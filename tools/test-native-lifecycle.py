@@ -208,11 +208,25 @@ def ordered(
     ]
 
 
+def normalize_rollback_times(
+    snapshot: dict, rollback_times: dict[str, int | None], started: int, ended: int,
+    *, require_clock: bool = False,
+) -> None:
+    for path, original in rollback_times.items():
+        entry = next(item for item in snapshot["filesystem"] if item["path"] == path)
+        if entry["kind"] != "symlink":
+            raise AssertionError(f"rollback changed symlink type: {path}")
+        value = entry["mtime_ns"]
+        if not started <= value <= ended and (require_clock or original is None or value != original):
+            raise AssertionError(f"unexpected rollback symlink timestamp: {path}: {value}")
+        entry["mtime_ns"] = original if original is not None else 0
+
+
 def compare_roots(
     expected: Path,
     candidate: Path,
     destination: Path,
-    rollback_times: dict[str, int],
+    rollback_times: dict[str, int | None],
     started: int,
     ended: int,
 ) -> None:
@@ -222,16 +236,7 @@ def compare_roots(
             destination / f"{label}.snapshot.json",
             m.oracle.canonical_json(snapshot).encode(),
         )
-        for path, original in rollback_times.items():
-            entry = next(item for item in snapshot["filesystem"] if item["path"] == path)
-            if entry["kind"] != "symlink":
-                raise AssertionError(f"rollback changed symlink type: {path}")
-            value = entry["mtime_ns"]
-            # dpkg recreates this rollback link at wall-clock time; preserving
-            # its original mtime is also valid, but an arbitrary timestamp is not.
-            if value != original and not started <= value <= ended:
-                raise AssertionError(f"unexpected rollback symlink timestamp: {path}: {value}")
-            entry["mtime_ns"] = original
+        normalize_rollback_times(snapshot, rollback_times, started, ended)
     mismatches = m.oracle.differences(*snapshots, maximum=30)
     if mismatches:
         raise AssertionError("native/dpkg mismatch:\n" + "\n".join(mismatches))
@@ -301,6 +306,7 @@ class Scenario:
         policy: str = "keep_existing",
         ordered_actions: list[dict] | None = None,
         rollback_clock: tuple[str, ...] = (),
+        created_rollback_clock: tuple[str, ...] = (),
         reference_groups: list[list[Path]] | None = None,
     ) -> None:
         destination = self.directory / f"{self.index}-{operation}"
@@ -310,6 +316,10 @@ class Scenario:
         rollback_times = {
             path: (self.expected / path).lstat().st_mtime_ns for path in rollback_clock
         }
+        for path in created_rollback_clock:
+            if os.path.lexists(self.expected / path):
+                raise AssertionError(f"expected a newly created rollback link: {path}")
+            rollback_times[path] = None
         started = time.time_ns()
         def reference(root: Path, output: Path) -> int:
             for index, group in enumerate(reference_groups or [archives or []]):
@@ -713,16 +723,159 @@ fi
 
 def make_diversion_packages(
     workspace: Path, environment: dict[str, str], architecture: str,
+    *, upgrade_symlink_target: str | None = None,
 ) -> dict[str, Path]:
+    def prepare_upgrade(source: Path) -> None:
+        assert upgrade_symlink_target is not None
+        link = source / DIVERSION_BASE / "current"
+        link.unlink()
+        link.symlink_to(upgrade_symlink_target)
+
     return {
         version: m.make_package(
             workspace, environment, architecture, version, "conffile",
             package=DIVERSION_PACKAGE, scripts=diversion_scripts(DIVERSION_PACKAGE, version),
             conffile_content=f"configuration {version}\n".encode(),
             extra_files={DIVERSION_LITERAL: f"literal version {version}\n".encode()},
+            prepare_payload=prepare_upgrade if version == "2" and upgrade_symlink_target is not None else None,
         )
         for version in ("1", "2")
     }
+
+
+def backup_probe_scripts(version: str, *, data_suffix: str = "", mode_suffix: str = "") -> dict[str, bytes]:
+    data = f"/{DIVERSION_BASE}/data{data_suffix}"
+    link = f"/{DIVERSION_BASE}/data.link"
+    symbolic = f"/{DIVERSION_BASE}/current"
+    mode = f"/{DIVERSION_BASE}/mode{mode_suffix}"
+    probe = f"""
+if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ] && [ "$1" = upgrade ]; then
+    /backup-probe-stat --printf='%d:%i\\n' {data} {symbolic} > /backup-before || exit 31
+fi
+if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = upgrade ]; then
+    {{
+        IFS= read -r original_data || exit 32
+        IFS= read -r original_symlink || exit 32
+    }} < /backup-before
+    [ "$(/backup-probe-stat --printf='%d:%i' {data}.dpkg-tmp)" = "$original_data" ] || exit 33
+    [ "$(/backup-probe-stat --printf='%d:%i' {link}.dpkg-tmp)" = "$original_data" ] || exit 34
+    [ -L {symbolic}.dpkg-tmp ] || exit 35
+    [ "$(/backup-probe-stat --printf='%d:%i' {symbolic}.dpkg-tmp)" != "$original_symlink" ] || exit 36
+    [ "$(/backup-probe-stat --printf='%a:%u:%g:%Y' {mode}.dpkg-tmp)" = '{"600" if version == "1" else "640"}:0:0:{m.EPOCH}' ] || exit 37
+    IFS= read -r previous < {data}.dpkg-tmp || exit 38
+    [ "$previous" = 'data version {version}' ] || exit 39
+    [ ! -e /etc/debz-native.conf.dpkg-tmp ] || exit 40
+    /backup-probe-rm -f /backup-before || exit 41
+fi
+""".encode()
+    guard = f"if [ -f /{FAILURE} ]; then\n".encode()
+    return {
+        kind: script.replace(guard, probe + guard, 1)
+        for kind, script in diversion_scripts(DIVERSION_PACKAGE, version).items()
+    }
+
+
+def install_backup_probe(root: Path) -> None:
+    runtime.copy_program(root, Path("/usr/bin/stat"), "/backup-probe-stat")
+    runtime.copy_program(root, Path("/usr/bin/rm"), "/backup-probe-rm")
+
+
+def exercise_unpack_backups(
+    executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
+) -> None:
+    for diverted in (False, True):
+        suffix = ".distrib" if diverted else ""
+        archives = {
+            version: m.make_package(
+                workspace / f"backup-packages-{diverted}", environment, architecture, version, "conffile",
+                package=DIVERSION_PACKAGE, scripts=backup_probe_scripts(version, data_suffix=suffix),
+                conffile_content=f"configuration {version}\n".encode(),
+            )
+            for version in ("1", "2")
+        }
+        for outcome in ("success", "unwind", "rollback"):
+            current = Scenario(workspace, f"unpack-backups-{diverted}-{outcome}", executable, architecture, environment)
+            for root in current.roots:
+                install_backup_probe(root)
+                if diverted:
+                    source = f"{DIVERSION_BASE}/data"
+                    seed_diversions(root, diversion_records(source, source + suffix))
+            current.seed(archives["1"])
+            if outcome != "success":
+                failures = [f"{DIVERSION_PACKAGE}@1:postrm:upgrade"]
+                if outcome == "rollback":
+                    failures.append(f"{DIVERSION_PACKAGE}@2:postrm:failed-upgrade")
+                current.fail(*failures)
+            current.phase(
+                "upgrade", [archives["2"]], names=(DIVERSION_PACKAGE,), failure=outcome == "rollback",
+                rollback_clock=(f"{DIVERSION_BASE}/current",) if outcome == "rollback" else (),
+            )
+            for root in current.roots:
+                for name in ("data" + suffix, "data.link", "mode", "current"):
+                    backup = root / DIVERSION_BASE / (name + ".dpkg-tmp")
+                    if diverted and outcome == "rollback" and name == "data" + suffix:
+                        assert backup.read_bytes() == b"data version 1\n"
+                        assert backup.samefile(root / DIVERSION_BASE / "data.link")
+                        assert (root / DIVERSION_BASE / name).read_bytes() == b"data version 2\n"
+                    else:
+                        assert not backup.exists() and not backup.is_symlink(), backup
+                assert not (root / "backup-before").exists()
+            if outcome == "success":
+                current.phase("reinstall", [archives["2"]], names=(DIVERSION_PACKAGE,))
+            current.complete()
+
+
+def exercise_unchanged_diversion_failures(
+    executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
+) -> None:
+    archives = make_diversion_packages(
+        workspace / "unchanged-failure-packages", environment, architecture,
+        upgrade_symlink_target="data.link",
+    )
+    for member in ("mode", "current", "data", "data.link", "introduced", "conffile"):
+        current = Scenario(workspace, f"unchanged-diversion-failure-{member}", executable, architecture, environment)
+        source = "etc/debz-native.conf" if member == "conffile" else f"{DIVERSION_BASE}/{member}"
+        destination = source + ".original"
+        records = diversion_records(source, destination)
+        for root in current.roots:
+            seed_diversions(root, records)
+        current.seed(archives["1"])
+        controls = [
+            {path.name: path.read_bytes() for path in (root / "var/lib/dpkg/info").iterdir() if path.is_file()}
+            for root in current.roots
+        ]
+        current.fail(f"{DIVERSION_PACKAGE}@1:postrm:upgrade", f"{DIVERSION_PACKAGE}@2:postrm:failed-upgrade")
+        current.phase(
+            "upgrade", [archives["2"]], names=(DIVERSION_PACKAGE,), failure=True,
+            rollback_clock=(f"{DIVERSION_BASE}/current",) if member != "current" else (),
+            created_rollback_clock=(destination + ".dpkg-tmp",) if member == "current" else (),
+        )
+        for root, previous_controls in zip(current.roots, controls):
+            assert (root / "var/lib/dpkg/diversions").read_bytes() == records
+            assert "Version: 1\n" in (root / "var/lib/dpkg/status").read_text()
+            assert previous_controls == {
+                path.name: path.read_bytes() for path in (root / "var/lib/dpkg/info").iterdir() if path.is_file()
+            }
+            target, backup = root / destination, root / (destination + ".dpkg-tmp")
+            if member in ("data", "data.link"):
+                sibling = root / DIVERSION_BASE / ("data.link" if member == "data" else "data")
+                assert target.read_bytes() == b"data version 2\n"
+                assert backup.read_bytes() == b"data version 1\n" and backup.samefile(sibling)
+                assert not target.samefile(sibling)
+            elif member == "mode":
+                assert target.stat().st_mode & 0o7777 == 0o640
+                assert backup.stat().st_mode & 0o7777 == 0o600
+            elif member == "current":
+                assert target.is_symlink() and backup.is_symlink()
+                assert os.readlink(target) == "data.link" and os.readlink(backup) == "data"
+                assert target.lstat().st_mtime_ns == m.EPOCH * 1_000_000_000
+            elif member == "introduced":
+                assert target.read_bytes() == b"only in 2\n" and not backup.exists()
+            else:
+                assert target.read_bytes() == b"configuration 1\n"
+                assert (root / (destination + ".dpkg-new")).read_bytes() == b"configuration 2\n"
+                assert not backup.exists()
+        current.complete()
 
 
 def diversion_records(source: str, destination: str, package: str = ":") -> bytes:
@@ -757,6 +910,8 @@ def seed_diversion_helper(root: Path, source: str, destination: str) -> None:
 def exercise_diversion_lifecycle(
     executable: Path | None, workspace: Path, environment: dict[str, str], architecture: str,
 ) -> None:
+    exercise_unpack_backups(executable, workspace, environment, architecture)
+    exercise_unchanged_diversion_failures(executable, workspace, environment, architecture)
     archives = make_diversion_packages(workspace / "diversion-packages", environment, architecture)
     for name, member, owner, override in (
         ("local", "mode", ":", ""),

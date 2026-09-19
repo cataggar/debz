@@ -206,6 +206,32 @@ fn checkpointManagedPathsAfterCacheValidation(
     );
 }
 
+fn checkpointRolledBackNativePhase(
+    allocator: std.mem.Allocator,
+    runtime: *native_recovery.Runtime,
+    action: native_recovery.Action,
+    steps: []const root_mutation.Step,
+) !?native_recovery.Digest {
+    var buffer: [128]u8 = undefined;
+    const path = try native_recovery.unpackDiversionPath(action.program_step, &buffer);
+    if (try runtime.root.entryIfExists(try root_fs.Path.init(path)) != null) {
+        const bytes = (try native_recovery.readManagedFile(
+            allocator,
+            runtime.root,
+            runtime.intent_sha256,
+            path,
+            native_unpack_diversion.maximum_document_bytes,
+        )) orelse return error.InvalidManagedState;
+        defer allocator.free(bytes);
+        var decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, action.program_step);
+        defer decoded.deinit();
+        if (decoded.backups != null)
+            return try native_recovery.checkpointRolledBackMutation(allocator, runtime.root, runtime.intent_sha256, action, steps);
+    }
+    try native_recovery.validateStableManagedState(allocator, runtime.root, runtime.intent_sha256);
+    return null;
+}
+
 fn validateManagedDiversionUpdate(
     allocator: std.mem.Allocator,
     runtime: *const native_recovery.Runtime,
@@ -324,26 +350,12 @@ fn captureUnpackDiversions(
             native_unpack_diversion.maximum_document_bytes,
         )) orelse return error.InvalidManagedState;
         defer allocator.free(bytes);
-        const decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, program_step);
-        return decoded.cache;
+        var decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, program_step);
+        defer decoded.deinit();
+        return try decoded.cache.clone(allocator);
     }
     if (kind.? != .absent) return error.InvalidManagedState;
     try native_recovery.validateStableManagedState(allocator, root, runtime.intent_sha256);
-    const bytes = try native_unpack_diversion.encode(allocator, session.cache, runtime.intent_sha256, program_step);
-    defer allocator.free(bytes);
-    try root.publishFile(try root_fs.Path.init(path), bytes, .{
-        .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600),
-        .overwrite = .fail_if_exists,
-        .durable = true,
-    });
-    _ = try checkpointManagedPaths(
-        allocator,
-        runtime,
-        nativeAction(.filesystem, program_step, 0, 0),
-        &.{},
-        &.{path},
-        false,
-    );
     return try session.cache.clone(allocator);
 }
 
@@ -384,6 +396,7 @@ const CombinedMutationHooks = struct {
     original: root_mutation.Hooks,
     runtime: ?*native_recovery.Runtime,
     action: ?native_recovery.Action,
+    publication_crash_point: ?native_recovery.CrashPoint = null,
 
     fn before(
         context: ?*anyopaque,
@@ -396,13 +409,14 @@ const CombinedMutationHooks = struct {
         const runtime = self.runtime orelse return;
         const action = self.action orelse return;
         const selected = runtime.crash.selected orelse return;
-        const matches = switch (selected) {
+        const matches = if (self.publication_crash_point) |point| selected == point else switch (selected) {
             .during_filesystem_publication => action.kind == .filesystem,
             .during_database_publication => action.kind == .database,
             else => false,
         };
         if (matches and
-            (boundary == .publish_rename or boundary == .publish_create))
+            (boundary == .publish_rename or boundary == .publish_create or
+                (selected == .during_unpack_backup_cleanup and boundary == .target_remove)))
             std.process.exit(native_recovery.crash_exit_code);
     }
 };
@@ -7416,6 +7430,9 @@ const MaterializationRequest = struct {
     mutation_database_step: ?*u32 = null,
     file_trigger_sink: ?FileTriggerSink = null,
     observed_paths: []const []const u8 = &.{},
+    unpack_diversions: ?*const native_diversion.CachedRecords = null,
+    unpack_hook: ?*PostUnpackHook = null,
+    publication_crash_point: ?native_recovery.CrashPoint = null,
     hooks: root_mutation.Hooks = .{},
     mutation_limits: root_mutation.Limits = .{},
 };
@@ -8142,9 +8159,377 @@ fn verifyMaterializedDatabase(
     }
 }
 
+const MaterializationPlanning = union(enum) {
+    plan: Plan,
+    result: MaterializationResult,
+};
+
+fn prepareMaterializationPlan(allocator: std.mem.Allocator, request: MaterializationRequest) !MaterializationPlanning {
+    return switch (try plan(allocator, request.planning)) {
+        .handoff => |value| block: {
+            var handoff = value;
+            defer handoff.deinit();
+            break :block .{ .result = .{
+                .outcome = .handoff,
+                .detail = if (handoff.items.len == 0) "handoff" else handoff.items[0].feature.spelling(),
+            } };
+        },
+        .refusal => |value| block: {
+            var refusal = value;
+            defer refusal.deinit();
+            break :block .{ .result = .{ .outcome = .refused, .detail = @tagName(refusal.diagnostic.code) } };
+        },
+        .plan => |value| .{ .plan = value },
+    };
+}
+
+fn unpackBackups(
+    allocator: std.mem.Allocator,
+    planned: Plan,
+    timestamp: i128,
+) ![]const native_unpack_diversion.Backup {
+    var paths: std.StringHashMapUnmanaged(void) = .empty;
+    defer paths.deinit(allocator);
+    var staged: std.StringHashMapUnmanaged(void) = .empty;
+    defer staged.deinit(allocator);
+    for (planned.packages) |package| {
+        for (package.paths) |path| try paths.put(allocator, path.path, {});
+        for (package.removals) |path| try paths.put(allocator, path.path, {});
+        for (package.conffiles) |conffile|
+            if (conffile.staged_path) |path| try staged.put(allocator, path, {});
+    }
+    var backups: std.ArrayList(native_unpack_diversion.Backup) = .empty;
+    errdefer backups.deinit(allocator);
+    for (planned.packages) |package| {
+        for (package.paths) |path| {
+            if (!path.publish or path.kind == .directory or staged.contains(path.path)) continue;
+            const previous = path.previous orelse continue;
+            if (previous.kind != .regular and previous.kind != .symlink) continue;
+            const backup: native_unpack_diversion.Backup = .{
+                .path = path.path,
+                .logical_path = path.archive_path,
+                .kind = if (previous.kind == .regular) .regular else .symlink,
+                .mode = previous.mode,
+                .uid = previous.uid,
+                .gid = previous.gid,
+                .size = previous.size,
+                .device = previous.device,
+                .inode = previous.inode,
+                .modified_nanoseconds = previous.modified_nanoseconds,
+                .backup_modified_nanoseconds = if (previous.kind == .symlink) timestamp else previous.modified_nanoseconds,
+                .content_sha256 = if (previous.content_sha256) |digest| hex(32, digest) else null,
+                .link_target = previous.link_target,
+            };
+            var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+            if (paths.contains(try backup.backupPath(&buffer)))
+                return error.UnpackBackupPathCollision;
+            try backups.append(allocator, backup);
+        }
+    }
+    std.mem.sort(native_unpack_diversion.Backup, backups.items, {}, struct {
+        fn less(_: void, left: native_unpack_diversion.Backup, right: native_unpack_diversion.Backup) bool {
+            return std.mem.lessThan(u8, left.path, right.path);
+        }
+    }.less);
+    return backups.toOwnedSlice(allocator);
+}
+
+fn materializeUnpackBackups(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    backups: []const native_unpack_diversion.Backup,
+    cleanup: bool,
+    preserve_diverted: bool,
+) !MaterializationResult {
+    const execution = request.execution orelse return error.InvalidLifecycleProgram;
+    if (try consumeRecoveredDatabasePhase(execution))
+        return .{ .outcome = .applied, .detail = "recovered_phase" };
+    if (execution.recovery) |runtime|
+        try native_recovery.validateStableManagedState(allocator, request.root, runtime.intent_sha256);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const intents = try owned.alloc(root_mutation.Intent, backups.len);
+    var intent_count: usize = 0;
+    var sources: std.AutoHashMapUnmanaged(u128, []const u8) = .empty;
+    defer sources.deinit(allocator);
+    for (backups) |backup| {
+        if (cleanup and preserve_diverted and try unpackPathDiverted(request, backup.logical_path)) continue;
+        const intent = &intents[intent_count];
+        intent_count += 1;
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const path = try owned.dupe(u8, try backup.backupPath(&buffer));
+        if (cleanup) {
+            intent.* = .{ .remove = .{ .path = path, .removal = .require_present } };
+            continue;
+        }
+        const source = try root_fs.Path.initPackage(backup.path);
+        const observed = try request.root.entry(source);
+        if (observed.device != backup.device or observed.inode != backup.inode or
+            observed.mode != backup.mode or observed.uid != backup.uid or observed.gid != backup.gid or
+            observed.modified_nanoseconds != backup.modified_nanoseconds or observed.size != backup.size)
+            return error.UnpackBackupSourceChanged;
+        switch (backup.kind) {
+            .regular => {
+                if (!observed.isRegularFile()) return error.UnpackBackupSourceChanged;
+                const bytes = try request.root.readFileAlloc(allocator, source, std.math.cast(usize, backup.size) orelse
+                    return error.UnpackBackupSourceChanged);
+                defer allocator.free(bytes);
+                var digest: [32]u8 = undefined;
+                Sha256.hash(bytes, &digest, .{});
+                if (!std.mem.eql(u8, &hex(32, digest), &(backup.content_sha256 orelse return error.InvalidUnpackBackup)))
+                    return error.UnpackBackupSourceChanged;
+                const source_key = (@as(u128, backup.device) << 64) | backup.inode;
+                const canonical = try sources.getOrPut(allocator, source_key);
+                if (!canonical.found_existing) canonical.value_ptr.* = backup.path;
+                intent.* = .{ .hard_link = .{ .path = path, .source = canonical.value_ptr.*, .overwrite = .replace } };
+            },
+            .symlink => {
+                if (!observed.isSymbolicLink()) return error.UnpackBackupSourceChanged;
+                var target: [root_fs.maximum_link_target_bytes]u8 = undefined;
+                if (!std.mem.eql(u8, try request.root.readSymbolicLink(source, &target), backup.link_target.?))
+                    return error.UnpackBackupSourceChanged;
+                intent.* = .{ .symlink = .{
+                    .path = path,
+                    .target = backup.link_target.?,
+                    .uid = backup.uid,
+                    .gid = backup.gid,
+                    .modified_nanoseconds = backup.backup_modified_nanoseconds,
+                    .overwrite = .replace,
+                } };
+            },
+        }
+    }
+    var phase_request = request;
+    phase_request.hooks = .{};
+    phase_request.mutation_database_step = null;
+    phase_request.publication_crash_point = if (cleanup) .during_unpack_backup_cleanup else .during_unpack_backup_publication;
+    return lifecycleAuxiliaryMutation(
+        allocator,
+        phase_request,
+        intents[0..intent_count],
+        if (cleanup) "unpack-backup-cleanup" else "unpack-backups",
+    );
+}
+
+fn unpackPathDiverted(request: MaterializationRequest, path: []const u8) !bool {
+    const execution = request.execution orelse return error.InvalidLifecycleProgram;
+    const cache = request.unpack_diversions orelse return error.InvalidLifecycleProgram;
+    if (execution.program_step >= request.planning.program.steps.len) return error.InvalidLifecycleProgram;
+    const operation = request.planning.program.steps[execution.program_step].operation;
+    if (operation != .unpack_package) return error.InvalidLifecycleProgram;
+    return !std.mem.eql(u8, path, cache.index.physical(path, operation.unpack_package.package.name));
+}
+
+fn materializeFailedUnpack(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    prepared: ?*const Plan,
+    backups: []const native_unpack_diversion.Backup,
+) !MaterializationResult {
+    const execution = request.execution orelse return error.InvalidLifecycleProgram;
+    if (try consumeRecoveredDatabasePhase(execution))
+        return .{ .outcome = .applied, .detail = "recovered_phase" };
+    if (execution.recovery) |runtime|
+        try native_recovery.validateStableManagedState(allocator, request.root, runtime.intent_sha256);
+    var owned_plan: ?Plan = null;
+    defer if (owned_plan) |*value| value.deinit();
+    const planned = if (prepared) |value| value.* else block: {
+        owned_plan = switch (try prepareMaterializationPlan(allocator, request)) {
+            .plan => |value| value,
+            .result => |result| return result,
+        };
+        break :block owned_plan.?;
+    };
+    var bound = (try bindMaterializationArchives(allocator, request.planning)) orelse
+        return .{ .outcome = .refused, .detail = "archive_binding_mismatch" };
+    defer bound.deinit();
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    defer intents.deinit(allocator);
+    var directories: std.ArrayList(root_mutation.Intent) = .empty;
+    defer directories.deinit(allocator);
+    var groups: std.AutoHashMapUnmanaged(u64, []const u8) = .empty;
+    defer groups.deinit(allocator);
+    for (planned.packages) |package| {
+        const archive = bound.find(package.artifact) orelse return error.MaterializationArchiveMissing;
+        for (package.paths) |path| {
+            if (!path.publish or !try unpackPathDiverted(request, path.archive_path)) continue;
+            const entry = path.archive_entry orelse return error.MaterializationPlanMismatch;
+            if (entry >= archive.model.files.len) return error.MaterializationPlanMismatch;
+            var modeled = archive.model.files[entry];
+            if (modeled.kind == .hardlink)
+                modeled = (archive.model.findFile(modeled.link_target orelse return error.MaterializationPlanMismatch) orelse
+                    return error.MaterializationPlanMismatch).*;
+            var intent = try root_mutation.archiveFileIntent(path.path, &archive.model, modeled, archive.binding);
+            switch (intent) {
+                .file => |*file| {
+                    file.mode = path.mode;
+                    file.uid = path.uid;
+                    file.gid = path.gid;
+                    file.modified_nanoseconds = path.modified_nanoseconds orelse return error.MaterializationPlanMismatch;
+                    const key = (@as(u64, package.artifact) << 32) |
+                        (std.math.cast(u32, modeled.entry_index) orelse return error.MaterializationPlanMismatch);
+                    const group = try groups.getOrPut(allocator, key);
+                    if (group.found_existing) {
+                        intent = .{ .hard_link = .{ .path = path.path, .source = group.value_ptr.*, .overwrite = .replace } };
+                    } else group.value_ptr.* = path.path;
+                },
+                .symlink => |*link| {
+                    link.uid = path.uid;
+                    link.gid = path.gid;
+                    link.modified_nanoseconds = path.modified_nanoseconds orelse return error.MaterializationPlanMismatch;
+                },
+                .directory => |*directory| {
+                    directory.mode = path.mode | 0o700;
+                    directory.uid = path.uid;
+                    directory.gid = path.gid;
+                    try directories.append(allocator, .{ .metadata = .{
+                        .path = path.path,
+                        .mode = path.mode,
+                        .uid = path.uid,
+                        .gid = path.gid,
+                        .modified_nanoseconds = path.modified_nanoseconds,
+                    } });
+                },
+                else => return error.MaterializationPlanMismatch,
+            }
+            try intents.append(allocator, intent);
+        }
+    }
+    std.mem.reverse(root_mutation.Intent, directories.items);
+    try intents.appendSlice(allocator, directories.items);
+    for (backups) |backup| {
+        if (backup.kind != .symlink or try unpackPathDiverted(request, backup.logical_path)) continue;
+        try intents.append(allocator, .{ .symlink = .{
+            .path = backup.path,
+            .target = backup.link_target.?,
+            .uid = backup.uid,
+            .gid = backup.gid,
+            .modified_nanoseconds = backup.backup_modified_nanoseconds,
+            .overwrite = .replace,
+        } });
+    }
+    var phase_request = request;
+    phase_request.hooks = .{};
+    phase_request.mutation_database_step = null;
+    phase_request.publication_crash_point = .during_failed_unpack_publication;
+    return lifecycleAuxiliaryMutation(allocator, phase_request, intents.items, "failed-unpack-publication");
+}
+
 fn materialize(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
+) !MaterializationResult {
+    const cache = request.unpack_diversions orelse return materializePlanned(allocator, request, null);
+    const execution = request.execution orelse return error.InvalidLifecycleProgram;
+    var decoded: ?native_unpack_diversion.Decoded = null;
+    defer if (decoded) |*value| value.deinit();
+    if (execution.recovery) |runtime| {
+        var buffer: [128]u8 = undefined;
+        const path = try native_recovery.unpackDiversionPath(execution.program_step, &buffer);
+        var managed = try native_recovery.readManagedState(allocator, request.root);
+        defer managed.deinit();
+        const entry = if (managed.document.stable) |snapshot| block: {
+            for (snapshot.entries) |item|
+                if (std.mem.eql(u8, item.path, path)) break :block item;
+            break :block null;
+        } else null;
+        if (entry == null) return materializePlanned(allocator, request, null);
+        if (entry.?.kind == .regular) {
+            const bytes = (try native_recovery.readManagedFile(
+                allocator,
+                request.root,
+                runtime.intent_sha256,
+                path,
+                native_unpack_diversion.maximum_document_bytes,
+            )) orelse return error.InvalidManagedState;
+            defer allocator.free(bytes);
+            decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, execution.program_step);
+            if (decoded.?.backups == null) return materializePlanned(allocator, request, null);
+        } else if (entry.?.kind != .absent) return error.InvalidManagedState;
+    }
+    var planned: ?Plan = null;
+    defer if (planned) |*value| value.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const backups = if (decoded) |value| value.backups.? else block: {
+        planned = switch (try prepareMaterializationPlan(allocator, request)) {
+            .plan => |value| value,
+            .result => |result| return result,
+        };
+        const entries = try unpackBackups(arena.allocator(), planned.?, std.Io.Clock.real.now(request.io).nanoseconds);
+        if (execution.recovery) |runtime| {
+            try native_recovery.validateStableManagedState(allocator, request.root, runtime.intent_sha256);
+            const bytes = try native_unpack_diversion.encodeWithBackups(
+                allocator,
+                cache.*,
+                runtime.intent_sha256,
+                execution.program_step,
+                entries,
+            );
+            defer allocator.free(bytes);
+            var buffer: [128]u8 = undefined;
+            const path = try native_recovery.unpackDiversionPath(execution.program_step, &buffer);
+            try request.root.publishFile(try root_fs.Path.init(path), bytes, .{
+                .permissions = if (builtin.os.tag == .windows) .default_file else .fromMode(0o600),
+                .overwrite = .fail_if_exists,
+                .durable = true,
+            });
+            const observed = try arena.allocator().alloc([]const u8, 1 + planned.?.filesystem.len + entries.len);
+            observed[0] = path;
+            for (planned.?.filesystem, observed[1 .. 1 + planned.?.filesystem.len]) |change, *slot|
+                slot.* = switch (change) {
+                    inline else => |value| value.path,
+                };
+            for (entries, observed[1 + planned.?.filesystem.len ..]) |backup, *slot| {
+                var backup_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+                slot.* = try arena.allocator().dupe(u8, try backup.backupPath(&backup_buffer));
+            }
+            _ = try checkpointManagedPaths(allocator, runtime, nativeAction(.filesystem, execution.program_step, 0, 0), &.{}, observed, false);
+        }
+        break :block entries;
+    };
+    if (backups.len != 0) {
+        const result = try materializeUnpackBackups(allocator, request, backups, false, false);
+        if (result.outcome != .applied) return result;
+        if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_backups);
+    }
+    const result = try resumeRolledBackUnpack(allocator, request) orelse
+        try materializePlanned(allocator, request, if (planned) |*value| value else null);
+    if (backups.len != 0 and (result.outcome == .refused or result.outcome == .handoff)) {
+        const attempt = request.borrowed_attempt orelse return error.InvalidLifecycleProgram;
+        try attempt.requireRecovery(allocator, .mutation);
+        return .{ .outcome = .recovery_required, .detail = result.detail };
+    }
+    const partial_rollback = result.outcome == .rolled_back and
+        request.unpack_hook != null and request.unpack_hook.?.rollback_required;
+    if (partial_rollback) {
+        if (execution.recovery) |runtime| runtime.crash.hit(.before_failed_unpack_publication);
+        const preserved = try materializeFailedUnpack(allocator, request, if (planned) |*value| value else null, backups);
+        if (preserved.outcome != .applied) {
+            const attempt = request.borrowed_attempt orelse return error.InvalidLifecycleProgram;
+            try attempt.requireRecovery(allocator, .mutation);
+            return .{ .outcome = .recovery_required, .detail = "failed_unpack_publication_incomplete" };
+        }
+        if (execution.recovery) |runtime| runtime.crash.hit(.after_failed_unpack_publication);
+    }
+    if (backups.len != 0 and (result.outcome == .applied or result.outcome == .rolled_back)) {
+        if (execution.recovery) |runtime| runtime.crash.hit(.before_unpack_backup_cleanup);
+        const cleaned = try materializeUnpackBackups(allocator, request, backups, true, partial_rollback);
+        if (cleaned.outcome != .applied) {
+            const attempt = request.borrowed_attempt orelse return error.InvalidLifecycleProgram;
+            try attempt.requireRecovery(allocator, .mutation);
+            return .{ .outcome = .recovery_required, .detail = "unpack_backup_cleanup_failed" };
+        }
+        if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_backup_cleanup);
+    }
+    return result;
+}
+
+fn materializePlanned(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    prepared: ?*const Plan,
 ) !MaterializationResult {
     var standalone_execution: ExecutionState = .{};
     const execution = request.execution orelse &standalone_execution;
@@ -8155,29 +8540,15 @@ fn materialize(
     if (try recoveredActionApplied(execution))
         return .{ .outcome = .applied, .detail = "recovered_phase" };
 
-    var planned = switch (try plan(allocator, request.planning)) {
-        .handoff => |value| {
-            var handoff = value;
-            defer handoff.deinit();
-            return .{
-                .outcome = .handoff,
-                .detail = if (handoff.items.len == 0)
-                    "handoff"
-                else
-                    handoff.items[0].feature.spelling(),
-            };
-        },
-        .refusal => |value| {
-            var refusal = value;
-            defer refusal.deinit();
-            return .{
-                .outcome = .refused,
-                .detail = @tagName(refusal.diagnostic.code),
-            };
-        },
-        .plan => |value| value,
+    var owned_plan: ?Plan = null;
+    defer if (owned_plan) |*value| value.deinit();
+    const planned = if (prepared) |value| value.* else block: {
+        owned_plan = switch (try prepareMaterializationPlan(allocator, request)) {
+            .plan => |value| value,
+            .result => |result| return result,
+        };
+        break :block owned_plan.?;
     };
-    defer planned.deinit();
 
     var fresh_database = try captureDatabaseSnapshot(
         allocator,
@@ -8344,6 +8715,7 @@ fn materialize(
         .original = request.hooks,
         .runtime = execution.recovery,
         .action = execution.action,
+        .publication_crash_point = request.publication_crash_point,
     };
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
@@ -8459,14 +8831,12 @@ fn materialize(
                         request.root,
                         runtime.intent_sha256,
                     );
-                    try native_recovery.validateStableManagedState(
+                    break :block try checkpointRolledBackNativePhase(
                         allocator,
-                        request.root,
-                        runtime.intent_sha256,
-                    );
-                    break :block native_recovery.hexDigest(
-                        mutation_plan.steps_sha256,
-                    );
+                        runtime,
+                        action,
+                        mutation_plan.steps,
+                    ) orelse native_recovery.hexDigest(mutation_plan.steps_sha256);
                 },
                 .recovery_required => unreachable,
             };
@@ -8739,6 +9109,7 @@ fn executePhaseMaterialization(
         .original = request.hooks,
         .runtime = execution.recovery,
         .action = execution.action,
+        .publication_crash_point = request.publication_crash_point,
     };
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
@@ -8874,12 +9245,12 @@ fn executePhaseMaterialization(
                         request.root,
                         runtime.intent_sha256,
                     );
-                    try native_recovery.validateStableManagedState(
+                    break :block try checkpointRolledBackNativePhase(
                         allocator,
-                        request.root,
-                        runtime.intent_sha256,
-                    );
-                    break :block native_recovery.hexDigest(phase_digest);
+                        runtime,
+                        action,
+                        mutation_plan.steps,
+                    ) orelse native_recovery.hexDigest(phase_digest);
                 },
                 .recovery_required => unreachable,
             };
@@ -13096,7 +13467,8 @@ fn lifecycleDataStep(
     package: native_program.PackageIdentity,
     hooks: root_mutation.Hooks,
     mutation_database_step: ?*u32,
-    publication_diversions: ?[]const package_database.DiversionRecord,
+    publication_diversions: ?*const native_diversion.CachedRecords,
+    unpack_hook: ?*PostUnpackHook,
 ) !MaterializationResult {
     const model_index = lifecycleArchiveIndex(models, package) orelse
         return .{ .outcome = .refused, .detail = "archive_missing" };
@@ -13126,7 +13498,9 @@ fn lifecycleDataStep(
     );
     request.hooks = hooks;
     request.mutation_database_step = mutation_database_step;
-    if (publication_diversions) |records| request.planning.diversion_records = records;
+    if (publication_diversions) |cache| request.planning.diversion_records = cache.records;
+    request.unpack_diversions = publication_diversions;
+    request.unpack_hook = unpack_hook;
     return materialize(allocator, request);
 }
 
@@ -16149,6 +16523,110 @@ const PostUnpackHook = struct {
     diversion_failure: ?native_diversion.UpdateError = null,
 };
 
+fn recoveredPostUnpackOutcome(
+    context: *PostUnpackHook,
+    ordinal: *u32,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) !?LifecycleScriptOutcome {
+    const runtime = context.execution.recovery orelse return null;
+    const action = nativeAction(.script, context.script.sequence, @intCast(@intFromEnum(kind)), ordinal.*);
+    const latest = try runtime.latest(action) orelse return null;
+    if (latest.stage != .completed) return null;
+    var outcome = (try native_recovery.readScriptOutcome(context.allocator, context.root, action)) orelse
+        return error.InvalidScriptOutcome;
+    defer outcome.deinit();
+    const package = try lifecycleScriptOwner(context.authorization.*, context.script.call.package, source);
+    if (!nativeScriptOutcomeMatches(
+        outcome.outcome,
+        runtime.*,
+        action,
+        package,
+        kind,
+        source,
+        parseHex(32, &script_sha256) orelse return error.InvalidLifecycleProgram,
+        arguments,
+    )) return error.InvalidScriptOutcome;
+    ordinal.* += 1;
+    return nativeScriptDisposition(outcome.outcome);
+}
+
+fn resumeRolledBackUnpack(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+) !?MaterializationResult {
+    const execution = request.execution orelse return null;
+    const runtime = execution.recovery orelse return null;
+    const context = request.unpack_hook orelse return null;
+    const action = nativeAction(.filesystem, execution.program_step, execution.phase_ordinal, 0);
+    const record = try runtime.latest(action) orelse return null;
+    if (record.stage != .completed or record.result != .rolled_back) return null;
+    try native_recovery.validateStableManagedState(allocator, request.root, runtime.intent_sha256);
+    var ordinal = execution.script_ordinal;
+    const call = context.script.call;
+    const primary = try recoveredPostUnpackOutcome(
+        context,
+        &ordinal,
+        call.kind,
+        call.source,
+        call.script_sha256,
+        call.arguments,
+    ) orelse return null;
+    switch (primary) {
+        .exited => |code| if (code == 0) return null,
+        .not_started => {},
+        .recovery_required => return error.InvalidScriptOutcome,
+    }
+    if (call.failure.unwind) |unwind| {
+        const outcome = try recoveredPostUnpackOutcome(
+            context,
+            &ordinal,
+            unwind.kind,
+            unwind.source,
+            unwind.script_sha256,
+            unwind.arguments,
+        ) orelse return null;
+        switch (outcome) {
+            .exited => |code| if (code == 0 and call.failure.resume_after_unwind) return null,
+            .not_started => {},
+            .recovery_required => return error.InvalidScriptOutcome,
+        }
+    }
+    const rollback_after = call.failure.rollback_after_compensations orelse 0;
+    if (rollback_after > call.failure.compensations.len) return error.InvalidLifecycleProgram;
+    var failed_compensation: ?u32 = null;
+    for (call.failure.compensations[0..rollback_after], 0..) |compensation, index| {
+        const outcome = try recoveredPostUnpackOutcome(
+            context,
+            &ordinal,
+            compensation.kind,
+            compensation.source,
+            compensation.script_sha256,
+            compensation.arguments,
+        ) orelse return null;
+        const code: u8 = switch (outcome) {
+            .exited => |value| value,
+            .not_started => 255,
+            .recovery_required => return error.InvalidScriptOutcome,
+        };
+        if (code != 0) {
+            failed_compensation = @intCast(index);
+            break;
+        }
+    }
+    // A completed rollback consumes only bound outcomes, never the published payload or scripts again.
+    const previous_action = execution.action;
+    _ = beginNativePhase(execution, .filesystem);
+    execution.action = previous_action;
+    execution.script_ordinal = ordinal;
+    context.fired = true;
+    context.rollback_required = true;
+    context.failed_compensation = failed_compensation;
+    return .{ .outcome = .rolled_back, .detail = "recovered_unpack_rollback" };
+}
+
 fn diversionUpdateFailure(err: anyerror) ?native_diversion.UpdateError {
     return switch (err) {
         error.UnsupportedInPlaceDiversionUpdate => error.UnsupportedInPlaceDiversionUpdate,
@@ -17462,12 +17940,8 @@ fn recoverNativeRootMutation(
                 root,
                 runtime.intent_sha256,
             );
-            try native_recovery.validateStableManagedState(
-                allocator,
-                root,
-                runtime.intent_sha256,
-            );
-            try runtime.append(action, .completed, .rolled_back, null);
+            const checkpoint = try checkpointRolledBackNativePhase(allocator, runtime, action, opened.journal().steps);
+            try runtime.append(action, .completed, .rolled_back, checkpoint);
             try root_mutation.clear(&opened);
             return true;
         },
@@ -19693,6 +20167,7 @@ fn executeLifecycleProgramWithRequest(
                 .{},
                 null,
                 null,
+                null,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
         },
@@ -19753,7 +20228,8 @@ fn executeLifecycleProgramWithRequest(
                 intent.package,
                 hooks,
                 if (post_unpack != null) &hook_context.target_step else null,
-                if (publication_diversions) |cache| cache.records else null,
+                if (publication_diversions) |*cache| cache else null,
+                if (post_unpack != null) &hook_context else null,
             );
             if (post_unpack != null) {
                 if (hook_context.diversion_failure) |err| return err;
@@ -19886,6 +20362,45 @@ fn executeLifecycleProgramWithRequest(
                     );
                     if (lifecycleMaterializationFailure(cleanup)) |failure|
                         return failure;
+                    if (program.trigger_authority != null) {
+                        const model_index = lifecycleArchiveIndex(models, intent.package) orelse
+                            return error.InvalidLifecycleProgram;
+                        try collectArchiveTriggerEvents(
+                            scratch,
+                            root,
+                            program.target_architecture,
+                            &models[model_index],
+                            &trigger_events,
+                            if (publication_diversions) |cache| cache.records else null,
+                        );
+                        try persistRuntimeTriggerEvents(execution, scratch, root, trigger_events.items);
+                        const trigger_step = for (program.steps) |candidate| {
+                            if (candidate.operation == .process_deferred_triggers) break candidate;
+                        } else return error.InvalidLifecycleProgram;
+                        _ = try beginNativeProgramStep(execution, trigger_step);
+                        const triggers = try lifecycleRunTriggerWork(
+                            execution,
+                            allocator,
+                            scratch,
+                            &trigger_events,
+                            root,
+                            external.root,
+                            program,
+                            authorization,
+                            initial_model,
+                            locks,
+                            attempt,
+                            operation,
+                            conffile_policy,
+                            trigger_step.sequence,
+                            false,
+                            true,
+                        );
+                        switch (triggers.outcome) {
+                            .applied, .trigger_failed => {},
+                            .recovery_required, .script_failed, .handoff, .refused => return triggers,
+                        }
+                    }
                     const restored = try restoreLifecycleStatusOld(
                         execution,
                         allocator,
@@ -21242,7 +21757,108 @@ fn testUnpackDiversionAllocations(allocator: std.mem.Allocator) !void {
         var decoded = try native_unpack_diversion.decode(allocator, bytes, @splat('0'), 7);
         defer decoded.deinit();
         try testing.expectEqual(contents == null, decoded.cache.bytes == null);
+        const backed = try native_unpack_diversion.encodeWithBackups(allocator, cache, @splat('0'), 7, &.{testUnpackBackup()});
+        defer allocator.free(backed);
+        var with_backups = try native_unpack_diversion.decode(allocator, backed, @splat('0'), 7);
+        defer with_backups.deinit();
+        try testing.expectEqualDeep(testUnpackBackup(), with_backups.backups.?[0]);
     }
+}
+
+fn testUnpackBackup() native_unpack_diversion.Backup {
+    return .{
+        .path = "usr/bin/tool.distrib",
+        .logical_path = "usr/bin/tool",
+        .kind = .regular,
+        .mode = 0o6750,
+        .uid = 42420,
+        .gid = 42421,
+        .size = 17,
+        .device = 3,
+        .inode = 4,
+        .modified_nanoseconds = 123456789,
+        .backup_modified_nanoseconds = 123456789,
+        .content_sha256 = @splat('a'),
+    };
+}
+
+test "native_unpack.test.unpack backup inputs distinguish legacy and bound backup phases" {
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, null, null);
+    defer cache.deinit();
+    const legacy = try native_unpack_diversion.encode(testing.allocator, cache, @splat('0'), 7);
+    defer testing.allocator.free(legacy);
+    try testing.expect(std.mem.indexOf(u8, legacy, "\"backups\"") == null);
+    var old = try native_unpack_diversion.decode(testing.allocator, legacy, @splat('0'), 7);
+    defer old.deinit();
+    try testing.expect(old.backups == null);
+    const explicit_null = try std.fmt.allocPrint(testing.allocator, "{s},\"backups\":null}}", .{legacy[0 .. legacy.len - 1]});
+    defer testing.allocator.free(explicit_null);
+    try testing.expectError(error.InvalidUnpackDiversionCache, native_unpack_diversion.decode(testing.allocator, explicit_null, @splat('0'), 7));
+    const empty = try native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{});
+    defer testing.allocator.free(empty);
+    var decoded = try native_unpack_diversion.decode(testing.allocator, empty, @splat('0'), 7);
+    defer decoded.deinit();
+    try testing.expectEqual(@as(usize, 0), decoded.backups.?.len);
+    try testing.expect(!std.mem.eql(u8, &old.digest_sha256, &decoded.digest_sha256));
+}
+
+test "native_unpack.test.unpack backup inputs retain symlink clocks and reject malformed preimages" {
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, null, null);
+    defer cache.deinit();
+    var link = testUnpackBackup();
+    link.kind = .symlink;
+    link.mode = 0o777;
+    link.content_sha256 = null;
+    link.link_target = "target";
+    link.size = 6;
+    link.backup_modified_nanoseconds = 987654321;
+    const bytes = try native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{link});
+    defer testing.allocator.free(bytes);
+    var decoded = try native_unpack_diversion.decode(testing.allocator, bytes, @splat('0'), 7);
+    defer decoded.deinit();
+    try testing.expectEqualDeep(link, decoded.backups.?[0]);
+    var invalid = [_]native_unpack_diversion.Backup{
+        testUnpackBackup(), testUnpackBackup(), testUnpackBackup(),
+        testUnpackBackup(), testUnpackBackup(), testUnpackBackup(),
+        link,               link,               testUnpackBackup(),
+        testUnpackBackup(),
+    };
+    invalid[0].path = "../escape";
+    invalid[1].logical_path = "/absolute";
+    invalid[2].inode = 0;
+    invalid[3].backup_modified_nanoseconds += 1;
+    invalid[4].content_sha256 = @splat('g');
+    invalid[5].link_target = "not-a-regular-file-field";
+    invalid[6].link_target = "nul\x00target";
+    invalid[7].size += 1;
+    invalid[8].mode = 0o10000;
+    invalid[9].modified_nanoseconds = root_mutation.minimum_timestamp_nanoseconds - 1;
+    for (invalid) |entry| try testing.expectError(
+        error.InvalidUnpackBackup,
+        native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{entry}),
+    );
+    try testing.expectError(
+        error.InvalidUnpackBackup,
+        native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{ testUnpackBackup(), testUnpackBackup() }),
+    );
+    var collision = testUnpackBackup();
+    collision.path = "usr/share/example.dpkg-tmp";
+    var original = testUnpackBackup();
+    original.path = "usr/share/example";
+    try testing.expectError(
+        error.InvalidUnpackBackup,
+        native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{ original, collision }),
+    );
+    try testing.expectError(
+        error.InvalidUnpackBackup,
+        native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{ collision, original }),
+    );
+    collision.path = "usr/share/linked";
+    collision.content_sha256 = @splat('b');
+    try testing.expectError(
+        error.InvalidUnpackBackup,
+        native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{ original, collision }),
+    );
 }
 
 test "native_unpack.test.unpack diversion inputs release partial allocations" {

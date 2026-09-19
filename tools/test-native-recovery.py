@@ -273,6 +273,62 @@ def assert_cached_diversion_contents(cached: dict) -> None:
         raise AssertionError("cached and observed diversion file identities differ")
 
 
+def assert_unpack_backup_contents(envelope: dict) -> None:
+    if "backups" not in envelope:
+        return
+    backups = envelope["backups"]
+    if not isinstance(backups, list):
+        raise AssertionError("backup-capable inputs require an explicit array")
+    paths = [entry["path"] for entry in backups]
+    if paths != sorted(set(paths)):
+        raise AssertionError("backup paths must be unique and sorted")
+    path_set = set(paths)
+    identities = {}
+    for entry in backups:
+        for path in (entry["path"], entry["logical_path"], entry["path"] + ".dpkg-tmp"):
+            if not path or len(path.encode()) > 4096 or any(part in ("", ".", "..") for part in path.split("/")):
+                raise AssertionError("backup paths must be canonical and root-relative")
+        if entry["path"] + ".dpkg-tmp" in path_set:
+            raise AssertionError("backup collides with an original path")
+        if entry["kind"] == "regular":
+            if entry["backup_modified_nanoseconds"] != entry["modified_nanoseconds"]:
+                raise AssertionError("regular backup changed the original timestamp")
+        elif entry["size"] != len(entry["link_target"].encode()):
+            raise AssertionError("symlink backup size differs from its target")
+        identity = (entry["device"], entry["inode"])
+        metadata = tuple(entry.get(key) for key in (
+            "kind", "mode", "uid", "gid", "size", "modified_nanoseconds", "content_sha256", "link_target",
+        ))
+        if identity in identities and identities[identity] != metadata:
+            raise AssertionError("hard-linked originals have contradictory metadata")
+        identities[identity] = metadata
+
+
+def assert_visible_unpack_backups(root: Path, envelope: dict) -> None:
+    assert_unpack_backup_contents(envelope)
+    assert envelope["backups"], "backup probe did not bind any original paths"
+    for entry in envelope["backups"]:
+        original, backup = root / entry["path"], root / (entry["path"] + ".dpkg-tmp")
+        before, saved = original.lstat(), backup.lstat()
+        for observed in (before, saved):
+            assert (stat.S_IMODE(observed.st_mode), observed.st_uid, observed.st_gid, observed.st_size) == (
+                entry["mode"], entry["uid"], entry["gid"], entry["size"],
+            )
+        device = (os.major(before.st_dev) << 32) | os.minor(before.st_dev)
+        assert (device, before.st_ino, before.st_mtime_ns) == (
+            entry["device"], entry["inode"], entry["modified_nanoseconds"],
+        )
+        assert saved.st_mtime_ns == entry["backup_modified_nanoseconds"]
+        if entry["kind"] == "regular":
+            assert stat.S_ISREG(before.st_mode) and stat.S_ISREG(saved.st_mode)
+            assert original.samefile(backup)
+            assert hashlib.sha256(backup.read_bytes()).hexdigest() == entry["content_sha256"]
+        else:
+            assert stat.S_ISLNK(before.st_mode) and stat.S_ISLNK(saved.st_mode)
+            assert before.st_ino != saved.st_ino
+            assert os.readlink(original) == os.readlink(backup) == entry["link_target"]
+
+
 def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
     expected_root = f"var/lib/debz/native-receipts-v1/{proof['attempt_id']}"
     if proof["evidence_root"] != expected_root:
@@ -379,6 +435,7 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
         assert_cached_diversion_contents(cached)
         if canonical(cached).decode() != envelope["cache_json"] or cached["intent_sha256"] != proof["execution_intent_sha256"]:
             raise AssertionError("unpack cache has noncanonical or foreign cached inputs")
+        assert_unpack_backup_contents(envelope)
     if seen_unpack != {step for step, entry in unpack_entries.items() if entry["kind"] == "regular"}:
         raise AssertionError("managed unpack cache has no retained evidence")
     request_blobs = [blob for blob in documents["intent"][0]["blobs"] if blob["kind"] == "request"]
@@ -452,7 +509,7 @@ def assert_output_streams(script: dict) -> None:
         raise AssertionError("retained script output accounting differs")
 
 
-def assert_script_output(script: dict) -> None:
+def assert_script_output(script: dict, script_sources: dict | None = None) -> None:
     assert_output_streams(script)
     environment = {entry["key"]: entry["value"] for entry in script["environment"]}
     if len(environment) != len(script["environment"]) or list(environment) != sorted(environment):
@@ -470,7 +527,10 @@ def assert_script_output(script: dict) -> None:
         raise AssertionError("retained script environment differs from the invocation")
     if not script["spawned"] or script["disposition"] != "exited" or script["signal"] is not None:
         raise AssertionError("fixture script receipt lost its actual exit disposition")
-    if script["package"] in ("debz-recovery-a", "debz-recovery-b", triggers.SOURCE):
+    supplied = (script_sources or {}).get((script["package"], script["package_version"]))
+    if supplied is not None:
+        source = supplied
+    elif script["package"] in ("debz-recovery-a", "debz-recovery-b", triggers.SOURCE):
         source = triggers.script_set(
             script["package"], script["package_version"],
             activate=("debz-b",) if script["package"] == "debz-recovery-a" else (),
@@ -607,7 +667,7 @@ def assert_script_trace(root: Path, proof: dict, scripts: list[dict]) -> None:
             raise AssertionError("retained script arguments or identity differ from the actual trace")
 
 
-def provenance(root: Path, report: dict, binding: dict) -> tuple[Path, bytes]:
+def provenance(root: Path, report: dict, binding: dict, *, script_sources: dict | None = None) -> tuple[Path, bytes]:
     path = namespace_path(root, report["provenance_path"])
     value = document(path, 16 * 1024 * 1024)
     validator(PROVENANCE_SCHEMA).validate(value)
@@ -654,7 +714,7 @@ def provenance(root: Path, report: dict, binding: dict) -> tuple[Path, bytes]:
     scripts = retained.get("script_outcome", [])
     assert_progress(value, retained["progress"][0], scripts)
     for script in scripts:
-        assert_script_output(script)
+        assert_script_output(script, script_sources)
     if retained.get("execution_request", [{}])[0].get("version") == 2:
         assert_helper_invocations(retained["execution_request"][0], retained["program"][0], scripts)
     assert_script_trace(root, value, scripts)
@@ -672,10 +732,15 @@ def provenance(root: Path, report: dict, binding: dict) -> tuple[Path, bytes]:
     return path, m.oracle._read_bounded(path, 16 * 1024 * 1024)
 
 
-def compare(expected: Path, candidate: Path) -> None:
-    mismatches = m.oracle.differences(
-        triggers.snapshot(expected), triggers.snapshot(candidate), maximum=30,
-    )
+def compare(
+    expected: Path, candidate: Path, *, rollback_times: dict[str, int] | None = None,
+    started: int = 0, ended: int = 0,
+) -> None:
+    snapshots = [triggers.snapshot(expected), triggers.snapshot(candidate)]
+    if rollback_times:
+        for snapshot in snapshots:
+            lifecycle.normalize_rollback_times(snapshot, rollback_times, started, ended, require_clock=True)
+    mismatches = m.oracle.differences(*snapshots, maximum=30)
     if mismatches:
         raise AssertionError("recovered native/dpkg mismatch:\n" + "\n".join(mismatches))
 
@@ -1493,10 +1558,39 @@ def exercise_diversion_recovery(
         ("install", "after_trigger_outcome", "unpack-cache-missing-drift"),
         ("install", "after_provenance", "unpack-retained-file-drift"),
         ("install", "after_provenance", "unpack-retained-missing-drift"),
+        ("upgrade", "after_unpack_backups", "backup-probe"),
+        ("upgrade", "before_unpack_backup_cleanup", "backup-probe"),
+        ("upgrade", "after_unpack_backup_cleanup", "backup-probe"),
+        ("upgrade", "after_upgrade_postrm_return_before_outcome", "backup-unknown"),
+        ("upgrade", "after_unpack_backups", "backup-file-drift"),
+        ("upgrade", "after_unpack_backups", "backup-mode-drift"),
+        ("upgrade", "after_unpack_backups", "backup-missing-drift"),
+        ("upgrade", "after_unpack_backups", "backup-source-drift"),
+        ("upgrade", "before_unpack_backup_cleanup", "backup-failure"),
+        ("upgrade", "after_unpack_backup_cleanup", "backup-failure"),
+        ("upgrade", "before_failed_unpack_publication", "backup-failure"),
+        ("upgrade", "after_failed_unpack_publication", "backup-failure"),
+        ("upgrade", "during_unpack_backup_publication", "backup-probe"),
+        ("upgrade", "during_unpack_backup_cleanup", "backup-probe"),
+        ("upgrade", "during_failed_unpack_publication", "backup-failure"),
+        ("upgrade", "during_unpack_backup_cleanup", "backup-failure"),
     ):
         name = f"diversion-{operation}-{boundary}" + (f"-{mutation}" if mutation else "")
         current = Scenario(workspace, name, executable, helper, architecture, environment)
-        archives = lifecycle.make_diversion_packages(current.directory / "packages", environment, architecture)
+        if mutation and mutation.startswith("backup-"):
+            archives = {
+                version: m.make_package(
+                    current.directory / "backup-packages", environment, architecture, version, "conffile",
+                    package=package, scripts=lifecycle.backup_probe_scripts(version, mode_suffix=".distrib"),
+                    conffile_content=f"configuration {version}\n".encode(),
+                    extra_files={lifecycle.DIVERSION_LITERAL: f"literal version {version}\n".encode()},
+                )
+                for version in ("1", "2")
+            }
+            for root in current.roots:
+                lifecycle.install_backup_probe(root)
+        else:
+            archives = lifecycle.make_diversion_packages(current.directory / "packages", environment, architecture)
         for root in current.roots:
             if mutation != "created":
                 lifecycle.seed_diversions(root, records)
@@ -1546,20 +1640,33 @@ def exercise_diversion_recovery(
         if mutation == "inplace-postrm":
             for root in current.roots:
                 lifecycle.seed_diversion_inplace(root, "postrm", records.replace(b".distrib", b".changed"))
-        failure = boundary == "after_failure_outcome"
+        failure = boundary == "after_failure_outcome" or mutation == "backup-failure"
         if failure:
             for root in current.roots:
-                m.write(root / lifecycle.FAILURE, f"{package}@1:postinst:configure\n".encode())
+                failures = (
+                    f"{package}@1:postrm:upgrade\n{package}@2:postrm:failed-upgrade\n"
+                    if mutation == "backup-failure" else f"{package}@1:postinst:configure\n"
+                )
+                m.write(root / lifecycle.FAILURE, failures.encode())
                 os.utime(root / lifecycle.FAILURE, (m.EPOCH, m.EPOCH))
         helper_path = current.candidate / triggers.HELPER
         shutil.copy2("/usr/bin/dpkg-trigger", helper_path)
         helper_before, helper_inode = helper_path.read_bytes(), helper_path.stat().st_ino
         version = "2" if operation == "upgrade" else "1"
+        rollback_times = {
+            f"{lifecycle.DIVERSION_BASE}/current":
+                (current.expected / lifecycle.DIVERSION_BASE / "current").lstat().st_mtime_ns,
+        } if mutation == "backup-failure" else {}
+        started = time.time_ns()
         binding = current.crash(
             operation, [archives[version]] if operation in ("install", "upgrade") else [], boundary,
             failure=failure, trigger_execution=True, caller_owned=True,
             isolated_helper=True, core_product=True, policy="keep_existing", packages=(package,),
         )
+        if boundary == "after_unpack_backups":
+            caches = list((current.candidate / NAMESPACE).glob("native-unpack-diversion-v1-*.json"))
+            assert len(caches) == 1
+            assert_visible_unpack_backups(current.candidate, document(caches[0], 128 * 1024 * 1024))
         for archive in archives.values():
             if archive.exists():
                 archive.unlink()
@@ -1576,6 +1683,18 @@ def exercise_diversion_recovery(
             (current.candidate / NAMESPACE / "native-diversion-cache-v1.json").chmod(0o644)
         elif mutation == "cache-missing-drift":
             (current.candidate / NAMESPACE / "native-diversion-cache-v1.json").unlink()
+        elif mutation and mutation.startswith("backup-") and mutation.endswith("-drift"):
+            path = current.candidate / lifecycle.DIVERSION_BASE / "data.dpkg-tmp"
+            if mutation == "backup-file-drift":
+                m.write(path, b"external backup bytes\n")
+            elif mutation == "backup-mode-drift":
+                path.chmod(0o600)
+            elif mutation == "backup-missing-drift":
+                path.unlink()
+            elif mutation == "backup-source-drift":
+                m.write(path.with_name("data"), b"external original source bytes\n")
+            else:
+                raise AssertionError(f"unknown backup mutation: {mutation}")
         elif mutation and mutation.startswith("unpack-cache-"):
             caches = list((current.candidate / NAMESPACE).glob("native-unpack-diversion-v1-*.json"))
             assert len(caches) == 1, caches
@@ -1601,7 +1720,7 @@ def exercise_diversion_recovery(
         before = triggers.snapshot(current.candidate)
         report = current.recover(trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True)
         assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
-        if mutation in ("mid-unpack", "mid-cached-route", "inplace-unknown"):
+        if mutation in ("mid-unpack", "mid-cached-route", "inplace-unknown", "backup-unknown"):
             assert report["outcome"] == "recovery_required", report
             if mutation == "inplace-unknown":
                 assert not (current.candidate / destination).exists()
@@ -1621,8 +1740,25 @@ def exercise_diversion_recovery(
             print(f"{name}: diversion database and destination drift blocks mutation", flush=True)
             continue
         assert report["outcome"] == ("script_failed" if failure else "applied"), report
-        compare(current.expected, current.candidate)
-        proof_path, proof_bytes = provenance(current.candidate, report, binding)
+        compare(
+            current.expected, current.candidate, rollback_times=rollback_times,
+            started=started, ended=time.time_ns(),
+        )
+        proof_path, proof_bytes = provenance(
+            current.candidate, report, binding,
+            script_sources={
+                (package, version): lifecycle.backup_probe_scripts(version, mode_suffix=".distrib")
+                for version in ("1", "2")
+            } if mutation and mutation.startswith("backup-") else None,
+        )
+        if mutation == "backup-failure":
+            proof = json.loads(proof_bytes)
+            evidence = [entry for entry in proof["evidence_files"] if entry["kind"] == "unpack_diversion_cache"]
+            assert len(evidence) == 1
+            envelope = document(namespace_path(current.candidate, evidence[0]["path"]), 128 * 1024 * 1024)
+            restored_link = f"{lifecycle.DIVERSION_BASE}/current"
+            original = next(entry for entry in envelope["backups"] if entry["path"] == restored_link)
+            assert (current.candidate / restored_link).lstat().st_mtime_ns == original["backup_modified_nanoseconds"]
         completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
         completion_bytes = completion_path.read_bytes()
         assert document(completion_path)["outcome"] == ("failed_after_mutation" if failure else "succeeded")

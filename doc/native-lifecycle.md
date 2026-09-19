@@ -63,6 +63,17 @@ effective cache for that matching, including across recovery after later script
 updates. See
 [diversion routing](native-unpack.md#diversion-routing).
 
+Old postrm now observes journalled `.dpkg-tmp` backups of replaced ordinary
+files: regular backups retain original inodes and hard-link groups, while
+symlink backups are recreated at a bound invocation-clock time. Successful
+unwind removes them after publication. Known failed upgrade can retain incoming
+diverted payload and old diverted backups while restoring old status/control
+records, even with an unchanged diversion database. Native/dpkg profiles cover
+regular files, symlinks, both hard-link positions, introduced files and conffiles.
+Fresh-process recovery preserves this failed result without repeating completed
+scripts, and completes or defers file triggers according to the original policy.
+This does not enable the still-guarded mid-unpack route changes.
+
 Purge deletes conffile bytes and recognized side files before `postrm purge`,
 while leaving the original control records visible to that script. A known
 outcome then settles the conffile records; final directory/info removal follows

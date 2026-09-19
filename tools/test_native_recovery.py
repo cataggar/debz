@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import base64
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -32,6 +33,44 @@ class RecoveryOracleTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_unpack_backup_evidence_distinguishes_legacy_and_canonical_preimages(self) -> None:
+        entry = {
+            "path": "usr/share/data", "logical_path": "usr/share/data", "kind": "regular",
+            "mode": 420, "uid": 0, "gid": 0, "size": 7, "device": 3, "inode": 4,
+            "modified_nanoseconds": 123, "backup_modified_nanoseconds": 123,
+            "content_sha256": hashlib.sha256(b"payload").hexdigest(),
+        }
+        acceptance.assert_unpack_backup_contents({})
+        acceptance.assert_unpack_backup_contents({"backups": []})
+        acceptance.assert_unpack_backup_contents({"backups": [entry]})
+        link = {**entry, "path": "usr/share/link", "kind": "symlink", "mode": 511, "inode": 5,
+                "link_target": "data", "size": 4, "backup_modified_nanoseconds": 456}
+        del link["content_sha256"]
+        acceptance.assert_unpack_backup_contents({"backups": [entry, link]})
+        for invalid in (
+            None, [entry, entry], [link, entry],
+            [{**entry, "path": "/absolute"}], [{**entry, "logical_path": "usr/../escape"}],
+            [entry, {**entry, "path": entry["path"] + ".dpkg-tmp"}],
+            [{**entry, "backup_modified_nanoseconds": 456}],
+            [entry, {**entry, "path": "usr/share/other", "content_sha256": "f" * 64}],
+            [entry, {**link, "inode": 4}],
+            [{**link, "size": 9}],
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                acceptance.assert_unpack_backup_contents({"backups": invalid})
+
+    def test_backup_failure_clock_rejects_original_or_arbitrary_timestamps(self) -> None:
+        snapshot = {"filesystem": [{"path": "link", "kind": "symlink", "mtime_ns": 150}]}
+        acceptance.lifecycle.normalize_rollback_times(snapshot, {"link": 100}, 125, 175, require_clock=True)
+        self.assertEqual(snapshot["filesystem"][0]["mtime_ns"], 100)
+        for value in (100, 124, 176):
+            changed = copy.deepcopy(snapshot)
+            changed["filesystem"][0]["mtime_ns"] = value
+            with self.subTest(value=value), self.assertRaises(AssertionError):
+                acceptance.lifecycle.normalize_rollback_times(changed, {"link": 100}, 125, 175, require_clock=True)
+        with self.assertRaises(AssertionError):
+            acceptance.lifecycle.normalize_rollback_times(snapshot, {"link": None}, 125, 175)
 
     def test_cached_diversion_evidence_keeps_loaded_and_observed_bytes_distinct(self) -> None:
         raw = b"/usr/bin/tool\n/usr/bin/tool.original\n:\n"
