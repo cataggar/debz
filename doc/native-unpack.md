@@ -203,6 +203,45 @@ For focused development, `-Dnative-diversions-only=true` selects just the
 diversion profiles in the existing lifecycle, trigger and recovery build
 targets. Their default workloads and CI still run all profiles.
 
+### Mid-unpack reference specification
+
+`tools/native_diversion_settlement_oracle.py` codifies 24 pinned-dpkg upgrade
+profiles and 16 subsequent successful invocations. The default
+`test-native-triggers` workload runs this specification in addition to its
+native parity cases, on both CI architectures. Every specification result is
+explicitly labeled **reference-only**: the mid-unpack native guard remains,
+and passing this corpus does not establish native execution or recovery parity.
+
+The oracle requires old postrm to observe real `.dpkg-tmp` backups before
+settlement. Regular backups retain the original inode, mode, owner and
+timestamp; recreated symlink times are bounded by the actual invocation, not
+discarded from comparison. Final observations compare all fixture payload and
+side-file paths, exact bytes and metadata, hard-link groups, logical installed
+lists, installed script/checksum/declaration bytes, package state, recorded
+conffile digest, compensation order and file-trigger routes. In particular,
+failed-upgrade compensation must preserve the reference's partial rollback:
+version 1 can remain recorded while the old diverted destination contains
+version-2 payload and a version-1 backup. Obsolete and introduced paths,
+stranded conffile staging, unchanged/in-place/atomic cache updates, creation,
+removal, empty databases and package exemption are covered.
+
+A subsequent invocation reloads current routes without deleting old-route
+artifacts. Missing conffile destinations under the keep-existing policy can
+produce a new-route `.dpkg-dist` while old-route `.dpkg-new` remains; these are
+asserted rather than normalized. Use the existing runner to exercise only the
+reference specification:
+
+```sh
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+sudo -n env PYTHONDONTWRITEBYTECODE=1 python3 tools/test-native-triggers.py \
+  --oracle-only --diversion-settlement-reference-only \
+  --reference-dpkg "$reference_dpkg"
+```
+
+This selector refuses native executable/helper arguments. The full #192
+runtime and fresh-process recovery implementation remains a separate
+requirement; legacy remains the default.
+
 ## Package identity and ownership
 
 Package identity is always `(name, architecture)`. This prevents a foreign
