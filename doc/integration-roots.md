@@ -135,15 +135,17 @@ cleaned.
 
 Immediately before that cleanup, the workflow runs
 `tools/capture-vendor-state.py` against the explicitly named staged reference
-root. The architecture-tagged v1 JSON inventories every `var/lib/dpkg/info`
-member by classification and bounded metadata/hash, including `*.config`,
-`*.alternatives`, and all unclassified members. It also inventories bounded
-regular records under `var/lib/dpkg/alternatives` and the root-confined
-filesystem paths and symlink chains referenced by alternatives state. The
-capture never follows a link into the host, rejects traversal, special files,
-credential/private namespaces, malformed text, and every count or byte-limit
-overflow, and records no hostname, timestamp, environment, or absolute
-workspace path.
+root. The architecture-tagged [v1 JSON
+schema](../schema/vendor-state-inventory-v1.json) inventories every
+`var/lib/dpkg/info` member by classification and bounded metadata/hash,
+including `*.config`, `*.alternatives`, and all unclassified members. It also
+inventories bounded regular records under `var/lib/dpkg/alternatives` and the
+root-confined filesystem paths and symlink chains referenced by alternatives
+state. Descriptor-rooted, no-follow traversal rejects races, hard links,
+special files, cycles, traversal, non-public installation namespaces,
+malformed text, and every count, path, integer, or byte-limit overflow. The
+capture records no file contents, hostname, timestamp, environment, or
+absolute workspace path.
 
 The uploaded JSON is review evidence from a particular amd64 or arm64 run, not
 a repository-pinned support manifest. No current pinned vendor manifests are

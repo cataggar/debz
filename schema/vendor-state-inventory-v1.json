@@ -88,12 +88,14 @@
         },
         "entries": {
           "type": "array",
+          "uniqueItems": true,
           "items": { "$ref": "#/$defs/controlMember" }
         }
       }
     },
     "alternatives_database": {
       "type": "array",
+      "uniqueItems": true,
       "items": { "$ref": "#/$defs/metadataFile" }
     },
     "linked_filesystem": {
@@ -108,6 +110,7 @@
         },
         "entries": {
           "type": "array",
+          "uniqueItems": true,
           "items": { "$ref": "#/$defs/linkedEntry" }
         }
       }
@@ -116,11 +119,13 @@
   "$defs": {
     "positiveInteger": {
       "type": "integer",
-      "minimum": 1
+      "minimum": 1,
+      "maximum": 9007199254740991
     },
     "count": {
       "type": "integer",
-      "minimum": 0
+      "minimum": 0,
+      "maximum": 9007199254740991
     },
     "digest": {
       "type": "string",
@@ -179,7 +184,11 @@
             "mode": { "$ref": "#/$defs/mode" },
             "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
             "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-            "size": { "type": "integer", "minimum": 0 },
+            "size": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
             "sha256": { "$ref": "#/$defs/digest" },
             "referenced_paths": { "$ref": "#/$defs/referencedPaths" }
           }
@@ -227,7 +236,11 @@
           "minimum": 0,
           "maximum": 4294967295
         },
-        "size": { "type": "integer", "minimum": 0 },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
         "sha256": { "$ref": "#/$defs/digest" },
         "referenced_paths": {
           "$ref": "#/$defs/referencedPaths"
@@ -235,51 +248,94 @@
       }
     },
     "linkedEntry": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["path", "kind"],
-      "properties": {
-        "path": { "$ref": "#/$defs/relativePath" },
-        "kind": {
-          "enum": ["absent", "directory", "regular", "symlink"]
-        },
-        "mode": { "$ref": "#/$defs/mode" },
-        "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-        "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-        "size": { "type": "integer", "minimum": 0 },
-        "sha256": { "$ref": "#/$defs/digest" },
-        "target": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
-        }
-      },
-      "allOf": [
+      "oneOf": [
         {
-          "if": {
-            "properties": { "kind": { "const": "regular" } },
-            "required": ["kind"]
-          },
-          "then": {
-            "required": ["mode", "uid", "gid", "size", "sha256"]
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "kind"],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "kind": { "const": "absent" }
           }
         },
         {
-          "if": {
-            "properties": { "kind": { "const": "symlink" } },
-            "required": ["kind"]
-          },
-          "then": {
-            "required": ["mode", "uid", "gid", "target"]
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "kind", "mode", "uid", "gid"],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "kind": { "const": "directory" },
+            "mode": { "$ref": "#/$defs/mode" },
+            "uid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "gid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            }
           }
         },
         {
-          "if": {
-            "properties": { "kind": { "const": "directory" } },
-            "required": ["kind"]
-          },
-          "then": {
-            "required": ["mode", "uid", "gid"]
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "kind",
+            "mode",
+            "uid",
+            "gid",
+            "size",
+            "sha256"
+          ],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "kind": { "const": "regular" },
+            "mode": { "$ref": "#/$defs/mode" },
+            "uid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "gid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "sha256": { "$ref": "#/$defs/digest" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "kind", "mode", "uid", "gid", "target"],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "kind": { "const": "symlink" },
+            "mode": { "$ref": "#/$defs/mode" },
+            "uid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "gid": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "target": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            }
           }
         }
       ]
