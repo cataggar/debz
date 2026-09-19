@@ -114,11 +114,14 @@ even through same-byte replacement.
 the later #192 route-aware phases. It binds the original v1 unpack-input digest,
 package identity, logical and publication paths, a direct post-script route or
 an authenticated `native-diversion-cache-v1` digest, settlement-write
-associations, trigger origin, and backup/conffile expectations. Its codec is
-canonical and bounded, and pure lowering verifies the original publication
-cache and v1 settlement recipe before producing route-adjusted intents. The
-document is not embedded in or inferred from v1 evidence: existing v1 bytes,
-phase selection and recovery meaning remain unchanged.
+associations, trigger origin, previous/resulting ownership,
+backup/conffile expectations, and any proven merged-`/usr` rewrites needed to
+compare logical cache routes with canonical publication paths. Its codec is
+canonical and bounded before collection or output allocation, and pure
+lowering verifies the original publication cache and v1 settlement recipe
+before producing route-adjusted intents. The document is not embedded in or
+inferred from v1 evidence: existing v1 bytes, phase selection and recovery
+meaning remain unchanged.
 
 No production path writes or consumes this contract yet. In particular, it
 does not admit a mid-unpack diversion update, authorize journal replay, or

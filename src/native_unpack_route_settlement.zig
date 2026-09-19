@@ -18,6 +18,41 @@ const json_options: std.json.Stringify.Options = .{
 
 pub const maximum_document_bytes = 128 * 1024 * 1024;
 pub const maximum_routes = (package_database.Limits{}).max_diversions;
+pub const maximum_aliases = 7;
+
+fn BoundedSlice(comptime T: type, comptime maximum_items: usize) type {
+    return struct {
+        items: []const T,
+
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            if (.array_begin != try source.next())
+                return error.UnexpectedToken;
+            var items: std.ArrayList(T) = .empty;
+            errdefer items.deinit(allocator);
+            while (true) {
+                if (try source.peekNextTokenType() == .array_end) {
+                    _ = try source.next();
+                    break;
+                }
+                if (items.items.len >= maximum_items)
+                    return error.Overflow;
+                try items.append(
+                    allocator,
+                    try std.json.innerParse(T, allocator, source, options),
+                );
+            }
+            return .{ .items = try items.toOwnedSlice(allocator) };
+        }
+
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try writer.write(self.items);
+        }
+    };
+}
 
 pub const Capability = enum {
     postrm_upgrade_route_settlement,
@@ -26,6 +61,11 @@ pub const Capability = enum {
 pub const Package = struct {
     name: []const u8,
     architecture: []const u8,
+};
+
+pub const Alias = struct {
+    from: []const u8,
+    to: []const u8,
 };
 
 pub const CacheReference = struct {
@@ -74,6 +114,12 @@ pub const StagingExpectation = enum {
     retain,
 };
 
+pub const OwnershipExpectation = enum {
+    previous,
+    resulting,
+    previous_and_resulting,
+};
+
 pub const ConffileExpectation = struct {
     staging: StagingExpectation,
     recorded_md5: native_program.Md5Digest,
@@ -85,8 +131,45 @@ pub const Route = struct {
     post_script_route: PostScriptRoute,
     settlement: []const Association,
     trigger_source: TriggerSource,
+    ownership: OwnershipExpectation,
     backup: BackupExpectation,
     conffile: ?ConffileExpectation = null,
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Route {
+        const Wire = struct {
+            logical_path: []const u8,
+            payload_route: []const u8,
+            post_script_route: PostScriptRoute,
+            settlement: BoundedSlice(
+                Association,
+                native_unpack_settlement.maximum_writes,
+            ),
+            trigger_source: TriggerSource,
+            ownership: OwnershipExpectation,
+            backup: BackupExpectation,
+            conffile: ?ConffileExpectation = null,
+        };
+        const wire = try std.json.innerParse(
+            Wire,
+            allocator,
+            source,
+            options,
+        );
+        return .{
+            .logical_path = wire.logical_path,
+            .payload_route = wire.payload_route,
+            .post_script_route = wire.post_script_route,
+            .settlement = wire.settlement.items,
+            .trigger_source = wire.trigger_source,
+            .ownership = wire.ownership,
+            .backup = wire.backup,
+            .conffile = wire.conffile,
+        };
+    }
 };
 
 pub const Contract = struct {
@@ -96,6 +179,7 @@ pub const Contract = struct {
     program_step: u32,
     unpack_input_sha256: Digest,
     package: Package,
+    aliases: []const Alias = &.{},
     routes: []const Route,
 };
 
@@ -107,7 +191,8 @@ const Document = struct {
     program_step: u32,
     unpack_input_sha256: Digest,
     package: Package,
-    routes: []const Route,
+    aliases: BoundedSlice(Alias, maximum_aliases),
+    routes: BoundedSlice(Route, maximum_routes),
     digest_sha256: Digest = @splat('0'),
 };
 
@@ -133,6 +218,7 @@ pub const LoweredRoute = struct {
     payload_route: []const u8,
     post_script_route: []const u8,
     trigger_paths: []const []const u8,
+    ownership: OwnershipExpectation,
     backup: BackupExpectation,
     backup_path: ?[]const u8,
     conffile: ?LoweredConffile,
@@ -170,6 +256,66 @@ fn validateSuffixedPath(path: []const u8, suffix: []const u8) !void {
     try validatePath(buffer[0 .. path.len + suffix.len]);
 }
 
+fn aliasDestination(source: []const u8) ?[]const u8 {
+    inline for (.{
+        .{ "bin", "usr/bin" },
+        .{ "lib", "usr/lib" },
+        .{ "lib32", "usr/lib32" },
+        .{ "lib64", "usr/lib64" },
+        .{ "libo32", "usr/libo32" },
+        .{ "libx32", "usr/libx32" },
+        .{ "sbin", "usr/sbin" },
+    }) |entry| {
+        if (std.mem.eql(u8, source, entry[0]))
+            return entry[1];
+    }
+    return null;
+}
+
+fn validateAliases(aliases: []const Alias) !void {
+    if (aliases.len > maximum_aliases)
+        return error.InvalidUnpackRouteSettlement;
+    var previous: ?[]const u8 = null;
+    for (aliases) |alias| {
+        const expected = aliasDestination(alias.from) orelse
+            return error.InvalidUnpackRouteSettlement;
+        if (!std.mem.eql(u8, alias.to, expected))
+            return error.InvalidUnpackRouteSettlement;
+        if (previous) |before|
+            if (!std.mem.lessThan(u8, before, alias.from))
+                return error.InvalidUnpackRouteSettlement;
+        previous = alias.from;
+    }
+}
+
+const CanonicalPath = struct {
+    text: []const u8,
+    rewritten: bool,
+};
+
+fn canonicalPath(
+    aliases: []const Alias,
+    path: []const u8,
+    buffer: *[root_fs.maximum_path_bytes]u8,
+) !CanonicalPath {
+    const first = std.mem.sliceTo(path, '/');
+    for (aliases) |alias| {
+        if (!std.mem.eql(u8, alias.from, first))
+            continue;
+        const rest = path[first.len..];
+        if (rest.len > root_fs.maximum_path_bytes - alias.to.len)
+            return error.InvalidUnpackRouteSettlement;
+        return .{
+            .text = std.fmt.bufPrint(buffer, "{s}{s}", .{
+                alias.to,
+                rest,
+            }) catch return error.InvalidUnpackRouteSettlement,
+            .rewritten = true,
+        };
+    }
+    return .{ .text = path, .rewritten = false };
+}
+
 fn claimRoutePath(
     allocator: std.mem.Allocator,
     paths: *std.StringHashMapUnmanaged(usize),
@@ -180,6 +326,25 @@ fn claimRoutePath(
     if (result.found_existing and result.value_ptr.* != route_index)
         return error.InvalidUnpackRouteSettlement;
     result.value_ptr.* = route_index;
+}
+
+fn claimCanonicalRoutePath(
+    allocator: std.mem.Allocator,
+    aliases: []const Alias,
+    owned_paths: *std.ArrayList([]u8),
+    paths: *std.StringHashMapUnmanaged(usize),
+    path: []const u8,
+    route_index: usize,
+) !void {
+    var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const canonical = try canonicalPath(aliases, path, &buffer);
+    const key = if (canonical.rewritten) block: {
+        const owned = try allocator.dupe(u8, canonical.text);
+        errdefer allocator.free(owned);
+        try owned_paths.append(allocator, owned);
+        break :block owned;
+    } else canonical.text;
+    try claimRoutePath(allocator, paths, key, route_index);
 }
 
 fn claimSidePath(
@@ -198,6 +363,11 @@ fn lessRoute(left: Route, right: Route) bool {
     return std.mem.lessThan(u8, left.logical_path, right.logical_path);
 }
 
+fn validateTriggerPath(path: []const u8) !void {
+    if (path.len >= (package_database.Limits{}).max_trigger_name_bytes)
+        return error.InvalidUnpackRouteSettlement;
+}
+
 pub fn validate(allocator: std.mem.Allocator, contract: Contract) !void {
     if (contract.version != 1 or
         contract.capability != .postrm_upgrade_route_settlement or
@@ -206,6 +376,7 @@ pub fn validate(allocator: std.mem.Allocator, contract: Contract) !void {
         return error.InvalidUnpackRouteSettlement;
     try validateDigest(contract.intent_sha256);
     try validateDigest(contract.unpack_input_sha256);
+    try validateAliases(contract.aliases);
     const limits = package_database.Limits{};
     if (contract.package.name.len > limits.max_package_name_bytes or
         contract.package.architecture.len > limits.max_architecture_bytes or
@@ -215,8 +386,14 @@ pub fn validate(allocator: std.mem.Allocator, contract: Contract) !void {
 
     var route_paths: std.StringHashMapUnmanaged(usize) = .empty;
     defer route_paths.deinit(allocator);
+    var canonical_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (canonical_paths.items) |path| allocator.free(path);
+        canonical_paths.deinit(allocator);
+    }
     var associations: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer associations.deinit(allocator);
+    var cache_digest: ?Digest = null;
     var previous: ?Route = null;
     for (contract.routes, 0..) |route, route_index| {
         if (previous) |before| {
@@ -226,14 +403,89 @@ pub fn validate(allocator: std.mem.Allocator, contract: Contract) !void {
         previous = route;
         try validatePath(route.logical_path);
         try validatePath(route.payload_route);
-        try claimRoutePath(allocator, &route_paths, route.logical_path, route_index);
-        try claimRoutePath(allocator, &route_paths, route.payload_route, route_index);
+        var payload_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        if ((try canonicalPath(
+            contract.aliases,
+            route.payload_route,
+            &payload_buffer,
+        )).rewritten)
+            return error.InvalidUnpackRouteSettlement;
+        try claimCanonicalRoutePath(
+            allocator,
+            contract.aliases,
+            &canonical_paths,
+            &route_paths,
+            route.logical_path,
+            route_index,
+        );
+        try claimCanonicalRoutePath(
+            allocator,
+            contract.aliases,
+            &canonical_paths,
+            &route_paths,
+            route.payload_route,
+            route_index,
+        );
         switch (route.post_script_route) {
             .path => |path| {
                 try validatePath(path);
-                try claimRoutePath(allocator, &route_paths, path, route_index);
+                var post_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+                if ((try canonicalPath(
+                    contract.aliases,
+                    path,
+                    &post_buffer,
+                )).rewritten)
+                    return error.InvalidUnpackRouteSettlement;
+                try claimCanonicalRoutePath(
+                    allocator,
+                    contract.aliases,
+                    &canonical_paths,
+                    &route_paths,
+                    path,
+                    route_index,
+                );
             },
-            .cache => |reference| try validateDigest(reference.digest_sha256),
+            .cache => |reference| {
+                try validateDigest(reference.digest_sha256);
+                if (cache_digest) |digest| {
+                    if (!std.mem.eql(
+                        u8,
+                        &digest,
+                        &reference.digest_sha256,
+                    ))
+                        return error.InvalidUnpackRouteSettlement;
+                } else cache_digest = reference.digest_sha256;
+            },
+        }
+        switch (route.trigger_source) {
+            .none => {},
+            .logical => try validateTriggerPath(route.logical_path),
+            .payload => try validateTriggerPath(route.payload_route),
+            .post_script => switch (route.post_script_route) {
+                .path => |path| try validateTriggerPath(path),
+                .cache => {},
+            },
+            .logical_and_payload => {
+                try validateTriggerPath(route.logical_path);
+                try validateTriggerPath(route.payload_route);
+                if (std.mem.eql(
+                    u8,
+                    route.logical_path,
+                    route.payload_route,
+                ))
+                    return error.InvalidUnpackRouteSettlement;
+            },
+            .logical_and_post_script => {
+                try validateTriggerPath(route.logical_path);
+                switch (route.post_script_route) {
+                    .path => |path| {
+                        try validateTriggerPath(path);
+                        if (std.mem.eql(u8, route.logical_path, path))
+                            return error.InvalidUnpackRouteSettlement;
+                    },
+                    .cache => {},
+                }
+            },
         }
         if (route.backup != .none and route.conffile != null)
             return error.InvalidUnpackRouteSettlement;
@@ -272,10 +524,11 @@ pub fn validate(allocator: std.mem.Allocator, contract: Contract) !void {
             null;
         if (suffix) |value| {
             const path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ route.payload_route, value });
-            try side_paths.append(allocator, path);
+            errdefer allocator.free(path);
             if (route_paths.contains(path))
                 return error.InvalidUnpackRouteSettlement;
             try claimSidePath(allocator, &route_paths, path, route_index);
+            try side_paths.append(allocator, path);
         }
     }
 }
@@ -291,6 +544,18 @@ fn documentDigest(document: Document) Digest {
     return native_recovery.hexDigest(sink.hasher.finalResult());
 }
 
+fn documentSize(document: Document) !usize {
+    var buffer: [4096]u8 = undefined;
+    var counter: std.Io.Writer.Discarding = .init(&buffer);
+    std.json.Stringify.value(document, json_options, &counter.writer) catch
+        unreachable;
+    const size = std.math.cast(usize, counter.fullCount()) orelse
+        return error.InvalidUnpackRouteSettlement;
+    if (size > maximum_document_bytes)
+        return error.InvalidUnpackRouteSettlement;
+    return size;
+}
+
 pub fn encode(allocator: std.mem.Allocator, contract: Contract) ![]u8 {
     try validate(allocator, contract);
     var document: Document = .{
@@ -300,15 +565,17 @@ pub fn encode(allocator: std.mem.Allocator, contract: Contract) ![]u8 {
         .program_step = contract.program_step,
         .unpack_input_sha256 = contract.unpack_input_sha256,
         .package = contract.package,
-        .routes = contract.routes,
+        .aliases = .{ .items = contract.aliases },
+        .routes = .{ .items = contract.routes },
     };
     document.digest_sha256 = documentDigest(document);
-    var output: std.Io.Writer.Allocating = .init(allocator);
+    var output: std.Io.Writer.Allocating = try .initCapacity(
+        allocator,
+        try documentSize(document),
+    );
     errdefer output.deinit();
     std.json.Stringify.value(document, json_options, &output.writer) catch
         return error.OutOfMemory;
-    if (output.written().len > maximum_document_bytes)
-        return error.InvalidUnpackRouteSettlement;
     return output.toOwnedSlice();
 }
 
@@ -325,6 +592,7 @@ fn decodeBounded(
     var parsed = try std.json.parseFromSlice(Document, allocator, bytes, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
+        .max_value_len = root_fs.maximum_path_bytes,
     });
     errdefer parsed.deinit();
     const document = parsed.value;
@@ -343,7 +611,8 @@ fn decodeBounded(
         .program_step = document.program_step,
         .unpack_input_sha256 = document.unpack_input_sha256,
         .package = document.package,
-        .routes = document.routes,
+        .aliases = document.aliases.items,
+        .routes = document.routes.items,
     };
     try validate(allocator, contract);
     const canonical = try encode(allocator, contract);
@@ -395,10 +664,13 @@ fn appendTrigger(
     paths: *std.ArrayList([]const u8),
     path: []const u8,
 ) !void {
+    try validateTriggerPath(path);
     for (paths.items) |existing|
         if (std.mem.eql(u8, existing[1..], path))
-            return;
-    try paths.append(allocator, try std.fmt.allocPrint(allocator, "/{s}", .{path}));
+            return error.InvalidUnpackRouteSettlement;
+    const trigger = try std.fmt.allocPrint(allocator, "/{s}", .{path});
+    errdefer allocator.free(trigger);
+    try paths.append(allocator, trigger);
 }
 
 fn backupForRoute(
@@ -426,7 +698,8 @@ fn associationMatches(
     };
 }
 
-/// The caller's arena owns the returned intents, routes, and derived paths.
+/// Returned collections and derived paths use `allocator`; borrowed contract
+/// and unpack-input strings must outlive the result.
 pub fn lower(
     allocator: std.mem.Allocator,
     contract: Contract,
@@ -441,28 +714,78 @@ pub fn lower(
     const backups = unpack_input.backups orelse
         return error.InvalidUnpackRouteSettlement;
     const base_intents = try native_unpack_settlement.lower(allocator, settlement);
+    defer allocator.free(base_intents);
     const intents = try allocator.dupe(root_mutation.Intent, base_intents);
 
     const lowered_routes = try allocator.alloc(LoweredRoute, contract.routes.len);
     var physical_routes: std.StringHashMapUnmanaged(usize) = .empty;
     defer physical_routes.deinit(allocator);
+    var canonical_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (canonical_paths.items) |path| allocator.free(path);
+        canonical_paths.deinit(allocator);
+    }
     var payload_routes: std.StringHashMapUnmanaged(usize) = .empty;
     defer payload_routes.deinit(allocator);
     const associated = try allocator.alloc(bool, settlement.writes.len);
     @memset(associated, false);
 
     for (contract.routes, lowered_routes, 0..) |route, *lowered, route_index| {
+        var payload_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const selected_payload = try canonicalPath(
+            contract.aliases,
+            unpack_input.cache.index.physical(
+                route.logical_path,
+                contract.package.name,
+            ),
+            &payload_buffer,
+        );
         if (!std.mem.eql(
             u8,
-            unpack_input.cache.index.physical(route.logical_path, contract.package.name),
+            selected_payload.text,
             route.payload_route,
         ))
             return error.InvalidUnpackRouteSettlement;
-        const post_script_route = try effectiveRoute(route, contract.package, route_cache);
-        try validatePath(post_script_route);
-        try claimRoutePath(allocator, &physical_routes, route.logical_path, route_index);
-        try claimRoutePath(allocator, &physical_routes, route.payload_route, route_index);
-        try claimRoutePath(allocator, &physical_routes, post_script_route, route_index);
+        const raw_post_script_route = try effectiveRoute(
+            route,
+            contract.package,
+            route_cache,
+        );
+        var post_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const selected_post_script = try canonicalPath(
+            contract.aliases,
+            raw_post_script_route,
+            &post_buffer,
+        );
+        try validatePath(selected_post_script.text);
+        const post_script_route = try allocator.dupe(
+            u8,
+            selected_post_script.text,
+        );
+        try claimCanonicalRoutePath(
+            allocator,
+            contract.aliases,
+            &canonical_paths,
+            &physical_routes,
+            route.logical_path,
+            route_index,
+        );
+        try claimCanonicalRoutePath(
+            allocator,
+            contract.aliases,
+            &canonical_paths,
+            &physical_routes,
+            route.payload_route,
+            route_index,
+        );
+        try claimCanonicalRoutePath(
+            allocator,
+            contract.aliases,
+            &canonical_paths,
+            &physical_routes,
+            post_script_route,
+            route_index,
+        );
         try payload_routes.put(allocator, route.payload_route, route_index);
 
         const backup = try backupForRoute(backups, route);
@@ -509,6 +832,7 @@ pub fn lower(
             .payload_route = route.payload_route,
             .post_script_route = post_script_route,
             .trigger_paths = try triggers.toOwnedSlice(allocator),
+            .ownership = route.ownership,
             .backup = route.backup,
             .backup_path = backup_path,
             .conffile = conffile,
@@ -649,6 +973,7 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
             .post_script_route = .{ .path = "etc/demo.conf.changed" },
             .settlement = &.{},
             .trigger_source = .payload,
+            .ownership = .previous_and_resulting,
             .backup = .none,
             .conffile = .{ .staging = .retain, .recorded_md5 = @splat('b') },
         },
@@ -658,6 +983,7 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
             .post_script_route = .{ .cache = .{ .digest_sha256 = cached.digest_sha256 } },
             .settlement = &.{},
             .trigger_source = .payload,
+            .ownership = .previous_and_resulting,
             .backup = .retain,
         },
         .{
@@ -670,6 +996,7 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
                 .route = .post_script,
             }},
             .trigger_source = .none,
+            .ownership = .previous,
             .backup = .none,
         },
     };
@@ -693,6 +1020,7 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
     const repeated = try encode(testing.allocator, decoded.contract);
     defer testing.allocator.free(repeated);
     try testing.expectEqualStrings(bytes, repeated);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"aliases\":[]") != null);
 
     var rejected_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer rejected_arena.deinit();
@@ -734,6 +1062,10 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
         "usr/share/demo/file.changed",
         lowered.routes[1].post_script_route,
     );
+    try testing.expectEqual(
+        OwnershipExpectation.previous,
+        lowered.routes[2].ownership,
+    );
 }
 
 fn testContract(routes: []const Route) Contract {
@@ -753,6 +1085,7 @@ fn testRoute(path: []const u8) Route {
         .post_script_route = .{ .path = path },
         .settlement = &.{},
         .trigger_source = .none,
+        .ownership = .previous_and_resulting,
         .backup = .none,
     };
 }
@@ -814,6 +1147,12 @@ test "native_unpack.test.route settlement contract enforces bounds and canonical
         error.InvalidUnpackRouteSettlement,
         encode(testing.allocator, invalid),
     );
+    invalid = testContract(&routes);
+    invalid.package.architecture = "Amd64";
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, invalid),
+    );
     var invalid_route = testRoute("../escape");
     invalid.routes = &.{invalid_route};
     try testing.expectError(
@@ -845,6 +1184,46 @@ test "native_unpack.test.route settlement contract enforces bounds and canonical
         error.InvalidUnpackRouteSettlement,
         encode(testing.allocator, invalid),
     );
+
+    const SmallSlice = BoundedSlice(u8, 1);
+    try testing.expectError(
+        error.Overflow,
+        std.json.parseFromSlice(
+            SmallSlice,
+            testing.allocator,
+            "[1,2]",
+            .{},
+        ),
+    );
+
+    const maximum_trigger_path = try testing.allocator.alloc(
+        u8,
+        root_fs.maximum_path_bytes,
+    );
+    defer testing.allocator.free(maximum_trigger_path);
+    var offset: usize = 0;
+    for (0..18) |component| {
+        const length: usize = if (component < 15)
+            255
+        else if (component == 15)
+            252
+        else
+            1;
+        @memset(maximum_trigger_path[offset .. offset + length], 'a');
+        offset += length;
+        if (component != 17) {
+            maximum_trigger_path[offset] = '/';
+            offset += 1;
+        }
+    }
+    try testing.expectEqual(root_fs.maximum_path_bytes, offset);
+    invalid_route = testRoute(maximum_trigger_path);
+    invalid_route.trigger_source = .logical;
+    invalid.routes = &.{invalid_route};
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, invalid),
+    );
 }
 
 test "native_unpack.test.route settlement contract rejects duplicate and conflicting claims" {
@@ -852,6 +1231,18 @@ test "native_unpack.test.route settlement contract rejects duplicate and conflic
         testRoute("usr/bin/a"),
         testRoute("usr/bin/a"),
     };
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, testContract(&routes)),
+    );
+
+    routes[0] = testRoute("usr/bin/a");
+    routes[0].backup = .retain;
+    routes[0].conffile = .{
+        .staging = .retain,
+        .recorded_md5 = @splat('a'),
+    };
+    routes[1] = testRoute("usr/bin/b");
     try testing.expectError(
         error.InvalidUnpackRouteSettlement,
         encode(testing.allocator, testContract(&routes)),
@@ -884,6 +1275,212 @@ test "native_unpack.test.route settlement contract rejects duplicate and conflic
     try testing.expectError(
         error.InvalidUnpackRouteSettlement,
         encode(testing.allocator, testContract(&routes)),
+    );
+
+    routes[0] = testRoute("usr/bin/a");
+    routes[0].trigger_source = .logical_and_payload;
+    routes[1] = testRoute("usr/bin/b");
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, testContract(&routes)),
+    );
+
+    routes[0] = testRoute("usr/bin/a");
+    routes[0].conffile = .{
+        .staging = .retain,
+        .recorded_md5 = @splat('a'),
+    };
+    routes[1] = testRoute("usr/bin/a.dpkg-new");
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, testContract(&routes)),
+    );
+
+    routes[0] = testRoute("usr/bin/a");
+    routes[0].post_script_route = .{
+        .cache = .{ .digest_sha256 = @splat('a') },
+    };
+    routes[1] = testRoute("usr/bin/b");
+    routes[1].post_script_route = .{
+        .cache = .{ .digest_sha256 = @splat('b') },
+    };
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, testContract(&routes)),
+    );
+
+    routes[0] = testRoute("bin/a");
+    routes[0].payload_route = "usr/bin/a";
+    routes[0].post_script_route = .{ .path = "usr/bin/a" };
+    routes[1] = testRoute("usr/bin/a");
+    routes[1].payload_route = "usr/bin/b";
+    routes[1].post_script_route = .{ .path = "usr/bin/b" };
+    var alias_contract = testContract(&routes);
+    alias_contract.aliases = &.{.{ .from = "bin", .to = "usr/bin" }};
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, alias_contract),
+    );
+
+    routes[0] = testRoute("bin/a");
+    routes[0].payload_route = "bin/a";
+    routes[0].post_script_route = .{ .path = "bin/a" };
+    alias_contract.routes = routes[0..1];
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, alias_contract),
+    );
+
+    routes[0].payload_route = "usr/bin/a";
+    routes[0].post_script_route = .{ .path = "usr/bin/a" };
+    alias_contract.aliases = &.{.{ .from = "bin", .to = "usr/sbin" }};
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, alias_contract),
+    );
+
+    alias_contract.aliases = &.{
+        .{ .from = "lib", .to = "usr/lib" },
+        .{ .from = "bin", .to = "usr/bin" },
+    };
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        encode(testing.allocator, alias_contract),
+    );
+}
+
+test "native_unpack.test.route settlement contract lowers proven merged usr routes" {
+    const intent: Digest = @splat('1');
+    var original_cache = try native_diversion.CachedRecords.init(
+        testing.allocator,
+        null,
+        null,
+    );
+    defer original_cache.deinit();
+    const changed =
+        "/bin/demo\n/bin/demo.changed\n:\n";
+    var post_cache = try native_diversion.CachedRecords.init(
+        testing.allocator,
+        changed,
+        testObservation(changed, 10),
+    );
+    defer post_cache.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const settlement = try testSettlement(arena.allocator());
+    const parent_bytes = try native_unpack_diversion.encodeWithSettlement(
+        testing.allocator,
+        original_cache,
+        intent,
+        7,
+        &.{},
+        settlement,
+    );
+    defer testing.allocator.free(parent_bytes);
+    var parent = try native_unpack_diversion.decode(
+        testing.allocator,
+        parent_bytes,
+        intent,
+        7,
+    );
+    defer parent.deinit();
+
+    const cache_bytes = try native_diversion_cache.encode(
+        testing.allocator,
+        post_cache,
+        intent,
+    );
+    defer testing.allocator.free(cache_bytes);
+    var cached = try native_diversion_cache.decode(
+        testing.allocator,
+        cache_bytes,
+        intent,
+    );
+    defer cached.deinit();
+
+    const routes = [_]Route{.{
+        .logical_path = "bin/demo",
+        .payload_route = "usr/bin/demo",
+        .post_script_route = .{
+            .cache = .{ .digest_sha256 = cached.digest_sha256 },
+        },
+        .settlement = &.{},
+        .trigger_source = .logical_and_post_script,
+        .ownership = .previous_and_resulting,
+        .backup = .none,
+    }};
+    const contract: Contract = .{
+        .intent_sha256 = intent,
+        .program_step = 7,
+        .unpack_input_sha256 = parent.digest_sha256,
+        .package = .{ .name = "demo", .architecture = "amd64" },
+        .aliases = &.{.{ .from = "bin", .to = "usr/bin" }},
+        .routes = &routes,
+    };
+    const bytes = try encode(testing.allocator, contract);
+    defer testing.allocator.free(bytes);
+    var decoded = try decode(
+        testing.allocator,
+        bytes,
+        intent,
+        7,
+        parent.digest_sha256,
+    );
+    defer decoded.deinit();
+    const lowered = try lower(
+        arena.allocator(),
+        decoded.contract,
+        &parent,
+        &cached,
+    );
+    try testing.expectEqualStrings(
+        "usr/bin/demo.changed",
+        lowered.routes[0].post_script_route,
+    );
+    try testing.expectEqualStrings(
+        "/bin/demo",
+        lowered.routes[0].trigger_paths[0],
+    );
+    try testing.expectEqualStrings(
+        "/usr/bin/demo.changed",
+        lowered.routes[0].trigger_paths[1],
+    );
+
+    const unchanged_cache_bytes = try native_diversion_cache.encode(
+        testing.allocator,
+        original_cache,
+        intent,
+    );
+    defer testing.allocator.free(unchanged_cache_bytes);
+    var unchanged_cache = try native_diversion_cache.decode(
+        testing.allocator,
+        unchanged_cache_bytes,
+        intent,
+    );
+    defer unchanged_cache.deinit();
+    const duplicate_route = [_]Route{.{
+        .logical_path = "usr/bin/demo",
+        .payload_route = "usr/bin/demo",
+        .post_script_route = .{
+            .cache = .{ .digest_sha256 = unchanged_cache.digest_sha256 },
+        },
+        .settlement = &.{},
+        .trigger_source = .logical_and_post_script,
+        .ownership = .previous_and_resulting,
+        .backup = .none,
+    }};
+    var duplicate_contract = contract;
+    duplicate_contract.aliases = &.{};
+    duplicate_contract.routes = &duplicate_route;
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        lower(
+            arena.allocator(),
+            duplicate_contract,
+            &parent,
+            &unchanged_cache,
+        ),
     );
 }
 
