@@ -44,6 +44,7 @@ const native_statoverride = @import("native_statoverride.zig");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
 const native_unpack_diversion = @import("native_unpack_diversion.zig");
+const native_unpack_settlement = @import("native_unpack_settlement.zig");
 const native_trigger = @import("native_trigger.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
 const package_database = @import("package_database.zig");
@@ -206,7 +207,7 @@ fn checkpointManagedPathsAfterCacheValidation(
     );
 }
 
-const UnpackInputProtocol = enum { legacy, backups, deferred_removals };
+const UnpackInputProtocol = enum { legacy, backups, deferred_removals, settlement };
 
 fn unpackInputProtocol(
     allocator: std.mem.Allocator,
@@ -226,7 +227,7 @@ fn unpackInputProtocol(
         defer allocator.free(bytes);
         var decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, action.program_step);
         defer decoded.deinit();
-        return if (decoded.backups == null) .legacy else if (decoded.deferred_removals) .deferred_removals else .backups;
+        return if (decoded.settlement != null) .settlement else if (decoded.backups == null) .legacy else if (decoded.deferred_removals) .deferred_removals else .backups;
     }
     return .legacy;
 }
@@ -418,6 +419,7 @@ const CombinedMutationHooks = struct {
     action: ?native_recovery.Action,
     publication_crash_point: ?native_recovery.CrashPoint = null,
     deferred_removal_step: ?u32 = null,
+    settlement_failure_injected: bool = false,
 
     fn before(
         context: ?*anyopaque,
@@ -430,6 +432,13 @@ const CombinedMutationHooks = struct {
         const runtime = self.runtime orelse return;
         const action = self.action orelse return;
         const selected = runtime.crash.selected orelse return;
+        if (self.publication_crash_point == .during_unpack_settlement and
+            selected == .after_unpack_settlement_rollback and !self.settlement_failure_injected and
+            (boundary == .publish_rename or boundary == .publish_create))
+        {
+            self.settlement_failure_injected = true;
+            return error.AccessDenied;
+        }
         if (self.deferred_removal_step == index and boundary == .parent_sync)
             runtime.crash.hit(.during_unpack_obsolete_removal);
         const matches = if (self.publication_crash_point) |point| selected == point else switch (selected) {
@@ -7456,6 +7465,8 @@ const MaterializationRequest = struct {
     unpack_diversions: ?*const native_diversion.CachedRecords = null,
     unpack_hook: ?*PostUnpackHook = null,
     defer_obsolete_removals: bool = false,
+    split_unpack_settlement: bool = false,
+    deferred_removal_path: ?[]const u8 = null,
     publication_crash_point: ?native_recovery.CrashPoint = null,
     hooks: root_mutation.Hooks = .{},
     mutation_limits: root_mutation.Limits = .{},
@@ -7852,6 +7863,7 @@ const MaterializationIntents = struct {
     arena: *std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
     first_deferred_removal: ?[]const u8,
+    settlement_start: ?usize,
 
     fn deinit(self: *MaterializationIntents) void {
         self.intents.deinit(self.allocator);
@@ -7885,6 +7897,7 @@ fn lowerMaterializationIntents(
     plan_value: Plan,
     bound: *const BoundArchives,
     defer_obsolete_removals: bool,
+    split_settlement: bool,
 ) !MaterializationIntents {
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -8069,20 +8082,24 @@ fn lowerMaterializationIntents(
         .diagnostic => return error.MaterializationDatabaseMismatch,
     };
     errdefer database.deinit();
-    if (deferred_removals.items.len != 0) {
+    var settlement_start: ?usize = null;
+    if (deferred_removals.items.len != 0 or split_settlement) {
         if (database.intents.len == 0 or database.intents[0] != .copy)
             return error.MaterializationDatabaseMismatch;
         // Old postrm runs at the verified status-old copy, before obsolete
         // removal and incoming control publication.
         try intents.append(allocator, database.intents[0]);
+        settlement_start = intents.items.len;
         try intents.appendSlice(allocator, deferred_removals.items);
-        try intents.appendSlice(allocator, directory_metadata.items);
+        if (deferred_removals.items.len != 0)
+            try intents.appendSlice(allocator, directory_metadata.items);
         try intents.appendSlice(allocator, database.intents[1..]);
     } else try intents.appendSlice(allocator, database.intents);
     return .{
         .intents = intents,
         .database = database,
         .first_deferred_removal = if (deferred_removals.items.len == 0) null else deferred_removals.items[0].path(),
+        .settlement_start = settlement_start,
         .arena = arena,
         .allocator = allocator,
     };
@@ -8107,9 +8124,16 @@ fn verifyMaterializedFilesystem(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     plan_value: Plan,
+    deferred: []const root_mutation.Intent,
 ) !void {
+    var deferred_paths: std.StringHashMapUnmanaged(void) = .empty;
+    defer deferred_paths.deinit(allocator);
+    for (deferred) |intent| switch (intent) {
+        .remove, .remove_directory => try deferred_paths.put(allocator, intent.path(), {}),
+        else => {},
+    };
     for (plan_value.filesystem) |change| switch (change) {
-        .remove => |removal| if (try root.entryIfExists(
+        .remove => |removal| if (!deferred_paths.contains(removal.path) and try root.entryIfExists(
             try root_fs.Path.initPackage(removal.path),
         ) != null) return error.MaterializationVerificationFailed,
         .directory => |directory| {
@@ -8162,12 +8186,7 @@ fn verifyMaterializedFilesystem(
     };
 }
 
-const DatabasePhaseEvidence = struct {
-    base_generation: package_database.Generation,
-    base_status: package_database.StatusGeneration,
-    resulting_status: package_database.StatusGeneration,
-    digest: [32]u8,
-};
+const DatabasePhaseEvidence = native_unpack_settlement.DatabaseEvidence;
 
 fn databasePhaseEvidence(
     plan_value: package_database_changes.Plan,
@@ -8518,20 +8537,39 @@ fn materialize(
     defer if (planned) |*value| value.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    var settlement: ?native_unpack_settlement.Plan = if (decoded) |value| value.settlement else null;
     const backups = if (decoded) |value| value.backups.? else block: {
         planned = switch (try prepareMaterializationPlan(allocator, request)) {
             .plan => |value| value,
             .result => |result| return result,
         };
+        var bound = (try bindMaterializationArchives(allocator, request.planning)) orelse
+            return .{ .outcome = .refused, .detail = "archive_binding_mismatch" };
+        defer bound.deinit();
+        var lowered = lowerMaterializationIntents(allocator, request.root, planned.?, &bound, true, true) catch |err| switch (err) {
+            error.ZeroDirectoryTimestampUnsupported => return .{
+                .outcome = .refused,
+                .detail = "zero_directory_timestamp_unsupported",
+            },
+            else => return err,
+        };
+        defer lowered.deinit();
+        settlement = try native_unpack_settlement.capture(
+            arena.allocator(),
+            lowered.intents.items[lowered.settlement_start.?..],
+            databasePhaseEvidence(planned.?.database),
+            planned.?.digest,
+        );
         const entries = try unpackBackups(arena.allocator(), planned.?, std.Io.Clock.real.now(request.io).nanoseconds);
         if (execution.recovery) |runtime| {
             try native_recovery.validateStableManagedState(allocator, request.root, runtime.intent_sha256);
-            const bytes = try native_unpack_diversion.encodeWithDeferredRemovals(
+            const bytes = try native_unpack_diversion.encodeWithSettlement(
                 allocator,
                 cache.*,
                 runtime.intent_sha256,
                 execution.program_step,
                 entries,
+                settlement.?,
             );
             defer allocator.free(bytes);
             var buffer: [128]u8 = undefined;
@@ -8541,16 +8579,19 @@ fn materialize(
                 .overwrite = .fail_if_exists,
                 .durable = true,
             });
-            const observed = try arena.allocator().alloc([]const u8, 1 + planned.?.filesystem.len + entries.len);
+            const observed = try arena.allocator().alloc([]const u8, 1 + planned.?.filesystem.len + entries.len + settlement.?.writes.len);
             observed[0] = path;
             for (planned.?.filesystem, observed[1 .. 1 + planned.?.filesystem.len]) |change, *slot|
                 slot.* = switch (change) {
                     inline else => |value| value.path,
                 };
-            for (entries, observed[1 + planned.?.filesystem.len ..]) |backup, *slot| {
+            const backup_start = 1 + planned.?.filesystem.len;
+            for (entries, observed[backup_start .. backup_start + entries.len]) |backup, *slot| {
                 var backup_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
                 slot.* = try arena.allocator().dupe(u8, try backup.backupPath(&backup_buffer));
             }
+            for (settlement.?.writes, observed[backup_start + entries.len ..]) |write, *slot|
+                slot.* = write.path();
             _ = try checkpointManagedPaths(allocator, runtime, nativeAction(.filesystem, execution.program_step, 0, 0), &.{}, observed, false);
         }
         break :block entries;
@@ -8562,6 +8603,7 @@ fn materialize(
     }
     var payload_request = request;
     payload_request.defer_obsolete_removals = if (decoded) |value| value.deferred_removals else true;
+    payload_request.split_unpack_settlement = settlement != null;
     const result = try resumeRolledBackUnpack(allocator, payload_request) orelse
         try materializePlanned(allocator, payload_request, if (planned) |*value| value else null);
     if (backups.len != 0 and (result.outcome == .refused or result.outcome == .handoff)) {
@@ -8580,6 +8622,38 @@ fn materialize(
             return .{ .outcome = .recovery_required, .detail = "failed_unpack_publication_incomplete" };
         }
         if (execution.recovery) |runtime| runtime.crash.hit(.after_failed_unpack_publication);
+    }
+    if (settlement) |recipe| {
+        if (result.outcome == .applied) {
+            if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_payload);
+            const intents = try native_unpack_settlement.lower(arena.allocator(), recipe);
+            var settlement_request = request;
+            settlement_request.hooks = .{};
+            settlement_request.mutation_database_step = null;
+            settlement_request.publication_crash_point = .during_unpack_settlement;
+            settlement_request.deferred_removal_path = for (intents) |intent| {
+                if ((intent == .remove or intent == .remove_directory) and
+                    !std.mem.startsWith(u8, intent.path(), package_database.database_directory ++ "/"))
+                    break intent.path();
+            } else null;
+            const settled = try executePhaseMaterialization(
+                allocator,
+                settlement_request,
+                intents,
+                try recipe.evidence(),
+                native_recovery.parseDigest(recipe.unpack_plan_sha256) orelse return error.InvalidUnpackSettlement,
+                null,
+                true,
+            );
+            if (settled.outcome != .applied) {
+                const attempt = request.borrowed_attempt orelse return error.InvalidLifecycleProgram;
+                try attempt.requireRecovery(allocator, .mutation);
+                if (settled.outcome == .rolled_back)
+                    if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_settlement_rollback);
+                return .{ .outcome = .recovery_required, .detail = "unpack_settlement_incomplete" };
+            }
+            if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_settlement);
+        }
     }
     if (backups.len != 0 and (result.outcome == .applied or result.outcome == .rolled_back)) {
         if (execution.recovery) |runtime| runtime.crash.hit(.before_unpack_backup_cleanup);
@@ -8651,6 +8725,7 @@ fn materializePlanned(
         planned,
         &bound,
         request.defer_obsolete_removals,
+        request.split_unpack_settlement,
     ) catch |err| switch (err) {
         error.ZeroDirectoryTimestampUnsupported => return .{
             .outcome = .refused,
@@ -8659,6 +8734,10 @@ fn materializePlanned(
         else => return err,
     };
     defer lowered.deinit();
+    const payload_end = if (request.split_unpack_settlement)
+        lowered.settlement_start orelse return error.MaterializationPlanMismatch
+    else
+        lowered.intents.items.len;
 
     const program_sha256 = parseHex(
         32,
@@ -8750,7 +8829,7 @@ fn materializePlanned(
         allocator,
         request.root,
         .{
-            .intents = lowered.intents.items,
+            .intents = lowered.intents.items[0..payload_end],
             .limits = request.mutation_limits,
         },
     ) catch |err| {
@@ -8786,7 +8865,7 @@ fn materializePlanned(
         .action = execution.action,
         .publication_crash_point = request.publication_crash_point,
     };
-    if (lowered.first_deferred_removal) |path| {
+    if (if (request.split_unpack_settlement) null else lowered.first_deferred_removal) |path| {
         combined_hooks.deferred_removal_step = for (mutation_plan.steps) |step| {
             if ((step.kind == .remove_path or step.kind == .remove_directory) and std.mem.eql(u8, step.path, path))
                 break step.index;
@@ -8866,6 +8945,7 @@ fn materializePlanned(
             allocator,
             request.root,
             planned,
+            lowered.intents.items[payload_end..],
         ) catch |err| {
             try attempt.requireRecovery(allocator, .verification);
             return .{
@@ -8873,12 +8953,14 @@ fn materializePlanned(
                 .detail = @errorName(err),
             };
         };
+        var evidence = databasePhaseEvidence(planned.database);
+        if (request.split_unpack_settlement) evidence.resulting_status = evidence.base_status;
         verifyMaterializedDatabase(
             allocator,
             request.root,
             request.planning.program.target_architecture,
             request.planning.limits.database,
-            databasePhaseEvidence(planned.database),
+            evidence,
             true,
         ) catch |err| {
             try attempt.requireRecovery(allocator, .verification);
@@ -8891,6 +8973,8 @@ fn materializePlanned(
 
     if (execution.recovery) |runtime| {
         if (execution.action) |action| {
+            if (request.split_unpack_settlement and mutation_report.outcome == .applied)
+                runtime.crash.hit(.after_unpack_payload_commit);
             const checkpoint_sha256 = switch (mutation_report.outcome) {
                 .applied => try checkpointManagedPaths(
                     allocator,
@@ -9182,6 +9266,12 @@ fn executePhaseMaterialization(
         .action = execution.action,
         .publication_crash_point = request.publication_crash_point,
     };
+    if (request.deferred_removal_path) |path| {
+        combined_hooks.deferred_removal_step = for (mutation_plan.steps) |step| {
+            if ((step.kind == .remove_path or step.kind == .remove_directory) and std.mem.eql(u8, step.path, path))
+                break step.index;
+        } else return error.MaterializationPlanMismatch;
+    }
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
         allocator,
@@ -9301,6 +9391,8 @@ fn executePhaseMaterialization(
     }
     if (execution.recovery) |runtime| {
         if (execution.action) |action| {
+            if (request.publication_crash_point == .during_unpack_settlement and report.outcome == .applied)
+                runtime.crash.hit(.after_unpack_settlement_commit);
             const checkpoint_sha256 = switch (report.outcome) {
                 .applied => try checkpointManagedPaths(
                     allocator,
@@ -18050,7 +18142,8 @@ fn recoverNativeRootMutation(
             };
             if (known.program_step != script.sequence) return error.InvalidManagedState;
             const record = try runtime.latest(known) orelse return error.InvalidManagedState;
-            const journal_advanced = rolling_back or (protocol == .deferred_removals and record.stage == .completed);
+            const deferred = protocol == .deferred_removals or protocol == .settlement;
+            const journal_advanced = rolling_back or (deferred and record.stage == .completed);
             try native_recovery.validateScriptMutationCheckpoint(
                 allocator,
                 root,
@@ -18059,8 +18152,23 @@ fn recoverNativeRootMutation(
                 opened.journal().steps,
                 opened.journal().device,
                 journal_advanced,
-                protocol == .deferred_removals,
+                deferred,
             );
+        }
+    }
+    if (action.kind == .database and action.substep != 0 and
+        try unpackInputProtocol(allocator, runtime, action) == .settlement)
+    {
+        const payload = nativeAction(.filesystem, action.program_step, action.substep - 1, 0);
+        if (try runtime.latest(payload)) |record| {
+            if (record.stage == .completed and (record.result == .applied or record.result == .recovered))
+                try native_recovery.validateStableMutationCheckpoint(
+                    allocator,
+                    root,
+                    runtime.intent_sha256,
+                    opened.journal().steps,
+                    opened.journal().device,
+                );
         }
     }
     const report = try root_mutation.recover(&opened);
@@ -22078,12 +22186,103 @@ test "native_unpack.test.deferred removals preserve publication prerequisites" {
         try publications.put(testing.allocator, replacement.path, replacement);
         try testing.expect(!removalCanFollowPayload("usr/share/replacement/old", &publications, &required));
     }
+
     for ([_][]const u8{ "usr/share", "usr/share/demo", "usr/share/demo/new" }) |path|
         try testing.expect(!removalCanFollowPayload(path, &publications, &required));
     for ([_][]const u8{ "usr/share/demo/obsolete", "usr/share/demo/old/child", "usr/share/replacement-extra/old" }) |path|
         try testing.expect(removalCanFollowPayload(path, &publications, &required));
 }
 
+fn testUnpackSettlement(allocator: std.mem.Allocator) !native_unpack_settlement.Plan {
+    const status = "Package: example\nStatus: install ok unpacked\n\n";
+    const binary = "\x00\xff\xfe\x80templates\n";
+    var status_digest: [32]u8 = undefined;
+    var binary_digest: [32]u8 = undefined;
+    Sha256.hash(status, &status_digest, .{});
+    Sha256.hash(binary, &binary_digest, .{});
+    return native_unpack_settlement.capture(allocator, &.{
+        .{ .remove = .{ .path = "usr/share/example/obsolete" } },
+        .{ .remove_directory = .{ .path = "usr/share/example/old" } },
+        .{ .metadata = .{ .path = "usr/share/example", .mode = 0o750, .modified_nanoseconds = 123456789 } },
+        .{ .file = .{ .path = "var/lib/dpkg/info/example.templates", .bytes = binary, .expected_sha256 = binary_digest, .mode = 0o640 } },
+        .{ .file = .{ .path = "var/lib/dpkg/status", .bytes = status, .expected_sha256 = status_digest } },
+    }, .{
+        .base_generation = .{ .sha256 = @splat(0x80), .file_count = 4, .total_bytes = 345 },
+        .base_status = .{ .sha256 = @splat(0xff), .size = 123, .package_count = 1 },
+        .resulting_status = .{ .sha256 = status_digest, .size = status.len, .package_count = 1 },
+        .digest = @splat(0xfe),
+    }, @splat(0xfd));
+}
+
+fn testUnpackSettlementAllocations(allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const recipe = try testUnpackSettlement(arena.allocator());
+    var cache = try native_diversion.CachedRecords.init(allocator, null, null);
+    defer cache.deinit();
+    const bytes = try native_unpack_diversion.encodeWithSettlement(allocator, cache, @splat('0'), 7, &.{}, recipe);
+    defer allocator.free(bytes);
+    var decoded = try native_unpack_diversion.decode(allocator, bytes, @splat('0'), 7);
+    defer decoded.deinit();
+    const intents = try native_unpack_settlement.lower(arena.allocator(), decoded.settlement.?);
+    try testing.expectEqual(@as(usize, 5), intents.len);
+    try testing.expectEqualStrings("\x00\xff\xfe\x80templates\n", intents[3].file.bytes);
+    try testing.expectEqual(@as(u32, 0o640), intents[3].file.mode);
+    try testing.expectEqualDeep(try recipe.evidence(), try decoded.settlement.?.evidence());
+    try testing.expectEqualDeep(recipe.unpack_plan_sha256, decoded.settlement.?.unpack_plan_sha256);
+    try testing.expectEqual(@as(usize, 0), decoded.backups.?.len);
+    try testing.expect(decoded.deferred_removals);
+}
+
+test "native_unpack.test.post-script recipe retains binary control and original evidence" {
+    try testUnpackSettlementAllocations(testing.allocator);
+}
+
+test "native_unpack.test.post-script recipe releases partial allocations" {
+    try testing.checkAllAllocationFailures(testing.allocator, testUnpackSettlementAllocations, .{});
+}
+
+test "native_unpack.test.post-script recipe refuses malformed or unbound late intents" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const recipe = try testUnpackSettlement(arena.allocator());
+    const writes = try arena.allocator().dupe(native_unpack_settlement.Write, recipe.writes);
+    for (0..12) |case| {
+        @memcpy(writes, recipe.writes);
+        var invalid = recipe;
+        invalid.writes = writes;
+        switch (case) {
+            0 => invalid.version = 2,
+            1 => invalid.writes = &.{},
+            2 => invalid.resulting_status_size += 1,
+            3 => invalid.base_status_sha256 = @splat('g'),
+            4 => writes[0].remove.path = "../escape",
+            5 => writes[3].file.path = "usr/share/not-control",
+            6 => writes[3].file.bytes_hex = "abc",
+            7 => writes[3].file.bytes_hex = "FF",
+            8 => writes[3].file.sha256 = @splat('0'),
+            9 => writes[2].metadata.mode = 0o10000,
+            10 => writes[0] = writes[1],
+            11 => writes[4] = writes[2],
+            else => unreachable,
+        }
+        try testing.expectError(error.InvalidUnpackSettlement, native_unpack_settlement.validate(testing.allocator, invalid));
+    }
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, null, null);
+    defer cache.deinit();
+    const old = try native_unpack_diversion.encodeWithDeferredRemovals(testing.allocator, cache, @splat('0'), 7, &.{});
+    defer testing.allocator.free(old);
+    try testing.expect(std.mem.indexOf(u8, old, "\"settlement\"") == null);
+    var decoded = try native_unpack_diversion.decode(testing.allocator, old, @splat('0'), 7);
+    defer decoded.deinit();
+    try testing.expect(decoded.settlement == null);
+    const repeated = try native_unpack_diversion.encodeWithDeferredRemovals(testing.allocator, decoded.cache, @splat('0'), 7, decoded.backups.?);
+    defer testing.allocator.free(repeated);
+    try testing.expectEqualStrings(old, repeated);
+    const explicit_null = try std.fmt.allocPrint(testing.allocator, "{s},\"settlement\":null}}", .{old[0 .. old.len - 1]});
+    defer testing.allocator.free(explicit_null);
+    try testing.expectError(error.InvalidUnpackDiversionCache, native_unpack_diversion.decode(testing.allocator, explicit_null, @splat('0'), 7));
+}
 test "native_unpack.test.unpack diversion paths have an exact bounded program step" {
     for ([_]u32{ 0, 7, std.math.maxInt(u32) }) |step| {
         var buffer: [128]u8 = undefined;

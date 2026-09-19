@@ -49,12 +49,100 @@
     "deferred_removals": {
       "description": "Bind payload-first obsolete-removal ordering. Omission preserves the original lowering order.",
       "const": true
+    },
+    "settlement": {
+      "description": "Immutable late intents; presence selects a separate post-payload settlement journal.",
+      "$ref": "#/$defs/settlement"
     }
   },
   "dependentRequired": {
-    "deferred_removals": ["backups"]
+    "deferred_removals": ["backups"],
+    "settlement": ["backups", "deferred_removals"]
   },
   "$defs": {
+    "settlement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version", "unpack_plan_sha256", "base_generation_sha256",
+        "base_generation_file_count", "base_generation_total_bytes",
+        "base_status_sha256", "base_status_size", "base_status_package_count",
+        "resulting_status_sha256", "resulting_status_size",
+        "resulting_status_package_count", "database_plan_sha256", "writes"
+      ],
+      "properties": {
+        "version": { "const": 1 },
+        "unpack_plan_sha256": { "$ref": "#/$defs/digest" },
+        "base_generation_sha256": { "$ref": "#/$defs/digest" },
+        "base_generation_file_count": { "$ref": "#/$defs/unsigned" },
+        "base_generation_total_bytes": { "$ref": "#/$defs/unsigned" },
+        "base_status_sha256": { "$ref": "#/$defs/digest" },
+        "base_status_size": { "$ref": "#/$defs/unsigned" },
+        "base_status_package_count": { "$ref": "#/$defs/unsigned" },
+        "resulting_status_sha256": { "$ref": "#/$defs/digest" },
+        "resulting_status_size": { "$ref": "#/$defs/unsigned" },
+        "resulting_status_package_count": { "$ref": "#/$defs/unsigned" },
+        "database_plan_sha256": { "$ref": "#/$defs/digest" },
+        "writes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 200000,
+          "items": { "$ref": "#/$defs/settlementWrite" }
+        }
+      }
+    },
+    "settlementWrite": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "file": { "$ref": "#/$defs/settlementFile" },
+        "metadata": { "$ref": "#/$defs/settlementMetadata" },
+        "remove": { "$ref": "#/$defs/settlementRemoval" },
+        "remove_directory": { "$ref": "#/$defs/settlementRemoval" }
+      }
+    },
+    "settlementFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "bytes_hex", "sha256", "mode", "uid", "gid",
+        "modified_nanoseconds", "overwrite"
+      ],
+      "properties": {
+        "path": { "$ref": "#/$defs/path", "pattern": "^var/lib/dpkg/" },
+        "bytes_hex": { "type": "string", "maxLength": 134217728, "pattern": "^(?:[0-9a-f]{2})*$" },
+        "sha256": { "$ref": "#/$defs/digest" },
+        "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "uid": { "$ref": "#/$defs/owner" },
+        "gid": { "$ref": "#/$defs/owner" },
+        "modified_nanoseconds": { "$ref": "#/$defs/timestamp" },
+        "overwrite": { "enum": ["replace", "require_absent"] }
+      }
+    },
+    "settlementMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "minProperties": 2,
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "uid": { "$ref": "#/$defs/owner" },
+        "gid": { "$ref": "#/$defs/owner" },
+        "modified_nanoseconds": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "settlementRemoval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "removal"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "removal": { "enum": ["require_present", "allow_absent"] }
+      }
+    },
     "backup": {
       "type": "object",
       "additionalProperties": false,

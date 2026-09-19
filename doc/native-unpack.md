@@ -240,12 +240,23 @@ failure/unwind callbacks therefore observe the old obsolete files. Directory
 metadata is reapplied after deferred removal where the plan publishes it.
 The original plan remains descriptive; its execution ordering is selected by
 the immutable per-unpack protocol field, not inferred from live state.
+The current protocol binds a binary-safe late-settlement recipe before any
+backup or payload mutation. Successful payload/status-old publication commits
+first, with old postrm and immediate failure/unwind callbacks still inside that
+journal. A separate immutable journal then removes obsolete paths and publishes
+incoming control/status bytes before backup cleanup. Recovery consumes committed
+payload without replanning existing `.dpkg-new` files; late rollback retries
+only the bound settlement. Failure there remains recovery-required rather than
+claiming the whole unpack rolled back. Older inputs retain their original
+combined journal and phase numbering.
 Recovery covers interruption after actual obsolete removal, including a second
 interruption during or after rollback, without replaying completed scripts.
 Rerouting removals after changed diversion records remains guarded under #192.
-Fresh-process recovery consumes authenticated completed script outcomes rather
-than publishing the unpack or rerunning those scripts again. Mid-unpack route
-changes remain guarded pending the full settlement/recovery work in #192.
+Fresh-process recovery consumes committed payload and authenticated completed
+script outcomes without republishing that payload or rerunning those scripts.
+An unfinished payload may still be re-materialized after verified rollback for
+unfinished callbacks. Mid-unpack route changes remain guarded pending the full
+settlement/recovery work in #192.
 
 For focused development, `-Dnative-diversions-only=true` selects just the
 diversion profiles in the existing lifecycle, trigger and recovery build

@@ -79,6 +79,40 @@ class RecoveryOracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             acceptance.lifecycle.normalize_rollback_times(snapshot, {"link": None}, 125, 175)
 
+    def test_settlement_recipe_binds_binary_bytes_final_status_and_phase_protocol(self) -> None:
+        binary, status = b"\0\xff\xfe\x80templates\n", b"original status publication\n"
+        def file(path, contents):
+            return {"file": {"path": path, "bytes_hex": contents.hex(), "sha256": hashlib.sha256(contents).hexdigest()}}
+        recipe = {
+            "version": 1,
+            "writes": [file("var/lib/dpkg/info/example.templates", binary), file("var/lib/dpkg/status", status)],
+            "resulting_status_sha256": hashlib.sha256(status).hexdigest(),
+            "resulting_status_size": len(status),
+        }
+        envelope = {"backups": [], "deferred_removals": True, "settlement": recipe}
+        acceptance.assert_unpack_backup_contents(envelope)
+        for case in range(8):
+            changed = copy.deepcopy(envelope)
+            settlement = changed["settlement"]
+            if case == 0:
+                del changed["deferred_removals"]
+            elif case == 1:
+                changed["settlement"] = None
+            elif case == 2:
+                settlement["writes"][0]["file"]["bytes_hex"] = binary.hex().upper()
+            elif case == 3:
+                settlement["writes"][0]["file"]["sha256"] = "0" * 64
+            elif case == 4:
+                settlement["resulting_status_size"] += 1
+            elif case == 5:
+                settlement["writes"].reverse()
+            elif case == 6:
+                settlement["writes"].insert(0, settlement["writes"][0])
+            else:
+                settlement["writes"][0]["file"]["path"] = "var/lib/dpkg/../escape"
+            with self.subTest(case=case), self.assertRaises(AssertionError):
+                acceptance.assert_unpack_backup_contents(changed)
+
     def test_cached_diversion_evidence_keeps_loaded_and_observed_bytes_distinct(self) -> None:
         raw = b"/usr/bin/tool\n/usr/bin/tool.original\n:\n"
         loaded = {"device": 3, "inode": 4, "sha256": list(hashlib.sha256(raw).digest())}
