@@ -206,11 +206,13 @@ fn checkpointManagedPathsAfterCacheValidation(
     );
 }
 
-fn hasUnpackBackupInputs(
+const UnpackInputProtocol = enum { legacy, backups, deferred_removals };
+
+fn unpackInputProtocol(
     allocator: std.mem.Allocator,
     runtime: *native_recovery.Runtime,
     action: native_recovery.Action,
-) !bool {
+) !UnpackInputProtocol {
     var buffer: [128]u8 = undefined;
     const path = try native_recovery.unpackDiversionPath(action.program_step, &buffer);
     if (try runtime.root.entryIfExists(try root_fs.Path.init(path)) != null) {
@@ -224,9 +226,9 @@ fn hasUnpackBackupInputs(
         defer allocator.free(bytes);
         var decoded = try native_unpack_diversion.decode(allocator, bytes, runtime.intent_sha256, action.program_step);
         defer decoded.deinit();
-        return decoded.backups != null;
+        return if (decoded.backups == null) .legacy else if (decoded.deferred_removals) .deferred_removals else .backups;
     }
-    return false;
+    return .legacy;
 }
 
 fn checkpointRolledBackNativePhase(
@@ -236,7 +238,7 @@ fn checkpointRolledBackNativePhase(
     steps: []const root_mutation.Step,
     journal_device: u64,
 ) !?native_recovery.Digest {
-    if (try hasUnpackBackupInputs(allocator, runtime, action))
+    if (try unpackInputProtocol(allocator, runtime, action) != .legacy)
         return try native_recovery.checkpointRolledBackMutation(
             allocator,
             runtime.root,
@@ -415,6 +417,7 @@ const CombinedMutationHooks = struct {
     runtime: ?*native_recovery.Runtime,
     action: ?native_recovery.Action,
     publication_crash_point: ?native_recovery.CrashPoint = null,
+    deferred_removal_step: ?u32 = null,
 
     fn before(
         context: ?*anyopaque,
@@ -427,6 +430,8 @@ const CombinedMutationHooks = struct {
         const runtime = self.runtime orelse return;
         const action = self.action orelse return;
         const selected = runtime.crash.selected orelse return;
+        if (self.deferred_removal_step == index and boundary == .parent_sync)
+            runtime.crash.hit(.during_unpack_obsolete_removal);
         const matches = if (self.publication_crash_point) |point| selected == point else switch (selected) {
             .during_filesystem_publication => action.kind == .filesystem,
             .during_database_publication => action.kind == .database,
@@ -7450,6 +7455,7 @@ const MaterializationRequest = struct {
     observed_paths: []const []const u8 = &.{},
     unpack_diversions: ?*const native_diversion.CachedRecords = null,
     unpack_hook: ?*PostUnpackHook = null,
+    defer_obsolete_removals: bool = false,
     publication_crash_point: ?native_recovery.CrashPoint = null,
     hooks: root_mutation.Hooks = .{},
     mutation_limits: root_mutation.Limits = .{},
@@ -7845,6 +7851,7 @@ const MaterializationIntents = struct {
     database: root_mutation.DatabaseIntents,
     arena: *std.heap.ArenaAllocator,
     allocator: std.mem.Allocator,
+    first_deferred_removal: ?[]const u8,
 
     fn deinit(self: *MaterializationIntents) void {
         self.intents.deinit(self.allocator);
@@ -7877,6 +7884,7 @@ fn lowerMaterializationIntents(
     root: root_fs.Root,
     plan_value: Plan,
     bound: *const BoundArchives,
+    defer_obsolete_removals: bool,
 ) !MaterializationIntents {
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -7887,6 +7895,10 @@ fn lowerMaterializationIntents(
     errdefer intents.deinit(allocator);
     var directory_metadata: std.ArrayList(root_mutation.Intent) = .empty;
     defer directory_metadata.deinit(allocator);
+    var deferred_removals: std.ArrayList(root_mutation.Intent) = .empty;
+    defer deferred_removals.deinit(allocator);
+    var required_paths: std.StringHashMapUnmanaged(void) = .empty;
+    defer required_paths.deinit(allocator);
     var publications: std.StringHashMapUnmanaged(PlannedPath) = .empty;
     defer publications.deinit(allocator);
     var conffiles: std.StringHashMapUnmanaged(PlannedConffile) = .empty;
@@ -7898,6 +7910,14 @@ fn lowerMaterializationIntents(
             if (found.found_existing)
                 return error.MaterializationPlanMismatch;
             found.value_ptr.* = planned;
+            if (defer_obsolete_removals) {
+                var path = planned.path;
+                while (true) {
+                    try required_paths.put(allocator, path, {});
+                    const separator = std.mem.lastIndexOfScalar(u8, path, '/') orelse break;
+                    path = path[0..separator];
+                }
+            }
         }
         for (package.conffiles) |conffile| {
             const found = try conffiles.getOrPut(allocator, conffile.path);
@@ -7936,7 +7956,7 @@ fn lowerMaterializationIntents(
                 .skip_not_shipped, .mark_obsolete => continue,
                 else => {},
             };
-            try intents.append(allocator, if (removal.directory)
+            const removal_intent: root_mutation.Intent = if (removal.directory)
                 .{ .remove_directory = .{
                     .path = removal.path,
                     .removal = .require_present,
@@ -7945,7 +7965,10 @@ fn lowerMaterializationIntents(
                 .{ .remove = .{
                     .path = removal.path,
                     .removal = .require_present,
-                } });
+                } };
+            const deferred = defer_obsolete_removals and !conffiles.contains(removal.path) and
+                removalCanFollowPayload(removal.path, &publications, &required_paths);
+            try (if (deferred) &deferred_removals else &intents).append(allocator, removal_intent);
         },
         .directory => |directory| {
             try intents.append(allocator, .{
@@ -8046,13 +8069,38 @@ fn lowerMaterializationIntents(
         .diagnostic => return error.MaterializationDatabaseMismatch,
     };
     errdefer database.deinit();
-    try intents.appendSlice(allocator, database.intents);
+    if (deferred_removals.items.len != 0) {
+        if (database.intents.len == 0 or database.intents[0] != .copy)
+            return error.MaterializationDatabaseMismatch;
+        // Old postrm runs at the verified status-old copy, before obsolete
+        // removal and incoming control publication.
+        try intents.append(allocator, database.intents[0]);
+        try intents.appendSlice(allocator, deferred_removals.items);
+        try intents.appendSlice(allocator, directory_metadata.items);
+        try intents.appendSlice(allocator, database.intents[1..]);
+    } else try intents.appendSlice(allocator, database.intents);
     return .{
         .intents = intents,
         .database = database,
+        .first_deferred_removal = if (deferred_removals.items.len == 0) null else deferred_removals.items[0].path(),
         .arena = arena,
         .allocator = allocator,
     };
+}
+
+fn removalCanFollowPayload(
+    path: []const u8,
+    publications: *const std.StringHashMapUnmanaged(PlannedPath),
+    required_paths: *const std.StringHashMapUnmanaged(void),
+) bool {
+    if (required_paths.contains(path)) return false;
+    var ancestor = path;
+    while (std.mem.lastIndexOfScalar(u8, ancestor, '/')) |separator| {
+        ancestor = ancestor[0..separator];
+        if (publications.get(ancestor)) |publication|
+            if (publication.kind != .directory) return false;
+    }
+    return true;
 }
 
 fn verifyMaterializedFilesystem(
@@ -8478,7 +8526,7 @@ fn materialize(
         const entries = try unpackBackups(arena.allocator(), planned.?, std.Io.Clock.real.now(request.io).nanoseconds);
         if (execution.recovery) |runtime| {
             try native_recovery.validateStableManagedState(allocator, request.root, runtime.intent_sha256);
-            const bytes = try native_unpack_diversion.encodeWithBackups(
+            const bytes = try native_unpack_diversion.encodeWithDeferredRemovals(
                 allocator,
                 cache.*,
                 runtime.intent_sha256,
@@ -8512,8 +8560,10 @@ fn materialize(
         if (result.outcome != .applied) return result;
         if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_backups);
     }
-    const result = try resumeRolledBackUnpack(allocator, request) orelse
-        try materializePlanned(allocator, request, if (planned) |*value| value else null);
+    var payload_request = request;
+    payload_request.defer_obsolete_removals = if (decoded) |value| value.deferred_removals else true;
+    const result = try resumeRolledBackUnpack(allocator, payload_request) orelse
+        try materializePlanned(allocator, payload_request, if (planned) |*value| value else null);
     if (backups.len != 0 and (result.outcome == .refused or result.outcome == .handoff)) {
         const attempt = request.borrowed_attempt orelse return error.InvalidLifecycleProgram;
         try attempt.requireRecovery(allocator, .mutation);
@@ -8600,6 +8650,7 @@ fn materializePlanned(
         request.root,
         planned,
         &bound,
+        request.defer_obsolete_removals,
     ) catch |err| switch (err) {
         error.ZeroDirectoryTimestampUnsupported => return .{
             .outcome = .refused,
@@ -8735,6 +8786,12 @@ fn materializePlanned(
         .action = execution.action,
         .publication_crash_point = request.publication_crash_point,
     };
+    if (lowered.first_deferred_removal) |path| {
+        combined_hooks.deferred_removal_step = for (mutation_plan.steps) |step| {
+            if ((step.kind == .remove_path or step.kind == .remove_directory) and std.mem.eql(u8, step.path, path))
+                break step.index;
+        } else return error.MaterializationPlanMismatch;
+    }
     var refusal: ?root_mutation.Diagnostic = null;
     var engine = root_mutation.prepare(
         allocator,
@@ -17979,8 +18036,9 @@ fn recoverNativeRootMutation(
         ) orelse return error.InvalidManagedState;
         if (stage.direction() != .finish_new) {
             const rolling_back = stage == .rolling_back or stage == .releasing_rollback or stage == .rolled_back;
+            const protocol = try unpackInputProtocol(allocator, runtime, action);
             if ((stage != .applying and !rolling_back) or action.kind != .filesystem or action.program_step >= program.steps.len or
-                !try hasUnpackBackupInputs(allocator, runtime, action))
+                protocol == .legacy)
                 return error.ManagedStateChanged;
             const operation = program.steps[action.program_step].operation;
             if (operation != .unpack_package) return error.InvalidManagedState;
@@ -17991,6 +18049,8 @@ fn recoverNativeRootMutation(
                 else => return error.ManagedStateChanged,
             };
             if (known.program_step != script.sequence) return error.InvalidManagedState;
+            const record = try runtime.latest(known) orelse return error.InvalidManagedState;
+            const journal_advanced = rolling_back or (protocol == .deferred_removals and record.stage == .completed);
             try native_recovery.validateScriptMutationCheckpoint(
                 allocator,
                 root,
@@ -17998,7 +18058,8 @@ fn recoverNativeRootMutation(
                 known,
                 opened.journal().steps,
                 opened.journal().device,
-                rolling_back,
+                journal_advanced,
+                protocol == .deferred_removals,
             );
         }
     }
@@ -21857,6 +21918,11 @@ fn testUnpackDiversionAllocations(allocator: std.mem.Allocator) !void {
         var with_backups = try native_unpack_diversion.decode(allocator, backed, @splat('0'), 7);
         defer with_backups.deinit();
         try testing.expectEqualDeep(testUnpackBackup(), with_backups.backups.?[0]);
+        const deferred = try native_unpack_diversion.encodeWithDeferredRemovals(allocator, cache, @splat('0'), 7, &.{testUnpackBackup()});
+        defer allocator.free(deferred);
+        var with_deferred = try native_unpack_diversion.decode(allocator, deferred, @splat('0'), 7);
+        defer with_deferred.deinit();
+        try testing.expect(with_deferred.deferred_removals);
     }
 }
 
@@ -21958,6 +22024,64 @@ test "native_unpack.test.unpack backup inputs retain symlink clocks and reject m
 
 test "native_unpack.test.unpack diversion inputs release partial allocations" {
     try testing.checkAllAllocationFailures(testing.allocator, testUnpackDiversionAllocations, .{});
+}
+
+test "native_unpack.test.deferred removals are bound without changing legacy inputs" {
+    var cache = try native_diversion.CachedRecords.init(testing.allocator, null, null);
+    defer cache.deinit();
+    const old = try native_unpack_diversion.encodeWithBackups(testing.allocator, cache, @splat('0'), 7, &.{});
+    defer testing.allocator.free(old);
+    var legacy = try native_unpack_diversion.decode(testing.allocator, old, @splat('0'), 7);
+    defer legacy.deinit();
+    try testing.expect(!legacy.deferred_removals);
+    try testing.expect(std.mem.indexOf(u8, old, "\"deferred_removals\"") == null);
+    const bytes = try native_unpack_diversion.encodeWithDeferredRemovals(testing.allocator, cache, @splat('0'), 7, &.{});
+    defer testing.allocator.free(bytes);
+    var current = try native_unpack_diversion.decode(testing.allocator, bytes, @splat('0'), 7);
+    defer current.deinit();
+    try testing.expect(current.deferred_removals and current.backups.?.len == 0);
+    try testing.expect(!std.mem.eql(u8, &legacy.digest_sha256, &current.digest_sha256));
+    const repeated = try native_unpack_diversion.encodeWithBackups(testing.allocator, legacy.cache, @splat('0'), 7, legacy.backups);
+    defer testing.allocator.free(repeated);
+    try testing.expectEqualStrings(old, repeated);
+    for ([_][]const u8{ "null", "false", "true" }) |value| {
+        const invalid = try std.fmt.allocPrint(testing.allocator, "{s},\"deferred_removals\":{s}}}", .{ old[0 .. old.len - 1], value });
+        defer testing.allocator.free(invalid);
+        try testing.expectError(error.InvalidUnpackDiversionCache, native_unpack_diversion.decode(testing.allocator, invalid, @splat('0'), 7));
+    }
+}
+
+test "native_unpack.test.deferred removals preserve publication prerequisites" {
+    var publications: std.StringHashMapUnmanaged(PlannedPath) = .empty;
+    defer publications.deinit(testing.allocator);
+    var required: std.StringHashMapUnmanaged(void) = .empty;
+    defer required.deinit(testing.allocator);
+    const directory: PlannedPath = .{
+        .path = "usr/share/demo",
+        .absolute = "/usr/share/demo",
+        .archive_path = "usr/share/demo",
+        .kind = .directory,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .modified_nanoseconds = null,
+        .package = 0,
+        .disposition = .create,
+    };
+    try publications.put(testing.allocator, directory.path, directory);
+    for ([_][]const u8{ "usr", "usr/share", "usr/share/demo", "usr/share/demo/new", "usr/share/replacement" }) |path|
+        try required.put(testing.allocator, path, {});
+    for ([_]Kind{ .regular, .symlink, .hardlink }) |kind| {
+        var replacement = directory;
+        replacement.path = "usr/share/replacement";
+        replacement.kind = kind;
+        try publications.put(testing.allocator, replacement.path, replacement);
+        try testing.expect(!removalCanFollowPayload("usr/share/replacement/old", &publications, &required));
+    }
+    for ([_][]const u8{ "usr/share", "usr/share/demo", "usr/share/demo/new" }) |path|
+        try testing.expect(!removalCanFollowPayload(path, &publications, &required));
+    for ([_][]const u8{ "usr/share/demo/obsolete", "usr/share/demo/old/child", "usr/share/replacement-extra/old" }) |path|
+        try testing.expect(removalCanFollowPayload(path, &publications, &required));
 }
 
 test "native_unpack.test.unpack diversion paths have an exact bounded program step" {

@@ -282,6 +282,8 @@ def assert_cached_diversion_contents(cached: dict) -> None:
 
 
 def assert_unpack_backup_contents(envelope: dict) -> None:
+    if "deferred_removals" in envelope:
+        assert envelope["deferred_removals"] is True and "backups" in envelope, "invalid deferred-removal protocol"
     if "backups" not in envelope:
         return
     backups = envelope["backups"]
@@ -1601,6 +1603,12 @@ def exercise_diversion_recovery(
         ("upgrade", "after_upgrade_unwind_completed", "backup-unwind"),
         ("upgrade", "after_upgrade_unwind_completed", "backup-failure"),
         ("upgrade", "after_upgrade_pre_rollback_compensation_completed", "backup-failure"),
+        ("upgrade", "during_unpack_obsolete_removal", "backup-probe"),
+        ("upgrade", "during_unpack_obsolete_removal", "backup-probe-atomic"),
+        ("upgrade", "during_unpack_obsolete_removal", "backup-unwind"),
+        ("upgrade", "during_unpack_obsolete_removal", "backup-probe-rollback-crash"),
+        ("upgrade", "during_unpack_obsolete_removal", "backup-probe-rollback-finished"),
+        ("upgrade", "during_unpack_obsolete_removal", "backup-postrm-directory-drift"),
     ):
         name = f"diversion-{operation}-{boundary}" + (f"-{mutation}" if mutation else "")
         backup_failure = bool(mutation and mutation.startswith("backup-failure"))
@@ -1611,7 +1619,11 @@ def exercise_diversion_recovery(
                     current.directory / "backup-packages", environment, architecture, version, "conffile",
                     package=package, scripts=lifecycle.backup_probe_scripts(version, mode_suffix=".distrib"),
                     conffile_content=f"configuration {version}\n".encode(),
-                    extra_files={lifecycle.DIVERSION_LITERAL: f"literal version {version}\n".encode()},
+                    extra_files={
+                        lifecycle.DIVERSION_LITERAL: f"literal version {version}\n".encode(),
+                        **({f"{lifecycle.DIVERSION_BASE}/tracked/child": b"tracked directory\n"}
+                           if version == "2" and mutation == "backup-postrm-directory-drift" else {}),
+                    },
                 )
                 for version in ("1", "2")
             }
@@ -1704,7 +1716,10 @@ def exercise_diversion_recovery(
             if archive.exists():
                 archive.unlink()
             assert not archive.exists()
-        if mutation in ("backup-failure-rollback-crash", "backup-failure-rollback-finished"):
+        if mutation in (
+            "backup-failure-rollback-crash", "backup-failure-rollback-finished",
+            "backup-probe-rollback-crash", "backup-probe-rollback-finished",
+        ):
             destination_directory = current.directory / "interrupted-recovery"
             destination_directory.mkdir()
             native(
@@ -1740,6 +1755,8 @@ def exercise_diversion_recovery(
                 m.write(path, b"external old backup\n")
             elif mutation == "backup-postrm-cache-drift":
                 m.write(current.candidate / NAMESPACE / "native-diversion-cache-v1.json", b"external cached inputs\n")
+            elif mutation == "backup-postrm-directory-drift":
+                m.write(current.candidate / lifecycle.DIVERSION_BASE / "tracked/unrecorded", b"external directory member\n")
             else:
                 raise AssertionError(f"unknown backup mutation: {mutation}")
         elif mutation and mutation.startswith("unpack-cache-"):

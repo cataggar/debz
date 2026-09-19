@@ -91,6 +91,7 @@ pub const CrashPoint = enum {
     after_failed_unpack_publication,
     before_unpack_backup_cleanup,
     after_unpack_backup_cleanup,
+    during_unpack_obsolete_removal,
 };
 
 pub const CrashController = struct {
@@ -1025,6 +1026,16 @@ fn managedRegularEntry(path: []const u8, observation: root_fs.RegularFileObserva
     };
 }
 
+const ManagedDirectoryMember = struct { name: []const u8, kind: []const u8 };
+
+fn managedDirectoryDigest(allocator: std.mem.Allocator, members: []const root_fs.DirectoryMember) !Digest {
+    const wire = try allocator.alloc(ManagedDirectoryMember, members.len);
+    defer allocator.free(wire);
+    for (members, wire) |member, *entry|
+        entry.* = .{ .name = member.name, .kind = @tagName(member.kind) };
+    return digestValue("debz-native-managed-directory-v1\x00", wire);
+}
+
 fn observeManagedEntry(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -1110,21 +1121,6 @@ fn observeManagedEntry(
                 {},
                 lessDirectoryMember,
             );
-            const DirectoryMember = struct {
-                name: []const u8,
-                kind: []const u8,
-            };
-            const members = try allocator.alloc(
-                DirectoryMember,
-                observation.members.len,
-            );
-            defer allocator.free(members);
-            for (observation.members, 0..) |member, index| {
-                members[index] = .{
-                    .name = member.name,
-                    .kind = @tagName(member.kind),
-                };
-            }
             var result = base;
             result.mode = observation.entry.mode;
             result.uid = observation.entry.uid;
@@ -1136,10 +1132,7 @@ fn observeManagedEntry(
                 observation.entry.modified_nanoseconds;
             result.change_nanoseconds = observation.change_nanoseconds;
             result.size = observation.entry.size;
-            result.directory_sha256 = digestValue(
-                "debz-native-managed-directory-v1\x00",
-                members,
-            );
+            result.directory_sha256 = try managedDirectoryDigest(allocator, observation.members);
             result.directory_entries = observation.members.len;
             break :block result;
         },
@@ -1649,6 +1642,7 @@ pub fn validateScriptMutationCheckpoint(
     steps: []const @import("root_mutation.zig").Step,
     journal_device: u64,
     rolling_back: bool,
+    rebase_journal_directories: bool,
 ) !void {
     var current = try readManagedState(allocator, root);
     defer current.deinit();
@@ -1684,7 +1678,11 @@ pub fn validateScriptMutationCheckpoint(
             (entry.directory_entries != observed.directory_entries or
                 entry.directory_sha256 == null or observed.directory_sha256 == null or
                 !std.mem.eql(u8, &entry.directory_sha256.?, &observed.directory_sha256.?)))
-            return error.ManagedStateChanged;
+        {
+            if (!rebase_journal_directories or
+                !try journalDirectoryMembership(allocator, root, snapshot.entries, entry, observed, &paths))
+                return error.ManagedStateChanged;
+        }
         // The generic journal owns intermediate states of its paths. Other
         // recorded script effects must remain unchanged during its rollback.
         if (paths.contains(entry.path)) continue;
@@ -1698,6 +1696,72 @@ pub fn validateScriptMutationCheckpoint(
             adjusted.change_nanoseconds = entry.change_nanoseconds;
         if (!managedEntryEqual(entry, adjusted)) return error.ManagedStateChanged;
     }
+}
+
+fn managedEntryLowerBound(entries: []const ManagedEntry, path: []const u8) usize {
+    var first: usize = 0;
+    var last = entries.len;
+    while (first < last) {
+        const middle = first + (last - first) / 2;
+        if (std.mem.lessThan(u8, entries[middle].path, path)) first = middle + 1 else last = middle;
+    }
+    return first;
+}
+
+fn journalDirectoryMembership(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    entries: []const ManagedEntry,
+    expected: ManagedEntry,
+    observed: ManagedEntry,
+    paths: *const std.StringHashMapUnmanaged(void),
+) !bool {
+    // Reconstruct only journal-owned child names and kinds. Every other live
+    // member must still match the original script checkpoint.
+    var pinned = try root.pinDirectory(try root_fs.Path.initPackage(expected.path));
+    defer pinned.close();
+    var directory = try pinned.observeAlloc(allocator, maximum_managed_directory_entries, maximum_managed_directory_name_bytes);
+    defer directory.deinit();
+    std.mem.sort(root_fs.DirectoryMember, directory.members, {}, lessDirectoryMember);
+    const live_digest = try managedDirectoryDigest(allocator, directory.members);
+    if (observed.directory_sha256 == null or
+        !std.mem.eql(u8, &live_digest, &observed.directory_sha256.?))
+        return error.ManagedStateChanged;
+    var normalized: std.ArrayList(ManagedDirectoryMember) = .empty;
+    defer normalized.deinit(allocator);
+    for (directory.members) |member| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ expected.path, member.name });
+        defer allocator.free(path);
+        if (paths.contains(path)) {
+            const index = managedEntryLowerBound(entries, path);
+            if (index == entries.len or !std.mem.eql(u8, entries[index].path, path))
+                return false;
+        } else try normalized.append(allocator, .{ .name = member.name, .kind = @tagName(member.kind) });
+    }
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{expected.path});
+    defer allocator.free(prefix);
+    var index = managedEntryLowerBound(entries, prefix);
+    while (index < entries.len and std.mem.startsWith(u8, entries[index].path, prefix)) : (index += 1) {
+        const entry = entries[index];
+        const name = entry.path[prefix.len..];
+        if (std.mem.indexOfScalar(u8, name, '/') != null or !paths.contains(entry.path) or entry.kind == .absent)
+            continue;
+        try normalized.append(allocator, .{ .name = name, .kind = switch (entry.kind) {
+            .regular => "file",
+            .symlink => "sym_link",
+            .directory => "directory",
+            .absent => unreachable,
+        } });
+    }
+    if (normalized.items.len > maximum_managed_directory_entries) return error.ManagedStateLimit;
+    std.mem.sort(ManagedDirectoryMember, normalized.items, {}, struct {
+        fn less(_: void, left: ManagedDirectoryMember, right: ManagedDirectoryMember) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.less);
+    const digest = digestValue("debz-native-managed-directory-v1\x00", normalized.items);
+    return normalized.items.len == expected.directory_entries and expected.directory_sha256 != null and
+        std.mem.eql(u8, &digest, &expected.directory_sha256.?);
 }
 
 fn restoredJournalEntry(
@@ -2685,7 +2749,7 @@ test "native_recovery.test.script checkpoints bind outcome and latest invocation
     }
 }
 
-test "native_recovery.test.partial rollback cannot excuse changed directory membership" {
+test "native_recovery.test.directory membership recovery is limited to recorded journal paths" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
     const mutation = @import("root_mutation.zig");
@@ -2718,7 +2782,19 @@ test "native_recovery.test.partial rollback cannot excuse changed directory memb
     try publishScriptOutcome(testing.allocator, root, outcome);
     _ = try updateManagedState(testing.allocator, root, intent, outcome.action, &.{ "tracked", payload.text }, true);
     try appendProgress(testing.allocator, root, intent, outcome.action, .outcome, .exited, outcome.digest_sha256);
-    try validateScriptMutationCheckpoint(testing.allocator, root, intent, outcome.action, plan.steps, original.device, true);
+    try validateScriptMutationCheckpoint(testing.allocator, root, intent, outcome.action, plan.steps, original.device, true, false);
+    try root.removeFile(payload);
+    try testing.expectError(error.ManagedStateChanged, validateScriptMutationCheckpoint(
+        testing.allocator,
+        root,
+        intent,
+        outcome.action,
+        plan.steps,
+        original.device,
+        true,
+        false,
+    ));
+    try validateScriptMutationCheckpoint(testing.allocator, root, intent, outcome.action, plan.steps, original.device, true, true);
     try root.publishFile(try root_fs.Path.init("tracked/unrecorded"), "unexpected member", .{});
     try testing.expectError(error.ManagedStateChanged, validateScriptMutationCheckpoint(
         testing.allocator,
@@ -2727,6 +2803,17 @@ test "native_recovery.test.partial rollback cannot excuse changed directory memb
         outcome.action,
         plan.steps,
         original.device,
+        true,
+        false,
+    ));
+    try testing.expectError(error.ManagedStateChanged, validateScriptMutationCheckpoint(
+        testing.allocator,
+        root,
+        intent,
+        outcome.action,
+        plan.steps,
+        original.device,
+        true,
         true,
     ));
 }
