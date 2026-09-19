@@ -48,6 +48,7 @@ pub const Policy = struct {
     pins: []const PinRule = &.{},
     default_release: ?[]const u8 = null,
     immutability: Immutability = .{},
+    freshness: refresh_module.ExpiryPolicy = .require_valid_until,
     proxy: Proxy = .direct,
     credentials: ?OpaqueReference = null,
     deadlines: acquisition.Deadlines = .{
@@ -121,6 +122,7 @@ pub const NormalizedRepository = struct {
     pins: []const PinRule,
     default_release: ?[]const u8,
     immutability: Immutability,
+    freshness: refresh_module.ExpiryPolicy,
     proxy: Proxy,
     /// Opaque reference only. It is deliberately excluded from IDs,
     /// canonical sources, manifests, diagnostics, and cache keys.
@@ -409,6 +411,7 @@ fn appendNormalized(
                 else
                     null,
             },
+            .freshness = policy.freshness,
             .proxy = switch (policy.proxy) {
                 .direct => .direct,
                 .declared => |value| .{ .declared = .{
@@ -426,6 +429,7 @@ fn appendNormalized(
 }
 
 fn validPolicy(policy: Policy) bool {
+    if (!refresh_module.validExpiryPolicy(policy.freshness)) return false;
     if (policy.deadlines.connect_ms == 0 or policy.deadlines.read_ms == 0 or
         policy.deadlines.overall_ms == 0)
         return false;
@@ -504,6 +508,10 @@ fn repositoryId(repository: NormalizedRepository) source.RepositoryId {
     hashPart(&hash, repository.default_release orelse "");
     hashPart(&hash, @tagName(repository.immutability.kind));
     hashPart(&hash, repository.immutability.declared_identity orelse "");
+    if (refresh_module.expiryPolicyMaxAge(repository.freshness)) |maximum_age| {
+        hashPart(&hash, @tagName(repository.freshness));
+        hashInt(&hash, @intCast(maximum_age));
+    }
     switch (repository.proxy) {
         .direct => hashPart(&hash, "direct"),
         .declared => |value| hashPart(&hash, value.id),
@@ -518,7 +526,20 @@ fn repositoryId(repository: NormalizedRepository) source.RepositoryId {
 
 fn configurationId(repositories: []const NormalizedRepository) source.RepositoryId {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hashPart(&hash, "debz-multi-repository-configuration-v1");
+    var bounded_missing_expiry = false;
+    for (repositories) |repository| {
+        if (refresh_module.expiryPolicyMaxAge(repository.freshness) != null) {
+            bounded_missing_expiry = true;
+            break;
+        }
+    }
+    hashPart(
+        &hash,
+        if (bounded_missing_expiry)
+            "debz-multi-repository-configuration-v2"
+        else
+            "debz-multi-repository-configuration-v1",
+    );
     for (repositories) |repository| hashPart(&hash, repository.id.slice());
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -560,6 +581,14 @@ fn appendCanonical(
             try output.appendSlice(allocator, value);
         }
     }
+    if (refresh_module.expiryPolicyMaxAge(repository.freshness)) |seconds| {
+        try output.appendSlice(allocator, "\n# X-Debz-Expiry-Policy: ");
+        try output.appendSlice(allocator, @tagName(repository.freshness));
+        try output.appendSlice(allocator, "\n# X-Debz-Max-Release-Age-Seconds: ");
+        var seconds_buffer: [20]u8 = undefined;
+        const text = std.fmt.bufPrint(&seconds_buffer, "{d}", .{seconds}) catch unreachable;
+        try output.appendSlice(allocator, text);
+    }
     try output.appendSlice(
         allocator,
         if (repository.enabled) "\nEnabled: yes\n\n" else "\nEnabled: no\n\n",
@@ -598,6 +627,7 @@ fn equalRepository(left: NormalizedRepository, right: NormalizedRepository) bool
             left.immutability.declared_identity,
             right.immutability.declared_identity,
         ) and
+        refresh_module.expiryPoliciesEqual(left.freshness, right.freshness) and
         equalProxy(left.proxy, right.proxy) and
         equalOptionalReference(left.credentials, right.credentials) and
         left.deadlines.connect_ms == right.deadlines.connect_ms and
@@ -1011,6 +1041,10 @@ fn refreshRepository(
 }
 
 fn runtimeMatches(repository: NormalizedRepository, runtime: Runtime) bool {
+    if (!refresh_module.expiryPoliciesEqual(
+        repository.freshness,
+        runtime.refresh.expiry_policy,
+    )) return false;
     if (runtime.acquisition.deadlines.connect_ms == 0 or
         runtime.acquisition.deadlines.read_ms == 0 or
         runtime.acquisition.deadlines.overall_ms == 0 or
@@ -1571,6 +1605,103 @@ test "conflicting policy changes configuration identity" {
             DiagnosticCode.conflicting_repository,
             value.code,
         ),
+    }
+}
+
+test "freshness policy is canonical identity and conflict input" {
+    const bytes =
+        "deb [arch=amd64 signed-by=/keys/archive.gpg] https://packages.example stable main\n";
+    const strict_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = bytes,
+        .format = .legacy,
+    }}, null, .{});
+    var strict = switch (strict_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer strict.deinit();
+    const bounded_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = bytes,
+        .format = .legacy,
+        .policy = .{ .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = 7 * 24 * 60 * 60,
+        } },
+    }}, null, .{});
+    var bounded = switch (bounded_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer bounded.deinit();
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        strict.identity.slice(),
+        bounded.identity.slice(),
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        strict.repositories[0].id.slice(),
+        bounded.repositories[0].id.slice(),
+    ));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bounded.canonical_deb822,
+        "allow_missing_valid_until_with_max_age_seconds",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bounded.canonical_deb822,
+        "604800",
+    ) != null);
+
+    const conflict = try normalize(std.testing.allocator, &.{
+        .{ .bytes = bytes, .format = .legacy },
+        .{
+            .bytes = bytes,
+            .format = .legacy,
+            .policy = .{ .freshness = .{
+                .allow_missing_valid_until_with_max_age_seconds = 7 * 24 * 60 * 60,
+            } },
+        },
+    }, null, .{});
+    switch (conflict) {
+        .configuration => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedConflict;
+        },
+        .diagnostic => |diagnostic| try std.testing.expectEqual(
+            DiagnosticCode.conflicting_repository,
+            diagnostic.code,
+        ),
+    }
+}
+
+test "freshness policy rejects zero and over-maximum exceptions" {
+    const bytes = "deb [arch=amd64] https://packages.example stable main\n";
+    const invalid = [_]u64{
+        0,
+        refresh_module.maximum_missing_valid_until_age_seconds + 1,
+    };
+    for (invalid) |maximum_age| {
+        const result = try normalize(std.testing.allocator, &.{.{
+            .bytes = bytes,
+            .format = .legacy,
+            .policy = .{ .freshness = .{
+                .allow_missing_valid_until_with_max_age_seconds = maximum_age,
+            } },
+        }}, null, .{});
+        switch (result) {
+            .configuration => |value| {
+                var unexpected = value;
+                unexpected.deinit();
+                return error.ExpectedDiagnostic;
+            },
+            .diagnostic => |diagnostic| try std.testing.expectEqual(
+                DiagnosticCode.invalid_policy,
+                diagnostic.code,
+            ),
+        }
     }
 }
 

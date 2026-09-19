@@ -84,11 +84,23 @@ target-native evidence therefore requires an explicit override instead of a
 dpkg subprocess. Root-adapter checks, malformed-input refusals, and allocation
 errors are preserved. The ordinary `snapshot` fallback contract is unchanged.
 
-The canonical `apt-config-snapshot-v1` document records source paths and
-digests, normalized configuration and repository identities, keyring paths,
-digests and fingerprints, global compatibility use, deterministic exclusions,
-native and foreign architectures, and an aggregate SHA-256. Decode is bounded,
-rejects unknown fields and noncanonical documents, and verifies the aggregate
+Callers may attach an explicit freshness policy to a discovered source path.
+The default requires signed `Valid-Until`; the only alternative allows a
+missing field for a nonzero, bounded maximum Release age. Unknown, duplicate,
+invalid, or missing source-policy paths fail rather than being ignored. This is
+an API-level policy input only; target import does not infer a policy from a
+hostname or publish system-specific defaults.
+
+The canonical `apt-config-snapshot-v2` document records source paths, digests,
+and freshness policies; normalized configuration, repository identities, and
+per-repository freshness policies; keyring paths, digests and fingerprints;
+global compatibility use; deterministic exclusions; native and foreign
+architectures; and an aggregate SHA-256. It is emitted when a finite
+missing-expiry policy is configured. Strict-only snapshots continue to use
+canonical v1 bytes, whose defined semantics require `Valid-Until` for every
+source and repository. V1 artifacts remain readable and round-trip as v1 and
+can never acquire the finite exception by omission. Both decoders are bounded,
+reject unknown fields and noncanonical documents, and verify the aggregate
 digest. `Store.writeAtomic` publishes through a no-follow directory handle,
 file sync, rename, and directory sync.
 

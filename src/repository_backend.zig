@@ -5782,10 +5782,7 @@ fn runtimeForRepository(
             .compression_order = &.{ .xz, .gzip, .zstd, .uncompressed },
             .by_hash_fallback = .not_found_only,
             .maximum_future_seconds = 300,
-            .expiry_policy = if (repository.immutability.kind == .moving)
-                .require_valid_until
-            else
-                .allow_missing_valid_until,
+            .expiry_policy = repository.freshness,
             .maximum_compressed_bytes = network.maximum_compressed_index_bytes,
             .maximum_decompressed_bytes = network.maximum_decompressed_index_bytes,
             .maximum_decoder_memory = network.maximum_decoder_memory,

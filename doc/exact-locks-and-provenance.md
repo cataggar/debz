@@ -59,6 +59,19 @@ documents. V2 validation has explicit repository, artifact, package, signer,
 and total-work limits; sorted indexed matching and reference accounting avoid
 quadratic artifact/package validation. `ExactClosureLockStore` publishes with
 write/fsync/rename/fsync.
+
+Authenticated snapshot digest version 2 additionally binds the configured
+freshness policy and maximum missing-expiry age, signed Release date,
+freshness verification time and observed age, bounded future-skew decision,
+and whether the missing-`Valid-Until` exception was exercised. Repository and
+configuration identities also bind that configured policy. Exact-lock v1/v2
+and transaction-result v1/v2 schemas continue to carry the opaque repository
+snapshot digest, so their existing evidence path transitively binds the new
+freshness facts without a transaction-result v3. Previously serialized locks
+remain decodable, but a repository-backed lock carrying the old snapshot
+digest fails replay against a newly computed digest and requires reviewed
+regeneration; it never silently acquires the exception. Transaction
+provenance retains the same fail-closed snapshot comparison.
 The production CLI permits initial lock resolution only on non-mutating
 `plan` and `download` operations. The package-family API exposes that path as
 `resolve_lock`; all image mutations continue to require the reviewed lock.
