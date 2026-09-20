@@ -1,0 +1,96 @@
+{
+  "capture_schema": {
+    "id": "https://debz.dev/schema/vendor-state-inventory-v1",
+    "version": 1
+  },
+  "index_version": 1,
+  "manifests": [
+    {
+      "architecture": "amd64",
+      "artifact_id": 10602721005,
+      "artifact_member": "vendor-state-inventory-v1.json",
+      "artifact_name": "ubuntu-real-snapshot-amd64",
+      "artifact_sha256": "0cc352e4f75e129ebc713d28724133150ff064eaf1a5387460de951a205c52db",
+      "artifact_size_bytes": 262687,
+      "inventory": {
+        "alternatives_record_bytes": 5329,
+        "alternatives_record_count": 14,
+        "classification_counts": {
+          "checksums": 177,
+          "conffiles": 39,
+          "control": 0,
+          "debconf-config": 7,
+          "format": 1,
+          "maintainer-script": 186,
+          "ownership-list": 177,
+          "package-alternatives": 0,
+          "retained-metadata": 158,
+          "triggers": 84,
+          "unclassified": 0
+        },
+        "control_member_bytes": 4873475,
+        "control_member_count": 829,
+        "linked_entry_count": 190,
+        "linked_entry_kind_counts": {
+          "regular": 45,
+          "symlink": 145
+        },
+        "linked_regular_bytes": 5113978,
+        "requested_path_count": 189
+      },
+      "job_id": 106052418669,
+      "manifest_path": "ubuntu-resolute-20260816T000000Z-amd64-v1.json",
+      "manifest_sha256": "9ae81ea204a2cf608860451a41d477068a11ab77e8762e61e53d95bc0a70570b",
+      "manifest_size_bytes": 320842
+    },
+    {
+      "architecture": "arm64",
+      "artifact_id": 10602163417,
+      "artifact_member": "vendor-state-inventory-v1.json",
+      "artifact_name": "ubuntu-real-snapshot-arm64",
+      "artifact_sha256": "22c543d5191a9761b2ed4791ce67902fb6106abfaf1228a47d50c82c0dc803c6",
+      "artifact_size_bytes": 262743,
+      "inventory": {
+        "alternatives_record_bytes": 5329,
+        "alternatives_record_count": 14,
+        "classification_counts": {
+          "checksums": 177,
+          "conffiles": 39,
+          "control": 0,
+          "debconf-config": 7,
+          "format": 1,
+          "maintainer-script": 186,
+          "ownership-list": 177,
+          "package-alternatives": 0,
+          "retained-metadata": 158,
+          "triggers": 84,
+          "unclassified": 0
+        },
+        "control_member_bytes": 4863191,
+        "control_member_count": 829,
+        "linked_entry_count": 190,
+        "linked_entry_kind_counts": {
+          "regular": 45,
+          "symlink": 145
+        },
+        "linked_regular_bytes": 5306498,
+        "requested_path_count": 189
+      },
+      "job_id": 106052418730,
+      "manifest_path": "ubuntu-resolute-20260816T000000Z-arm64-v1.json",
+      "manifest_sha256": "90698d5a1eae643dfc68a0acbb38cca48b98b297453fdc5d1a10509c792fa16c",
+      "manifest_size_bytes": 320842
+    }
+  ],
+  "source": {
+    "commit": "193887f0e45dc35a25768f8e58daa98318daddc9",
+    "repository": "cataggar/debz",
+    "snapshot_suite": "resolute",
+    "snapshot_uri": "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z",
+    "workflow": "CI",
+    "workflow_path": ".github/workflows/ci.yml",
+    "workflow_run_attempt": 1,
+    "workflow_run_id": 35500920816,
+    "workflow_run_url": "https://github.com/cataggar/debz/actions/runs/35500920816"
+  }
+}

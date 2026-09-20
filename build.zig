@@ -1016,6 +1016,7 @@ fn installReleaseFiles(
         "native-install-capability-v1.json",
         "native-install-result-v1.json",
         "vendor-state-inventory-v1.json",
+        "vendor-state-reference-v1.json",
     };
     const regular_files = [_]struct { source: []const u8, destination: []const u8 }{
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },

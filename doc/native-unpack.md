@@ -153,7 +153,10 @@ described in [Native recovery](native-recovery.md).
 
 Native database plans explicitly preserve the override file without rewriting
 it, including remove and purge. Active `config` scripts, alternatives and other
-unsupported vendor state remain guarded.
+unsupported vendor state remain guarded. The exact pinned amd64/arm64 boundary,
+typed observed topology, and still-missing reference-execution evidence are in
+the [vendor-state reference specification](../schema/vendor-state-reference-v1.json);
+that evidence inventory does not grant mutation authority.
 
 ## Diversion routing
 

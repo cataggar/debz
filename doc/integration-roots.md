@@ -149,10 +149,79 @@ or ambient installation namespaces, malformed text, and every count, path,
 integer, or byte-limit overflow. The capture records no file contents,
 hostname, timestamp, environment, or absolute workspace path.
 
-The uploaded JSON is review evidence from a particular amd64 or arm64 run, not
-a repository-pinned support manifest. No current pinned vendor manifests are
-claimed; future reviewed runs may pin exact artifact digests separately.
-Native production feature guards for config scripts, alternatives, and
-unclassified vendor metadata remain unchanged. The lane is manual because of
-bandwidth, but release acceptance requires dispatching it successfully; it
-does not replace deterministic PR CI.
+The reviewed amd64 and arm64 captures from workflow run
+[`35500920816`](https://github.com/cataggar/debz/actions/runs/35500920816) at
+commit `193887f0e45dc35a25768f8e58daa98318daddc9` are pinned under
+`tools/fixtures/vendor-state/`. `index-v1.json` binds the immutable snapshot,
+workflow run and jobs, source commit, downloaded artifact sizes and SHA-256
+digests, manifest sizes and SHA-256 digests, capture schema version, and
+inventory totals. Tests revalidate the manifests against the schema and
+capture classifier, require canonical ordering and bounded totals, inspect
+every recorded path, and reject credential patterns or ambient host
+namespaces.
+
+Each pinned architecture has 829 control members, 14 alternatives database
+records, 189 requested linked paths, and 190 linked entries. The control
+inventory includes seven `*.config` members and no `*.alternatives` or
+unclassified members. Both architectures have the same classification counts,
+alternatives records, requested paths, and linked-path topology; their
+architecture-qualified control paths pair exactly, while expected package
+metadata and ten linked executable hashes differ. These references document
+observed vendor state but do not expand native production support: feature
+guards for config scripts, alternatives, and unclassified vendor metadata
+remain unchanged. The lane is manual because of bandwidth, but release
+acceptance requires dispatching it successfully; it does not replace
+deterministic PR CI.
+
+The deterministic [vendor-state reference
+specification](../schema/vendor-state-reference-v1.json) is committed as
+`tools/fixtures/vendor-state/reference-v1.json`. It is derived only from the
+two reviewed manifests and their index:
+
+```sh
+python3 tools/derive-vendor-state-reference.py \
+  --index tools/fixtures/vendor-state/index-v1.json \
+  --check tools/fixtures/vendor-state/reference-v1.json
+```
+
+The reference binds index SHA-256
+`682bff167a4bc2386ceb78fb554be0adbe6fbfab16f4eab77aff3b63af04dd34`
+and manifest SHA-256 values
+`9ae81ea204a2cf608860451a41d477068a11ab77e8762e61e53d95bc0a70570b`
+(amd64) and
+`90698d5a1eae643dfc68a0acbb38cca48b98b297453fdc5d1a10509c792fa16c`
+(arm64). The canonical reference SHA-256 is
+`73228f959a335956c58d48712c891ccc372082dfc4f78f4405c18a37f98efe08`.
+Regeneration validates every source digest, the fixed capture limits, canonical
+ordering, count/byte/path bound, classification, requested-path resolution,
+symlink target, public-path privacy boundary, and terminal linked identity
+before emitting canonical JSON.
+
+The paired reference accounts for every item in each manifest. Of the 829
+control members, 664 are already-supported typed package-database or lifecycle
+state, 158 are bounded inert `templates`/`shlibs`/`symbols`, and the seven
+debconf `*.config` scripts require reference-execution evidence. There are
+zero package `*.alternatives` and zero unclassified members. The 14
+alternatives records produce 72 current relationships (14 masters and 58
+slaves), 189 complete requested-path resolutions, and all 190 linked entries:
+145 symlinks and 45 regular files, including the inert
+`etc/alternatives/README`. Each group records the observed record identity,
+declared paths, master/slave selectors, selected target topology, and linked
+path kind, metadata, target or digest. Package/provider ownership,
+auto-versus-manual selection, priorities, candidate registration rows, and
+mutation causality are explicitly `not-captured` or
+`reference-execution-required`; none is inferred from names or hashes.
+
+Cross-architecture pairing records all 422 architecture-qualified control
+paths and the exact 275 control-content differences: 140 checksums, one
+conffiles member, 28 maintainer scripts, 94 ownership lists, nine retained
+metadata members, and three trigger members. Alternatives records and topology
+are identical. Exactly ten regular linked targets differ in size and SHA-256.
+Difference entries index the authoritative per-architecture facts above rather
+than duplicating them in the generated fixture.
+Remaining oracle work is bounded reference execution for config-script
+invocation/effects and alternatives record decoding plus install, upgrade,
+remove, purge, failure, and recovery mutations. Until that evidence and an
+explicit support contract exist, native preflight continues handing off or
+rejecting active config/alternatives or unclassified semantics before
+mutation.

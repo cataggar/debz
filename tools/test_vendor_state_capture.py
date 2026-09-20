@@ -8,21 +8,41 @@ import hashlib
 import json
 import os
 import pathlib
+import posixpath
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from unittest import mock
 
 import jsonschema
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/capture-vendor-state.py"
+REFERENCE_TOOL = ROOT / "tools/derive-vendor-state-reference.py"
+REFERENCE_DIRECTORY = ROOT / "tools/fixtures/vendor-state"
+REFERENCE_INDEX = REFERENCE_DIRECTORY / "index-v1.json"
+REFERENCE_DOCUMENT = REFERENCE_DIRECTORY / "reference-v1.json"
+REFERENCE_INDEX_SHA256 = (
+    "682bff167a4bc2386ceb78fb554be0adbe6fbfab16f4eab77aff3b63af04dd34"
+)
+REFERENCE_DOCUMENT_SHA256 = (
+    "73228f959a335956c58d48712c891ccc372082dfc4f78f4405c18a37f98efe08"
+)
 SPEC = importlib.util.spec_from_file_location("vendor_state_capture", TOOL)
 assert SPEC and SPEC.loader
 vendor_state_capture = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = vendor_state_capture
 SPEC.loader.exec_module(vendor_state_capture)
+REFERENCE_SPEC = importlib.util.spec_from_file_location(
+    "vendor_state_reference", REFERENCE_TOOL
+)
+assert REFERENCE_SPEC and REFERENCE_SPEC.loader
+vendor_state_reference = importlib.util.module_from_spec(REFERENCE_SPEC)
+sys.modules[REFERENCE_SPEC.name] = vendor_state_reference
+REFERENCE_SPEC.loader.exec_module(vendor_state_reference)
 
 
 class VendorStateCaptureTests(unittest.TestCase):
@@ -184,6 +204,559 @@ class VendorStateCaptureTests(unittest.TestCase):
                     self.fixture_root(f"bad-architecture-{len(str(architecture))}"),
                     architecture,  # type: ignore[arg-type]
                 )
+
+    def test_pinned_vendor_state_references_are_canonical_bounded_and_private(
+        self,
+    ) -> None:
+        raw_index = REFERENCE_INDEX.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw_index).hexdigest(), REFERENCE_INDEX_SHA256
+        )
+        index = json.loads(raw_index)
+        self.assertEqual(
+            raw_index, vendor_state_capture.canonical_json(index)
+        )
+        self.assertEqual(
+            set(index),
+            {"capture_schema", "index_version", "manifests", "source"},
+        )
+        self.assertEqual(index["index_version"], 1)
+        self.assertEqual(
+            index["capture_schema"],
+            {"id": vendor_state_capture.SCHEMA, "version": 1},
+        )
+        self.assertEqual(
+            index["source"],
+            {
+                "commit": "193887f0e45dc35a25768f8e58daa98318daddc9",
+                "repository": "cataggar/debz",
+                "snapshot_suite": "resolute",
+                "snapshot_uri": (
+                    "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z"
+                ),
+                "workflow": "CI",
+                "workflow_path": ".github/workflows/ci.yml",
+                "workflow_run_attempt": 1,
+                "workflow_run_id": 35500920816,
+                "workflow_run_url": (
+                    "https://github.com/cataggar/debz/actions/runs/35500920816"
+                ),
+            },
+        )
+        schema = json.loads(
+            (ROOT / "schema/vendor-state-inventory-v1.json").read_text()
+        )
+        validator = jsonschema.Draft202012Validator(schema)
+        digest = re.compile(r"^[0-9a-f]{64}$")
+        credential_patterns = (
+            re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+            re.compile(b"-----BEGIN PGP " + b"PRIVATE KEY BLOCK-----"),
+            re.compile(
+                rb"(?i)authorization\s*:\s*bearer\s+"
+                rb"[A-Za-z0-9._~+/=-]{12,}"
+            ),
+            re.compile(rb"AKIA[0-9A-Z]{16}"),
+            re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}"),
+        )
+        ambient_needles = (
+            b"/home/",
+            b"/root/",
+            b"/run/",
+            b"/tmp/",
+            b"/var/tmp/",
+            b"/var/log/",
+            b"/var/lib/cloud/",
+            b"/var/lib/private/",
+            b"/d/",
+            b"GITHUB_",
+            b"RUNNER_",
+            b"runner-host",
+            b"workspace",
+            b"etc/apt/auth.conf",
+            b"etc/gshadow",
+            b"etc/hostname",
+            b"etc/hosts",
+            b"etc/machine-id",
+            b"etc/resolv.conf",
+            b"etc/shadow",
+            b"etc/ssh/",
+            b"etc/ssl/private/",
+        )
+        manifests: dict[str, dict] = {}
+        expected_provenance = {
+            "amd64": {
+                "artifact_id": 10602721005,
+                "artifact_sha256": (
+                    "0cc352e4f75e129ebc713d28724133150ff064eaf1a5387460de951a205c52db"
+                ),
+                "artifact_size_bytes": 262687,
+                "job_id": 106052418669,
+                "manifest_path": (
+                    "ubuntu-resolute-20260816T000000Z-amd64-v1.json"
+                ),
+                "manifest_sha256": (
+                    "9ae81ea204a2cf608860451a41d477068a11ab77e8762e61e53d95bc0a70570b"
+                ),
+                "manifest_size_bytes": 320842,
+            },
+            "arm64": {
+                "artifact_id": 10602163417,
+                "artifact_sha256": (
+                    "22c543d5191a9761b2ed4791ce67902fb6106abfaf1228a47d50c82c0dc803c6"
+                ),
+                "artifact_size_bytes": 262743,
+                "job_id": 106052418730,
+                "manifest_path": (
+                    "ubuntu-resolute-20260816T000000Z-arm64-v1.json"
+                ),
+                "manifest_sha256": (
+                    "90698d5a1eae643dfc68a0acbb38cca48b98b297453fdc5d1a10509c792fa16c"
+                ),
+                "manifest_size_bytes": 320842,
+            },
+        }
+        expected_classification_counts = {
+            "checksums": 177,
+            "conffiles": 39,
+            "control": 0,
+            "debconf-config": 7,
+            "format": 1,
+            "maintainer-script": 186,
+            "ownership-list": 177,
+            "package-alternatives": 0,
+            "retained-metadata": 158,
+            "triggers": 84,
+            "unclassified": 0,
+        }
+        self.assertEqual(
+            [item["architecture"] for item in index["manifests"]],
+            ["amd64", "arm64"],
+        )
+        for reference in index["manifests"]:
+            architecture = reference["architecture"]
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    reference["artifact_name"],
+                    f"ubuntu-real-snapshot-{architecture}",
+                )
+                self.assertEqual(
+                    reference["artifact_member"],
+                    "vendor-state-inventory-v1.json",
+                )
+                self.assertEqual(
+                    {
+                        key: reference[key]
+                        for key in expected_provenance[architecture]
+                    },
+                    expected_provenance[architecture],
+                )
+                self.assertEqual(
+                    set(reference),
+                    {
+                        "architecture",
+                        "artifact_id",
+                        "artifact_member",
+                        "artifact_name",
+                        "artifact_sha256",
+                        "artifact_size_bytes",
+                        "inventory",
+                        "job_id",
+                        "manifest_path",
+                        "manifest_sha256",
+                        "manifest_size_bytes",
+                    },
+                )
+                self.assertGreater(reference["artifact_id"], 0)
+                self.assertGreater(reference["job_id"], 0)
+                self.assertGreater(reference["artifact_size_bytes"], 0)
+                self.assertLessEqual(
+                    reference["artifact_size_bytes"], 1024 * 1024
+                )
+                self.assertRegex(reference["artifact_sha256"], digest)
+                manifest_name = pathlib.PurePosixPath(
+                    reference["manifest_path"]
+                )
+                self.assertEqual(len(manifest_name.parts), 1)
+                raw = (REFERENCE_DIRECTORY / manifest_name).read_bytes()
+                self.assertEqual(len(raw), reference["manifest_size_bytes"])
+                self.assertLessEqual(len(raw), 1024 * 1024)
+                self.assertEqual(
+                    hashlib.sha256(raw).hexdigest(),
+                    reference["manifest_sha256"],
+                )
+                self.assertFalse(
+                    any(pattern.search(raw) for pattern in credential_patterns)
+                )
+                self.assertFalse(
+                    any(needle in raw for needle in ambient_needles)
+                )
+                document = json.loads(raw)
+                manifests[architecture] = document
+                validator.validate(document)
+                self.assertEqual(document["schema"], vendor_state_capture.SCHEMA)
+                self.assertEqual(document["version"], 1)
+                self.assertEqual(document["architecture"], architecture)
+                self.assertEqual(
+                    raw, vendor_state_capture.canonical_json(document)
+                )
+
+                limits = document["limits"]
+                controls = document["control_members"]["entries"]
+                alternatives = document["alternatives_database"]
+                requested = document["linked_filesystem"]["requested_paths"]
+                linked = document["linked_filesystem"]["entries"]
+
+                def assert_sorted_unique(values: list[str]) -> None:
+                    self.assertEqual(
+                        values,
+                        sorted(values, key=lambda value: value.encode("utf-8")),
+                    )
+                    self.assertEqual(len(values), len(set(values)))
+
+                assert_sorted_unique([item["path"] for item in controls])
+                assert_sorted_unique([item["path"] for item in alternatives])
+                assert_sorted_unique(requested)
+                assert_sorted_unique([item["path"] for item in linked])
+
+                counts = {
+                    classification: 0
+                    for classification in vendor_state_capture.CLASSIFICATIONS
+                }
+                control_bytes = 0
+                category_paths = {
+                    classification: []
+                    for classification in vendor_state_capture.CLASSIFICATIONS
+                }
+                for item in controls:
+                    path = item["path"]
+                    self.assertTrue(path.startswith("var/lib/dpkg/info/"))
+                    classification = vendor_state_capture._classification(
+                        pathlib.PurePosixPath(path).name
+                    )
+                    self.assertEqual(item["classification"], classification)
+                    counts[classification] += 1
+                    category_paths[classification].append(path)
+                    self.assertLessEqual(
+                        item["size"], limits["max_metadata_file_bytes"]
+                    )
+                    self.assertRegex(item["sha256"], digest)
+                    assert_sorted_unique(item["referenced_paths"])
+                    control_bytes += item["size"]
+                self.assertEqual(
+                    counts,
+                    document["control_members"]["classification_counts"],
+                )
+                self.assertEqual(counts, expected_classification_counts)
+                self.assertLessEqual(
+                    len(controls), limits["max_control_members"]
+                )
+                self.assertEqual(len(controls), 829)
+                self.assertEqual(
+                    [
+                        pathlib.PurePosixPath(path).name
+                        for path in category_paths["debconf-config"]
+                    ],
+                    [
+                        "chrony.config",
+                        "console-setup.config",
+                        "debconf.config",
+                        "iproute2.config",
+                        "keyboard-configuration.config",
+                        "locales.config",
+                        "tzdata.config",
+                    ],
+                )
+                self.assertEqual(category_paths["package-alternatives"], [])
+                self.assertEqual(category_paths["unclassified"], [])
+
+                alternatives_bytes = 0
+                for item in alternatives:
+                    self.assertTrue(
+                        item["path"].startswith(
+                            "var/lib/dpkg/alternatives/"
+                        )
+                    )
+                    self.assertLessEqual(
+                        item["size"], limits["max_metadata_file_bytes"]
+                    )
+                    self.assertRegex(item["sha256"], digest)
+                    assert_sorted_unique(item["referenced_paths"])
+                    alternatives_bytes += item["size"]
+                self.assertLessEqual(
+                    len(alternatives), limits["max_alternatives_records"]
+                )
+                self.assertEqual(len(alternatives), 14)
+                self.assertLessEqual(
+                    control_bytes + alternatives_bytes,
+                    limits["max_total_metadata_bytes"],
+                )
+                self.assertLessEqual(
+                    len(requested), limits["max_referenced_paths"]
+                )
+                self.assertEqual(len(requested), 189)
+
+                linked_bytes = 0
+                linked_kinds: dict[str, int] = {}
+                for path in requested:
+                    self.assertFalse(path.startswith("/"))
+                    self.assertLessEqual(
+                        len(path.encode("utf-8")),
+                        vendor_state_capture.MAX_DOCUMENT_PATH_BYTES,
+                    )
+                    self.assertFalse(
+                        any(
+                            path == denied
+                            or path.startswith(denied + "/")
+                            for denied in vendor_state_capture.SENSITIVE_PATHS
+                        )
+                    )
+                for item in linked:
+                    path = item["path"]
+                    self.assertFalse(path.startswith("/"))
+                    self.assertFalse(
+                        any(
+                            path == denied
+                            or path.startswith(denied + "/")
+                            for denied in vendor_state_capture.SENSITIVE_PATHS
+                        )
+                    )
+                    linked_kinds[item["kind"]] = (
+                        linked_kinds.get(item["kind"], 0) + 1
+                    )
+                    if item["kind"] == "regular":
+                        self.assertLessEqual(
+                            item["size"], limits["max_linked_file_bytes"]
+                        )
+                        self.assertRegex(item["sha256"], digest)
+                        linked_bytes += item["size"]
+                    elif item["kind"] == "symlink":
+                        self.assertLessEqual(
+                            len(item["target"].encode("utf-8")),
+                            limits["max_link_target_bytes"],
+                        )
+                self.assertLessEqual(
+                    len(linked), limits["max_linked_entries"]
+                )
+                self.assertEqual(len(linked), 190)
+                self.assertLessEqual(
+                    linked_bytes, limits["max_total_linked_bytes"]
+                )
+                self.assertEqual(
+                    reference["inventory"],
+                    {
+                        "alternatives_record_bytes": alternatives_bytes,
+                        "alternatives_record_count": len(alternatives),
+                        "classification_counts": counts,
+                        "control_member_bytes": control_bytes,
+                        "control_member_count": len(controls),
+                        "linked_entry_count": len(linked),
+                        "linked_entry_kind_counts": linked_kinds,
+                        "linked_regular_bytes": linked_bytes,
+                        "requested_path_count": len(requested),
+                    },
+                )
+
+                linked_by_path = {item["path"]: item for item in linked}
+                reached_entries: set[str] = set()
+
+                def resolve_recorded_path(start: str) -> str:
+                    current = start
+                    seen: set[str] = set()
+                    hops = 0
+                    while current not in seen:
+                        seen.add(current)
+                        parts = current.split("/")
+                        for length in range(1, len(parts) + 1):
+                            prefix = "/".join(parts[:length])
+                            entry = linked_by_path.get(prefix)
+                            if entry is None:
+                                continue
+                            reached_entries.add(prefix)
+                            if entry["kind"] != "symlink":
+                                self.assertEqual(length, len(parts))
+                                return entry["kind"]
+                            target = entry["target"]
+                            if target.startswith("/"):
+                                resolved = posixpath.normpath(target)[1:]
+                            else:
+                                resolved = posixpath.normpath(
+                                    posixpath.join(
+                                        posixpath.dirname(prefix), target
+                                    )
+                                )
+                            remaining = parts[length:]
+                            current = (
+                                posixpath.normpath(
+                                    posixpath.join(resolved, *remaining)
+                                )
+                                if remaining
+                                else resolved
+                            )
+                            self.assertNotIn(current, {"", "."})
+                            self.assertFalse(current.startswith("/"))
+                            self.assertFalse(current.startswith("../"))
+                            self.assertFalse(
+                                any(
+                                    current == denied
+                                    or current.startswith(denied + "/")
+                                    for denied in vendor_state_capture.SENSITIVE_PATHS
+                                )
+                            )
+                            hops += 1
+                            self.assertLessEqual(
+                                hops, limits["max_link_hops"]
+                            )
+                            break
+                        else:
+                            self.fail(
+                                f"linked path has no recorded terminal: {start}"
+                            )
+                    self.fail(f"linked path contains a cycle: {start}")
+
+                self.assertEqual(
+                    {
+                        resolve_recorded_path(path)
+                        for path in requested
+                    },
+                    {"regular"},
+                )
+                self.assertEqual(reached_entries, set(linked_by_path))
+                declared_paths = {
+                    path
+                    for item in alternatives
+                    for path in item["referenced_paths"]
+                }
+                selector_paths = {
+                    path
+                    for path in requested
+                    if path.startswith("etc/alternatives/")
+                }
+                self.assertTrue(declared_paths.isdisjoint(selector_paths))
+                self.assertEqual(
+                    set(requested), declared_paths | selector_paths
+                )
+
+        amd64 = manifests["amd64"]
+        arm64 = manifests["arm64"]
+        self.assertEqual(
+            amd64["alternatives_database"],
+            arm64["alternatives_database"],
+        )
+        self.assertEqual(
+            amd64["linked_filesystem"]["requested_paths"],
+            arm64["linked_filesystem"]["requested_paths"],
+        )
+        self.assertEqual(
+            [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"size", "sha256"}
+                }
+                for item in amd64["linked_filesystem"]["entries"]
+            ],
+            [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"size", "sha256"}
+                }
+                for item in arm64["linked_filesystem"]["entries"]
+            ],
+        )
+
+        def normalize(path: str) -> str:
+            return path.replace(":amd64", ":ARCH").replace(
+                ":arm64", ":ARCH"
+            )
+
+        expected_control_differences = {
+            "checksums": 140,
+            "conffiles": 1,
+            "control": 0,
+            "debconf-config": 0,
+            "format": 0,
+            "maintainer-script": 28,
+            "ownership-list": 94,
+            "package-alternatives": 0,
+            "retained-metadata": 9,
+            "triggers": 3,
+            "unclassified": 0,
+        }
+        control_maps = {}
+        for architecture, document in manifests.items():
+            control_maps[architecture] = {
+                normalize(item["path"]): {
+                    **item,
+                    "path": normalize(item["path"]),
+                }
+                for item in document["control_members"]["entries"]
+            }
+        self.assertEqual(
+            set(control_maps["amd64"]), set(control_maps["arm64"])
+        )
+        observed_control_differences = {
+            classification: 0
+            for classification in vendor_state_capture.CLASSIFICATIONS
+        }
+        for path in sorted(control_maps["amd64"]):
+            amd64_member = control_maps["amd64"][path]
+            arm64_member = control_maps["arm64"][path]
+            self.assertEqual(
+                amd64_member["classification"],
+                arm64_member["classification"],
+            )
+            changed_fields = {
+                key
+                for key in amd64_member
+                if amd64_member[key] != arm64_member[key]
+            }
+            if changed_fields:
+                self.assertIn(
+                    changed_fields, ({"sha256"}, {"sha256", "size"})
+                )
+                observed_control_differences[
+                    amd64_member["classification"]
+                ] += 1
+        self.assertEqual(
+            observed_control_differences, expected_control_differences
+        )
+
+        linked_maps = {
+            architecture: {
+                item["path"]: item
+                for item in document["linked_filesystem"]["entries"]
+            }
+            for architecture, document in manifests.items()
+        }
+        expected_linked_differences = {
+            "usr/bin/less",
+            "usr/bin/mawk",
+            "usr/bin/more",
+            "usr/bin/nc.openbsd",
+            "usr/bin/sudo.ws",
+            "usr/bin/vim.tiny",
+            "usr/lib/cargo/bin/sudo",
+            "usr/lib/cargo/bin/visudo",
+            "usr/sbin/rmt-tar",
+            "usr/sbin/visudo.ws",
+        }
+        observed_linked_differences = set()
+        for path in sorted(linked_maps["amd64"]):
+            amd64_entry = linked_maps["amd64"][path]
+            arm64_entry = linked_maps["arm64"][path]
+            changed_fields = {
+                key
+                for key in amd64_entry
+                if amd64_entry[key] != arm64_entry[key]
+            }
+            if changed_fields:
+                self.assertEqual(changed_fields, {"sha256", "size"})
+                self.assertEqual(amd64_entry["kind"], "regular")
+                observed_linked_differences.add(path)
+        self.assertEqual(
+            observed_linked_differences, expected_linked_differences
+        )
 
     def test_bounds_fail_closed(self) -> None:
         root = self.fixture_root("bounds")
@@ -824,6 +1397,662 @@ class VendorStateCaptureTests(unittest.TestCase):
         )
         build = (ROOT / "build.zig").read_text()
         self.assertIn('"vendor-state-inventory-v1.json",', build)
+        self.assertIn('"vendor-state-reference-v1.json",', build)
+
+
+class VendorStateReferenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_root = ROOT / ".tmp"
+        temporary_root.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="vendor-state-reference-", dir=temporary_root
+        )
+        self.addCleanup(self.temporary.cleanup)
+        self.workspace = pathlib.Path(self.temporary.name)
+
+    def mutated_index(
+        self,
+        name: str,
+        mutate: Callable[[dict], None],
+        architecture: str | None = "amd64",
+    ) -> pathlib.Path:
+        directory = self.workspace / name
+        directory.mkdir()
+        index = json.loads(REFERENCE_INDEX.read_text())
+        for reference in index["manifests"]:
+            source = REFERENCE_DIRECTORY / reference["manifest_path"]
+            destination = directory / reference["manifest_path"]
+            destination.write_bytes(source.read_bytes())
+        selected_references = [
+            item
+            for item in index["manifests"]
+            if architecture is None or item["architecture"] == architecture
+        ]
+        for selected in selected_references:
+            manifest_path = directory / selected["manifest_path"]
+            document = json.loads(manifest_path.read_text())
+            mutate(document)
+            raw = vendor_state_reference.canonical_json(document)
+            manifest_path.write_bytes(raw)
+            selected["manifest_size_bytes"] = len(raw)
+            selected["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+        index_path = directory / "index-v1.json"
+        index_path.write_bytes(vendor_state_reference.canonical_json(index))
+        return index_path
+
+    def mutated_source_index(
+        self,
+        name: str,
+        mutate: Callable[[dict], None],
+    ) -> pathlib.Path:
+        directory = self.workspace / name
+        directory.mkdir()
+        index = json.loads(REFERENCE_INDEX.read_text())
+        for reference in index["manifests"]:
+            source = REFERENCE_DIRECTORY / reference["manifest_path"]
+            destination = directory / reference["manifest_path"]
+            destination.write_bytes(source.read_bytes())
+        mutate(index)
+        index_path = directory / "index-v1.json"
+        index_path.write_bytes(vendor_state_reference.canonical_json(index))
+        return index_path
+
+    def test_reference_is_deterministic_complete_digest_bound_and_typed(
+        self,
+    ) -> None:
+        raw = REFERENCE_DOCUMENT.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(), REFERENCE_DOCUMENT_SHA256
+        )
+        document = json.loads(raw)
+        self.assertEqual(
+            raw, vendor_state_reference.canonical_json(document)
+        )
+        self.assertEqual(
+            raw,
+            vendor_state_reference.canonical_json(
+                vendor_state_reference.derive(REFERENCE_INDEX)
+            ),
+        )
+        checked = subprocess.run(
+            [
+                sys.executable,
+                str(REFERENCE_TOOL),
+                "--index",
+                str(REFERENCE_INDEX),
+                "--check",
+                str(REFERENCE_DOCUMENT),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+        schema = json.loads(
+            (ROOT / "schema/vendor-state-reference-v1.json").read_text()
+        )
+        jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.Draft202012Validator(
+            schema, format_checker=jsonschema.FormatChecker()
+        ).validate(document)
+        self.assertEqual(document["schema"], vendor_state_reference.SCHEMA)
+        self.assertEqual(document["version"], 1)
+        self.assertEqual(
+            document["source"]["index"],
+            {
+                "path": "index-v1.json",
+                "size": REFERENCE_INDEX.stat().st_size,
+                "sha256": REFERENCE_INDEX_SHA256,
+            },
+        )
+        self.assertEqual(
+            document["source"]["capture_limits"],
+            vendor_state_reference.EXPECTED_LIMITS,
+        )
+        indexed = {
+            item["architecture"]: item
+            for item in json.loads(REFERENCE_INDEX.read_text())["manifests"]
+        }
+        self.assertEqual(
+            [
+                source["architecture"]
+                for source in document["source"]["manifests"]
+            ],
+            ["amd64", "arm64"],
+        )
+        for source in document["source"]["manifests"]:
+            architecture = source["architecture"]
+            self.assertEqual(
+                source["sha256"], indexed[architecture]["manifest_sha256"]
+            )
+            self.assertEqual(
+                source["size"], indexed[architecture]["manifest_size_bytes"]
+            )
+            self.assertEqual(
+                source["artifact"],
+                {
+                    "id": indexed[architecture]["artifact_id"],
+                    "name": indexed[architecture]["artifact_name"],
+                    "member": indexed[architecture]["artifact_member"],
+                    "size": indexed[architecture]["artifact_size_bytes"],
+                    "sha256": indexed[architecture]["artifact_sha256"],
+                    "job_id": indexed[architecture]["job_id"],
+                },
+            )
+
+        boundary = document["boundary"]
+        self.assertEqual(boundary["architectures"], ["amd64", "arm64"])
+        self.assertEqual(boundary["paired_control_member_count"], 829)
+        self.assertEqual(boundary["alternatives_group_count"], 14)
+        self.assertEqual(boundary["requested_path_count"], 189)
+        self.assertEqual(boundary["linked_entry_count"], 190)
+        for architecture in ("amd64", "arm64"):
+            inventory = boundary["per_architecture"][architecture]
+            self.assertEqual(inventory["control_member_count"], 829)
+            self.assertEqual(inventory["alternatives_record_count"], 14)
+            self.assertEqual(inventory["requested_path_count"], 189)
+            self.assertEqual(inventory["linked_entry_count"], 190)
+            self.assertEqual(inventory["config_member_count"], 7)
+            self.assertEqual(
+                inventory["package_alternatives_member_count"], 0
+            )
+            self.assertEqual(
+                inventory["unclassified_control_member_count"], 0
+            )
+            self.assertEqual(
+                inventory["control_handling_counts"],
+                {
+                    "bounded-inert-retained-metadata": 158,
+                    "reference-execution-required": 7,
+                    "supported-typed-state": 664,
+                },
+            )
+
+        controls = document["control_members"]
+        identities = [item["identity"] for item in controls]
+        self.assertEqual(
+            identities,
+            sorted(identities, key=lambda value: value.encode("utf-8")),
+        )
+        self.assertEqual(len(identities), len(set(identities)))
+        self.assertEqual(len(controls), 829)
+        configs = [
+            item
+            for item in controls
+            if item["classification"] == "debconf-config"
+        ]
+        self.assertEqual(
+            [item["identity"] for item in configs],
+            [
+                "chrony.config",
+                "console-setup.config",
+                "debconf.config",
+                "iproute2.config",
+                "keyboard-configuration.config",
+                "locales.config",
+                "tzdata.config",
+            ],
+        )
+        for item in configs:
+            self.assertEqual(item["owner"]["kind"], "package")
+            self.assertEqual(
+                item["handling"], "reference-execution-required"
+            )
+            self.assertNotEqual(
+                item["reference_execution_requirement"], "none"
+            )
+            for architecture in ("amd64", "arm64"):
+                fact = item["architectures"][architecture]
+                self.assertTrue(fact["path"].endswith(".config"))
+                self.assertEqual(fact["mode"], "0755")
+        for item in controls:
+            if item["classification"] == "debconf-config":
+                continue
+            self.assertIn(
+                item["handling"],
+                {
+                    "supported-typed-state",
+                    "bounded-inert-retained-metadata",
+                },
+            )
+            self.assertEqual(item["reference_execution_requirement"], "none")
+            self.assertNotEqual(item["classification"], "unclassified")
+
+        alternatives = document["alternatives"]
+        groups = alternatives["groups"]
+        group_names = [item["name"] for item in groups]
+        self.assertEqual(
+            group_names,
+            [
+                "awk",
+                "builtins.7.gz",
+                "editor",
+                "ex",
+                "nc",
+                "newt-palette",
+                "pager",
+                "rmt",
+                "rview",
+                "sudo",
+                "vi",
+                "view",
+                "vtrgb",
+                "which",
+            ],
+        )
+        self.assertEqual(len(group_names), len(set(group_names)))
+        for group in groups:
+            self.assertEqual(
+                group["record"]["path"],
+                f"var/lib/dpkg/alternatives/{group['name']}",
+            )
+            self.assertEqual(group["ownership"]["status"], "not-captured")
+            self.assertEqual(
+                group["selection_mode"]["status"],
+                "reference-execution-required",
+            )
+            self.assertEqual(
+                group["priorities"]["status"],
+                "reference-execution-required",
+            )
+            masters = [
+                link
+                for link in group["links"]
+                if link["relationship"] == "master"
+            ]
+            self.assertEqual(len(masters), 1)
+            self.assertEqual(
+                [link["link_path"] for link in group["links"]],
+                sorted(
+                    (link["link_path"] for link in group["links"]),
+                    key=lambda value: value.encode("utf-8"),
+                ),
+            )
+            self.assertEqual(
+                [item["path"] for item in group["candidate_paths"]],
+                sorted(
+                    (item["path"] for item in group["candidate_paths"]),
+                    key=lambda value: value.encode("utf-8"),
+                ),
+            )
+            self.assertEqual(
+                len({link["selector_path"] for link in group["links"]}),
+                len(group["links"]),
+            )
+            self.assertEqual(
+                masters[0]["selector_path"],
+                f"etc/alternatives/{group['name']}",
+            )
+            classified_paths = {
+                item["link_path"] for item in group["links"]
+            } | {item["path"] for item in group["candidate_paths"]}
+            self.assertEqual(
+                classified_paths, set(group["record"]["referenced_paths"])
+            )
+            self.assertEqual(
+                len(group["record"]["referenced_paths"]),
+                len(classified_paths),
+            )
+            for link in group["links"]:
+                self.assertEqual(
+                    link["ownership"]["status"], "not-captured"
+                )
+
+        requested = alternatives["requested_paths"]
+        requested_names = [item["path"] for item in requested]
+        self.assertEqual(len(requested), 189)
+        self.assertEqual(len(requested_names), len(set(requested_names)))
+        self.assertEqual(
+            requested_names,
+            sorted(requested_names, key=lambda value: value.encode("utf-8")),
+        )
+        for item in requested:
+            self.assertEqual(item["chain"][-1], item["terminal_path"])
+        reached = {
+            path for item in requested for path in item["chain"]
+        }
+        linked = alternatives["linked_entries"]
+        linked_names = [item["identity"] for item in linked]
+        self.assertEqual(len(linked), 190)
+        self.assertEqual(len(linked_names), len(set(linked_names)))
+        self.assertEqual(
+            linked_names,
+            sorted(linked_names, key=lambda value: value.encode("utf-8")),
+        )
+        self.assertEqual(reached, set(linked_names))
+        for item in linked:
+            self.assertTrue(item["roles"])
+            self.assertEqual(item["ownership"]["status"], "not-captured")
+            for architecture in ("amd64", "arm64"):
+                fact = item["architectures"][architecture]
+                if item["kind"] == "regular":
+                    self.assertRegex(fact["sha256"], r"^[0-9a-f]{64}$")
+                else:
+                    self.assertIn("target", fact)
+        self.assertEqual(
+            alternatives["retained_selector_metadata"],
+            [
+                {
+                    "handling": "bounded-inert-retained-metadata",
+                    "path": "etc/alternatives/README",
+                    "rationale": (
+                        "This regular etc/alternatives entry is not a selector "
+                        "or alternatives database record and is retained by identity."
+                    ),
+                    "terminal_path": "etc/alternatives/README",
+                }
+            ],
+        )
+
+        differences = document["cross_architecture_differences"]
+        self.assertEqual(len(differences["path_qualifications"]), 422)
+        self.assertEqual(len(differences["control_content"]), 275)
+        for field in ("path_qualifications", "control_content", "linked_content"):
+            difference_identities = [
+                item["identity"] for item in differences[field]
+            ]
+            self.assertEqual(
+                difference_identities,
+                sorted(
+                    difference_identities,
+                    key=lambda value: value.encode("utf-8"),
+                ),
+            )
+        self.assertEqual(
+            differences["control_content_counts"],
+            {
+                "checksums": 140,
+                "conffiles": 1,
+                "control": 0,
+                "debconf-config": 0,
+                "format": 0,
+                "maintainer-script": 28,
+                "ownership-list": 94,
+                "package-alternatives": 0,
+                "retained-metadata": 9,
+                "triggers": 3,
+                "unclassified": 0,
+            },
+        )
+        self.assertEqual(
+            [item["identity"] for item in differences["linked_content"]],
+            [
+                "usr/bin/less",
+                "usr/bin/mawk",
+                "usr/bin/more",
+                "usr/bin/nc.openbsd",
+                "usr/bin/sudo.ws",
+                "usr/bin/vim.tiny",
+                "usr/lib/cargo/bin/sudo",
+                "usr/lib/cargo/bin/visudo",
+                "usr/sbin/rmt-tar",
+                "usr/sbin/visudo.ws",
+            ],
+        )
+        controls_by_identity = {
+            item["identity"]: item for item in controls
+        }
+        for difference in differences["control_content"]:
+            self.assertNotIn("amd64", difference)
+            self.assertNotIn("arm64", difference)
+            control = controls_by_identity[difference["identity"]]
+            self.assertEqual(
+                difference["classification"], control["classification"]
+            )
+            self.assertEqual(
+                difference["changed_fields"],
+                [
+                    field
+                    for field in vendor_state_reference.CONTROL_FACT_FIELDS
+                    if control["architectures"]["amd64"][field]
+                    != control["architectures"]["arm64"][field]
+                ],
+            )
+        linked_by_identity = {
+            item["identity"]: item for item in linked
+        }
+        for difference in differences["linked_content"]:
+            self.assertNotIn("amd64", difference)
+            self.assertNotIn("arm64", difference)
+            entry = linked_by_identity[difference["identity"]]
+            self.assertEqual(difference["kind"], entry["kind"])
+            self.assertEqual(
+                difference["changed_fields"],
+                [
+                    field
+                    for field in vendor_state_reference.LINKED_FACT_FIELDS
+                    if entry["architectures"]["amd64"].get(field)
+                    != entry["architectures"]["arm64"].get(field)
+                ],
+            )
+        requirements = {
+            item["id"]: item
+            for item in document["reference_execution_requirements"]
+        }
+        self.assertEqual(
+            set(requirements),
+            {
+                "debconf-config-execution",
+                "alternatives-record-semantics",
+                "alternatives-mutation-behavior",
+            },
+        )
+        native_unpack = (ROOT / "src/native_unpack.zig").read_text()
+        self.assertIn(
+            'std.mem.endsWith(u8, entry.name, ".alternatives")',
+            native_unpack,
+        )
+        self.assertIn(
+            "if (database.model.opaque_info.len != 0)\n"
+            '        return .{ .outcome = .handoff, .detail = "package_metadata" };',
+            native_unpack,
+        )
+
+    def test_reference_derivation_rejects_unclassified_manifest_items(
+        self,
+    ) -> None:
+        def mutate(document: dict) -> None:
+            member = next(
+                item
+                for item in document["control_members"]["entries"]
+                if item["classification"] == "retained-metadata"
+            )
+            old = member["classification"]
+            member["path"] = member["path"].rsplit(".", 1)[0] + ".vendor-state"
+            member["classification"] = "unclassified"
+            counts = document["control_members"]["classification_counts"]
+            counts[old] -= 1
+            counts["unclassified"] += 1
+            document["control_members"]["entries"].sort(
+                key=lambda item: item["path"].encode("utf-8")
+            )
+
+        index = self.mutated_index("unclassified", mutate)
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError,
+            "unclassified control member",
+        ):
+            vendor_state_reference.derive(index)
+
+    def test_reference_derivation_rejects_malformed_oversized_and_unsafe_state(
+        self,
+    ) -> None:
+        def add_uncaptured_reference(document: dict) -> None:
+            references = document["alternatives_database"][0][
+                "referenced_paths"
+            ]
+            references[0] = "usr/bin/not-captured"
+            references.sort(key=lambda value: value.encode("utf-8"))
+
+        cases = (
+            (
+                "malformed",
+                lambda document: document["control_members"]["entries"][0].__setitem__(
+                    "mode", "9999"
+                ),
+                "malformed mode",
+                "amd64",
+            ),
+            (
+                "oversized",
+                lambda document: document["control_members"]["entries"][0].__setitem__(
+                    "size",
+                    document["limits"]["max_metadata_file_bytes"] + 1,
+                ),
+                "metadata file byte limit",
+                "amd64",
+            ),
+            (
+                "raised-limits",
+                lambda document: document["limits"].__setitem__(
+                    "max_metadata_file_bytes",
+                    document["limits"]["max_metadata_file_bytes"] + 1,
+                ),
+                "capture limits changed",
+                "amd64",
+            ),
+            (
+                "traversal",
+                lambda document: document["linked_filesystem"]["entries"][0].__setitem__(
+                    "path", "usr/../escape"
+                ),
+                "unsafe path component",
+                "amd64",
+            ),
+            (
+                "escaping-symlink",
+                lambda document: next(
+                    item
+                    for item in document["linked_filesystem"]["entries"]
+                    if item["path"] == "etc/alternatives/awk"
+                ).__setitem__("target", "../../../outside"),
+                "escapes the reference root",
+                "amd64",
+            ),
+            (
+                "sensitive-symlink",
+                lambda document: next(
+                    item
+                    for item in document["linked_filesystem"]["entries"]
+                    if item["path"] == "etc/alternatives/awk"
+                ).__setitem__("target", "/etc/shadow"),
+                "excluded sensitive state",
+                None,
+            ),
+            (
+                "uncaptured-reference",
+                add_uncaptured_reference,
+                "references an uncaptured path",
+                None,
+            ),
+            (
+                "cycle",
+                lambda document: next(
+                    item
+                    for item in document["linked_filesystem"]["entries"]
+                    if item["path"] == "etc/alternatives/awk"
+                ).__setitem__("target", "/etc/alternatives/awk"),
+                "symlink cycle",
+                None,
+            ),
+            (
+                "special-file",
+                lambda document: document["linked_filesystem"]["entries"].__setitem__(
+                    0,
+                    {
+                        "path": document["linked_filesystem"]["entries"][0][
+                            "path"
+                        ],
+                        "kind": "fifo",
+                    },
+                ),
+                "unsupported linked entry kind",
+                "amd64",
+            ),
+        )
+        for name, mutate, message, architecture in cases:
+            with self.subTest(name=name):
+                index = self.mutated_index(
+                    name, mutate, architecture=architecture
+                )
+                with self.assertRaisesRegex(
+                    vendor_state_reference.DerivationError, message
+                ):
+                    vendor_state_reference.derive(index)
+
+    def test_reference_derivation_rejects_unsafe_sources_and_input_files(
+        self,
+    ) -> None:
+        private_uri = self.mutated_source_index(
+            "private-uri",
+            lambda index: index["source"].__setitem__(
+                "snapshot_uri",
+                "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z?token=secret",
+            ),
+        )
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "public HTTPS URI"
+        ):
+            vendor_state_reference.derive(private_uri)
+
+        symlink_directory = self.workspace / "symlink-index"
+        symlink_directory.mkdir()
+        symlink_index = symlink_directory / "index-v1.json"
+        symlink_index.symlink_to(REFERENCE_INDEX)
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "not a regular file"
+        ):
+            vendor_state_reference.derive(symlink_index)
+
+        fifo_directory = self.workspace / "fifo-index"
+        fifo_directory.mkdir()
+        fifo_index = fifo_directory / "index-v1.json"
+        os.mkfifo(fifo_index)
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "not a regular file"
+        ):
+            vendor_state_reference.derive(fifo_index)
+
+        oversized_directory = self.workspace / "oversized-index"
+        oversized_directory.mkdir()
+        oversized_index = oversized_directory / "index-v1.json"
+        oversized_index.write_bytes(
+            b" " * (vendor_state_reference.MAX_INDEX_BYTES + 1)
+        )
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "exceeds byte limit"
+        ):
+            vendor_state_reference.derive(oversized_index)
+
+        nonstandard_directory = self.workspace / "nonstandard-index"
+        nonstandard_directory.mkdir()
+        nonstandard_index = nonstandard_directory / "index-v1.json"
+        nonstandard_index.write_bytes(b'{"source": NaN}\n')
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError,
+            "non-standard JSON numeric constant",
+        ):
+            vendor_state_reference.derive(nonstandard_index)
+
+        manifest_symlink = self.mutated_source_index(
+            "manifest-symlink", lambda index: None
+        )
+        manifest_index = json.loads(manifest_symlink.read_text())
+        manifest_path = (
+            manifest_symlink.parent
+            / manifest_index["manifests"][0]["manifest_path"]
+        )
+        manifest_path.unlink()
+        manifest_path.symlink_to(
+            REFERENCE_DIRECTORY
+            / manifest_index["manifests"][0]["manifest_path"]
+        )
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError,
+            "amd64 manifest is not a regular file",
+        ):
+            vendor_state_reference.derive(manifest_symlink)
 
 
 if __name__ == "__main__":
