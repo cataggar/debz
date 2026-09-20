@@ -271,5 +271,17 @@ architecture-specific observation is reviewed. A future native implementation
 must reproduce the applicable byte/mode/ownership publication, rollback,
 removal, and non-execution contract.
 Current opaque-info and unsupported-archive-metadata guards remain unchanged.
-Remaining oracle work is alternatives record decoding and install, upgrade,
-remove, purge, failure, and recovery mutation behavior.
+
+The remaining alternatives reference requirement is closed separately by the
+[pinned dpkg/update-alternatives oracle](dpkg-alternatives-reference.md).
+Its canonical schema and fixture bind dpkg/update-alternatives 1.22.22, both
+architecture-specific executable pins, the reviewed 14 groups, 189 requested
+paths and linked topology, and an amd64-only execution. The external-tool rows
+cover exact record bytes, auto/manual mode, priorities and ties, master/slave
+shape, missing providers, malformed and non-regular records, root escapes,
+symlink/cycle attacks, and database/link partial states. Direct-dpkg rows cover
+opaque `.alternatives` info members plus maintainer-script-driven install,
+reinstall, upgrade, remove, purge, multiple providers, script failure/unwind,
+interruption, and recovery. Dpkg never interprets the member or invokes the
+tool implicitly. Arm64 publication is rejected until the executable oracle is
+run and reviewed natively there. Current production guards remain unchanged.

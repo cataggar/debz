@@ -1,0 +1,1813 @@
+{
+  "$defs": {
+    "absolutePath": {
+      "maxLength": 4096,
+      "pattern": "^/(?:[^/\\u0000-\\u001f\\u007f]+/)*[^/\\u0000-\\u001f\\u007f]+$",
+      "type": "string"
+    },
+    "archiveBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "archiveMap": {
+      "additionalProperties": {
+        "$ref": "#/$defs/archiveBinding"
+      },
+      "maxProperties": 8,
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9+.-]*$"
+      },
+      "type": "object"
+    },
+    "databaseState": {
+      "additionalProperties": false,
+      "properties": {
+        "committed": {
+          "$ref": "#/$defs/optionalPackageState"
+        },
+        "journal_latest": {
+          "$ref": "#/$defs/optionalPackageState"
+        },
+        "journal_nonempty": {
+          "type": "boolean"
+        },
+        "temporary_update": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "committed",
+        "journal_latest",
+        "journal_nonempty",
+        "temporary_update"
+      ],
+      "type": "object"
+    },
+    "digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "dpkgState": {
+      "additionalProperties": false,
+      "properties": {
+        "all_info": {
+          "$ref": "#/$defs/pathObservations"
+        },
+        "alternatives": {
+          "$ref": "#/$defs/groupState"
+        },
+        "database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "database_files": {
+          "$ref": "#/$defs/pathObservations"
+        },
+        "info": {
+          "items": {
+            "$ref": "#/$defs/infoFile"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "payload": {
+          "$ref": "#/$defs/pathObservations"
+        },
+        "trace": {
+          "$ref": "#/$defs/scriptTrace"
+        }
+      },
+      "required": [
+        "all_info",
+        "alternatives",
+        "database",
+        "database_files",
+        "info",
+        "payload",
+        "trace"
+      ],
+      "type": "object"
+    },
+    "fileBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "groupState": {
+      "additionalProperties": false,
+      "properties": {
+        "generic_links": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "fact": {
+                "$ref": "#/$defs/optionalPathFact"
+              },
+              "path": {
+                "$ref": "#/$defs/absolutePath"
+              }
+            },
+            "required": [
+              "fact",
+              "path"
+            ],
+            "type": "object"
+          },
+          "maxItems": 128,
+          "type": "array"
+        },
+        "record": {
+          "$ref": "#/$defs/optionalPathFact"
+        },
+        "selectors": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "fact": {
+                "$ref": "#/$defs/optionalPathFact"
+              },
+              "name": {
+                "$ref": "#/$defs/name"
+              }
+            },
+            "required": [
+              "fact",
+              "name"
+            ],
+            "type": "object"
+          },
+          "maxItems": 256,
+          "type": "array"
+        }
+      },
+      "required": [
+        "generic_links",
+        "record",
+        "selectors"
+      ],
+      "type": "object"
+    },
+    "infoFile": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes_base64": {
+          "maxLength": 1398104,
+          "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+          "type": "string"
+        },
+        "gid": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/mode"
+        },
+        "name": {
+          "$ref": "#/$defs/name"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 1048576,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "uid": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes_base64",
+        "gid",
+        "mode",
+        "name",
+        "sha256",
+        "size",
+        "uid"
+      ],
+      "type": "object"
+    },
+    "mode": {
+      "pattern": "^[0-7]{4}$",
+      "type": "string"
+    },
+    "name": {
+      "maxLength": 256,
+      "minLength": 1,
+      "pattern": "^[^/\\u0000-\\u001f\\u007f]+$",
+      "type": "string"
+    },
+    "optionalPackageState": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/packageState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "optionalPathFact": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/pathFact"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "packageState": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "enum": [
+            "amd64",
+            "arm64"
+          ]
+        },
+        "config_version": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "description": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "maintainer": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "status": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "required": [
+        "architecture",
+        "description",
+        "maintainer",
+        "status",
+        "version"
+      ],
+      "type": "object"
+    },
+    "pathFact": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "bytes_base64": {
+              "maxLength": 2796204,
+              "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+              "type": "string"
+            },
+            "gid": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "regular"
+            },
+            "mode": {
+              "$ref": "#/$defs/mode"
+            },
+            "sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "size": {
+              "maximum": 2097152,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "uid": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "bytes_base64",
+            "gid",
+            "kind",
+            "mode",
+            "sha256",
+            "size",
+            "uid"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "gid": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "symlink"
+            },
+            "mode": {
+              "$ref": "#/$defs/mode"
+            },
+            "target": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "uid": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "gid",
+            "kind",
+            "mode",
+            "target",
+            "uid"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "gid": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "directory",
+                "fifo",
+                "special"
+              ]
+            },
+            "mode": {
+              "$ref": "#/$defs/mode"
+            },
+            "uid": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "gid",
+            "kind",
+            "mode",
+            "uid"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "pathObservation": {
+      "additionalProperties": false,
+      "properties": {
+        "fact": {
+          "$ref": "#/$defs/optionalPathFact"
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        }
+      },
+      "required": [
+        "fact",
+        "path"
+      ],
+      "type": "object"
+    },
+    "pathObservations": {
+      "items": {
+        "$ref": "#/$defs/pathObservation"
+      },
+      "maxItems": 64,
+      "type": "array"
+    },
+    "relativePath": {
+      "maxLength": 4096,
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*//)[^\\u0000-\\u001f\\u007f]+$",
+      "type": "string"
+    },
+    "scriptTrace": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "arguments": {
+            "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 512,
+            "type": "array"
+          },
+          "script": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "arguments",
+          "script"
+        ],
+        "type": "object"
+      },
+      "maxItems": 128,
+      "type": "array"
+    },
+    "toolResult": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "maxItems": 512,
+          "minItems": 1,
+          "type": "array"
+        },
+        "exit": {
+          "maximum": 255,
+          "minimum": -255,
+          "type": "integer"
+        },
+        "log": {
+          "maxLength": 262144,
+          "type": "string"
+        },
+        "output": {
+          "maxLength": 131072,
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "exit",
+        "log",
+        "output"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://debz.dev/schema/dpkg-alternatives-reference-v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "boundary": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture_scope": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "architectures": {
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "const": "amd64"
+            },
+            {
+              "const": "arm64"
+            }
+          ],
+          "type": "array"
+        },
+        "environment": {
+          "additionalProperties": false,
+          "properties": {
+            "ambient_alternatives": {
+              "const": "forbidden"
+            },
+            "ambient_dpkg_database": {
+              "const": "signature-checked-unchanged"
+            },
+            "frontend_environment": {
+              "const": "forbidden"
+            },
+            "locale": {
+              "const": "C"
+            },
+            "root": {
+              "const": "guarded-disposable-real-directory"
+            },
+            "temporary_and_cache_storage": {
+              "const": "repository-local"
+            }
+          },
+          "required": [
+            "ambient_alternatives",
+            "ambient_dpkg_database",
+            "frontend_environment",
+            "locale",
+            "root",
+            "temporary_and_cache_storage"
+          ],
+          "type": "object"
+        },
+        "invocation_clock": {
+          "additionalProperties": false,
+          "properties": {
+            "log_clock": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "task_invocation": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "unstable_filesystem_timestamps": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "log_clock",
+            "task_invocation",
+            "unstable_filesystem_timestamps"
+          ],
+          "type": "object"
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "dependency_timeout_seconds": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_archive_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_argument_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_arguments": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_cases": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_database_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_database_files": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_groups": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_host_entries": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_info_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_info_files": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_linked_entries": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_log_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_output_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_path_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_payload_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_payload_files": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_record_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_relationships": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_requested_paths": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maximum_total_record_bytes": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "pause_timeout_seconds": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "subprocess_cleanup_seconds": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "subprocess_timeout_seconds": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "dependency_timeout_seconds",
+            "maximum_archive_bytes",
+            "maximum_argument_bytes",
+            "maximum_arguments",
+            "maximum_cases",
+            "maximum_database_bytes",
+            "maximum_database_files",
+            "maximum_groups",
+            "maximum_host_entries",
+            "maximum_info_bytes",
+            "maximum_info_files",
+            "maximum_linked_entries",
+            "maximum_log_bytes",
+            "maximum_output_bytes",
+            "maximum_path_bytes",
+            "maximum_payload_bytes",
+            "maximum_payload_files",
+            "maximum_record_bytes",
+            "maximum_relationships",
+            "maximum_requested_paths",
+            "maximum_total_record_bytes",
+            "pause_timeout_seconds",
+            "subprocess_cleanup_seconds",
+            "subprocess_timeout_seconds"
+          ],
+          "type": "object"
+        },
+        "observed_architecture": {
+          "const": "amd64"
+        }
+      },
+      "required": [
+        "architecture_scope",
+        "architectures",
+        "environment",
+        "invocation_clock",
+        "limits",
+        "observed_architecture"
+      ],
+      "type": "object"
+    },
+    "native_requirements": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 16,
+      "minItems": 8,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "observed_behavior": {
+      "additionalProperties": false,
+      "properties": {
+        "direct_dpkg": {
+          "additionalProperties": false,
+          "properties": {
+            "conflicting_packages": {
+              "additionalProperties": false,
+              "properties": {
+                "all_info": {
+                  "$ref": "#/$defs/pathObservations"
+                },
+                "database_files": {
+                  "$ref": "#/$defs/pathObservations"
+                },
+                "first_archive": {
+                  "$ref": "#/$defs/archiveBinding"
+                },
+                "first_result": {
+                  "$ref": "#/$defs/toolResult"
+                },
+                "first_state": {
+                  "$ref": "#/$defs/databaseState"
+                },
+                "payload": {
+                  "$ref": "#/$defs/pathObservations"
+                },
+                "second_archive": {
+                  "$ref": "#/$defs/archiveBinding"
+                },
+                "second_result": {
+                  "$ref": "#/$defs/toolResult"
+                },
+                "second_status": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "Architecture": {
+                      "type": "string"
+                    },
+                    "Package": {
+                      "type": "string"
+                    },
+                    "Status": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "Architecture",
+                    "Package",
+                    "Status"
+                  ],
+                  "type": "object"
+                },
+                "shared_file": {
+                  "$ref": "#/$defs/pathObservation"
+                }
+              },
+              "required": [
+                "all_info",
+                "database_files",
+                "first_archive",
+                "first_result",
+                "first_state",
+                "payload",
+                "second_archive",
+                "second_result",
+                "second_status",
+                "shared_file"
+              ],
+              "type": "object"
+            },
+            "conflicting_providers": {
+              "additionalProperties": false,
+              "properties": {
+                "archives": {
+                  "$ref": "#/$defs/archiveMap"
+                },
+                "phases": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "all_info": {
+                        "$ref": "#/$defs/pathObservations"
+                      },
+                      "alternatives": {
+                        "$ref": "#/$defs/groupState"
+                      },
+                      "database_files": {
+                        "$ref": "#/$defs/pathObservations"
+                      },
+                      "info": {
+                        "items": {
+                          "$ref": "#/$defs/infoFile"
+                        },
+                        "maxItems": 32,
+                        "type": "array"
+                      },
+                      "operation": {
+                        "enum": [
+                          "install-a",
+                          "install-b",
+                          "remove-b",
+                          "purge-a"
+                        ]
+                      },
+                      "package": {
+                        "$ref": "#/$defs/databaseState"
+                      },
+                      "payload": {
+                        "$ref": "#/$defs/pathObservations"
+                      },
+                      "result": {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      "trace": {
+                        "$ref": "#/$defs/scriptTrace"
+                      }
+                    },
+                    "required": [
+                      "all_info",
+                      "alternatives",
+                      "database_files",
+                      "info",
+                      "operation",
+                      "package",
+                      "payload",
+                      "result",
+                      "trace"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "archives",
+                "phases"
+              ],
+              "type": "object"
+            },
+            "failure_recovery": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "archives": {
+                    "$ref": "#/$defs/archiveMap"
+                  },
+                  "case": {
+                    "enum": [
+                      "fresh-postinst",
+                      "upgrade-prerm",
+                      "upgrade-postinst",
+                      "remove-postrm"
+                    ]
+                  },
+                  "failed": {
+                    "$ref": "#/$defs/dpkgState"
+                  },
+                  "operation_result": {
+                    "$ref": "#/$defs/toolResult"
+                  },
+                  "recovered": {
+                    "$ref": "#/$defs/dpkgState"
+                  },
+                  "recovery_result": {
+                    "$ref": "#/$defs/toolResult"
+                  },
+                  "seed_result": {
+                    "oneOf": [
+                      {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "archives",
+                  "case",
+                  "failed",
+                  "operation_result",
+                  "recovered",
+                  "recovery_result",
+                  "seed_result"
+                ],
+                "type": "object"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "interruption_recovery": {
+              "additionalProperties": false,
+              "properties": {
+                "archive": {
+                  "$ref": "#/$defs/archiveBinding"
+                },
+                "interrupted": {
+                  "$ref": "#/$defs/dpkgState"
+                },
+                "interruption_result": {
+                  "$ref": "#/$defs/toolResult"
+                },
+                "recovered": {
+                  "$ref": "#/$defs/dpkgState"
+                },
+                "recovery_result": {
+                  "$ref": "#/$defs/toolResult"
+                }
+              },
+              "required": [
+                "archive",
+                "interrupted",
+                "interruption_result",
+                "recovered",
+                "recovery_result"
+              ],
+              "type": "object"
+            },
+            "scriptless_alternatives_member": {
+              "additionalProperties": false,
+              "properties": {
+                "archive": {
+                  "$ref": "#/$defs/archiveBinding"
+                },
+                "install_result": {
+                  "$ref": "#/$defs/toolResult"
+                },
+                "installed": {
+                  "$ref": "#/$defs/dpkgState"
+                },
+                "purge_result": {
+                  "$ref": "#/$defs/toolResult"
+                },
+                "purged": {
+                  "$ref": "#/$defs/dpkgState"
+                },
+                "remove_result": {
+                  "$ref": "#/$defs/toolResult"
+                },
+                "removed": {
+                  "$ref": "#/$defs/dpkgState"
+                }
+              },
+              "required": [
+                "archive",
+                "install_result",
+                "installed",
+                "purge_result",
+                "purged",
+                "remove_result",
+                "removed"
+              ],
+              "type": "object"
+            },
+            "successful_lifecycle": {
+              "additionalProperties": false,
+              "properties": {
+                "archives": {
+                  "$ref": "#/$defs/archiveMap"
+                },
+                "phases": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "operation": {
+                        "enum": [
+                          "install",
+                          "reinstall",
+                          "upgrade",
+                          "remove",
+                          "purge"
+                        ]
+                      },
+                      "result": {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      "state": {
+                        "$ref": "#/$defs/dpkgState"
+                      }
+                    },
+                    "required": [
+                      "operation",
+                      "result",
+                      "state"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 5,
+                  "minItems": 5,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "archives",
+                "phases"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "conflicting_packages",
+            "conflicting_providers",
+            "failure_recovery",
+            "interruption_recovery",
+            "scriptless_alternatives_member",
+            "successful_lifecycle"
+          ],
+          "type": "object"
+        },
+        "external_update_alternatives": {
+          "additionalProperties": false,
+          "properties": {
+            "atomicity": {
+              "additionalProperties": false,
+              "properties": {
+                "failure_injection": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "blocker": {
+                        "$ref": "#/$defs/pathFact"
+                      },
+                      "case": {
+                        "enum": [
+                          "database-temporary-blocked",
+                          "selector-temporary-blocked",
+                          "generic-temporary-blocked"
+                        ]
+                      },
+                      "result": {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      "state": {
+                        "$ref": "#/$defs/groupState"
+                      }
+                    },
+                    "required": [
+                      "blocker",
+                      "case",
+                      "result",
+                      "state"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 3,
+                  "minItems": 3,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "failure_injection"
+              ],
+              "type": "object"
+            },
+            "malformed_records": {
+              "additionalProperties": false,
+              "properties": {
+                "oracle_preflight_rejections": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "case": {
+                        "enum": [
+                          "directory",
+                          "symlink",
+                          "fifo",
+                          "oversized"
+                        ]
+                      },
+                      "error": {
+                        "maxLength": 4096,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "case",
+                      "error"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
+                "regular_record_cases": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "case": {
+                        "enum": [
+                          "empty",
+                          "truncated",
+                          "invalid-mode",
+                          "invalid-priority",
+                          "embedded-nul"
+                        ]
+                      },
+                      "input": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "sha256": {
+                            "$ref": "#/$defs/digest"
+                          },
+                          "size": {
+                            "maximum": 262144,
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "sha256",
+                          "size"
+                        ],
+                        "type": "object"
+                      },
+                      "result": {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      "state": {
+                        "$ref": "#/$defs/groupState"
+                      }
+                    },
+                    "required": [
+                      "case",
+                      "input",
+                      "result",
+                      "state"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 5,
+                  "minItems": 5,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "oracle_preflight_rejections",
+                "regular_record_cases"
+              ],
+              "type": "object"
+            },
+            "missing_targets_and_group_shape": {
+              "additionalProperties": false,
+              "properties": {
+                "steps": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "operation": {
+                        "enum": [
+                          "install-missing-high",
+                          "install-present-low",
+                          "reregister-present-with-missing-slave",
+                          "install-second-with-slave",
+                          "reregister-selected-without-slave",
+                          "query-prunes-missing-selected",
+                          "auto-with-all-targets-missing"
+                        ]
+                      },
+                      "result": {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      "state": {
+                        "$ref": "#/$defs/groupState"
+                      }
+                    },
+                    "required": [
+                      "operation",
+                      "result",
+                      "state"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 7,
+                  "minItems": 7,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "steps"
+              ],
+              "type": "object"
+            },
+            "path_and_symlink_attacks": {
+              "additionalProperties": false,
+              "properties": {
+                "oracle_rejections": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "case": {
+                        "maxLength": 256,
+                        "type": "string"
+                      },
+                      "error": {
+                        "maxLength": 4096,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "case",
+                      "error"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 10,
+                  "minItems": 10,
+                  "type": "array"
+                },
+                "raw_tool_cases": {
+                  "items": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "case": {
+                            "const": "generic-link-traversal"
+                          },
+                          "outside_root": {
+                            "$ref": "#/$defs/optionalPathFact"
+                          },
+                          "record": {
+                            "$ref": "#/$defs/optionalPathFact"
+                          },
+                          "result": {
+                            "$ref": "#/$defs/toolResult"
+                          }
+                        },
+                        "required": [
+                          "case",
+                          "outside_root",
+                          "record",
+                          "result"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "case": {
+                            "const": "alternatives-directory-symlink"
+                          },
+                          "generic": {
+                            "$ref": "#/$defs/optionalPathFact"
+                          },
+                          "outside_root": {
+                            "$ref": "#/$defs/optionalPathFact"
+                          },
+                          "result": {
+                            "$ref": "#/$defs/toolResult"
+                          }
+                        },
+                        "required": [
+                          "case",
+                          "generic",
+                          "outside_root",
+                          "result"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "case": {
+                            "const": "self-referential-provider"
+                          },
+                          "result": {
+                            "$ref": "#/$defs/toolResult"
+                          },
+                          "state": {
+                            "$ref": "#/$defs/groupState"
+                          }
+                        },
+                        "required": [
+                          "case",
+                          "result",
+                          "state"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "case": {
+                            "const": "indirect-symlink-cycle"
+                          },
+                          "provider": {
+                            "$ref": "#/$defs/optionalPathFact"
+                          },
+                          "result": {
+                            "$ref": "#/$defs/toolResult"
+                          },
+                          "setup_result": {
+                            "$ref": "#/$defs/toolResult"
+                          },
+                          "state": {
+                            "$ref": "#/$defs/groupState"
+                          }
+                        },
+                        "required": [
+                          "case",
+                          "provider",
+                          "result",
+                          "setup_result",
+                          "state"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "oracle_rejections",
+                "raw_tool_cases"
+              ],
+              "type": "object"
+            },
+            "selection": {
+              "additionalProperties": false,
+              "properties": {
+                "steps": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "operation": {
+                        "enum": [
+                          "install-b-10",
+                          "install-a-10-tie",
+                          "install-c-20",
+                          "set-a-manual",
+                          "raise-c-30-manual-sticks",
+                          "auto-selects-c",
+                          "remove-c-tie-selects-a",
+                          "remove-a-selects-b",
+                          "remove-all"
+                        ]
+                      },
+                      "result": {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      "state": {
+                        "$ref": "#/$defs/groupState"
+                      }
+                    },
+                    "required": [
+                      "operation",
+                      "result",
+                      "state"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 9,
+                  "minItems": 9,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "steps"
+              ],
+              "type": "object"
+            },
+            "vendor_projection": {
+              "additionalProperties": false,
+              "properties": {
+                "group_count": {
+                  "const": 14
+                },
+                "groups": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "generic_links": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fact": {
+                              "$ref": "#/$defs/pathFact"
+                            },
+                            "path": {
+                              "$ref": "#/$defs/absolutePath"
+                            }
+                          },
+                          "required": [
+                            "fact",
+                            "path"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 128,
+                        "minItems": 1,
+                        "type": "array"
+                      },
+                      "name": {
+                        "pattern": "^[a-z0-9][a-z0-9+.-]*$",
+                        "type": "string"
+                      },
+                      "record": {
+                        "$ref": "#/$defs/pathFact"
+                      },
+                      "result": {
+                        "$ref": "#/$defs/toolResult"
+                      },
+                      "selectors": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "fact": {
+                              "$ref": "#/$defs/pathFact"
+                            },
+                            "name": {
+                              "$ref": "#/$defs/name"
+                            }
+                          },
+                          "required": [
+                            "fact",
+                            "name"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 128,
+                        "minItems": 1,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "generic_links",
+                      "name",
+                      "record",
+                      "result",
+                      "selectors"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 14,
+                  "minItems": 14,
+                  "type": "array"
+                },
+                "relationship_count": {
+                  "const": 72
+                },
+                "requested_path_count": {
+                  "const": 189
+                },
+                "requested_paths_sha256": {
+                  "$ref": "#/$defs/digest"
+                },
+                "timestamp_contract": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "log": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "records": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "symlinks": {
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "log",
+                    "records",
+                    "symlinks"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "group_count",
+                "groups",
+                "relationship_count",
+                "requested_path_count",
+                "requested_paths_sha256",
+                "timestamp_contract"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "atomicity",
+            "malformed_records",
+            "missing_targets_and_group_shape",
+            "path_and_symlink_attacks",
+            "selection",
+            "vendor_projection"
+          ],
+          "type": "object"
+        },
+        "separation": {
+          "additionalProperties": false,
+          "properties": {
+            "ambient_host_alternatives_used": {
+              "const": false
+            },
+            "dpkg_invokes_update_alternatives_implicitly": {
+              "const": false
+            },
+            "maintainer_script_updates_are_external_tool_side_effects": {
+              "const": true
+            },
+            "package_alternatives_member_is_copied_but_not_interpreted": {
+              "const": true
+            }
+          },
+          "required": [
+            "ambient_host_alternatives_used",
+            "dpkg_invokes_update_alternatives_implicitly",
+            "maintainer_script_updates_are_external_tool_side_effects",
+            "package_alternatives_member_is_copied_but_not_interpreted"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "direct_dpkg",
+        "external_update_alternatives",
+        "separation"
+      ],
+      "type": "object"
+    },
+    "schema": {
+      "const": "https://debz.dev/schema/dpkg-alternatives-reference-v1"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "dpkg": {
+          "additionalProperties": false,
+          "properties": {
+            "architectures": {
+              "additionalProperties": false,
+              "properties": {
+                "amd64": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "archive_sha256": {
+                      "$ref": "#/$defs/digest"
+                    },
+                    "dpkg_sha256": {
+                      "$ref": "#/$defs/digest"
+                    },
+                    "update_alternatives_sha256": {
+                      "$ref": "#/$defs/digest"
+                    }
+                  },
+                  "required": [
+                    "archive_sha256",
+                    "dpkg_sha256",
+                    "update_alternatives_sha256"
+                  ],
+                  "type": "object"
+                },
+                "arm64": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "archive_sha256": {
+                      "$ref": "#/$defs/digest"
+                    },
+                    "dpkg_sha256": {
+                      "$ref": "#/$defs/digest"
+                    },
+                    "update_alternatives_sha256": {
+                      "$ref": "#/$defs/digest"
+                    }
+                  },
+                  "required": [
+                    "archive_sha256",
+                    "dpkg_sha256",
+                    "update_alternatives_sha256"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "amd64",
+                "arm64"
+              ],
+              "type": "object"
+            },
+            "configuration_sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "package": {
+              "const": "dpkg"
+            },
+            "source": {
+              "const": "https://deb.debian.org/debian/pool/main/d/dpkg"
+            },
+            "version": {
+              "const": "1.22.22"
+            }
+          },
+          "required": [
+            "architectures",
+            "configuration_sha256",
+            "package",
+            "source",
+            "version"
+          ],
+          "type": "object"
+        },
+        "fixture_packages": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "const": "amd64"
+            },
+            "clock_epoch": {
+              "const": 1700000000
+            },
+            "maintainer": {
+              "const": "debz fixture <fixture@example.invalid>"
+            },
+            "namespace": {
+              "const": "debz-alt-*"
+            },
+            "package_builder": {
+              "const": "repository deterministic Python ar/tar builder"
+            }
+          },
+          "required": [
+            "architecture",
+            "clock_epoch",
+            "maintainer",
+            "namespace",
+            "package_builder"
+          ],
+          "type": "object"
+        },
+        "vendor_reference": {
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "$ref": "#/$defs/fileBinding"
+            },
+            "manifests": {
+              "items": false,
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "architecture": {
+                      "const": "amd64"
+                    },
+                    "path": {
+                      "$ref": "#/$defs/relativePath"
+                    },
+                    "sha256": {
+                      "$ref": "#/$defs/digest"
+                    },
+                    "size": {
+                      "maximum": 8388608,
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "architecture",
+                    "path",
+                    "sha256",
+                    "size"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "architecture": {
+                      "const": "arm64"
+                    },
+                    "path": {
+                      "$ref": "#/$defs/relativePath"
+                    },
+                    "sha256": {
+                      "$ref": "#/$defs/digest"
+                    },
+                    "size": {
+                      "maximum": 8388608,
+                      "minimum": 1,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "architecture",
+                    "path",
+                    "sha256",
+                    "size"
+                  ],
+                  "type": "object"
+                }
+              ],
+              "type": "array"
+            },
+            "reference": {
+              "$ref": "#/$defs/fileBinding"
+            },
+            "snapshot": {
+              "format": "uri",
+              "type": "string"
+            },
+            "workflow_run": {
+              "format": "uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "index",
+            "manifests",
+            "reference",
+            "snapshot",
+            "workflow_run"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "dpkg",
+        "fixture_packages",
+        "vendor_reference"
+      ],
+      "type": "object"
+    },
+    "vendor_projection": {
+      "additionalProperties": false,
+      "properties": {
+        "alternatives_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "group_names": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9+.-]*$",
+            "type": "string"
+          },
+          "maxItems": 14,
+          "minItems": 14,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "linked_entry_count": {
+          "const": 190
+        },
+        "relationship_count": {
+          "const": 72
+        },
+        "requested_path_count": {
+          "const": 189
+        },
+        "scope": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "alternatives_sha256",
+        "group_names",
+        "linked_entry_count",
+        "relationship_count",
+        "requested_path_count",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "boundary",
+    "native_requirements",
+    "observed_behavior",
+    "schema",
+    "source",
+    "vendor_projection",
+    "version"
+  ],
+  "title": "dpkg/update-alternatives reference specification v1",
+  "type": "object"
+}

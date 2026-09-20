@@ -284,6 +284,7 @@ pub fn build(b: *std.Build) void {
             "tools/test_real_snapshot_acceptance.py",
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
+            "tools/test_dpkg_alternatives_reference.py",
         },
     );
     audit_step.dependOn(&audit_tests.step);
@@ -614,6 +615,20 @@ pub fn build(b: *std.Build) void {
     b.step("test-dpkg-config-reference", "Verify amd64 direct pinned-dpkg config control-member behavior")
         .dependOn(&dpkg_config_reference.step);
 
+    const dpkg_alternatives_reference = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), "python3", "tools/dpkg-alternatives-reference.py",
+    });
+    const dpkg_alternatives_reference_tests = b.addSystemCommand(
+        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_alternatives_reference.py" },
+    );
+    dpkg_alternatives_reference.step.dependOn(&dpkg_alternatives_reference_tests.step);
+    test_step.dependOn(&dpkg_alternatives_reference_tests.step);
+    b.step(
+        "test-dpkg-alternatives-reference",
+        "Verify amd64 pinned dpkg/update-alternatives records, links, lifecycle and recovery",
+    ).dependOn(&dpkg_alternatives_reference.step);
+
     const native_lifecycle_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -744,8 +759,17 @@ pub fn build(b: *std.Build) void {
     }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
         for ([_]*std.Build.Step.Run{
-            native_materialization, native_conffiles, dpkg_config_reference, native_lifecycle, native_triggers, native_recovery,
+            native_materialization, native_conffiles, dpkg_config_reference, dpkg_alternatives_reference, native_lifecycle, native_triggers, native_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
+    }
+    if (b.option(
+        []const u8,
+        "native-reference-update-alternatives",
+        "Absolute path to the pinned private update-alternatives fixture reference",
+    )) |path| {
+        dpkg_alternatives_reference.addArgs(
+            &.{ "--reference-update-alternatives", path },
+        );
     }
 
     const package_database_tests = b.addTest(.{
@@ -951,6 +975,7 @@ fn installReleaseFiles(
         "archive-application-model.md",
         "authenticated-refresh.md",
         "deb-payload-validation.md",
+        "dpkg-alternatives-reference.md",
         "exact-locks-and-provenance.md",
         "github-actions.md",
         "integration-roots.md",
@@ -1030,6 +1055,7 @@ fn installReleaseFiles(
         "transaction-result-capability-v1.json",
         "native-install-capability-v1.json",
         "native-install-result-v1.json",
+        "dpkg-alternatives-reference-v1.json",
         "dpkg-config-reference-v1.json",
         "vendor-state-inventory-v1.json",
         "vendor-state-reference-v1.json",

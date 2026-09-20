@@ -23,10 +23,12 @@ PINS = {
     "amd64": {
         "archive": "3e800c6d75e8e709007ed1c356e5fa8509a75c1694fb0a1183709abc9cfdc1f3",
         "executable": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
+        "update_alternatives": "b02b581c6a7f85679f32efe18c9aaeb05316847fa90d3d3fda30b57defab9b13",
     },
     "arm64": {
         "archive": "1142468e57f69e13d174f517dff739508c61ee97d81c182c120cd6b281d8cdfa",
         "executable": "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79",
+        "update_alternatives": "35616ec58ba58f3fb8b4820bdf893c47a842d56684b3335ba6ebf6df86b27cc5",
     },
 }
 
@@ -48,6 +50,22 @@ def version(executable: str) -> tuple[int, int, int]:
     match = re.search(r"\bversion (\d+)\.(\d+)\.(\d+)\b", result.stdout.partition("\n")[0])
     if match is None:
         raise RuntimeError(f"unrecognized dpkg reference version: {executable}")
+    return tuple(int(part) for part in match.groups())
+
+
+def update_alternatives_version(executable: str) -> tuple[int, int, int]:
+    result = subprocess.run(
+        [executable, "--version"], check=True, capture_output=True, text=True,
+        timeout=10, env={**os.environ, "LC_ALL": "C"},
+    )
+    match = re.search(
+        r"\bversion (\d+)\.(\d+)\.(\d+)\b",
+        result.stdout.partition("\n")[0],
+    )
+    if match is None:
+        raise RuntimeError(
+            f"unrecognized update-alternatives reference version: {executable}"
+        )
     return tuple(int(part) for part in match.groups())
 
 
@@ -76,6 +94,24 @@ def select(executable: Path | None, architecture: str, *, root_accounts: bool = 
     return selected
 
 
+def select_update_alternatives(executable: Path, architecture: str) -> str:
+    if architecture not in PINS:
+        raise RuntimeError(f"unsupported reference architecture: {architecture}")
+    if not executable.is_absolute() or executable.resolve(strict=True) != executable:
+        raise RuntimeError(
+            "pinned update-alternatives reference must be an absolute, non-symlink path"
+        )
+    verify_file(executable, PINS[architecture]["update_alternatives"])
+    found = update_alternatives_version(str(executable))
+    if found != tuple(int(part) for part in VERSION.split(".")):
+        raise RuntimeError("pinned update-alternatives reference version mismatch")
+    print(
+        f"Alternatives reference: {executable} ({'.'.join(map(str, found))})",
+        file=sys.stderr,
+    )
+    return str(executable)
+
+
 def prepare(architecture: str) -> Path:
     if os.geteuid() == 0:
         raise RuntimeError("prepare the private reference as the build user, not root")
@@ -87,6 +123,10 @@ def prepare(architecture: str) -> Path:
     executable = prefix / "usr/bin/dpkg"
     if prefix.exists():
         select(executable, architecture, root_accounts=True)
+        select_update_alternatives(
+            prefix / "usr/bin/update-alternatives",
+            architecture,
+        )
         return executable
     prefix.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="preparing-", dir=prefix.parent) as temporary:
@@ -103,6 +143,10 @@ def prepare(architecture: str) -> Path:
         staged = workspace / "prefix"
         subprocess.run(["dpkg-deb", "--extract", str(archive), str(staged)], check=True, timeout=60)
         select(staged / "usr/bin/dpkg", architecture, root_accounts=True)
+        select_update_alternatives(
+            staged / "usr/bin/update-alternatives",
+            architecture,
+        )
         staged.rename(prefix)
     return executable
 
