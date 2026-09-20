@@ -1,0 +1,291 @@
+{
+  "$id": "https://debz.dev/schema/dpkg-alternatives-reference-v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "boundary": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture_scope": {
+          "type": "string"
+        },
+        "architectures": {
+          "prefixItems": [
+            {
+              "const": "amd64"
+            },
+            {
+              "const": "arm64"
+            }
+          ],
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "environment": {
+          "additionalProperties": false,
+          "properties": {
+            "ambient_alternatives": {
+              "const": "forbidden"
+            },
+            "ambient_dpkg_database": {
+              "const": "signature-checked-unchanged"
+            },
+            "frontend_environment": {
+              "const": "forbidden"
+            },
+            "locale": {
+              "const": "C"
+            },
+            "root": {
+              "const": "guarded-disposable-real-directory"
+            },
+            "temporary_and_cache_storage": {
+              "const": "repository-local"
+            }
+          },
+          "required": [
+            "ambient_alternatives",
+            "ambient_dpkg_database",
+            "frontend_environment",
+            "locale",
+            "root",
+            "temporary_and_cache_storage"
+          ],
+          "type": "object"
+        },
+        "invocation_clock": {
+          "additionalProperties": false,
+          "properties": {
+            "log_clock": {
+              "type": "string"
+            },
+            "task_invocation": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "unstable_filesystem_timestamps": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "log_clock",
+            "task_invocation",
+            "unstable_filesystem_timestamps"
+          ],
+          "type": "object"
+        },
+        "limits": {
+          "additionalProperties": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxProperties": 32,
+          "minProperties": 16,
+          "type": "object"
+        },
+        "observed_architecture": {
+          "const": "amd64"
+        }
+      },
+      "required": [
+        "architecture_scope",
+        "architectures",
+        "environment",
+        "invocation_clock",
+        "limits",
+        "observed_architecture"
+      ],
+      "type": "object"
+    },
+    "native_requirements": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 16,
+      "minItems": 8,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "observed_behavior": {
+      "additionalProperties": false,
+      "properties": {
+        "direct_dpkg": {
+          "additionalProperties": false,
+          "properties": {
+            "conflicting_packages": {
+              "type": "object"
+            },
+            "conflicting_providers": {
+              "type": "object"
+            },
+            "failure_recovery": {
+              "maxItems": 8,
+              "minItems": 4,
+              "type": "array"
+            },
+            "interruption_recovery": {
+              "type": "object"
+            },
+            "scriptless_alternatives_member": {
+              "type": "object"
+            },
+            "successful_lifecycle": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "conflicting_packages",
+            "conflicting_providers",
+            "failure_recovery",
+            "interruption_recovery",
+            "scriptless_alternatives_member",
+            "successful_lifecycle"
+          ],
+          "type": "object"
+        },
+        "external_update_alternatives": {
+          "additionalProperties": false,
+          "properties": {
+            "atomicity": {
+              "type": "object"
+            },
+            "malformed_records": {
+              "type": "object"
+            },
+            "missing_targets_and_group_shape": {
+              "type": "object"
+            },
+            "path_and_symlink_attacks": {
+              "type": "object"
+            },
+            "selection": {
+              "type": "object"
+            },
+            "vendor_projection": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "atomicity",
+            "malformed_records",
+            "missing_targets_and_group_shape",
+            "path_and_symlink_attacks",
+            "selection",
+            "vendor_projection"
+          ],
+          "type": "object"
+        },
+        "separation": {
+          "additionalProperties": false,
+          "properties": {
+            "ambient_host_alternatives_used": {
+              "const": false
+            },
+            "dpkg_invokes_update_alternatives_implicitly": {
+              "const": false
+            },
+            "maintainer_script_updates_are_external_tool_side_effects": {
+              "const": true
+            },
+            "package_alternatives_member_is_copied_but_not_interpreted": {
+              "const": true
+            }
+          },
+          "required": [
+            "ambient_host_alternatives_used",
+            "dpkg_invokes_update_alternatives_implicitly",
+            "maintainer_script_updates_are_external_tool_side_effects",
+            "package_alternatives_member_is_copied_but_not_interpreted"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "direct_dpkg",
+        "external_update_alternatives",
+        "separation"
+      ],
+      "type": "object"
+    },
+    "schema": {
+      "const": "https://debz.dev/schema/dpkg-alternatives-reference-v1"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "dpkg": {
+          "type": "object"
+        },
+        "fixture_packages": {
+          "type": "object"
+        },
+        "vendor_reference": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "dpkg",
+        "fixture_packages",
+        "vendor_reference"
+      ],
+      "type": "object"
+    },
+    "vendor_projection": {
+      "additionalProperties": false,
+      "properties": {
+        "alternatives_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "group_names": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9+.-]*$",
+            "type": "string"
+          },
+          "maxItems": 14,
+          "minItems": 14,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "linked_entry_count": {
+          "const": 190
+        },
+        "relationship_count": {
+          "const": 72
+        },
+        "requested_path_count": {
+          "const": 189
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "alternatives_sha256",
+        "group_names",
+        "linked_entry_count",
+        "relationship_count",
+        "requested_path_count",
+        "scope"
+      ],
+      "type": "object"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "boundary",
+    "native_requirements",
+    "observed_behavior",
+    "schema",
+    "source",
+    "vendor_projection",
+    "version"
+  ],
+  "title": "dpkg/update-alternatives reference specification v1",
+  "type": "object"
+}

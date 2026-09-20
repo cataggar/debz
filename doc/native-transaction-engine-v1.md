@@ -106,9 +106,11 @@ member is classified as already-supported typed state or bounded inert retained
 metadata. The reference types current alternatives master/slave and selected
 target topology, but its source manifests do not contain record bytes,
 provider ownership, selection mode, priorities, or before/after mutation
-evidence. Config-script invocation and alternatives mutation therefore remain
-reference-execution gates, not inferred successful outcomes. Existing opaque
-info and alternatives checks continue to refuse or hand off before mutation.
+evidence. Those gaps are closed for amd64 synthetic execution, rather than
+inferred from the vendor hashes, by the separate direct-dpkg config oracle and
+the [pinned dpkg/update-alternatives reference](dpkg-alternatives-reference.md).
+Arm64 execution and native implementation remain gates. Existing opaque-info
+and alternatives checks continue to refuse or hand off before mutation.
 
 The typed model, import validation, canonical writers, generation evidence, and
 staged change-set plans for these surfaces are documented in

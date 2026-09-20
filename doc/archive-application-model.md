@@ -117,6 +117,11 @@ Rejected before mutation, with the classification in parentheses:
 `alternatives` is deliberately not in the supported control-member table. dpkg
 acts on that member, so accepting and ignoring it would silently change package
 semantics; v1 rejects it and requires an explicit contract revision instead.
+The separate [pinned alternatives reference](dpkg-alternatives-reference.md)
+shows that direct dpkg 1.22.22 copies opaque package `.alternatives` bytes into
+the info database but does not interpret them or invoke `update-alternatives`;
+maintainer scripts cause all observed group mutations. That reference also
+binds the external tool's record/link behavior and does not relax this guard.
 The debconf `config` script is modeled and preserved but never executed by v1,
 because debconf preconfiguration is a frontend responsibility outside the dpkg
 replacement boundary.
