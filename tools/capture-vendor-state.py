@@ -55,7 +55,7 @@ SENSITIVE_PATHS = (
     "etc/apt/auth.conf.d",
 )
 PUBLIC_REFERENCE_ROOTS = frozenset(
-    {"bin", "lib", "lib32", "lib64", "libx32", "sbin", "usr"}
+    {"bin", "etc", "lib", "lib32", "lib64", "libx32", "sbin", "usr"}
 )
 MAX_JSON_INTEGER = (1 << 53) - 1
 MAX_DOCUMENT_PATH_BYTES = 4096
@@ -429,19 +429,14 @@ def _classification(name: str) -> str:
     return "unclassified"
 
 
-def _allowed_reference(relative: str, *, intermediate: bool = False) -> None:
+def _allowed_reference(relative: str) -> None:
     if any(
         relative == denied or relative.startswith(denied + "/")
         for denied in SENSITIVE_PATHS
     ):
         raise CaptureError(f"alternative reference enters excluded state: {relative}")
     top_level = relative.split("/", 1)[0]
-    if (
-        top_level not in PUBLIC_REFERENCE_ROOTS
-        and not (intermediate and relative == "etc")
-        and relative != "etc/alternatives"
-        and not relative.startswith("etc/alternatives/")
-    ):
+    if top_level not in PUBLIC_REFERENCE_ROOTS:
         raise CaptureError(f"alternative reference enters excluded state: {relative}")
 
 
@@ -733,7 +728,7 @@ def _capture_reference(
             component = unresolved.popleft()
             current_parts = [*resolved, component]
             relative = _normalize_relative("/".join(current_parts))
-            _allowed_reference(relative, intermediate=bool(unresolved))
+            _allowed_reference(relative)
             parent_metadata = os.fstat(current_descriptor)
             try:
                 metadata = os.stat(

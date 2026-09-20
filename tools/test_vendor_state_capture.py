@@ -302,6 +302,51 @@ class VendorStateCaptureTests(unittest.TestCase):
             ):
                 self.capture(root)
 
+    def test_non_sensitive_etc_alternative_is_captured(self) -> None:
+        root = self.minimal_root("etc-alternative")
+        records = root / "var/lib/dpkg/alternatives"
+        records.mkdir()
+        records.joinpath("newt-palette").write_text(
+            "auto\n"
+            "/etc/newt/palette\n"
+            "\n"
+            "/etc/newt/palette.ubuntu\n"
+            "30\n"
+        )
+        package_link = root / "etc/newt/palette"
+        package_link.parent.mkdir(parents=True)
+        package_link.symlink_to("/etc/alternatives/newt-palette")
+        selected_link = root / "etc/alternatives/newt-palette"
+        selected_link.parent.mkdir(parents=True)
+        selected_link.symlink_to("/etc/newt/palette.ubuntu")
+        selected = root / "etc/newt/palette.ubuntu"
+        selected.write_text("root=white,black\n")
+
+        document = self.capture(root)
+        linked = {
+            entry["path"]: entry
+            for entry in document["linked_filesystem"]["entries"]
+        }
+        self.assertEqual(
+            document["linked_filesystem"]["requested_paths"],
+            [
+                "etc/alternatives/newt-palette",
+                "etc/newt/palette",
+                "etc/newt/palette.ubuntu",
+            ],
+        )
+        self.assertEqual(
+            linked["etc/newt/palette"]["target"],
+            "/etc/alternatives/newt-palette",
+        )
+        self.assertEqual(
+            linked["etc/alternatives/newt-palette"]["target"],
+            "/etc/newt/palette.ubuntu",
+        )
+        self.assertEqual(
+            linked["etc/newt/palette.ubuntu"]["kind"], "regular"
+        )
+
     def test_hard_links_cycles_permissions_and_races_fail_closed(self) -> None:
         hardlink_root = self.minimal_root("metadata-hardlink")
         member = hardlink_root / "var/lib/dpkg/info/demo.config"
@@ -584,6 +629,9 @@ class VendorStateCaptureTests(unittest.TestCase):
         )
         self.assertIn(
             "path: .real-snapshot/${{ matrix.architecture }}/evidence/", job
+        )
+        self.assertIn(
+            'sudo tee "$work/evidence/disk-usage-final.txt" >/dev/null', job
         )
         build = (ROOT / "build.zig").read_text()
         self.assertIn('"vendor-state-inventory-v1.json",', build)

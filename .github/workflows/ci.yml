@@ -1188,7 +1188,8 @@ jobs:
           sudo cp "$work/root/var/lib/dpkg/status" "$work/evidence/status-final" 2>/dev/null || true
           sudo cp "$work/ubuntu.sources" "$work/evidence/" 2>/dev/null || true
           sudo cp "$work/ubuntu.json" "$work/evidence/" 2>/dev/null || true
-          sudo du -sh "$work" >"$work/evidence/disk-usage-final.txt" 2>/dev/null || true
+          sudo du -sh "$work" 2>/dev/null \
+            | sudo tee "$work/evidence/disk-usage-final.txt" >/dev/null || true
           cleanup_status=0
           sudo rm -rf "$work/root" "$work/cache" || cleanup_status=$?
           ownership_status=0
