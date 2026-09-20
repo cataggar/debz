@@ -304,6 +304,10 @@ class VendorStateCaptureTests(unittest.TestCase):
 
     def test_non_sensitive_etc_alternative_is_captured(self) -> None:
         root = self.minimal_root("etc-alternative")
+        root.joinpath("var/lib/dpkg/info/libnewt0.52.list").write_text(
+            "/etc/newt/palette.original\n"
+            "/etc/newt/palette.ubuntu\n"
+        )
         records = root / "var/lib/dpkg/alternatives"
         records.mkdir()
         records.joinpath("newt-palette").write_text(
@@ -311,7 +315,9 @@ class VendorStateCaptureTests(unittest.TestCase):
             "/etc/newt/palette\n"
             "\n"
             "/etc/newt/palette.ubuntu\n"
-            "30\n"
+            "50\n"
+            "/etc/newt/palette.original\n"
+            "20\n"
         )
         package_link = root / "etc/newt/palette"
         package_link.parent.mkdir(parents=True)
@@ -321,6 +327,8 @@ class VendorStateCaptureTests(unittest.TestCase):
         selected_link.symlink_to("/etc/newt/palette.ubuntu")
         selected = root / "etc/newt/palette.ubuntu"
         selected.write_text("root=white,black\n")
+        original = root / "etc/newt/palette.original"
+        original.write_text("root=white,blue\n")
 
         document = self.capture(root)
         linked = {
@@ -332,6 +340,7 @@ class VendorStateCaptureTests(unittest.TestCase):
             [
                 "etc/alternatives/newt-palette",
                 "etc/newt/palette",
+                "etc/newt/palette.original",
                 "etc/newt/palette.ubuntu",
             ],
         )
@@ -346,6 +355,186 @@ class VendorStateCaptureTests(unittest.TestCase):
         self.assertEqual(
             linked["etc/newt/palette.ubuntu"]["kind"], "regular"
         )
+        self.assertEqual(
+            linked["etc/newt/palette.ubuntu"]["sha256"],
+            hashlib.sha256(b"root=white,black\n").hexdigest(),
+        )
+        self.assertEqual(
+            linked["etc/newt/palette.original"]["kind"], "regular"
+        )
+        arm64 = self.capture(root, "arm64")
+        self.assertEqual(
+            {**document, "architecture": "arm64"},
+            arm64,
+        )
+
+    def test_etc_alternatives_do_not_admit_ambient_state(self) -> None:
+        ambient_root = self.minimal_root("etc-ambient")
+        ambient_records = ambient_root / "var/lib/dpkg/alternatives"
+        ambient_records.mkdir()
+        ambient_records.joinpath("ambient").write_text("/etc/hostname\n")
+        ambient = ambient_root / "etc/hostname"
+        ambient.parent.mkdir()
+        ambient.write_text("runner-host\n")
+        with self.assertRaisesRegex(
+            vendor_state_capture.CaptureError, "unowned etc state"
+        ):
+            self.capture(ambient_root)
+
+        credential_root = self.minimal_root("etc-credential")
+        credential_root.joinpath(
+            "var/lib/dpkg/info/credential.list"
+        ).write_text("/etc/apt/auth.conf\n")
+        credential_records = credential_root / "var/lib/dpkg/alternatives"
+        credential_records.mkdir()
+        credential_records.joinpath("credential").write_text(
+            "/etc/apt/auth.conf\n"
+        )
+        credential = credential_root / "etc/apt/auth.conf"
+        credential.parent.mkdir(parents=True)
+        credential.write_text("machine example.invalid login secret\n")
+        with self.assertRaisesRegex(
+            vendor_state_capture.CaptureError, "excluded state"
+        ):
+            self.capture(credential_root)
+
+        wrong_link_root = self.minimal_root("etc-wrong-link")
+        wrong_link_records = wrong_link_root / "var/lib/dpkg/alternatives"
+        wrong_link_records.mkdir()
+        wrong_link_records.joinpath("newt-palette").write_text(
+            "/etc/newt/palette\n"
+        )
+        wrong_link = wrong_link_root / "etc/newt/palette"
+        wrong_link.parent.mkdir(parents=True)
+        wrong_link.symlink_to("/usr/share/newt/palette")
+        wrong_target = wrong_link_root / "usr/share/newt/palette"
+        wrong_target.parent.mkdir(parents=True)
+        wrong_target.write_text("ambient\n")
+        with self.assertRaisesRegex(
+            vendor_state_capture.CaptureError,
+            "does not target etc/alternatives",
+        ):
+            self.capture(wrong_link_root)
+
+        undeclared_root = self.minimal_root("etc-undeclared-target")
+        undeclared_root.joinpath(
+            "var/lib/dpkg/info/libnewt0.52.list"
+        ).write_text("/etc/newt/palette.ubuntu\n")
+        undeclared_records = undeclared_root / "var/lib/dpkg/alternatives"
+        undeclared_records.mkdir()
+        undeclared_records.joinpath("newt-palette").write_text(
+            "/etc/newt/palette\n"
+        )
+        undeclared_link = undeclared_root / "etc/newt/palette"
+        undeclared_link.parent.mkdir(parents=True)
+        undeclared_link.symlink_to("/etc/alternatives/newt-palette")
+        undeclared_selector = (
+            undeclared_root / "etc/alternatives/newt-palette"
+        )
+        undeclared_selector.parent.mkdir(parents=True)
+        undeclared_selector.symlink_to("/etc/newt/palette.ubuntu")
+        undeclared_target = undeclared_root / "etc/newt/palette.ubuntu"
+        undeclared_target.write_text("ambient\n")
+        with self.assertRaisesRegex(
+            vendor_state_capture.CaptureError, "excluded state"
+        ):
+            self.capture(undeclared_root)
+
+    def test_etc_alternative_hard_links_special_files_cycles_and_races_fail_closed(
+        self,
+    ) -> None:
+        hardlink_root = self.minimal_root("etc-hardlink")
+        hardlink_root.joinpath("var/lib/dpkg/info/newt.list").write_text(
+            "/etc/newt/palette.ubuntu\n"
+        )
+        hardlink_records = hardlink_root / "var/lib/dpkg/alternatives"
+        hardlink_records.mkdir()
+        hardlink_records.joinpath("newt-palette").write_text(
+            "/etc/newt/palette.ubuntu\n"
+        )
+        hardlink_target = hardlink_root / "etc/newt/palette.ubuntu"
+        hardlink_target.parent.mkdir(parents=True)
+        outside = self.workspace / "outside-palette"
+        outside.write_text("ambient\n")
+        os.link(outside, hardlink_target)
+        with self.assertRaisesRegex(
+            vendor_state_capture.CaptureError, "hard-linked regular file"
+        ):
+            self.capture(hardlink_root)
+
+        special_root = self.minimal_root("etc-special")
+        special_root.joinpath("var/lib/dpkg/info/newt.list").write_text(
+            "/etc/newt/palette.ubuntu\n"
+        )
+        special_records = special_root / "var/lib/dpkg/alternatives"
+        special_records.mkdir()
+        special_records.joinpath("newt-palette").write_text(
+            "/etc/newt/palette.ubuntu\n"
+        )
+        special = special_root / "etc/newt/palette.ubuntu"
+        special.parent.mkdir(parents=True)
+        os.mkfifo(special)
+        with self.assertRaisesRegex(
+            vendor_state_capture.CaptureError,
+            "linked path is a special file",
+        ):
+            self.capture(special_root)
+
+        cycle_root = self.minimal_root("etc-cycle")
+        cycle_records = cycle_root / "var/lib/dpkg/alternatives"
+        cycle_records.mkdir()
+        cycle_records.joinpath("newt-palette").write_text(
+            "/etc/newt/palette\n"
+        )
+        cycle_link = cycle_root / "etc/newt/palette"
+        cycle_link.parent.mkdir(parents=True)
+        cycle_link.symlink_to("/etc/alternatives/newt-palette")
+        cycle_selector = cycle_root / "etc/alternatives/newt-palette"
+        cycle_selector.parent.mkdir(parents=True)
+        cycle_selector.symlink_to("/etc/newt/palette")
+        with self.assertRaisesRegex(
+            vendor_state_capture.CaptureError, "symlink cycle"
+        ):
+            self.capture(cycle_root)
+
+        disappearing_root = self.minimal_root("etc-disappearing")
+        disappearing_root.joinpath(
+            "var/lib/dpkg/info/newt.list"
+        ).write_text("/etc/newt/palette.ubuntu\n")
+        disappearing_records = (
+            disappearing_root / "var/lib/dpkg/alternatives"
+        )
+        disappearing_records.mkdir()
+        disappearing_records.joinpath("newt-palette").write_text(
+            "/etc/newt/palette.ubuntu\n"
+        )
+        disappearing = disappearing_root / "etc/newt/palette.ubuntu"
+        disappearing.parent.mkdir(parents=True)
+        disappearing.write_text("palette\n")
+        real_open = vendor_state_capture.os.open
+        removed = False
+
+        def remove_linked_before_open(
+            path, flags, mode=0o777, *, dir_fd=None
+        ):
+            nonlocal removed
+            if (
+                path == "palette.ubuntu"
+                and dir_fd is not None
+                and not removed
+            ):
+                removed = True
+                disappearing.unlink()
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(
+            vendor_state_capture.os,
+            "open",
+            side_effect=remove_linked_before_open,
+        ), self.assertRaisesRegex(
+            vendor_state_capture.CaptureError, "cannot open regular file"
+        ):
+            self.capture(disappearing_root)
 
     def test_hard_links_cycles_permissions_and_races_fail_closed(self) -> None:
         hardlink_root = self.minimal_root("metadata-hardlink")

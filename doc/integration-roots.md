@@ -141,12 +141,13 @@ schema](../schema/vendor-state-inventory-v1.json) inventories every
 including `*.config`, `*.alternatives`, and all unclassified members. It also
 inventories bounded regular records under `var/lib/dpkg/alternatives` and the
 root-confined filesystem paths and symlink chains referenced by alternatives
-state, including non-sensitive package-managed links under `etc`.
-Descriptor-rooted, no-follow traversal rejects races, hard links, special
-files, cycles, traversal, sensitive or ambient installation namespaces,
-malformed text, and every count, path, integer, or byte-limit overflow. The
-capture records no file contents, hostname, timestamp, environment, or absolute
-workspace path.
+state. Outside `etc/alternatives`, `etc` targets must be package-owned according
+to captured dpkg ownership lists, while an unowned alternatives link must point
+into `etc/alternatives`. Descriptor-rooted, no-follow traversal rejects races,
+hard links, special files, cycles, undeclared link targets, traversal, sensitive
+or ambient installation namespaces, malformed text, and every count, path,
+integer, or byte-limit overflow. The capture records no file contents,
+hostname, timestamp, environment, or absolute workspace path.
 
 The uploaded JSON is review evidence from a particular amd64 or arm64 run, not
 a repository-pinned support manifest. No current pinned vendor manifests are
