@@ -2408,10 +2408,25 @@ fn cleanupDiversionEvidence(
     var observed = try namespace.observeAlloc(allocator, maximum_records, 64 * 1024 * 1024);
     defer observed.deinit();
     for (observed.members) |member| {
-        if (!std.mem.startsWith(u8, member.name, unpack_diversion_prefix)) continue;
+        const unpack = std.mem.startsWith(
+            u8,
+            member.name,
+            unpack_diversion_prefix,
+        );
+        const route = std.mem.startsWith(
+            u8,
+            member.name,
+            unpack_route_settlement_prefix,
+        );
+        if (!unpack and !route) continue;
         var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&buffer, root_operation.namespace_path ++ "/{s}", .{member.name});
-        _ = (try unpackDiversionStep(path)) orelse return error.InvalidManagedState;
+        _ = if (unpack)
+            (try unpackDiversionStep(path)) orelse
+                return error.InvalidManagedState
+        else
+            (try unpackRouteSettlementStep(path)) orelse
+                return error.InvalidManagedState;
         const bytes = (try readManagedFile(
             allocator,
             root,
@@ -2434,7 +2449,13 @@ fn cleanupDiversionEvidence(
         allocator.free(bytes);
     }
     for (observed.members) |member| {
-        if (!std.mem.startsWith(u8, member.name, unpack_diversion_prefix)) continue;
+        if (!std.mem.startsWith(u8, member.name, unpack_diversion_prefix) and
+            !std.mem.startsWith(
+                u8,
+                member.name,
+                unpack_route_settlement_prefix,
+            ))
+            continue;
         var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&buffer, root_operation.namespace_path ++ "/{s}", .{member.name});
         try root.removeFile(try root_fs.Path.init(path));
@@ -3057,6 +3078,106 @@ test "native_recovery.test.route settlement inputs bind once at their unpack anc
                     action.kind == .script,
                 ),
             );
+    }
+}
+
+test "native_recovery.test.route settlement cleanup validates all inputs before removal" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |drift| {
+        var temporary = testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        try root.createDirectoryPath(
+            try root_fs.Path.init(root_operation.namespace_path),
+            .fromMode(0o755),
+        );
+        const intent: Digest = @splat('1');
+        const anchor: Action = .{
+            .kind = .filesystem,
+            .program_step = 7,
+            .substep = 0,
+            .ordinal = 0,
+        };
+        try initializeProgress(testing.allocator, root, intent);
+        try initializeManagedState(testing.allocator, root, intent);
+        var unpack_buffer: [128]u8 = undefined;
+        const unpack_path = try unpackDiversionPath(7, &unpack_buffer);
+        _ = try updateManagedState(
+            testing.allocator,
+            root,
+            intent,
+            .{
+                .kind = .verification,
+                .program_step = 0,
+                .substep = 0,
+                .ordinal = 0,
+            },
+            &.{unpack_path},
+            false,
+        );
+        var route_buffer: [128]u8 = undefined;
+        const route_path = try unpackRouteSettlementPath(7, &route_buffer);
+        try root.publishFile(
+            try root_fs.Path.init(unpack_path),
+            "bound unpack input",
+            .{},
+        );
+        try root.publishFile(
+            try root_fs.Path.init(route_path),
+            "bound route input",
+            .{},
+        );
+        _ = try updateManagedState(
+            testing.allocator,
+            root,
+            intent,
+            anchor,
+            &.{ unpack_path, route_path },
+            false,
+        );
+        if (drift)
+            try root.publishFile(
+                try root_fs.Path.init(route_path),
+                "drifted route input",
+                .{ .overwrite = .replace },
+            );
+        if (drift) {
+            try testing.expectError(
+                error.ManagedStateChanged,
+                cleanupDiversionEvidence(
+                    testing.allocator,
+                    root,
+                    intent,
+                ),
+            );
+            try testing.expect(
+                try root.entryIfExists(
+                    try root_fs.Path.init(unpack_path),
+                ) != null,
+            );
+            try testing.expect(
+                try root.entryIfExists(
+                    try root_fs.Path.init(route_path),
+                ) != null,
+            );
+        } else {
+            try cleanupDiversionEvidence(
+                testing.allocator,
+                root,
+                intent,
+            );
+            try testing.expect(
+                try root.entryIfExists(
+                    try root_fs.Path.init(unpack_path),
+                ) == null,
+            );
+            try testing.expect(
+                try root.entryIfExists(
+                    try root_fs.Path.init(route_path),
+                ) == null,
+            );
+        }
     }
 }
 

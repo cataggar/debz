@@ -79,8 +79,11 @@ original unpack step, substep zero and ordinal zero, independently of later
 journal phase numbering. Completed-result verification checks the original program step,
 managed bytes and envelope binding; pending cleanup checks surviving files and
 rejects unbound extra names. Cleanup validates all cache inputs before removing
-any of them. Older executions without initial per-step observations never gain
-retrospectively reconstructed input files.
+any of them. The same all-before-any cleanup rule applies to inactive
+route-settlement inputs, and an orphan route-settlement name remains active
+recovery evidence rather than becoming a clean-root operation input. Older
+executions without initial per-step observations never gain retrospectively
+reconstructed input files.
 
 The optional `backups` array extends this envelope without changing legacy
 canonical bytes. Omission selects the original cache-only phase protocol;
@@ -153,17 +156,20 @@ routes, previous-only obsolete paths, stranded conffile staging, authenticated
 changed-route backups and original-route triggers. Successful and
 postinst-failure paths use the same route-adjusted late settlement.
 
-A route contract can be bound once at the unpack filesystem anchor and is
+A route contract is write-once at the unpack filesystem anchor; an exact retry
+may finish the same managed checkpoint but cannot replace its bytes. It is
 retained as separate indexed provenance evidence. Recovery verifies the
 publication input/cache, current authenticated post-script cache, exact script
 outcome and progress, lowered destinations and directory observations, backup
 identity/content/metadata, conffile staging and digest, settlement recipe and
 the actual journal. The cache-refresh-before-checkpoint window is admitted only
 when the completed script outcome and managed route input authenticate the
-new cache; unknown outcomes still return before any journal repair. Drift at
-any input or artifact refuses further mutation. Existing intent-owned artifact
-blobs, not caller archive paths, supply any recovery publication, and repeated
-completed recovery retains equivalent evidence.
+new cache, whose stable regular-file observation must retain private mode and a
+single link before and after checkpointing; unknown outcomes still return
+before any journal repair. Drift at any input or artifact refuses further
+mutation. Existing intent-owned artifact blobs, not caller archive paths,
+supply any recovery publication, and repeated completed recovery retains
+equivalent evidence.
 
 For nonempty inventories, journalled backup creation precedes payload
 publication and the status-old copy. Old postrm and its immediate failure/unwind

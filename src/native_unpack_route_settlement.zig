@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const deb822 = @import("deb822.zig");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
@@ -1533,6 +1534,33 @@ fn verifyRecoveryState(
             native_diversion_cache.maximum_document_bytes,
         );
     defer allocator.free(cache_bytes);
+    const cache_path = try root_fs.Path.init(
+        native_recovery.diversion_cache_path,
+    );
+    var pinned_cache = root.pinRegularFile(cache_path) catch |err| switch (err) {
+        error.FileNotFound,
+        error.NotRegularFile,
+        error.PathChanged,
+        => return error.ManagedStateChanged,
+        else => return err,
+    };
+    defer pinned_cache.close();
+    const observed_cache = pinned_cache.observeStableAlloc(
+        allocator,
+        native_diversion_cache.maximum_document_bytes,
+    ) catch |err| switch (err) {
+        error.FileTooLarge,
+        error.PathChanged,
+        => return error.ManagedStateChanged,
+        else => return err,
+    };
+    defer allocator.free(observed_cache.bytes);
+    if ((builtin.os.tag != .windows and
+        (!observed_cache.entry.modeled or
+            observed_cache.entry.mode != 0o600 or
+            observed_cache.entry.link_count != 1)) or
+        !std.mem.eql(u8, observed_cache.bytes, cache_bytes))
+        return error.ManagedStateChanged;
     var route_cache = try native_diversion_cache.decode(
         allocator,
         cache_bytes,
@@ -3459,7 +3487,7 @@ test "native_recovery.test.route settlement evidence survives fresh recovery and
     try root.publishFile(
         try root_fs.Path.init(native_recovery.diversion_cache_path),
         publication_cache_bytes,
-        .{},
+        .{ .permissions = .fromMode(0o600) },
     );
     _ = try native_recovery.updateManagedState(
         testing.allocator,
@@ -3477,7 +3505,10 @@ test "native_recovery.test.route settlement evidence survives fresh recovery and
     try root.publishFile(
         try root_fs.Path.init(native_recovery.diversion_cache_path),
         cache_bytes,
-        .{ .overwrite = .replace },
+        .{
+            .permissions = .fromMode(0o600),
+            .overwrite = .replace,
+        },
     );
 
     try root.publishFile(
@@ -3494,6 +3525,21 @@ test "native_recovery.test.route settlement evidence survives fresh recovery and
         program_step,
         true,
     );
+    const cache_path = try root_fs.Path.init(
+        native_recovery.diversion_cache_path,
+    );
+    try recovered_root.applyMetadata(cache_path, .{ .mode = 0o640 });
+    try testing.expectError(
+        error.ManagedStateChanged,
+        verifyUncheckpointedCacheTransition(
+            testing.allocator,
+            recovered_root,
+            intent,
+            program_step,
+            true,
+        ),
+    );
+    try recovered_root.applyMetadata(cache_path, .{ .mode = 0o600 });
     try testing.expectError(
         error.ManagedStateChanged,
         verifyManagedRecoveryState(

@@ -348,6 +348,41 @@ fn writeDiversionCache(
     });
 }
 
+fn readPrivateDiversionCache(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: native_recovery.Digest,
+) !native_diversion_cache.Decoded {
+    const path = try root_fs.Path.init(native_recovery.diversion_cache_path);
+    var pinned = root.pinRegularFile(path) catch |err| switch (err) {
+        error.FileNotFound,
+        error.NotRegularFile,
+        error.PathChanged,
+        => return error.ManagedStateChanged,
+        else => return err,
+    };
+    defer pinned.close();
+    const observed = pinned.observeStableAlloc(
+        allocator,
+        native_diversion_cache.maximum_document_bytes,
+    ) catch |err| switch (err) {
+        error.FileTooLarge,
+        error.PathChanged,
+        => return error.ManagedStateChanged,
+        else => return err,
+    };
+    defer allocator.free(observed.bytes);
+    if (builtin.os.tag != .windows and
+        (!observed.entry.modeled or observed.entry.mode != 0o600 or
+            observed.entry.link_count != 1))
+        return error.ManagedStateChanged;
+    return native_diversion_cache.decode(
+        allocator,
+        observed.bytes,
+        intent_sha256,
+    );
+}
+
 fn readManagedRouteSettlement(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -415,6 +450,11 @@ fn refreshExecutionRouteSettlement(
         active.unpack_input,
         &route_cache,
     );
+    try native_unpack_route_settlement.validateBoundPaths(
+        allocator,
+        root,
+        lowered.bound_paths,
+    );
     try root.publishFile(
         try root_fs.Path.init(native_recovery.diversion_cache_path),
         cache_bytes,
@@ -444,6 +484,33 @@ fn refreshExecutionRouteSettlement(
         script_action,
         paths,
         observed_steps.len != 0,
+    );
+    var checkpointed_cache = (try readManagedDiversionCache(
+        allocator,
+        root,
+        runtime.intent_sha256,
+    )) orelse return error.InvalidManagedState;
+    defer checkpointed_cache.deinit();
+    var private_cache = try readPrivateDiversionCache(
+        allocator,
+        root,
+        runtime.intent_sha256,
+    );
+    defer private_cache.deinit();
+    if (!std.mem.eql(
+        u8,
+        &checkpointed_cache.digest_sha256,
+        &route_cache.digest_sha256,
+    ) or !std.mem.eql(
+        u8,
+        &private_cache.digest_sha256,
+        &route_cache.digest_sha256,
+    ))
+        return error.ManagedStateChanged;
+    try native_unpack_route_settlement.validateBoundPaths(
+        allocator,
+        root,
+        lowered.bound_paths,
     );
     runtime.crash.hit(.after_upgrade_postrm_route_checkpoint);
     return checkpoint;
@@ -8509,6 +8576,39 @@ fn materializeUnpackBackups(
     );
 }
 
+fn publishInactiveRouteSettlement(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: root_fs.Path,
+    bytes: []const u8,
+) !void {
+    root.publishFile(path, bytes, .{
+        .permissions = if (builtin.os.tag == .windows)
+            .default_file
+        else
+            .fromMode(0o600),
+        .overwrite = .fail_if_exists,
+        .durable = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            var pinned = root.pinRegularFile(path) catch
+                return error.InvalidManagedState;
+            defer pinned.close();
+            const existing = pinned.observeStableAlloc(
+                allocator,
+                native_unpack_route_settlement.maximum_document_bytes,
+            ) catch return error.InvalidManagedState;
+            defer allocator.free(existing.bytes);
+            if ((builtin.os.tag != .windows and
+                (!existing.entry.modeled or existing.entry.mode != 0o600 or
+                    existing.entry.link_count != 1)) or
+                !std.mem.eql(u8, existing.bytes, bytes))
+                return error.InvalidManagedState;
+        },
+        else => return err,
+    };
+}
+
 /// Inactive #192 success path. Ordinary lifecycle execution neither creates
 /// route-settlement evidence nor calls this helper while the mid-unpack guard
 /// remains active.
@@ -8564,16 +8664,12 @@ pub fn bindInactiveRouteSettlement(
         contract.program_step,
         &path_buffer,
     );
-    if (try runtime.root.entryIfExists(try root_fs.Path.init(path)) != null)
-        return error.InvalidManagedState;
-    try runtime.root.publishFile(try root_fs.Path.init(path), bytes, .{
-        .permissions = if (builtin.os.tag == .windows)
-            .default_file
-        else
-            .fromMode(0o600),
-        .overwrite = .fail_if_exists,
-        .durable = true,
-    });
+    try publishInactiveRouteSettlement(
+        allocator,
+        runtime.root,
+        try root_fs.Path.init(path),
+        bytes,
+    );
     _ = try native_recovery.updateManagedState(
         allocator,
         runtime.root,
@@ -18345,15 +18441,9 @@ fn authenticateRouteCacheTransition(
         unpack_input.digest_sha256,
     );
     defer route.deinit();
-    const cache_bytes = try root.readFileAlloc(
+    var cache = try readPrivateDiversionCache(
         allocator,
-        try root_fs.Path.init(native_recovery.diversion_cache_path),
-        native_diversion_cache.maximum_document_bytes,
-    );
-    defer allocator.free(cache_bytes);
-    var cache = try native_diversion_cache.decode(
-        allocator,
-        cache_bytes,
+        root,
         runtime.intent_sha256,
     );
     defer cache.deinit();
@@ -18387,6 +18477,28 @@ fn authenticateRouteCacheTransition(
             paths,
             steps.len != 0,
         );
+        var checkpointed_cache = (try readManagedDiversionCache(
+            allocator,
+            root,
+            runtime.intent_sha256,
+        )) orelse return error.InvalidManagedState;
+        defer checkpointed_cache.deinit();
+        var private_cache = try readPrivateDiversionCache(
+            allocator,
+            root,
+            runtime.intent_sha256,
+        );
+        defer private_cache.deinit();
+        if (!std.mem.eql(
+            u8,
+            &checkpointed_cache.digest_sha256,
+            &cache.digest_sha256,
+        ) or !std.mem.eql(
+            u8,
+            &private_cache.digest_sha256,
+            &cache.digest_sha256,
+        ))
+            return error.ManagedStateChanged;
         runtime.crash.hit(.after_upgrade_postrm_route_checkpoint);
     }
     if (diversion_cache.*) |*session| session.deinit();
@@ -18412,13 +18524,13 @@ fn completedRouteScriptCode(
     source: native_program.ScriptSource,
     script_sha256: native_program.Digest,
     arguments: []const []const u8,
-) !u8 {
+) !?u8 {
     var progress = try native_recovery.readProgress(allocator, root);
     defer progress.deinit();
     const record = native_recovery.latest(
         progress.document,
         action,
-    ) orelse return error.InvalidScriptOutcome;
+    ) orelse return null;
     if (record.stage != .completed)
         return error.InvalidScriptOutcome;
     var outcome = (try native_recovery.readScriptOutcome(
@@ -18474,7 +18586,7 @@ fn routeSettlementScriptOutcome(
     program: native_program.Program,
     authorization: native_authorization.Authorization,
     unpack_step: u32,
-) !native_unpack_route_settlement.Outcome {
+) !?native_unpack_route_settlement.Outcome {
     if (unpack_step >= program.steps.len or
         program.steps[unpack_step].sequence != unpack_step)
         return error.InvalidLifecycleProgram;
@@ -18492,7 +18604,7 @@ fn routeSettlementScriptOutcome(
         @intCast(@intFromEnum(postrm.call.kind)),
         0,
     );
-    const primary_code = try completedRouteScriptCode(
+    const primary_code = (try completedRouteScriptCode(
         allocator,
         root,
         runtime,
@@ -18503,7 +18615,7 @@ fn routeSettlementScriptOutcome(
         postrm.call.source,
         postrm.call.script_sha256,
         postrm.call.arguments,
-    );
+    )) orelse return null;
     if (primary_code == 0)
         return .postrm_succeeded;
     const unwind = postrm.call.failure.unwind orelse return .rollback;
@@ -18513,7 +18625,7 @@ fn routeSettlementScriptOutcome(
         @intCast(@intFromEnum(unwind.kind)),
         1,
     );
-    const unwind_code = try completedRouteScriptCode(
+    const unwind_code = (try completedRouteScriptCode(
         allocator,
         root,
         runtime,
@@ -18524,7 +18636,7 @@ fn routeSettlementScriptOutcome(
         unwind.source,
         unwind.script_sha256,
         unwind.arguments,
-    );
+    )) orelse return error.InvalidScriptOutcome;
     return if (unwind_code == 0 and
         postrm.call.failure.resume_after_unwind)
         .unwind_succeeded
@@ -18583,14 +18695,16 @@ fn validateRouteSettlementRecoveryJournal(
         runtime.intent_sha256,
     )) orelse return error.InvalidManagedState;
     defer cache.deinit();
-    const outcome = try routeSettlementScriptOutcome(
+    const outcome = (try routeSettlementScriptOutcome(
         allocator,
         root,
         runtime,
         program,
         authorization,
         action.program_step,
-    );
+    )) orelse return;
+    if (outcome == .rollback)
+        return;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const lowered = try native_unpack_route_settlement.lowerOutcome(
@@ -19428,6 +19542,11 @@ fn orphanNativeEvidenceDetail(
             std.mem.eql(u8, name, "native-managed-state-v1.json") or
             std.mem.eql(u8, name, std.fs.path.basename(native_recovery.diversion_cache_path)) or
             std.mem.startsWith(u8, name, native_recovery.unpack_diversion_prefix) or
+            std.mem.startsWith(
+                u8,
+                name,
+                native_recovery.unpack_route_settlement_prefix,
+            ) or
             std.mem.eql(u8, name, "native-trigger-events-v1.json") or
             std.mem.startsWith(
                 u8,
@@ -23143,6 +23262,87 @@ test "native_unpack.test.unpack diversion paths have an exact bounded program st
     }
 }
 
+test "native_unpack.test.orphan route settlement evidence remains active" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(
+        try root_fs.Path.init(root_operation.namespace_path),
+        .fromMode(0o755),
+    );
+    var buffer: [128]u8 = undefined;
+    try root.publishFile(
+        try root_fs.Path.init(
+            try native_recovery.unpackRouteSettlementPath(7, &buffer),
+        ),
+        "orphan route settlement",
+        .{},
+    );
+    try testing.expect(try Runtime.hasActiveEvidence(testing.allocator, root));
+}
+
+test "native_unpack.test.route settlement publication is immutable and repeatable" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(
+        try root_fs.Path.init(root_operation.namespace_path),
+        .fromMode(0o755),
+    );
+    var buffer: [128]u8 = undefined;
+    const path = try root_fs.Path.init(
+        try native_recovery.unpackRouteSettlementPath(7, &buffer),
+    );
+    try publishInactiveRouteSettlement(
+        testing.allocator,
+        root,
+        path,
+        "bound route settlement",
+    );
+    try publishInactiveRouteSettlement(
+        testing.allocator,
+        root,
+        path,
+        "bound route settlement",
+    );
+    try root.applyMetadata(path, .{ .mode = 0o640 });
+    try testing.expectError(
+        error.InvalidManagedState,
+        publishInactiveRouteSettlement(
+            testing.allocator,
+            root,
+            path,
+            "bound route settlement",
+        ),
+    );
+    try root.applyMetadata(path, .{ .mode = 0o600 });
+    const link = try root_fs.Path.init(
+        root_operation.namespace_path ++ "/route-settlement-link",
+    );
+    try root.createHardLink(path, link);
+    try testing.expectError(
+        error.InvalidManagedState,
+        publishInactiveRouteSettlement(
+            testing.allocator,
+            root,
+            path,
+            "bound route settlement",
+        ),
+    );
+    try root.removeFile(link);
+    try testing.expectError(
+        error.InvalidManagedState,
+        publishInactiveRouteSettlement(
+            testing.allocator,
+            root,
+            path,
+            "changed route settlement",
+        ),
+    );
+}
+
 fn testDiversionCacheEvidenceAllocations(allocator: std.mem.Allocator) !void {
     const records = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
     var cache = try native_diversion.CachedRecords.init(allocator, records, testDiversionObservation(records, 3, 4));
@@ -23155,6 +23355,63 @@ fn testDiversionCacheEvidenceAllocations(allocator: std.mem.Allocator) !void {
 
 test "native_unpack.test.diversion cache evidence releases partial allocations" {
     try testing.checkAllAllocationFailures(testing.allocator, testDiversionCacheEvidenceAllocations, .{});
+}
+
+test "native_unpack.test.route recovery cache requires private stable metadata" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(
+        try root_fs.Path.init(root_operation.namespace_path),
+        .fromMode(0o755),
+    );
+    const intent: native_recovery.Digest = @splat('1');
+    const records = "/usr/bin/tool\n/usr/bin/tool.original\n:\n";
+    var cache = try native_diversion.CachedRecords.init(
+        testing.allocator,
+        records,
+        testDiversionObservation(records, 3, 4),
+    );
+    defer cache.deinit();
+    try writeDiversionCache(
+        testing.allocator,
+        root,
+        intent,
+        cache,
+        .fail_if_exists,
+    );
+    var decoded = try readPrivateDiversionCache(
+        testing.allocator,
+        root,
+        intent,
+    );
+    decoded.deinit();
+    const path = try root_fs.Path.init(
+        native_recovery.diversion_cache_path,
+    );
+    try root.applyMetadata(path, .{ .mode = 0o640 });
+    try testing.expectError(
+        error.ManagedStateChanged,
+        readPrivateDiversionCache(
+            testing.allocator,
+            root,
+            intent,
+        ),
+    );
+    try root.applyMetadata(path, .{ .mode = 0o600 });
+    const link = try root_fs.Path.init(
+        root_operation.namespace_path ++ "/diversion-cache-link",
+    );
+    try root.createHardLink(path, link);
+    try testing.expectError(
+        error.ManagedStateChanged,
+        readPrivateDiversionCache(
+            testing.allocator,
+            root,
+            intent,
+        ),
+    );
 }
 
 test "native_unpack.test.pinned diversion cache restores effective records without accepting live drift" {

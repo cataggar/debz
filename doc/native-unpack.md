@@ -370,10 +370,12 @@ payload and stranded conffile staging; changed-route backups remain
 authenticated and are not consumed by ordinary cleanup. Original publication
 routes remain the trigger authority.
 
-The route contract is a write-once managed input at its unpack anchor.
+The route contract is a write-once managed input at its unpack anchor. An exact
+retry can finish an interrupted checkpoint without changing the contract.
 Fresh-process recovery can authenticate the narrow interruption after the
 postrm cache document is durably refreshed but before its script checkpoint,
-then records that exact transition. Later settlement and cleanup recovery
+but requires its private mode, single-link identity and exact bytes before
+recording that transition. Later settlement and cleanup recovery
 re-lowers the contract, checks completed script outcomes and progress, and
 matches the actual mutation journal before generic repair. Missing/unknown
 outcomes, changed caches or contract, destination occupants, backup or staging
