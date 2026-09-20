@@ -233,13 +233,15 @@ def verify_source_bindings(reference: dict[str, Any]) -> dict[str, Any]:
         }:
             raise OracleError(f"dpkg tool pins changed for {architecture}")
     if source["fixture_packages"] != {
-        "architecture": "amd64",
+        "architectures": ["amd64", "arm64"],
+        "baseline_architecture": "amd64",
         "clock_epoch": m.EPOCH,
         "maintainer": "debz fixture <fixture@example.invalid>",
         "namespace": "debz-alt-*",
         "package_builder": "repository deterministic Python ar/tar builder",
     }:
         raise OracleError("fixture package provenance changed")
+    config.verify_architecture_evidence(reference)
     return derived
 
 
@@ -2406,8 +2408,11 @@ def main() -> int:
 
     reference = load_reference()
     derived = verify_source_bindings(reference)
+    expected_observation: dict[str, Any] | None = None
     if arguments.capture_observed is None:
-        validate_observation_architecture(reference, architecture)
+        expected_observation = config.published_observation(reference, architecture)
+    if arguments.update_reference and architecture != "amd64":
+        raise OracleError("only the amd64 baseline observation can be regenerated")
     dpkg, update_alternatives = select_references(
         arguments.reference_dpkg,
         arguments.reference_update_alternatives,
@@ -2468,7 +2473,7 @@ def main() -> int:
         REFERENCE.write_text(canonical_json(reference))
     elif arguments.capture_observed is not None:
         write_capture(arguments.capture_observed, observed)
-    elif observed != reference["observed_behavior"]:
+    elif observed != expected_observation:
         raise OracleError(
             "observed alternatives behavior differs from the canonical reference"
         )

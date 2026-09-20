@@ -491,6 +491,248 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "architecture_evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "arm64": {
+          "additionalProperties": false,
+          "properties": {
+            "comparison": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "difference_count": {
+              "const": 190
+            },
+            "difference_summary": {
+              "additionalProperties": false,
+              "properties": {
+                "architecture_derived_bytes_base64": {
+                  "const": 64
+                },
+                "architecture_derived_logs": {
+                  "const": 26
+                },
+                "architecture_derived_sha256": {
+                  "const": 80
+                },
+                "architecture_fields": {
+                  "const": 20
+                }
+              },
+              "required": [
+                "architecture_derived_bytes_base64",
+                "architecture_derived_logs",
+                "architecture_derived_sha256",
+                "architecture_fields"
+              ],
+              "type": "object"
+            },
+            "differences_from_baseline": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "path": {
+                    "maxLength": 512,
+                    "pattern": "^/[^\\u0000-\\u001f\\u007f]+$",
+                    "type": "string"
+                  },
+                  "value": {}
+                },
+                "required": [
+                  "path",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "maxItems": 190,
+              "minItems": 190,
+              "type": "array"
+            },
+            "execution": {
+              "additionalProperties": false,
+              "properties": {
+                "artifact": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "const": 10609708158
+                    },
+                    "name": {
+                      "const": "dpkg-oracle-execution-evidence-arm64-f3132ef5fa554b7bbfbfa73a84983632bd08ff68"
+                    },
+                    "size": {
+                      "const": 50924
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "name",
+                    "size"
+                  ],
+                  "type": "object"
+                },
+                "evidence_manifest": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "const": "dpkg-oracle-execution-evidence-arm64-v1.json"
+                    },
+                    "sha256": {
+                      "const": "c2717c576f7a231966dff09b6a547a6aa48dca526d70b46356e77a9bc7445ed2"
+                    },
+                    "size": {
+                      "const": 4847
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "sha256",
+                    "size"
+                  ],
+                  "type": "object"
+                },
+                "executed_reference": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": {
+                      "const": "tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json"
+                    },
+                    "sha256": {
+                      "const": "51af34c1c6621b5164eeed3f05002ecabd9fcc0e6eba298e042c693da46bce03"
+                    },
+                    "size": {
+                      "const": 725123
+                    }
+                  },
+                  "required": [
+                    "path",
+                    "sha256",
+                    "size"
+                  ],
+                  "type": "object"
+                },
+                "invocation_clock": {
+                  "const": "2026-09-20T16:29:21.965+00:00"
+                },
+                "job_id": {
+                  "const": 106120369829
+                },
+                "run_id": {
+                  "const": 35526836596
+                },
+                "source_commit": {
+                  "const": "f3132ef5fa554b7bbfbfa73a84983632bd08ff68"
+                },
+                "workflow_path": {
+                  "const": ".github/workflows/ci.yml"
+                }
+              },
+              "required": [
+                "artifact",
+                "evidence_manifest",
+                "executed_reference",
+                "invocation_clock",
+                "job_id",
+                "run_id",
+                "source_commit",
+                "workflow_path"
+              ],
+              "type": "object"
+            },
+            "observation": {
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "const": "dpkg-alternatives-reference-arm64-observed-v1.json"
+                },
+                "sha256": {
+                  "const": "cf2b4f92399c2c19281d62b6ab1ea266cd85887263bc273ac8857fe507deae8f"
+                },
+                "size": {
+                  "const": 694862
+                }
+              },
+              "required": [
+                "path",
+                "sha256",
+                "size"
+              ],
+              "type": "object"
+            },
+            "tool_evidence": {
+              "additionalProperties": false,
+              "properties": {
+                "archive_size": {
+                  "const": 1521436
+                },
+                "dpkg_size": {
+                  "const": 396184
+                },
+                "pinned_tool_binding": {
+                  "const": "source.dpkg.architectures.arm64"
+                },
+                "receipt_sha256": {
+                  "const": "ba45506b84e31bb8a9629b74dbabca884bc96af5a187ba8db41b2969122719b2"
+                },
+                "receipt_size": {
+                  "const": 582
+                },
+                "update_alternatives_size": {
+                  "const": 67840
+                }
+              },
+              "required": [
+                "archive_size",
+                "dpkg_size",
+                "pinned_tool_binding",
+                "receipt_sha256",
+                "receipt_size",
+                "update_alternatives_size"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "comparison",
+            "difference_count",
+            "difference_summary",
+            "differences_from_baseline",
+            "execution",
+            "observation",
+            "tool_evidence"
+          ],
+          "type": "object"
+        },
+        "baseline": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "const": "amd64"
+            },
+            "observation_sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "observation_size": {
+              "maximum": 2097152,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "architecture",
+            "observation_sha256",
+            "observation_size"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "arm64",
+        "baseline"
+      ],
+      "type": "object"
+    },
     "boundary": {
       "additionalProperties": false,
       "properties": {
@@ -695,8 +937,19 @@
           ],
           "type": "object"
         },
-        "observed_architecture": {
-          "const": "amd64"
+        "observed_architectures": {
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "const": "amd64"
+            },
+            {
+              "const": "arm64"
+            }
+          ],
+          "type": "array"
         }
       },
       "required": [
@@ -705,7 +958,7 @@
         "environment",
         "invocation_clock",
         "limits",
-        "observed_architecture"
+        "observed_architectures"
       ],
       "type": "object"
     },
@@ -1635,7 +1888,21 @@
         "fixture_packages": {
           "additionalProperties": false,
           "properties": {
-            "architecture": {
+            "architectures": {
+              "items": false,
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "const": "amd64"
+                },
+                {
+                  "const": "arm64"
+                }
+              ],
+              "type": "array"
+            },
+            "baseline_architecture": {
               "const": "amd64"
             },
             "clock_epoch": {
@@ -1652,7 +1919,8 @@
             }
           },
           "required": [
-            "architecture",
+            "architectures",
+            "baseline_architecture",
             "clock_epoch",
             "maintainer",
             "namespace",
@@ -1800,6 +2068,7 @@
     }
   },
   "required": [
+    "architecture_evidence",
     "boundary",
     "native_requirements",
     "observed_behavior",

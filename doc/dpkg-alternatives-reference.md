@@ -21,6 +21,16 @@ The canonical result is
   selector, and generic-link effect;
 - every count, byte, path, file, process, cleanup, and timeout limit.
 
+The common observation is stored once as the amd64 baseline. The reviewed
+arm64 execution is represented by 190 sorted JSON-pointer replacements:
+20 architecture fields, 64 architecture-derived encoded database values,
+26 architecture-qualified dpkg log values, and their 80 SHA-256 values.
+Applying those replacements reconstructs the exact 694,862-byte arm64
+observation with SHA-256
+`cf2b4f92399c2c19281d62b6ab1ea266cd85887263bc273ac8857fe507deae8f`.
+The external `update-alternatives` observation and the dpkg/tool separation
+result are byte-identical between architectures.
+
 The reviewed vendor captures do not contain alternatives record bytes,
 priorities, providers, ownership, or auto/manual mode. The executable vendor
 projection therefore registers one synthetic priority-50 provider for every
@@ -60,17 +70,17 @@ zig build test-dpkg-alternatives-reference \
   -Dnative-reference-architecture=amd64 -j2
 ```
 
-The current canonical execution is amd64 only. Arm64 archive and executable
-pins are evidence inputs, not observed behavior. The runner rejects arm64
-publication until it is executed natively and reviewed separately.
-
-The `CI` workflow's opt-in `run_arm64_dpkg_oracles` dispatch target performs
-that review capture on `ubuntu-24.04-arm`. It passes the architecture
-explicitly, verifies the downloaded archive and private binaries against the
-pinned digests, hides host dpkg configuration and fragments inside a private
-mount namespace, executes both references with an empty inherited environment,
-and uploads only canonical bounded observations plus their
-execution-evidence manifest.
+The canonical execution covers amd64 and arm64. The arm64 result was captured
+by `CI` run `35526836596`, job `106120369829`, from source commit
+`f3132ef5fa554b7bbfbfa73a84983632bd08ff68` on `ubuntu-24.04-arm`.
+The opt-in `run_arm64_dpkg_oracles` target passes the architecture explicitly,
+verifies the downloaded archive and private binaries against the pinned
+digests, hides host dpkg configuration and fragments inside a private mount
+namespace, executes both references with an empty inherited environment, and
+uploads only canonical bounded observations plus their execution-evidence
+manifest. The manifest and artifact bindings, invocation clock, exact compact
+architecture differences, tool sizes, and receipt digest are retained in the
+canonical JSON.
 
 ## External `update-alternatives` behavior
 

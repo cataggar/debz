@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from collections import Counter
 import copy
 import hashlib
 import importlib.util
@@ -107,12 +108,51 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.Draft202012Validator(schema).validate(invalid)
 
-    def test_publication_is_amd64_only(self) -> None:
+    def test_publication_has_exact_dual_architecture_evidence(self) -> None:
         reference = oracle.load_reference()
         oracle.validate_observation_architecture(reference, "amd64")
+        oracle.validate_observation_architecture(reference, "arm64")
         with self.assertRaisesRegex(oracle.OracleError, "architecture-specific"):
-            oracle.validate_observation_architecture(reference, "arm64")
-        self.assertIn("rejects arm64", reference["boundary"]["architecture_scope"])
+            oracle.validate_observation_architecture(reference, "riscv64")
+        self.assertEqual(
+            reference["boundary"]["observed_architectures"],
+            ["amd64", "arm64"],
+        )
+        evidence = reference["architecture_evidence"]["arm64"]
+        self.assertEqual(evidence["difference_count"], 190)
+        self.assertEqual(
+            evidence["difference_summary"],
+            {
+                "architecture_derived_bytes_base64": 64,
+                "architecture_derived_logs": 26,
+                "architecture_derived_sha256": 80,
+                "architecture_fields": 20,
+            },
+        )
+        self.assertEqual(
+            Counter(
+                difference["path"].rsplit("/", 1)[-1]
+                for difference in evidence["differences_from_baseline"]
+            ),
+            Counter(
+                {
+                    "Architecture": 1,
+                    "architecture": 19,
+                    "bytes_base64": 64,
+                    "log": 26,
+                    "sha256": 80,
+                }
+            ),
+        )
+        arm64 = oracle.config.verify_architecture_evidence(reference)
+        self.assertEqual(
+            arm64["external_update_alternatives"],
+            reference["observed_behavior"]["external_update_alternatives"],
+        )
+        self.assertEqual(
+            arm64["separation"],
+            reference["observed_behavior"]["separation"],
+        )
 
     def test_vendor_projection_covers_every_pinned_group_and_requested_path(self) -> None:
         reference = oracle.load_reference()

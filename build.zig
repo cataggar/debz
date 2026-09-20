@@ -612,7 +612,7 @@ pub fn build(b: *std.Build) void {
     );
     dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
     test_step.dependOn(&dpkg_config_reference_tests.step);
-    b.step("test-dpkg-config-reference", "Verify amd64 direct pinned-dpkg config control-member behavior")
+    b.step("test-dpkg-config-reference", "Verify pinned-dpkg config control-member behavior")
         .dependOn(&dpkg_config_reference.step);
 
     const dpkg_alternatives_reference = b.addSystemCommand(&.{
@@ -626,7 +626,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dpkg_alternatives_reference_tests.step);
     b.step(
         "test-dpkg-alternatives-reference",
-        "Verify amd64 pinned dpkg/update-alternatives records, links, lifecycle and recovery",
+        "Verify pinned dpkg/update-alternatives records, links, lifecycle and recovery",
     ).dependOn(&dpkg_alternatives_reference.step);
     const dpkg_oracle_evidence_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_oracle_evidence.py" },

@@ -226,10 +226,14 @@ schema](../schema/dpkg-config-reference-v1.json) and canonical
 `tools/fixtures/vendor-state/dpkg-config-reference-v1.json` bind dpkg 1.22.22
 and both executable/archive pins, the index, both manifests, the derived
 reference digest, and all seven package/config identities. The seven vendor
-facts and the pinned dpkg package are available for amd64 and arm64, but this
-v1 lifecycle observation was executed and published for amd64 only. It makes
-no architecture-independence claim: the runner rejects an arm64 host until a
-separate arm64 observation is reviewed and published.
+facts and the pinned dpkg package are available for amd64 and arm64, and the
+v1 lifecycle observation is executed and published for both. The common
+amd64 observation is stored once; 78 sorted JSON-pointer replacements
+reconstruct the exact arm64 result. Those differences are 45 architecture
+fields plus six sizes and 27 SHA-256 values derived from
+architecture-qualified package/status/info bytes. Commands, exits, traces,
+maintainer-script environments, config non-execution, package states, journal
+semantics, and frontend exclusion are otherwise identical.
 
 The elevated `tools/dpkg-config-reference.py` runner invokes only the pinned
 dpkg binary against guarded disposable roots. Its deterministic Python
@@ -253,7 +257,7 @@ zig build test-dpkg-config-reference \
   -Dnative-reference-architecture=amd64 -j2
 ```
 
-On amd64, direct dpkg never executes `config`: nonzero scripts and a script with a
+On amd64 and arm64, direct dpkg never executes `config`: nonzero scripts and a script with a
 missing interpreter are installed and replaced without affecting command
 success. Incoming bytes are visible at `tmp.ci/config` to old `prerm`, incoming
 `preinst`, and old `postrm`; the installed info member remains the old version
@@ -265,24 +269,23 @@ rollback restores the old member, and retries settle without invoking config.
 The interruption rows additionally bind committed status versus the latest
 bounded `updates/` fragment.
 
-This closes the config direct-dpkg behavior question, not debconf frontend
-behavior, arm64 behavior, or native support. Arm64 publication remains blocked
-until the same executable oracle is run there and its canonical
-architecture-specific observation is reviewed. A future native implementation
-must reproduce the applicable byte/mode/ownership publication, rollback,
-removal, and non-execution contract.
+This closes the config direct-dpkg behavior question for the pinned amd64 and
+arm64 tools, not debconf frontend behavior or native support. A future native
+implementation must reproduce the applicable byte/mode/ownership publication,
+rollback, removal, and non-execution contract.
 Current opaque-info and unsupported-archive-metadata guards remain unchanged.
 
 The remaining alternatives reference requirement is closed separately by the
 [pinned dpkg/update-alternatives oracle](dpkg-alternatives-reference.md).
 Its canonical schema and fixture bind dpkg/update-alternatives 1.22.22, both
 architecture-specific executable pins, the reviewed 14 groups, 189 requested
-paths and linked topology, and an amd64-only execution. The external-tool rows
+paths and linked topology, and native amd64/arm64 executions. The external-tool rows
 cover exact record bytes, auto/manual mode, priorities and ties, master/slave
 shape, missing providers, malformed and non-regular records, root escapes,
 symlink/cycle attacks, and database/link partial states. Direct-dpkg rows cover
 opaque `.alternatives` info members plus maintainer-script-driven install,
 reinstall, upgrade, remove, purge, multiple providers, script failure/unwind,
 interruption, and recovery. Dpkg never interprets the member or invokes the
-tool implicitly. Arm64 publication is rejected until the executable oracle is
-run and reviewed natively there. Current production guards remain unchanged.
+tool implicitly. Exact arm64 architecture-derived differences are stored as a
+compact patch over the amd64 baseline; external `update-alternatives` behavior
+is identical. Current production guards remain unchanged.
