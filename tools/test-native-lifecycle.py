@@ -1080,22 +1080,43 @@ def exercise_diversion_lifecycle(
         current.complete()
 
     if executable is not None:
-        current = Scenario(workspace, "diversion-refusal-mid-unpack", executable, architecture, environment)
-        source = f"{DIVERSION_BASE}/mode"
-        for root in current.roots:
-            seed_diversions(root, diversion_records(source, source + ".original"))
-        current.seed(archives["1"])
-        seed_diversion_replacement(
-            current.candidate, "postrm", diversion_records(source, source + ".changed"),
-        )
-        output = current.directory / "refusal"
-        output.mkdir()
-        report = native(
-            executable, current.candidate, [archives["2"]], "upgrade", architecture, environment, output,
-            packages=current.identities((DIVERSION_PACKAGE,)),
-        )
-        assert report["outcome"] == "recovery_required" and report["detail"] == "unsupported_mid_unpack_diversion_update", report
-        assert not (current.candidate / (source + ".changed")).exists()
+        for outcome, failures in (
+            ("success", ()),
+            ("failure", (f"{DIVERSION_PACKAGE}@1:postrm:upgrade",)),
+            ("double-failure", (
+                f"{DIVERSION_PACKAGE}@1:postrm:upgrade",
+                f"{DIVERSION_PACKAGE}@2:postrm:failed-upgrade",
+            )),
+        ):
+            current = Scenario(
+                workspace, f"diversion-refusal-mid-unpack-{outcome}",
+                executable, architecture, environment,
+            )
+            source = f"{DIVERSION_BASE}/mode"
+            for root in current.roots:
+                seed_diversions(
+                    root,
+                    diversion_records(source, source + ".original"),
+                )
+            current.seed(archives["1"])
+            current.fail(*failures)
+            seed_diversion_replacement(
+                current.candidate, "postrm",
+                diversion_records(source, source + ".changed"),
+            )
+            output = current.directory / "refusal"
+            output.mkdir()
+            report = native(
+                executable, current.candidate, [archives["2"]], "upgrade",
+                architecture, environment, output,
+                packages=current.identities((DIVERSION_PACKAGE,)),
+            )
+            assert (
+                report["outcome"] == "recovery_required"
+                and report["detail"]
+                == "unsupported_mid_unpack_diversion_update"
+            ), report
+            assert not (current.candidate / (source + ".changed")).exists()
         print("diversion-refusal-mid-unpack: old-postrm route changes stop before settlement", flush=True)
 
     for spelling in ("bin", "usr/bin"):

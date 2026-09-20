@@ -43,6 +43,7 @@ pub const EvidenceKind = enum {
     managed_state,
     diversion_cache,
     unpack_diversion_cache,
+    unpack_route_settlement,
     trigger_events,
     script_outcome,
     active_script,
@@ -367,17 +368,21 @@ pub fn validate(document: Document) !void {
         for (document.evidence_files[0..index]) |prior|
             if (std.mem.eql(u8, prior.path, file.path))
                 return error.InvalidEvidence;
-        const indexed = file.kind == .script_outcome or file.kind == .unpack_diversion_cache;
+        const indexed = file.kind == .script_outcome or
+            file.kind == .unpack_diversion_cache or
+            file.kind == .unpack_route_settlement;
         if (indexed and file.action == null)
             return error.InvalidEvidence;
         if (!indexed and file.action != null)
             return error.InvalidEvidence;
-        if (file.kind == .unpack_diversion_cache) {
+        if (file.kind == .unpack_diversion_cache or
+            file.kind == .unpack_route_settlement)
+        {
             const action = file.action.?;
             if (action.kind != .filesystem or action.substep != 0 or action.ordinal != 0)
                 return error.InvalidEvidence;
             for (document.evidence_files[0..index]) |prior| {
-                if (prior.kind == .unpack_diversion_cache and
+                if (prior.kind == file.kind and
                     prior.action != null and prior.action.?.program_step == action.program_step)
                     return error.InvalidEvidence;
             }
@@ -391,6 +396,7 @@ pub fn validate(document: Document) !void {
             .managed_state,
             .diversion_cache,
             .unpack_diversion_cache,
+            .unpack_route_settlement,
             .trigger_events,
             .script_outcome,
             .root_operation,

@@ -203,9 +203,9 @@ def current_route(update: str, source: str) -> str:
     return source if update in ("empty", "remove", "exempt") else source + ".changed"
 
 
-def successful_route_profile(update: str, member: str) -> dict:
-    if (update, member) not in SUCCESSFUL_POSTRM_CASES:
-        raise ValueError("profile is not a successful old-postrm transition")
+def route_settlement_profile(update: str, member: str) -> dict:
+    if (update, member) not in CASES:
+        raise ValueError("unknown diversion settlement profile")
     source = MEMBERS[member]
     payload_route = source if update == "create" else source + ".original"
     post_script_route = (
@@ -230,6 +230,23 @@ def successful_route_profile(update: str, member: str) -> dict:
         ownership = "previous_and_resulting"
         triggers, removal = [f"/{payload_route}"], None
     conffile_version = "1" if member == "conffile" and changed else "2"
+    if update == "rollback":
+        outcome = "rollback"
+    elif update == "unwind-success":
+        outcome = "unwind_succeeded"
+    elif update == "postinst-failure":
+        outcome = "postinst_failed"
+    else:
+        outcome = "postrm_succeeded"
+    if outcome == "rollback":
+        if member == "conffile":
+            partial = "retain_conffile_staging"
+        elif ownership == "previous":
+            partial = "restore_previous"
+        else:
+            partial = "retain_incoming"
+    else:
+        partial = None
     return {
         "update": update,
         "member": member,
@@ -243,6 +260,19 @@ def successful_route_profile(update: str, member: str) -> dict:
         "recorded_md5": hashlib.md5(
             f"configuration {conffile_version}\n".encode()
         ).hexdigest(),
+        "outcome": outcome,
+        "publish_settlement": outcome != "rollback",
+        "partial_disposition": partial,
+    }
+
+
+def successful_route_profile(update: str, member: str) -> dict:
+    if (update, member) not in SUCCESSFUL_POSTRM_CASES:
+        raise ValueError("profile is not a successful old-postrm transition")
+    profile = route_settlement_profile(update, member)
+    return {
+        key: value for key, value in profile.items()
+        if key not in ("outcome", "publish_settlement", "partial_disposition")
     }
 
 

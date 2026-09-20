@@ -241,6 +241,7 @@
             "managed_state",
             "diversion_cache",
             "unpack_diversion_cache",
+            "unpack_route_settlement",
             "trigger_events",
             "script_outcome",
             "active_script",

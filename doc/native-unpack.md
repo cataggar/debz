@@ -357,9 +357,34 @@ The internal executor requires the existing held operation and recovery
 runtime, then uses the generic mutation journal, stable managed-state
 validation and pre-mutation path checkpointing.
 It does not synthesize or publish a diversion database. It is intentionally
-unreachable from normal requests: no ordinary execution emits this capability,
-the existing mid-unpack guard remains, and failure/unwind plus fresh-process
-route-settlement recovery are still later #192 work.
+unreachable from normal requests: no ordinary execution emits this capability
+and the existing mid-unpack guard remains.
+
+The third inactive increment extends the same lowering across successful
+failed-upgrade unwind, double-postrm rollback and later postinst failure. A
+rollback does not publish the incoming late database recipe: the verified
+payload journal restores the old status/list/control generation first, then
+only contract-described changed publication routes are retained. The route
+description distinguishes restored previous-only paths, orphaned incoming
+payload and stranded conffile staging; changed-route backups remain
+authenticated and are not consumed by ordinary cleanup. Original publication
+routes remain the trigger authority.
+
+The route contract is a write-once managed input at its unpack anchor.
+Fresh-process recovery can authenticate the narrow interruption after the
+postrm cache document is durably refreshed but before its script checkpoint,
+then records that exact transition. Later settlement and cleanup recovery
+re-lowers the contract, checks completed script outcomes and progress, and
+matches the actual mutation journal before generic repair. Missing/unknown
+outcomes, changed caches or contract, destination occupants, backup or staging
+drift and unrelated directory membership still refuse before further
+mutation. Caller archives are not consulted: the existing intent-owned
+artifact copies remain recovery authority.
+
+Completed provenance retains the route contract as indexed evidence alongside
+the publication cache. Repeated completion therefore verifies the same
+immutable bytes. This remains inactive infrastructure only; production
+activation and the ordinary execution guard are unchanged.
 
 The 15-profile success-lowering corpus covers successful old-`postrm`
 transitions. The 24-profile reference set has 16 overall successful upgrades;

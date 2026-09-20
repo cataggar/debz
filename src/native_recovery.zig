@@ -33,6 +33,8 @@ pub const trigger_events_path = "var/lib/debz/native-trigger-events-v1.json";
 pub const managed_state_path = "var/lib/debz/native-managed-state-v1.json";
 pub const diversion_cache_path = "var/lib/debz/native-diversion-cache-v1.json";
 pub const unpack_diversion_prefix = "native-unpack-diversion-v1-";
+pub const unpack_route_settlement_prefix =
+    "native-unpack-route-settlement-v1-";
 pub const maximum_intent_bytes: usize = 16 * 1024 * 1024;
 pub const maximum_progress_bytes: usize = 64 * 1024 * 1024;
 pub const maximum_records: usize = 200_000;
@@ -60,6 +62,40 @@ pub fn unpackDiversionStep(path: []const u8) !?u32 {
     return step;
 }
 
+pub fn unpackRouteSettlementPath(
+    program_step: u32,
+    buffer: *[128]u8,
+) ![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        root_operation.namespace_path ++ "/" ++
+            unpack_route_settlement_prefix ++ "{d}.json",
+        .{program_step},
+    );
+}
+
+pub fn unpackRouteSettlementStep(path: []const u8) !?u32 {
+    const prefix = root_operation.namespace_path ++ "/" ++
+        unpack_route_settlement_prefix;
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (!std.mem.endsWith(u8, path, ".json") or
+        path.len <= prefix.len + ".json".len)
+        return error.InvalidUnpackRouteSettlementPath;
+    const step = std.fmt.parseUnsigned(
+        u32,
+        path[prefix.len .. path.len - ".json".len],
+        10,
+    ) catch return error.InvalidUnpackRouteSettlementPath;
+    var buffer: [128]u8 = undefined;
+    if (!std.mem.eql(
+        u8,
+        path,
+        try unpackRouteSettlementPath(step, &buffer),
+    ))
+        return error.InvalidUnpackRouteSettlementPath;
+    return step;
+}
+
 pub const CrashPoint = enum {
     after_execution_intent,
     during_filesystem_publication,
@@ -68,6 +104,8 @@ pub const CrashPoint = enum {
     after_script_outcome,
     after_script_return_before_outcome,
     after_upgrade_postrm_return_before_outcome,
+    after_upgrade_postrm_cache_refresh,
+    after_upgrade_postrm_route_checkpoint,
     after_upgrade_postrm_outcome,
     after_upgrade_unwind_outcome,
     after_upgrade_pre_rollback_compensation_outcome,
@@ -1394,7 +1432,10 @@ pub fn updateManagedState(
             &observed_bytes,
         );
         initialized += 1;
-        if (try unpackDiversionStep(path)) |program_step| {
+        const immutable_input_step =
+            try unpackDiversionStep(path) orelse
+            try unpackRouteSettlementStep(path);
+        if (immutable_input_step) |program_step| {
             const previous: ?ManagedEntry = if (base) |snapshot| block: {
                 const previous_index = managedEntryLowerBound(snapshot.entries, path);
                 break :block if (previous_index < snapshot.entries.len and std.mem.eql(u8, snapshot.entries[previous_index].path, path))
@@ -1410,7 +1451,13 @@ pub fn updateManagedState(
                     action.kind != .filesystem or action.program_step != program_step or
                     action.substep != 0 or action.ordinal != 0)
                     return error.ManagedStateChanged;
-            } else if (entries[index].kind != .absent) return error.ManagedStateChanged;
+            } else if (entries[index].kind != .absent and
+                (try unpackRouteSettlementStep(path) == null or
+                    entries[index].kind != .regular or transient or
+                    action.kind != .filesystem or
+                    action.program_step != program_step or
+                    action.substep != 0 or action.ordinal != 0))
+                return error.ManagedStateChanged;
         }
     }
     var snapshot: ManagedSnapshot = .{
@@ -2925,6 +2972,91 @@ test "native_recovery.test.unpack inputs cannot be rebound by script or publicat
             for ([_]bool{ false, true }) |transient|
                 try testing.expectError(error.ManagedStateChanged, updateManagedState(testing.allocator, root, intent, action, &.{}, transient));
         }
+    }
+}
+
+test "native_recovery.test.route settlement inputs bind once at their unpack anchor" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    for (0..3) |change| {
+        var temporary = testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        for ([_][]const u8{
+            "var",
+            "var/lib",
+            root_operation.namespace_path,
+        }) |path|
+            try root.ensureDirectory(
+                try root_fs.Path.init(path),
+                root_fs.default_directory_permissions,
+            );
+        const intent: Digest = @splat('1');
+        const publication: Action = .{
+            .kind = .filesystem,
+            .program_step = 7,
+            .substep = 0,
+            .ordinal = 0,
+        };
+        const script: Action = .{
+            .kind = .script,
+            .program_step = 8,
+            .substep = 0,
+            .ordinal = 0,
+        };
+        var buffer: [128]u8 = undefined;
+        const path = try root_fs.Path.init(
+            try unpackRouteSettlementPath(7, &buffer),
+        );
+        try initializeProgress(testing.allocator, root, intent);
+        try initializeManagedState(testing.allocator, root, intent);
+        try root.publishFile(path, "bound route contract", .{});
+        _ = try updateManagedState(
+            testing.allocator,
+            root,
+            intent,
+            publication,
+            &.{path.text},
+            false,
+        );
+        _ = try updateManagedState(
+            testing.allocator,
+            root,
+            intent,
+            script,
+            &.{},
+            true,
+        );
+        try discardTransientManagedState(
+            testing.allocator,
+            root,
+            intent,
+        );
+        switch (change) {
+            0 => try root.publishFile(
+                path,
+                "replacement contract",
+                .{ .overwrite = .replace },
+            ),
+            1 => try root.applyMetadata(
+                path,
+                .{ .mode = (try root.entry(path)).mode ^ 0o040 },
+            ),
+            2 => try root.removeFile(path),
+            else => unreachable,
+        }
+        for ([_]Action{ publication, script }) |action|
+            try testing.expectError(
+                error.ManagedStateChanged,
+                updateManagedState(
+                    testing.allocator,
+                    root,
+                    intent,
+                    action,
+                    &.{},
+                    action.kind == .script,
+                ),
+            );
     }
 }
 

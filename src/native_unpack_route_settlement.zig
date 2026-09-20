@@ -9,6 +9,7 @@ const native_unpack_settlement = @import("native_unpack_settlement.zig");
 const package_database = @import("package_database.zig");
 const root_fs = @import("root_fs.zig");
 const root_mutation = @import("root_mutation.zig");
+const root_operation = @import("root_operation.zig");
 
 const Digest = native_recovery.Digest;
 const schema_name = "https://debz.dev/schema/native-unpack-route-settlement-v1";
@@ -246,6 +247,41 @@ pub const Lowered = struct {
     observed_paths: []const []const u8,
     evidence: native_unpack_settlement.DatabaseEvidence,
     phase_sha256: [32]u8,
+};
+
+pub const Outcome = enum {
+    postrm_succeeded,
+    unwind_succeeded,
+    rollback,
+    postinst_failed,
+};
+
+pub const PartialDisposition = enum {
+    restore_previous,
+    retain_incoming,
+    retain_conffile_staging,
+};
+
+pub const PartialRoute = struct {
+    logical_path: []const u8,
+    payload_route: []const u8,
+    post_script_route: []const u8,
+    disposition: PartialDisposition,
+    backup_path: ?[]const u8,
+    trigger_paths: []const []const u8,
+};
+
+pub const LoweredOutcome = struct {
+    outcome: Outcome,
+    routes: []const LoweredRoute,
+    settlement_intents: []const root_mutation.Intent,
+    cleanup_intents: []const root_mutation.Intent,
+    partial_routes: []const PartialRoute,
+    bound_paths: []const BoundPath,
+    observed_paths: []const []const u8,
+    evidence: native_unpack_settlement.DatabaseEvidence,
+    phase_sha256: [32]u8,
+    publish_settlement: bool,
 };
 
 fn validateDigest(digest: Digest) !void {
@@ -563,6 +599,10 @@ fn documentDigest(document: Document) Digest {
     return native_recovery.hexDigest(sink.hasher.finalResult());
 }
 
+pub fn contractDigest(contract: Contract) Digest {
+    return documentDigest(contractDocument(contract));
+}
+
 fn contractDocument(contract: Contract) Document {
     return .{
         .version = contract.version,
@@ -607,7 +647,7 @@ fn decodeBounded(
     bytes: []const u8,
     intent_sha256: Digest,
     program_step: u32,
-    unpack_input_sha256: Digest,
+    unpack_input_sha256: ?Digest,
     maximum_bytes: usize,
 ) !Decoded {
     if (bytes.len > maximum_bytes)
@@ -624,9 +664,15 @@ fn decodeBounded(
         document.capability != .postrm_upgrade_route_settlement or
         !std.mem.eql(u8, &document.intent_sha256, &intent_sha256) or
         document.program_step != program_step or
-        !std.mem.eql(u8, &document.unpack_input_sha256, &unpack_input_sha256) or
         !std.mem.eql(u8, &document.digest_sha256, &documentDigest(document)))
         return error.InvalidUnpackRouteSettlement;
+    if (unpack_input_sha256) |expected|
+        if (!std.mem.eql(
+            u8,
+            &document.unpack_input_sha256,
+            &expected,
+        ))
+            return error.InvalidUnpackRouteSettlement;
     const contract: Contract = .{
         .version = document.version,
         .capability = document.capability,
@@ -662,6 +708,22 @@ pub fn decode(
         intent_sha256,
         program_step,
         unpack_input_sha256,
+        maximum_document_bytes,
+    );
+}
+
+pub fn decodeEvidence(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    intent_sha256: Digest,
+    program_step: u32,
+) !Decoded {
+    return decodeBounded(
+        allocator,
+        bytes,
+        intent_sha256,
+        program_step,
+        null,
         maximum_document_bytes,
     );
 }
@@ -1311,6 +1373,293 @@ pub fn lowerSuccess(
     );
 }
 
+fn outcomePhaseDigest(
+    contract: Contract,
+    route_cache: *const native_diversion_cache.Decoded,
+    outcome: Outcome,
+    base: [32]u8,
+) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("debz-native-route-settlement-outcome-v1\x00");
+    hash.update(&base);
+    hash.update(&native_recovery.parseDigest(
+        contractDigest(contract),
+    ).?);
+    hash.update(&native_recovery.parseDigest(
+        route_cache.digest_sha256,
+    ).?);
+    hash.update(@tagName(outcome));
+    return hash.finalResult();
+}
+
+fn partialDisposition(route: LoweredRoute) PartialDisposition {
+    if (route.conffile) |conffile|
+        if (conffile.staging == .retain)
+            return .retain_conffile_staging;
+    return switch (route.ownership) {
+        .previous => .restore_previous,
+        .resulting, .previous_and_resulting => .retain_incoming,
+    };
+}
+
+/// Inactive outcome-aware lowering for the complete old-postrm reference
+/// boundary. Rollback consumes the same authenticated routes and artifacts
+/// but does not publish the incoming late database recipe; the generic payload
+/// rollback remains authoritative and only the described partial routes may be
+/// re-published afterwards.
+pub fn lowerOutcome(
+    allocator: std.mem.Allocator,
+    contract: Contract,
+    unpack_input: *const native_unpack_diversion.Decoded,
+    route_cache: *const native_diversion_cache.Decoded,
+    outcome: Outcome,
+) !LoweredOutcome {
+    const lowered = try lowerSuccess(
+        allocator,
+        contract,
+        unpack_input,
+        route_cache,
+    );
+    var changed_routes: usize = 0;
+    for (lowered.routes) |route|
+        changed_routes += @intFromBool(route.route_changed);
+    if (changed_routes == 0 and outcome != .postrm_succeeded)
+        return error.InvalidUnpackRouteSettlement;
+
+    const partial_routes = if (outcome == .rollback) block: {
+        const routes = try allocator.alloc(PartialRoute, changed_routes);
+        var index: usize = 0;
+        for (lowered.routes) |route| {
+            if (!route.route_changed) continue;
+            routes[index] = .{
+                .logical_path = route.logical_path,
+                .payload_route = route.payload_route,
+                .post_script_route = route.post_script_route,
+                .disposition = partialDisposition(route),
+                .backup_path = route.backup_path,
+                .trigger_paths = route.trigger_paths,
+            };
+            index += 1;
+        }
+        break :block routes;
+    } else &.{};
+    const publish_settlement = outcome != .rollback;
+    return .{
+        .outcome = outcome,
+        .routes = lowered.routes,
+        .settlement_intents = if (publish_settlement)
+            lowered.intents
+        else
+            &.{},
+        .cleanup_intents = lowered.cleanup_intents,
+        .partial_routes = partial_routes,
+        .bound_paths = lowered.bound_paths,
+        .observed_paths = lowered.observed_paths,
+        .evidence = lowered.evidence,
+        .phase_sha256 = outcomePhaseDigest(
+            contract,
+            route_cache,
+            outcome,
+            lowered.phase_sha256,
+        ),
+        .publish_settlement = publish_settlement,
+    };
+}
+
+fn verifyRecoveryState(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    program_step: u32,
+    outcome: Outcome,
+    validate_artifacts: bool,
+    cache_checkpointed: bool,
+) !void {
+    var unpack_path_buffer: [128]u8 = undefined;
+    const unpack_path = try native_recovery.unpackDiversionPath(
+        program_step,
+        &unpack_path_buffer,
+    );
+    const unpack_bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        intent_sha256,
+        unpack_path,
+        native_unpack_diversion.maximum_document_bytes,
+    )) orelse return error.InvalidManagedState;
+    defer allocator.free(unpack_bytes);
+    var unpack_input = try native_unpack_diversion.decode(
+        allocator,
+        unpack_bytes,
+        intent_sha256,
+        program_step,
+    );
+    defer unpack_input.deinit();
+
+    var route_path_buffer: [128]u8 = undefined;
+    const route_path = try native_recovery.unpackRouteSettlementPath(
+        program_step,
+        &route_path_buffer,
+    );
+    const route_bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        intent_sha256,
+        route_path,
+        maximum_document_bytes,
+    )) orelse return error.InvalidManagedState;
+    defer allocator.free(route_bytes);
+    var route = try decode(
+        allocator,
+        route_bytes,
+        intent_sha256,
+        program_step,
+        unpack_input.digest_sha256,
+    );
+    defer route.deinit();
+
+    const cache_bytes = if (cache_checkpointed)
+        (try native_recovery.readManagedFile(
+            allocator,
+            root,
+            intent_sha256,
+            native_recovery.diversion_cache_path,
+            native_diversion_cache.maximum_document_bytes,
+        )) orelse return error.InvalidManagedState
+    else
+        try root.readFileAlloc(
+            allocator,
+            try root_fs.Path.init(native_recovery.diversion_cache_path),
+            native_diversion_cache.maximum_document_bytes,
+        );
+    defer allocator.free(cache_bytes);
+    var route_cache = try native_diversion_cache.decode(
+        allocator,
+        cache_bytes,
+        intent_sha256,
+    );
+    defer route_cache.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const lowered = try lowerOutcome(
+        arena.allocator(),
+        route.contract,
+        &unpack_input,
+        &route_cache,
+        outcome,
+    );
+    if (validate_artifacts)
+        try validateBoundPaths(
+            allocator,
+            root,
+            lowered.bound_paths,
+        );
+}
+
+pub fn verifyManagedRecoveryState(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    program_step: u32,
+    outcome: Outcome,
+    validate_artifacts: bool,
+) !void {
+    return verifyRecoveryState(
+        allocator,
+        root,
+        intent_sha256,
+        program_step,
+        outcome,
+        validate_artifacts,
+        true,
+    );
+}
+
+pub fn verifyUncheckpointedCacheTransition(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    program_step: u32,
+    validate_artifacts: bool,
+) !void {
+    return verifyRecoveryState(
+        allocator,
+        root,
+        intent_sha256,
+        program_step,
+        .postrm_succeeded,
+        validate_artifacts,
+        false,
+    );
+}
+
+pub fn validateJournal(
+    lowered: LoweredOutcome,
+    journal: root_mutation.Journal,
+) !void {
+    const database_digest = journal.evidence.database_plan_sha256;
+    const intents = if (database_digest != null and std.mem.eql(
+        u8,
+        &database_digest.?,
+        &lowered.evidence.digest,
+    ))
+        lowered.settlement_intents
+    else
+        lowered.cleanup_intents;
+    if (journal.steps.len != intents.len or intents.len == 0)
+        return error.InvalidUnpackRouteSettlementJournal;
+    for (intents, journal.steps) |intent, step| {
+        if (!std.mem.eql(u8, intent.path(), step.path))
+            return error.InvalidUnpackRouteSettlementJournal;
+        switch (intent) {
+            .file => |file| {
+                if (step.kind != .publish_file or
+                    step.desired != .present or
+                    step.desired.present.kind != .regular)
+                    return error.InvalidUnpackRouteSettlementJournal;
+                const desired = step.desired.present;
+                const expected = file.expected_sha256 orelse
+                    return error.InvalidUnpackRouteSettlementJournal;
+                if (desired.content_sha256 == null or
+                    !std.mem.eql(
+                        u8,
+                        &desired.content_sha256.?,
+                        &expected,
+                    ) or desired.metadata.mode != file.mode or
+                    desired.metadata.uid != file.uid or
+                    desired.metadata.gid != file.gid or
+                    desired.metadata.modified_nanoseconds !=
+                        file.modified_nanoseconds)
+                    return error.InvalidUnpackRouteSettlementJournal;
+            },
+            .metadata => |metadata| {
+                if (step.kind != .set_metadata or
+                    step.desired != .present)
+                    return error.InvalidUnpackRouteSettlementJournal;
+                const desired = step.desired.present.metadata;
+                if ((metadata.mode != null and
+                    desired.mode != metadata.mode.?) or
+                    (metadata.uid != null and
+                        desired.uid != metadata.uid.?) or
+                    (metadata.gid != null and
+                        desired.gid != metadata.gid.?) or
+                    (metadata.modified_nanoseconds != null and
+                        desired.modified_nanoseconds !=
+                            metadata.modified_nanoseconds.?))
+                    return error.InvalidUnpackRouteSettlementJournal;
+            },
+            .remove => if (step.kind != .remove_path or
+                step.desired != .absent)
+                return error.InvalidUnpackRouteSettlementJournal,
+            .remove_directory => if (step.kind != .remove_directory or
+                step.desired != .absent)
+                return error.InvalidUnpackRouteSettlementJournal,
+            else => return error.InvalidUnpackRouteSettlementJournal,
+        }
+    }
+}
+
 fn validateBackupPath(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -1553,6 +1902,21 @@ test "native_unpack.test.route settlement contract round trips and lowers withou
         parent.digest_sha256,
     );
     defer decoded.deinit();
+    var retained = try decodeEvidence(
+        testing.allocator,
+        bytes,
+        intent,
+        7,
+    );
+    defer retained.deinit();
+    try testing.expectEqualDeep(
+        decoded.digest_sha256,
+        retained.digest_sha256,
+    );
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlement,
+        decodeEvidence(testing.allocator, bytes, @splat('2'), 7),
+    );
     const repeated = try encode(testing.allocator, decoded.contract);
     defer testing.allocator.free(repeated);
     try testing.expectEqualStrings(bytes, repeated);
@@ -2560,6 +2924,75 @@ test "native_unpack.test.success route settlement lowers every reference profile
             &parent,
             &authenticated,
         );
+        const successful_outcome = try lowerOutcome(
+            owned,
+            contract,
+            &parent,
+            &authenticated,
+            .postrm_succeeded,
+        );
+        try testing.expect(successful_outcome.publish_settlement);
+        try testing.expectEqual(
+            lowered.intents.len,
+            successful_outcome.settlement_intents.len,
+        );
+        try testing.expectEqual(@as(usize, 0), successful_outcome.partial_routes.len);
+        try testing.expect(!std.mem.eql(
+            u8,
+            &lowered.phase_sha256,
+            &successful_outcome.phase_sha256,
+        ));
+        if (std.mem.eql(u8, profile.update, "atomic")) {
+            const rolled_back = try lowerOutcome(
+                owned,
+                contract,
+                &parent,
+                &authenticated,
+                .rollback,
+            );
+            try testing.expect(!rolled_back.publish_settlement);
+            try testing.expectEqual(
+                @as(usize, 0),
+                rolled_back.settlement_intents.len,
+            );
+            try testing.expectEqual(
+                @as(usize, 1),
+                rolled_back.partial_routes.len,
+            );
+            const expected_disposition: PartialDisposition =
+                if (std.mem.eql(u8, profile.member, "conffile"))
+                    .retain_conffile_staging
+                else if (profile.ownership == .previous)
+                    .restore_previous
+                else
+                    .retain_incoming;
+            try testing.expectEqual(
+                expected_disposition,
+                rolled_back.partial_routes[0].disposition,
+            );
+            if (std.mem.eql(u8, profile.member, "regular")) {
+                const unwound = try lowerOutcome(
+                    owned,
+                    contract,
+                    &parent,
+                    &authenticated,
+                    .unwind_succeeded,
+                );
+                try testing.expect(unwound.publish_settlement);
+            }
+            if (std.mem.eql(u8, profile.member, "regular") or
+                std.mem.eql(u8, profile.member, "conffile"))
+            {
+                const postinst_failed = try lowerOutcome(
+                    owned,
+                    contract,
+                    &parent,
+                    &authenticated,
+                    .postinst_failed,
+                );
+                try testing.expect(postinst_failed.publish_settlement);
+            }
+        }
         try testing.expectEqualStrings(
             profile.post_script_route,
             lowered.routes[0].post_script_route,
@@ -2827,6 +3260,318 @@ test "native_unpack.test.success route settlement authenticates retained backups
     try testing.expectError(
         error.UnpackRouteArtifactMismatch,
         validateBoundPaths(testing.allocator, root, &.{symlink_bound}),
+    );
+}
+
+test "native_recovery.test.route settlement evidence survives fresh recovery and rejects drift" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(
+        try root_fs.Path.init(root_operation.namespace_path),
+        .fromMode(0o755),
+    );
+    try root.createDirectoryPath(
+        try root_fs.Path.init("usr/share/demo"),
+        .fromMode(0o755),
+    );
+
+    const intent: Digest = @splat('1');
+    const program_step: u32 = 7;
+    const source = "usr/share/demo/file";
+    const original =
+        "/usr/share/demo/file\n/usr/share/demo/file.original\n:\n";
+    const changed =
+        "/usr/share/demo/file\n/usr/share/demo/file.changed\n:\n";
+    var publication = try native_diversion.CachedRecords.init(
+        testing.allocator,
+        original,
+        testObservation(original, 9),
+    );
+    defer publication.deinit();
+    var post_script = try native_diversion.CachedRecords.init(
+        testing.allocator,
+        changed,
+        testObservation(changed, 10),
+    );
+    defer post_script.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const settlement = try successSettlement(arena.allocator(), null);
+    const unpack_bytes = try native_unpack_diversion.encodeWithSettlement(
+        testing.allocator,
+        publication,
+        intent,
+        program_step,
+        &.{},
+        settlement,
+    );
+    defer testing.allocator.free(unpack_bytes);
+    var unpack = try native_unpack_diversion.decode(
+        testing.allocator,
+        unpack_bytes,
+        intent,
+        program_step,
+    );
+    defer unpack.deinit();
+
+    const cache_bytes = try native_diversion_cache.encode(
+        testing.allocator,
+        post_script,
+        intent,
+    );
+    defer testing.allocator.free(cache_bytes);
+    const publication_cache_bytes = try native_diversion_cache.encode(
+        testing.allocator,
+        publication,
+        intent,
+    );
+    defer testing.allocator.free(publication_cache_bytes);
+    var cache = try native_diversion_cache.decode(
+        testing.allocator,
+        cache_bytes,
+        intent,
+    );
+    defer cache.deinit();
+    const routes = [_]Route{.{
+        .logical_path = source,
+        .payload_route = "usr/share/demo/file.original",
+        .post_script_route = .{ .cache = .{
+            .digest_sha256 = cache.digest_sha256,
+        } },
+        .settlement = &.{},
+        .trigger_source = .payload,
+        .ownership = .previous_and_resulting,
+        .backup = .none,
+    }};
+    const contract: Contract = .{
+        .intent_sha256 = intent,
+        .program_step = program_step,
+        .unpack_input_sha256 = unpack.digest_sha256,
+        .package = .{ .name = "demo", .architecture = "amd64" },
+        .routes = &routes,
+    };
+    const route_bytes = try encode(testing.allocator, contract);
+    defer testing.allocator.free(route_bytes);
+    const lowered = try lowerOutcome(
+        arena.allocator(),
+        contract,
+        &unpack,
+        &cache,
+        .postrm_succeeded,
+    );
+    try root.createDirectoryPath(
+        try root_fs.Path.init(package_database.database_directory),
+        .fromMode(0o755),
+    );
+    const preflight = try root_mutation.preflight(
+        testing.allocator,
+        root,
+        .{ .intents = lowered.settlement_intents },
+    );
+    var plan = switch (preflight) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer plan.deinit();
+    const journal: root_mutation.Journal = .{
+        .attempt_id = @splat(1),
+        .attempt_generation = 1,
+        .attempt_digest_sha256 = @splat(2),
+        .install_root = "/fixture",
+        .root_identity_sha256 = @splat(3),
+        .evidence = .{
+            .database_plan_sha256 = lowered.evidence.digest,
+        },
+        .device = plan.device,
+        .staging_bytes = plan.staging_bytes,
+        .budget_bytes = plan.staging_bytes,
+        .steps = plan.steps,
+        .steps_sha256 = plan.steps_sha256,
+        .digest_sha256 = @splat(4),
+    };
+    try validateJournal(lowered, journal);
+    var unrelated = journal;
+    unrelated.evidence.database_plan_sha256 = null;
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlementJournal,
+        validateJournal(lowered, unrelated),
+    );
+    const changed_steps = try testing.allocator.dupe(
+        root_mutation.Step,
+        plan.steps,
+    );
+    defer testing.allocator.free(changed_steps);
+    changed_steps[0].path = "var/lib/dpkg/unrelated";
+    var changed_journal = journal;
+    changed_journal.steps = changed_steps;
+    try testing.expectError(
+        error.InvalidUnpackRouteSettlementJournal,
+        validateJournal(lowered, changed_journal),
+    );
+
+    try native_recovery.initializeProgress(
+        testing.allocator,
+        root,
+        intent,
+    );
+    try native_recovery.initializeManagedState(
+        testing.allocator,
+        root,
+        intent,
+    );
+    const action: native_recovery.Action = .{
+        .kind = .filesystem,
+        .program_step = program_step,
+        .substep = 0,
+        .ordinal = 0,
+    };
+    var unpack_path_buffer: [128]u8 = undefined;
+    const unpack_path = try native_recovery.unpackDiversionPath(
+        program_step,
+        &unpack_path_buffer,
+    );
+    _ = try native_recovery.updateManagedState(
+        testing.allocator,
+        root,
+        intent,
+        action,
+        &.{unpack_path},
+        false,
+    );
+    var route_path_buffer: [128]u8 = undefined;
+    const route_path = try native_recovery.unpackRouteSettlementPath(
+        program_step,
+        &route_path_buffer,
+    );
+    try root.publishFile(
+        try root_fs.Path.init(unpack_path),
+        unpack_bytes,
+        .{},
+    );
+    try root.publishFile(
+        try root_fs.Path.init(route_path),
+        route_bytes,
+        .{},
+    );
+    try root.publishFile(
+        try root_fs.Path.init(native_recovery.diversion_cache_path),
+        publication_cache_bytes,
+        .{},
+    );
+    _ = try native_recovery.updateManagedState(
+        testing.allocator,
+        root,
+        intent,
+        action,
+        &.{
+            unpack_path,
+            route_path,
+            native_recovery.diversion_cache_path,
+            "usr/share/demo/file.changed",
+        },
+        false,
+    );
+    try root.publishFile(
+        try root_fs.Path.init(native_recovery.diversion_cache_path),
+        cache_bytes,
+        .{ .overwrite = .replace },
+    );
+
+    try root.publishFile(
+        try root_fs.Path.init("caller-archive.deb"),
+        "caller owned",
+        .{},
+    );
+    try root.removeFile(try root_fs.Path.init("caller-archive.deb"));
+    const recovered_root = root_fs.Root.init(testing.io, temporary.dir);
+    try verifyUncheckpointedCacheTransition(
+        testing.allocator,
+        recovered_root,
+        intent,
+        program_step,
+        true,
+    );
+    try testing.expectError(
+        error.ManagedStateChanged,
+        verifyManagedRecoveryState(
+            testing.allocator,
+            recovered_root,
+            intent,
+            program_step,
+            .postrm_succeeded,
+            true,
+        ),
+    );
+    _ = try native_recovery.updateManagedState(
+        testing.allocator,
+        recovered_root,
+        intent,
+        .{
+            .kind = .script,
+            .program_step = program_step + 1,
+            .substep = 0,
+            .ordinal = 0,
+        },
+        &.{
+            native_recovery.diversion_cache_path,
+            "usr/share/demo/file.changed",
+        },
+        false,
+    );
+    try verifyManagedRecoveryState(
+        testing.allocator,
+        recovered_root,
+        intent,
+        program_step,
+        .postrm_succeeded,
+        true,
+    );
+    try verifyManagedRecoveryState(
+        testing.allocator,
+        recovered_root,
+        intent,
+        program_step,
+        .postrm_succeeded,
+        true,
+    );
+
+    try recovered_root.publishFile(
+        try root_fs.Path.init("usr/share/demo/file.changed"),
+        "drift",
+        .{},
+    );
+    try testing.expectError(
+        error.UnexpectedUnpackRouteOccupant,
+        verifyManagedRecoveryState(
+            testing.allocator,
+            recovered_root,
+            intent,
+            program_step,
+            .postrm_succeeded,
+            true,
+        ),
+    );
+    try recovered_root.removeFile(
+        try root_fs.Path.init("usr/share/demo/file.changed"),
+    );
+    try recovered_root.publishFile(
+        try root_fs.Path.init(route_path),
+        "{}\n",
+        .{ .overwrite = .replace },
+    );
+    try testing.expectError(
+        error.ManagedStateChanged,
+        verifyManagedRecoveryState(
+            testing.allocator,
+            recovered_root,
+            intent,
+            program_step,
+            .postrm_succeeded,
+            true,
+        ),
     );
 }
 

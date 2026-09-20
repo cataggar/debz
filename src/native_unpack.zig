@@ -112,10 +112,16 @@ const ExecutionState = struct {
     stat_overrides: ?native_statoverride.Resolved = null,
     diversion_observation: ?native_diversion.Observation = null,
     diversion_cache: ?*native_diversion.Session = null,
+    route_settlement: ?ActiveRouteSettlement = null,
 
     fn checkDeadline(self: *ExecutionState) !void {
         try checkRuntimeBounds(self.bounds);
     }
+};
+
+const ActiveRouteSettlement = struct {
+    contract: *const native_unpack_route_settlement.Decoded,
+    unpack_input: *const native_unpack_diversion.Decoded,
 };
 
 fn nativeAction(
@@ -340,6 +346,107 @@ fn writeDiversionCache(
         .overwrite = overwrite,
         .durable = true,
     });
+}
+
+fn readManagedRouteSettlement(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: native_recovery.Digest,
+    program_step: u32,
+    unpack_input_sha256: native_recovery.Digest,
+) !?native_unpack_route_settlement.Decoded {
+    var buffer: [128]u8 = undefined;
+    const path = try native_recovery.unpackRouteSettlementPath(
+        program_step,
+        &buffer,
+    );
+    const bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        intent_sha256,
+        path,
+        native_unpack_route_settlement.maximum_document_bytes,
+    )) orelse {
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.InvalidManagedState;
+        return null;
+    };
+    defer allocator.free(bytes);
+    return try native_unpack_route_settlement.decode(
+        allocator,
+        bytes,
+        intent_sha256,
+        program_step,
+        unpack_input_sha256,
+    );
+}
+
+fn refreshExecutionRouteSettlement(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    script_action: native_recovery.Action,
+    observed_steps: []const root_mutation.Step,
+) !native_recovery.Digest {
+    const active = execution.route_settlement orelse
+        return error.InvalidLifecycleProgram;
+    const runtime = execution.recovery orelse
+        return error.InvalidLifecycleProgram;
+    const session = execution.diversion_cache orelse
+        return error.InvalidLifecycleProgram;
+    _ = try session.refreshRouteSettlement(root);
+    const cache_bytes = try native_diversion_cache.encode(
+        allocator,
+        session.cache,
+        runtime.intent_sha256,
+    );
+    defer allocator.free(cache_bytes);
+    var route_cache = try native_diversion_cache.decode(
+        allocator,
+        cache_bytes,
+        runtime.intent_sha256,
+    );
+    defer route_cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const lowered = try native_unpack_route_settlement.lowerSuccess(
+        arena.allocator(),
+        active.contract.contract,
+        active.unpack_input,
+        &route_cache,
+    );
+    try root.publishFile(
+        try root_fs.Path.init(native_recovery.diversion_cache_path),
+        cache_bytes,
+        .{
+            .permissions = if (builtin.os.tag == .windows)
+                .default_file
+            else
+                .fromMode(0o600),
+            .overwrite = .replace,
+            .durable = true,
+        },
+    );
+    execution.diversion_observation = session.cache.observed;
+    runtime.crash.hit(.after_upgrade_postrm_cache_refresh);
+    const paths = try allocator.alloc(
+        []const u8,
+        observed_steps.len + lowered.observed_paths.len,
+    );
+    defer allocator.free(paths);
+    for (observed_steps, 0..) |step, index|
+        paths[index] = step.path;
+    @memcpy(paths[observed_steps.len..], lowered.observed_paths);
+    const checkpoint = try native_recovery.updateManagedState(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        script_action,
+        paths,
+        observed_steps.len != 0,
+    );
+    runtime.crash.hit(.after_upgrade_postrm_route_checkpoint);
+    return checkpoint;
 }
 
 fn captureUnpackDiversions(
@@ -8405,6 +8512,78 @@ fn materializeUnpackBackups(
 /// Inactive #192 success path. Ordinary lifecycle execution neither creates
 /// route-settlement evidence nor calls this helper while the mid-unpack guard
 /// remains active.
+pub fn bindInactiveRouteSettlement(
+    allocator: std.mem.Allocator,
+    runtime: *native_recovery.Runtime,
+    contract: native_unpack_route_settlement.Contract,
+) !void {
+    if (!std.mem.eql(
+        u8,
+        &contract.intent_sha256,
+        &runtime.intent_sha256,
+    ))
+        return error.InvalidUnpackRouteSettlement;
+    try native_recovery.validateStableManagedState(
+        allocator,
+        runtime.root,
+        runtime.intent_sha256,
+    );
+    var unpack_path_buffer: [128]u8 = undefined;
+    const unpack_path = try native_recovery.unpackDiversionPath(
+        contract.program_step,
+        &unpack_path_buffer,
+    );
+    const unpack_bytes = (try native_recovery.readManagedFile(
+        allocator,
+        runtime.root,
+        runtime.intent_sha256,
+        unpack_path,
+        native_unpack_diversion.maximum_document_bytes,
+    )) orelse return error.InvalidManagedState;
+    defer allocator.free(unpack_bytes);
+    var unpack_input = try native_unpack_diversion.decode(
+        allocator,
+        unpack_bytes,
+        runtime.intent_sha256,
+        contract.program_step,
+    );
+    defer unpack_input.deinit();
+    if (!std.mem.eql(
+        u8,
+        &contract.unpack_input_sha256,
+        &unpack_input.digest_sha256,
+    ))
+        return error.InvalidUnpackRouteSettlement;
+    const bytes = try native_unpack_route_settlement.encode(
+        allocator,
+        contract,
+    );
+    defer allocator.free(bytes);
+    var path_buffer: [128]u8 = undefined;
+    const path = try native_recovery.unpackRouteSettlementPath(
+        contract.program_step,
+        &path_buffer,
+    );
+    if (try runtime.root.entryIfExists(try root_fs.Path.init(path)) != null)
+        return error.InvalidManagedState;
+    try runtime.root.publishFile(try root_fs.Path.init(path), bytes, .{
+        .permissions = if (builtin.os.tag == .windows)
+            .default_file
+        else
+            .fromMode(0o600),
+        .overwrite = .fail_if_exists,
+        .durable = true,
+    });
+    _ = try native_recovery.updateManagedState(
+        allocator,
+        runtime.root,
+        runtime.intent_sha256,
+        nativeAction(.filesystem, contract.program_step, 0, 0),
+        &.{path},
+        false,
+    );
+}
+
 fn executeSuccessfulRouteSettlement(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
@@ -8622,6 +8801,26 @@ fn materialize(
             if (decoded.?.backups == null) return materializePlanned(allocator, request, null);
         } else if (entry.?.kind != .absent) return error.InvalidManagedState;
     }
+    var route_settlement: ?native_unpack_route_settlement.Decoded = null;
+    defer if (route_settlement) |*value| value.deinit();
+    const previous_route_settlement = execution.route_settlement;
+    defer execution.route_settlement = previous_route_settlement;
+    if (decoded) |*unpack_input| {
+        if (execution.recovery) |runtime| {
+            route_settlement = try readManagedRouteSettlement(
+                allocator,
+                request.root,
+                runtime.intent_sha256,
+                execution.program_step,
+                unpack_input.digest_sha256,
+            );
+            if (route_settlement) |*contract|
+                execution.route_settlement = .{
+                    .contract = contract,
+                    .unpack_input = unpack_input,
+                };
+        }
+    }
     var planned: ?Plan = null;
     defer if (planned) |*value| value.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -8702,6 +8901,37 @@ fn materialize(
     }
     const partial_rollback = result.outcome == .rolled_back and
         request.unpack_hook != null and request.unpack_hook.?.rollback_required;
+    var route_cache: ?native_diversion_cache.Decoded = null;
+    defer if (route_cache) |*value| value.deinit();
+    var route_lowered: ?native_unpack_route_settlement.LoweredOutcome = null;
+    if (execution.route_settlement) |active| {
+        if (result.outcome == .applied or result.outcome == .rolled_back) {
+            const runtime = execution.recovery orelse
+                return error.InvalidLifecycleProgram;
+            route_cache = (try readManagedDiversionCache(
+                allocator,
+                request.root,
+                runtime.intent_sha256,
+            )) orelse return error.InvalidManagedState;
+            const route_outcome: native_unpack_route_settlement.Outcome =
+                if (result.outcome == .rolled_back)
+                    .rollback
+                else if (request.unpack_hook) |hook|
+                    if (hook.primary_failed and hook.unwind_succeeded)
+                        .unwind_succeeded
+                    else
+                        .postrm_succeeded
+                else
+                    .postrm_succeeded;
+            route_lowered = try native_unpack_route_settlement.lowerOutcome(
+                arena.allocator(),
+                active.contract.contract,
+                active.unpack_input,
+                &route_cache.?,
+                route_outcome,
+            );
+        }
+    }
     if (partial_rollback) {
         if (execution.recovery) |runtime| runtime.crash.hit(.before_failed_unpack_publication);
         const preserved = try materializeFailedUnpack(allocator, request, if (planned) |*value| value else null, backups);
@@ -8711,29 +8941,63 @@ fn materialize(
             return .{ .outcome = .recovery_required, .detail = "failed_unpack_publication_incomplete" };
         }
         if (execution.recovery) |runtime| runtime.crash.hit(.after_failed_unpack_publication);
+        if (route_lowered) |lowered|
+            try native_unpack_route_settlement.validateBoundPaths(
+                allocator,
+                request.root,
+                lowered.bound_paths,
+            );
     }
     if (settlement) |recipe| {
         if (result.outcome == .applied) {
             if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_payload);
-            const intents = try native_unpack_settlement.lower(arena.allocator(), recipe);
-            var settlement_request = request;
-            settlement_request.hooks = .{};
-            settlement_request.mutation_database_step = null;
-            settlement_request.publication_crash_point = .during_unpack_settlement;
-            settlement_request.deferred_removal_path = for (intents) |intent| {
-                if ((intent == .remove or intent == .remove_directory) and
-                    !std.mem.startsWith(u8, intent.path(), package_database.database_directory ++ "/"))
-                    break intent.path();
-            } else null;
-            const settled = try executePhaseMaterialization(
-                allocator,
-                settlement_request,
-                intents,
-                try recipe.evidence(),
-                native_recovery.parseDigest(recipe.unpack_plan_sha256) orelse return error.InvalidUnpackSettlement,
-                null,
-                true,
-            );
+            const settled = if (route_lowered) |lowered|
+                try executeSuccessfulRouteSettlement(
+                    allocator,
+                    request,
+                    .{
+                        .intents = lowered.settlement_intents,
+                        .cleanup_intents = lowered.cleanup_intents,
+                        .routes = lowered.routes,
+                        .bound_paths = lowered.bound_paths,
+                        .observed_paths = lowered.observed_paths,
+                        .evidence = lowered.evidence,
+                        .phase_sha256 = lowered.phase_sha256,
+                    },
+                )
+            else block: {
+                const intents = try native_unpack_settlement.lower(
+                    arena.allocator(),
+                    recipe,
+                );
+                var settlement_request = request;
+                settlement_request.hooks = .{};
+                settlement_request.mutation_database_step = null;
+                settlement_request.publication_crash_point =
+                    .during_unpack_settlement;
+                settlement_request.deferred_removal_path =
+                    for (intents) |intent| {
+                        if ((intent == .remove or
+                            intent == .remove_directory) and
+                            !std.mem.startsWith(
+                                u8,
+                                intent.path(),
+                                package_database.database_directory ++ "/",
+                            ))
+                            break intent.path();
+                    } else null;
+                break :block try executePhaseMaterialization(
+                    allocator,
+                    settlement_request,
+                    intents,
+                    try recipe.evidence(),
+                    native_recovery.parseDigest(
+                        recipe.unpack_plan_sha256,
+                    ) orelse return error.InvalidUnpackSettlement,
+                    null,
+                    true,
+                );
+            };
             if (settled.outcome != .applied) {
                 const attempt = request.borrowed_attempt orelse return error.InvalidLifecycleProgram;
                 try attempt.requireRecovery(allocator, .mutation);
@@ -8744,7 +9008,10 @@ fn materialize(
             if (execution.recovery) |runtime| runtime.crash.hit(.after_unpack_settlement);
         }
     }
-    if (backups.len != 0 and (result.outcome == .applied or result.outcome == .rolled_back)) {
+    if (backups.len != 0 and
+        (result.outcome == .applied or result.outcome == .rolled_back) and
+        !(result.outcome == .applied and route_lowered != null))
+    {
         if (execution.recovery) |runtime| runtime.crash.hit(.before_unpack_backup_cleanup);
         const cleaned = try materializeUnpackBackups(allocator, request, backups, true, partial_rollback);
         if (cleaned.outcome != .applied) {
@@ -16038,7 +16305,39 @@ fn retainNativeEvidence(
     }
     if (managed.transient orelse managed.stable) |snapshot| {
         for (snapshot.entries) |entry| {
-            const step = (try native_recovery.unpackDiversionStep(entry.path)) orelse continue;
+            if (try native_recovery.unpackDiversionStep(entry.path)) |step| {
+                if (entry.kind == .absent) continue;
+                if (entry.kind != .regular) return error.InvalidManagedState;
+                const bytes = (try native_recovery.readManagedFile(
+                    scratch,
+                    root,
+                    intent.digest_sha256,
+                    entry.path,
+                    native_unpack_diversion.maximum_document_bytes,
+                )) orelse return error.InvalidManagedState;
+                var decoded = try native_unpack_diversion.decode(
+                    scratch,
+                    bytes,
+                    intent.digest_sha256,
+                    step,
+                );
+                defer decoded.deinit();
+                try sources.append(scratch, .{
+                    .kind = .unpack_diversion_cache,
+                    .source_path = entry.path,
+                    .receipt_name = try std.fmt.allocPrint(
+                        scratch,
+                        "unpack-diversions/{d}.json",
+                        .{step},
+                    ),
+                    .document_sha256 = decoded.digest_sha256,
+                    .action = nativeAction(.filesystem, step, 0, 0),
+                });
+                continue;
+            }
+            const step = (try native_recovery.unpackRouteSettlementStep(
+                entry.path,
+            )) orelse continue;
             if (entry.kind == .absent) continue;
             if (entry.kind != .regular) return error.InvalidManagedState;
             const bytes = (try native_recovery.readManagedFile(
@@ -16046,14 +16345,23 @@ fn retainNativeEvidence(
                 root,
                 intent.digest_sha256,
                 entry.path,
-                native_unpack_diversion.maximum_document_bytes,
+                native_unpack_route_settlement.maximum_document_bytes,
             )) orelse return error.InvalidManagedState;
-            var decoded = try native_unpack_diversion.decode(scratch, bytes, intent.digest_sha256, step);
+            var decoded = try native_unpack_route_settlement.decodeEvidence(
+                scratch,
+                bytes,
+                intent.digest_sha256,
+                step,
+            );
             defer decoded.deinit();
             try sources.append(scratch, .{
-                .kind = .unpack_diversion_cache,
+                .kind = .unpack_route_settlement,
                 .source_path = entry.path,
-                .receipt_name = try std.fmt.allocPrint(scratch, "unpack-diversions/{d}.json", .{step}),
+                .receipt_name = try std.fmt.allocPrint(
+                    scratch,
+                    "unpack-route-settlement/{d}.json",
+                    .{step},
+                ),
                 .document_sha256 = decoded.digest_sha256,
                 .action = nativeAction(.filesystem, step, 0, 0),
             });
@@ -16623,26 +16931,54 @@ fn runLifecycleScript(
             arguments,
             report,
         );
-        refreshExecutionDiversions(execution, allocator, root, mid_unpack) catch |err| {
-            try attempt.requireRecovery(allocator, .script);
-            return err;
-        };
-        if (mid_unpack and execution.phase_steps == null)
-            validateManagedDiversionUpdate(allocator, runtime, true) catch |err| {
+        const route_postrm = mid_unpack and kind == .postrm and
+            source == .installed_package and arguments.len != 0 and
+            std.mem.eql(u8, arguments[0], "upgrade") and
+            execution.route_settlement != null;
+        if (route_postrm) {
+            managed_checkpoint_sha256 =
+                refreshExecutionRouteSettlement(
+                    execution,
+                    allocator,
+                    root,
+                    recovery_action,
+                    execution.phase_steps orelse &.{},
+                ) catch |err| {
+                    try attempt.requireRecovery(allocator, .script);
+                    return err;
+                };
+        } else {
+            refreshExecutionDiversions(
+                execution,
+                allocator,
+                root,
+                mid_unpack,
+            ) catch |err| {
                 try attempt.requireRecovery(allocator, .script);
                 return err;
             };
-        managed_checkpoint_sha256 = checkpointManagedPathsAfterCacheValidation(
-            allocator,
-            runtime,
-            recovery_action,
-            execution.phase_steps orelse &.{},
-            &.{},
-            execution.phase_steps != null,
-        ) catch |err| {
-            try attempt.requireRecovery(allocator, .script);
-            return err;
-        };
+            if (mid_unpack and execution.phase_steps == null)
+                validateManagedDiversionUpdate(
+                    allocator,
+                    runtime,
+                    true,
+                ) catch |err| {
+                    try attempt.requireRecovery(allocator, .script);
+                    return err;
+                };
+            managed_checkpoint_sha256 =
+                checkpointManagedPathsAfterCacheValidation(
+                    allocator,
+                    runtime,
+                    recovery_action,
+                    execution.phase_steps orelse &.{},
+                    &.{},
+                    execution.phase_steps != null,
+                ) catch |err| {
+                    try attempt.requireRecovery(allocator, .script);
+                    return err;
+                };
+        }
         try runtime.append(
             recovery_action,
             .outcome,
@@ -16787,6 +17123,8 @@ const PostUnpackHook = struct {
     fired: bool = false,
     unknown_outcome: bool = false,
     rollback_required: bool = false,
+    primary_failed: bool = false,
+    unwind_succeeded: bool = false,
     failed_compensation: ?u32 = null,
     diversion_failure: ?native_diversion.UpdateError = null,
 };
@@ -16946,6 +17284,7 @@ fn postUnpackHook(
         },
     };
     if (code == 0) return;
+    context.primary_failed = true;
     if (context.script.call.failure.unwind) |unwind| {
         const unwind_outcome = runLifecycleScript(
             context.execution,
@@ -16979,7 +17318,10 @@ fn postUnpackHook(
         };
         if (unwind_code == 0 and
             context.script.call.failure.resume_after_unwind)
+        {
+            context.unwind_succeeded = true;
             return;
+        }
     }
     const rollback_after =
         context.script.call.failure.rollback_after_compensations orelse 0;
@@ -17928,6 +18270,347 @@ const ActiveScriptRecovery = union(enum) {
     outcome_unknown,
 };
 
+fn routeSettlementUnpackStep(
+    program: native_program.Program,
+    script_action: native_recovery.Action,
+) ?u32 {
+    if (script_action.kind != .script or script_action.ordinal != 0)
+        return null;
+    for (program.steps) |step| {
+        if (step.operation != .unpack_package) continue;
+        const postrm = postUnpackScript(
+            program,
+            step.sequence,
+            step.operation.unpack_package.package,
+        ) orelse continue;
+        if (postrm.sequence == script_action.program_step and
+            script_action.substep ==
+                @intFromEnum(postrm.call.kind))
+            return step.sequence;
+    }
+    return null;
+}
+
+fn authenticateRouteCacheTransition(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    runtime: *native_recovery.Runtime,
+    program: native_program.Program,
+    script_action: native_recovery.Action,
+    diversion_cache: *?native_diversion.Session,
+    checkpoint_steps: ?[]const root_mutation.Step,
+) !u32 {
+    const unpack_step = routeSettlementUnpackStep(
+        program,
+        script_action,
+    ) orelse return error.InvalidManagedState;
+    var unpack_path_buffer: [128]u8 = undefined;
+    const unpack_path = try native_recovery.unpackDiversionPath(
+        unpack_step,
+        &unpack_path_buffer,
+    );
+    const unpack_bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        unpack_path,
+        native_unpack_diversion.maximum_document_bytes,
+    )) orelse return error.InvalidManagedState;
+    defer allocator.free(unpack_bytes);
+    var unpack_input = try native_unpack_diversion.decode(
+        allocator,
+        unpack_bytes,
+        runtime.intent_sha256,
+        unpack_step,
+    );
+    defer unpack_input.deinit();
+    var route_path_buffer: [128]u8 = undefined;
+    const route_path = try native_recovery.unpackRouteSettlementPath(
+        unpack_step,
+        &route_path_buffer,
+    );
+    const route_bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        route_path,
+        native_unpack_route_settlement.maximum_document_bytes,
+    )) orelse return error.InvalidManagedState;
+    defer allocator.free(route_bytes);
+    var route = try native_unpack_route_settlement.decode(
+        allocator,
+        route_bytes,
+        runtime.intent_sha256,
+        unpack_step,
+        unpack_input.digest_sha256,
+    );
+    defer route.deinit();
+    const cache_bytes = try root.readFileAlloc(
+        allocator,
+        try root_fs.Path.init(native_recovery.diversion_cache_path),
+        native_diversion_cache.maximum_document_bytes,
+    );
+    defer allocator.free(cache_bytes);
+    var cache = try native_diversion_cache.decode(
+        allocator,
+        cache_bytes,
+        runtime.intent_sha256,
+    );
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const lowered = try native_unpack_route_settlement.lowerSuccess(
+        arena.allocator(),
+        route.contract,
+        &unpack_input,
+        &cache,
+    );
+    if (checkpoint_steps) |steps| {
+        try native_unpack_route_settlement.validateBoundPaths(
+            allocator,
+            root,
+            lowered.bound_paths,
+        );
+        const paths = try allocator.alloc(
+            []const u8,
+            steps.len + lowered.observed_paths.len,
+        );
+        defer allocator.free(paths);
+        for (steps, 0..) |step, index|
+            paths[index] = step.path;
+        @memcpy(paths[steps.len..], lowered.observed_paths);
+        _ = try native_recovery.updateManagedState(
+            allocator,
+            root,
+            runtime.intent_sha256,
+            script_action,
+            paths,
+            steps.len != 0,
+        );
+        runtime.crash.hit(.after_upgrade_postrm_route_checkpoint);
+    }
+    if (diversion_cache.*) |*session| session.deinit();
+    diversion_cache.* = native_diversion.Session.restore(
+        allocator,
+        root,
+        cache.cache,
+    ) catch |err| switch (err) {
+        error.InvalidDiversionObservation => return error.ManagedStateChanged,
+        else => return err,
+    };
+    return unpack_step;
+}
+
+fn completedRouteScriptCode(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    runtime: *native_recovery.Runtime,
+    authorization: native_authorization.Authorization,
+    action: native_recovery.Action,
+    call: native_program.ScriptCall,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) !u8 {
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    const record = native_recovery.latest(
+        progress.document,
+        action,
+    ) orelse return error.InvalidScriptOutcome;
+    if (record.stage != .completed)
+        return error.InvalidScriptOutcome;
+    var outcome = (try native_recovery.readScriptOutcome(
+        allocator,
+        root,
+        action,
+    )) orelse return error.InvalidScriptOutcome;
+    defer outcome.deinit();
+    const package = try lifecycleScriptOwner(
+        authorization,
+        call.package,
+        source,
+    );
+    const expected = parseHex(32, &script_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    if (!nativeScriptOutcomeMatches(
+        outcome.outcome,
+        runtime.*,
+        action,
+        package,
+        kind,
+        source,
+        expected,
+        arguments,
+    ) or outcome.outcome.disposition != .exited or
+        outcome.outcome.exit_code == null)
+        return error.InvalidScriptOutcome;
+    const code = outcome.outcome.exit_code.?;
+    const expected_result: native_recovery.Result =
+        if (code == 0) .succeeded else .failed;
+    if (record.result != expected_result)
+        return error.InvalidScriptOutcome;
+    const checkpoint = try native_recovery.managedCheckpointDigestForAction(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        action,
+    ) orelse return error.InvalidScriptOutcome;
+    if (record.evidence_sha256 == null or
+        !std.mem.eql(
+            u8,
+            &record.evidence_sha256.?,
+            &checkpoint,
+        ))
+        return error.InvalidScriptOutcome;
+    return code;
+}
+
+fn routeSettlementScriptOutcome(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    runtime: *native_recovery.Runtime,
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    unpack_step: u32,
+) !native_unpack_route_settlement.Outcome {
+    if (unpack_step >= program.steps.len or
+        program.steps[unpack_step].sequence != unpack_step)
+        return error.InvalidLifecycleProgram;
+    const operation = program.steps[unpack_step].operation;
+    if (operation != .unpack_package)
+        return error.InvalidLifecycleProgram;
+    const postrm = postUnpackScript(
+        program,
+        unpack_step,
+        operation.unpack_package.package,
+    ) orelse return error.InvalidLifecycleProgram;
+    const primary_action = nativeAction(
+        .script,
+        postrm.sequence,
+        @intCast(@intFromEnum(postrm.call.kind)),
+        0,
+    );
+    const primary_code = try completedRouteScriptCode(
+        allocator,
+        root,
+        runtime,
+        authorization,
+        primary_action,
+        postrm.call,
+        postrm.call.kind,
+        postrm.call.source,
+        postrm.call.script_sha256,
+        postrm.call.arguments,
+    );
+    if (primary_code == 0)
+        return .postrm_succeeded;
+    const unwind = postrm.call.failure.unwind orelse return .rollback;
+    const unwind_action = nativeAction(
+        .script,
+        postrm.sequence,
+        @intCast(@intFromEnum(unwind.kind)),
+        1,
+    );
+    const unwind_code = try completedRouteScriptCode(
+        allocator,
+        root,
+        runtime,
+        authorization,
+        unwind_action,
+        postrm.call,
+        unwind.kind,
+        unwind.source,
+        unwind.script_sha256,
+        unwind.arguments,
+    );
+    return if (unwind_code == 0 and
+        postrm.call.failure.resume_after_unwind)
+        .unwind_succeeded
+    else
+        .rollback;
+}
+
+fn validateRouteSettlementRecoveryJournal(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    runtime: *native_recovery.Runtime,
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    action: native_recovery.Action,
+    journal: root_mutation.Journal,
+) !void {
+    if (action.kind != .database) return;
+    var route_path_buffer: [128]u8 = undefined;
+    const route_path = try native_recovery.unpackRouteSettlementPath(
+        action.program_step,
+        &route_path_buffer,
+    );
+    if (try root.entryIfExists(try root_fs.Path.init(route_path)) == null)
+        return;
+    var unpack_path_buffer: [128]u8 = undefined;
+    const unpack_path = try native_recovery.unpackDiversionPath(
+        action.program_step,
+        &unpack_path_buffer,
+    );
+    const unpack_bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        unpack_path,
+        native_unpack_diversion.maximum_document_bytes,
+    )) orelse return error.InvalidManagedState;
+    defer allocator.free(unpack_bytes);
+    var unpack_input = try native_unpack_diversion.decode(
+        allocator,
+        unpack_bytes,
+        runtime.intent_sha256,
+        action.program_step,
+    );
+    defer unpack_input.deinit();
+    var route = (try readManagedRouteSettlement(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        action.program_step,
+        unpack_input.digest_sha256,
+    )) orelse return error.InvalidManagedState;
+    defer route.deinit();
+    var cache = (try readManagedDiversionCache(
+        allocator,
+        root,
+        runtime.intent_sha256,
+    )) orelse return error.InvalidManagedState;
+    defer cache.deinit();
+    const outcome = try routeSettlementScriptOutcome(
+        allocator,
+        root,
+        runtime,
+        program,
+        authorization,
+        action.program_step,
+    );
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const lowered = try native_unpack_route_settlement.lowerOutcome(
+        arena.allocator(),
+        route.contract,
+        &unpack_input,
+        &cache,
+        outcome,
+    );
+    try native_unpack_route_settlement.validateBoundPaths(
+        allocator,
+        root,
+        lowered.bound_paths,
+    );
+    try native_unpack_route_settlement.validateJournal(
+        lowered,
+        journal,
+    );
+}
+
 fn activeScriptInvocationMatches(
     authorization: native_authorization.Authorization,
     active: native_trigger.ActiveScript,
@@ -18163,10 +18846,36 @@ fn recoverNativeRootMutation(
     bounds: ?*RuntimeBounds,
     diversion_cache: *?native_diversion.Session,
     program: native_program.Program,
+    authorization: native_authorization.Authorization,
     script_recovery: ActiveScriptRecovery,
 ) !bool {
     try checkRuntimeBounds(bounds);
-    if (try readManagedDiversionCache(allocator, root, runtime.intent_sha256)) |value| {
+    var route_checkpoint_action: ?native_recovery.Action = null;
+    const managed_cache = readManagedDiversionCache(
+        allocator,
+        root,
+        runtime.intent_sha256,
+    ) catch |err| switch (err) {
+        error.ManagedStateChanged => block: {
+            const action = switch (script_recovery) {
+                .known_outcome => |value| value,
+                else => return err,
+            };
+            _ = try authenticateRouteCacheTransition(
+                allocator,
+                root,
+                runtime,
+                program,
+                action,
+                diversion_cache,
+                null,
+            );
+            route_checkpoint_action = action;
+            break :block null;
+        },
+        else => return err,
+    };
+    if (managed_cache) |value| {
         var cached = value;
         defer cached.deinit();
         diversion_cache.* = native_diversion.Session.restore(allocator, root, cached.cache) catch |err| switch (err) {
@@ -18198,6 +18907,17 @@ fn recoverNativeRootMutation(
         return true;
     };
     defer opened.deinit();
+    if (route_checkpoint_action) |action| {
+        _ = try authenticateRouteCacheTransition(
+            allocator,
+            root,
+            runtime,
+            program,
+            action,
+            diversion_cache,
+            opened.journal().steps,
+        );
+    }
     try validateManagedDiversionUpdate(allocator, runtime, true);
     var progress = try native_recovery.readProgress(allocator, root);
     defer progress.deinit();
@@ -18205,6 +18925,15 @@ fn recoverNativeRootMutation(
         try attempt.requireRecovery(allocator, .mutation);
         return false;
     };
+    try validateRouteSettlementRecoveryJournal(
+        allocator,
+        root,
+        runtime,
+        program,
+        authorization,
+        action,
+        opened.journal(),
+    );
     if (try native_recovery.managedStateHasTransient(
         allocator,
         root,
@@ -20374,6 +21103,7 @@ fn executeLifecycleProgramWithRequest(
             bounds,
             &diversion_session,
             program.*,
+            authorization.*,
             script_recovery,
         ) catch |err| switch (err) {
             error.ManagedStateChanged,
@@ -22377,8 +23107,18 @@ test "native_unpack.test.unpack diversion paths have an exact bounded program st
         var buffer: [128]u8 = undefined;
         const path = try native_recovery.unpackDiversionPath(step, &buffer);
         try testing.expectEqual(step, (try native_recovery.unpackDiversionStep(path)).?);
+        var route_buffer: [128]u8 = undefined;
+        const route_path = try native_recovery.unpackRouteSettlementPath(
+            step,
+            &route_buffer,
+        );
+        try testing.expectEqual(
+            step,
+            (try native_recovery.unpackRouteSettlementStep(route_path)).?,
+        );
     }
     try testing.expect(try native_recovery.unpackDiversionStep(native_recovery.diversion_cache_path) == null);
+    try testing.expect(try native_recovery.unpackRouteSettlementStep(native_recovery.diversion_cache_path) == null);
     for ([_][]const u8{
         "07.json", "-1.json", "+1.json", "4294967296.json", ".json", "7.json.extra", "7", "7/child.json",
     }) |suffix| {
@@ -22389,6 +23129,17 @@ test "native_unpack.test.unpack diversion paths have an exact bounded program st
         );
         defer testing.allocator.free(path);
         try testing.expectError(error.InvalidUnpackDiversionPath, native_recovery.unpackDiversionStep(path));
+        const route_path = try std.fmt.allocPrint(
+            testing.allocator,
+            root_operation.namespace_path ++ "/" ++
+                native_recovery.unpack_route_settlement_prefix ++ "{s}",
+            .{suffix},
+        );
+        defer testing.allocator.free(route_path);
+        try testing.expectError(
+            error.InvalidUnpackRouteSettlementPath,
+            native_recovery.unpackRouteSettlementStep(route_path),
+        );
     }
 }
 

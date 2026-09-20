@@ -321,6 +321,63 @@ class SettlementOracleTests(unittest.TestCase):
             {("unwind-success", "regular")},
         )
 
+    def test_outcome_lowering_covers_all_reference_and_subsequent_profiles(self) -> None:
+        oracle = acceptance.settlement
+        profiles = {
+            case: oracle.route_settlement_profile(*case)
+            for case in oracle.CASES
+        }
+        self.assertEqual(len(profiles), 24)
+        self.assertEqual(
+            sum(profile["publish_settlement"] for profile in profiles.values()),
+            18,
+        )
+        self.assertEqual(
+            {
+                case for case, profile in profiles.items()
+                if profile["outcome"] == "rollback"
+            },
+            {
+                ("rollback", "regular"),
+                ("rollback", "symlink"),
+                ("rollback", "hardlink-source"),
+                ("rollback", "obsolete"),
+                ("rollback", "introduced"),
+                ("rollback", "conffile"),
+            },
+        )
+        self.assertEqual(len(oracle.SUCCESSFUL_UPGRADE_CASES), 16)
+        for case in oracle.SUCCESSFUL_UPGRADE_CASES:
+            profile = profiles[case]
+            self.assertNotEqual(profile["outcome"], "rollback")
+            self.assertTrue(profile["publish_settlement"])
+
+    def test_failure_lowering_preserves_exact_partial_route_dispositions(self) -> None:
+        oracle = acceptance.settlement
+        expected = {
+            ("rollback", "regular"): "retain_incoming",
+            ("rollback", "symlink"): "retain_incoming",
+            ("rollback", "hardlink-source"): "retain_incoming",
+            ("rollback", "obsolete"): "restore_previous",
+            ("rollback", "introduced"): "retain_incoming",
+            ("rollback", "conffile"): "retain_conffile_staging",
+        }
+        for case, disposition in expected.items():
+            with self.subTest(case=case):
+                profile = oracle.route_settlement_profile(*case)
+                self.assertEqual(profile["partial_disposition"], disposition)
+                self.assertFalse(profile["publish_settlement"])
+                self.assertEqual(profile["backup"], (
+                    "retain" if case[1] in (
+                        "regular", "symlink", "hardlink-source"
+                    ) else "none"
+                ))
+                self.assertEqual(
+                    profile["trigger_paths"],
+                    [] if case[1] == "obsolete"
+                    else ["/" + profile["payload_route"]],
+                )
+
     def test_failure_and_unwind_profiles_cannot_enter_success_lowering(self) -> None:
         for case in (
             ("unwind-success", "regular"),
