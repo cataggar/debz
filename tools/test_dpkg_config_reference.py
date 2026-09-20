@@ -150,6 +150,124 @@ class DpkgConfigReferenceTests(unittest.TestCase):
             with self.assertRaisesRegex(oracle.OracleError, "frontend environment"):
                 oracle.validate_environment({**environment, name: "contaminated"})
 
+    def test_ambient_dpkg_configuration_is_pinned_and_hook_free(self) -> None:
+        config_root = self.workspace / "etc/dpkg"
+        home = self.workspace / "home"
+        config_root.mkdir(parents=True)
+        home.mkdir()
+        (config_root / "dpkg.cfg").write_bytes(oracle.PINNED_DPKG_CONFIG)
+        oracle.validate_host_configuration(home, config_root)
+
+        fragments = config_root / "dpkg.cfg.d"
+        fragments.mkdir()
+        (fragments / "hook").write_text("pre-invoke touch /ambient-hook\n")
+        with self.assertRaisesRegex(oracle.OracleError, "fragments are forbidden"):
+            oracle.validate_host_configuration(home, config_root)
+        (fragments / "hook").unlink()
+
+        (home / ".dpkg.cfg").write_text("path-exclude=*\n")
+        with self.assertRaisesRegex(oracle.OracleError, "config file is forbidden"):
+            oracle.validate_host_configuration(home, config_root)
+
+    def test_python_package_builder_is_deterministic_and_dpkg_readable(self) -> None:
+        environment = oracle.m.fixture_environment(self.workspace)
+        archives = []
+        for name in ("first", "second"):
+            archive = oracle.m.make_package(
+                self.workspace / name,
+                environment,
+                "amd64",
+                "1",
+                "conffile",
+                package=oracle.PACKAGE,
+                scripts=oracle.maintainer_scripts("v1"),
+                prepare_payload=lambda source: oracle.prepare_control(
+                    source, oracle.config_body("v1", 91)
+                ),
+                archive_builder=oracle.build_package_archive,
+            )
+            archives.append(archive)
+        self.assertEqual(archives[0].read_bytes(), archives[1].read_bytes())
+        result = oracle.subprocess.run(
+            ["dpkg-deb", "--info", str(archives[0])],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_published_observation_is_amd64_scoped_and_state_complete(self) -> None:
+        reference = oracle.load_reference()
+        boundary = reference["boundary"]
+        self.assertEqual(boundary["observed_architecture"], "amd64")
+        self.assertIn("amd64 only", boundary["architecture_scope"])
+        oracle.validate_observation_architecture(reference, "amd64")
+        with self.assertRaisesRegex(oracle.OracleError, "architecture-specific"):
+            oracle.validate_observation_architecture(reference, "arm64")
+
+        observed = reference["observed_behavior"]
+        inputs = observed["package_inputs"]
+        self.assertEqual(inputs["architecture"], "amd64")
+        self.assertEqual(len(inputs["lifecycle"]), 3)
+        self.assertEqual(len(inputs["vendor"]), 7)
+        self.assertEqual(
+            len(
+                {
+                    item["archive"]["sha256"]
+                    for group in ("lifecycle", "vendor")
+                    for item in inputs[group]
+                }
+            ),
+            10,
+        )
+        for package_input, member in zip(inputs["vendor"], reference["members"]):
+            self.assertEqual(package_input["identity"], member["owner"]["package"])
+            config = next(
+                item for item in package_input["control"] if item["name"] == "config"
+            )
+            self.assertEqual(
+                config["size"],
+                member["architectures"]["amd64"]["size"],
+            )
+
+        for phase in observed["successful_lifecycle"]:
+            database = phase["database"]
+            self.assertFalse(database["journal_nonempty"])
+            self.assertFalse(database["temporary_update"])
+            self.assertEqual(database["committed"], phase["state"])
+            self.assertEqual(phase["filesystem"]["staging"], [])
+        remove, purge = observed["successful_lifecycle"][-2:]
+        self.assertEqual(
+            [item["name"] for item in remove["filesystem"]["info"]],
+            ["list", "postrm"],
+        )
+        self.assertEqual(purge["filesystem"]["info"], [])
+
+        for case in observed["failure_recovery"]:
+            self.assertFalse(case["failed_database"]["journal_nonempty"])
+            self.assertFalse(case["failed_database"]["temporary_update"])
+            if "recovery_database" in case:
+                self.assertFalse(case["recovery_database"]["journal_nonempty"])
+                self.assertFalse(case["recovery_database"]["temporary_update"])
+        for case in observed["interruption_recovery"]:
+            self.assertTrue(case["interrupted_database"]["journal_nonempty"])
+            self.assertTrue(case["interrupted_database"]["temporary_update"])
+            self.assertFalse(case["recovery_database"]["journal_nonempty"])
+            self.assertFalse(case["recovery_database"]["temporary_update"])
+
+        for package in observed["vendor_identity_cohort"]["installed_state"]:
+            config = next(item for item in package["info"] if item["name"] == "config")
+            self.assertEqual(
+                (config["mode"], config["uid"], config["gid"]),
+                ("0755", 0, 0),
+            )
+        self.assertTrue(
+            all(
+                package["info"] == [] and package["state"] is None
+                for package in observed["vendor_identity_cohort"]["removed_state"]
+            )
+        )
+
     def test_trace_parser_preserves_empty_arguments_and_bounds_output(self) -> None:
         root = self.workspace / "root"
         (root / "var/log").mkdir(parents=True)
@@ -182,6 +300,21 @@ class DpkgConfigReferenceTests(unittest.TestCase):
         for root in (Path("/"), unguarded):
             with self.assertRaises((RuntimeError, FileNotFoundError)):
                 oracle.m.reference_command(root)
+
+        guarded = self.workspace / "guarded"
+        oracle.m.make_root(guarded, "amd64")
+        command = oracle.direct_dpkg_command(
+            oracle.m.REFERENCE_DPKG,
+            guarded,
+            ["--audit"],
+        )
+        self.assertIn(f"--log={guarded / oracle.DPKG_LOG}", command)
+        with self.assertRaisesRegex(oracle.OracleError, "frontend executable"):
+            oracle.direct_dpkg_command(
+                oracle.m.REFERENCE_DPKG,
+                guarded,
+                ["/usr/bin/apt"],
+            )
 
         native_unpack = (ROOT / "src/native_unpack.zig").read_text()
         self.assertIn(

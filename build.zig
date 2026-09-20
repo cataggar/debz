@@ -611,7 +611,7 @@ pub fn build(b: *std.Build) void {
     );
     dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
     test_step.dependOn(&dpkg_config_reference_tests.step);
-    b.step("test-dpkg-config-reference", "Verify direct pinned-dpkg config control-member behavior")
+    b.step("test-dpkg-config-reference", "Verify amd64 direct pinned-dpkg config control-member behavior")
         .dependOn(&dpkg_config_reference.step);
 
     const native_lifecycle_tests = b.addTest(.{

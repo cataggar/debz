@@ -69,6 +69,49 @@
       ],
       "type": "object"
     },
+    "archiveBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "cohortPackageState": {
+      "additionalProperties": false,
+      "properties": {
+        "info": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "package": {
+          "pattern": "^[a-z0-9][a-z0-9+.-]*$",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        }
+      },
+      "required": [
+        "info",
+        "package",
+        "state"
+      ],
+      "type": "object"
+    },
     "digest": {
       "pattern": "^[0-9a-f]{64}$",
       "type": "string"
@@ -89,6 +132,12 @@
         "failed_config": {
           "$ref": "#/$defs/token"
         },
+        "failed_database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "failed_filesystem": {
+          "$ref": "#/$defs/filesystemState"
+        },
         "failed_state": {
           "$ref": "#/$defs/state"
         },
@@ -97,6 +146,12 @@
         },
         "recovery_config": {
           "$ref": "#/$defs/token"
+        },
+        "recovery_database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "recovery_filesystem": {
+          "$ref": "#/$defs/filesystemState"
         },
         "recovery_state": {
           "$ref": "#/$defs/state"
@@ -108,6 +163,8 @@
       "required": [
         "case",
         "failed_config",
+        "failed_database",
+        "failed_filesystem",
         "failed_state",
         "failed_trace"
       ],
@@ -152,6 +209,9 @@
         "interrupted_database": {
           "$ref": "#/$defs/databaseState"
         },
+        "interrupted_filesystem": {
+          "$ref": "#/$defs/filesystemState"
+        },
         "interrupted_staging_config": {
           "$ref": "#/$defs/token"
         },
@@ -160,6 +220,12 @@
         },
         "recovery_config": {
           "$ref": "#/$defs/token"
+        },
+        "recovery_database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "recovery_filesystem": {
+          "$ref": "#/$defs/filesystemState"
         },
         "recovery_state": {
           "$ref": "#/$defs/state"
@@ -172,9 +238,12 @@
         "case",
         "interrupted_config",
         "interrupted_database",
+        "interrupted_filesystem",
         "interrupted_staging_config",
         "interrupted_trace",
         "recovery_config",
+        "recovery_database",
+        "recovery_filesystem",
         "recovery_state",
         "recovery_trace"
       ],
@@ -204,6 +273,30 @@
         "path",
         "sha256",
         "size"
+      ],
+      "type": "object"
+    },
+    "filesystemState": {
+      "additionalProperties": false,
+      "properties": {
+        "info": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "staging": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "required": [
+        "info",
+        "staging"
       ],
       "type": "object"
     },
@@ -277,6 +370,77 @@
       ],
       "type": "object"
     },
+    "observedFile": {
+      "additionalProperties": false,
+      "properties": {
+        "gid": {
+          "const": 0
+        },
+        "mode": {
+          "enum": [
+            "0644",
+            "0755"
+          ]
+        },
+        "name": {
+          "pattern": "^[^/\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 262144,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "uid": {
+          "const": 0
+        }
+      },
+      "required": [
+        "gid",
+        "mode",
+        "name",
+        "sha256",
+        "size",
+        "uid"
+      ],
+      "type": "object"
+    },
+    "packageInput": {
+      "additionalProperties": false,
+      "properties": {
+        "archive": {
+          "$ref": "#/$defs/archiveBinding"
+        },
+        "control": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "identity": {
+          "pattern": "^(v1|v1r|v2|[a-z0-9][a-z0-9+.-]*)$",
+          "type": "string"
+        },
+        "version": {
+          "enum": [
+            "1",
+            "2"
+          ]
+        }
+      },
+      "required": [
+        "archive",
+        "control",
+        "identity",
+        "version"
+      ],
+      "type": "object"
+    },
     "relativePath": {
       "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\u0000-\\u001f\\u007f]+$",
       "type": "string"
@@ -289,10 +453,19 @@
         {
           "additionalProperties": false,
           "properties": {
+            "architecture": {
+              "const": "amd64"
+            },
             "config_version": {
               "maxLength": 64,
               "minLength": 1,
               "type": "string"
+            },
+            "description": {
+              "const": "native data-only materialization fixture"
+            },
+            "maintainer": {
+              "const": "debz fixture <fixture@example.invalid>"
             },
             "status": {
               "enum": [
@@ -312,6 +485,9 @@
             }
           },
           "required": [
+            "architecture",
+            "description",
+            "maintainer",
             "status",
             "version"
           ],
@@ -324,6 +500,12 @@
       "properties": {
         "config": {
           "$ref": "#/$defs/token"
+        },
+        "database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "filesystem": {
+          "$ref": "#/$defs/filesystemState"
         },
         "operation": {
           "enum": [
@@ -343,6 +525,8 @@
       },
       "required": [
         "config",
+        "database",
+        "filesystem",
         "operation",
         "state",
         "trace"
@@ -388,8 +572,8 @@
           "minItems": 2,
           "type": "array"
         },
-        "cross_architecture_behavior": {
-          "const": "identical except DPKG_MAINTSCRIPT_ARCH; all seven pinned config facts are identical"
+        "architecture_scope": {
+          "const": "vendor config facts cover amd64 and arm64; direct-dpkg lifecycle execution is published for amd64 only"
         },
         "excluded_frontends": {
           "prefixItems": [
@@ -429,6 +613,9 @@
             "maximum_control_members": {
               "const": 16
             },
+            "maximum_archive_bytes": {
+              "const": 8388608
+            },
             "maximum_environment_line_bytes": {
               "const": 4096
             },
@@ -440,6 +627,12 @@
             },
             "maximum_file_bytes": {
               "const": 262144
+            },
+            "maximum_info_bytes": {
+              "const": 1048576
+            },
+            "maximum_info_files": {
+              "const": 32
             },
             "maximum_log_bytes": {
               "const": 131072
@@ -472,12 +665,15 @@
           "required": [
             "maximum_argument_bytes",
             "maximum_arguments",
+            "maximum_archive_bytes",
             "maximum_control_bytes",
             "maximum_control_members",
             "maximum_environment_line_bytes",
             "maximum_environment_records",
             "maximum_environment_variables",
             "maximum_file_bytes",
+            "maximum_info_bytes",
+            "maximum_info_files",
             "maximum_log_bytes",
             "maximum_packages",
             "maximum_status_bytes",
@@ -518,14 +714,18 @@
           "maxItems": 7,
           "minItems": 7,
           "type": "array"
+        },
+        "observed_architecture": {
+          "const": "amd64"
         }
       },
       "required": [
+        "architecture_scope",
         "architectures",
-        "cross_architecture_behavior",
         "excluded_frontends",
         "invocation",
         "limits",
+        "observed_architecture",
         "operations"
       ],
       "type": "object"
@@ -585,6 +785,36 @@
           "maxItems": 3,
           "minItems": 3,
           "type": "array"
+        },
+        "package_inputs": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "const": "amd64"
+            },
+            "lifecycle": {
+              "items": {
+                "$ref": "#/$defs/packageInput"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array"
+            },
+            "vendor": {
+              "items": {
+                "$ref": "#/$defs/packageInput"
+              },
+              "maxItems": 7,
+              "minItems": 7,
+              "type": "array"
+            }
+          },
+          "required": [
+            "architecture",
+            "lifecycle",
+            "vendor"
+          ],
+          "type": "object"
         },
         "script_context": {
           "additionalProperties": false,
@@ -649,8 +879,24 @@
               "type": "array",
               "uniqueItems": true
             },
+            "installed_state": {
+              "items": {
+                "$ref": "#/$defs/cohortPackageState"
+              },
+              "maxItems": 7,
+              "minItems": 7,
+              "type": "array"
+            },
             "remove_exit": {
               "const": 0
+            },
+            "removed_state": {
+              "items": {
+                "$ref": "#/$defs/cohortPackageState"
+              },
+              "maxItems": 7,
+              "minItems": 7,
+              "type": "array"
             },
             "retained_after_remove": {
               "maxItems": 0,
@@ -661,7 +907,9 @@
             "config_invocation_count",
             "install_exit",
             "installed_identities",
+            "installed_state",
             "remove_exit",
+            "removed_state",
             "retained_after_remove"
           ],
           "type": "object"
@@ -672,6 +920,7 @@
         "failure_recovery",
         "frontend_invocation_count",
         "interruption_recovery",
+        "package_inputs",
         "script_context",
         "successful_lifecycle",
         "vendor_identity_cohort"
@@ -729,12 +978,16 @@
               ],
               "type": "object"
             },
+            "configuration_sha256": {
+              "const": "fead43b89af3ea5691c48f32d7fe1ba0f7ab229fb5d230f612d76fe8e6f5a015"
+            },
             "version": {
               "const": "1.22.22"
             }
           },
           "required": [
             "architectures",
+            "configuration_sha256",
             "version"
           ],
           "type": "object"

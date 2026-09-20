@@ -225,16 +225,26 @@ The [direct-dpkg config reference
 schema](../schema/dpkg-config-reference-v1.json) and canonical
 `tools/fixtures/vendor-state/dpkg-config-reference-v1.json` bind dpkg 1.22.22
 and both executable/archive pins, the index, both manifests, the derived
-reference digest, and all seven package/config identities. All seven facts are
-identical on amd64 and arm64; the direct-dpkg contract is identical except for
-the expected `DPKG_MAINTSCRIPT_ARCH` environment value. The elevated
-`tools/dpkg-config-reference.py` runner invokes only the pinned dpkg binary
-against guarded disposable roots; apt, debconf, and `dpkg-preconfigure` are not
-present or invoked. It generates exact-size adversarial config members for all
-seven identities plus instrumented lifecycle packages, bounds every path,
-control member, trace, environment, fd probe, update fragment, log, timeout,
-and process, and rejects traversing, symlink, and special-file control
-fixtures.
+reference digest, and all seven package/config identities. The seven vendor
+facts and the pinned dpkg package are available for amd64 and arm64, but this
+v1 lifecycle observation was executed and published for amd64 only. It makes
+no architecture-independence claim: the runner rejects an arm64 host until a
+separate arm64 observation is reviewed and published.
+
+The elevated `tools/dpkg-config-reference.py` runner invokes only the pinned
+dpkg binary against guarded disposable roots. Its deterministic Python
+archive builder does not invoke host `dpkg-deb`; generated package archives,
+control members, and installed info members are digest-, size-, mode-, uid-,
+and gid-bound in the observation. The runner requires the exact benign
+`/etc/dpkg/dpkg.cfg` shipped by the pinned package, rejects global config
+fragments and the fresh fixture user's `.dpkg.cfg`, and rejects any apt,
+debconf, or `dpkg-preconfigure` path or environment. The command line overrides
+the configured log into each disposable root and asserts that the host dpkg
+status and log are unchanged. It generates exact-size
+adversarial config members for all seven identities plus instrumented
+lifecycle packages, bounds every path, archive, info member, trace,
+environment, fd probe, update fragment, log, timeout, and process, and rejects
+traversing, symlink, and special-file control fixtures.
 
 ```sh
 reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
@@ -242,7 +252,7 @@ zig build test-dpkg-config-reference \
   -Dnative-reference-dpkg="$reference_dpkg" -j2
 ```
 
-Direct dpkg never executes `config`: nonzero scripts and a script with a
+On amd64, direct dpkg never executes `config`: nonzero scripts and a script with a
 missing interpreter are installed and replaced without affecting command
 success. Incoming bytes are visible at `tmp.ci/config` to old `prerm`, incoming
 `preinst`, and old `postrm`; the installed info member remains the old version
@@ -255,8 +265,11 @@ The interruption rows additionally bind committed status versus the latest
 bounded `updates/` fragment.
 
 This closes the config direct-dpkg behavior question, not debconf frontend
-behavior and not native support. A future native implementation must reproduce
-that byte/mode publication, rollback, removal, and non-execution contract.
+behavior, arm64 behavior, or native support. Arm64 publication remains blocked
+until the same executable oracle is run there and its canonical
+architecture-specific observation is reviewed. A future native implementation
+must reproduce the applicable byte/mode/ownership publication, rollback,
+removal, and non-execution contract.
 Current opaque-info and unsupported-archive-metadata guards remain unchanged.
 Remaining oracle work is alternatives record decoding and install, upgrade,
 remove, purge, failure, and recovery mutation behavior.

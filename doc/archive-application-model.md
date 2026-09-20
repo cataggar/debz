@@ -140,8 +140,8 @@ No pinned archive-application fixture ships `md5sums`, symbolic or hard links,
 setuid or setgid payload entries, non-root ownership, GNU long names,
 or `remove-on-upgrade` conffiles. The installed-state vendor reference contains
 seven bounded `*.config` members but no archive bytes. The separate
-[direct-dpkg config oracle](integration-roots.md) generates bounded adversarial
-archives at each pinned member size and proves their exact direct-dpkg
+[amd64 direct-dpkg config oracle](integration-roots.md) generates bounded
+adversarial archives at each pinned member size and proves their exact direct-dpkg
 publication, replacement, failure, interruption, removal, and non-execution
 behavior. It does not claim the unavailable vendor bytes or any apt/debconf
 frontend behavior. Those archive-model paths are also
