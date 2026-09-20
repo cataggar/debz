@@ -96,6 +96,20 @@ database path component.
 | `var/lib/dpkg/parts/` | Empty is accepted. Nonempty records are retained and classified during feature inventory before mutation. |
 | `var/lib/dpkg/available` | Preserve as non-authoritative compatibility data; the native engine does not use it for solving or authorization. |
 
+The pinned Ubuntu amd64/arm64 installed-state boundary is the derived
+[vendor-state reference specification](../schema/vendor-state-reference-v1.json)
+described in [Integration roots](integration-roots.md). Per architecture it
+contains exactly 829 `info` members, 14 alternatives records, 189 requested
+paths, 190 linked entries, seven `*.config` members, zero package
+`*.alternatives`, and zero unclassified members. Every non-config control
+member is classified as already-supported typed state or bounded inert retained
+metadata. The reference types current alternatives master/slave and selected
+target topology, but its source manifests do not contain record bytes,
+provider ownership, selection mode, priorities, or before/after mutation
+evidence. Config-script invocation and alternatives mutation therefore remain
+reference-execution gates, not inferred successful outcomes. Existing opaque
+info and alternatives checks continue to refuse or hand off before mutation.
+
 The typed model, import validation, canonical writers, generation evidence, and
 staged change-set plans for these surfaces are documented in
 [Native package database](package-database.md).

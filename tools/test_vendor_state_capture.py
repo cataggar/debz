@@ -14,22 +14,35 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from unittest import mock
 
 import jsonschema
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/capture-vendor-state.py"
+REFERENCE_TOOL = ROOT / "tools/derive-vendor-state-reference.py"
 REFERENCE_DIRECTORY = ROOT / "tools/fixtures/vendor-state"
 REFERENCE_INDEX = REFERENCE_DIRECTORY / "index-v1.json"
+REFERENCE_DOCUMENT = REFERENCE_DIRECTORY / "reference-v1.json"
 REFERENCE_INDEX_SHA256 = (
     "682bff167a4bc2386ceb78fb554be0adbe6fbfab16f4eab77aff3b63af04dd34"
+)
+REFERENCE_DOCUMENT_SHA256 = (
+    "478b476dc07ccdfae94ab782ef87a9061a2a5bfbd9fafa900803c9fb72802943"
 )
 SPEC = importlib.util.spec_from_file_location("vendor_state_capture", TOOL)
 assert SPEC and SPEC.loader
 vendor_state_capture = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = vendor_state_capture
 SPEC.loader.exec_module(vendor_state_capture)
+REFERENCE_SPEC = importlib.util.spec_from_file_location(
+    "vendor_state_reference", REFERENCE_TOOL
+)
+assert REFERENCE_SPEC and REFERENCE_SPEC.loader
+vendor_state_reference = importlib.util.module_from_spec(REFERENCE_SPEC)
+sys.modules[REFERENCE_SPEC.name] = vendor_state_reference
+REFERENCE_SPEC.loader.exec_module(vendor_state_reference)
 
 
 class VendorStateCaptureTests(unittest.TestCase):
@@ -1384,6 +1397,437 @@ class VendorStateCaptureTests(unittest.TestCase):
         )
         build = (ROOT / "build.zig").read_text()
         self.assertIn('"vendor-state-inventory-v1.json",', build)
+        self.assertIn('"vendor-state-reference-v1.json",', build)
+
+
+class VendorStateReferenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary_root = ROOT / ".tmp"
+        temporary_root.mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="vendor-state-reference-", dir=temporary_root
+        )
+        self.addCleanup(self.temporary.cleanup)
+        self.workspace = pathlib.Path(self.temporary.name)
+
+    def mutated_index(
+        self,
+        name: str,
+        mutate: Callable[[dict], None],
+        architecture: str | None = "amd64",
+    ) -> pathlib.Path:
+        directory = self.workspace / name
+        directory.mkdir()
+        index = json.loads(REFERENCE_INDEX.read_text())
+        for reference in index["manifests"]:
+            source = REFERENCE_DIRECTORY / reference["manifest_path"]
+            destination = directory / reference["manifest_path"]
+            destination.write_bytes(source.read_bytes())
+        selected_references = [
+            item
+            for item in index["manifests"]
+            if architecture is None or item["architecture"] == architecture
+        ]
+        for selected in selected_references:
+            manifest_path = directory / selected["manifest_path"]
+            document = json.loads(manifest_path.read_text())
+            mutate(document)
+            raw = vendor_state_reference.canonical_json(document)
+            manifest_path.write_bytes(raw)
+            selected["manifest_size_bytes"] = len(raw)
+            selected["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+        index_path = directory / "index-v1.json"
+        index_path.write_bytes(vendor_state_reference.canonical_json(index))
+        return index_path
+
+    def test_reference_is_deterministic_complete_digest_bound_and_typed(
+        self,
+    ) -> None:
+        raw = REFERENCE_DOCUMENT.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(), REFERENCE_DOCUMENT_SHA256
+        )
+        document = json.loads(raw)
+        self.assertEqual(
+            raw, vendor_state_reference.canonical_json(document)
+        )
+        self.assertEqual(
+            raw,
+            vendor_state_reference.canonical_json(
+                vendor_state_reference.derive(REFERENCE_INDEX)
+            ),
+        )
+        checked = subprocess.run(
+            [
+                sys.executable,
+                str(REFERENCE_TOOL),
+                "--index",
+                str(REFERENCE_INDEX),
+                "--check",
+                str(REFERENCE_DOCUMENT),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+        schema = json.loads(
+            (ROOT / "schema/vendor-state-reference-v1.json").read_text()
+        )
+        jsonschema.Draft202012Validator.check_schema(schema)
+        jsonschema.Draft202012Validator(schema).validate(document)
+        self.assertEqual(document["schema"], vendor_state_reference.SCHEMA)
+        self.assertEqual(document["version"], 1)
+        self.assertEqual(
+            document["source"]["index"],
+            {
+                "path": "index-v1.json",
+                "size": REFERENCE_INDEX.stat().st_size,
+                "sha256": REFERENCE_INDEX_SHA256,
+            },
+        )
+        indexed = {
+            item["architecture"]: item
+            for item in json.loads(REFERENCE_INDEX.read_text())["manifests"]
+        }
+        for source in document["source"]["manifests"]:
+            architecture = source["architecture"]
+            self.assertEqual(
+                source["sha256"], indexed[architecture]["manifest_sha256"]
+            )
+            self.assertEqual(
+                source["size"], indexed[architecture]["manifest_size_bytes"]
+            )
+
+        boundary = document["boundary"]
+        self.assertEqual(boundary["architectures"], ["amd64", "arm64"])
+        self.assertEqual(boundary["paired_control_member_count"], 829)
+        self.assertEqual(boundary["alternatives_group_count"], 14)
+        self.assertEqual(boundary["requested_path_count"], 189)
+        self.assertEqual(boundary["linked_entry_count"], 190)
+        for architecture in ("amd64", "arm64"):
+            inventory = boundary["per_architecture"][architecture]
+            self.assertEqual(inventory["control_member_count"], 829)
+            self.assertEqual(inventory["alternatives_record_count"], 14)
+            self.assertEqual(inventory["requested_path_count"], 189)
+            self.assertEqual(inventory["linked_entry_count"], 190)
+            self.assertEqual(inventory["config_member_count"], 7)
+            self.assertEqual(
+                inventory["package_alternatives_member_count"], 0
+            )
+            self.assertEqual(
+                inventory["unclassified_control_member_count"], 0
+            )
+            self.assertEqual(
+                inventory["control_handling_counts"],
+                {
+                    "bounded-inert-retained-metadata": 158,
+                    "reference-execution-required": 7,
+                    "supported-typed-state": 664,
+                },
+            )
+
+        controls = document["control_members"]
+        identities = [item["identity"] for item in controls]
+        self.assertEqual(
+            identities,
+            sorted(identities, key=lambda value: value.encode("utf-8")),
+        )
+        self.assertEqual(len(identities), len(set(identities)))
+        self.assertEqual(len(controls), 829)
+        configs = [
+            item
+            for item in controls
+            if item["classification"] == "debconf-config"
+        ]
+        self.assertEqual(
+            [item["identity"] for item in configs],
+            [
+                "chrony.config",
+                "console-setup.config",
+                "debconf.config",
+                "iproute2.config",
+                "keyboard-configuration.config",
+                "locales.config",
+                "tzdata.config",
+            ],
+        )
+        for item in configs:
+            self.assertEqual(item["owner"]["kind"], "package")
+            self.assertEqual(
+                item["handling"], "reference-execution-required"
+            )
+            self.assertNotEqual(
+                item["reference_execution_requirement"], "none"
+            )
+            for architecture in ("amd64", "arm64"):
+                fact = item["architectures"][architecture]
+                self.assertTrue(fact["path"].endswith(".config"))
+                self.assertEqual(fact["mode"], "0755")
+        for item in controls:
+            if item["classification"] == "debconf-config":
+                continue
+            self.assertIn(
+                item["handling"],
+                {
+                    "supported-typed-state",
+                    "bounded-inert-retained-metadata",
+                },
+            )
+            self.assertEqual(item["reference_execution_requirement"], "none")
+            self.assertNotEqual(item["classification"], "unclassified")
+
+        alternatives = document["alternatives"]
+        groups = alternatives["groups"]
+        group_names = [item["name"] for item in groups]
+        self.assertEqual(
+            group_names,
+            [
+                "awk",
+                "builtins.7.gz",
+                "editor",
+                "ex",
+                "nc",
+                "newt-palette",
+                "pager",
+                "rmt",
+                "rview",
+                "sudo",
+                "vi",
+                "view",
+                "vtrgb",
+                "which",
+            ],
+        )
+        self.assertEqual(len(group_names), len(set(group_names)))
+        for group in groups:
+            self.assertEqual(group["ownership"]["status"], "not-captured")
+            self.assertEqual(
+                group["selection_mode"]["status"],
+                "reference-execution-required",
+            )
+            self.assertEqual(
+                group["priorities"]["status"],
+                "reference-execution-required",
+            )
+            masters = [
+                link
+                for link in group["links"]
+                if link["relationship"] == "master"
+            ]
+            self.assertEqual(len(masters), 1)
+            self.assertEqual(
+                masters[0]["selector_path"],
+                f"etc/alternatives/{group['name']}",
+            )
+            classified_paths = {
+                item["link_path"] for item in group["links"]
+            } | {item["path"] for item in group["candidate_paths"]}
+            self.assertEqual(
+                classified_paths, set(group["record"]["referenced_paths"])
+            )
+            self.assertEqual(
+                len(group["record"]["referenced_paths"]),
+                len(classified_paths),
+            )
+            for link in group["links"]:
+                self.assertEqual(
+                    link["ownership"]["status"], "not-captured"
+                )
+
+        requested = alternatives["requested_paths"]
+        requested_names = [item["path"] for item in requested]
+        self.assertEqual(len(requested), 189)
+        self.assertEqual(len(requested_names), len(set(requested_names)))
+        reached = {
+            path for item in requested for path in item["chain"]
+        }
+        linked = alternatives["linked_entries"]
+        linked_names = [item["identity"] for item in linked]
+        self.assertEqual(len(linked), 190)
+        self.assertEqual(len(linked_names), len(set(linked_names)))
+        self.assertEqual(reached, set(linked_names))
+        for item in linked:
+            self.assertTrue(item["roles"])
+            self.assertEqual(item["ownership"]["status"], "not-captured")
+            for architecture in ("amd64", "arm64"):
+                fact = item["architectures"][architecture]
+                if item["kind"] == "regular":
+                    self.assertRegex(fact["sha256"], r"^[0-9a-f]{64}$")
+                else:
+                    self.assertIn("target", fact)
+        self.assertEqual(
+            alternatives["retained_selector_metadata"],
+            [
+                {
+                    "handling": "bounded-inert-retained-metadata",
+                    "path": "etc/alternatives/README",
+                    "rationale": (
+                        "This regular etc/alternatives entry is not a selector "
+                        "or alternatives database record and is retained by identity."
+                    ),
+                    "terminal_path": "etc/alternatives/README",
+                }
+            ],
+        )
+
+        differences = document["cross_architecture_differences"]
+        self.assertEqual(len(differences["path_qualifications"]), 422)
+        self.assertEqual(len(differences["control_content"]), 275)
+        self.assertEqual(
+            differences["control_content_counts"],
+            {
+                "checksums": 140,
+                "conffiles": 1,
+                "control": 0,
+                "debconf-config": 0,
+                "format": 0,
+                "maintainer-script": 28,
+                "ownership-list": 94,
+                "package-alternatives": 0,
+                "retained-metadata": 9,
+                "triggers": 3,
+                "unclassified": 0,
+            },
+        )
+        self.assertEqual(
+            [item["identity"] for item in differences["linked_content"]],
+            [
+                "usr/bin/less",
+                "usr/bin/mawk",
+                "usr/bin/more",
+                "usr/bin/nc.openbsd",
+                "usr/bin/sudo.ws",
+                "usr/bin/vim.tiny",
+                "usr/lib/cargo/bin/sudo",
+                "usr/lib/cargo/bin/visudo",
+                "usr/sbin/rmt-tar",
+                "usr/sbin/visudo.ws",
+            ],
+        )
+        requirements = {
+            item["id"]: item
+            for item in document["reference_execution_requirements"]
+        }
+        self.assertEqual(
+            set(requirements),
+            {
+                "debconf-config-execution",
+                "alternatives-record-semantics",
+                "alternatives-mutation-behavior",
+            },
+        )
+        native_unpack = (ROOT / "src/native_unpack.zig").read_text()
+        self.assertIn(
+            'std.mem.endsWith(u8, entry.name, ".alternatives")',
+            native_unpack,
+        )
+        self.assertIn(
+            "if (database.model.opaque_info.len != 0)\n"
+            '        return .{ .outcome = .handoff, .detail = "package_metadata" };',
+            native_unpack,
+        )
+
+    def test_reference_derivation_rejects_unclassified_manifest_items(
+        self,
+    ) -> None:
+        def mutate(document: dict) -> None:
+            member = next(
+                item
+                for item in document["control_members"]["entries"]
+                if item["classification"] == "retained-metadata"
+            )
+            old = member["classification"]
+            member["path"] = member["path"].rsplit(".", 1)[0] + ".vendor-state"
+            member["classification"] = "unclassified"
+            counts = document["control_members"]["classification_counts"]
+            counts[old] -= 1
+            counts["unclassified"] += 1
+            document["control_members"]["entries"].sort(
+                key=lambda item: item["path"].encode("utf-8")
+            )
+
+        index = self.mutated_index("unclassified", mutate)
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError,
+            "unclassified control member",
+        ):
+            vendor_state_reference.derive(index)
+
+    def test_reference_derivation_rejects_malformed_oversized_and_unsafe_state(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "malformed",
+                lambda document: document["control_members"]["entries"][0].__setitem__(
+                    "mode", "9999"
+                ),
+                "malformed mode",
+                "amd64",
+            ),
+            (
+                "oversized",
+                lambda document: document["control_members"]["entries"][0].__setitem__(
+                    "size",
+                    document["limits"]["max_metadata_file_bytes"] + 1,
+                ),
+                "metadata file byte limit",
+                "amd64",
+            ),
+            (
+                "traversal",
+                lambda document: document["linked_filesystem"]["entries"][0].__setitem__(
+                    "path", "usr/../escape"
+                ),
+                "unsafe path component",
+                "amd64",
+            ),
+            (
+                "escaping-symlink",
+                lambda document: next(
+                    item
+                    for item in document["linked_filesystem"]["entries"]
+                    if item["path"] == "etc/alternatives/awk"
+                ).__setitem__("target", "../../../outside"),
+                "escapes the reference root",
+                "amd64",
+            ),
+            (
+                "cycle",
+                lambda document: next(
+                    item
+                    for item in document["linked_filesystem"]["entries"]
+                    if item["path"] == "etc/alternatives/awk"
+                ).__setitem__("target", "/etc/alternatives/awk"),
+                "symlink cycle",
+                None,
+            ),
+            (
+                "special-file",
+                lambda document: document["linked_filesystem"]["entries"].__setitem__(
+                    0,
+                    {
+                        "path": document["linked_filesystem"]["entries"][0][
+                            "path"
+                        ],
+                        "kind": "fifo",
+                    },
+                ),
+                "unsupported linked entry kind",
+                "amd64",
+            ),
+        )
+        for name, mutate, message, architecture in cases:
+            with self.subTest(name=name):
+                index = self.mutated_index(
+                    name, mutate, architecture=architecture
+                )
+                with self.assertRaisesRegex(
+                    vendor_state_reference.DerivationError, message
+                ):
+                    vendor_state_reference.derive(index)
 
 
 if __name__ == "__main__":
