@@ -207,8 +207,9 @@ pub const AuthenticatedResult = struct {
 };
 
 /// Deterministic identity of the authenticated repository view used by locks.
-/// Transport location and cache/network outcome are excluded. Freshness
-/// verification time and policy evidence are intentionally included.
+/// Transport location, cache/network outcome, and observation time are
+/// excluded. Freshness policy and its authoritative signed bounds are included;
+/// every refresh still revalidates those bounds at the current time.
 pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("debz-authenticated-repository-snapshot-v2\x00");
@@ -227,10 +228,8 @@ pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
     updateDigestInt(&hash, i64, policy.release_date_unix);
     hash.update(&.{@intFromBool(policy.valid_until_unix != null)});
     updateDigestInt(&hash, i64, policy.valid_until_unix orelse 0);
-    updateDigestInt(&hash, i64, policy.verification_time_unix);
     updateDigestInt(&hash, u64, policy.maximum_future_seconds);
     updateDigestInt(&hash, u64, policy.expiry_grace_seconds);
-    updateDigestInt(&hash, u64, policy.observed_release_age_seconds);
     hash.update(@tagName(policy.expiry_policy));
     hash.update("\x00");
     hash.update(&.{@intFromBool(policy.maximum_release_age_seconds != null)});
@@ -1882,10 +1881,8 @@ test "authenticated InRelease publishes trusted snapshot and revalidates offline
     const FreshnessBinding = enum {
         release_date,
         valid_until,
-        verification_time,
         future_bound,
         expiry_grace,
-        observed_age,
         expiry_policy,
         maximum_age,
         exception_exercised,
@@ -1896,10 +1893,8 @@ test "authenticated InRelease publishes trusted snapshot and revalidates offline
         switch (binding) {
             .release_date => result.snapshot.provenance.policy.release_date_unix += 1,
             .valid_until => result.snapshot.provenance.policy.valid_until_unix = null,
-            .verification_time => result.snapshot.provenance.policy.verification_time_unix += 1,
             .future_bound => result.snapshot.provenance.policy.maximum_future_seconds += 1,
             .expiry_grace => result.snapshot.provenance.policy.expiry_grace_seconds += 1,
-            .observed_age => result.snapshot.provenance.policy.observed_release_age_seconds += 1,
             .expiry_policy => result.snapshot.provenance.policy.expiry_policy = .{
                 .allow_missing_valid_until_with_max_age_seconds = 1,
             },
@@ -1915,6 +1910,14 @@ test "authenticated InRelease publishes trusted snapshot and revalidates offline
             &changed_snapshot_digest,
         ));
     }
+    result.snapshot.provenance.policy = original_policy;
+    result.snapshot.provenance.policy.verification_time_unix += 1;
+    result.snapshot.provenance.policy.observed_release_age_seconds += 1;
+    try std.testing.expectEqualSlices(
+        u8,
+        &original_snapshot_digest,
+        &snapshotDigest(&result),
+    );
     result.snapshot.provenance.policy = original_policy;
 
     policy.mode = .cache_only;

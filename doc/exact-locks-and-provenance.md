@@ -62,10 +62,12 @@ write/fsync/rename/fsync.
 
 Authenticated snapshot digest version 2 additionally binds the configured
 freshness policy and maximum missing-expiry age, signed Release date,
-freshness verification time and observed age, `Valid-Until` grace, bounded
-future-skew decision, and whether the missing-`Valid-Until` exception was
-exercised. Repository and configuration identities also bind that configured
-policy. Exact-lock v1/v2
+`Valid-Until` grace, bounded future-skew decision, and whether the
+missing-`Valid-Until` exception was exercised. Observation time and observed
+age remain validated cache evidence but are excluded from lock identity, so
+independent authenticated refreshes of the same still-valid signed snapshot
+under the same policy produce the same digest. Repository and configuration
+identities also bind that configured policy. Exact-lock v1/v2
 and transaction-result v1/v2 schemas continue to carry the opaque repository
 snapshot digest, so their existing evidence path transitively binds the new
 freshness facts without a transaction-result v3. Previously serialized locks
