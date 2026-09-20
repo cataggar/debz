@@ -293,8 +293,10 @@ Repository sources can be supplied explicitly as canonical `.sources` stanzas or
 boundary for APT sources, binary OpenPGP keyrings, and dpkg-native architecture
 state. Its production filesystem adapter is traversal-safe and no-follow;
 logical `Signed-By` values remain root-independent while verifier inputs use
-the imported bytes. Imports produce the canonical, digest-bound
-[`apt-config-snapshot-v1`](../schema/apt-config-snapshot-v1.json) manifest. See
+the imported bytes. Strict imports retain the canonical, digest-bound
+[`apt-config-snapshot-v1`](../schema/apt-config-snapshot-v1.json) format;
+explicit finite missing-expiry policy uses
+[`apt-config-snapshot-v2`](../schema/apt-config-snapshot-v2.json). See
 [Target-root APT configuration snapshots](target-apt-config.md).
 
 `debz.repository_api` is the separate versioned repository-management

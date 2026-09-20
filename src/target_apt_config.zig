@@ -8,7 +8,14 @@ const source = @import("source.zig");
 
 pub const schema_id = "https://debz.dev/schema/apt-config-snapshot-v1";
 pub const schema_version: u32 = 1;
+pub const freshness_schema_id = "https://debz.dev/schema/apt-config-snapshot-v2";
+pub const freshness_schema_version: u32 = 2;
 pub const maximum_document_bytes: usize = 16 * 1024 * 1024;
+
+pub const ArtifactVersion = enum {
+    v1,
+    v2,
+};
 
 const sources_list_path = "/etc/apt/sources.list";
 const sources_directory_path = "/etc/apt/sources.list.d";
@@ -146,14 +153,26 @@ pub const Request = struct {
     /// filesystem adapter owns logical-to-physical root mapping.
     root_path: []const u8,
     architecture_override: ?[]const u8 = null,
+    source_policies: []const SourcePolicy = &.{},
     limits: Limits = .{},
     dependencies: Dependencies,
+};
+
+pub const SourcePolicy = struct {
+    logical_path: []const u8,
+    freshness: repository_refresh.ExpiryPolicy,
 };
 
 pub const SourceRecord = struct {
     logical_path: []const u8,
     sha256: [32]u8,
     format: source.Format,
+    freshness: repository_refresh.ExpiryPolicy = .require_valid_until,
+};
+
+pub const RepositoryPolicyRecord = struct {
+    repository_id: [64]u8,
+    freshness: repository_refresh.ExpiryPolicy,
 };
 
 pub const KeyringUse = enum {
@@ -182,11 +201,13 @@ pub const Exclusion = struct {
 };
 
 pub const Manifest = struct {
+    artifact_version: ArtifactVersion = .v1,
     native_architecture: []const u8,
     foreign_architectures: []const []const u8,
     sources: []const SourceRecord,
     configuration_id: [64]u8,
     repository_ids: []const [64]u8,
+    repository_policies: []const RepositoryPolicyRecord = &.{},
     keyrings: []const KeyringRecord,
     global_trust_compatibility: bool,
     exclusions: []const Exclusion,
@@ -208,11 +229,33 @@ fn validateSerializableManifest(manifest: Manifest) ValidationError!void {
         if (!validArchitecture(architecture)) return error.InvalidArchitecture;
     }
     for (manifest.sources) |record| {
-        if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
+        if (!validLogicalPath(record.logical_path) or
+            !repository_refresh.validExpiryPolicy(record.freshness))
+            return error.InvalidPath;
     }
     if (!validLowerHex(&manifest.configuration_id)) return error.InvalidIdentity;
     for (manifest.repository_ids) |id| {
         if (!validLowerHex(&id)) return error.InvalidIdentity;
+    }
+    if (manifest.repository_policies.len == 0) {
+        if (manifest.artifact_version != .v1) return error.InvalidIdentity;
+    } else {
+        if (manifest.repository_policies.len != manifest.repository_ids.len)
+            return error.InvalidIdentity;
+        for (manifest.repository_policies, manifest.repository_ids) |policy, id| {
+            if (!std.mem.eql(u8, &policy.repository_id, &id) or
+                !repository_refresh.validExpiryPolicy(policy.freshness))
+                return error.InvalidIdentity;
+            if (manifest.artifact_version == .v1 and
+                policy.freshness != .require_valid_until)
+                return error.InvalidIdentity;
+        }
+    }
+    if (manifest.artifact_version == .v1) {
+        for (manifest.sources) |record| {
+            if (record.freshness != .require_valid_until)
+                return error.InvalidIdentity;
+        }
     }
     for (manifest.keyrings) |record| {
         if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
@@ -341,6 +384,7 @@ pub const ManifestInput = struct {
     sources: []const SourceRecord,
     configuration_id: [64]u8,
     repository_ids: []const [64]u8,
+    repository_policies: []const RepositoryPolicyRecord = &.{},
     keyrings: []const KeyringRecord,
     global_trust_compatibility: bool,
     exclusions: []const Exclusion,
@@ -390,6 +434,7 @@ pub const ImportError = error{
     NativeArchitectureUnavailable,
     ArchitectureProcessFailed,
     ArchitectureProcessOutputInvalid,
+    InvalidSourcePolicy,
 };
 
 pub const Architecture = struct {
@@ -451,6 +496,7 @@ pub fn snapshot(
     request: Request,
 ) !Snapshot {
     try validateRootAdapter(request);
+    try validateSourcePolicies(request.source_policies, request.limits.max_sources);
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -466,7 +512,21 @@ pub fn snapshot(
     for (source_materials, 0..) |material, index| documents[index] = .{
         .bytes = material.bytes,
         .format = material.format,
+        .policy = .{ .freshness = sourceFreshness(
+            request.source_policies,
+            material.logical_path,
+        ) },
     };
+    for (request.source_policies) |policy| {
+        var found = false;
+        for (source_materials) |material| {
+            if (std.mem.eql(u8, policy.logical_path, material.logical_path)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidSourcePolicy;
+    }
     var repository_limits = request.limits.repository;
     repository_limits.source = request.limits.source;
     const normalized = try repository_policy.normalizeBinaryRefresh(
@@ -603,11 +663,23 @@ pub fn snapshot(
         .logical_path = material.logical_path,
         .sha256 = material.sha256,
         .format = material.format,
+        .freshness = documents[index].policy.freshness,
     };
     const repository_ids = try allocator.alloc([64]u8, configuration.repositories.len);
     defer allocator.free(repository_ids);
     for (configuration.repositories, 0..) |repository, index|
         repository_ids[index] = repository.id.bytes;
+    const repository_policies = try allocator.alloc(
+        RepositoryPolicyRecord,
+        configuration.repositories.len,
+    );
+    defer allocator.free(repository_policies);
+    for (configuration.repositories, 0..) |repository, index| {
+        repository_policies[index] = .{
+            .repository_id = repository.id.bytes,
+            .freshness = repository.freshness,
+        };
+    }
     const keyring_records = try allocator.alloc(KeyringRecord, keyring_materials.items.len);
     defer allocator.free(keyring_records);
     for (keyring_materials.items, 0..) |material, index| keyring_records[index] = .{
@@ -623,6 +695,7 @@ pub fn snapshot(
         .sources = source_records,
         .configuration_id = configuration.identity.bytes,
         .repository_ids = repository_ids,
+        .repository_policies = repository_policies,
         .keyrings = keyring_records,
         .global_trust_compatibility = global_trust,
         .exclusions = exclusions.items,
@@ -701,6 +774,30 @@ fn discoverSources(
     if (materials.items.len > request.limits.max_sources) return error.TooManySources;
     std.mem.sort(SourceMaterial, materials.items, {}, lessSourceMaterial);
     return owned.dupe(SourceMaterial, materials.items);
+}
+
+fn validateSourcePolicies(policies: []const SourcePolicy, maximum: usize) !void {
+    if (policies.len > maximum) return error.InvalidSourcePolicy;
+    for (policies, 0..) |policy, index| {
+        if (!validLogicalPath(policy.logical_path) or
+            !repository_refresh.validExpiryPolicy(policy.freshness))
+            return error.InvalidSourcePolicy;
+        for (policies[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.logical_path, policy.logical_path))
+                return error.InvalidSourcePolicy;
+        }
+    }
+}
+
+fn sourceFreshness(
+    policies: []const SourcePolicy,
+    logical_path: []const u8,
+) repository_refresh.ExpiryPolicy {
+    for (policies) |policy| {
+        if (std.mem.eql(u8, policy.logical_path, logical_path))
+            return policy.freshness;
+    }
+    return .require_valid_until;
 }
 
 fn appendSourceIfPresent(
@@ -1017,6 +1114,24 @@ pub fn createManifest(
     allocator: std.mem.Allocator,
     input: ManifestInput,
 ) (std.mem.Allocator.Error || ValidationError)!OwnedManifest {
+    return createManifestVersion(allocator, input, manifestVersion(input));
+}
+
+fn manifestVersion(input: ManifestInput) ArtifactVersion {
+    for (input.sources) |record| {
+        if (record.freshness != .require_valid_until) return .v2;
+    }
+    for (input.repository_policies) |policy| {
+        if (policy.freshness != .require_valid_until) return .v2;
+    }
+    return .v1;
+}
+
+fn createManifestVersion(
+    allocator: std.mem.Allocator,
+    input: ManifestInput,
+    artifact_version: ArtifactVersion,
+) (std.mem.Allocator.Error || ValidationError)!OwnedManifest {
     if (!validArchitecture(input.native_architecture)) return error.InvalidArchitecture;
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
@@ -1039,7 +1154,11 @@ pub fn createManifest(
 
     const sources = try owned.alloc(SourceRecord, input.sources.len);
     for (input.sources, 0..) |record, index| {
-        if (!validLogicalPath(record.logical_path)) return error.InvalidPath;
+        if (!validLogicalPath(record.logical_path) or
+            !repository_refresh.validExpiryPolicy(record.freshness))
+            return error.InvalidPath;
+        if (artifact_version == .v1 and record.freshness != .require_valid_until)
+            return error.InvalidIdentity;
         sources[index] = record;
         sources[index].logical_path = try owned.dupe(u8, record.logical_path);
     }
@@ -1056,6 +1175,35 @@ pub fn createManifest(
         if (!validLowerHex(&id)) return error.InvalidIdentity;
         if (index != 0 and std.mem.eql(u8, &id, &repository_ids[index - 1]))
             return error.DuplicateRepository;
+    }
+
+    const repository_policies = try owned.alloc(
+        RepositoryPolicyRecord,
+        repository_ids.len,
+    );
+    if (input.repository_policies.len == 0) {
+        for (repository_ids, 0..) |id, index| repository_policies[index] = .{
+            .repository_id = id,
+            .freshness = .require_valid_until,
+        };
+    } else {
+        if (input.repository_policies.len != repository_ids.len)
+            return error.InvalidIdentity;
+        @memcpy(repository_policies, input.repository_policies);
+        std.mem.sort(
+            RepositoryPolicyRecord,
+            repository_policies,
+            {},
+            lessRepositoryPolicy,
+        );
+        for (repository_policies, repository_ids) |policy, id| {
+            if (!std.mem.eql(u8, &policy.repository_id, &id) or
+                !repository_refresh.validExpiryPolicy(policy.freshness))
+                return error.InvalidIdentity;
+            if (artifact_version == .v1 and
+                policy.freshness != .require_valid_until)
+                return error.InvalidIdentity;
+        }
     }
 
     const keyrings = try owned.alloc(KeyringRecord, input.keyrings.len);
@@ -1097,11 +1245,13 @@ pub fn createManifest(
     }
 
     var manifest: Manifest = .{
+        .artifact_version = artifact_version,
         .native_architecture = try owned.dupe(u8, input.native_architecture),
         .foreign_architectures = foreign,
         .sources = sources,
         .configuration_id = input.configuration_id,
         .repository_ids = repository_ids,
+        .repository_policies = repository_policies,
         .keyrings = keyrings,
         .global_trust_compatibility = input.global_trust_compatibility,
         .exclusions = exclusions,
@@ -1111,10 +1261,37 @@ pub fn createManifest(
     return .{ .manifest = manifest, .arena = arena, .backing_allocator = allocator };
 }
 
-const WireSource = struct {
+const WireHeader = struct {
+    schema: []const u8,
+    version: u32,
+};
+
+const WireSourceV1 = struct {
     logical_path: []const u8,
     sha256: []const u8,
     format: source.Format,
+};
+
+const FreshnessMode = enum {
+    require_valid_until,
+    allow_missing_valid_until_with_max_age_seconds,
+};
+
+const WireFreshness = struct {
+    mode: FreshnessMode,
+    maximum_release_age_seconds: ?u64,
+};
+
+const WireSourceV2 = struct {
+    logical_path: []const u8,
+    sha256: []const u8,
+    format: source.Format,
+    freshness: WireFreshness,
+};
+
+const WireRepositoryPolicy = struct {
+    repository_id: []const u8,
+    freshness: WireFreshness,
 };
 
 const WireKeyring = struct {
@@ -1129,14 +1306,29 @@ const WireExclusion = struct {
     reason: ExclusionReason,
 };
 
-const WireManifest = struct {
+const WireManifestV1 = struct {
     schema: []const u8,
     version: u32,
     native_architecture: []const u8,
     foreign_architectures: []const []const u8,
-    sources: []const WireSource,
+    sources: []const WireSourceV1,
     configuration_id: []const u8,
     repository_ids: []const []const u8,
+    keyrings: []const WireKeyring,
+    global_trust_compatibility: bool,
+    exclusions: []const WireExclusion,
+    digest_sha256: []const u8,
+};
+
+const WireManifestV2 = struct {
+    schema: []const u8,
+    version: u32,
+    native_architecture: []const u8,
+    foreign_architectures: []const []const u8,
+    sources: []const WireSourceV2,
+    configuration_id: []const u8,
+    repository_ids: []const []const u8,
+    repository_policies: []const WireRepositoryPolicy,
     keyrings: []const WireKeyring,
     global_trust_compatibility: bool,
     exclusions: []const WireExclusion,
@@ -1150,34 +1342,99 @@ pub fn decodeManifest(
 ) !OwnedManifest {
     if (bytes.len > maximum_bytes or bytes.len > maximum_document_bytes)
         return error.DocumentTooLarge;
-    var parsed = try std.json.parseFromSlice(WireManifest, allocator, bytes, .{
+    var header = try std.json.parseFromSlice(WireHeader, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer header.deinit();
+    if (std.mem.eql(u8, header.value.schema, schema_id) and
+        header.value.version == schema_version)
+        return decodeManifestV1(allocator, bytes);
+    if (std.mem.eql(u8, header.value.schema, freshness_schema_id) and
+        header.value.version == freshness_schema_version)
+        return decodeManifestV2(allocator, bytes);
+    return error.UnsupportedSchema;
+}
+
+fn decodeManifestV1(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManifest {
+    var parsed = try std.json.parseFromSlice(WireManifestV1, allocator, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
     });
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.schema, schema_id) or
-        parsed.value.version != schema_version)
-        return error.UnsupportedSchema;
-
     const sources = try allocator.alloc(SourceRecord, parsed.value.sources.len);
     defer allocator.free(sources);
     for (parsed.value.sources, 0..) |record, index| sources[index] = .{
         .logical_path = record.logical_path,
         .sha256 = try parseHex(32, record.sha256),
         .format = record.format,
+        .freshness = .require_valid_until,
     };
-    const repository_ids = try allocator.alloc([64]u8, parsed.value.repository_ids.len);
+    return finishDecodedManifest(
+        allocator,
+        bytes,
+        parsed.value,
+        sources,
+        &.{},
+        .v1,
+    );
+}
+
+fn decodeManifestV2(allocator: std.mem.Allocator, bytes: []const u8) !OwnedManifest {
+    var parsed = try std.json.parseFromSlice(WireManifestV2, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = false,
+    });
+    defer parsed.deinit();
+    const sources = try allocator.alloc(SourceRecord, parsed.value.sources.len);
+    defer allocator.free(sources);
+    for (parsed.value.sources, 0..) |record, index| sources[index] = .{
+        .logical_path = record.logical_path,
+        .sha256 = try parseHex(32, record.sha256),
+        .format = record.format,
+        .freshness = try parseFreshness(record.freshness),
+    };
+    const repository_policies = try allocator.alloc(
+        RepositoryPolicyRecord,
+        parsed.value.repository_policies.len,
+    );
+    defer allocator.free(repository_policies);
+    for (parsed.value.repository_policies, 0..) |policy, index| {
+        repository_policies[index] = .{
+            .repository_id = try parseId(policy.repository_id),
+            .freshness = try parseFreshness(policy.freshness),
+        };
+    }
+    return finishDecodedManifest(
+        allocator,
+        bytes,
+        parsed.value,
+        sources,
+        repository_policies,
+        .v2,
+    );
+}
+
+fn finishDecodedManifest(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    parsed: anytype,
+    sources: []const SourceRecord,
+    repository_policies: []const RepositoryPolicyRecord,
+    artifact_version: ArtifactVersion,
+) !OwnedManifest {
+    const repository_ids = try allocator.alloc([64]u8, parsed.repository_ids.len);
     defer allocator.free(repository_ids);
-    for (parsed.value.repository_ids, 0..) |id, index|
+    for (parsed.repository_ids, 0..) |id, index|
         repository_ids[index] = try parseId(id);
-    const keyrings = try allocator.alloc(KeyringRecord, parsed.value.keyrings.len);
+    const keyrings = try allocator.alloc(KeyringRecord, parsed.keyrings.len);
     var keyrings_initialized: usize = 0;
     defer {
         for (keyrings[0..keyrings_initialized]) |record|
             allocator.free(record.primary_fingerprints);
         allocator.free(keyrings);
     }
-    for (parsed.value.keyrings, 0..) |record, index| {
+    for (parsed.keyrings, 0..) |record, index| {
         const fingerprints = try allocator.alloc([20]u8, record.primary_fingerprints.len);
         errdefer allocator.free(fingerprints);
         for (record.primary_fingerprints, 0..) |fingerprint, fingerprint_index|
@@ -1190,31 +1447,48 @@ pub fn decodeManifest(
         };
         keyrings_initialized += 1;
     }
-    const exclusions = try allocator.alloc(Exclusion, parsed.value.exclusions.len);
+    const exclusions = try allocator.alloc(Exclusion, parsed.exclusions.len);
     defer allocator.free(exclusions);
-    for (parsed.value.exclusions, 0..) |exclusion, index| exclusions[index] = .{
+    for (parsed.exclusions, 0..) |exclusion, index| exclusions[index] = .{
         .logical_path = exclusion.logical_path,
         .reason = exclusion.reason,
     };
 
-    var result = try createManifest(allocator, .{
-        .native_architecture = parsed.value.native_architecture,
-        .foreign_architectures = parsed.value.foreign_architectures,
+    var result = try createManifestVersion(allocator, .{
+        .native_architecture = parsed.native_architecture,
+        .foreign_architectures = parsed.foreign_architectures,
         .sources = sources,
-        .configuration_id = try parseId(parsed.value.configuration_id),
+        .configuration_id = try parseId(parsed.configuration_id),
         .repository_ids = repository_ids,
+        .repository_policies = repository_policies,
         .keyrings = keyrings,
-        .global_trust_compatibility = parsed.value.global_trust_compatibility,
+        .global_trust_compatibility = parsed.global_trust_compatibility,
         .exclusions = exclusions,
-    });
+    }, artifact_version);
     errdefer result.deinit();
-    const expected = try parseHex(32, parsed.value.digest_sha256);
+    const expected = try parseHex(32, parsed.digest_sha256);
     if (!std.mem.eql(u8, &expected, &result.manifest.digest_sha256))
         return error.DigestMismatch;
     const canonical = try result.manifest.canonicalJson(allocator);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, bytes)) return error.NonCanonicalDocument;
     return result;
+}
+
+fn parseFreshness(wire: WireFreshness) ValidationError!repository_refresh.ExpiryPolicy {
+    const policy: repository_refresh.ExpiryPolicy = switch (wire.mode) {
+        .require_valid_until => blk: {
+            if (wire.maximum_release_age_seconds != null)
+                return error.InvalidIdentity;
+            break :blk .require_valid_until;
+        },
+        .allow_missing_valid_until_with_max_age_seconds => .{
+            .allow_missing_valid_until_with_max_age_seconds = wire.maximum_release_age_seconds orelse return error.InvalidIdentity,
+        },
+    };
+    if (!repository_refresh.validExpiryPolicy(policy))
+        return error.InvalidIdentity;
+    return policy;
 }
 
 pub const Store = struct {
@@ -1546,8 +1820,14 @@ fn writeDocument(manifest: Manifest, writer: *std.Io.Writer) !void {
 
 fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
-    try writeJsonString(writer, schema_id);
-    try writer.print(",\"version\":{},\"native_architecture\":", .{schema_version});
+    try writeJsonString(writer, switch (manifest.artifact_version) {
+        .v1 => schema_id,
+        .v2 => freshness_schema_id,
+    });
+    try writer.print(",\"version\":{},\"native_architecture\":", .{switch (manifest.artifact_version) {
+        .v1 => schema_version,
+        .v2 => freshness_schema_version,
+    }});
     try writeJsonString(writer, manifest.native_architecture);
     try writer.writeAll(",\"foreign_architectures\":[");
     for (manifest.foreign_architectures, 0..) |architecture, index| {
@@ -1563,6 +1843,10 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
         try writeHexString(writer, &record.sha256);
         try writer.writeAll(",\"format\":");
         try writeJsonString(writer, @tagName(record.format));
+        if (manifest.artifact_version == .v2) {
+            try writer.writeAll(",\"freshness\":");
+            try writeFreshness(writer, record.freshness);
+        }
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"configuration_id\":");
@@ -1571,6 +1855,17 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
     for (manifest.repository_ids, 0..) |id, index| {
         if (index != 0) try writer.writeByte(',');
         try writeJsonString(writer, &id);
+    }
+    if (manifest.artifact_version == .v2) {
+        try writer.writeAll("],\"repository_policies\":[");
+        for (manifest.repository_policies, 0..) |policy, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"repository_id\":");
+            try writeJsonString(writer, &policy.repository_id);
+            try writer.writeAll(",\"freshness\":");
+            try writeFreshness(writer, policy.freshness);
+            try writer.writeByte('}');
+        }
     }
     try writer.writeAll("],\"keyrings\":[");
     for (manifest.keyrings, 0..) |record, index| {
@@ -1601,6 +1896,20 @@ fn writePayload(manifest: Manifest, writer: *std.Io.Writer) !void {
         try writer.writeByte('}');
     }
     try writer.writeAll("]}");
+}
+
+fn writeFreshness(
+    writer: *std.Io.Writer,
+    freshness: repository_refresh.ExpiryPolicy,
+) !void {
+    try writer.writeAll("{\"mode\":");
+    try writeJsonString(writer, @tagName(freshness));
+    try writer.writeAll(",\"maximum_release_age_seconds\":");
+    if (repository_refresh.expiryPolicyMaxAge(freshness)) |seconds|
+        try writer.print("{d}", .{seconds})
+    else
+        try writer.writeAll("null");
+    try writer.writeByte('}');
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
@@ -1720,6 +2029,14 @@ fn lessSourceMaterial(_: void, left: SourceMaterial, right: SourceMaterial) bool
 
 fn lessSourceRecord(_: void, left: SourceRecord, right: SourceRecord) bool {
     return std.mem.order(u8, left.logical_path, right.logical_path) == .lt;
+}
+
+fn lessRepositoryPolicy(
+    _: void,
+    left: RepositoryPolicyRecord,
+    right: RepositoryPolicyRecord,
+) bool {
+    return std.mem.order(u8, &left.repository_id, &right.repository_id) == .lt;
 }
 
 fn lessKeyCandidate(_: void, left: KeyCandidate, right: KeyCandidate) bool {
@@ -1969,11 +2286,96 @@ test "target_apt_config retains source-only evidence but excludes it from binary
         "https://binary.invalid",
         imported.configuration.repositories[0].uri,
     );
+    try std.testing.expectEqual(ArtifactVersion.v1, imported.manifest.manifest.artifact_version);
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        .require_valid_until,
+        imported.configuration.repositories[0].freshness,
+    ));
     try std.testing.expectEqual(@as(usize, 1), imported.keyring_materials.len);
     try std.testing.expectEqualStrings(
         "/keyrings/binary.gpg",
         imported.keyring_materials[0].logical_path,
     );
+}
+
+test "target_apt_config explicit source freshness is identity and manifest evidence" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt");
+    try directory.dir.createDirPath(std.testing.io, "root/usr/share/keyrings");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list",
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg] " ++
+            "https://packages.example stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/keyrings/vendor.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    const bounded: repository_refresh.ExpiryPolicy = .{
+        .allow_missing_valid_until_with_max_age_seconds = 7 * 24 * 60 * 60,
+    };
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .source_policies = &.{.{
+            .logical_path = "/etc/apt/sources.list",
+            .freshness = bounded,
+        }},
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer imported.deinit();
+    try std.testing.expectEqual(ArtifactVersion.v2, imported.manifest.manifest.artifact_version);
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        bounded,
+        imported.configuration.repositories[0].freshness,
+    ));
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        bounded,
+        imported.manifest.manifest.sources[0].freshness,
+    ));
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        bounded,
+        imported.manifest.manifest.repository_policies[0].freshness,
+    ));
+    const canonical = try imported.manifest.manifest.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        canonical,
+        "allow_missing_valid_until_with_max_age_seconds",
+    ) != null);
+
+    try std.testing.expectError(error.InvalidSourcePolicy, snapshot(
+        std.testing.allocator,
+        .{
+            .root_path = root_path,
+            .architecture_override = "amd64",
+            .source_policies = &.{.{
+                .logical_path = "/etc/apt/missing.list",
+                .freshness = bounded,
+            }},
+            .dependencies = .{ .filesystem = files.interface() },
+        },
+    ));
+    try std.testing.expectError(error.InvalidSourcePolicy, snapshot(
+        std.testing.allocator,
+        .{
+            .root_path = root_path,
+            .architecture_override = "amd64",
+            .source_policies = &.{.{
+                .logical_path = "/etc/apt/sources.list",
+                .freshness = .{
+                    .allow_missing_valid_until_with_max_age_seconds = 0,
+                },
+            }},
+            .dependencies = .{ .filesystem = files.interface() },
+        },
+    ));
 }
 
 test "target_apt_config enforces aggregate source material bounds" {
@@ -2840,6 +3242,9 @@ test "target_apt_config manifest canonical round trip detects tampering and stor
             .logical_path = "/etc/apt/sources.list.d/z.sources",
             .sha256 = @splat(2),
             .format = .deb822,
+            .freshness = .{
+                .allow_missing_valid_until_with_max_age_seconds = 86_400,
+            },
         },
         .{
             .logical_path = "/etc/apt/sources.list",
@@ -2854,6 +3259,18 @@ test "target_apt_config manifest canonical round trip detects tampering and stor
         .use = .declared,
     }};
     const repositories = [_][64]u8{ @splat('b'), @splat('a') };
+    const repository_policies = [_]RepositoryPolicyRecord{
+        .{
+            .repository_id = @splat('b'),
+            .freshness = .{
+                .allow_missing_valid_until_with_max_age_seconds = 86_400,
+            },
+        },
+        .{
+            .repository_id = @splat('a'),
+            .freshness = .require_valid_until,
+        },
+    };
     const exclusions = [_]Exclusion{.{
         .logical_path = "/etc/apt/sources.list.d/README",
         .reason = .unsupported_name,
@@ -2864,6 +3281,7 @@ test "target_apt_config manifest canonical round trip detects tampering and stor
         .sources = &sources,
         .configuration_id = @splat('c'),
         .repository_ids = &repositories,
+        .repository_policies = &repository_policies,
         .keyrings = &keyrings,
         .global_trust_compatibility = false,
         .exclusions = &exclusions,
@@ -2886,6 +3304,15 @@ test "target_apt_config manifest canonical round trip detects tampering and stor
         "/etc/apt/sources.list",
         decoded.manifest.sources[0].logical_path,
     );
+    try std.testing.expectEqual(ArtifactVersion.v2, decoded.manifest.artifact_version);
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        .{ .allow_missing_valid_until_with_max_age_seconds = 86_400 },
+        decoded.manifest.sources[1].freshness,
+    ));
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        .require_valid_until,
+        decoded.manifest.repository_policies[0].freshness,
+    ));
 
     var tampered = try std.testing.allocator.dupe(u8, canonical);
     defer std.testing.allocator.free(tampered);
@@ -2906,6 +3333,143 @@ test "target_apt_config manifest canonical round trip detects tampering and stor
         &created.manifest.digest_sha256,
         &stored.manifest.digest_sha256,
     );
+}
+
+test "target_apt_config legacy v1 artifacts remain strict and canonical" {
+    const sources = [_]SourceRecord{.{
+        .logical_path = "/etc/apt/sources.list",
+        .sha256 = @splat(1),
+        .format = .legacy,
+    }};
+    const repositories = [_][64]u8{@splat('a')};
+    var legacy = try createManifestVersion(std.testing.allocator, .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &sources,
+        .configuration_id = @splat('b'),
+        .repository_ids = &repositories,
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+    }, .v1);
+    defer legacy.deinit();
+    const canonical = try legacy.manifest.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "freshness") == null);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, schema_id) != null);
+
+    var decoded = try decodeManifest(
+        std.testing.allocator,
+        canonical,
+        maximum_document_bytes,
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqual(ArtifactVersion.v1, decoded.manifest.artifact_version);
+    try std.testing.expectEqual(@as(usize, 1), decoded.manifest.repository_policies.len);
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        .require_valid_until,
+        decoded.manifest.sources[0].freshness,
+    ));
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        .require_valid_until,
+        decoded.manifest.repository_policies[0].freshness,
+    ));
+    const round_trip = try decoded.manifest.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(round_trip);
+    try std.testing.expectEqualStrings(canonical, round_trip);
+}
+
+test "target_apt_config v2 decoder rejects malformed policy documents within bounds" {
+    const allocator = std.testing.allocator;
+    const sources = [_]SourceRecord{.{
+        .logical_path = "/etc/apt/sources.list",
+        .sha256 = @splat(1),
+        .format = .legacy,
+        .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = 86_400,
+        },
+    }};
+    const repositories = [_][64]u8{@splat('a')};
+    const repository_policies = [_]RepositoryPolicyRecord{.{
+        .repository_id = @splat('a'),
+        .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = 86_400,
+        },
+    }};
+    var created = try createManifest(allocator, .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &sources,
+        .configuration_id = @splat('b'),
+        .repository_ids = &repositories,
+        .repository_policies = &repository_policies,
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+    });
+    defer created.deinit();
+    const canonical = try created.manifest.canonicalJson(allocator);
+    defer allocator.free(canonical);
+
+    try std.testing.expectError(
+        error.DocumentTooLarge,
+        decodeManifest(allocator, canonical, canonical.len - 1),
+    );
+    const missing =
+        "{\"schema\":\"https://debz.dev/schema/apt-config-snapshot-v2\",\"version\":2}";
+    if (decodeManifest(allocator, missing, maximum_document_bytes)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    const unknown = try std.mem.concat(allocator, u8, &.{
+        "{\"unknown\":0,",
+        canonical[1..],
+    });
+    defer allocator.free(unknown);
+    if (decodeManifest(allocator, unknown, maximum_document_bytes)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    const duplicate = try std.mem.concat(allocator, u8, &.{
+        "{\"schema\":\"https://debz.dev/schema/apt-config-snapshot-v2\",",
+        canonical[1..],
+    });
+    defer allocator.free(duplicate);
+    if (decodeManifest(allocator, duplicate, maximum_document_bytes)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    const valid_policy =
+        "\"mode\":\"allow_missing_valid_until_with_max_age_seconds\"," ++
+        "\"maximum_release_age_seconds\":86400";
+    const policy_offset = std.mem.indexOf(u8, canonical, valid_policy) orelse
+        return error.MissingPolicyFixture;
+    const invalid_policies = [_][]const u8{
+        "\"mode\":\"require_valid_until\",\"maximum_release_age_seconds\":86400",
+        "\"mode\":\"allow_missing_valid_until_with_max_age_seconds\"," ++
+            "\"maximum_release_age_seconds\":null",
+        "\"mode\":\"allow_missing_valid_until_with_max_age_seconds\"," ++
+            "\"maximum_release_age_seconds\":2678401",
+    };
+    for (invalid_policies) |invalid_policy| {
+        const malformed = try std.mem.concat(allocator, u8, &.{
+            canonical[0..policy_offset],
+            invalid_policy,
+            canonical[policy_offset + valid_policy.len ..],
+        });
+        defer allocator.free(malformed);
+        if (decodeManifest(allocator, malformed, maximum_document_bytes)) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDecodeFailure;
+        } else |_| {}
+    }
 }
 
 test "target_apt_config logical path grammar is UTF-8 and traversal safe" {

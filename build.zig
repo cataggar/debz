@@ -970,6 +970,7 @@ fn installReleaseFiles(
     };
     const schemas = [_][]const u8{
         "apt-config-snapshot-v1.json",
+        "apt-config-snapshot-v2.json",
         "apt-system-cli-diagnostic-v1.json",
         "apt-system-execution-completion-v1.json",
         "apt-system-operation-state-v1.json",
