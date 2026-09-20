@@ -149,10 +149,26 @@ or ambient installation namespaces, malformed text, and every count, path,
 integer, or byte-limit overflow. The capture records no file contents,
 hostname, timestamp, environment, or absolute workspace path.
 
-The uploaded JSON is review evidence from a particular amd64 or arm64 run, not
-a repository-pinned support manifest. No current pinned vendor manifests are
-claimed; future reviewed runs may pin exact artifact digests separately.
-Native production feature guards for config scripts, alternatives, and
-unclassified vendor metadata remain unchanged. The lane is manual because of
-bandwidth, but release acceptance requires dispatching it successfully; it
-does not replace deterministic PR CI.
+The reviewed amd64 and arm64 captures from workflow run
+[`35500920816`](https://github.com/cataggar/debz/actions/runs/35500920816) at
+commit `193887f0e45dc35a25768f8e58daa98318daddc9` are pinned under
+`tools/fixtures/vendor-state/`. `index-v1.json` binds the immutable snapshot,
+workflow run and jobs, source commit, downloaded artifact sizes and SHA-256
+digests, manifest sizes and SHA-256 digests, capture schema version, and
+inventory totals. Tests revalidate the manifests against the schema and
+capture classifier, require canonical ordering and bounded totals, inspect
+every recorded path, and reject credential patterns or ambient host
+namespaces.
+
+Each pinned architecture has 829 control members, 14 alternatives database
+records, 189 requested linked paths, and 190 linked entries. The control
+inventory includes seven `*.config` members and no `*.alternatives` or
+unclassified members. Both architectures have the same classification counts,
+alternatives records, requested paths, and linked-path topology; their
+architecture-qualified control paths pair exactly, while expected package
+metadata and ten linked executable hashes differ. These references document
+observed vendor state but do not expand native production support: feature
+guards for config scripts, alternatives, and unclassified vendor metadata
+remain unchanged. The lane is manual because of bandwidth, but release
+acceptance requires dispatching it successfully; it does not replace
+deterministic PR CI.

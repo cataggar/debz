@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,8 @@ import jsonschema
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/capture-vendor-state.py"
+REFERENCE_DIRECTORY = ROOT / "tools/fixtures/vendor-state"
+REFERENCE_INDEX = REFERENCE_DIRECTORY / "index-v1.json"
 SPEC = importlib.util.spec_from_file_location("vendor_state_capture", TOOL)
 assert SPEC and SPEC.loader
 vendor_state_capture = importlib.util.module_from_spec(SPEC)
@@ -184,6 +187,312 @@ class VendorStateCaptureTests(unittest.TestCase):
                     self.fixture_root(f"bad-architecture-{len(str(architecture))}"),
                     architecture,  # type: ignore[arg-type]
                 )
+
+    def test_pinned_vendor_state_references_are_canonical_bounded_and_private(
+        self,
+    ) -> None:
+        index = json.loads(REFERENCE_INDEX.read_text())
+        self.assertEqual(index["index_version"], 1)
+        self.assertEqual(
+            index["capture_schema"],
+            {"id": vendor_state_capture.SCHEMA, "version": 1},
+        )
+        self.assertEqual(
+            index["source"],
+            {
+                "commit": "193887f0e45dc35a25768f8e58daa98318daddc9",
+                "repository": "cataggar/debz",
+                "snapshot_suite": "resolute",
+                "snapshot_uri": (
+                    "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z"
+                ),
+                "workflow": "CI",
+                "workflow_path": ".github/workflows/ci.yml",
+                "workflow_run_attempt": 1,
+                "workflow_run_id": 35500920816,
+                "workflow_run_url": (
+                    "https://github.com/cataggar/debz/actions/runs/35500920816"
+                ),
+            },
+        )
+        schema = json.loads(
+            (ROOT / "schema/vendor-state-inventory-v1.json").read_text()
+        )
+        validator = jsonschema.Draft202012Validator(schema)
+        digest = re.compile(r"^[0-9a-f]{64}$")
+        credential_patterns = (
+            re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+            re.compile(b"-----BEGIN PGP " + b"PRIVATE KEY BLOCK-----"),
+            re.compile(
+                rb"(?i)authorization\s*:\s*bearer\s+"
+                rb"[A-Za-z0-9._~+/=-]{12,}"
+            ),
+            re.compile(rb"AKIA[0-9A-Z]{16}"),
+            re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}"),
+        )
+        ambient_needles = (
+            b"/home/",
+            b"/root/",
+            b"/run/",
+            b"/tmp/",
+            b"/var/tmp/",
+            b"/var/log/",
+            b"/var/lib/cloud/",
+            b"/var/lib/private/",
+            b"/d/",
+            b"GITHUB_",
+            b"RUNNER_",
+            b"runner-host",
+            b"workspace",
+            b"etc/apt/auth.conf",
+            b"etc/gshadow",
+            b"etc/hostname",
+            b"etc/hosts",
+            b"etc/machine-id",
+            b"etc/resolv.conf",
+            b"etc/shadow",
+            b"etc/ssh/",
+            b"etc/ssl/private/",
+        )
+        manifests: dict[str, dict] = {}
+        self.assertEqual(
+            [item["architecture"] for item in index["manifests"]],
+            ["amd64", "arm64"],
+        )
+        for reference in index["manifests"]:
+            architecture = reference["architecture"]
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    reference["artifact_name"],
+                    f"ubuntu-real-snapshot-{architecture}",
+                )
+                self.assertEqual(
+                    reference["artifact_member"],
+                    "vendor-state-inventory-v1.json",
+                )
+                self.assertGreater(reference["artifact_id"], 0)
+                self.assertGreater(reference["job_id"], 0)
+                self.assertGreater(reference["artifact_size_bytes"], 0)
+                self.assertLessEqual(
+                    reference["artifact_size_bytes"], 1024 * 1024
+                )
+                self.assertRegex(reference["artifact_sha256"], digest)
+                manifest_name = pathlib.PurePosixPath(
+                    reference["manifest_path"]
+                )
+                self.assertEqual(len(manifest_name.parts), 1)
+                raw = (REFERENCE_DIRECTORY / manifest_name).read_bytes()
+                self.assertEqual(len(raw), reference["manifest_size_bytes"])
+                self.assertLessEqual(len(raw), 1024 * 1024)
+                self.assertEqual(
+                    hashlib.sha256(raw).hexdigest(),
+                    reference["manifest_sha256"],
+                )
+                self.assertFalse(
+                    any(pattern.search(raw) for pattern in credential_patterns)
+                )
+                self.assertFalse(
+                    any(needle in raw for needle in ambient_needles)
+                )
+                document = json.loads(raw)
+                manifests[architecture] = document
+                validator.validate(document)
+                self.assertEqual(document["schema"], vendor_state_capture.SCHEMA)
+                self.assertEqual(document["version"], 1)
+                self.assertEqual(document["architecture"], architecture)
+                self.assertEqual(
+                    raw, vendor_state_capture.canonical_json(document)
+                )
+
+                limits = document["limits"]
+                controls = document["control_members"]["entries"]
+                alternatives = document["alternatives_database"]
+                requested = document["linked_filesystem"]["requested_paths"]
+                linked = document["linked_filesystem"]["entries"]
+
+                def assert_sorted_unique(values: list[str]) -> None:
+                    self.assertEqual(
+                        values,
+                        sorted(values, key=lambda value: value.encode("utf-8")),
+                    )
+                    self.assertEqual(len(values), len(set(values)))
+
+                assert_sorted_unique([item["path"] for item in controls])
+                assert_sorted_unique([item["path"] for item in alternatives])
+                assert_sorted_unique(requested)
+                assert_sorted_unique([item["path"] for item in linked])
+
+                counts = {
+                    classification: 0
+                    for classification in vendor_state_capture.CLASSIFICATIONS
+                }
+                control_bytes = 0
+                category_paths = {
+                    classification: []
+                    for classification in vendor_state_capture.CLASSIFICATIONS
+                }
+                for item in controls:
+                    path = item["path"]
+                    self.assertTrue(path.startswith("var/lib/dpkg/info/"))
+                    classification = vendor_state_capture._classification(
+                        pathlib.PurePosixPath(path).name
+                    )
+                    self.assertEqual(item["classification"], classification)
+                    counts[classification] += 1
+                    category_paths[classification].append(path)
+                    self.assertLessEqual(
+                        item["size"], limits["max_metadata_file_bytes"]
+                    )
+                    self.assertRegex(item["sha256"], digest)
+                    assert_sorted_unique(item["referenced_paths"])
+                    control_bytes += item["size"]
+                self.assertEqual(
+                    counts,
+                    document["control_members"]["classification_counts"],
+                )
+                self.assertLessEqual(
+                    len(controls), limits["max_control_members"]
+                )
+                self.assertEqual(
+                    [
+                        pathlib.PurePosixPath(path).name
+                        for path in category_paths["debconf-config"]
+                    ],
+                    [
+                        "chrony.config",
+                        "console-setup.config",
+                        "debconf.config",
+                        "iproute2.config",
+                        "keyboard-configuration.config",
+                        "locales.config",
+                        "tzdata.config",
+                    ],
+                )
+                self.assertEqual(category_paths["package-alternatives"], [])
+                self.assertEqual(category_paths["unclassified"], [])
+
+                alternatives_bytes = 0
+                for item in alternatives:
+                    self.assertTrue(
+                        item["path"].startswith(
+                            "var/lib/dpkg/alternatives/"
+                        )
+                    )
+                    self.assertLessEqual(
+                        item["size"], limits["max_metadata_file_bytes"]
+                    )
+                    self.assertRegex(item["sha256"], digest)
+                    assert_sorted_unique(item["referenced_paths"])
+                    alternatives_bytes += item["size"]
+                self.assertLessEqual(
+                    len(alternatives), limits["max_alternatives_records"]
+                )
+                self.assertLessEqual(
+                    control_bytes + alternatives_bytes,
+                    limits["max_total_metadata_bytes"],
+                )
+                self.assertLessEqual(
+                    len(requested), limits["max_referenced_paths"]
+                )
+
+                linked_bytes = 0
+                linked_kinds: dict[str, int] = {}
+                for path in requested:
+                    self.assertFalse(path.startswith("/"))
+                    self.assertLessEqual(
+                        len(path.encode("utf-8")),
+                        vendor_state_capture.MAX_DOCUMENT_PATH_BYTES,
+                    )
+                    self.assertFalse(
+                        any(
+                            path == denied
+                            or path.startswith(denied + "/")
+                            for denied in vendor_state_capture.SENSITIVE_PATHS
+                        )
+                    )
+                for item in linked:
+                    path = item["path"]
+                    self.assertFalse(path.startswith("/"))
+                    self.assertFalse(
+                        any(
+                            path == denied
+                            or path.startswith(denied + "/")
+                            for denied in vendor_state_capture.SENSITIVE_PATHS
+                        )
+                    )
+                    linked_kinds[item["kind"]] = (
+                        linked_kinds.get(item["kind"], 0) + 1
+                    )
+                    if item["kind"] == "regular":
+                        self.assertLessEqual(
+                            item["size"], limits["max_linked_file_bytes"]
+                        )
+                        self.assertRegex(item["sha256"], digest)
+                        linked_bytes += item["size"]
+                    elif item["kind"] == "symlink":
+                        self.assertLessEqual(
+                            len(item["target"].encode("utf-8")),
+                            limits["max_link_target_bytes"],
+                        )
+                self.assertLessEqual(
+                    len(linked), limits["max_linked_entries"]
+                )
+                self.assertLessEqual(
+                    linked_bytes, limits["max_total_linked_bytes"]
+                )
+                self.assertEqual(
+                    reference["inventory"],
+                    {
+                        "alternatives_record_bytes": alternatives_bytes,
+                        "alternatives_record_count": len(alternatives),
+                        "classification_counts": counts,
+                        "control_member_bytes": control_bytes,
+                        "control_member_count": len(controls),
+                        "linked_entry_count": len(linked),
+                        "linked_entry_kind_counts": linked_kinds,
+                        "linked_regular_bytes": linked_bytes,
+                        "requested_path_count": len(requested),
+                    },
+                )
+
+        amd64 = manifests["amd64"]
+        arm64 = manifests["arm64"]
+        self.assertEqual(
+            amd64["alternatives_database"],
+            arm64["alternatives_database"],
+        )
+        self.assertEqual(
+            amd64["linked_filesystem"]["requested_paths"],
+            arm64["linked_filesystem"]["requested_paths"],
+        )
+        self.assertEqual(
+            {
+                item["path"]
+                for item in amd64["linked_filesystem"]["entries"]
+            },
+            {
+                item["path"]
+                for item in arm64["linked_filesystem"]["entries"]
+            },
+        )
+        amd64_controls = {
+            item["path"]
+            for item in amd64["control_members"]["entries"]
+        }
+        arm64_controls = {
+            item["path"]
+            for item in arm64["control_members"]["entries"]
+        }
+
+        def normalize(path: str) -> str:
+            return path.replace(":amd64", ":ARCH").replace(
+                ":arm64", ":ARCH"
+            )
+
+        self.assertEqual(
+            {normalize(path) for path in amd64_controls - arm64_controls},
+            {normalize(path) for path in arm64_controls - amd64_controls},
+        )
 
     def test_bounds_fail_closed(self) -> None:
         root = self.fixture_root("bounds")
