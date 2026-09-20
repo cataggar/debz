@@ -29,6 +29,8 @@
     },
     "control_members": {
       "type": "array",
+      "minItems": 829,
+      "maxItems": 829,
       "uniqueItems": true,
       "items": {
         "$ref": "#/$defs/controlMember"
@@ -42,6 +44,8 @@
     },
     "reference_execution_requirements": {
       "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
       "uniqueItems": true,
       "items": {
         "$ref": "#/$defs/referenceExecutionRequirement"
@@ -270,11 +274,15 @@
         },
         "name": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^/\\u0000-\\u001f\\u007f]+$"
         },
         "member": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^/\\u0000-\\u001f\\u007f]+$"
         },
         "size": {
           "$ref": "#/$defs/positiveInteger"
@@ -307,6 +315,7 @@
         "path": {
           "type": "string",
           "minLength": 1,
+          "maxLength": 4096,
           "pattern": "^[^/]+$"
         },
         "size": {
@@ -341,19 +350,27 @@
         },
         "repository": {
           "type": "string",
-          "minLength": 1
+          "minLength": 3,
+          "maxLength": 4096,
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
         },
         "snapshot_suite": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^/\\u0000-\\u001f\\u007f]+$"
         },
         "snapshot_uri": {
           "type": "string",
-          "format": "uri"
+          "maxLength": 4096,
+          "format": "uri",
+          "pattern": "^https://[^?#]+$"
         },
         "workflow": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
         },
         "workflow_path": {
           "$ref": "#/$defs/relativePath"
@@ -366,7 +383,57 @@
         },
         "workflow_run_url": {
           "type": "string",
-          "format": "uri"
+          "maxLength": 4096,
+          "format": "uri",
+          "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[1-9][0-9]*$"
+        }
+      }
+    },
+    "captureLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_control_members",
+        "max_alternatives_records",
+        "max_metadata_file_bytes",
+        "max_total_metadata_bytes",
+        "max_referenced_paths",
+        "max_linked_entries",
+        "max_link_hops",
+        "max_link_target_bytes",
+        "max_linked_file_bytes",
+        "max_total_linked_bytes"
+      ],
+      "properties": {
+        "max_control_members": {
+          "const": 100000
+        },
+        "max_alternatives_records": {
+          "const": 20000
+        },
+        "max_metadata_file_bytes": {
+          "const": 8388608
+        },
+        "max_total_metadata_bytes": {
+          "const": 268435456
+        },
+        "max_referenced_paths": {
+          "const": 50000
+        },
+        "max_linked_entries": {
+          "const": 100000
+        },
+        "max_link_hops": {
+          "const": 64
+        },
+        "max_link_target_bytes": {
+          "const": 4096
+        },
+        "max_linked_file_bytes": {
+          "const": 268435456
+        },
+        "max_total_linked_bytes": {
+          "const": 1073741824
         }
       }
     },
@@ -375,6 +442,7 @@
       "additionalProperties": false,
       "required": [
         "capture_schema",
+        "capture_limits",
         "index",
         "index_source",
         "manifests"
@@ -395,6 +463,9 @@
               "const": 1
             }
           }
+        },
+        "capture_limits": {
+          "$ref": "#/$defs/captureLimits"
         },
         "index": {
           "type": "object",
@@ -489,16 +560,16 @@
           }
         },
         "paired_control_member_count": {
-          "$ref": "#/$defs/count"
+          "const": 829
         },
         "alternatives_group_count": {
-          "$ref": "#/$defs/count"
+          "const": 14
         },
         "requested_path_count": {
-          "$ref": "#/$defs/count"
+          "const": 189
         },
         "linked_entry_count": {
-          "$ref": "#/$defs/count"
+          "const": 190
         }
       }
     },
@@ -1019,6 +1090,8 @@
       "properties": {
         "groups": {
           "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/alternativeGroup"
@@ -1026,6 +1099,8 @@
         },
         "requested_paths": {
           "type": "array",
+          "minItems": 189,
+          "maxItems": 189,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/requestedPath"
@@ -1033,6 +1108,8 @@
         },
         "linked_entries": {
           "type": "array",
+          "minItems": 190,
+          "maxItems": 190,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/linkedEntry"
@@ -1040,6 +1117,8 @@
         },
         "retained_selector_metadata": {
           "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/retainedSelectorMetadata"
@@ -1074,9 +1153,7 @@
       "required": [
         "identity",
         "classification",
-        "changed_fields",
-        "amd64",
-        "arm64"
+        "changed_fields"
       ],
       "properties": {
         "identity": {
@@ -1087,21 +1164,19 @@
           "$ref": "#/$defs/classification"
         },
         "changed_fields": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "size",
-              "sha256"
-            ]
-          }
-        },
-        "amd64": {
-          "$ref": "#/$defs/controlFact"
-        },
-        "arm64": {
-          "$ref": "#/$defs/controlFact"
+          "oneOf": [
+            {
+              "const": [
+                "sha256"
+              ]
+            },
+            {
+              "const": [
+                "size",
+                "sha256"
+              ]
+            }
+          ]
         }
       }
     },
@@ -1111,9 +1186,7 @@
       "required": [
         "identity",
         "kind",
-        "changed_fields",
-        "amd64",
-        "arm64"
+        "changed_fields"
       ],
       "properties": {
         "identity": {
@@ -1123,22 +1196,10 @@
           "const": "regular"
         },
         "changed_fields": {
-          "type": "array",
-          "minItems": 2,
-          "maxItems": 2,
-          "uniqueItems": true,
-          "items": {
-            "enum": [
-              "size",
-              "sha256"
-            ]
-          }
-        },
-        "amd64": {
-          "$ref": "#/$defs/regularFact"
-        },
-        "arm64": {
-          "$ref": "#/$defs/regularFact"
+          "const": [
+            "size",
+            "sha256"
+          ]
         }
       }
     },
@@ -1155,6 +1216,8 @@
       "properties": {
         "path_qualifications": {
           "type": "array",
+          "minItems": 422,
+          "maxItems": 422,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/pathQualification"
@@ -1162,6 +1225,8 @@
         },
         "control_content": {
           "type": "array",
+          "minItems": 275,
+          "maxItems": 275,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/controlDifference"
@@ -1172,6 +1237,8 @@
         },
         "linked_content": {
           "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/linkedDifference"
@@ -1179,7 +1246,8 @@
         },
         "invariants": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 5,
+          "maxItems": 5,
           "uniqueItems": true,
           "items": {
             "enum": [

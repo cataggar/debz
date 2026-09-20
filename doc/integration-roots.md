@@ -190,9 +190,12 @@ and manifest SHA-256 values
 `9ae81ea204a2cf608860451a41d477068a11ab77e8762e61e53d95bc0a70570b`
 (amd64) and
 `90698d5a1eae643dfc68a0acbb38cca48b98b297453fdc5d1a10509c792fa16c`
-(arm64). Regeneration validates every source digest, canonical ordering,
-count/byte/path bound, classification, requested-path resolution, symlink
-target, and terminal linked identity before emitting canonical JSON.
+(arm64). The canonical reference SHA-256 is
+`73228f959a335956c58d48712c891ccc372082dfc4f78f4405c18a37f98efe08`.
+Regeneration validates every source digest, the fixed capture limits, canonical
+ordering, count/byte/path bound, classification, requested-path resolution,
+symlink target, public-path privacy boundary, and terminal linked identity
+before emitting canonical JSON.
 
 The paired reference accounts for every item in each manifest. Of the 829
 control members, 664 are already-supported typed package-database or lifecycle
@@ -214,6 +217,8 @@ paths and the exact 275 control-content differences: 140 checksums, one
 conffiles member, 28 maintainer scripts, 94 ownership lists, nine retained
 metadata members, and three trigger members. Alternatives records and topology
 are identical. Exactly ten regular linked targets differ in size and SHA-256.
+Difference entries index the authoritative per-architecture facts above rather
+than duplicating them in the generated fixture.
 Remaining oracle work is bounded reference execution for config-script
 invocation/effects and alternatives record decoding plus install, upgrade,
 remove, purge, failure, and recovery mutations. Until that evidence and an

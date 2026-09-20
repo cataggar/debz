@@ -29,7 +29,7 @@ REFERENCE_INDEX_SHA256 = (
     "682bff167a4bc2386ceb78fb554be0adbe6fbfab16f4eab77aff3b63af04dd34"
 )
 REFERENCE_DOCUMENT_SHA256 = (
-    "478b476dc07ccdfae94ab782ef87a9061a2a5bfbd9fafa900803c9fb72802943"
+    "73228f959a335956c58d48712c891ccc372082dfc4f78f4405c18a37f98efe08"
 )
 SPEC = importlib.util.spec_from_file_location("vendor_state_capture", TOOL)
 assert SPEC and SPEC.loader
@@ -1440,6 +1440,23 @@ class VendorStateReferenceTests(unittest.TestCase):
         index_path.write_bytes(vendor_state_reference.canonical_json(index))
         return index_path
 
+    def mutated_source_index(
+        self,
+        name: str,
+        mutate: Callable[[dict], None],
+    ) -> pathlib.Path:
+        directory = self.workspace / name
+        directory.mkdir()
+        index = json.loads(REFERENCE_INDEX.read_text())
+        for reference in index["manifests"]:
+            source = REFERENCE_DIRECTORY / reference["manifest_path"]
+            destination = directory / reference["manifest_path"]
+            destination.write_bytes(source.read_bytes())
+        mutate(index)
+        index_path = directory / "index-v1.json"
+        index_path.write_bytes(vendor_state_reference.canonical_json(index))
+        return index_path
+
     def test_reference_is_deterministic_complete_digest_bound_and_typed(
         self,
     ) -> None:
@@ -1476,7 +1493,9 @@ class VendorStateReferenceTests(unittest.TestCase):
             (ROOT / "schema/vendor-state-reference-v1.json").read_text()
         )
         jsonschema.Draft202012Validator.check_schema(schema)
-        jsonschema.Draft202012Validator(schema).validate(document)
+        jsonschema.Draft202012Validator(
+            schema, format_checker=jsonschema.FormatChecker()
+        ).validate(document)
         self.assertEqual(document["schema"], vendor_state_reference.SCHEMA)
         self.assertEqual(document["version"], 1)
         self.assertEqual(
@@ -1487,10 +1506,21 @@ class VendorStateReferenceTests(unittest.TestCase):
                 "sha256": REFERENCE_INDEX_SHA256,
             },
         )
+        self.assertEqual(
+            document["source"]["capture_limits"],
+            vendor_state_reference.EXPECTED_LIMITS,
+        )
         indexed = {
             item["architecture"]: item
             for item in json.loads(REFERENCE_INDEX.read_text())["manifests"]
         }
+        self.assertEqual(
+            [
+                source["architecture"]
+                for source in document["source"]["manifests"]
+            ],
+            ["amd64", "arm64"],
+        )
         for source in document["source"]["manifests"]:
             architecture = source["architecture"]
             self.assertEqual(
@@ -1498,6 +1528,17 @@ class VendorStateReferenceTests(unittest.TestCase):
             )
             self.assertEqual(
                 source["size"], indexed[architecture]["manifest_size_bytes"]
+            )
+            self.assertEqual(
+                source["artifact"],
+                {
+                    "id": indexed[architecture]["artifact_id"],
+                    "name": indexed[architecture]["artifact_name"],
+                    "member": indexed[architecture]["artifact_member"],
+                    "size": indexed[architecture]["artifact_size_bytes"],
+                    "sha256": indexed[architecture]["artifact_sha256"],
+                    "job_id": indexed[architecture]["job_id"],
+                },
             )
 
         boundary = document["boundary"]
@@ -1602,6 +1643,10 @@ class VendorStateReferenceTests(unittest.TestCase):
         )
         self.assertEqual(len(group_names), len(set(group_names)))
         for group in groups:
+            self.assertEqual(
+                group["record"]["path"],
+                f"var/lib/dpkg/alternatives/{group['name']}",
+            )
             self.assertEqual(group["ownership"]["status"], "not-captured")
             self.assertEqual(
                 group["selection_mode"]["status"],
@@ -1617,6 +1662,24 @@ class VendorStateReferenceTests(unittest.TestCase):
                 if link["relationship"] == "master"
             ]
             self.assertEqual(len(masters), 1)
+            self.assertEqual(
+                [link["link_path"] for link in group["links"]],
+                sorted(
+                    (link["link_path"] for link in group["links"]),
+                    key=lambda value: value.encode("utf-8"),
+                ),
+            )
+            self.assertEqual(
+                [item["path"] for item in group["candidate_paths"]],
+                sorted(
+                    (item["path"] for item in group["candidate_paths"]),
+                    key=lambda value: value.encode("utf-8"),
+                ),
+            )
+            self.assertEqual(
+                len({link["selector_path"] for link in group["links"]}),
+                len(group["links"]),
+            )
             self.assertEqual(
                 masters[0]["selector_path"],
                 f"etc/alternatives/{group['name']}",
@@ -1640,6 +1703,12 @@ class VendorStateReferenceTests(unittest.TestCase):
         requested_names = [item["path"] for item in requested]
         self.assertEqual(len(requested), 189)
         self.assertEqual(len(requested_names), len(set(requested_names)))
+        self.assertEqual(
+            requested_names,
+            sorted(requested_names, key=lambda value: value.encode("utf-8")),
+        )
+        for item in requested:
+            self.assertEqual(item["chain"][-1], item["terminal_path"])
         reached = {
             path for item in requested for path in item["chain"]
         }
@@ -1647,6 +1716,10 @@ class VendorStateReferenceTests(unittest.TestCase):
         linked_names = [item["identity"] for item in linked]
         self.assertEqual(len(linked), 190)
         self.assertEqual(len(linked_names), len(set(linked_names)))
+        self.assertEqual(
+            linked_names,
+            sorted(linked_names, key=lambda value: value.encode("utf-8")),
+        )
         self.assertEqual(reached, set(linked_names))
         for item in linked:
             self.assertTrue(item["roles"])
@@ -1675,6 +1748,17 @@ class VendorStateReferenceTests(unittest.TestCase):
         differences = document["cross_architecture_differences"]
         self.assertEqual(len(differences["path_qualifications"]), 422)
         self.assertEqual(len(differences["control_content"]), 275)
+        for field in ("path_qualifications", "control_content", "linked_content"):
+            difference_identities = [
+                item["identity"] for item in differences[field]
+            ]
+            self.assertEqual(
+                difference_identities,
+                sorted(
+                    difference_identities,
+                    key=lambda value: value.encode("utf-8"),
+                ),
+            )
         self.assertEqual(
             differences["control_content_counts"],
             {
@@ -1706,6 +1790,42 @@ class VendorStateReferenceTests(unittest.TestCase):
                 "usr/sbin/visudo.ws",
             ],
         )
+        controls_by_identity = {
+            item["identity"]: item for item in controls
+        }
+        for difference in differences["control_content"]:
+            self.assertNotIn("amd64", difference)
+            self.assertNotIn("arm64", difference)
+            control = controls_by_identity[difference["identity"]]
+            self.assertEqual(
+                difference["classification"], control["classification"]
+            )
+            self.assertEqual(
+                difference["changed_fields"],
+                [
+                    field
+                    for field in vendor_state_reference.CONTROL_FACT_FIELDS
+                    if control["architectures"]["amd64"][field]
+                    != control["architectures"]["arm64"][field]
+                ],
+            )
+        linked_by_identity = {
+            item["identity"]: item for item in linked
+        }
+        for difference in differences["linked_content"]:
+            self.assertNotIn("amd64", difference)
+            self.assertNotIn("arm64", difference)
+            entry = linked_by_identity[difference["identity"]]
+            self.assertEqual(difference["kind"], entry["kind"])
+            self.assertEqual(
+                difference["changed_fields"],
+                [
+                    field
+                    for field in vendor_state_reference.LINKED_FACT_FIELDS
+                    if entry["architectures"]["amd64"].get(field)
+                    != entry["architectures"]["arm64"].get(field)
+                ],
+            )
         requirements = {
             item["id"]: item
             for item in document["reference_execution_requirements"]
@@ -1758,6 +1878,13 @@ class VendorStateReferenceTests(unittest.TestCase):
     def test_reference_derivation_rejects_malformed_oversized_and_unsafe_state(
         self,
     ) -> None:
+        def add_uncaptured_reference(document: dict) -> None:
+            references = document["alternatives_database"][0][
+                "referenced_paths"
+            ]
+            references[0] = "usr/bin/not-captured"
+            references.sort(key=lambda value: value.encode("utf-8"))
+
         cases = (
             (
                 "malformed",
@@ -1777,6 +1904,15 @@ class VendorStateReferenceTests(unittest.TestCase):
                 "amd64",
             ),
             (
+                "raised-limits",
+                lambda document: document["limits"].__setitem__(
+                    "max_metadata_file_bytes",
+                    document["limits"]["max_metadata_file_bytes"] + 1,
+                ),
+                "capture limits changed",
+                "amd64",
+            ),
+            (
                 "traversal",
                 lambda document: document["linked_filesystem"]["entries"][0].__setitem__(
                     "path", "usr/../escape"
@@ -1793,6 +1929,22 @@ class VendorStateReferenceTests(unittest.TestCase):
                 ).__setitem__("target", "../../../outside"),
                 "escapes the reference root",
                 "amd64",
+            ),
+            (
+                "sensitive-symlink",
+                lambda document: next(
+                    item
+                    for item in document["linked_filesystem"]["entries"]
+                    if item["path"] == "etc/alternatives/awk"
+                ).__setitem__("target", "/etc/shadow"),
+                "excluded sensitive state",
+                None,
+            ),
+            (
+                "uncaptured-reference",
+                add_uncaptured_reference,
+                "references an uncaptured path",
+                None,
             ),
             (
                 "cycle",
@@ -1828,6 +1980,79 @@ class VendorStateReferenceTests(unittest.TestCase):
                     vendor_state_reference.DerivationError, message
                 ):
                     vendor_state_reference.derive(index)
+
+    def test_reference_derivation_rejects_unsafe_sources_and_input_files(
+        self,
+    ) -> None:
+        private_uri = self.mutated_source_index(
+            "private-uri",
+            lambda index: index["source"].__setitem__(
+                "snapshot_uri",
+                "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z?token=secret",
+            ),
+        )
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "public HTTPS URI"
+        ):
+            vendor_state_reference.derive(private_uri)
+
+        symlink_directory = self.workspace / "symlink-index"
+        symlink_directory.mkdir()
+        symlink_index = symlink_directory / "index-v1.json"
+        symlink_index.symlink_to(REFERENCE_INDEX)
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "not a regular file"
+        ):
+            vendor_state_reference.derive(symlink_index)
+
+        fifo_directory = self.workspace / "fifo-index"
+        fifo_directory.mkdir()
+        fifo_index = fifo_directory / "index-v1.json"
+        os.mkfifo(fifo_index)
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "not a regular file"
+        ):
+            vendor_state_reference.derive(fifo_index)
+
+        oversized_directory = self.workspace / "oversized-index"
+        oversized_directory.mkdir()
+        oversized_index = oversized_directory / "index-v1.json"
+        oversized_index.write_bytes(
+            b" " * (vendor_state_reference.MAX_INDEX_BYTES + 1)
+        )
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError, "exceeds byte limit"
+        ):
+            vendor_state_reference.derive(oversized_index)
+
+        nonstandard_directory = self.workspace / "nonstandard-index"
+        nonstandard_directory.mkdir()
+        nonstandard_index = nonstandard_directory / "index-v1.json"
+        nonstandard_index.write_bytes(b'{"source": NaN}\n')
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError,
+            "non-standard JSON numeric constant",
+        ):
+            vendor_state_reference.derive(nonstandard_index)
+
+        manifest_symlink = self.mutated_source_index(
+            "manifest-symlink", lambda index: None
+        )
+        manifest_index = json.loads(manifest_symlink.read_text())
+        manifest_path = (
+            manifest_symlink.parent
+            / manifest_index["manifests"][0]["manifest_path"]
+        )
+        manifest_path.unlink()
+        manifest_path.symlink_to(
+            REFERENCE_DIRECTORY
+            / manifest_index["manifests"][0]["manifest_path"]
+        )
+        with self.assertRaisesRegex(
+            vendor_state_reference.DerivationError,
+            "amd64 manifest is not a regular file",
+        ):
+            vendor_state_reference.derive(manifest_symlink)
 
 
 if __name__ == "__main__":

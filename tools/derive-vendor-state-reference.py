@@ -9,7 +9,9 @@ import json
 import os
 import pathlib
 import re
+import stat
 import sys
+import urllib.parse
 from collections import Counter
 from typing import Any, Callable
 
@@ -20,11 +22,28 @@ MAX_JSON_INTEGER = (1 << 53) - 1
 MAX_INDEX_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_PATH_BYTES = 4096
+MAX_TEXT_BYTES = 4096
 EXPECTED_CONTROL_MEMBERS = 829
 EXPECTED_ALTERNATIVES_RECORDS = 14
 EXPECTED_REQUESTED_PATHS = 189
 EXPECTED_LINKED_ENTRIES = 190
 EXPECTED_CONFIG_MEMBERS = 7
+EXPECTED_PATH_QUALIFICATIONS = 422
+EXPECTED_CONTROL_CONTENT_DIFFERENCES = 275
+EXPECTED_LINK_RELATIONSHIPS = {"master": 14, "slave": 58}
+EXPECTED_LINKED_KIND_COUNTS = {"regular": 45, "symlink": 145}
+EXPECTED_LIMITS = {
+    "max_control_members": 100_000,
+    "max_alternatives_records": 20_000,
+    "max_metadata_file_bytes": 8 * 1024 * 1024,
+    "max_total_metadata_bytes": 256 * 1024 * 1024,
+    "max_referenced_paths": 50_000,
+    "max_linked_entries": 100_000,
+    "max_link_hops": 64,
+    "max_link_target_bytes": 4096,
+    "max_linked_file_bytes": 256 * 1024 * 1024,
+    "max_total_linked_bytes": 1024 * 1024 * 1024,
+}
 EXPECTED_CLASSIFICATION_COUNTS = {
     "checksums": 177,
     "conffiles": 39,
@@ -38,13 +57,65 @@ EXPECTED_CLASSIFICATION_COUNTS = {
     "triggers": 84,
     "unclassified": 0,
 }
+EXPECTED_CONTROL_DIFFERENCE_COUNTS = {
+    "checksums": 140,
+    "conffiles": 1,
+    "control": 0,
+    "debconf-config": 0,
+    "format": 0,
+    "maintainer-script": 28,
+    "ownership-list": 94,
+    "package-alternatives": 0,
+    "retained-metadata": 9,
+    "triggers": 3,
+    "unclassified": 0,
+}
+EXPECTED_CONFIG_IDENTITIES = (
+    "chrony.config",
+    "console-setup.config",
+    "debconf.config",
+    "iproute2.config",
+    "keyboard-configuration.config",
+    "locales.config",
+    "tzdata.config",
+)
+EXPECTED_ALTERNATIVES_GROUPS = (
+    "awk",
+    "builtins.7.gz",
+    "editor",
+    "ex",
+    "nc",
+    "newt-palette",
+    "pager",
+    "rmt",
+    "rview",
+    "sudo",
+    "vi",
+    "view",
+    "vtrgb",
+    "which",
+)
+EXPECTED_LINKED_DIFFERENCES = (
+    "usr/bin/less",
+    "usr/bin/mawk",
+    "usr/bin/more",
+    "usr/bin/nc.openbsd",
+    "usr/bin/sudo.ws",
+    "usr/bin/vim.tiny",
+    "usr/lib/cargo/bin/sudo",
+    "usr/lib/cargo/bin/visudo",
+    "usr/sbin/rmt-tar",
+    "usr/sbin/visudo.ws",
+)
 CLASSIFICATIONS = tuple(EXPECTED_CLASSIFICATION_COUNTS)
 MAINTAINER_SCRIPTS = frozenset({"preinst", "postinst", "prerm", "postrm"})
 RETAINED_METADATA = frozenset({"templates", "shlibs", "symbols"})
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
 MODE = re.compile(r"^[0-7]{4}$")
 PACKAGE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
 ARCHITECTURE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 INDEX_KEYS = frozenset({"capture_schema", "index_version", "manifests", "source"})
 INDEX_MANIFEST_KEYS = frozenset(
     {
@@ -176,6 +247,41 @@ CONTROL_FACT_FIELDS = (
     "referenced_paths",
 )
 LINKED_FACT_FIELDS = ("mode", "uid", "gid", "size", "sha256", "target")
+PUBLIC_REFERENCE_ROOTS = frozenset(
+    {"bin", "lib", "lib32", "lib64", "libx32", "sbin", "usr"}
+)
+SENSITIVE_PATHS = (
+    "dev",
+    "proc",
+    "sys",
+    "run",
+    "root",
+    "home",
+    "tmp",
+    "var/tmp",
+    "var/log",
+    "var/lib/cloud",
+    "var/lib/private",
+    "etc/shadow",
+    "etc/gshadow",
+    "etc/sudoers",
+    "etc/sudoers.d",
+    "etc/ssh",
+    "etc/ssl/private",
+    "etc/apt/auth.conf",
+    "etc/apt/auth.conf.d",
+)
+STABLE_STAT_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_nlink",
+    "st_uid",
+    "st_gid",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
 
 
 class DerivationError(ValueError):
@@ -183,9 +289,19 @@ class DerivationError(ValueError):
 
 
 def canonical_json(document: Any) -> bytes:
-    return (
-        json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    ).encode("utf-8")
+    try:
+        return (
+            json.dumps(
+                document,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as error:
+        raise DerivationError("document cannot be encoded as canonical JSON") from error
 
 
 def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -197,24 +313,86 @@ def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _same_stat(first: os.stat_result, second: os.stat_result) -> bool:
+    return all(
+        getattr(first, field) == getattr(second, field)
+        for field in STABLE_STAT_FIELDS
+    )
+
+
+def _read_regular_bytes(path: pathlib.Path, maximum: int, label: str) -> bytes:
+    try:
+        expected = path.lstat()
+    except OSError as error:
+        raise DerivationError(f"cannot stat {label}: {path}: {error}") from error
+    if not stat.S_ISREG(expected.st_mode):
+        raise DerivationError(f"{label} is not a regular file: {path}")
+    if expected.st_size < 0 or expected.st_size > maximum:
+        raise DerivationError(f"{label} exceeds byte limit: {path}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise DerivationError(f"cannot open {label}: {path}: {error}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not _same_stat(expected, opened):
+            raise DerivationError(f"{label} changed before reading: {path}")
+        chunks: list[bytes] = []
+        observed = 0
+        while observed <= maximum:
+            try:
+                chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - observed))
+            except OSError as error:
+                raise DerivationError(
+                    f"cannot read {label}: {path}: {error}"
+                ) from error
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+        if observed > maximum:
+            raise DerivationError(f"{label} exceeds byte limit: {path}")
+        finished = os.fstat(descriptor)
+        if observed != opened.st_size or not _same_stat(opened, finished):
+            raise DerivationError(f"{label} changed while reading: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise DerivationError(f"non-standard JSON numeric constant: {value}")
+
+
 def _read_document(
     path: pathlib.Path, maximum: int, label: str
 ) -> tuple[bytes, dict[str, Any]]:
-    try:
-        raw = path.read_bytes()
-    except OSError as error:
-        raise DerivationError(f"cannot read {label}: {path}: {error}") from error
-    if len(raw) > maximum:
-        raise DerivationError(f"{label} exceeds byte limit: {path}")
+    raw = _read_regular_bytes(path, maximum, label)
     try:
         document = json.loads(
-            raw.decode("utf-8"), object_pairs_hook=_object_without_duplicates
+            raw.decode("utf-8"),
+            object_pairs_hook=_object_without_duplicates,
+            parse_constant=_reject_json_constant,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except DerivationError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError) as error:
         raise DerivationError(f"{label} is not canonical UTF-8 JSON: {path}") from error
     if not isinstance(document, dict):
         raise DerivationError(f"{label} must be a JSON object: {path}")
-    if canonical_json(document) != raw:
+    try:
+        encoded = canonical_json(document)
+    except DerivationError as error:
+        raise DerivationError(
+            f"{label} is not canonical UTF-8 JSON: {path}"
+        ) from error
+    if encoded != raw:
         raise DerivationError(f"{label} is not canonical JSON: {path}")
     return raw, document
 
@@ -246,6 +424,15 @@ def _text(value: Any, label: str) -> str:
     except UnicodeEncodeError as error:
         raise DerivationError(f"{label} must be UTF-8") from error
     return value
+
+
+def _bounded_text(value: Any, label: str) -> str:
+    text = _text(value, label)
+    if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
+        raise DerivationError(f"{label} exceeds text byte limit")
+    if any(ord(character) < 32 or ord(character) == 127 for character in text):
+        raise DerivationError(f"{label} contains control characters")
+    return text
 
 
 def _digest(value: Any, label: str) -> str:
@@ -291,6 +478,19 @@ def _relative_path(value: Any, label: str) -> str:
     return text
 
 
+def _public_reference_path(value: Any, label: str) -> str:
+    path = _relative_path(value, label)
+    if any(
+        path == denied or path.startswith(denied + "/")
+        for denied in SENSITIVE_PATHS
+    ):
+        raise DerivationError(f"{label} enters excluded sensitive state")
+    top_level = path.split("/", 1)[0]
+    if top_level not in PUBLIC_REFERENCE_ROOTS and top_level != "etc":
+        raise DerivationError(f"{label} leaves the public reference roots")
+    return path
+
+
 def _target_path(link_path: str, target: Any, label: str) -> str:
     text = _text(target, label)
     encoded = text.encode("utf-8")
@@ -314,6 +514,23 @@ def _target_path(link_path: str, target: Any, label: str) -> str:
     if not result:
         raise DerivationError(f"{label} resolves to the reference root")
     return _relative_path("/".join(result), label)
+
+
+def _public_https_uri(value: Any, label: str) -> str:
+    text = _bounded_text(value, label)
+    parsed = urllib.parse.urlsplit(text)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or any(character.isspace() for character in text)
+    ):
+        raise DerivationError(f"{label} must be a public HTTPS URI")
+    return text
 
 
 def _sorted_unique(values: Any, validator: Callable[[Any, str], str], label: str) -> list[str]:
@@ -386,7 +603,9 @@ def _validate_metadata_file(
         raise DerivationError(f"{label} exceeds metadata file byte limit")
     _digest(item["sha256"], f"{label}.sha256")
     _sorted_unique(
-        item["referenced_paths"], _relative_path, f"{label}.referenced_paths"
+        item["referenced_paths"],
+        _public_reference_path,
+        f"{label}.referenced_paths",
     )
     if control:
         classification = item["classification"]
@@ -404,7 +623,7 @@ def _validate_linked_entry(
 ) -> None:
     if not isinstance(item, dict):
         raise DerivationError(f"{label} must be an object")
-    path = _relative_path(item.get("path"), f"{label}.path")
+    path = _public_reference_path(item.get("path"), f"{label}.path")
     kind = item.get("kind")
     if kind == "regular":
         _require_keys(
@@ -429,7 +648,8 @@ def _validate_linked_entry(
             "max_link_target_bytes"
         ]:
             raise DerivationError(f"{label} symlink target exceeds byte limit")
-        _target_path(path, item["target"], f"{label}.target")
+        resolved = _target_path(path, item["target"], f"{label}.target")
+        _public_reference_path(resolved, f"{label}.resolved_target")
         return
     raise DerivationError(f"{label} has unsupported linked entry kind: {kind!r}")
 
@@ -486,6 +706,8 @@ def _validate_manifest(document: dict[str, Any], architecture: str) -> None:
         key: _positive_integer(value, f"{architecture}.limits.{key}")
         for key, value in limits.items()
     }
+    if validated_limits != EXPECTED_LIMITS:
+        raise DerivationError(f"{architecture} capture limits changed")
 
     controls_wrapper = document["control_members"]
     if not isinstance(controls_wrapper, dict):
@@ -541,7 +763,7 @@ def _validate_manifest(document: dict[str, Any], architecture: str) -> None:
             )
     requested = _sorted_unique(
         linked_wrapper["requested_paths"],
-        _relative_path,
+        _public_reference_path,
         f"{architecture}.requested_paths",
     )
     for index, item in enumerate(linked):
@@ -705,6 +927,41 @@ def _validate_index(index: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(index["source"], dict):
         raise DerivationError("vendor-state source must be an object")
     _require_keys(index["source"], SOURCE_KEYS, "vendor-state source")
+    source = index["source"]
+    commit = _bounded_text(source["commit"], "vendor-state source commit")
+    if COMMIT.fullmatch(commit) is None:
+        raise DerivationError("vendor-state source commit is malformed")
+    repository = _bounded_text(
+        source["repository"], "vendor-state source repository"
+    )
+    if REPOSITORY.fullmatch(repository) is None:
+        raise DerivationError("vendor-state source repository is malformed")
+    for component in repository.split("/"):
+        _component(component, "vendor-state source repository")
+    _component(
+        _bounded_text(
+            source["snapshot_suite"], "vendor-state source snapshot suite"
+        ),
+        "vendor-state source snapshot suite",
+    )
+    _public_https_uri(source["snapshot_uri"], "vendor-state source snapshot URI")
+    _bounded_text(source["workflow"], "vendor-state source workflow")
+    _relative_path(
+        source["workflow_path"], "vendor-state source workflow path"
+    )
+    _positive_integer(
+        source["workflow_run_attempt"],
+        "vendor-state source workflow run attempt",
+    )
+    run_id = _positive_integer(
+        source["workflow_run_id"], "vendor-state source workflow run ID"
+    )
+    run_url = _public_https_uri(
+        source["workflow_run_url"], "vendor-state source workflow run URL"
+    )
+    expected_run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
+    if run_url != expected_run_url:
+        raise DerivationError("vendor-state source workflow run URL is inconsistent")
     manifests = index["manifests"]
     if not isinstance(manifests, list) or len(manifests) != len(ARCHITECTURES):
         raise DerivationError("vendor-state index must contain two manifests")
@@ -720,14 +977,28 @@ def _validate_index(index: dict[str, Any]) -> list[dict[str, Any]]:
             _positive_integer(item[field], f"{architecture}.{field}")
         _digest(item["artifact_sha256"], f"{architecture}.artifact_sha256")
         _digest(item["manifest_sha256"], f"{architecture}.manifest_sha256")
-        manifest_name = _text(item["manifest_path"], f"{architecture}.manifest_path")
+        manifest_name = _bounded_text(
+            item["manifest_path"], f"{architecture}.manifest_path"
+        )
         if (
             pathlib.PurePosixPath(manifest_name).name != manifest_name
             or manifest_name in {".", ".."}
         ):
             raise DerivationError(f"{architecture} manifest path is not a filename")
-        _text(item["artifact_name"], f"{architecture}.artifact_name")
-        _text(item["artifact_member"], f"{architecture}.artifact_member")
+        _component(
+            _bounded_text(item["artifact_name"], f"{architecture}.artifact_name"),
+            f"{architecture}.artifact_name",
+        )
+        artifact_member = _bounded_text(
+            item["artifact_member"], f"{architecture}.artifact_member"
+        )
+        if (
+            pathlib.PurePosixPath(artifact_member).name != artifact_member
+            or artifact_member in {".", ".."}
+        ):
+            raise DerivationError(
+                f"{architecture} artifact member is not a filename"
+            )
         if not isinstance(item["inventory"], dict):
             raise DerivationError(f"{architecture} inventory must be an object")
     return manifests
@@ -811,8 +1082,6 @@ def _derive_control_members(
                     "identity": identity,
                     "classification": classification,
                     "changed_fields": changed_fields,
-                    "amd64": amd64_fact,
-                    "arm64": arm64_fact,
                 }
             )
     return (
@@ -892,7 +1161,11 @@ def _derive_alternatives(
         candidates: list[dict[str, Any]] = []
         for path in record["referenced_paths"]:
             associated_requested.add(path)
-            resolution = resolutions[path]
+            resolution = resolutions.get(path)
+            if resolution is None:
+                raise DerivationError(
+                    f"alternatives record references an uncaptured path: {path}"
+                )
             selectors = [
                 entry_path
                 for entry_path in resolution["chain"]
@@ -947,6 +1220,18 @@ def _derive_alternatives(
             )
         links.sort(key=lambda item: item["link_path"].encode("utf-8"))
         candidates.sort(key=lambda item: item["path"].encode("utf-8"))
+        selectors = [link["selector_path"] for link in links]
+        if len(selectors) != len(set(selectors)):
+            raise DerivationError(
+                f"alternatives group {name} has duplicate selector relationships"
+            )
+        candidate_terminals = [
+            candidate["terminal_path"] for candidate in candidates
+        ]
+        if len(candidate_terminals) != len(set(candidate_terminals)):
+            raise DerivationError(
+                f"alternatives group {name} has duplicate candidate terminals"
+            )
         masters = [link for link in links if link["relationship"] == "master"]
         if len(masters) != 1:
             raise DerivationError(
@@ -1052,8 +1337,6 @@ def _derive_alternatives(
                     "identity": path,
                     "kind": "regular",
                     "changed_fields": changed_fields,
-                    "amd64": amd64_fact,
-                    "arm64": arm64_fact,
                 }
             )
 
@@ -1071,6 +1354,8 @@ def _derive_alternatives(
 
 def derive(index_path: os.PathLike[str] | str) -> dict[str, Any]:
     path = pathlib.Path(index_path)
+    if path.name != "index-v1.json":
+        raise DerivationError("vendor-state index filename must be index-v1.json")
     raw_index, index = _read_document(path, MAX_INDEX_BYTES, "vendor-state index")
     manifest_references = _validate_index(index)
     documents: dict[str, dict[str, Any]] = {}
@@ -1117,6 +1402,43 @@ def derive(index_path: os.PathLike[str] | str) -> dict[str, Any]:
         if item["classification"] == "debconf-config"
     ]
     group_names = [group["name"] for group in alternatives["groups"]]
+    if tuple(config_identities) != EXPECTED_CONFIG_IDENTITIES:
+        raise DerivationError("config-script identity boundary changed")
+    if tuple(group_names) != EXPECTED_ALTERNATIVES_GROUPS:
+        raise DerivationError("alternatives-group identity boundary changed")
+    if (
+        len(control_differences["path_qualifications"])
+        != EXPECTED_PATH_QUALIFICATIONS
+    ):
+        raise DerivationError("architecture-qualified control boundary changed")
+    if (
+        len(control_differences["control_content"])
+        != EXPECTED_CONTROL_CONTENT_DIFFERENCES
+        or control_differences["control_content_counts"]
+        != EXPECTED_CONTROL_DIFFERENCE_COUNTS
+    ):
+        raise DerivationError("control-content difference boundary changed")
+    if tuple(item["identity"] for item in linked_differences) != (
+        EXPECTED_LINKED_DIFFERENCES
+    ):
+        raise DerivationError("linked-content difference boundary changed")
+    relationship_counts = Counter(
+        link["relationship"]
+        for group in alternatives["groups"]
+        for link in group["links"]
+    )
+    if relationship_counts != EXPECTED_LINK_RELATIONSHIPS:
+        raise DerivationError("alternatives relationship boundary changed")
+    linked_kind_counts = Counter(
+        item["kind"] for item in alternatives["linked_entries"]
+    )
+    if linked_kind_counts != EXPECTED_LINKED_KIND_COUNTS:
+        raise DerivationError("linked-entry kind boundary changed")
+    retained_paths = [
+        item["path"] for item in alternatives["retained_selector_metadata"]
+    ]
+    if retained_paths != ["etc/alternatives/README"]:
+        raise DerivationError("retained alternatives metadata boundary changed")
     per_architecture = {}
     for reference in manifest_references:
         architecture = reference["architecture"]
@@ -1133,6 +1455,7 @@ def derive(index_path: os.PathLike[str] | str) -> dict[str, Any]:
         "version": 1,
         "source": {
             "capture_schema": index["capture_schema"],
+            "capture_limits": EXPECTED_LIMITS,
             "index": {
                 "path": path.name,
                 "size": len(raw_index),
@@ -1235,7 +1558,11 @@ def main() -> int:
     try:
         encoded = canonical_json(derive(arguments.index))
         if arguments.check:
-            expected = pathlib.Path(arguments.check).read_bytes()
+            expected = _read_regular_bytes(
+                pathlib.Path(arguments.check),
+                len(encoded),
+                "reference check file",
+            )
             if expected != encoded:
                 raise DerivationError(
                     f"derived reference differs from {arguments.check}"
