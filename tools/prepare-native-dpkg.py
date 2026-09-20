@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -31,6 +33,7 @@ PINS = {
         "update_alternatives": "35616ec58ba58f3fb8b4820bdf893c47a842d56684b3335ba6ebf6df86b27cc5",
     },
 }
+RECEIPT = "reference-receipt-v1.json"
 
 
 def verify_file(path: Path, expected: str) -> None:
@@ -40,6 +43,125 @@ def verify_file(path: Path, expected: str) -> None:
         content = source.read(MAXIMUM_BYTES + 1)
     if len(content) > MAXIMUM_BYTES or hashlib.sha256(content).hexdigest() != expected:
         raise RuntimeError(f"pinned reference digest mismatch: {path}")
+
+
+def canonical_json(document: object) -> str:
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+def file_binding(path: Path, expected: str) -> dict[str, int | str]:
+    verify_file(path, expected)
+    return {
+        "sha256": expected,
+        "size": path.stat().st_size,
+    }
+
+
+def download_archive(architecture: str) -> tuple[str, bytes]:
+    name = f"dpkg_{VERSION}_{architecture}.deb"
+    url = f"{BASE_URL}/{name}"
+    with urllib.request.urlopen(url, timeout=60) as response:
+        if not response.url.startswith("https://"):
+            raise RuntimeError("reference download redirected away from HTTPS")
+        content = response.read(MAXIMUM_BYTES + 1)
+    if len(content) > MAXIMUM_BYTES:
+        raise RuntimeError("reference archive exceeds its byte limit")
+    if hashlib.sha256(content).hexdigest() != PINS[architecture]["archive"]:
+        raise RuntimeError("pinned reference archive digest mismatch")
+    return url, content
+
+
+def receipt_document(
+    architecture: str,
+    archive_url: str,
+    archive: bytes,
+    prefix: Path,
+) -> dict[str, object]:
+    return {
+        "architecture": architecture,
+        "archive": {
+            "sha256": PINS[architecture]["archive"],
+            "size": len(archive),
+            "url": archive_url,
+        },
+        "dpkg": file_binding(
+            prefix / "usr/bin/dpkg",
+            PINS[architecture]["executable"],
+        ),
+        "schema": "https://debz.dev/schema/native-dpkg-reference-receipt-v1",
+        "update_alternatives": file_binding(
+            prefix / "usr/bin/update-alternatives",
+            PINS[architecture]["update_alternatives"],
+        ),
+        "version": VERSION,
+    }
+
+
+def write_receipt(
+    architecture: str,
+    archive_url: str,
+    archive: bytes,
+    prefix: Path,
+) -> None:
+    path = prefix / RECEIPT
+    path.write_text(canonical_json(receipt_document(
+        architecture,
+        archive_url,
+        archive,
+        prefix,
+    )))
+
+
+def verify_receipt(path: Path, architecture: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 4096:
+        raise RuntimeError(f"invalid pinned reference receipt: {path}")
+    raw = path.read_bytes()
+    receipt = json.loads(raw)
+    if raw != canonical_json(receipt).encode():
+        raise RuntimeError("pinned reference receipt is not canonical JSON")
+    expected = {
+        "architecture": architecture,
+        "schema": "https://debz.dev/schema/native-dpkg-reference-receipt-v1",
+        "version": VERSION,
+    }
+    if any(receipt.get(name) != value for name, value in expected.items()):
+        raise RuntimeError("pinned reference receipt identity mismatch")
+    archive = receipt.get("archive")
+    expected_url = f"{BASE_URL}/dpkg_{VERSION}_{architecture}.deb"
+    if (
+        set(receipt) != {
+            "architecture",
+            "archive",
+            "dpkg",
+            "schema",
+            "update_alternatives",
+            "version",
+        }
+        or not isinstance(archive, dict)
+        or set(archive) != {"sha256", "size", "url"}
+        or archive.get("sha256") != PINS[architecture]["archive"]
+        or archive.get("url") != expected_url
+        or not isinstance(archive.get("size"), int)
+        or not 0 < archive["size"] <= MAXIMUM_BYTES
+    ):
+        raise RuntimeError("pinned reference receipt archive mismatch")
+    for name, key, relative in (
+        ("dpkg", "executable", "usr/bin/dpkg"),
+        (
+            "update_alternatives",
+            "update_alternatives",
+            "usr/bin/update-alternatives",
+        ),
+    ):
+        executable = path.parent / relative
+        if receipt.get(name) != file_binding(
+            executable,
+            PINS[architecture][key],
+        ):
+            raise RuntimeError(
+                f"pinned reference receipt {name} mismatch: {executable}"
+            )
+    return receipt
 
 
 def version(executable: str) -> tuple[int, int, int]:
@@ -90,7 +212,10 @@ def select(executable: Path | None, architecture: str, *, root_accounts: bool = 
             "python3 tools/prepare-native-dpkg.py and pass its path with "
             "-Dnative-reference-dpkg=PATH (or --reference-dpkg PATH)"
         )
-    print(f"Native reference: {selected} ({'.'.join(map(str, found))})", file=sys.stderr)
+    print(
+        f"Native reference: dpkg ({'.'.join(map(str, found))})",
+        file=sys.stderr,
+    )
     return selected
 
 
@@ -106,7 +231,8 @@ def select_update_alternatives(executable: Path, architecture: str) -> str:
     if found != tuple(int(part) for part in VERSION.split(".")):
         raise RuntimeError("pinned update-alternatives reference version mismatch")
     print(
-        f"Alternatives reference: {executable} ({'.'.join(map(str, found))})",
+        "Alternatives reference: update-alternatives "
+        f"({'.'.join(map(str, found))})",
         file=sys.stderr,
     )
     return str(executable)
@@ -127,17 +253,17 @@ def prepare(architecture: str) -> Path:
             prefix / "usr/bin/update-alternatives",
             architecture,
         )
+        receipt = prefix / RECEIPT
+        if not receipt.exists():
+            archive_url, archive = download_archive(architecture)
+            write_receipt(architecture, archive_url, archive, prefix)
+        verify_receipt(receipt, architecture)
         return executable
     prefix.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="preparing-", dir=prefix.parent) as temporary:
         workspace = Path(temporary)
         archive = workspace / f"dpkg_{VERSION}_{architecture}.deb"
-        with urllib.request.urlopen(f"{BASE_URL}/{archive.name}", timeout=60) as response:
-            if not response.url.startswith("https://"):
-                raise RuntimeError("reference download redirected away from HTTPS")
-            content = response.read(MAXIMUM_BYTES + 1)
-        if len(content) > MAXIMUM_BYTES:
-            raise RuntimeError("reference archive exceeds its byte limit")
+        archive_url, content = download_archive(architecture)
         archive.write_bytes(content)
         verify_file(archive, PINS[architecture]["archive"])
         staged = workspace / "prefix"
@@ -147,12 +273,20 @@ def prepare(architecture: str) -> Path:
             staged / "usr/bin/update-alternatives",
             architecture,
         )
+        write_receipt(architecture, archive_url, content, staged)
         staged.rename(prefix)
+    verify_receipt(prefix / RECEIPT, architecture)
     return executable
 
 
 def main() -> int:
-    architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--architecture", choices=sorted(PINS))
+    arguments = parser.parse_args()
+    architecture = arguments.architecture or {
+        "x86_64": "amd64",
+        "aarch64": "arm64",
+    }.get(platform.machine())
     if architecture is None:
         raise RuntimeError(f"unsupported reference machine: {platform.machine()}")
     print(prepare(architecture))

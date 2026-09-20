@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from collections import Counter
 
 import jsonschema
 
@@ -90,6 +91,13 @@ class DpkgConfigReferenceTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_script_environment_shell_variables_are_explicit(self) -> None:
+        for body in oracle.maintainer_scripts("v1").values():
+            self.assertIn(
+                b"SHLVL=1 _=/oracle-env /oracle-env",
+                body,
+            )
 
     def test_vendor_config_fixtures_match_all_pinned_sizes(self) -> None:
         reference = oracle.load_reference()
@@ -196,16 +204,36 @@ class DpkgConfigReferenceTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_published_observation_is_amd64_scoped_and_state_complete(self) -> None:
+    def test_published_observation_is_dual_architecture_and_state_complete(self) -> None:
         reference = oracle.load_reference()
         boundary = reference["boundary"]
-        self.assertEqual(boundary["observed_architecture"], "amd64")
-        self.assertIn("amd64 only", boundary["architecture_scope"])
+        self.assertEqual(boundary["observed_architectures"], ["amd64", "arm64"])
+        self.assertIn("amd64 and arm64", boundary["architecture_scope"])
         oracle.validate_observation_architecture(reference, "amd64")
+        oracle.validate_observation_architecture(reference, "arm64")
         with self.assertRaisesRegex(oracle.OracleError, "architecture-specific"):
-            oracle.validate_observation_architecture(reference, "arm64")
+            oracle.validate_observation_architecture(reference, "riscv64")
 
         observed = reference["observed_behavior"]
+        arm64 = oracle.verify_architecture_evidence(reference)
+        evidence = reference["architecture_evidence"]["arm64"]
+        self.assertEqual(evidence["difference_count"], 78)
+        self.assertEqual(
+            evidence["difference_summary"],
+            {
+                "architecture_derived_sha256": 27,
+                "architecture_derived_sizes": 6,
+                "architecture_fields": 45,
+            },
+        )
+        self.assertEqual(
+            Counter(
+                difference["path"].rsplit("/", 1)[-1]
+                for difference in evidence["differences_from_baseline"]
+            ),
+            Counter({"architecture": 45, "sha256": 27, "size": 6}),
+        )
+        self.assertEqual(arm64["package_inputs"]["architecture"], "arm64")
         inputs = observed["package_inputs"]
         self.assertEqual(inputs["architecture"], "amd64")
         self.assertEqual(len(inputs["lifecycle"]), 3)

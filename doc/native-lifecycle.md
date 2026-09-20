@@ -172,9 +172,10 @@ or another compatible Linux host with an older dpkg, prepare that reference
 without root privileges:
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
 zig build test-dpkg-config-reference test-native-lifecycle test-native-recovery \
-  -Dnative-reference-dpkg="$reference_dpkg" -j2
+  -Dnative-reference-dpkg="$reference_dpkg" \
+  -Dnative-reference-architecture=amd64 -j2
 ```
 
 The helper verifies architecture-specific archive and executable SHA-256 pins,

@@ -11,7 +11,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
-import platform
 import re
 import resource
 import shutil
@@ -234,13 +233,15 @@ def verify_source_bindings(reference: dict[str, Any]) -> dict[str, Any]:
         }:
             raise OracleError(f"dpkg tool pins changed for {architecture}")
     if source["fixture_packages"] != {
-        "architecture": "amd64",
+        "architectures": ["amd64", "arm64"],
+        "baseline_architecture": "amd64",
         "clock_epoch": m.EPOCH,
         "maintainer": "debz fixture <fixture@example.invalid>",
         "namespace": "debz-alt-*",
         "package_builder": "repository deterministic Python ar/tar builder",
     }:
         raise OracleError("fixture package provenance changed")
+    config.verify_architecture_evidence(reference)
     return derived
 
 
@@ -248,11 +249,13 @@ def validate_observation_architecture(
     reference: dict[str, Any],
     architecture: str,
 ) -> None:
-    observed = reference["boundary"]["observed_architecture"]
-    if architecture != observed:
+    observed = reference["boundary"].get("observed_architectures")
+    if observed is None:
+        observed = [reference["boundary"]["observed_architecture"]]
+    if architecture not in observed:
         raise OracleError(
             "published alternatives observation is architecture-specific: "
-            f"host={architecture}, observed={observed}"
+            f"requested={architecture}, observed={','.join(observed)}"
         )
 
 
@@ -2356,28 +2359,60 @@ def assert_host_unchanged(expected: dict[str, Any]) -> None:
             raise OracleError(f"host {name.replace('_', ' ')} changed during observation")
 
 
+def write_capture(path: Path, observed: dict[str, Any]) -> None:
+    temporary_root = (ROOT / ".tmp").resolve()
+    destination = path.resolve()
+    if destination.parent.parent != temporary_root:
+        raise OracleError(
+            "captured observation must be a file in a directory directly under .tmp"
+        )
+    if destination.exists() or destination.is_symlink():
+        raise OracleError("captured observation path already exists")
+    destination.parent.mkdir(exist_ok=True)
+    m.write(destination, canonical_json(observed).encode())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
     parser.add_argument("--reference-dpkg", type=Path)
     parser.add_argument("--reference-update-alternatives", type=Path)
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--print-observed", action="store_true")
     parser.add_argument("--update-reference", action="store_true")
+    parser.add_argument(
+        "--capture-observed",
+        type=Path,
+        help="write a canonical bounded observation without publishing it",
+    )
     arguments = parser.parse_args()
-    if arguments.print_observed and arguments.update_reference:
-        parser.error("--print-observed and --update-reference are mutually exclusive")
+    selected_outputs = sum(
+        value is not None and value is not False
+        for value in (
+            arguments.capture_observed,
+            arguments.print_observed,
+            arguments.update_reference,
+        )
+    )
+    if selected_outputs > 1:
+        parser.error(
+            "--capture-observed, --print-observed and --update-reference are "
+            "mutually exclusive"
+        )
     if os.geteuid() != 0:
         raise OracleError("dpkg alternatives reference execution requires root")
     for command in ("ldd",):
         if shutil.which(command) is None:
             raise OracleError(f"required reference tool is missing: {command}")
-    architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
-    if architecture is None:
-        raise OracleError(f"unsupported reference architecture: {platform.machine()}")
+    architecture = arguments.architecture
 
     reference = load_reference()
     derived = verify_source_bindings(reference)
-    validate_observation_architecture(reference, architecture)
+    expected_observation: dict[str, Any] | None = None
+    if arguments.capture_observed is None:
+        expected_observation = config.published_observation(reference, architecture)
+    if arguments.update_reference and architecture != "amd64":
+        raise OracleError("only the amd64 baseline observation can be regenerated")
     dpkg, update_alternatives = select_references(
         arguments.reference_dpkg,
         arguments.reference_update_alternatives,
@@ -2436,7 +2471,9 @@ def main() -> int:
     if arguments.update_reference:
         reference["observed_behavior"] = observed
         REFERENCE.write_text(canonical_json(reference))
-    elif observed != reference["observed_behavior"]:
+    elif arguments.capture_observed is not None:
+        write_capture(arguments.capture_observed, observed)
+    elif observed != expected_observation:
         raise OracleError(
             "observed alternatives behavior differs from the canonical reference"
         )

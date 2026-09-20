@@ -1,0 +1,313 @@
+{
+  "$id": "https://debz.dev/schema/dpkg-oracle-execution-evidence-v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "artifact": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "pattern": "^[a-z0-9][a-z0-9.-]*$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 2097152,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "execution": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 8,
+          "type": "array"
+        },
+        "exit": {
+          "const": 0
+        },
+        "observation": {
+          "$ref": "#/$defs/artifact"
+        },
+        "published_reference": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "pattern": "^tools/fixtures/vendor-state/dpkg-(config|alternatives)-reference-v1\\.json$",
+              "type": "string"
+            },
+            "sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "size": {
+              "maximum": 2097152,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path",
+            "sha256",
+            "size"
+          ],
+          "type": "object"
+        },
+        "reference_schema": {
+          "enum": [
+            "https://debz.dev/schema/dpkg-config-reference-v1",
+            "https://debz.dev/schema/dpkg-alternatives-reference-v1"
+          ]
+        },
+        "stderr": {
+          "$ref": "#/$defs/output"
+        },
+        "stdout": {
+          "$ref": "#/$defs/output"
+        }
+      },
+      "required": [
+        "command",
+        "exit",
+        "observation",
+        "published_reference",
+        "reference_schema",
+        "stderr",
+        "stdout"
+      ],
+      "type": "object"
+    },
+    "output": {
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 32768,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "maxLength": 32768,
+          "type": "string"
+        }
+      },
+      "required": [
+        "sha256",
+        "size",
+        "text"
+      ],
+      "type": "object"
+    },
+    "tool": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "pattern": "^\\.cache/native-dpkg-reference/1\\.22\\.22/arm64/usr/bin/(dpkg|update-alternatives)$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "version": {
+          "const": "1.22.22"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "size",
+        "version"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "architecture": {
+      "const": "arm64"
+    },
+    "invocation_clock": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "oracles": {
+      "additionalProperties": false,
+      "properties": {
+        "direct_dpkg_config": {
+          "$ref": "#/$defs/execution"
+        },
+        "dpkg_update_alternatives": {
+          "$ref": "#/$defs/execution"
+        }
+      },
+      "required": [
+        "direct_dpkg_config",
+        "dpkg_update_alternatives"
+      ],
+      "type": "object"
+    },
+    "runner": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "const": "ubuntu-24.04-arm"
+        },
+        "machine": {
+          "const": "aarch64"
+        },
+        "runner_arch": {
+          "const": "ARM64"
+        }
+      },
+      "required": [
+        "label",
+        "machine",
+        "runner_arch"
+      ],
+      "type": "object"
+    },
+    "schema": {
+      "const": "https://debz.dev/schema/dpkg-oracle-execution-evidence-v1"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "job": {
+          "const": "arm64-dpkg-oracles"
+        },
+        "repository": {
+          "const": "cataggar/debz"
+        },
+        "run_attempt": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "run_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workflow": {
+          "const": "CI"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/ci.yml"
+        }
+      },
+      "required": [
+        "commit",
+        "job",
+        "repository",
+        "run_attempt",
+        "run_id",
+        "workflow",
+        "workflow_path"
+      ],
+      "type": "object"
+    },
+    "tools": {
+      "additionalProperties": false,
+      "properties": {
+        "archive": {
+          "additionalProperties": false,
+          "properties": {
+            "sha256": {
+              "const": "1142468e57f69e13d174f517dff739508c61ee97d81c182c120cd6b281d8cdfa"
+            },
+            "size": {
+              "maximum": 8388608,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "url": {
+              "const": "https://deb.debian.org/debian/pool/main/d/dpkg/dpkg_1.22.22_arm64.deb"
+            }
+          },
+          "required": [
+            "sha256",
+            "size",
+            "url"
+          ],
+          "type": "object"
+        },
+        "dpkg": {
+          "$ref": "#/$defs/tool"
+        },
+        "receipt": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "const": ".cache/native-dpkg-reference/1.22.22/arm64/reference-receipt-v1.json"
+            },
+            "sha256": {
+              "$ref": "#/$defs/digest"
+            },
+            "size": {
+              "maximum": 4096,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path",
+            "sha256",
+            "size"
+          ],
+          "type": "object"
+        },
+        "update_alternatives": {
+          "$ref": "#/$defs/tool"
+        }
+      },
+      "required": [
+        "archive",
+        "dpkg",
+        "receipt",
+        "update_alternatives"
+      ],
+      "type": "object"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "architecture",
+    "invocation_clock",
+    "oracles",
+    "runner",
+    "schema",
+    "source",
+    "tools",
+    "version"
+  ],
+  "type": "object"
+}

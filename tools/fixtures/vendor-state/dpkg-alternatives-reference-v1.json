@@ -1,6 +1,820 @@
 {
+  "architecture_evidence": {
+    "arm64": {
+      "comparison": "All 190 differences are direct-dpkg package-architecture identity or archive, log, status, and database bytes and digests derived from that identity; external update-alternatives behavior and the dpkg/tool separation result are byte-identical.",
+      "difference_count": 190,
+      "difference_summary": {
+        "architecture_derived_bytes_base64": 64,
+        "architecture_derived_logs": 26,
+        "architecture_derived_sha256": 80,
+        "architecture_fields": 20
+      },
+      "differences_from_baseline": [
+        {
+          "path": "/direct_dpkg/conflicting_packages/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtY29uZmxpY3QtYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoKUGFja2FnZTogZGViei1hbHQtY29uZmxpY3QtYgpTdGF0dXM6IGluc3RhbGwgb2sgbm90LWluc3RhbGxlZApBcmNoaXRlY3R1cmU6IGFybTY0Cgo="
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/database_files/3/fact/sha256",
+          "value": "fe699abeb53a7c94eda2ffa00bf787261bc106b36d3178bd8d67cf2a39941a9c"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtY29uZmxpY3QtYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/database_files/4/fact/sha256",
+          "value": "f6b7376fd0e6ffd438961dd3c7e3fb69433e8fe868fa52494b5ee4341f281409"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/first_archive/sha256",
+          "value": "3c0a5a816185e9f695e9a6a868498dca7e81b81a3d6a0ab1f6f54cdc58f7a581"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/first_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-conflict-a:arm64 <none> 1\n<clock> status half-installed debz-alt-conflict-a:arm64 1\n<clock> status unpacked debz-alt-conflict-a:arm64 1\n<clock> configure debz-alt-conflict-a:arm64 1 1\n<clock> status half-configured debz-alt-conflict-a:arm64 1\n<clock> status installed debz-alt-conflict-a:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/first_state/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/second_archive/sha256",
+          "value": "850bcd571bc4d81d790a5df1bf3cf7421a43a3d1407a194260c75110e31a8a36"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/second_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-conflict-b:arm64 <none> 1\n<clock> status half-installed debz-alt-conflict-b:arm64 1\n<clock> status not-installed debz-alt-conflict-b:arm64 <none>\n"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_packages/second_status/Architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/archives/debz-alt-provider-a/sha256",
+          "value": "0bc57561a9c25f567534f9d57c7ce9b193be200c4860d68f75a089b2777525eb"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/archives/debz-alt-provider-b/sha256",
+          "value": "111f64b8601b1be7f7a3faf148d4c0354b23e2dea8436fda498494f331aeb21f"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/0/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/0/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/0/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/0/database_files/3/fact/sha256",
+          "value": "68da564f4a831df40d6d0c70a946637a19b496c03ea55272263035af547d9ef7"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/0/package/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/0/result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-provider-a:arm64 <none> 1\n<clock> status half-installed debz-alt-provider-a:arm64 1\n<clock> status unpacked debz-alt-provider-a:arm64 1\n<clock> configure debz-alt-provider-a:arm64 1 1\n<clock> status half-configured debz-alt-provider-a:arm64 1\n<clock> status installed debz-alt-provider-a:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoKUGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYgpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/database_files/3/fact/sha256",
+          "value": "724da751be32f1eb11f4c05f10acb21384a2e2325921a16b356742af2d8c1832"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/database_files/4/fact/sha256",
+          "value": "68da564f4a831df40d6d0c70a946637a19b496c03ea55272263035af547d9ef7"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/package/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/1/result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-provider-b:arm64 <none> 1\n<clock> status half-installed debz-alt-provider-b:arm64 1\n<clock> status unpacked debz-alt-provider-b:arm64 1\n<clock> configure debz-alt-provider-b:arm64 1 1\n<clock> status half-configured debz-alt-provider-b:arm64 1\n<clock> status installed debz-alt-provider-b:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoKUGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYgpTdGF0dXM6IGRlaW5zdGFsbCBvayBjb25maWctZmlsZXMKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkNvbmZpZy1WZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/database_files/3/fact/sha256",
+          "value": "b03693256aa6e7a4152e9c1f2d1df587ab4ae81f89595dad32a567ea3e406310"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoKUGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYgpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/database_files/4/fact/sha256",
+          "value": "724da751be32f1eb11f4c05f10acb21384a2e2325921a16b356742af2d8c1832"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/package/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/2/result/log",
+          "value": "<clock> startup packages remove\n<clock> status installed debz-alt-provider-b:arm64 1\n<clock> remove debz-alt-provider-b:arm64 1 <none>\n<clock> status half-configured debz-alt-provider-b:arm64 1\n<clock> status half-installed debz-alt-provider-b:arm64 1\n<clock> status config-files debz-alt-provider-b:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/3/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/3/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/3/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYgpTdGF0dXM6IGRlaW5zdGFsbCBvayBjb25maWctZmlsZXMKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkNvbmZpZy1WZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/3/database_files/3/fact/sha256",
+          "value": "adce612356c9d242241565e6bcee53b550413a61ebd9a4f0acfb98304ed0a172"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/3/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoKUGFja2FnZTogZGViei1hbHQtcHJvdmlkZXItYgpTdGF0dXM6IGRlaW5zdGFsbCBvayBjb25maWctZmlsZXMKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkNvbmZpZy1WZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/3/database_files/4/fact/sha256",
+          "value": "b03693256aa6e7a4152e9c1f2d1df587ab4ae81f89595dad32a567ea3e406310"
+        },
+        {
+          "path": "/direct_dpkg/conflicting_providers/phases/3/result/log",
+          "value": "<clock> startup packages purge\n<clock> status installed debz-alt-provider-a:arm64 1\n<clock> remove debz-alt-provider-a:arm64 1 <none>\n<clock> status half-configured debz-alt-provider-a:arm64 1\n<clock> status half-installed debz-alt-provider-a:arm64 1\n<clock> status config-files debz-alt-provider-a:arm64 1\n<clock> purge debz-alt-provider-a:arm64 1 <none>\n<clock> status not-installed debz-alt-provider-a:arm64 <none>\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/archives/1/sha256",
+          "value": "efb9e99dc7873e3687c4a2493b262730f51a7c41fb0eb8e6dd212c0e8b9f66d6"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/archives/2/sha256",
+          "value": "a4a452c13c85008148624b1abe2f7fbb53754241ecb7ad233bc52003d28f7cee"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/failed/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/failed/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/failed/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/failed/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtZnJlc2gtcG9zdGluc3QKU3RhdHVzOiBpbnN0YWxsIG9rIGhhbGYtY29uZmlndXJlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/failed/database_files/3/fact/sha256",
+          "value": "0da4c4760be8da9019248b6a1edbca0c3f83efad79be0075b317f4f3f3abda82"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/operation_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-fresh-postinst:arm64 <none> 1\n<clock> status half-installed debz-alt-fresh-postinst:arm64 1\n<clock> status unpacked debz-alt-fresh-postinst:arm64 1\n<clock> configure debz-alt-fresh-postinst:arm64 1 1\n<clock> status half-configured debz-alt-fresh-postinst:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovered/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovered/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovered/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovered/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtZnJlc2gtcG9zdGluc3QKU3RhdHVzOiBpbnN0YWxsIG9rIGluc3RhbGxlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovered/database_files/3/fact/sha256",
+          "value": "79895245fd9907691b905e3755b9703cc37a47a059acc625008a14fbadc6802b"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovered/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtZnJlc2gtcG9zdGluc3QKU3RhdHVzOiBpbnN0YWxsIG9rIGhhbGYtY29uZmlndXJlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovered/database_files/4/fact/sha256",
+          "value": "0da4c4760be8da9019248b6a1edbca0c3f83efad79be0075b317f4f3f3abda82"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/0/recovery_result/log",
+          "value": "<clock> startup packages configure\n<clock> configure debz-alt-fresh-postinst:arm64 1 <none>\n<clock> status half-configured debz-alt-fresh-postinst:arm64 1\n<clock> status installed debz-alt-fresh-postinst:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/archives/1/sha256",
+          "value": "fe1c28d04ae0a6107b8a5c3076a887a742f2222a04e820c5015a579fd665a3c9"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/archives/2/sha256",
+          "value": "db3e585505a158ec752203dfc40de5136d3048fee983efbab57a0bf02b6976e7"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/failed/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/failed/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/failed/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/failed/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wcmVybQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMgpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/failed/database_files/3/fact/sha256",
+          "value": "8f807e0f9cfec1f663002b78d56f53a5707c1491d5671c58f0e48b703ace7415"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/failed/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wcmVybQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/failed/database_files/4/fact/sha256",
+          "value": "0a2e1ebe601de9c3f0c14eccca5900c706b80e50f5715d1162d9dc772b117915"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/operation_result/log",
+          "value": "<clock> startup archives install\n<clock> upgrade debz-alt-upgrade-prerm:arm64 1 2\n<clock> status half-configured debz-alt-upgrade-prerm:arm64 1\n<clock> status unpacked debz-alt-upgrade-prerm:arm64 1\n<clock> status half-installed debz-alt-upgrade-prerm:arm64 1\n<clock> status unpacked debz-alt-upgrade-prerm:arm64 2\n<clock> configure debz-alt-upgrade-prerm:arm64 2 2\n<clock> status half-configured debz-alt-upgrade-prerm:arm64 2\n<clock> status installed debz-alt-upgrade-prerm:arm64 2\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovered/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovered/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovered/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovered/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wcmVybQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMgpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovered/database_files/3/fact/sha256",
+          "value": "8f807e0f9cfec1f663002b78d56f53a5707c1491d5671c58f0e48b703ace7415"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovered/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wcmVybQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMgpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovered/database_files/4/fact/sha256",
+          "value": "8f807e0f9cfec1f663002b78d56f53a5707c1491d5671c58f0e48b703ace7415"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/recovery_result/log",
+          "value": "<clock> startup archives install\n<clock> upgrade debz-alt-upgrade-prerm:arm64 2 2\n<clock> status half-configured debz-alt-upgrade-prerm:arm64 2\n<clock> status unpacked debz-alt-upgrade-prerm:arm64 2\n<clock> status half-installed debz-alt-upgrade-prerm:arm64 2\n<clock> status unpacked debz-alt-upgrade-prerm:arm64 2\n<clock> configure debz-alt-upgrade-prerm:arm64 2 2\n<clock> status half-configured debz-alt-upgrade-prerm:arm64 2\n<clock> status installed debz-alt-upgrade-prerm:arm64 2\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/1/seed_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-upgrade-prerm:arm64 <none> 1\n<clock> status half-installed debz-alt-upgrade-prerm:arm64 1\n<clock> status unpacked debz-alt-upgrade-prerm:arm64 1\n<clock> configure debz-alt-upgrade-prerm:arm64 1 1\n<clock> status half-configured debz-alt-upgrade-prerm:arm64 1\n<clock> status installed debz-alt-upgrade-prerm:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/archives/1/sha256",
+          "value": "4ba95994c524c5cb5e49d437a8a827896db6f746938aecda4b24dcb8c945c4d3"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/archives/2/sha256",
+          "value": "31de683355a62e18e47b6a5966e3bdce8cbf2cd7b08c8548b39c5a53908d984e"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/failed/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/failed/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/failed/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/failed/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wb3N0aW5zdApTdGF0dXM6IGluc3RhbGwgb2sgaGFsZi1jb25maWd1cmVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMgpDb25maWctVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/failed/database_files/3/fact/sha256",
+          "value": "dc1e281306e02d4eef0291c7f036425b14217c6d9c2022722d356072e94ad836"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/failed/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wb3N0aW5zdApTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/failed/database_files/4/fact/sha256",
+          "value": "e7c3bee583b55793c496571e63a8c29a7b0f2b7a930c7d66a66ce4c621ec6fe0"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/operation_result/log",
+          "value": "<clock> startup archives install\n<clock> upgrade debz-alt-upgrade-postinst:arm64 1 2\n<clock> status half-configured debz-alt-upgrade-postinst:arm64 1\n<clock> status unpacked debz-alt-upgrade-postinst:arm64 1\n<clock> status half-installed debz-alt-upgrade-postinst:arm64 1\n<clock> status unpacked debz-alt-upgrade-postinst:arm64 2\n<clock> configure debz-alt-upgrade-postinst:arm64 2 2\n<clock> status half-configured debz-alt-upgrade-postinst:arm64 2\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovered/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovered/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovered/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovered/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wb3N0aW5zdApTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMgpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovered/database_files/3/fact/sha256",
+          "value": "b0410680dc742cedf54933c042f7fa5324f7064420f911fa32f0bf8a62e1a052"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovered/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtdXBncmFkZS1wb3N0aW5zdApTdGF0dXM6IGluc3RhbGwgb2sgaGFsZi1jb25maWd1cmVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMgpDb25maWctVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovered/database_files/4/fact/sha256",
+          "value": "dc1e281306e02d4eef0291c7f036425b14217c6d9c2022722d356072e94ad836"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/recovery_result/log",
+          "value": "<clock> startup packages configure\n<clock> configure debz-alt-upgrade-postinst:arm64 2 <none>\n<clock> status half-configured debz-alt-upgrade-postinst:arm64 2\n<clock> status installed debz-alt-upgrade-postinst:arm64 2\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/2/seed_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-upgrade-postinst:arm64 <none> 1\n<clock> status half-installed debz-alt-upgrade-postinst:arm64 1\n<clock> status unpacked debz-alt-upgrade-postinst:arm64 1\n<clock> configure debz-alt-upgrade-postinst:arm64 1 1\n<clock> status half-configured debz-alt-upgrade-postinst:arm64 1\n<clock> status installed debz-alt-upgrade-postinst:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/archives/1/sha256",
+          "value": "a33772c86e18c0d04ea3f0fac165c53a6501b4442601f08b4313d5cb1d1e2665"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/archives/2/sha256",
+          "value": "070a8983e977742872181bbea6b28d1c6e872166c604eb5c6b5c4941284187e7"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/failed/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/failed/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/failed/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/failed/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcmVtb3ZlLXBvc3RybQpTdGF0dXM6IGRlaW5zdGFsbCBvayBoYWxmLWluc3RhbGxlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKQ29uZmlnLVZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/failed/database_files/3/fact/sha256",
+          "value": "81c845d9c5553a59dfdd9accf7540c3f9ccd03054d1440cba63aca9c75f5e6c3"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/failed/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcmVtb3ZlLXBvc3RybQpTdGF0dXM6IGluc3RhbGwgb2sgaW5zdGFsbGVkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQoK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/failed/database_files/4/fact/sha256",
+          "value": "0a4ff5dc730abcc5d94b6f8a25859c3ad13883d5145b4b11e45ef9f14b88e735"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/operation_result/log",
+          "value": "<clock> startup packages remove\n<clock> status installed debz-alt-remove-postrm:arm64 1\n<clock> remove debz-alt-remove-postrm:arm64 1 <none>\n<clock> status half-configured debz-alt-remove-postrm:arm64 1\n<clock> status half-installed debz-alt-remove-postrm:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovered/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovered/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovered/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovered/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcmVtb3ZlLXBvc3RybQpTdGF0dXM6IGRlaW5zdGFsbCBvayBjb25maWctZmlsZXMKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkNvbmZpZy1WZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovered/database_files/3/fact/sha256",
+          "value": "d4752020840ed6c8f81a6d5eac6b977b691f98407b22e8615f4d991c7570fe7d"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovered/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtcmVtb3ZlLXBvc3RybQpTdGF0dXM6IGRlaW5zdGFsbCBvayBoYWxmLWluc3RhbGxlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKQ29uZmlnLVZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovered/database_files/4/fact/sha256",
+          "value": "81c845d9c5553a59dfdd9accf7540c3f9ccd03054d1440cba63aca9c75f5e6c3"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/recovery_result/log",
+          "value": "<clock> startup packages remove\n<clock> status half-installed debz-alt-remove-postrm:arm64 1\n<clock> remove debz-alt-remove-postrm:arm64 1 <none>\n<clock> status config-files debz-alt-remove-postrm:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/failure_recovery/3/seed_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-remove-postrm:arm64 <none> 1\n<clock> status half-installed debz-alt-remove-postrm:arm64 1\n<clock> status unpacked debz-alt-remove-postrm:arm64 1\n<clock> configure debz-alt-remove-postrm:arm64 1 1\n<clock> status half-configured debz-alt-remove-postrm:arm64 1\n<clock> status installed debz-alt-remove-postrm:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/archive/sha256",
+          "value": "d817f2da148b86cd9d936f83db49ad0b2979f592877f6f34aee99ed121596aea"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database/journal_latest/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/10/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtaW50ZXJydXB0ZWQKU3RhdHVzOiBpbnN0YWxsIG9rIHVucGFja2VkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQo="
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/10/fact/sha256",
+          "value": "52d00640a2798b7d6db61dfe0461f94702dd31ad60dc963a641e06fcaf390ed8"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/11/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtaW50ZXJydXB0ZWQKU3RhdHVzOiBpbnN0YWxsIG9rIGhhbGYtY29uZmlndXJlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUK"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/11/fact/sha256",
+          "value": "2a7ac620d6878565788a97c16ca2f35653bc9c059412cb7eef5d3d7aaf3f9b35"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/7/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtaW50ZXJydXB0ZWQKU3RhdHVzOiBpbnN0YWxsIHJlaW5zdHJlcSBoYWxmLWluc3RhbGxlZApBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEK"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/7/fact/sha256",
+          "value": "556ee2bae3e66ab8f97fec120a0027da096424bee5bd8b5e7fd48343ddddea5d"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/8/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtaW50ZXJydXB0ZWQKU3RhdHVzOiBpbnN0YWxsIHJlaW5zdHJlcSB1bnBhY2tlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUK"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/8/fact/sha256",
+          "value": "fc69db7786e7359e5e3a7aba0b1f4d0f975a597cf9b53bf0ec4483d118a57ecd"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/9/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtaW50ZXJydXB0ZWQKU3RhdHVzOiBpbnN0YWxsIG9rIHVucGFja2VkCk1haW50YWluZXI6IGRlYnogZml4dHVyZSA8Zml4dHVyZUBleGFtcGxlLmludmFsaWQ+CkFyY2hpdGVjdHVyZTogYXJtNjQKVmVyc2lvbjogMQpEZXNjcmlwdGlvbjogbmF0aXZlIGRhdGEtb25seSBtYXRlcmlhbGl6YXRpb24gZml4dHVyZQo="
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interrupted/database_files/9/fact/sha256",
+          "value": "52d00640a2798b7d6db61dfe0461f94702dd31ad60dc963a641e06fcaf390ed8"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/interruption_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-interrupted:arm64 <none> 1\n<clock> status half-installed debz-alt-interrupted:arm64 1\n<clock> status unpacked debz-alt-interrupted:arm64 1\n<clock> configure debz-alt-interrupted:arm64 1 1\n<clock> status half-configured debz-alt-interrupted:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovered/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovered/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovered/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovered/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtaW50ZXJydXB0ZWQKU3RhdHVzOiBpbnN0YWxsIG9rIGluc3RhbGxlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovered/database_files/3/fact/sha256",
+          "value": "470a4a6f03a6a1eb9aa1378d2f8baf9c09a04d37f9816b3405adca6f8330447f"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovered/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtaW50ZXJydXB0ZWQKU3RhdHVzOiBpbnN0YWxsIG9rIGhhbGYtY29uZmlndXJlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovered/database_files/4/fact/sha256",
+          "value": "6384b0a7d948ca56a1dce666b857588bed421f8dfe42330b413cfabf37f409b1"
+        },
+        {
+          "path": "/direct_dpkg/interruption_recovery/recovery_result/log",
+          "value": "<clock> startup packages configure\n<clock> configure debz-alt-interrupted:arm64 1 <none>\n<clock> status half-configured debz-alt-interrupted:arm64 1\n<clock> status installed debz-alt-interrupted:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/archive/sha256",
+          "value": "10411122735c2ce7521c9042421d634abb9a82ddf58b50d6ab0463fb9b43d8bd"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/install_result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-metadata:arm64 <none> 1\n<clock> status half-installed debz-alt-metadata:arm64 1\n<clock> status unpacked debz-alt-metadata:arm64 1\n<clock> configure debz-alt-metadata:arm64 1 1\n<clock> status half-configured debz-alt-metadata:arm64 1\n<clock> status installed debz-alt-metadata:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/installed/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/installed/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/installed/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/installed/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbWV0YWRhdGEKU3RhdHVzOiBpbnN0YWxsIG9rIGluc3RhbGxlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/installed/database_files/3/fact/sha256",
+          "value": "92de6aac371f6a26a30fcf319510e42d56484b70dae0d40888bfd275ee55b750"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/purged/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/purged/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/remove_result/log",
+          "value": "<clock> startup packages remove\n<clock> status installed debz-alt-metadata:arm64 1\n<clock> remove debz-alt-metadata:arm64 1 <none>\n<clock> status half-configured debz-alt-metadata:arm64 1\n<clock> status half-installed debz-alt-metadata:arm64 1\n<clock> status config-files debz-alt-metadata:arm64 1\n<clock> status not-installed debz-alt-metadata:arm64 <none>\n"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/removed/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/removed/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/removed/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbWV0YWRhdGEKU3RhdHVzOiBpbnN0YWxsIG9rIGluc3RhbGxlZApNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDEKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/scriptless_alternatives_member/removed/database_files/4/fact/sha256",
+          "value": "92de6aac371f6a26a30fcf319510e42d56484b70dae0d40888bfd275ee55b750"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/archives/1/sha256",
+          "value": "6afa776523301d132abc3a7fd62141f845cad57be657ada80453e462727ee117"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/archives/2/sha256",
+          "value": "b5c660444042bd641cb9e72b17a3230c4139175fa915ab6c37547cd2434255e6"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/0/result/log",
+          "value": "<clock> startup archives install\n<clock> install debz-alt-lifecycle:arm64 <none> 1\n<clock> status half-installed debz-alt-lifecycle:arm64 1\n<clock> status unpacked debz-alt-lifecycle:arm64 1\n<clock> configure debz-alt-lifecycle:arm64 1 1\n<clock> status half-configured debz-alt-lifecycle:arm64 1\n<clock> status installed debz-alt-lifecycle:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/0/state/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/0/state/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/0/state/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/0/state/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogaW5zdGFsbCBvayBpbnN0YWxsZWQKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/0/state/database_files/3/fact/sha256",
+          "value": "d53061aa9fe21a380a84a692e3fe5c2afdd5321343a270396bfdbb0a25848b57"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/result/log",
+          "value": "<clock> startup archives install\n<clock> upgrade debz-alt-lifecycle:arm64 1 1\n<clock> status half-configured debz-alt-lifecycle:arm64 1\n<clock> status unpacked debz-alt-lifecycle:arm64 1\n<clock> status half-installed debz-alt-lifecycle:arm64 1\n<clock> status unpacked debz-alt-lifecycle:arm64 1\n<clock> configure debz-alt-lifecycle:arm64 1 1\n<clock> status half-configured debz-alt-lifecycle:arm64 1\n<clock> status installed debz-alt-lifecycle:arm64 1\n"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/state/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/state/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/state/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/state/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogaW5zdGFsbCBvayBpbnN0YWxsZWQKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/state/database_files/3/fact/sha256",
+          "value": "d53061aa9fe21a380a84a692e3fe5c2afdd5321343a270396bfdbb0a25848b57"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/state/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogaW5zdGFsbCBvayBpbnN0YWxsZWQKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/1/state/database_files/4/fact/sha256",
+          "value": "d53061aa9fe21a380a84a692e3fe5c2afdd5321343a270396bfdbb0a25848b57"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/result/log",
+          "value": "<clock> startup archives install\n<clock> upgrade debz-alt-lifecycle:arm64 1 2\n<clock> status half-configured debz-alt-lifecycle:arm64 1\n<clock> status unpacked debz-alt-lifecycle:arm64 1\n<clock> status half-installed debz-alt-lifecycle:arm64 1\n<clock> status unpacked debz-alt-lifecycle:arm64 2\n<clock> configure debz-alt-lifecycle:arm64 2 2\n<clock> status half-configured debz-alt-lifecycle:arm64 2\n<clock> status installed debz-alt-lifecycle:arm64 2\n"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/state/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/state/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/state/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/state/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogaW5zdGFsbCBvayBpbnN0YWxsZWQKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAyCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/state/database_files/3/fact/sha256",
+          "value": "a299009d5f07c4c9ceaea2ea7908c347c29fef88303ae73ec58b61d820901d22"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/state/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogaW5zdGFsbCBvayBpbnN0YWxsZWQKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAxCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/2/state/database_files/4/fact/sha256",
+          "value": "d53061aa9fe21a380a84a692e3fe5c2afdd5321343a270396bfdbb0a25848b57"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/result/log",
+          "value": "<clock> startup packages remove\n<clock> status installed debz-alt-lifecycle:arm64 2\n<clock> remove debz-alt-lifecycle:arm64 2 <none>\n<clock> status half-configured debz-alt-lifecycle:arm64 2\n<clock> status half-installed debz-alt-lifecycle:arm64 2\n<clock> status config-files debz-alt-lifecycle:arm64 2\n"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/state/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/state/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/state/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/state/database_files/3/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogZGVpbnN0YWxsIG9rIGNvbmZpZy1maWxlcwpNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDIKQ29uZmlnLVZlcnNpb246IDIKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/state/database_files/3/fact/sha256",
+          "value": "3a9b31bf88566ecb65a12abc4bb45bfd15acddd17decda95efa5043a3b24a1b6"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/state/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogaW5zdGFsbCBvayBpbnN0YWxsZWQKTWFpbnRhaW5lcjogZGVieiBmaXh0dXJlIDxmaXh0dXJlQGV4YW1wbGUuaW52YWxpZD4KQXJjaGl0ZWN0dXJlOiBhcm02NApWZXJzaW9uOiAyCkRlc2NyaXB0aW9uOiBuYXRpdmUgZGF0YS1vbmx5IG1hdGVyaWFsaXphdGlvbiBmaXh0dXJlCgo="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/3/state/database_files/4/fact/sha256",
+          "value": "a299009d5f07c4c9ceaea2ea7908c347c29fef88303ae73ec58b61d820901d22"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/4/result/log",
+          "value": "<clock> startup packages purge\n<clock> status config-files debz-alt-lifecycle:arm64 2\n<clock> purge debz-alt-lifecycle:arm64 2 <none>\n<clock> status not-installed debz-alt-lifecycle:arm64 <none>\n"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/4/state/database_files/0/fact/bytes_base64",
+          "value": "YXJtNjQK"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/4/state/database_files/0/fact/sha256",
+          "value": "c1669e1d8edca98769c37d494b76442a1d6e5ffffd7b4da1fb63aef8ebaf6f01"
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/4/state/database_files/4/fact/bytes_base64",
+          "value": "UGFja2FnZTogZGViei1hbHQtbGlmZWN5Y2xlClN0YXR1czogZGVpbnN0YWxsIG9rIGNvbmZpZy1maWxlcwpNYWludGFpbmVyOiBkZWJ6IGZpeHR1cmUgPGZpeHR1cmVAZXhhbXBsZS5pbnZhbGlkPgpBcmNoaXRlY3R1cmU6IGFybTY0ClZlcnNpb246IDIKQ29uZmlnLVZlcnNpb246IDIKRGVzY3JpcHRpb246IG5hdGl2ZSBkYXRhLW9ubHkgbWF0ZXJpYWxpemF0aW9uIGZpeHR1cmUKCg=="
+        },
+        {
+          "path": "/direct_dpkg/successful_lifecycle/phases/4/state/database_files/4/fact/sha256",
+          "value": "3a9b31bf88566ecb65a12abc4bb45bfd15acddd17decda95efa5043a3b24a1b6"
+        }
+      ],
+      "execution": {
+        "artifact": {
+          "id": 10609708158,
+          "name": "dpkg-oracle-execution-evidence-arm64-f3132ef5fa554b7bbfbfa73a84983632bd08ff68",
+          "size": 50924
+        },
+        "evidence_manifest": {
+          "path": "dpkg-oracle-execution-evidence-arm64-v1.json",
+          "sha256": "c2717c576f7a231966dff09b6a547a6aa48dca526d70b46356e77a9bc7445ed2",
+          "size": 4847
+        },
+        "executed_reference": {
+          "path": "tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json",
+          "sha256": "51af34c1c6621b5164eeed3f05002ecabd9fcc0e6eba298e042c693da46bce03",
+          "size": 725123
+        },
+        "invocation_clock": "2026-09-20T16:29:21.965+00:00",
+        "job_id": 106120369829,
+        "run_id": 35526836596,
+        "source_commit": "f3132ef5fa554b7bbfbfa73a84983632bd08ff68",
+        "workflow_path": ".github/workflows/ci.yml"
+      },
+      "observation": {
+        "path": "dpkg-alternatives-reference-arm64-observed-v1.json",
+        "sha256": "cf2b4f92399c2c19281d62b6ab1ea266cd85887263bc273ac8857fe507deae8f",
+        "size": 694862
+      },
+      "tool_evidence": {
+        "archive_size": 1521436,
+        "dpkg_size": 396184,
+        "pinned_tool_binding": "source.dpkg.architectures.arm64",
+        "receipt_sha256": "ba45506b84e31bb8a9629b74dbabca884bc96af5a187ba8db41b2969122719b2",
+        "receipt_size": 582,
+        "update_alternatives_size": 67840
+      }
+    },
+    "baseline": {
+      "architecture": "amd64",
+      "observation_sha256": "1ad5dc5cae9c02bd98531647dad6d7f7ff953ceed44ef4553a9c1dd1dd4a8b16",
+      "observation_size": 694862
+    }
+  },
   "boundary": {
-    "architecture_scope": "Observed behavior is published for amd64 only. The arm64 archive and executable digests are pinned as inputs, but arm64 execution must be run and reviewed separately; this oracle rejects arm64 publication.",
+    "architecture_scope": "Observed dpkg/update-alternatives behavior is published for amd64 and arm64; common behavior is stored once with exact arm64 differences.",
     "architectures": [
       "amd64",
       "arm64"
@@ -44,7 +858,10 @@
       "subprocess_cleanup_seconds": 2,
       "subprocess_timeout_seconds": 30
     },
-    "observed_architecture": "amd64"
+    "observed_architectures": [
+      "amd64",
+      "arm64"
+    ]
   },
   "native_requirements": [
     "Keep the current alternatives archive-member and installed-state guards fail-closed until a reviewed native contract revision is admitted.",
@@ -55,7 +872,7 @@
     "Retain opaque package .alternatives members with exact bytes, modes, ownership, replacement, removal, purge, failure, and recovery visibility even though direct dpkg 1.22.22 does not interpret them.",
     "Reject malformed, oversized, non-regular, traversing, absolute-escape, symlink-mediated, and cyclic state before native mutation, with bounded diagnostics and no host namespace access.",
     "Bind native execution to reviewed dpkg/update-alternatives versions, architecture-specific executable digests, package/archive identities, invocation evidence, and bounded repository-local roots.",
-    "Run and review this executable oracle natively on arm64 before publishing any arm64 behavior or claiming cross-architecture parity."
+    "Preserve the reviewed native amd64 and arm64 execution evidence, exact architecture-specific differences, version and digest pins, and fail-closed publication checks when revising this contract."
   ],
   "observed_behavior": {
     "direct_dpkg": {
@@ -11778,7 +12595,11 @@
       "version": "1.22.22"
     },
     "fixture_packages": {
-      "architecture": "amd64",
+      "architectures": [
+        "amd64",
+        "arm64"
+      ],
+      "baseline_architecture": "amd64",
       "clock_epoch": 1700000000,
       "maintainer": "debz fixture <fixture@example.invalid>",
       "namespace": "debz-alt-*",

@@ -612,7 +612,7 @@ pub fn build(b: *std.Build) void {
     );
     dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
     test_step.dependOn(&dpkg_config_reference_tests.step);
-    b.step("test-dpkg-config-reference", "Verify amd64 direct pinned-dpkg config control-member behavior")
+    b.step("test-dpkg-config-reference", "Verify pinned-dpkg config control-member behavior")
         .dependOn(&dpkg_config_reference.step);
 
     const dpkg_alternatives_reference = b.addSystemCommand(&.{
@@ -626,8 +626,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&dpkg_alternatives_reference_tests.step);
     b.step(
         "test-dpkg-alternatives-reference",
-        "Verify amd64 pinned dpkg/update-alternatives records, links, lifecycle and recovery",
+        "Verify pinned dpkg/update-alternatives records, links, lifecycle and recovery",
     ).dependOn(&dpkg_alternatives_reference.step);
+    const dpkg_oracle_evidence_tests = b.addSystemCommand(
+        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_oracle_evidence.py" },
+    );
+    test_step.dependOn(&dpkg_oracle_evidence_tests.step);
 
     const native_lifecycle_tests = b.addTest(.{
         .root_module = debz,
@@ -761,6 +765,15 @@ pub fn build(b: *std.Build) void {
         for ([_]*std.Build.Step.Run{
             native_materialization, native_conffiles, dpkg_config_reference, dpkg_alternatives_reference, native_lifecycle, native_triggers, native_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
+    }
+    if (b.option(
+        []const u8,
+        "native-reference-architecture",
+        "Explicit architecture for pinned dpkg reference oracles",
+    )) |architecture| {
+        for ([_]*std.Build.Step.Run{
+            dpkg_config_reference, dpkg_alternatives_reference,
+        }) |runner| runner.addArgs(&.{ "--architecture", architecture });
     }
     if (b.option(
         []const u8,
@@ -1057,6 +1070,8 @@ fn installReleaseFiles(
         "native-install-result-v1.json",
         "dpkg-alternatives-reference-v1.json",
         "dpkg-config-reference-v1.json",
+        "dpkg-oracle-execution-evidence-v1.json",
+        "native-dpkg-reference-receipt-v1.json",
         "vendor-state-inventory-v1.json",
         "vendor-state-reference-v1.json",
     };

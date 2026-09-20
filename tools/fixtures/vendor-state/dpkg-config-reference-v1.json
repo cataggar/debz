@@ -1,6 +1,371 @@
 {
+  "architecture_evidence": {
+    "arm64": {
+      "comparison": "All 78 differences are package-architecture identity or bytes, sizes, and digests derived from that identity; commands, exits, maintainer-script traces and environments, config non-execution, package states, journal semantics, and frontend exclusion are identical.",
+      "difference_count": 78,
+      "difference_summary": {
+        "architecture_derived_sha256": 27,
+        "architecture_derived_sizes": 6,
+        "architecture_fields": 45
+      },
+      "differences_from_baseline": [
+        {
+          "path": "/failure_recovery/0/failed_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/0/failed_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/0/recovery_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/0/recovery_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/1/failed_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/1/failed_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/1/recovery_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/1/recovery_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/2/failed_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/2/failed_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/3/failed_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/3/failed_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/4/failed_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/4/failed_filesystem/info/2/sha256",
+          "value": "ea72b2f3952dd2f986b852f4126a306f76e94eddd63b3f54cff45a3d01a1bca4"
+        },
+        {
+          "path": "/failure_recovery/4/failed_filesystem/info/2/size",
+          "value": 27
+        },
+        {
+          "path": "/failure_recovery/4/failed_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/4/recovery_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/4/recovery_filesystem/info/0/sha256",
+          "value": "ea72b2f3952dd2f986b852f4126a306f76e94eddd63b3f54cff45a3d01a1bca4"
+        },
+        {
+          "path": "/failure_recovery/4/recovery_filesystem/info/0/size",
+          "value": 27
+        },
+        {
+          "path": "/failure_recovery/4/recovery_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/5/failed_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/failure_recovery/5/failed_filesystem/info/0/sha256",
+          "value": "ead5422085c3a0d3c789a8da58ff98b3769f4368d27f4847d5c7e313d4060099"
+        },
+        {
+          "path": "/failure_recovery/5/failed_filesystem/info/0/size",
+          "value": 5
+        },
+        {
+          "path": "/failure_recovery/5/failed_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/0/interrupted_database/journal_latest/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/0/recovery_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/0/recovery_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/1/interrupted_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/1/interrupted_database/journal_latest/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/1/interrupted_filesystem/staging/2/sha256",
+          "value": "009019776b1f1310b18738fab7981c07f1686e887c4ae00c2d2d50b936b19e9b"
+        },
+        {
+          "path": "/interruption_recovery/1/recovery_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/1/recovery_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/2/interrupted_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/2/interrupted_database/journal_latest/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/2/interrupted_filesystem/info/2/sha256",
+          "value": "ea72b2f3952dd2f986b852f4126a306f76e94eddd63b3f54cff45a3d01a1bca4"
+        },
+        {
+          "path": "/interruption_recovery/2/interrupted_filesystem/info/2/size",
+          "value": 27
+        },
+        {
+          "path": "/interruption_recovery/2/recovery_database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/interruption_recovery/2/recovery_filesystem/info/0/sha256",
+          "value": "ea72b2f3952dd2f986b852f4126a306f76e94eddd63b3f54cff45a3d01a1bca4"
+        },
+        {
+          "path": "/interruption_recovery/2/recovery_filesystem/info/0/size",
+          "value": 27
+        },
+        {
+          "path": "/interruption_recovery/2/recovery_state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/package_inputs/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/package_inputs/lifecycle/0/archive/sha256",
+          "value": "89c48b007152e3c056646846d5e839b3f1450c30c9b86c615a86ceeaec5f1c40"
+        },
+        {
+          "path": "/package_inputs/lifecycle/0/control/2/sha256",
+          "value": "4abb0bc31b822aeacfaa2f5532972fd3106d50818f935213ad32986ce0ee6d4f"
+        },
+        {
+          "path": "/package_inputs/lifecycle/1/archive/sha256",
+          "value": "0aba42ab2e9e1119ed428df28a6ad884e16d12336787dee46e13761620b3bc94"
+        },
+        {
+          "path": "/package_inputs/lifecycle/1/control/2/sha256",
+          "value": "4abb0bc31b822aeacfaa2f5532972fd3106d50818f935213ad32986ce0ee6d4f"
+        },
+        {
+          "path": "/package_inputs/lifecycle/2/archive/sha256",
+          "value": "9a89f6a334631b6bfe597e99fc369bb481db2e3d5e623b5e380850d0af8535d1"
+        },
+        {
+          "path": "/package_inputs/lifecycle/2/control/2/sha256",
+          "value": "009019776b1f1310b18738fab7981c07f1686e887c4ae00c2d2d50b936b19e9b"
+        },
+        {
+          "path": "/package_inputs/vendor/0/archive/sha256",
+          "value": "0ab81059897ad7758b86c2c72f433e8d08b2489948745895ffd2caff6d90f295"
+        },
+        {
+          "path": "/package_inputs/vendor/0/control/1/sha256",
+          "value": "08a99758a2997f4d638d4578062e4acccfb914bbec11d2585b13bc62daef589b"
+        },
+        {
+          "path": "/package_inputs/vendor/1/archive/sha256",
+          "value": "0327c6ec7032a545d40a706c503172a609caa918884fa680643d161f83e80cb9"
+        },
+        {
+          "path": "/package_inputs/vendor/1/control/1/sha256",
+          "value": "cff27956207842efb6d45a137ff543c468fd742f1c2998a1d9ff1b0e805e6980"
+        },
+        {
+          "path": "/package_inputs/vendor/2/archive/sha256",
+          "value": "20a8ea92fb6dd53e2017d987ef45c4c256252557e0fade3b5b3896099883b7a0"
+        },
+        {
+          "path": "/package_inputs/vendor/2/control/1/sha256",
+          "value": "03818fc7926d5bffa4ee9dc892b4f8ec8e29f510d2ab5e415cfbf23eb6b360de"
+        },
+        {
+          "path": "/package_inputs/vendor/3/archive/sha256",
+          "value": "dc839dcfecdb5423e9900e50e5a784c74569d832415fea4f22eff4c96118ca58"
+        },
+        {
+          "path": "/package_inputs/vendor/3/control/1/sha256",
+          "value": "47d5fd75b70a1658f10d8ffaa9b483aa347310037747b4d6e98be551707c04a8"
+        },
+        {
+          "path": "/package_inputs/vendor/4/archive/sha256",
+          "value": "33e7190d9dc9671d8a362f8426c1e0d450e2ce9f5ab276f897b782cbab1068af"
+        },
+        {
+          "path": "/package_inputs/vendor/4/control/1/sha256",
+          "value": "7db66c26bc484275183c0d5e3c2a006a6f82d0f69b13faeb8480d243415a793d"
+        },
+        {
+          "path": "/package_inputs/vendor/5/archive/sha256",
+          "value": "0775b5c5927a27b6d8c5fd98492a1c4a4ca0061188fbcc39ff134e64fd7c041e"
+        },
+        {
+          "path": "/package_inputs/vendor/5/control/1/sha256",
+          "value": "b6a3048e2fd3bda9d2761cac67db705c0619756ae88c7505ac6f47d3561063cd"
+        },
+        {
+          "path": "/package_inputs/vendor/6/archive/sha256",
+          "value": "d9b485f1b1fb91e11a6efbed4a11fd18b754480a8a699c5809f0f55a8ebd5e6c"
+        },
+        {
+          "path": "/package_inputs/vendor/6/control/1/sha256",
+          "value": "5f9f10aa45b6f7f148487669a652e0bd151702e95e276ba8934f2f77eba25a2d"
+        },
+        {
+          "path": "/successful_lifecycle/0/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/successful_lifecycle/0/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/successful_lifecycle/1/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/successful_lifecycle/1/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/successful_lifecycle/2/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/successful_lifecycle/2/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/successful_lifecycle/3/database/committed/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/successful_lifecycle/3/filesystem/info/0/sha256",
+          "value": "ea72b2f3952dd2f986b852f4126a306f76e94eddd63b3f54cff45a3d01a1bca4"
+        },
+        {
+          "path": "/successful_lifecycle/3/filesystem/info/0/size",
+          "value": 27
+        },
+        {
+          "path": "/successful_lifecycle/3/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/vendor_identity_cohort/installed_state/0/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/vendor_identity_cohort/installed_state/1/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/vendor_identity_cohort/installed_state/2/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/vendor_identity_cohort/installed_state/3/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/vendor_identity_cohort/installed_state/4/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/vendor_identity_cohort/installed_state/5/state/architecture",
+          "value": "arm64"
+        },
+        {
+          "path": "/vendor_identity_cohort/installed_state/6/state/architecture",
+          "value": "arm64"
+        }
+      ],
+      "execution": {
+        "artifact": {
+          "id": 10609708158,
+          "name": "dpkg-oracle-execution-evidence-arm64-f3132ef5fa554b7bbfbfa73a84983632bd08ff68",
+          "size": 50924
+        },
+        "evidence_manifest": {
+          "path": "dpkg-oracle-execution-evidence-arm64-v1.json",
+          "sha256": "c2717c576f7a231966dff09b6a547a6aa48dca526d70b46356e77a9bc7445ed2",
+          "size": 4847
+        },
+        "executed_reference": {
+          "path": "tools/fixtures/vendor-state/dpkg-config-reference-v1.json",
+          "sha256": "0424d79499e0ec2874db98625a38ceec62cadeb05378516ff61d80702bd2d290",
+          "size": 92159
+        },
+        "invocation_clock": "2026-09-20T16:29:21.965+00:00",
+        "job_id": 106120369829,
+        "run_id": 35526836596,
+        "source_commit": "f3132ef5fa554b7bbfbfa73a84983632bd08ff68",
+        "workflow_path": ".github/workflows/ci.yml"
+      },
+      "observation": {
+        "path": "dpkg-config-reference-arm64-observed-v1.json",
+        "sha256": "14ffaae4574d4965c26b8a054c8ef946c150e9614c78addf28e22497b6eee792",
+        "size": 75057
+      },
+      "tool_evidence": {
+        "archive_size": 1521436,
+        "dpkg_size": 396184,
+        "pinned_tool_binding": "source.dpkg.architectures.arm64",
+        "receipt_sha256": "ba45506b84e31bb8a9629b74dbabca884bc96af5a187ba8db41b2969122719b2",
+        "receipt_size": 582,
+        "update_alternatives_size": 67840
+      }
+    },
+    "baseline": {
+      "architecture": "amd64",
+      "observation_sha256": "7215a36cf8611c75fc7e7d92f2f56cca3d2d17098d0c973f962ad7034434c882",
+      "observation_size": 75058
+    }
+  },
   "boundary": {
-    "architecture_scope": "vendor config facts cover amd64 and arm64; direct-dpkg lifecycle execution is published for amd64 only",
+    "architecture_scope": "vendor config facts and direct-dpkg lifecycle execution are published for amd64 and arm64; common behavior is stored once with exact arm64 differences",
     "architectures": [
       "amd64",
       "arm64"
@@ -34,7 +399,10 @@
       "pause_timeout_seconds": 10,
       "subprocess_timeout_seconds": 60
     },
-    "observed_architecture": "amd64",
+    "observed_architectures": [
+      "amd64",
+      "arm64"
+    ],
     "operations": [
       "install",
       "reinstall",
@@ -332,32 +700,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -425,32 +793,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -521,32 +889,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
-              "size": 1718,
+              "sha256": "43bfb369d1cf5cad4fb0ff4f34023741cb18b0868db7bf1fa7183d9aff6f908b",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
-              "size": 1710,
+              "sha256": "f3dc0f275b369a867cd117bf888507722119cdefacc69a6fc24a0c3bec758bc1",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
-              "size": 1714,
+              "sha256": "32916c367c57a0c29bc7d4e82936cb1cb95017868628ab2c185a9c245cd7bce2",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
-              "size": 1706,
+              "sha256": "04cdb7c0f2b82402bcd3e6dd4fff05f059e941d4c92ca66e0ff7bac4cee6ae38",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -617,32 +985,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
-              "size": 1718,
+              "sha256": "43bfb369d1cf5cad4fb0ff4f34023741cb18b0868db7bf1fa7183d9aff6f908b",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
-              "size": 1710,
+              "sha256": "f3dc0f275b369a867cd117bf888507722119cdefacc69a6fc24a0c3bec758bc1",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
-              "size": 1714,
+              "sha256": "32916c367c57a0c29bc7d4e82936cb1cb95017868628ab2c185a9c245cd7bce2",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
-              "size": 1706,
+              "sha256": "04cdb7c0f2b82402bcd3e6dd4fff05f059e941d4c92ca66e0ff7bac4cee6ae38",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -712,32 +1080,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -810,32 +1178,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -912,32 +1280,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -983,8 +1351,8 @@
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             }
           ],
@@ -1031,8 +1399,8 @@
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             }
           ],
@@ -1122,32 +1490,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -1209,32 +1577,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -1311,32 +1679,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -1377,32 +1745,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
-              "size": 1718,
+              "sha256": "43bfb369d1cf5cad4fb0ff4f34023741cb18b0868db7bf1fa7183d9aff6f908b",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
-              "size": 1710,
+              "sha256": "f3dc0f275b369a867cd117bf888507722119cdefacc69a6fc24a0c3bec758bc1",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
-              "size": 1714,
+              "sha256": "32916c367c57a0c29bc7d4e82936cb1cb95017868628ab2c185a9c245cd7bce2",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
-              "size": 1706,
+              "sha256": "04cdb7c0f2b82402bcd3e6dd4fff05f059e941d4c92ca66e0ff7bac4cee6ae38",
+              "size": 1728,
               "uid": 0
             }
           ]
@@ -1463,32 +1831,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
-              "size": 1718,
+              "sha256": "43bfb369d1cf5cad4fb0ff4f34023741cb18b0868db7bf1fa7183d9aff6f908b",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
-              "size": 1710,
+              "sha256": "f3dc0f275b369a867cd117bf888507722119cdefacc69a6fc24a0c3bec758bc1",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
-              "size": 1714,
+              "sha256": "32916c367c57a0c29bc7d4e82936cb1cb95017868628ab2c185a9c245cd7bce2",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
-              "size": 1706,
+              "sha256": "04cdb7c0f2b82402bcd3e6dd4fff05f059e941d4c92ca66e0ff7bac4cee6ae38",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -1567,32 +1935,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -1631,8 +1999,8 @@
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             }
           ],
@@ -1656,7 +2024,7 @@
       "lifecycle": [
         {
           "archive": {
-            "sha256": "a7ae891a0c5a0601de9bb65008c630c20d81ed18d9442901682c8ba6ae786cce",
+            "sha256": "1e1cccc3e2db393eff3fe026ff7ad7306e1be95c74274ce74e0c14f860284a6a",
             "size": 30912
           },
           "control": [
@@ -1696,32 +2064,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -1730,7 +2098,7 @@
         },
         {
           "archive": {
-            "sha256": "9e1849a622b6408f917016aaebc9cca3f5b305a875a3f6d6b01d5d220333e220",
+            "sha256": "a5f832d703afabede7e21d14e418eeed904409a8ffe5edba5ae3d7c103244ec2",
             "size": 30912
           },
           "control": [
@@ -1770,32 +2138,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "de235c2e50f3fc026f2c527b5ef75e87edd005a6fa79166641b74ce27804509e",
-              "size": 1722,
+              "sha256": "70a8be6e1636038e3348c6524efd7fc9b96814125199cd8dde5076b5bad9f978",
+              "size": 1744,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "bdfc34d18c2619012a7ba30731112129ef6126e43bba9bd9110ff84194eb76f4",
-              "size": 1714,
+              "sha256": "d54407b9d1a6a68551bc7614d79078803439d19f55535f9ca4229dc032eda2ac",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "eff99f756233db0394792e376579146fe9f14d82b80d352a44c173226597f748",
-              "size": 1718,
+              "sha256": "27e41ca6df9281f9886f3b7b393c6dde58afdc9e4ce8997a8844295a7afdce5d",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "19c6618eb4cfe11d7dd9da7e1900b971cc251e106f13b28f67e386e960b1449a",
-              "size": 1710,
+              "sha256": "dfae5ed330628dc10a98b8ba5005ea92652dfbad1039e19a867dc8da891747e3",
+              "size": 1732,
               "uid": 0
             }
           ],
@@ -1804,7 +2172,7 @@
         },
         {
           "archive": {
-            "sha256": "4a3a3e8dafe6ccda3d7dbcd1ac8b7c98f9c6eb21c828c338c9beaf19d3c50f59",
+            "sha256": "d8a38eb31988e13de1564904526177ec3a189e455febc6e40e9d2fef456adf48",
             "size": 30912
           },
           "control": [
@@ -1844,32 +2212,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
-              "size": 1718,
+              "sha256": "43bfb369d1cf5cad4fb0ff4f34023741cb18b0868db7bf1fa7183d9aff6f908b",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
-              "size": 1710,
+              "sha256": "f3dc0f275b369a867cd117bf888507722119cdefacc69a6fc24a0c3bec758bc1",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
-              "size": 1714,
+              "sha256": "32916c367c57a0c29bc7d4e82936cb1cb95017868628ab2c185a9c245cd7bce2",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
-              "size": 1706,
+              "sha256": "04cdb7c0f2b82402bcd3e6dd4fff05f059e941d4c92ca66e0ff7bac4cee6ae38",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -2189,32 +2557,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
-              "size": 1718,
+              "sha256": "7404946ccba549c0bb122ad6bf4f162ffd863e0ae3edeea69f45094f7b807d60",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
-              "size": 1710,
+              "sha256": "ac975259dcb162d0c4b1a4017fa92061973eac310addd93533be9e59c0c1c873",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
-              "size": 1714,
+              "sha256": "9f310b653c5bc96af2504d8d2476a55cc019fc90babb25d0e11eef264dd83cfa",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
-              "size": 1706,
+              "sha256": "6209060e733cac96cdea93b7b2e8d312be82dd4fa55ee20c291ddf9544d9afb2",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -2285,32 +2653,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "de235c2e50f3fc026f2c527b5ef75e87edd005a6fa79166641b74ce27804509e",
-              "size": 1722,
+              "sha256": "70a8be6e1636038e3348c6524efd7fc9b96814125199cd8dde5076b5bad9f978",
+              "size": 1744,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "bdfc34d18c2619012a7ba30731112129ef6126e43bba9bd9110ff84194eb76f4",
-              "size": 1714,
+              "sha256": "d54407b9d1a6a68551bc7614d79078803439d19f55535f9ca4229dc032eda2ac",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "eff99f756233db0394792e376579146fe9f14d82b80d352a44c173226597f748",
-              "size": 1718,
+              "sha256": "27e41ca6df9281f9886f3b7b393c6dde58afdc9e4ce8997a8844295a7afdce5d",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "19c6618eb4cfe11d7dd9da7e1900b971cc251e106f13b28f67e386e960b1449a",
-              "size": 1710,
+              "sha256": "dfae5ed330628dc10a98b8ba5005ea92652dfbad1039e19a867dc8da891747e3",
+              "size": 1732,
               "uid": 0
             }
           ],
@@ -2383,32 +2751,32 @@
               "gid": 0,
               "mode": "0755",
               "name": "postinst",
-              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
-              "size": 1718,
+              "sha256": "43bfb369d1cf5cad4fb0ff4f34023741cb18b0868db7bf1fa7183d9aff6f908b",
+              "size": 1740,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
-              "size": 1710,
+              "sha256": "f3dc0f275b369a867cd117bf888507722119cdefacc69a6fc24a0c3bec758bc1",
+              "size": 1732,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "preinst",
-              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
-              "size": 1714,
+              "sha256": "32916c367c57a0c29bc7d4e82936cb1cb95017868628ab2c185a9c245cd7bce2",
+              "size": 1736,
               "uid": 0
             },
             {
               "gid": 0,
               "mode": "0755",
               "name": "prerm",
-              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
-              "size": 1706,
+              "sha256": "04cdb7c0f2b82402bcd3e6dd4fff05f059e941d4c92ca66e0ff7bac4cee6ae38",
+              "size": 1728,
               "uid": 0
             }
           ],
@@ -2458,8 +2826,8 @@
               "gid": 0,
               "mode": "0755",
               "name": "postrm",
-              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
-              "size": 1710,
+              "sha256": "f3dc0f275b369a867cd117bf888507722119cdefacc69a6fc24a0c3bec758bc1",
+              "size": 1732,
               "uid": 0
             }
           ],
