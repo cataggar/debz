@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -58,7 +60,10 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
         schema = json.loads(
             (ROOT / "schema/dpkg-alternatives-reference-v1.json").read_bytes()
         )
-        jsonschema.Draft202012Validator(schema).validate(reference)
+        jsonschema.Draft202012Validator(
+            schema,
+            format_checker=jsonschema.FormatChecker(),
+        ).validate(reference)
         self.assertEqual(
             (
                 ROOT
@@ -86,6 +91,21 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
                 for architecture, pins in oracle.m.reference_dpkg.PINS.items()
             },
         )
+        self.assertEqual(
+            reference["source"]["dpkg"]["configuration_sha256"],
+            hashlib.sha256(oracle.config.PINNED_DPKG_CONFIG).hexdigest(),
+        )
+        self.assertEqual(
+            reference["boundary"]["invocation_clock"]["task_invocation"],
+            oracle.CANONICAL_TASK_INVOCATION,
+        )
+
+        invalid = copy.deepcopy(reference)
+        del invalid["observed_behavior"]["external_update_alternatives"][
+            "selection"
+        ]["steps"][0]["result"]["command"]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.Draft202012Validator(schema).validate(invalid)
 
     def test_publication_is_amd64_only(self) -> None:
         reference = oracle.load_reference()
@@ -226,6 +246,18 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
             "/usr/lib/provider",
         )
         self.assertEqual(attacks["self-referential-provider"]["result"]["exit"], 2)
+        self.assertEqual(attacks["indirect-symlink-cycle"]["result"]["exit"], 0)
+        self.assertIn(
+            "doesn't exist",
+            attacks["indirect-symlink-cycle"]["result"]["output"],
+        )
+        self.assertEqual(
+            attacks["indirect-symlink-cycle"]["provider"]["target"],
+            "/usr/bin/cycle-link",
+        )
+        self.assertIsNotNone(
+            attacks["indirect-symlink-cycle"]["state"]["record"]
+        )
 
         failures = external["atomicity"]["failure_injection"]
         self.assertTrue(all(item["result"]["exit"] == 2 for item in failures))
@@ -256,33 +288,38 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
         self.assertEqual(scriptless["purged"]["info"], [])
 
         phases = {
-            phase["operation"]: phase["state"]
+            phase["operation"]: phase
             for phase in direct["successful_lifecycle"]["phases"]
         }
-        self.assertEqual(phases["install"]["database"]["committed"]["status"], "install ok installed")
-        self.assertEqual(phases["upgrade"]["database"]["committed"]["version"], "2")
-        self.assertIsNotNone(phases["upgrade"]["alternatives"]["record"])
-        self.assertIsNone(phases["remove"]["alternatives"]["record"])
+        self.assertTrue(all(phase["result"]["exit"] == 0 for phase in phases.values()))
+        self.assertEqual(phases["install"]["state"]["database"]["committed"]["status"], "install ok installed")
+        self.assertEqual(phases["upgrade"]["state"]["database"]["committed"]["version"], "2")
+        self.assertIsNotNone(phases["upgrade"]["state"]["alternatives"]["record"])
+        self.assertIsNone(phases["remove"]["state"]["alternatives"]["record"])
         self.assertEqual(
-            [item["name"] for item in phases["remove"]["info"]],
+            [item["name"] for item in phases["remove"]["state"]["info"]],
             ["list", "postrm"],
         )
-        self.assertEqual(phases["purge"]["info"], [])
+        self.assertEqual(phases["purge"]["state"]["info"], [])
 
         conflict = direct["conflicting_packages"]
-        self.assertEqual(conflict["first_exit"], 0)
-        self.assertEqual(conflict["second_exit"], 1)
+        self.assertEqual(conflict["first_result"]["exit"], 0)
+        self.assertEqual(conflict["second_result"]["exit"], 1)
         self.assertIn(
             "trying to overwrite",
-            conflict["second_output"],
+            conflict["second_result"]["output"],
         )
         self.assertEqual(
-            base64.b64decode(conflict["shared_file"]["bytes_base64"]),
+            base64.b64decode(conflict["shared_file"]["fact"]["bytes_base64"]),
             b"first owner\n",
+        )
+        self.assertEqual(
+            conflict["shared_file"]["path"],
+            "usr/lib/debz-alternatives/package-conflict",
         )
 
         failures = {item["case"]: item for item in direct["failure_recovery"]}
-        self.assertEqual(failures["fresh-postinst"]["failed_exit"], 1)
+        self.assertEqual(failures["fresh-postinst"]["operation_result"]["exit"], 1)
         self.assertEqual(
             failures["fresh-postinst"]["failed"]["database"]["committed"]["status"],
             "install ok half-configured",
@@ -290,26 +327,83 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
         self.assertIsNotNone(
             failures["fresh-postinst"]["failed"]["alternatives"]["record"]
         )
-        self.assertEqual(failures["upgrade-prerm"]["failed_exit"], 0)
+        self.assertEqual(failures["upgrade-prerm"]["operation_result"]["exit"], 0)
         self.assertIn(
             "failed-upgrade",
-            "\n".join(failures["upgrade-prerm"]["failed"]["trace"]),
+            "\n".join(
+                " ".join([item["script"], *item["arguments"]])
+                for item in failures["upgrade-prerm"]["failed"]["trace"]
+            ),
         )
-        self.assertEqual(failures["upgrade-postinst"]["failed_exit"], 1)
-        self.assertEqual(failures["remove-postrm"]["failed_exit"], 1)
+        self.assertEqual(failures["upgrade-postinst"]["operation_result"]["exit"], 1)
+        self.assertEqual(failures["remove-postrm"]["operation_result"]["exit"], 1)
         self.assertIsNone(
             failures["remove-postrm"]["failed"]["alternatives"]["record"]
         )
-        self.assertTrue(all(item["recovery_exit"] == 0 for item in failures.values()))
+        self.assertTrue(
+            all(item["recovery_result"]["exit"] == 0 for item in failures.values())
+        )
+        self.assertTrue(all(len(item["archives"]) == 2 for item in failures.values()))
 
         interruption = direct["interruption_recovery"]
+        self.assertEqual(interruption["interruption_result"]["exit"], -9)
         self.assertTrue(interruption["interrupted"]["database"]["journal_nonempty"])
         self.assertTrue(interruption["interrupted"]["database"]["temporary_update"])
         self.assertIsNotNone(interruption["interrupted"]["alternatives"]["record"])
+        self.assertEqual(interruption["recovery_result"]["exit"], 0)
         self.assertFalse(interruption["recovered"]["database"]["journal_nonempty"])
         self.assertEqual(
             interruption["recovered"]["database"]["committed"]["status"],
             "install ok installed",
+        )
+
+    def test_every_execution_binds_command_outcome_and_relevant_filesystem(self) -> None:
+        reference = oracle.load_reference()
+        results = []
+
+        def collect(value: object) -> None:
+            if isinstance(value, dict):
+                if set(value) == {"command", "exit", "log", "output"}:
+                    results.append(value)
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(reference["observed_behavior"])
+        self.assertEqual(len(results), 70)
+        self.assertTrue(
+            all(
+                result["command"][0]
+                in {"<pinned-dpkg>", "<pinned-update-alternatives>"}
+                for result in results
+            )
+        )
+        self.assertTrue(
+            all(str(ROOT) not in argument for result in results for argument in result["command"])
+        )
+        self.assertNotIn(str(ROOT), oracle.canonical_json(reference))
+
+        direct = reference["observed_behavior"]["direct_dpkg"]
+        states = [
+            phase["state"] for phase in direct["successful_lifecycle"]["phases"]
+        ]
+        self.assertTrue(all(state["database_files"] for state in states))
+        self.assertIn(
+            "var/lib/dpkg/lock",
+            {item["path"] for item in states[0]["database_files"]},
+        )
+        self.assertIn(
+            "var/lib/dpkg/info/debz-alt-lifecycle.alternatives",
+            {item["path"] for item in states[0]["all_info"]},
+        )
+        self.assertTrue(all(state["trace"] for state in states[:-2]))
+        self.assertTrue(
+            any(
+                item["path"].startswith("usr/lib/debz-alternatives/")
+                for item in states[0]["payload"]
+            )
         )
 
     def test_paths_records_scripts_and_native_guards_fail_closed(self) -> None:
@@ -355,6 +449,16 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
         (root / "etc/alternatives").symlink_to(escaped)
         with self.assertRaisesRegex(oracle.OracleError, "state directory is unsafe"):
             oracle.validate_root(root)
+
+    def test_subprocess_timeout_kills_the_complete_process_group(self) -> None:
+        output = self.workspace / "timeout.log"
+        with self.assertRaisesRegex(oracle.OracleError, "1-second timeout"):
+            oracle.run_bounded_process(
+                ["/bin/sh", "-c", "sleep 30"],
+                dict(oracle.ENVIRONMENT),
+                output,
+                timeout=1,
+            )
 
 
 if __name__ == "__main__":

@@ -11,9 +11,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import platform
 import re
 import resource
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
@@ -26,12 +28,14 @@ ROOT = Path(__file__).resolve().parents[1]
 REFERENCE = ROOT / "tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json"
 SCHEMA = "https://debz.dev/schema/dpkg-alternatives-reference-v1"
 TRACE = "var/log/debz-alternatives-oracle.trace"
+FD_ERRORS = "var/log/debz-alternatives-oracle.fd-errors"
 FAILURES = "debz-alternatives-oracle.failures"
 PAUSE = "debz-alternatives-oracle.pause"
 PAUSED = "debz-alternatives-oracle.paused"
 DPKG_LOG = "var/log/dpkg.log"
 ALT_LOG = "var/log/alternatives.log"
 GROUP = "debz-alternatives"
+CANONICAL_TASK_INVOCATION = "2026-09-20T12:22:59.658+00:00"
 ENVIRONMENT = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
     "LANG": "C",
@@ -42,6 +46,9 @@ LOG_CLOCK_PATTERN = re.compile(
     rb"(?m)^update-alternatives "
     rb"(?P<clock>[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}):"
 )
+DPKG_LOG_CLOCK_PATTERN = re.compile(
+    rb"(?m)^(?P<clock>[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}) "
+)
 
 
 CONFIG_SPEC = importlib.util.spec_from_file_location(
@@ -51,7 +58,6 @@ assert CONFIG_SPEC and CONFIG_SPEC.loader
 config = importlib.util.module_from_spec(CONFIG_SPEC)
 CONFIG_SPEC.loader.exec_module(config)
 m = config.m
-lifecycle = config.lifecycle
 
 
 class OracleError(RuntimeError):
@@ -73,8 +79,15 @@ class Limits:
     maximum_cases = 64
     maximum_info_files = 32
     maximum_info_bytes = 1024 * 1024
+    maximum_database_files = 64
+    maximum_database_bytes = 1024 * 1024
+    maximum_payload_files = 64
+    maximum_payload_bytes = 1024 * 1024
+    maximum_host_entries = 100_000
     maximum_archive_bytes = 8 * 1024 * 1024
+    dependency_timeout_seconds = 10
     subprocess_timeout_seconds = 30
+    subprocess_cleanup_seconds = 2
     pause_timeout_seconds = 10
 
 
@@ -117,6 +130,17 @@ def optional_regular(path: Path, maximum: int) -> bytes | None:
     return read_regular(path, maximum)
 
 
+def bounded_scandir(path: Path, maximum: int) -> list[os.DirEntry[str]]:
+    count = 0
+    with os.scandir(path) as entries:
+        for _ in entries:
+            count += 1
+            if count > maximum:
+                raise OracleError(f"directory entry count exceeds its limit: {path}")
+    with os.scandir(path) as entries:
+        return sorted(entries, key=lambda entry: os.fsencode(entry.name))
+
+
 def load_reference() -> dict[str, Any]:
     raw = read_regular(REFERENCE, Limits.maximum_total_record_bytes)
     reference = json.loads(raw)
@@ -134,8 +158,14 @@ def verify_file_binding(path: Path, binding: dict[str, Any]) -> None:
 
 
 def verify_source_bindings(reference: dict[str, Any]) -> dict[str, Any]:
-    if reference["boundary"]["limits"] != limit_contract():
+    boundary = reference["boundary"]
+    if boundary["limits"] != limit_contract():
         raise OracleError("published oracle limits changed")
+    if (
+        boundary["invocation_clock"]["task_invocation"]
+        != CANONICAL_TASK_INVOCATION
+    ):
+        raise OracleError("canonical task invocation binding changed")
     source = reference["source"]
     fixtures = ROOT / "tools/fixtures/vendor-state"
     vendor = source["vendor_reference"]
@@ -143,6 +173,10 @@ def verify_source_bindings(reference: dict[str, Any]) -> dict[str, Any]:
     verify_file_binding(fixtures / vendor["reference"]["path"], vendor["reference"])
     for manifest in vendor["manifests"]:
         verify_file_binding(fixtures / manifest["path"], manifest)
+    if [item["architecture"] for item in vendor["manifests"]] != boundary[
+        "architectures"
+    ]:
+        raise OracleError("vendor manifest architecture coverage changed")
     derived = json.loads(
         read_regular(
             fixtures / vendor["reference"]["path"],
@@ -164,9 +198,33 @@ def verify_source_bindings(reference: dict[str, Any]) -> dict[str, Any]:
         raise OracleError("vendor alternatives projection digest changed")
     if projection["group_names"] != [group["name"] for group in alternatives["groups"]]:
         raise OracleError("vendor alternatives group ordering changed")
+    derived_source = derived["source"]
+    expected_manifests = [
+        {
+            "architecture": item["architecture"],
+            "path": item["path"],
+            "sha256": item["sha256"],
+            "size": item["size"],
+        }
+        for item in derived_source["manifests"]
+    ]
+    if vendor["manifests"] != expected_manifests:
+        raise OracleError("vendor manifest bindings changed")
+    if vendor["index"] != derived_source["index"]:
+        raise OracleError("vendor index binding changed")
+    index_source = derived_source["index_source"]
+    if (
+        vendor["snapshot"] != index_source["snapshot_uri"]
+        or vendor["workflow_run"] != index_source["workflow_run_url"]
+    ):
+        raise OracleError("vendor invocation provenance changed")
 
     if source["dpkg"]["version"] != m.reference_dpkg.VERSION:
         raise OracleError("dpkg reference version binding changed")
+    if source["dpkg"]["configuration_sha256"] != sha256_bytes(
+        config.PINNED_DPKG_CONFIG
+    ):
+        raise OracleError("dpkg configuration binding changed")
     for architecture, pins in m.reference_dpkg.PINS.items():
         expected = source["dpkg"]["architectures"][architecture]
         if expected != {
@@ -175,6 +233,14 @@ def verify_source_bindings(reference: dict[str, Any]) -> dict[str, Any]:
             "update_alternatives_sha256": pins["update_alternatives"],
         }:
             raise OracleError(f"dpkg tool pins changed for {architecture}")
+    if source["fixture_packages"] != {
+        "architecture": "amd64",
+        "clock_epoch": m.EPOCH,
+        "maintainer": "debz fixture <fixture@example.invalid>",
+        "namespace": "debz-alt-*",
+        "package_builder": "repository deterministic Python ar/tar builder",
+    }:
+        raise OracleError("fixture package provenance changed")
     return derived
 
 
@@ -253,10 +319,8 @@ def validate_root(root: Path) -> Path:
 
 def validate_admin_records(root: Path) -> None:
     admin = validate_root(root) / "var/lib/dpkg/alternatives"
-    entries = sorted(os.scandir(admin), key=lambda entry: os.fsencode(entry.name))
+    entries = bounded_scandir(admin, Limits.maximum_groups)
     total = 0
-    if len(entries) > Limits.maximum_groups:
-        raise OracleError("alternatives record count exceeds its limit")
     for entry in entries:
         validate_name(entry.name.removesuffix(".dpkg-tmp"))
         metadata = entry.stat(follow_symlinks=False)
@@ -283,8 +347,22 @@ def make_root(path: Path, architecture: str, *, dpkg_runtime: bool = False) -> N
         (path / relative).mkdir(parents=True, exist_ok=True)
         (path / relative).chmod(0o755)
     if dpkg_runtime:
-        config.make_root(path, architecture, instrumented=False)
-        lifecycle.runtime.copy_program(path, Path("/bin/sleep"), "/bin/sleep")
+        copy_program(path, Path("/bin/sh"), "/bin/sh")
+        copy_program(path, Path("/bin/sleep"), "/bin/sleep")
+        for relative in config.FORBIDDEN_FRONTEND_PATHS:
+            if os.path.lexists(path / relative):
+                raise OracleError(
+                    f"ambient frontend contaminated fixture root: {relative}"
+                )
+        info = path / "var/lib/dpkg/info"
+        entries = bounded_scandir(info, 2)
+        if (
+            [entry.name for entry in entries] != ["format"]
+            or read_regular(info / "format", 16) != b"1\n"
+        ):
+            raise OracleError("ambient package metadata contaminated fixture root")
+        if os.path.lexists(path / "var/lib/dpkg/tmp.ci"):
+            raise OracleError("ambient control staging contaminated fixture root")
 
 
 def bound_child_resources() -> None:
@@ -294,6 +372,92 @@ def bound_child_resources() -> None:
     )
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+
+
+def run_bounded_process(
+    command: list[str],
+    environment: dict[str, str],
+    output: Path,
+    *,
+    timeout: int,
+) -> int:
+    with output.open("wb") as stream:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            preexec_fn=bound_child_resources,
+            start_new_session=True,
+            close_fds=True,
+        )
+        try:
+            result = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=Limits.pause_timeout_seconds)
+            raise OracleError(
+                f"subprocess exceeded its {timeout}-second timeout: {command[0]}"
+            ) from error
+    deadline = time.monotonic() + Limits.subprocess_cleanup_seconds
+    while True:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        if time.monotonic() >= deadline:
+            os.killpg(process.pid, signal.SIGKILL)
+            raise OracleError(f"subprocess left a live process group: {command[0]}")
+        time.sleep(0.01)
+    return result
+
+
+def copy_program(root: Path, source: Path, destination: str) -> None:
+    target = root / validate_absolute_path(destination).lstrip("/")
+    if os.path.lexists(target):
+        if target.is_symlink() or not target.is_file():
+            raise OracleError(f"fixture program destination is unsafe: {target}")
+        return
+    resolved = source.resolve(strict=True)
+    data = read_regular(resolved, Limits.maximum_archive_bytes)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved, target)
+    if data.startswith(b"#!"):
+        interpreter = shlex.split(data.split(b"\n", 1)[0][2:].decode())[0]
+        validate_absolute_path(interpreter)
+        copy_program(root, Path(interpreter), interpreter)
+        return
+
+    output = root / "var/log" / (
+        ".debz-alternatives-ldd-" + sha256_bytes(os.fsencode(destination)) + ".log"
+    )
+    try:
+        returncode = run_bounded_process(
+            ["ldd", str(resolved)],
+            dict(ENVIRONMENT),
+            output,
+            timeout=Limits.dependency_timeout_seconds,
+        )
+        dependencies = read_regular(output, Limits.maximum_output_bytes).decode(
+            errors="backslashreplace"
+        )
+    finally:
+        output.unlink(missing_ok=True)
+    static = any(
+        message in dependencies
+        for message in ("not a dynamic executable", "statically linked")
+    )
+    if returncode and not static:
+        raise OracleError(f"cannot inspect fixture libraries: {source}: {dependencies}")
+    if "=> not found" in dependencies:
+        raise OracleError(f"missing fixture library: {source}: {dependencies}")
+    for name in re.findall(r"(?:=>\s+|^\s*)(/[^\s]+)", dependencies, re.MULTILINE):
+        library = root / validate_absolute_path(name).lstrip("/")
+        library.parent.mkdir(parents=True, exist_ok=True)
+        resolved_library = Path(name).resolve(strict=True)
+        read_regular(resolved_library, Limits.maximum_archive_bytes)
+        shutil.copy2(resolved_library, library)
 
 
 def normalize_output(data: bytes, workspace: Path) -> str:
@@ -309,6 +473,53 @@ def normalize_alternatives_log(data: bytes, workspace: Path) -> str:
     normalized = data.replace(os.fsencode(workspace), b"<workspace>")
     normalized = LOG_CLOCK_PATTERN.sub(b"update-alternatives <clock>:", normalized)
     return normalized.decode(errors="backslashreplace")
+
+
+def normalize_dpkg_log(data: bytes, workspace: Path) -> str:
+    if len(data) > Limits.maximum_log_bytes:
+        raise OracleError("dpkg log exceeds its byte limit")
+    normalized = data.replace(os.fsencode(workspace), b"<workspace>")
+    normalized = DPKG_LOG_CLOCK_PATTERN.sub(b"<clock> ", normalized)
+    return normalized.decode(errors="backslashreplace")
+
+
+def normalize_command(
+    command: list[str],
+    workspace: Path,
+    executable: str,
+    label: str,
+) -> list[str]:
+    selected = []
+    for index, argument in enumerate(command):
+        if index == 0:
+            if argument != executable:
+                raise OracleError(f"{label} command did not select its pinned executable")
+            selected.append(f"<pinned-{label}>")
+        else:
+            selected.append(argument.replace(str(workspace), "<workspace>"))
+    return selected
+
+
+def log_delta(path: Path, before: bytes, maximum: int) -> bytes:
+    after = optional_regular(path, maximum) or b""
+    if not after.startswith(before):
+        raise OracleError(f"subprocess log was replaced instead of appended: {path}")
+    return after[len(before) :]
+
+
+def validate_log_clocks(
+    data: bytes,
+    pattern: re.Pattern[bytes],
+    started: int,
+    ended: int,
+    label: str,
+) -> None:
+    for match in pattern.finditer(data):
+        clock = time.mktime(
+            time.strptime(match.group("clock").decode(), "%Y-%m-%d %H:%M:%S")
+        )
+        if not started / 1_000_000_000 - 2 <= clock <= ended / 1_000_000_000 + 2:
+            raise OracleError(f"{label} log timestamp is outside the invocation window")
 
 
 def update_command(executable: str, root: Path, arguments: list[str]) -> list[str]:
@@ -337,7 +548,10 @@ def run_update(
     *,
     workspace: Path,
     raw: bool = False,
+    preflight: bool = True,
 ) -> dict[str, Any]:
+    if not raw and preflight:
+        validate_admin_records(root)
     command = (
         [
             executable,
@@ -350,33 +564,31 @@ def run_update(
         if raw
         else update_command(executable, root, arguments)
     )
+    log_before = optional_regular(root / ALT_LOG, Limits.maximum_log_bytes) or b""
     started = time.time_ns()
-    result = subprocess.run(
+    returncode = run_bounded_process(
         command,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        preexec_fn=bound_child_resources,
+        environment,
+        output,
         timeout=Limits.subprocess_timeout_seconds,
-        check=False,
     )
     ended = time.time_ns()
-    output.write_bytes(result.stdout)
-    if result.returncode not in (0, 2):
+    data = read_regular(output, Limits.maximum_output_bytes)
+    if returncode not in (0, 2):
         raise OracleError(
-            f"update-alternatives exited unexpectedly: {result.returncode}; {output}"
+            f"update-alternatives exited unexpectedly: {returncode}; {output}"
         )
-    log = optional_regular(root / ALT_LOG, Limits.maximum_log_bytes) or b""
-    for match in LOG_CLOCK_PATTERN.finditer(log):
-        clock = time.mktime(
-            time.strptime(match.group("clock").decode(), "%Y-%m-%d %H:%M:%S")
-        )
-        if not started / 1_000_000_000 - 2 <= clock <= ended / 1_000_000_000 + 2:
-            raise OracleError("alternatives log timestamp is outside the invocation window")
+    log = log_delta(root / ALT_LOG, log_before, Limits.maximum_log_bytes)
+    validate_log_clocks(log, LOG_CLOCK_PATTERN, started, ended, "alternatives")
     return {
-        "exit": result.returncode,
-        "output": normalize_output(result.stdout, workspace),
+        "command": normalize_command(
+            command,
+            workspace,
+            executable,
+            "update-alternatives",
+        ),
+        "exit": returncode,
+        "output": normalize_output(data, workspace),
         "log": normalize_alternatives_log(log, workspace),
     }
 
@@ -391,8 +603,11 @@ def write_target(root: Path, value: str, content: bytes) -> None:
     m.write(path, content, 0o755)
 
 
-def regular_fact(path: Path) -> dict[str, Any]:
-    data = read_regular(path, Limits.maximum_record_bytes)
+def regular_fact(
+    path: Path,
+    maximum: int = Limits.maximum_record_bytes,
+) -> dict[str, Any]:
+    data = read_regular(path, maximum)
     metadata = path.lstat()
     return {
         "bytes_base64": base64.b64encode(data).decode(),
@@ -451,7 +666,7 @@ def group_state(
     record_path = root / "var/lib/dpkg/alternatives" / name
     selectors = []
     alt_dir = root / "etc/alternatives"
-    for entry in sorted(os.scandir(alt_dir), key=lambda item: os.fsencode(item.name)):
+    for entry in bounded_scandir(alt_dir, Limits.maximum_linked_entries):
         if entry.name == "README":
             continue
         fact = optional_path_fact(Path(entry.path))
@@ -536,6 +751,7 @@ def observe_vendor_projection(
             raise OracleError(f"vendor group projection failed: {group['name']}")
         observations.append(
             {
+                "result": result,
                 "name": group["name"],
                 "record": state["record"],
                 "generic_links": state["generic_links"],
@@ -953,6 +1169,44 @@ def observe_attacks(
             "state": group_state(root, "cycle", ["/usr/bin/cycle"]),
         }
     )
+
+    root = directory / "indirect-cycle-root"
+    make_root(root, architecture)
+    write_target(root, "/usr/lib/cycle-provider", b"provider\n")
+    setup_result = run_update(
+        executable,
+        root,
+        [
+            "--install",
+            "/usr/bin/cycle-link",
+            "cycle-link",
+            "/usr/lib/cycle-provider",
+            "10",
+        ],
+        environment,
+        directory / "indirect-cycle-install.log",
+        workspace=workspace,
+    )
+    provider = root / "usr/lib/cycle-provider"
+    provider.unlink()
+    provider.symlink_to("/usr/bin/cycle-link")
+    result = run_update(
+        executable,
+        root,
+        ["--query", "cycle-link"],
+        environment,
+        directory / "indirect-cycle-query.log",
+        workspace=workspace,
+    )
+    raw_cases.append(
+        {
+            "case": "indirect-symlink-cycle",
+            "setup_result": setup_result,
+            "result": result,
+            "provider": optional_path_fact(provider),
+            "state": group_state(root, "cycle-link", ["/usr/bin/cycle-link"]),
+        }
+    )
     return {"oracle_rejections": results, "raw_tool_cases": raw_cases}
 
 
@@ -981,6 +1235,7 @@ def observe_atomicity(
             environment,
             directory / f"{label}.log",
             workspace=workspace,
+            preflight=False,
         )
         results.append(
             {
@@ -1027,11 +1282,24 @@ esac
 """
         identity = f"{package}@{version}:{kind}"
         scripts[kind] = f"""#!/bin/sh
-printf '%s' '{identity}' >> /{TRACE}
-for argument do
-    printf '\\t%s' "$argument" >> /{TRACE}
+if [ "${{DEBCONF_DB_FALLBACK+x}}" = x ] ||
+   [ "${{DEBCONF_DB_OVERRIDE+x}}" = x ] ||
+   [ "${{DEBCONF_DEBUG+x}}" = x ] ||
+   [ "${{DEBIAN_FRONTEND+x}}" = x ]; then
+    exit 24
+fi
+fds=''
+for fd in 0 1 2 3 4 5 6 7 8 9; do
+    if ( eval ": <&$fd" ) 2>> /{FD_ERRORS}; then
+        if [ -n "$fds" ]; then fds="$fds,"; fi
+        fds="$fds$fd"
+    fi
 done
-printf '\\n' >> /{TRACE}
+printf '%s\\t%d' '{identity}' "$#" >> /{TRACE}
+for argument do
+    printf '\\t%d:%s' "${{#argument}}" "$argument" >> /{TRACE}
+done
+printf '\\tcwd=%s\\tfds=%s\\n' "$PWD" "$fds" >> /{TRACE}
 {action}
 marker='{identity}:'"$1"
 if [ -f /{PAUSE} ]; then
@@ -1095,10 +1363,15 @@ def prepare_dpkg_root(
     update_alternatives: str,
 ) -> None:
     make_root(root, architecture, dpkg_runtime=True)
-    lifecycle.runtime.copy_program(
+    copy_program(
         root,
         Path(update_alternatives),
         "/usr/bin/update-alternatives",
+    )
+    copied = root / "usr/bin/update-alternatives"
+    m.reference_dpkg.verify_file(
+        copied,
+        m.reference_dpkg.PINS[architecture]["update_alternatives"],
     )
     m.write(root / TRACE, b"")
 
@@ -1108,7 +1381,7 @@ def package_info(root: Path, package: str) -> list[dict[str, Any]]:
     selected = []
     total = 0
     prefix = package + "."
-    for entry in sorted(os.scandir(info), key=lambda item: os.fsencode(item.name)):
+    for entry in bounded_scandir(info, Limits.maximum_info_files + 1):
         if not entry.name.startswith(prefix):
             continue
         fact = regular_fact(Path(entry.path))
@@ -1121,23 +1394,145 @@ def package_info(root: Path, package: str) -> list[dict[str, Any]]:
     return selected
 
 
-def trace_lines(root: Path) -> list[str]:
+def trace_lines(root: Path) -> list[dict[str, Any]]:
     data = read_regular(root / TRACE, Limits.maximum_output_bytes)
     lines = data.decode().splitlines()
     if len(lines) > 128:
         raise OracleError("maintainer-script trace exceeds its record limit")
-    return lines
+    records = []
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) < 4:
+            raise OracleError(f"malformed alternatives script trace: {line!r}")
+        try:
+            count = int(fields[1])
+        except ValueError as error:
+            raise OracleError("invalid alternatives script argument count") from error
+        if count > Limits.maximum_arguments or len(fields) != count + 4:
+            raise OracleError("alternatives script argument bounds changed")
+        arguments = []
+        for field in fields[2 : 2 + count]:
+            length, separator, value = field.partition(":")
+            if (
+                not separator
+                or not length.isdigit()
+                or int(length) != len(value)
+                or len(os.fsencode(value)) > Limits.maximum_argument_bytes
+            ):
+                raise OracleError("malformed alternatives script argument")
+            arguments.append(value)
+        attributes = {}
+        for field in fields[2 + count :]:
+            name, separator, value = field.partition("=")
+            if not separator or name in attributes:
+                raise OracleError("malformed alternatives script trace attributes")
+            attributes[name] = value
+        if attributes != {"cwd": "/", "fds": "0,1,2"}:
+            raise OracleError(
+                f"alternatives script cwd/fd contract changed: {attributes}"
+            )
+        records.append(
+            {
+                "script": fields[0],
+                "arguments": arguments,
+            }
+        )
+    errors = optional_regular(root / FD_ERRORS, Limits.maximum_output_bytes)
+    if errors is not None and len(errors) > Limits.maximum_output_bytes:
+        raise OracleError("alternatives script fd probe exceeded its byte limit")
+    return records
+
+
+def bounded_tree_facts(
+    root: Path,
+    bases: tuple[str, ...],
+    *,
+    maximum_files: int,
+    maximum_bytes: int,
+    excluded: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    selected = []
+    total = 0
+    visited = 0
+
+    def visit(directory: Path) -> None:
+        nonlocal total, visited
+        for entry in bounded_scandir(directory, maximum_files - visited):
+            visited += 1
+            item = Path(entry.path)
+            relative = item.relative_to(root).as_posix()
+            if any(
+                relative == prefix or relative.startswith(prefix + "/")
+                for prefix in excluded
+            ):
+                continue
+            metadata = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode) and not entry.is_symlink():
+                visit(item)
+                continue
+            fact = optional_path_fact(item)
+            if fact is None:
+                raise OracleError(f"observed fixture file disappeared: {item}")
+            if fact["kind"] == "regular":
+                total += fact["size"]
+            if total > maximum_bytes:
+                raise OracleError("observed fixture tree exceeds its byte limit")
+            selected.append({"path": relative, "fact": fact})
+            if len(selected) > maximum_files:
+                raise OracleError("observed fixture tree exceeds its file limit")
+
+    for base in bases:
+        path = root / base
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
+            raise OracleError(f"observed fixture tree is not a real directory: {path}")
+        visit(path)
+    return selected
+
+
+def database_files(root: Path) -> list[dict[str, Any]]:
+    return bounded_tree_facts(
+        root,
+        ("var/lib/dpkg",),
+        maximum_files=Limits.maximum_database_files,
+        maximum_bytes=Limits.maximum_database_bytes,
+        excluded=("var/lib/dpkg/alternatives", "var/lib/dpkg/info"),
+    )
+
+
+def all_info_files(root: Path) -> list[dict[str, Any]]:
+    return bounded_tree_facts(
+        root,
+        ("var/lib/dpkg/info",),
+        maximum_files=Limits.maximum_database_files,
+        maximum_bytes=Limits.maximum_info_bytes,
+    )
+
+
+def payload_files(root: Path) -> list[dict[str, Any]]:
+    return bounded_tree_facts(
+        root,
+        ("usr/lib/debz-alternatives", "usr/share/man/man1"),
+        maximum_files=Limits.maximum_payload_files,
+        maximum_bytes=Limits.maximum_payload_bytes,
+    )
 
 
 def dpkg_state(root: Path, package: str, group: str) -> dict[str, Any]:
     return {
+        "all_info": all_info_files(root),
         "alternatives": group_state(
             root,
             group,
             [f"/usr/bin/{group}", f"/usr/share/man/man1/{group}.1"],
         ),
         "database": config.database_state(root, package),
+        "database_files": database_files(root),
         "info": package_info(root, package),
+        "payload": payload_files(root),
         "trace": trace_lines(root),
     }
 
@@ -1148,8 +1543,36 @@ def run_dpkg(
     arguments: list[str],
     environment: dict[str, str],
     output: Path,
-) -> int:
-    return config.run_dpkg(executable, root, arguments, environment, output)
+    *,
+    workspace: Path,
+) -> dict[str, Any]:
+    validate_root(root)
+    if len(arguments) > Limits.maximum_arguments:
+        raise OracleError("dpkg argument count exceeds its limit")
+    for argument in arguments:
+        if "\x00" in argument or len(os.fsencode(argument)) > Limits.maximum_argument_bytes:
+            raise OracleError("dpkg argument exceeds its byte limit")
+    command = config.direct_dpkg_command(executable, root, arguments)
+    log_before = optional_regular(root / DPKG_LOG, Limits.maximum_log_bytes) or b""
+    started = time.time_ns()
+    returncode = run_bounded_process(
+        command,
+        environment,
+        output,
+        timeout=Limits.subprocess_timeout_seconds,
+    )
+    ended = time.time_ns()
+    data = read_regular(output, Limits.maximum_output_bytes)
+    if returncode not in (0, 1):
+        raise OracleError(f"direct dpkg exited unexpectedly: {returncode}; {output}")
+    log = log_delta(root / DPKG_LOG, log_before, Limits.maximum_log_bytes)
+    validate_log_clocks(log, DPKG_LOG_CLOCK_PATTERN, started, ended, "dpkg")
+    return {
+        "command": normalize_command(command, workspace, executable, "dpkg"),
+        "exit": returncode,
+        "output": normalize_output(data, workspace),
+        "log": normalize_dpkg_log(log, workspace),
+    }
 
 
 def set_marker(root: Path, relative: str, value: str | None) -> None:
@@ -1205,13 +1628,14 @@ def observe_successful_dpkg(
             arguments,
             environment,
             directory / f"{label}.log",
+            workspace=workspace,
         )
-        if result != 0:
+        if result["exit"] != 0:
             raise OracleError(f"successful alternatives lifecycle failed: {label}")
         phases.append(
             {
                 "operation": label,
-                "exit": result,
+                "result": result,
                 "state": dpkg_state(root, package, group),
             }
         )
@@ -1252,8 +1676,9 @@ def observe_scriptless_member(
         ["--install", str(archive)],
         environment,
         directory / "install.log",
+        workspace=workspace,
     )
-    if result != 0:
+    if result["exit"] != 0:
         raise OracleError("scriptless alternatives-member install failed")
     installed = dpkg_state(root, package, group)
     if installed["alternatives"]["record"] is not None:
@@ -1264,8 +1689,9 @@ def observe_scriptless_member(
         ["--remove", package],
         environment,
         directory / "remove.log",
+        workspace=workspace,
     )
-    if result_remove != 0:
+    if result_remove["exit"] != 0:
         raise OracleError("scriptless alternatives-member removal failed")
     removed = dpkg_state(root, package, group)
     result_purge = run_dpkg(
@@ -1274,17 +1700,18 @@ def observe_scriptless_member(
         ["--purge", package],
         environment,
         directory / "purge.log",
+        workspace=workspace,
     )
-    if result_purge != 0:
+    if result_purge["exit"] != 0:
         raise OracleError("scriptless alternatives-member purge failed")
     purged = dpkg_state(root, package, group)
     return {
         "archive": archive_fact(archive),
-        "install_exit": result,
+        "install_result": result,
         "installed": installed,
-        "remove_exit": result_remove,
+        "remove_result": result_remove,
         "removed": removed,
-        "purge_exit": result_purge,
+        "purge_result": result_purge,
         "purged": purged,
     }
 
@@ -1327,14 +1754,19 @@ def observe_conflicting_providers(
             arguments,
             environment,
             directory / f"{label}.log",
+            workspace=workspace,
         )
-        if result != 0:
+        if result["exit"] != 0:
             raise OracleError(f"conflicting-provider lifecycle failed: {label}")
         phases.append(
             {
                 "operation": label,
-                "exit": result,
+                "result": result,
                 "package": config.database_state(root, observed_package),
+                "all_info": all_info_files(root),
+                "database_files": database_files(root),
+                "info": package_info(root, observed_package),
+                "payload": payload_files(root),
                 "alternatives": group_state(
                     root,
                     group,
@@ -1343,7 +1775,12 @@ def observe_conflicting_providers(
                 "trace": trace_lines(root),
             }
         )
-    return {"phases": phases}
+    return {
+        "archives": {
+            package: archive_fact(archive) for package, archive in archives.items()
+        },
+        "phases": phases,
+    }
 
 
 def observe_conflicting_packages(
@@ -1378,24 +1815,26 @@ def observe_conflicting_packages(
     second = build(second_name, b"second owner\n")
     root = directory / "root"
     prepare_dpkg_root(root, architecture, update_alternatives)
-    first_exit = run_dpkg(
+    first_result = run_dpkg(
         dpkg,
         root,
         ["--install", str(first)],
         environment,
         directory / "first.log",
+        workspace=workspace,
     )
-    if first_exit != 0:
+    if first_result["exit"] != 0:
         raise OracleError("failed to seed package file-conflict case")
     second_log = directory / "second.log"
-    second_exit = run_dpkg(
+    second_result = run_dpkg(
         dpkg,
         root,
         ["--install", str(second)],
         environment,
         second_log,
+        workspace=workspace,
     )
-    if second_exit != 1:
+    if second_result["exit"] != 1:
         raise OracleError("conflicting package payload did not fail")
     shared_fact = regular_fact(root / shared)
     if base64.b64decode(shared_fact["bytes_base64"]) != b"first owner\n":
@@ -1410,16 +1849,18 @@ def observe_conflicting_packages(
     )
     return {
         "first_archive": archive_fact(first),
-        "first_exit": first_exit,
+        "first_result": first_result,
         "first_state": config.database_state(root, first_name),
         "second_archive": archive_fact(second),
-        "second_exit": second_exit,
-        "second_output": normalize_output(
-            read_regular(second_log, Limits.maximum_output_bytes),
-            workspace,
-        ),
+        "second_result": second_result,
         "second_status": second_status,
-        "shared_file": shared_fact,
+        "shared_file": {
+            "path": shared,
+            "fact": {"kind": "regular", **shared_fact},
+        },
+        "database_files": database_files(root),
+        "all_info": all_info_files(root),
+        "payload": payload_files(root),
     }
 
 
@@ -1449,14 +1890,17 @@ def failure_case(
     }
     root = directory / "root"
     prepare_dpkg_root(root, architecture, update_alternatives)
+    seed_result = None
     if case != "fresh-postinst":
-        if run_dpkg(
+        seed_result = run_dpkg(
             dpkg,
             root,
             ["--install", str(archives["1"])],
             environment,
             directory / "seed.log",
-        ):
+            workspace=workspace,
+        )
+        if seed_result["exit"]:
             raise OracleError(f"failed to seed alternatives failure case: {case}")
         m.write(root / TRACE, b"")
 
@@ -1479,36 +1923,42 @@ def failure_case(
     else:
         raise OracleError(f"unknown dpkg alternatives failure case: {case}")
     set_marker(root, FAILURES, marker)
-    failed_exit = run_dpkg(
+    operation_result = run_dpkg(
         dpkg,
         root,
         operation,
         environment,
         directory / "failed.log",
+        workspace=workspace,
     )
     expected_failed_exit = 0 if case == "upgrade-prerm" else 1
-    if failed_exit != expected_failed_exit:
+    if operation_result["exit"] != expected_failed_exit:
         raise OracleError(
             f"dpkg failure case exit changed: {case}: "
-            f"{failed_exit} != {expected_failed_exit}"
+            f"{operation_result['exit']} != {expected_failed_exit}"
         )
     failed = dpkg_state(root, package, group)
     set_marker(root, FAILURES, None)
-    recovery_exit = run_dpkg(
+    recovery_result = run_dpkg(
         dpkg,
         root,
         recovery,
         environment,
         directory / "recovery.log",
+        workspace=workspace,
     )
-    if recovery_exit != 0:
+    if recovery_result["exit"] != 0:
         raise OracleError(f"dpkg failure recovery did not settle: {case}")
     recovered = dpkg_state(root, package, group)
     return {
+        "archives": {
+            version: archive_fact(path) for version, path in archives.items()
+        },
         "case": case,
-        "failed_exit": failed_exit,
+        "seed_result": seed_result,
+        "operation_result": operation_result,
         "failed": failed,
-        "recovery_exit": recovery_exit,
+        "recovery_result": recovery_result,
         "recovered": recovered,
     }
 
@@ -1520,9 +1970,13 @@ def interrupt_dpkg(
     environment: dict[str, str],
     output: Path,
     marker: str,
-) -> None:
+    *,
+    workspace: Path,
+) -> dict[str, Any]:
     set_marker(root, PAUSE, marker)
     command = config.direct_dpkg_command(executable, root, arguments)
+    log_before = optional_regular(root / DPKG_LOG, Limits.maximum_log_bytes) or b""
+    started = time.time_ns()
     with output.open("wb") as stream:
         process = subprocess.Popen(
             command,
@@ -1532,6 +1986,7 @@ def interrupt_dpkg(
             stderr=subprocess.STDOUT,
             preexec_fn=bound_child_resources,
             start_new_session=True,
+            close_fds=True,
         )
         deadline = time.monotonic() + Limits.pause_timeout_seconds
         while time.monotonic() < deadline:
@@ -1546,10 +2001,20 @@ def interrupt_dpkg(
             raise OracleError("dpkg did not reach alternatives interruption")
         os.killpg(process.pid, signal.SIGKILL)
         result = process.wait(timeout=Limits.pause_timeout_seconds)
+    ended = time.time_ns()
     if result != -signal.SIGKILL:
         raise OracleError(f"interrupted dpkg returned unexpectedly: {result}")
+    data = read_regular(output, Limits.maximum_output_bytes)
+    log = log_delta(root / DPKG_LOG, log_before, Limits.maximum_log_bytes)
+    validate_log_clocks(log, DPKG_LOG_CLOCK_PATTERN, started, ended, "dpkg")
     set_marker(root, PAUSE, None)
     (root / PAUSED).unlink()
+    return {
+        "command": normalize_command(command, workspace, executable, "dpkg"),
+        "exit": result,
+        "output": normalize_output(data, workspace),
+        "log": normalize_dpkg_log(log, workspace),
+    }
 
 
 def observe_interruption(
@@ -1574,27 +2039,31 @@ def observe_interruption(
     )
     root = directory / "root"
     prepare_dpkg_root(root, architecture, update_alternatives)
-    interrupt_dpkg(
+    interruption_result = interrupt_dpkg(
         dpkg,
         root,
         ["--install", str(archive)],
         environment,
         directory / "interrupted.log",
         f"{package}@1:postinst:configure",
+        workspace=workspace,
     )
     interrupted = dpkg_state(root, package, group)
-    recovery_exit = run_dpkg(
+    recovery_result = run_dpkg(
         dpkg,
         root,
         ["--configure", package],
         environment,
         directory / "recovery.log",
+        workspace=workspace,
     )
-    if recovery_exit != 0:
+    if recovery_result["exit"] != 0:
         raise OracleError("interrupted alternatives package did not recover")
     return {
+        "archive": archive_fact(archive),
+        "interruption_result": interruption_result,
         "interrupted": interrupted,
-        "recovery_exit": recovery_exit,
+        "recovery_result": recovery_result,
         "recovered": dpkg_state(root, package, group),
     }
 
@@ -1744,13 +2213,17 @@ def select_references(
             "missing pinned references; run python3 tools/prepare-native-dpkg.py "
             "as the build user"
         )
-    return (
-        m.reference_dpkg.select(selected_dpkg, architecture),
-        m.reference_dpkg.select_update_alternatives(selected_update, architecture),
-    )
+    for path, key in (
+        (selected_dpkg, "executable"),
+        (selected_update, "update_alternatives"),
+    ):
+        if not path.is_absolute() or path.resolve(strict=True) != path:
+            raise OracleError("pinned reference must be an absolute, non-symlink path")
+        m.reference_dpkg.verify_file(path, m.reference_dpkg.PINS[architecture][key])
+    return str(selected_dpkg), str(selected_update)
 
 
-def host_path_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+def host_path_signature(path: Path) -> tuple[int, int, int, int, int, int] | None:
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -1766,21 +2239,121 @@ def host_path_signature(path: Path) -> tuple[int, int, int, int, int] | None:
     )
 
 
-def host_alternatives_signature() -> list[tuple[str, int, int, int, int]] | None:
-    root = Path("/var/lib/dpkg/alternatives")
+def host_tree_signature(root: Path) -> tuple[int, str] | None:
     try:
         metadata = root.lstat()
     except FileNotFoundError:
         return None
     if not stat.S_ISDIR(metadata.st_mode) or root.is_symlink():
-        raise OracleError("host alternatives database is not a real directory")
-    result = []
-    for entry in sorted(os.scandir(root), key=lambda item: os.fsencode(item.name)):
-        item = entry.stat(follow_symlinks=False)
-        result.append(
-            (entry.name, item.st_mode, item.st_size, item.st_mtime_ns, item.st_ino)
+        raise OracleError(f"host isolation path is not a real directory: {root}")
+    digest = hashlib.sha256()
+    count = 0
+
+    def visit(path: Path, relative: str) -> None:
+        nonlocal count
+        item = path.lstat()
+        count += 1
+        if count > Limits.maximum_host_entries:
+            raise OracleError(f"host isolation inventory exceeds its limit: {root}")
+        digest.update(os.fsencode(relative))
+        digest.update(b"\0")
+        digest.update(
+            (
+                f"{item.st_dev}:{item.st_ino}:{item.st_mode}:{item.st_size}:"
+                f"{item.st_mtime_ns}:{item.st_ctime_ns}"
+            ).encode()
         )
+        digest.update(b"\0")
+        if stat.S_ISLNK(item.st_mode):
+            target = os.readlink(path)
+            if len(os.fsencode(target)) > Limits.maximum_path_bytes:
+                raise OracleError(f"host symlink target exceeds its limit: {path}")
+            digest.update(os.fsencode(target))
+        elif stat.S_ISDIR(item.st_mode):
+            for entry in bounded_scandir(
+                path,
+                Limits.maximum_host_entries - count,
+            ):
+                child = f"{relative}/{entry.name}" if relative else entry.name
+                visit(Path(entry.path), child)
+
+    visit(root, "")
+    return count, digest.hexdigest()
+
+
+def host_any_path_signature(path: Path) -> tuple[Any, ...] | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    signature: tuple[Any, ...] = (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+    if stat.S_ISLNK(metadata.st_mode):
+        target = os.readlink(path)
+        if len(os.fsencode(target)) > Limits.maximum_path_bytes:
+            raise OracleError(f"host symlink target exceeds its limit: {path}")
+        signature += (target,)
+    return signature
+
+
+def host_alternatives_generic_signature() -> list[tuple[str, tuple[Any, ...] | None]]:
+    admin = Path("/var/lib/dpkg/alternatives")
+    try:
+        entries = bounded_scandir(admin, Limits.maximum_host_entries)
+    except FileNotFoundError:
+        return []
+    paths = set()
+    total = 0
+    for entry in entries:
+        path = Path(entry.path)
+        data = read_regular(path, Limits.maximum_record_bytes)
+        total += len(data)
+        if total > Limits.maximum_total_record_bytes:
+            raise OracleError("host alternatives records exceed their aggregate limit")
+        lines = data.splitlines()
+        if len(lines) < 3 or lines[0] not in (b"auto", b"manual"):
+            raise OracleError(f"host alternatives record is malformed: {path}")
+        index = 1
+        paths.add(os.fsdecode(lines[index]))
+        index += 1
+        while index < len(lines) and lines[index]:
+            if index + 1 >= len(lines):
+                raise OracleError(f"host alternatives record is truncated: {path}")
+            index += 1
+            paths.add(os.fsdecode(lines[index]))
+            index += 1
+    result = []
+    for value in sorted(paths, key=os.fsencode):
+        validate_absolute_path(value)
+        result.append((value, host_any_path_signature(Path(value))))
     return result
+
+
+def capture_host_state() -> dict[str, Any]:
+    return {
+        "alternatives_database": host_tree_signature(
+            Path("/var/lib/dpkg/alternatives")
+        ),
+        "alternatives_generic_links": host_alternatives_generic_signature(),
+        "alternatives_links": host_tree_signature(Path("/etc/alternatives")),
+        "dpkg_config": host_tree_signature(Path("/etc/dpkg")),
+        "dpkg_database": host_tree_signature(Path("/var/lib/dpkg")),
+        "alternatives_log": host_path_signature(Path("/var/log/alternatives.log")),
+        "dpkg_log": host_path_signature(Path("/var/log/dpkg.log")),
+    }
+
+
+def assert_host_unchanged(expected: dict[str, Any]) -> None:
+    observed = capture_host_state()
+    for name, signature in expected.items():
+        if observed[name] != signature:
+            raise OracleError(f"host {name.replace('_', ' ')} changed during observation")
 
 
 def main() -> int:
@@ -1795,18 +2368,12 @@ def main() -> int:
         parser.error("--print-observed and --update-reference are mutually exclusive")
     if os.geteuid() != 0:
         raise OracleError("dpkg alternatives reference execution requires root")
-    for command in ("dpkg", "ldd"):
+    for command in ("ldd",):
         if shutil.which(command) is None:
             raise OracleError(f"required reference tool is missing: {command}")
-    architecture = subprocess.run(
-        ["dpkg", "--print-architecture"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    ).stdout.strip()
-    if architecture not in ("amd64", "arm64"):
-        raise OracleError(f"unsupported reference architecture: {architecture}")
+    architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    if architecture is None:
+        raise OracleError(f"unsupported reference architecture: {platform.machine()}")
 
     reference = load_reference()
     derived = verify_source_bindings(reference)
@@ -1834,32 +2401,36 @@ def main() -> int:
             dir=temporary_root,
         )
 
-    host_status = host_path_signature(Path("/var/lib/dpkg/status"))
-    host_alt_log = host_path_signature(Path("/var/log/alternatives.log"))
-    host_database = host_alternatives_signature()
+    host_state = capture_host_state()
     observed: dict[str, Any] | None = None
-    with context as temporary:
-        workspace = Path(temporary)
-        environment["HOME"] = str(workspace / "home")
-        environment["TMPDIR"] = str(workspace / "tmp")
-        environment["SOURCE_DATE_EPOCH"] = str(m.EPOCH)
-        (workspace / "home").mkdir()
-        (workspace / "tmp").mkdir()
-        validate_environment(environment)
-        observed = observe(
-            workspace,
-            environment,
-            architecture,
-            dpkg,
-            update_alternatives,
-            derived,
+    try:
+        with context as temporary:
+            workspace = Path(temporary)
+            environment["HOME"] = str(workspace / "home")
+            environment["TMPDIR"] = str(workspace / "tmp")
+            environment["SOURCE_DATE_EPOCH"] = str(m.EPOCH)
+            (workspace / "home").mkdir()
+            (workspace / "tmp").mkdir()
+            validate_environment(environment)
+            config.validate_host_configuration(Path(environment["HOME"]))
+            observed = observe(
+                workspace,
+                environment,
+                architecture,
+                dpkg,
+                update_alternatives,
+                derived,
+            )
+    finally:
+        assert_host_unchanged(host_state)
+        m.reference_dpkg.verify_file(
+            Path(dpkg),
+            m.reference_dpkg.PINS[architecture]["executable"],
         )
-    if host_path_signature(Path("/var/lib/dpkg/status")) != host_status:
-        raise OracleError("host dpkg status changed during alternatives observation")
-    if host_path_signature(Path("/var/log/alternatives.log")) != host_alt_log:
-        raise OracleError("host alternatives log changed during alternatives observation")
-    if host_alternatives_signature() != host_database:
-        raise OracleError("host alternatives database changed during observation")
+        m.reference_dpkg.verify_file(
+            Path(update_alternatives),
+            m.reference_dpkg.PINS[architecture]["update_alternatives"],
+        )
 
     assert observed is not None
     if arguments.update_reference:

@@ -16,7 +16,10 @@ The canonical result is
   `update-alternatives` executable SHA-256 digests;
 - deterministic synthetic package identities and archive bytes;
 - the task invocation clock and the runtime clock/timestamp classification;
-- every count, byte, path, argument, output, file, process, and timeout limit.
+- every executed command, argument, exit, bounded output/log delta, package
+  archive, relevant payload, status/journal file, control/info file, record,
+  selector, and generic-link effect;
+- every count, byte, path, file, process, cleanup, and timeout limit.
 
 The reviewed vendor captures do not contain alternatives record bytes,
 priorities, providers, ownership, or auto/manual mode. The executable vendor
@@ -30,11 +33,23 @@ database state.
 The runner requires root only for direct dpkg maintainer-script execution. It
 uses guarded disposable roots under repository-local `.tmp`, the hash-pinned
 private tools under `.cache`, a fixed `C` environment, bounded subprocesses,
-and no apt/debconf frontend. External tool calls always provide `--root` and a
-root-local log. Maintainer scripts execute the same pinned
-`/usr/bin/update-alternatives` inside the disposable chroot. Host dpkg status,
-host alternatives records, and the host alternatives log are signature-checked
-unchanged.
+and no apt/debconf frontend. The benign host dpkg configuration is digest-bound;
+configuration fragments and user configuration are forbidden. External tool
+calls always provide `--root` and a root-local log. Maintainer scripts execute
+the same pinned `/usr/bin/update-alternatives` inside the disposable chroot,
+assert cwd `/`, descriptors 0/1/2 only, and reject frontend variables. Output
+is streamed into size-limited files rather than accumulated in memory.
+Subprocesses have a 30-second runtime bound, a two-second process-group cleanup
+bound, a 64-descriptor limit, and complete process-group termination on
+timeout. The copied chroot binary and both selected private binaries are
+digest-verified.
+
+Before every run, the oracle inventories the complete host dpkg database plus
+host alternatives database, every generic link named by those records, the
+selector directory, dpkg configuration, dpkg log, and alternatives log. The
+inventory is checked in `finally`, including failed oracle runs, so no host
+mutation can be hidden by an observation exception. No ambient host dpkg
+executable is used to identify the architecture.
 
 Prepare and run the reference:
 
@@ -94,15 +109,20 @@ oversized, directory, FIFO, and symlink records before invoking the tool.
 Raw adversarial rows are retained separately from the safe command wrapper:
 1.22.22 accepts a generic path containing `/../` and creates a link outside
 the selected root, and it follows a symlink used as `etc/alternatives`. A
-self-referential provider is rejected. Normal oracle execution rejects these
+self-referential provider is rejected. Replacing an already selected provider
+with a symlink back to its generic link creates an indirect cycle; `--query`
+warns that the provider is missing and computes an in-memory removal without
+persisting the record or links. Normal oracle execution rejects unsafe generic
 paths and state-directory symlinks before spawning the tool.
 
-The database and link set are not one atomic filesystem transaction. Blocking
-the database temporary, selector temporary, or generic-link temporary makes
-the command exit 2 with no committed group record, but can strand an
+The database and link set are not one atomic filesystem transaction. The
+explicitly labeled injected cases block the database temporary, selector
+temporary, or generic-link temporary. They make the command exit 2 with no
+committed group record, but can strand an
 `atomic.dpkg-tmp` selector symlink. The alternatives log still says the link
 group was updated. These partial states and diagnostics are canonical and must
-not be approximated as an all-or-nothing commit.
+not be approximated as an all-or-nothing commit. They are failure models, not
+claims that the vendor tool spontaneously produced those failures.
 
 Log timestamps come from local `CLOCK_REALTIME` at one-second precision and
 are asserted to fall within the subprocess invocation. Record mtimes use the
