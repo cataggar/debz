@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pathlib
+import posixpath
 import re
 import subprocess
 import sys
@@ -21,6 +22,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/capture-vendor-state.py"
 REFERENCE_DIRECTORY = ROOT / "tools/fixtures/vendor-state"
 REFERENCE_INDEX = REFERENCE_DIRECTORY / "index-v1.json"
+REFERENCE_INDEX_SHA256 = (
+    "682bff167a4bc2386ceb78fb554be0adbe6fbfab16f4eab77aff3b63af04dd34"
+)
 SPEC = importlib.util.spec_from_file_location("vendor_state_capture", TOOL)
 assert SPEC and SPEC.loader
 vendor_state_capture = importlib.util.module_from_spec(SPEC)
@@ -191,7 +195,18 @@ class VendorStateCaptureTests(unittest.TestCase):
     def test_pinned_vendor_state_references_are_canonical_bounded_and_private(
         self,
     ) -> None:
-        index = json.loads(REFERENCE_INDEX.read_text())
+        raw_index = REFERENCE_INDEX.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw_index).hexdigest(), REFERENCE_INDEX_SHA256
+        )
+        index = json.loads(raw_index)
+        self.assertEqual(
+            raw_index, vendor_state_capture.canonical_json(index)
+        )
+        self.assertEqual(
+            set(index),
+            {"capture_schema", "index_version", "manifests", "source"},
+        )
         self.assertEqual(index["index_version"], 1)
         self.assertEqual(
             index["capture_schema"],
@@ -255,6 +270,51 @@ class VendorStateCaptureTests(unittest.TestCase):
             b"etc/ssl/private/",
         )
         manifests: dict[str, dict] = {}
+        expected_provenance = {
+            "amd64": {
+                "artifact_id": 10602721005,
+                "artifact_sha256": (
+                    "0cc352e4f75e129ebc713d28724133150ff064eaf1a5387460de951a205c52db"
+                ),
+                "artifact_size_bytes": 262687,
+                "job_id": 106052418669,
+                "manifest_path": (
+                    "ubuntu-resolute-20260816T000000Z-amd64-v1.json"
+                ),
+                "manifest_sha256": (
+                    "9ae81ea204a2cf608860451a41d477068a11ab77e8762e61e53d95bc0a70570b"
+                ),
+                "manifest_size_bytes": 320842,
+            },
+            "arm64": {
+                "artifact_id": 10602163417,
+                "artifact_sha256": (
+                    "22c543d5191a9761b2ed4791ce67902fb6106abfaf1228a47d50c82c0dc803c6"
+                ),
+                "artifact_size_bytes": 262743,
+                "job_id": 106052418730,
+                "manifest_path": (
+                    "ubuntu-resolute-20260816T000000Z-arm64-v1.json"
+                ),
+                "manifest_sha256": (
+                    "90698d5a1eae643dfc68a0acbb38cca48b98b297453fdc5d1a10509c792fa16c"
+                ),
+                "manifest_size_bytes": 320842,
+            },
+        }
+        expected_classification_counts = {
+            "checksums": 177,
+            "conffiles": 39,
+            "control": 0,
+            "debconf-config": 7,
+            "format": 1,
+            "maintainer-script": 186,
+            "ownership-list": 177,
+            "package-alternatives": 0,
+            "retained-metadata": 158,
+            "triggers": 84,
+            "unclassified": 0,
+        }
         self.assertEqual(
             [item["architecture"] for item in index["manifests"]],
             ["amd64", "arm64"],
@@ -269,6 +329,29 @@ class VendorStateCaptureTests(unittest.TestCase):
                 self.assertEqual(
                     reference["artifact_member"],
                     "vendor-state-inventory-v1.json",
+                )
+                self.assertEqual(
+                    {
+                        key: reference[key]
+                        for key in expected_provenance[architecture]
+                    },
+                    expected_provenance[architecture],
+                )
+                self.assertEqual(
+                    set(reference),
+                    {
+                        "architecture",
+                        "artifact_id",
+                        "artifact_member",
+                        "artifact_name",
+                        "artifact_sha256",
+                        "artifact_size_bytes",
+                        "inventory",
+                        "job_id",
+                        "manifest_path",
+                        "manifest_sha256",
+                        "manifest_size_bytes",
+                    },
                 )
                 self.assertGreater(reference["artifact_id"], 0)
                 self.assertGreater(reference["job_id"], 0)
@@ -350,9 +433,11 @@ class VendorStateCaptureTests(unittest.TestCase):
                     counts,
                     document["control_members"]["classification_counts"],
                 )
+                self.assertEqual(counts, expected_classification_counts)
                 self.assertLessEqual(
                     len(controls), limits["max_control_members"]
                 )
+                self.assertEqual(len(controls), 829)
                 self.assertEqual(
                     [
                         pathlib.PurePosixPath(path).name
@@ -387,6 +472,7 @@ class VendorStateCaptureTests(unittest.TestCase):
                 self.assertLessEqual(
                     len(alternatives), limits["max_alternatives_records"]
                 )
+                self.assertEqual(len(alternatives), 14)
                 self.assertLessEqual(
                     control_bytes + alternatives_bytes,
                     limits["max_total_metadata_bytes"],
@@ -394,6 +480,7 @@ class VendorStateCaptureTests(unittest.TestCase):
                 self.assertLessEqual(
                     len(requested), limits["max_referenced_paths"]
                 )
+                self.assertEqual(len(requested), 189)
 
                 linked_bytes = 0
                 linked_kinds: dict[str, int] = {}
@@ -437,6 +524,7 @@ class VendorStateCaptureTests(unittest.TestCase):
                 self.assertLessEqual(
                     len(linked), limits["max_linked_entries"]
                 )
+                self.assertEqual(len(linked), 190)
                 self.assertLessEqual(
                     linked_bytes, limits["max_total_linked_bytes"]
                 )
@@ -455,6 +543,86 @@ class VendorStateCaptureTests(unittest.TestCase):
                     },
                 )
 
+                linked_by_path = {item["path"]: item for item in linked}
+                reached_entries: set[str] = set()
+
+                def resolve_recorded_path(start: str) -> str:
+                    current = start
+                    seen: set[str] = set()
+                    hops = 0
+                    while current not in seen:
+                        seen.add(current)
+                        parts = current.split("/")
+                        for length in range(1, len(parts) + 1):
+                            prefix = "/".join(parts[:length])
+                            entry = linked_by_path.get(prefix)
+                            if entry is None:
+                                continue
+                            reached_entries.add(prefix)
+                            if entry["kind"] != "symlink":
+                                self.assertEqual(length, len(parts))
+                                return entry["kind"]
+                            target = entry["target"]
+                            if target.startswith("/"):
+                                resolved = posixpath.normpath(target)[1:]
+                            else:
+                                resolved = posixpath.normpath(
+                                    posixpath.join(
+                                        posixpath.dirname(prefix), target
+                                    )
+                                )
+                            remaining = parts[length:]
+                            current = (
+                                posixpath.normpath(
+                                    posixpath.join(resolved, *remaining)
+                                )
+                                if remaining
+                                else resolved
+                            )
+                            self.assertNotIn(current, {"", "."})
+                            self.assertFalse(current.startswith("/"))
+                            self.assertFalse(current.startswith("../"))
+                            self.assertFalse(
+                                any(
+                                    current == denied
+                                    or current.startswith(denied + "/")
+                                    for denied in vendor_state_capture.SENSITIVE_PATHS
+                                )
+                            )
+                            hops += 1
+                            self.assertLessEqual(
+                                hops, limits["max_link_hops"]
+                            )
+                            break
+                        else:
+                            self.fail(
+                                f"linked path has no recorded terminal: {start}"
+                            )
+                    self.fail(f"linked path contains a cycle: {start}")
+
+                self.assertEqual(
+                    {
+                        resolve_recorded_path(path)
+                        for path in requested
+                    },
+                    {"regular"},
+                )
+                self.assertEqual(reached_entries, set(linked_by_path))
+                declared_paths = {
+                    path
+                    for item in alternatives
+                    for path in item["referenced_paths"]
+                }
+                selector_paths = {
+                    path
+                    for path in requested
+                    if path.startswith("etc/alternatives/")
+                }
+                self.assertTrue(declared_paths.isdisjoint(selector_paths))
+                self.assertEqual(
+                    set(requested), declared_paths | selector_paths
+                )
+
         amd64 = manifests["amd64"]
         arm64 = manifests["arm64"]
         self.assertEqual(
@@ -466,32 +634,115 @@ class VendorStateCaptureTests(unittest.TestCase):
             arm64["linked_filesystem"]["requested_paths"],
         )
         self.assertEqual(
-            {
-                item["path"]
+            [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"size", "sha256"}
+                }
                 for item in amd64["linked_filesystem"]["entries"]
-            },
-            {
-                item["path"]
+            ],
+            [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"size", "sha256"}
+                }
                 for item in arm64["linked_filesystem"]["entries"]
-            },
+            ],
         )
-        amd64_controls = {
-            item["path"]
-            for item in amd64["control_members"]["entries"]
-        }
-        arm64_controls = {
-            item["path"]
-            for item in arm64["control_members"]["entries"]
-        }
 
         def normalize(path: str) -> str:
             return path.replace(":amd64", ":ARCH").replace(
                 ":arm64", ":ARCH"
             )
 
+        expected_control_differences = {
+            "checksums": 140,
+            "conffiles": 1,
+            "control": 0,
+            "debconf-config": 0,
+            "format": 0,
+            "maintainer-script": 28,
+            "ownership-list": 94,
+            "package-alternatives": 0,
+            "retained-metadata": 9,
+            "triggers": 3,
+            "unclassified": 0,
+        }
+        control_maps = {}
+        for architecture, document in manifests.items():
+            control_maps[architecture] = {
+                normalize(item["path"]): {
+                    **item,
+                    "path": normalize(item["path"]),
+                }
+                for item in document["control_members"]["entries"]
+            }
         self.assertEqual(
-            {normalize(path) for path in amd64_controls - arm64_controls},
-            {normalize(path) for path in arm64_controls - amd64_controls},
+            set(control_maps["amd64"]), set(control_maps["arm64"])
+        )
+        observed_control_differences = {
+            classification: 0
+            for classification in vendor_state_capture.CLASSIFICATIONS
+        }
+        for path in sorted(control_maps["amd64"]):
+            amd64_member = control_maps["amd64"][path]
+            arm64_member = control_maps["arm64"][path]
+            self.assertEqual(
+                amd64_member["classification"],
+                arm64_member["classification"],
+            )
+            changed_fields = {
+                key
+                for key in amd64_member
+                if amd64_member[key] != arm64_member[key]
+            }
+            if changed_fields:
+                self.assertIn(
+                    changed_fields, ({"sha256"}, {"sha256", "size"})
+                )
+                observed_control_differences[
+                    amd64_member["classification"]
+                ] += 1
+        self.assertEqual(
+            observed_control_differences, expected_control_differences
+        )
+
+        linked_maps = {
+            architecture: {
+                item["path"]: item
+                for item in document["linked_filesystem"]["entries"]
+            }
+            for architecture, document in manifests.items()
+        }
+        expected_linked_differences = {
+            "usr/bin/less",
+            "usr/bin/mawk",
+            "usr/bin/more",
+            "usr/bin/nc.openbsd",
+            "usr/bin/sudo.ws",
+            "usr/bin/vim.tiny",
+            "usr/lib/cargo/bin/sudo",
+            "usr/lib/cargo/bin/visudo",
+            "usr/sbin/rmt-tar",
+            "usr/sbin/visudo.ws",
+        }
+        observed_linked_differences = set()
+        for path in sorted(linked_maps["amd64"]):
+            amd64_entry = linked_maps["amd64"][path]
+            arm64_entry = linked_maps["arm64"][path]
+            changed_fields = {
+                key
+                for key in amd64_entry
+                if amd64_entry[key] != arm64_entry[key]
+            }
+            if changed_fields:
+                self.assertEqual(changed_fields, {"sha256", "size"})
+                self.assertEqual(amd64_entry["kind"], "regular")
+                observed_linked_differences.add(path)
+        self.assertEqual(
+            observed_linked_differences, expected_linked_differences
         )
 
     def test_bounds_fail_closed(self) -> None:
