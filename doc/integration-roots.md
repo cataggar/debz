@@ -200,7 +200,8 @@ before emitting canonical JSON.
 The paired reference accounts for every item in each manifest. Of the 829
 control members, 664 are already-supported typed package-database or lifecycle
 state, 158 are bounded inert `templates`/`shlibs`/`symbols`, and the seven
-debconf `*.config` scripts require reference-execution evidence. There are
+debconf `*.config` scripts are the input to the separate direct-dpkg reference
+oracle. There are
 zero package `*.alternatives` and zero unclassified members. The 14
 alternatives records produce 72 current relationships (14 masters and 58
 slaves), 189 complete requested-path resolutions, and all 190 linked entries:
@@ -219,9 +220,56 @@ metadata members, and three trigger members. Alternatives records and topology
 are identical. Exactly ten regular linked targets differ in size and SHA-256.
 Difference entries index the authoritative per-architecture facts above rather
 than duplicating them in the generated fixture.
-Remaining oracle work is bounded reference execution for config-script
-invocation/effects and alternatives record decoding plus install, upgrade,
-remove, purge, failure, and recovery mutations. Until that evidence and an
-explicit support contract exist, native preflight continues handing off or
-rejecting active config/alternatives or unclassified semantics before
-mutation.
+
+The [direct-dpkg config reference
+schema](../schema/dpkg-config-reference-v1.json) and canonical
+`tools/fixtures/vendor-state/dpkg-config-reference-v1.json` bind dpkg 1.22.22
+and both executable/archive pins, the index, both manifests, the derived
+reference digest, and all seven package/config identities. The seven vendor
+facts and the pinned dpkg package are available for amd64 and arm64, but this
+v1 lifecycle observation was executed and published for amd64 only. It makes
+no architecture-independence claim: the runner rejects an arm64 host until a
+separate arm64 observation is reviewed and published.
+
+The elevated `tools/dpkg-config-reference.py` runner invokes only the pinned
+dpkg binary against guarded disposable roots. Its deterministic Python
+archive builder does not invoke host `dpkg-deb`; generated package archives,
+control members, and installed info members are digest-, size-, mode-, uid-,
+and gid-bound in the observation. The runner requires the exact benign
+`/etc/dpkg/dpkg.cfg` shipped by the pinned package, rejects global config
+fragments and the fresh fixture user's `.dpkg.cfg`, and rejects any apt,
+debconf, or `dpkg-preconfigure` path or environment. The command line overrides
+the configured log into each disposable root and asserts that the host dpkg
+status and log are unchanged. It generates exact-size
+adversarial config members for all seven identities plus instrumented
+lifecycle packages, bounds every path, archive, info member, trace,
+environment, fd probe, update fragment, log, timeout, and process, and rejects
+traversing, symlink, and special-file control fixtures.
+
+```sh
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+zig build test-dpkg-config-reference \
+  -Dnative-reference-dpkg="$reference_dpkg" -j2
+```
+
+On amd64, direct dpkg never executes `config`: nonzero scripts and a script with a
+missing interpreter are installed and replaced without affecting command
+success. Incoming bytes are visible at `tmp.ci/config` to old `prerm`, incoming
+`preinst`, and old `postrm`; the installed info member remains the old version
+through those calls and changes before new `postinst`. Successful removal
+keeps the member through `prerm remove` and `postrm remove`, then deletes it;
+`postrm purge` sees it absent. Failed postinst retains the incoming member,
+failed or interrupted remove retains the installed member, failed upgrade
+rollback restores the old member, and retries settle without invoking config.
+The interruption rows additionally bind committed status versus the latest
+bounded `updates/` fragment.
+
+This closes the config direct-dpkg behavior question, not debconf frontend
+behavior, arm64 behavior, or native support. Arm64 publication remains blocked
+until the same executable oracle is run there and its canonical
+architecture-specific observation is reviewed. A future native implementation
+must reproduce the applicable byte/mode/ownership publication, rollback,
+removal, and non-execution contract.
+Current opaque-info and unsupported-archive-metadata guards remain unchanged.
+Remaining oracle work is alternatives record decoding and install, upgrade,
+remove, purge, failure, and recovery mutation behavior.

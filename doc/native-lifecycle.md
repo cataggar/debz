@@ -41,6 +41,21 @@ configure/purge retries with and without conffiles. Existing admission guards
 for otherwise unsupported half-installed states remain unchanged.
 No debconf preconfiguration or other active/unknown metadata support is implied.
 
+The separate [amd64 direct-dpkg config reference](integration-roots.md) closes
+the dpkg side of that boundary for the seven pinned vendor `*.config`
+identities on that architecture. Pinned dpkg 1.22.22 never invokes config
+during install, reinstall, upgrade,
+configure retry, remove, purge, compensation, or interrupted-operation retry.
+It stages incoming config for the pre-unpack callbacks, publishes it before
+the incoming postinst, keeps it through remove postrm, and deletes it only
+after successful remove settlement. Failed/interrupted removal keeps it;
+failed upgrade rollback restores the old bytes; purge postrm sees it absent.
+These are requirements for future native support, not current support:
+installed config remains opaque package metadata and an incoming config still
+causes pre-mutation handoff. Debconf or another frontend invoking config is a
+different contract. Arm64 remains unpublished pending its own executable
+oracle run.
+
 Statoverrides use file-backed target-root identities and are resolved once
 before scripts, not separately at unpack and configure. A preinst or postinst
 may change the account or override files, but the same invocation keeps its
@@ -158,7 +173,7 @@ without root privileges:
 
 ```sh
 reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
-zig build test-native-lifecycle test-native-recovery \
+zig build test-dpkg-config-reference test-native-lifecycle test-native-recovery \
   -Dnative-reference-dpkg="$reference_dpkg" -j2
 ```
 
@@ -168,10 +183,11 @@ each reuse. It never installs a package, rewrites host accounts, changes host
 dpkg, or repairs a tampered cache. The Debian binary requires glibc 2.38 or
 newer and the usual dpkg runtime libraries. Direct fixture drivers accept
 `--reference-dpkg PATH`; the build option forwards it explicitly through
-`sudo` to all five native reference runners. The selected binary is used only
-for reference commands. Host `dpkg-deb` still builds/decodes archives, the
-package-owned reference trigger helper remains unchanged, and fixture/script
-`PATH` does not gain the private prefix.
+`sudo` to the config oracle and all five native reference runners. The selected
+binary is used only for reference commands. The config oracle uses its bounded
+deterministic Python archive builder; the other native fixtures still use host
+`dpkg-deb` where documented. The package-owned reference trigger helper remains
+unchanged, and fixture/script `PATH` does not gain the private prefix.
 
 Only the fixture runner is elevated; Zig compilation is not. Roots, packages,
 requests, snapshots, and logs are created under the worktree's `.tmp` directory.

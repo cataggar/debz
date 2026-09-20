@@ -1,0 +1,2853 @@
+{
+  "boundary": {
+    "architecture_scope": "vendor config facts cover amd64 and arm64; direct-dpkg lifecycle execution is published for amd64 only",
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "excluded_frontends": [
+      "apt",
+      "apt-get",
+      "debconf",
+      "dpkg-preconfigure"
+    ],
+    "invocation": "direct-dpkg-only",
+    "limits": {
+      "maximum_archive_bytes": 8388608,
+      "maximum_argument_bytes": 256,
+      "maximum_arguments": 16,
+      "maximum_control_bytes": 262144,
+      "maximum_control_members": 16,
+      "maximum_environment_line_bytes": 4096,
+      "maximum_environment_records": 128,
+      "maximum_environment_variables": 32,
+      "maximum_file_bytes": 262144,
+      "maximum_info_bytes": 1048576,
+      "maximum_info_files": 32,
+      "maximum_log_bytes": 131072,
+      "maximum_packages": 16,
+      "maximum_status_bytes": 262144,
+      "maximum_trace_bytes": 131072,
+      "maximum_trace_records": 128,
+      "maximum_updates": 32,
+      "pause_script_timeout_seconds": 30,
+      "pause_timeout_seconds": 10,
+      "subprocess_timeout_seconds": 60
+    },
+    "observed_architecture": "amd64",
+    "operations": [
+      "install",
+      "reinstall",
+      "upgrade",
+      "configure",
+      "remove",
+      "purge",
+      "interrupted-retry"
+    ]
+  },
+  "implementation_requirement": {
+    "current_native_guards": "unchanged: installed config remains opaque package metadata and incoming config still causes pre-mutation unsupported-archive-metadata handoff",
+    "required_behavior": "A future native implementation must retain config as executable-mode, byte-exact, non-lifecycle package metadata; stage incoming bytes for preinst, keep installed bytes visible through old prerm/preinst/postrm, publish incoming bytes before new postinst, remove them only after successful postrm remove settlement, keep or restore them on failed or interrupted removal and failed upgrade rollback, leave them absent for postrm purge, and never execute them in the direct-dpkg lifecycle. Any debconf or preconfiguration execution belongs to a separately specified frontend.",
+    "support_status": "reference-only-not-enabled"
+  },
+  "members": [
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/chrony.config",
+          "referenced_paths": [],
+          "sha256": "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0",
+          "size": 204,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/chrony.config",
+          "referenced_paths": [],
+          "sha256": "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0",
+          "size": 204,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "chrony.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "chrony"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/console-setup.config",
+          "referenced_paths": [],
+          "sha256": "9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8",
+          "size": 32119,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/console-setup.config",
+          "referenced_paths": [],
+          "sha256": "9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8",
+          "size": 32119,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "console-setup.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "console-setup"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/debconf.config",
+          "referenced_paths": [],
+          "sha256": "e91259e40c51b1dfb94d9a49eb58d6808096f291bc238c9da1e901f55639106d",
+          "size": 505,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/debconf.config",
+          "referenced_paths": [],
+          "sha256": "e91259e40c51b1dfb94d9a49eb58d6808096f291bc238c9da1e901f55639106d",
+          "size": 505,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "debconf.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "debconf"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/iproute2.config",
+          "referenced_paths": [],
+          "sha256": "869cc5faa0408240da4688cfd77548bd9039ea07ac0c94b4a89498694aa7be7f",
+          "size": 104,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/iproute2.config",
+          "referenced_paths": [],
+          "sha256": "869cc5faa0408240da4688cfd77548bd9039ea07ac0c94b4a89498694aa7be7f",
+          "size": 104,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "iproute2.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "iproute2"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/keyboard-configuration.config",
+          "referenced_paths": [],
+          "sha256": "385d56699c0cb381cb5a5253bbb2a02cdbcc134a90c62b2ca966f8e49efc61f0",
+          "size": 91581,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/keyboard-configuration.config",
+          "referenced_paths": [],
+          "sha256": "385d56699c0cb381cb5a5253bbb2a02cdbcc134a90c62b2ca966f8e49efc61f0",
+          "size": 91581,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "keyboard-configuration.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "keyboard-configuration"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/locales.config",
+          "referenced_paths": [],
+          "sha256": "439d7a556bad252fd4dd0c21e54235fae3e5570e4522aae39cdadbeebc272805",
+          "size": 8327,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/locales.config",
+          "referenced_paths": [],
+          "sha256": "439d7a556bad252fd4dd0c21e54235fae3e5570e4522aae39cdadbeebc272805",
+          "size": 8327,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "locales.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "locales"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/tzdata.config",
+          "referenced_paths": [],
+          "sha256": "24fb276659bc741b3efa9896094f738d32583deb8086caf86cc027f0e63d9d87",
+          "size": 8080,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/tzdata.config",
+          "referenced_paths": [],
+          "sha256": "24fb276659bc741b3efa9896094f738d32583deb8086caf86cc027f0e63d9d87",
+          "size": 8080,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "tzdata.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "tzdata"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    }
+  ],
+  "observed_behavior": {
+    "config_invocation_count": 0,
+    "failure_recovery": [
+      {
+        "case": "fresh-postinst-failure",
+        "failed_config": "v1",
+        "failed_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok half-configured",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "failed_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "failed_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok half-configured",
+          "version": "1"
+        },
+        "failed_trace": [
+          "preinst@v1\t[\"install\"]\t-\tv1",
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ],
+        "recovery_config": "v1",
+        "recovery_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "recovery_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "recovery_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ]
+      },
+      {
+        "case": "upgrade-postinst-failure",
+        "failed_config": "v2",
+        "failed_database": {
+          "committed": {
+            "architecture": "amd64",
+            "config_version": "1",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok half-configured",
+            "version": "2"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "failed_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "cb573e53621ec94b68af2769ff4f86cb6038b4cf05ad2734b0da761654e6f694",
+              "size": 402,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "1e7e32470a09e43a38c7f28047291ce66f9daa279d123f83e69c70af9d7b5f7c",
+              "size": 298,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "fce6964dd6dca77c50365e7a3b408daf54313015d6083fb690f90daddb6ce91a",
+              "size": 338,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "failed_state": {
+          "architecture": "amd64",
+          "config_version": "1",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok half-configured",
+          "version": "2"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ],
+        "recovery_config": "v2",
+        "recovery_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "2"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "recovery_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "cb573e53621ec94b68af2769ff4f86cb6038b4cf05ad2734b0da761654e6f694",
+              "size": 402,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "1e7e32470a09e43a38c7f28047291ce66f9daa279d123f83e69c70af9d7b5f7c",
+              "size": 298,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "fce6964dd6dca77c50365e7a3b408daf54313015d6083fb690f90daddb6ce91a",
+              "size": 338,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "recovery_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "2"
+        },
+        "recovery_trace": [
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ]
+      },
+      {
+        "case": "incoming-preinst-failure",
+        "failed_config": "v1",
+        "failed_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "failed_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "failed_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v2\t[\"abort-upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postinst@v1\t[\"abort-upgrade\",\"2\"]\tv1\tv2"
+        ]
+      },
+      {
+        "case": "double-postrm-upgrade-failure",
+        "failed_config": "v1",
+        "failed_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "failed_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "failed_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "postrm@v2\t[\"failed-upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "preinst@v1\t[\"abort-upgrade\",\"2\"]\tv1\tv2",
+          "postrm@v2\t[\"abort-upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postinst@v1\t[\"abort-upgrade\",\"2\"]\tv1\tv2"
+        ]
+      },
+      {
+        "case": "remove-postrm-failure",
+        "failed_config": "v1",
+        "failed_database": {
+          "committed": {
+            "architecture": "amd64",
+            "config_version": "1",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "deinstall ok half-installed",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "failed_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dfc1f8513c6d860a7e4da99032b1c9be88f249214d07a58fd9347aa933226621",
+              "size": 32,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "failed_state": {
+          "architecture": "amd64",
+          "config_version": "1",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "deinstall ok half-installed",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ],
+        "recovery_config": null,
+        "recovery_database": {
+          "committed": {
+            "architecture": "amd64",
+            "config_version": "1",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "deinstall ok config-files",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "recovery_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dfc1f8513c6d860a7e4da99032b1c9be88f249214d07a58fd9347aa933226621",
+              "size": 32,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "recovery_state": {
+          "architecture": "amd64",
+          "config_version": "1",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "deinstall ok config-files",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ]
+      },
+      {
+        "case": "purge-postrm-failure",
+        "failed_config": null,
+        "failed_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "purge ok config-files",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "failed_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "c9b0b9424c6142192f3a2b1a05f4d90a85147d5dab2f2376e02288d77ca3a538",
+              "size": 10,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "failed_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "purge ok config-files",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"purge\"]\t-\t-"
+        ],
+        "recovery_config": null,
+        "recovery_database": {
+          "committed": null,
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "recovery_filesystem": {
+          "info": [],
+          "staging": []
+        },
+        "recovery_state": null,
+        "recovery_trace": [
+          "postrm@v1\t[\"purge\"]\t-\t-"
+        ]
+      }
+    ],
+    "frontend_invocation_count": 0,
+    "interruption_recovery": [
+      {
+        "case": "postinst-interruption",
+        "interrupted_config": "v1",
+        "interrupted_database": {
+          "committed": null,
+          "journal_latest": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok half-configured",
+            "version": "1"
+          },
+          "journal_nonempty": true,
+          "temporary_update": true
+        },
+        "interrupted_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "interrupted_staging_config": null,
+        "interrupted_trace": [
+          "preinst@v1\t[\"install\"]\t-\tv1",
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ],
+        "recovery_config": "v1",
+        "recovery_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "recovery_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "recovery_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ]
+      },
+      {
+        "case": "upgrade-preinst-interruption",
+        "interrupted_config": "v1",
+        "interrupted_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": {
+            "architecture": "amd64",
+            "config_version": "1",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install reinstreq half-installed",
+            "version": "1"
+          },
+          "journal_nonempty": true,
+          "temporary_update": true
+        },
+        "interrupted_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "cb573e53621ec94b68af2769ff4f86cb6038b4cf05ad2734b0da761654e6f694",
+              "size": 402,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "ddb4a3ec2ce1bbc6852657dd86f9d8d4a41c667e8b74345ffcfb611fdfdbd29c",
+              "size": 164,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "fce6964dd6dca77c50365e7a3b408daf54313015d6083fb690f90daddb6ce91a",
+              "size": 338,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
+              "size": 1706,
+              "uid": 0
+            }
+          ]
+        },
+        "interrupted_staging_config": "v2",
+        "interrupted_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2"
+        ],
+        "recovery_config": "v2",
+        "recovery_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "2"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "recovery_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "cb573e53621ec94b68af2769ff4f86cb6038b4cf05ad2734b0da761654e6f694",
+              "size": 402,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "1e7e32470a09e43a38c7f28047291ce66f9daa279d123f83e69c70af9d7b5f7c",
+              "size": 298,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "fce6964dd6dca77c50365e7a3b408daf54313015d6083fb690f90daddb6ce91a",
+              "size": 338,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "recovery_state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "2"
+        },
+        "recovery_trace": [
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ]
+      },
+      {
+        "case": "remove-postrm-interruption",
+        "interrupted_config": "v1",
+        "interrupted_database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": {
+            "architecture": "amd64",
+            "config_version": "1",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "deinstall ok half-installed",
+            "version": "1"
+          },
+          "journal_nonempty": true,
+          "temporary_update": true
+        },
+        "interrupted_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dfc1f8513c6d860a7e4da99032b1c9be88f249214d07a58fd9347aa933226621",
+              "size": 32,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "interrupted_staging_config": null,
+        "interrupted_trace": [
+          "prerm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ],
+        "recovery_config": null,
+        "recovery_database": {
+          "committed": {
+            "architecture": "amd64",
+            "config_version": "1",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "deinstall ok config-files",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "recovery_filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dfc1f8513c6d860a7e4da99032b1c9be88f249214d07a58fd9347aa933226621",
+              "size": 32,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "recovery_state": {
+          "architecture": "amd64",
+          "config_version": "1",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "deinstall ok config-files",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ]
+      }
+    ],
+    "package_inputs": {
+      "architecture": "amd64",
+      "lifecycle": [
+        {
+          "archive": {
+            "sha256": "a7ae891a0c5a0601de9bb65008c630c20d81ed18d9442901682c8ba6ae786cce",
+            "size": 30912
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "a94142aa9289baf567d40e5a7e59dc8f09a0c9bebffa467cd86068aa2d2a1c65",
+              "size": 164,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "identity": "v1",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "9e1849a622b6408f917016aaebc9cca3f5b305a875a3f6d6b01d5d220333e220",
+            "size": 30912
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "760e17d4f55ca8eefc2e9c4888968226e7ee328106786806621ec83e6fd4817a",
+              "size": 384,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "a94142aa9289baf567d40e5a7e59dc8f09a0c9bebffa467cd86068aa2d2a1c65",
+              "size": 164,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "de235c2e50f3fc026f2c527b5ef75e87edd005a6fa79166641b74ce27804509e",
+              "size": 1722,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "bdfc34d18c2619012a7ba30731112129ef6126e43bba9bd9110ff84194eb76f4",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "eff99f756233db0394792e376579146fe9f14d82b80d352a44c173226597f748",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "19c6618eb4cfe11d7dd9da7e1900b971cc251e106f13b28f67e386e960b1449a",
+              "size": 1710,
+              "uid": 0
+            }
+          ],
+          "identity": "v1r",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "4a3a3e8dafe6ccda3d7dbcd1ac8b7c98f9c6eb21c828c338c9beaf19d3c50f59",
+            "size": 30912
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "cb573e53621ec94b68af2769ff4f86cb6038b4cf05ad2734b0da761654e6f694",
+              "size": 402,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "ddb4a3ec2ce1bbc6852657dd86f9d8d4a41c667e8b74345ffcfb611fdfdbd29c",
+              "size": 164,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "fce6964dd6dca77c50365e7a3b408daf54313015d6083fb690f90daddb6ce91a",
+              "size": 338,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "identity": "v2",
+          "version": "2"
+        }
+      ],
+      "vendor": [
+        {
+          "archive": {
+            "sha256": "eeb6597a0a72c7f67b436b6b18d601cfd8c96a4231442b77d23c5bbe667d7f42",
+            "size": 20672
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "d66fbec91249e55064c3045f104fb5515538b6f2350e4f070949b254ce183634",
+              "size": 204,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "0cfef0a12a0c9800ee8fb55e4a1a2b15e073cfe02228c888181950953e1ca60c",
+              "size": 152,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "d8315388168438c85b14033909be86b8926f377b4dfc2734471519d4c4ae137e",
+              "size": 233,
+              "uid": 0
+            }
+          ],
+          "identity": "chrony",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "9cd28ee316add5f948b3b2f8bc70f65ee62c96cc2cc7607fc6f83ff6c097c530",
+            "size": 51392
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "c67a8e398c4df6871c4cef327ba03e4ea277b8bb7340885eeb4e046c0aee91c0",
+              "size": 32119,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "00b3687fa13741673e7c0aba67c2aedfc6563c2438629ef01173a1e56692653f",
+              "size": 159,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "c39402902a92e8ab861ad160ced4768f674fd780d78951e80c923e3702a866b5",
+              "size": 261,
+              "uid": 0
+            }
+          ],
+          "identity": "console-setup",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "a58f8e17309fd299a7df7541d40acd2a57ad613f9fa39693909667f5418b5968",
+            "size": 20672
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "f416c6a4f8ecc39ec744e91b155f5736c27ccc6b04665d06e9ab4575b88b32b9",
+              "size": 505,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "e1662f3011c1b1019ce12218b94c6d9b50829d4bf934606b9fb817468319cdb7",
+              "size": 153,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "d06996b7fe406113ff79c6e604cb239b51cc409031bec7960fb2b4ad423205f1",
+              "size": 237,
+              "uid": 0
+            }
+          ],
+          "identity": "debconf",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "6d0bee7a2061b513ef30502f4129388d8ee65cc7ccce0524b87f85f0b1a7c993",
+            "size": 20672
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "6070c9325502f11d11751308b2384f205de26fcd98f69d9003558a73187acfcf",
+              "size": 104,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "c4b96f1b7db209effc923ef7a42ef6bfe9051eb7924b6631b6f281a5a260b64d",
+              "size": 154,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "a105888e49a26ad2f31f75965a433952c7516a572f42b647eedeb15edca1076a",
+              "size": 241,
+              "uid": 0
+            }
+          ],
+          "identity": "iproute2",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "1de5fb9018d609560c61afdca158bffc6763ff3ee5b13b7258ae0f0f9c45beab",
+            "size": 112832
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "5efe1532ded9885cd306ee85842a7268d64a15a9a08bcf5bedbed622f044fa90",
+              "size": 91581,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "98990061e7a930e1ee623a8ffa057ad9962149614d0caa6ebe3a482d47243310",
+              "size": 168,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "d6d6915d1379032de4a1e2b46025e4919580d6268efb5471e7064781b37b4add",
+              "size": 297,
+              "uid": 0
+            }
+          ],
+          "identity": "keyboard-configuration",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "5e7d7ed2be3a08f10935adc339777422ca830cb7a897d96b571cd24035335cfa",
+            "size": 30912
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "8422bd11be101e3616bc2ea38c88389bc1736f54a1aca78c182d3513ccee2d40",
+              "size": 8327,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "422172c5cbc116bd5ea79815ed14da181ca60376c651e67f5b81fb5ca28f299f",
+              "size": 153,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "a5558b0649ab1dd0e0a06acd656b81cda82dfce023e27c80a6828ab7a35e02f4",
+              "size": 237,
+              "uid": 0
+            }
+          ],
+          "identity": "locales",
+          "version": "1"
+        },
+        {
+          "archive": {
+            "sha256": "b0aefc926aa4bcd497007bf42c837a6a95c6eadedf5260ec90c049811afc5a29",
+            "size": 30912
+          },
+          "control": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "5bc47133e082bac32e13ab74b5a58e28fb81a977ba54c35cfdb242cdbee2a621",
+              "size": 8080,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "control",
+              "sha256": "41bcecb35e262d1b7c0562bf940de816bfc61eb987431446cb58ab7a2ad66632",
+              "size": 152,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "a8e223e9d48e3d9625d5c70d5352f7ab87f4deb42203b802dfc39132acbe6b81",
+              "size": 233,
+              "uid": 0
+            }
+          ],
+          "identity": "tzdata",
+          "version": "1"
+        }
+      ]
+    },
+    "script_context": {
+      "closed_probe_fds": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "cwd": "/",
+      "environment": "exact-bounded-direct-dpkg-maintscript-environment",
+      "open_fds": [
+        0,
+        1,
+        2
+      ]
+    },
+    "successful_lifecycle": [
+      {
+        "config": "v1",
+        "database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "420d6dd5dfc65e78815d28a65e3c2682866e2a1693699709f8e82b056c97c478",
+              "size": 382,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "51c649e9219584964c51f6cb15f223cec950270b52cff4b6151a9494f13b2fae",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9dff993f93b158d19a598e1ddca3a8e94bbe7de733b47744e7214e639a6e4e4d",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c96010804e90a030ff88716b99375926d10dec00fd6134a2660505e0368dc56b",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "275234dca6c6c3e8e01e6edbaf64c38528495e2abc20ad91256e12ac7f06acfc",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "operation": "install",
+        "state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "trace": [
+          "preinst@v1\t[\"install\"]\t-\tv1",
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ]
+      },
+      {
+        "config": "v1r",
+        "database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "760e17d4f55ca8eefc2e9c4888968226e7ee328106786806621ec83e6fd4817a",
+              "size": 384,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dc4d116aa86e155cf7124597a1347f3398bcf80a8c06a0751cc1dc322b8c68e4",
+              "size": 296,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "5bae8db65e52d10614a912665ba85ebc04bbe8dc0f0a5de0529541af448c0ea7",
+              "size": 336,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "de235c2e50f3fc026f2c527b5ef75e87edd005a6fa79166641b74ce27804509e",
+              "size": 1722,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "bdfc34d18c2619012a7ba30731112129ef6126e43bba9bd9110ff84194eb76f4",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "eff99f756233db0394792e376579146fe9f14d82b80d352a44c173226597f748",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "19c6618eb4cfe11d7dd9da7e1900b971cc251e106f13b28f67e386e960b1449a",
+              "size": 1710,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "operation": "reinstall",
+        "state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "trace": [
+          "prerm@v1\t[\"upgrade\",\"1\"]\tv1\tv1r",
+          "preinst@v1r\t[\"upgrade\",\"1\",\"1\"]\tv1\tv1r",
+          "postrm@v1\t[\"upgrade\",\"1\"]\tv1\tv1r",
+          "postinst@v1r\t[\"configure\",\"1\"]\tv1r\t-"
+        ]
+      },
+      {
+        "config": "v2",
+        "database": {
+          "committed": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "2"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "conffiles",
+              "sha256": "571f0e48039cdeed6e52d462581528f79db8f0242eb43ebdedde980656db1b8a",
+              "size": 22,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "cb573e53621ec94b68af2769ff4f86cb6038b4cf05ad2734b0da761654e6f694",
+              "size": 402,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "1e7e32470a09e43a38c7f28047291ce66f9daa279d123f83e69c70af9d7b5f7c",
+              "size": 298,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "fce6964dd6dca77c50365e7a3b408daf54313015d6083fb690f90daddb6ce91a",
+              "size": 338,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postinst",
+              "sha256": "9048eb1f117837fb98af19f51f7aa5cfcb2a5c3da1afd35058e06fab33482441",
+              "size": 1718,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
+              "size": 1710,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "preinst",
+              "sha256": "c37fe23ceec79ba2bb2cf3fb4e3ce7fffb5cf84e4498ea21d2d93064f94c4446",
+              "size": 1714,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "prerm",
+              "sha256": "a3cd6c9c91c0c332eadabd7cf2b9327e0575d8e866c17ef5e6730f0da27858b2",
+              "size": 1706,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "operation": "upgrade",
+        "state": {
+          "architecture": "amd64",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "install ok installed",
+          "version": "2"
+        },
+        "trace": [
+          "prerm@v1r\t[\"upgrade\",\"2\"]\tv1r\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1r\tv2",
+          "postrm@v1r\t[\"upgrade\",\"2\"]\tv1r\tv2",
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ]
+      },
+      {
+        "config": null,
+        "database": {
+          "committed": {
+            "architecture": "amd64",
+            "config_version": "2",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "deinstall ok config-files",
+            "version": "2"
+          },
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "filesystem": {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "dfc1f8513c6d860a7e4da99032b1c9be88f249214d07a58fd9347aa933226621",
+              "size": 32,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "postrm",
+              "sha256": "9033d88e7198d25494d5e805ae3a452fffe60f3a849fe6093f18980e61afdc18",
+              "size": 1710,
+              "uid": 0
+            }
+          ],
+          "staging": []
+        },
+        "operation": "remove",
+        "state": {
+          "architecture": "amd64",
+          "config_version": "2",
+          "description": "native data-only materialization fixture",
+          "maintainer": "debz fixture <fixture@example.invalid>",
+          "status": "deinstall ok config-files",
+          "version": "2"
+        },
+        "trace": [
+          "prerm@v2\t[\"remove\"]\tv2\t-",
+          "postrm@v2\t[\"remove\"]\tv2\t-"
+        ]
+      },
+      {
+        "config": null,
+        "database": {
+          "committed": null,
+          "journal_latest": null,
+          "journal_nonempty": false,
+          "temporary_update": false
+        },
+        "filesystem": {
+          "info": [],
+          "staging": []
+        },
+        "operation": "purge",
+        "state": null,
+        "trace": [
+          "postrm@v2\t[\"purge\"]\t-\t-"
+        ]
+      }
+    ],
+    "vendor_identity_cohort": {
+      "config_invocation_count": 0,
+      "install_exit": 0,
+      "installed_identities": [
+        "chrony.config",
+        "console-setup.config",
+        "debconf.config",
+        "iproute2.config",
+        "keyboard-configuration.config",
+        "locales.config",
+        "tzdata.config"
+      ],
+      "installed_state": [
+        {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "d66fbec91249e55064c3045f104fb5515538b6f2350e4f070949b254ce183634",
+              "size": 204,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "81e59df657a6bdcd2259bb917119bb7c65292d070d9c6db78171b832b98687ad",
+              "size": 185,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "d8315388168438c85b14033909be86b8926f377b4dfc2734471519d4c4ae137e",
+              "size": 233,
+              "uid": 0
+            }
+          ],
+          "package": "chrony",
+          "state": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          }
+        },
+        {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "c67a8e398c4df6871c4cef327ba03e4ea277b8bb7340885eeb4e046c0aee91c0",
+              "size": 32119,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "8c4f4e308d24fa92f293e1deccc0f13af95c67d42715e46ce7b6732360a40cc6",
+              "size": 234,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "c39402902a92e8ab861ad160ced4768f674fd780d78951e80c923e3702a866b5",
+              "size": 261,
+              "uid": 0
+            }
+          ],
+          "package": "console-setup",
+          "state": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          }
+        },
+        {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "f416c6a4f8ecc39ec744e91b155f5736c27ccc6b04665d06e9ab4575b88b32b9",
+              "size": 505,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "ee514548852b1de2bb2fc68251d2cd8c11c5e861fa7b1b36be967a6f4bc022ce",
+              "size": 192,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "d06996b7fe406113ff79c6e604cb239b51cc409031bec7960fb2b4ad423205f1",
+              "size": 237,
+              "uid": 0
+            }
+          ],
+          "package": "debconf",
+          "state": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          }
+        },
+        {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "6070c9325502f11d11751308b2384f205de26fcd98f69d9003558a73187acfcf",
+              "size": 104,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "96995763f9081d826d72652d37a26437abdc1ead8cf92e0a8b98a86193132af2",
+              "size": 199,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "a105888e49a26ad2f31f75965a433952c7516a572f42b647eedeb15edca1076a",
+              "size": 241,
+              "uid": 0
+            }
+          ],
+          "package": "iproute2",
+          "state": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          }
+        },
+        {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "5efe1532ded9885cd306ee85842a7268d64a15a9a08bcf5bedbed622f044fa90",
+              "size": 91581,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "535a658f816f0364e3e78bf84f3f2fef8de924c098abc11f9299903474267000",
+              "size": 297,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "d6d6915d1379032de4a1e2b46025e4919580d6268efb5471e7064781b37b4add",
+              "size": 297,
+              "uid": 0
+            }
+          ],
+          "package": "keyboard-configuration",
+          "state": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          }
+        },
+        {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "8422bd11be101e3616bc2ea38c88389bc1736f54a1aca78c182d3513ccee2d40",
+              "size": 8327,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "31876df662011a4960d9dc9ab1bbc99627acf985d88ed57acf51224d949ef739",
+              "size": 192,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "a5558b0649ab1dd0e0a06acd656b81cda82dfce023e27c80a6828ab7a35e02f4",
+              "size": 237,
+              "uid": 0
+            }
+          ],
+          "package": "locales",
+          "state": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          }
+        },
+        {
+          "info": [
+            {
+              "gid": 0,
+              "mode": "0755",
+              "name": "config",
+              "sha256": "5bc47133e082bac32e13ab74b5a58e28fb81a977ba54c35cfdb242cdbee2a621",
+              "size": 8080,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "list",
+              "sha256": "accf3b5afbc0847b84a57fd4ef931571683451e0ff8782ccae51ab8ef70ca903",
+              "size": 185,
+              "uid": 0
+            },
+            {
+              "gid": 0,
+              "mode": "0644",
+              "name": "md5sums",
+              "sha256": "a8e223e9d48e3d9625d5c70d5352f7ab87f4deb42203b802dfc39132acbe6b81",
+              "size": 233,
+              "uid": 0
+            }
+          ],
+          "package": "tzdata",
+          "state": {
+            "architecture": "amd64",
+            "description": "native data-only materialization fixture",
+            "maintainer": "debz fixture <fixture@example.invalid>",
+            "status": "install ok installed",
+            "version": "1"
+          }
+        }
+      ],
+      "remove_exit": 0,
+      "removed_state": [
+        {
+          "info": [],
+          "package": "chrony",
+          "state": null
+        },
+        {
+          "info": [],
+          "package": "console-setup",
+          "state": null
+        },
+        {
+          "info": [],
+          "package": "debconf",
+          "state": null
+        },
+        {
+          "info": [],
+          "package": "iproute2",
+          "state": null
+        },
+        {
+          "info": [],
+          "package": "keyboard-configuration",
+          "state": null
+        },
+        {
+          "info": [],
+          "package": "locales",
+          "state": null
+        },
+        {
+          "info": [],
+          "package": "tzdata",
+          "state": null
+        }
+      ],
+      "retained_after_remove": []
+    }
+  },
+  "schema": "https://debz.dev/schema/dpkg-config-reference-v1",
+  "source": {
+    "dpkg": {
+      "architectures": {
+        "amd64": {
+          "archive_sha256": "3e800c6d75e8e709007ed1c356e5fa8509a75c1694fb0a1183709abc9cfdc1f3",
+          "executable_sha256": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5"
+        },
+        "arm64": {
+          "archive_sha256": "1142468e57f69e13d174f517dff739508c61ee97d81c182c120cd6b281d8cdfa",
+          "executable_sha256": "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79"
+        }
+      },
+      "configuration_sha256": "fead43b89af3ea5691c48f32d7fe1ba0f7ab229fb5d230f612d76fe8e6f5a015",
+      "version": "1.22.22"
+    },
+    "vendor_reference": {
+      "index": {
+        "path": "index-v1.json",
+        "sha256": "682bff167a4bc2386ceb78fb554be0adbe6fbfab16f4eab77aff3b63af04dd34",
+        "size": 3256
+      },
+      "manifests": [
+        {
+          "architecture": "amd64",
+          "path": "ubuntu-resolute-20260816T000000Z-amd64-v1.json",
+          "sha256": "9ae81ea204a2cf608860451a41d477068a11ab77e8762e61e53d95bc0a70570b",
+          "size": 320842
+        },
+        {
+          "architecture": "arm64",
+          "path": "ubuntu-resolute-20260816T000000Z-arm64-v1.json",
+          "sha256": "90698d5a1eae643dfc68a0acbb38cca48b98b297453fdc5d1a10509c792fa16c",
+          "size": 320842
+        }
+      ],
+      "reference": {
+        "path": "reference-v1.json",
+        "sha256": "73228f959a335956c58d48712c891ccc372082dfc4f78f4405c18a37f98efe08",
+        "size": 1290490
+      },
+      "requirement_id": "debconf-config-execution"
+    }
+  },
+  "version": 1
+}

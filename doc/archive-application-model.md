@@ -138,10 +138,13 @@ The pinned fixtures currently exercise a deliberately small part of the profile.
 
 No pinned archive-application fixture ships `md5sums`, symbolic or hard links,
 setuid or setgid payload entries, non-root ownership, GNU long names,
-`remove-on-upgrade` conffiles or `config`. The separate installed-state
-vendor reference contains seven bounded `*.config` members but no archive bytes
-or execution evidence, so it does not close this archive/reference-execution
-gate. Those paths are therefore
+or `remove-on-upgrade` conffiles. The installed-state vendor reference contains
+seven bounded `*.config` members but no archive bytes. The separate
+[amd64 direct-dpkg config oracle](integration-roots.md) generates bounded
+adversarial archives at each pinned member size and proves their exact direct-dpkg
+publication, replacement, failure, interruption, removal, and non-execution
+behavior. It does not claim the unavailable vendor bytes or any apt/debconf
+frontend behavior. Those archive-model paths are also
 covered by the adversarial and positive unit tests in
 `src/archive_application.zig` and by the `archive-application-model`,
 `archive-checksum-verification`, and `archive-unsupported-feature` scenarios in

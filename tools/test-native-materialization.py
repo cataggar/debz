@@ -79,6 +79,7 @@ def make_package(
     prepare_payload: Callable[[Path], None] | None = None,
     compression: str = "gzip",
     triggers: bytes | None = None,
+    archive_builder: Callable[[Path, Path], None] | None = None,
 ) -> Path:
     if compression not in ("gzip", "none"):
         raise ValueError(f"unsupported fixture compression: {compression}")
@@ -145,12 +146,16 @@ def make_package(
     if feature == "zero-time":
         os.utime(source / payload / "empty", (0, 0))
     destination = workspace / (stem + ".deb")
-    run(
-        ["dpkg-deb", "--build", "--uniform-compression", f"-Z{compression}",
-         *(["-z1"] if compression == "gzip" else []), str(source), str(destination)],
-        environment,
-        workspace / (stem + ".build.log"),
-    )
+    if archive_builder is None:
+        run(
+            ["dpkg-deb", "--build", "--uniform-compression", f"-Z{compression}",
+             *(["-z1"] if compression == "gzip" else []),
+             str(source), str(destination)],
+            environment,
+            workspace / (stem + ".build.log"),
+        )
+    else:
+        archive_builder(source, destination)
     return destination
 
 

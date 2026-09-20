@@ -1,0 +1,1046 @@
+{
+  "$defs": {
+    "architecture": {
+      "enum": [
+        "amd64",
+        "arm64"
+      ]
+    },
+    "architectureFact": {
+      "additionalProperties": false,
+      "properties": {
+        "gid": {
+          "const": 0
+        },
+        "mode": {
+          "const": "0755"
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "referenced_paths": {
+          "maxItems": 0,
+          "type": "array"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 262144,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "uid": {
+          "const": 0
+        }
+      },
+      "required": [
+        "gid",
+        "mode",
+        "path",
+        "referenced_paths",
+        "sha256",
+        "size",
+        "uid"
+      ],
+      "type": "object"
+    },
+    "databaseState": {
+      "additionalProperties": false,
+      "properties": {
+        "committed": {
+          "$ref": "#/$defs/state"
+        },
+        "journal_latest": {
+          "$ref": "#/$defs/state"
+        },
+        "journal_nonempty": {
+          "type": "boolean"
+        },
+        "temporary_update": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "committed",
+        "journal_latest",
+        "journal_nonempty",
+        "temporary_update"
+      ],
+      "type": "object"
+    },
+    "archiveBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "cohortPackageState": {
+      "additionalProperties": false,
+      "properties": {
+        "info": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "package": {
+          "pattern": "^[a-z0-9][a-z0-9+.-]*$",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        }
+      },
+      "required": [
+        "info",
+        "package",
+        "state"
+      ],
+      "type": "object"
+    },
+    "digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "failureCase": {
+      "additionalProperties": false,
+      "properties": {
+        "case": {
+          "enum": [
+            "fresh-postinst-failure",
+            "upgrade-postinst-failure",
+            "incoming-preinst-failure",
+            "double-postrm-upgrade-failure",
+            "remove-postrm-failure",
+            "purge-postrm-failure"
+          ]
+        },
+        "failed_config": {
+          "$ref": "#/$defs/token"
+        },
+        "failed_database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "failed_filesystem": {
+          "$ref": "#/$defs/filesystemState"
+        },
+        "failed_state": {
+          "$ref": "#/$defs/state"
+        },
+        "failed_trace": {
+          "$ref": "#/$defs/trace"
+        },
+        "recovery_config": {
+          "$ref": "#/$defs/token"
+        },
+        "recovery_database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "recovery_filesystem": {
+          "$ref": "#/$defs/filesystemState"
+        },
+        "recovery_state": {
+          "$ref": "#/$defs/state"
+        },
+        "recovery_trace": {
+          "$ref": "#/$defs/trace"
+        }
+      },
+      "required": [
+        "case",
+        "failed_config",
+        "failed_database",
+        "failed_filesystem",
+        "failed_state",
+        "failed_trace"
+      ],
+      "type": "object"
+    },
+    "fileBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "pattern": "^[^/\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "interruptionCase": {
+      "additionalProperties": false,
+      "properties": {
+        "case": {
+          "enum": [
+            "postinst-interruption",
+            "upgrade-preinst-interruption",
+            "remove-postrm-interruption"
+          ]
+        },
+        "interrupted_config": {
+          "$ref": "#/$defs/token"
+        },
+        "interrupted_database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "interrupted_filesystem": {
+          "$ref": "#/$defs/filesystemState"
+        },
+        "interrupted_staging_config": {
+          "$ref": "#/$defs/token"
+        },
+        "interrupted_trace": {
+          "$ref": "#/$defs/trace"
+        },
+        "recovery_config": {
+          "$ref": "#/$defs/token"
+        },
+        "recovery_database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "recovery_filesystem": {
+          "$ref": "#/$defs/filesystemState"
+        },
+        "recovery_state": {
+          "$ref": "#/$defs/state"
+        },
+        "recovery_trace": {
+          "$ref": "#/$defs/trace"
+        }
+      },
+      "required": [
+        "case",
+        "interrupted_config",
+        "interrupted_database",
+        "interrupted_filesystem",
+        "interrupted_staging_config",
+        "interrupted_trace",
+        "recovery_config",
+        "recovery_database",
+        "recovery_filesystem",
+        "recovery_state",
+        "recovery_trace"
+      ],
+      "type": "object"
+    },
+    "manifestBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "$ref": "#/$defs/architecture"
+        },
+        "path": {
+          "pattern": "^[^/\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "architecture",
+        "path",
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    },
+    "filesystemState": {
+      "additionalProperties": false,
+      "properties": {
+        "info": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "staging": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "required": [
+        "info",
+        "staging"
+      ],
+      "type": "object"
+    },
+    "member": {
+      "additionalProperties": false,
+      "properties": {
+        "architectures": {
+          "additionalProperties": false,
+          "properties": {
+            "amd64": {
+              "$ref": "#/$defs/architectureFact"
+            },
+            "arm64": {
+              "$ref": "#/$defs/architectureFact"
+            }
+          },
+          "required": [
+            "amd64",
+            "arm64"
+          ],
+          "type": "object"
+        },
+        "classification": {
+          "const": "debconf-config"
+        },
+        "handling": {
+          "const": "reference-execution-required"
+        },
+        "identity": {
+          "pattern": "^[a-z0-9][a-z0-9+.-]*\\.config$",
+          "type": "string"
+        },
+        "owner": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture_qualified": {
+              "const": false
+            },
+            "kind": {
+              "const": "package"
+            },
+            "package": {
+              "pattern": "^[a-z0-9][a-z0-9+.-]*$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "architecture_qualified",
+            "kind",
+            "package"
+          ],
+          "type": "object"
+        },
+        "rationale": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reference_execution_requirement": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "architectures",
+        "classification",
+        "handling",
+        "identity",
+        "owner",
+        "rationale",
+        "reference_execution_requirement"
+      ],
+      "type": "object"
+    },
+    "observedFile": {
+      "additionalProperties": false,
+      "properties": {
+        "gid": {
+          "const": 0
+        },
+        "mode": {
+          "enum": [
+            "0644",
+            "0755"
+          ]
+        },
+        "name": {
+          "pattern": "^[^/\\u0000-\\u001f\\u007f]+$",
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 262144,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "uid": {
+          "const": 0
+        }
+      },
+      "required": [
+        "gid",
+        "mode",
+        "name",
+        "sha256",
+        "size",
+        "uid"
+      ],
+      "type": "object"
+    },
+    "packageInput": {
+      "additionalProperties": false,
+      "properties": {
+        "archive": {
+          "$ref": "#/$defs/archiveBinding"
+        },
+        "control": {
+          "items": {
+            "$ref": "#/$defs/observedFile"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "identity": {
+          "pattern": "^(v1|v1r|v2|[a-z0-9][a-z0-9+.-]*)$",
+          "type": "string"
+        },
+        "version": {
+          "enum": [
+            "1",
+            "2"
+          ]
+        }
+      },
+      "required": [
+        "archive",
+        "control",
+        "identity",
+        "version"
+      ],
+      "type": "object"
+    },
+    "relativePath": {
+      "pattern": "^(?!/)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\u0000-\\u001f\\u007f]+$",
+      "type": "string"
+    },
+    "state": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "const": "amd64"
+            },
+            "config_version": {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            "description": {
+              "const": "native data-only materialization fixture"
+            },
+            "maintainer": {
+              "const": "debz fixture <fixture@example.invalid>"
+            },
+            "status": {
+              "enum": [
+                "install ok installed",
+                "install ok half-configured",
+                "install reinstreq half-installed",
+                "deinstall ok half-installed",
+                "deinstall ok config-files",
+                "purge ok config-files"
+              ]
+            },
+            "version": {
+              "enum": [
+                "1",
+                "2"
+              ]
+            }
+          },
+          "required": [
+            "architecture",
+            "description",
+            "maintainer",
+            "status",
+            "version"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "successPhase": {
+      "additionalProperties": false,
+      "properties": {
+        "config": {
+          "$ref": "#/$defs/token"
+        },
+        "database": {
+          "$ref": "#/$defs/databaseState"
+        },
+        "filesystem": {
+          "$ref": "#/$defs/filesystemState"
+        },
+        "operation": {
+          "enum": [
+            "install",
+            "reinstall",
+            "upgrade",
+            "remove",
+            "purge"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "trace": {
+          "$ref": "#/$defs/trace"
+        }
+      },
+      "required": [
+        "config",
+        "database",
+        "filesystem",
+        "operation",
+        "state",
+        "trace"
+      ],
+      "type": "object"
+    },
+    "token": {
+      "enum": [
+        null,
+        "v1",
+        "v1r",
+        "v2"
+      ]
+    },
+    "trace": {
+      "items": {
+        "maxLength": 512,
+        "pattern": "^(preinst|postinst|prerm|postrm)@(v1|v1r|v2)\\t\\[[^\\r\\n]*\\]\\t(-|v1|v1r|v2)\\t(-|v1|v1r|v2)$",
+        "type": "string"
+      },
+      "maxItems": 16,
+      "type": "array"
+    }
+  },
+  "$id": "https://debz.dev/schema/dpkg-config-reference-v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "boundary": {
+      "additionalProperties": false,
+      "properties": {
+        "architectures": {
+          "prefixItems": [
+            {
+              "const": "amd64"
+            },
+            {
+              "const": "arm64"
+            }
+          ],
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "architecture_scope": {
+          "const": "vendor config facts cover amd64 and arm64; direct-dpkg lifecycle execution is published for amd64 only"
+        },
+        "excluded_frontends": {
+          "prefixItems": [
+            {
+              "const": "apt"
+            },
+            {
+              "const": "apt-get"
+            },
+            {
+              "const": "debconf"
+            },
+            {
+              "const": "dpkg-preconfigure"
+            }
+          ],
+          "items": false,
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
+        },
+        "invocation": {
+          "const": "direct-dpkg-only"
+        },
+        "limits": {
+          "additionalProperties": false,
+          "properties": {
+            "maximum_argument_bytes": {
+              "const": 256
+            },
+            "maximum_arguments": {
+              "const": 16
+            },
+            "maximum_control_bytes": {
+              "const": 262144
+            },
+            "maximum_control_members": {
+              "const": 16
+            },
+            "maximum_archive_bytes": {
+              "const": 8388608
+            },
+            "maximum_environment_line_bytes": {
+              "const": 4096
+            },
+            "maximum_environment_records": {
+              "const": 128
+            },
+            "maximum_environment_variables": {
+              "const": 32
+            },
+            "maximum_file_bytes": {
+              "const": 262144
+            },
+            "maximum_info_bytes": {
+              "const": 1048576
+            },
+            "maximum_info_files": {
+              "const": 32
+            },
+            "maximum_log_bytes": {
+              "const": 131072
+            },
+            "maximum_packages": {
+              "const": 16
+            },
+            "maximum_status_bytes": {
+              "const": 262144
+            },
+            "maximum_trace_bytes": {
+              "const": 131072
+            },
+            "maximum_trace_records": {
+              "const": 128
+            },
+            "maximum_updates": {
+              "const": 32
+            },
+            "pause_script_timeout_seconds": {
+              "const": 30
+            },
+            "pause_timeout_seconds": {
+              "const": 10
+            },
+            "subprocess_timeout_seconds": {
+              "const": 60
+            }
+          },
+          "required": [
+            "maximum_argument_bytes",
+            "maximum_arguments",
+            "maximum_archive_bytes",
+            "maximum_control_bytes",
+            "maximum_control_members",
+            "maximum_environment_line_bytes",
+            "maximum_environment_records",
+            "maximum_environment_variables",
+            "maximum_file_bytes",
+            "maximum_info_bytes",
+            "maximum_info_files",
+            "maximum_log_bytes",
+            "maximum_packages",
+            "maximum_status_bytes",
+            "maximum_trace_bytes",
+            "maximum_trace_records",
+            "maximum_updates",
+            "pause_script_timeout_seconds",
+            "pause_timeout_seconds",
+            "subprocess_timeout_seconds"
+          ],
+          "type": "object"
+        },
+        "operations": {
+          "prefixItems": [
+            {
+              "const": "install"
+            },
+            {
+              "const": "reinstall"
+            },
+            {
+              "const": "upgrade"
+            },
+            {
+              "const": "configure"
+            },
+            {
+              "const": "remove"
+            },
+            {
+              "const": "purge"
+            },
+            {
+              "const": "interrupted-retry"
+            }
+          ],
+          "items": false,
+          "maxItems": 7,
+          "minItems": 7,
+          "type": "array"
+        },
+        "observed_architecture": {
+          "const": "amd64"
+        }
+      },
+      "required": [
+        "architecture_scope",
+        "architectures",
+        "excluded_frontends",
+        "invocation",
+        "limits",
+        "observed_architecture",
+        "operations"
+      ],
+      "type": "object"
+    },
+    "implementation_requirement": {
+      "additionalProperties": false,
+      "properties": {
+        "current_native_guards": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "required_behavior": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "support_status": {
+          "const": "reference-only-not-enabled"
+        }
+      },
+      "required": [
+        "current_native_guards",
+        "required_behavior",
+        "support_status"
+      ],
+      "type": "object"
+    },
+    "members": {
+      "items": {
+        "$ref": "#/$defs/member"
+      },
+      "maxItems": 7,
+      "minItems": 7,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "observed_behavior": {
+      "additionalProperties": false,
+      "properties": {
+        "config_invocation_count": {
+          "const": 0
+        },
+        "failure_recovery": {
+          "items": {
+            "$ref": "#/$defs/failureCase"
+          },
+          "maxItems": 6,
+          "minItems": 6,
+          "type": "array"
+        },
+        "frontend_invocation_count": {
+          "const": 0
+        },
+        "interruption_recovery": {
+          "items": {
+            "$ref": "#/$defs/interruptionCase"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "package_inputs": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "const": "amd64"
+            },
+            "lifecycle": {
+              "items": {
+                "$ref": "#/$defs/packageInput"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array"
+            },
+            "vendor": {
+              "items": {
+                "$ref": "#/$defs/packageInput"
+              },
+              "maxItems": 7,
+              "minItems": 7,
+              "type": "array"
+            }
+          },
+          "required": [
+            "architecture",
+            "lifecycle",
+            "vendor"
+          ],
+          "type": "object"
+        },
+        "script_context": {
+          "additionalProperties": false,
+          "properties": {
+            "closed_probe_fds": {
+              "const": [
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9
+              ]
+            },
+            "cwd": {
+              "const": "/"
+            },
+            "environment": {
+              "const": "exact-bounded-direct-dpkg-maintscript-environment"
+            },
+            "open_fds": {
+              "const": [
+                0,
+                1,
+                2
+              ]
+            }
+          },
+          "required": [
+            "closed_probe_fds",
+            "cwd",
+            "environment",
+            "open_fds"
+          ],
+          "type": "object"
+        },
+        "successful_lifecycle": {
+          "items": {
+            "$ref": "#/$defs/successPhase"
+          },
+          "maxItems": 5,
+          "minItems": 5,
+          "type": "array"
+        },
+        "vendor_identity_cohort": {
+          "additionalProperties": false,
+          "properties": {
+            "config_invocation_count": {
+              "const": 0
+            },
+            "install_exit": {
+              "const": 0
+            },
+            "installed_identities": {
+              "items": {
+                "pattern": "^[a-z0-9][a-z0-9+.-]*\\.config$",
+                "type": "string"
+              },
+              "maxItems": 7,
+              "minItems": 7,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "installed_state": {
+              "items": {
+                "$ref": "#/$defs/cohortPackageState"
+              },
+              "maxItems": 7,
+              "minItems": 7,
+              "type": "array"
+            },
+            "remove_exit": {
+              "const": 0
+            },
+            "removed_state": {
+              "items": {
+                "$ref": "#/$defs/cohortPackageState"
+              },
+              "maxItems": 7,
+              "minItems": 7,
+              "type": "array"
+            },
+            "retained_after_remove": {
+              "maxItems": 0,
+              "type": "array"
+            }
+          },
+          "required": [
+            "config_invocation_count",
+            "install_exit",
+            "installed_identities",
+            "installed_state",
+            "remove_exit",
+            "removed_state",
+            "retained_after_remove"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "config_invocation_count",
+        "failure_recovery",
+        "frontend_invocation_count",
+        "interruption_recovery",
+        "package_inputs",
+        "script_context",
+        "successful_lifecycle",
+        "vendor_identity_cohort"
+      ],
+      "type": "object"
+    },
+    "schema": {
+      "const": "https://debz.dev/schema/dpkg-config-reference-v1"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "dpkg": {
+          "additionalProperties": false,
+          "properties": {
+            "architectures": {
+              "additionalProperties": false,
+              "properties": {
+                "amd64": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "archive_sha256": {
+                      "const": "3e800c6d75e8e709007ed1c356e5fa8509a75c1694fb0a1183709abc9cfdc1f3"
+                    },
+                    "executable_sha256": {
+                      "const": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5"
+                    }
+                  },
+                  "required": [
+                    "archive_sha256",
+                    "executable_sha256"
+                  ],
+                  "type": "object"
+                },
+                "arm64": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "archive_sha256": {
+                      "const": "1142468e57f69e13d174f517dff739508c61ee97d81c182c120cd6b281d8cdfa"
+                    },
+                    "executable_sha256": {
+                      "const": "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79"
+                    }
+                  },
+                  "required": [
+                    "archive_sha256",
+                    "executable_sha256"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "amd64",
+                "arm64"
+              ],
+              "type": "object"
+            },
+            "configuration_sha256": {
+              "const": "fead43b89af3ea5691c48f32d7fe1ba0f7ab229fb5d230f612d76fe8e6f5a015"
+            },
+            "version": {
+              "const": "1.22.22"
+            }
+          },
+          "required": [
+            "architectures",
+            "configuration_sha256",
+            "version"
+          ],
+          "type": "object"
+        },
+        "vendor_reference": {
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "$ref": "#/$defs/fileBinding"
+            },
+            "manifests": {
+              "items": {
+                "$ref": "#/$defs/manifestBinding"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "reference": {
+              "$ref": "#/$defs/fileBinding"
+            },
+            "requirement_id": {
+              "const": "debconf-config-execution"
+            }
+          },
+          "required": [
+            "index",
+            "manifests",
+            "reference",
+            "requirement_id"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "dpkg",
+        "vendor_reference"
+      ],
+      "type": "object"
+    },
+    "version": {
+      "const": 1
+    }
+  },
+  "required": [
+    "boundary",
+    "implementation_requirement",
+    "members",
+    "observed_behavior",
+    "schema",
+    "source",
+    "version"
+  ],
+  "title": "Direct dpkg config control-member reference v1",
+  "type": "object"
+}

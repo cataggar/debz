@@ -275,12 +275,15 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&audit.step);
     const audit_tests = b.addSystemCommand(
         &.{
+            "env",
+            "PYTHONDONTWRITEBYTECODE=1",
             "python3",
             "-m",
             "unittest",
             "tools/test_security_audit.py",
             "tools/test_real_snapshot_acceptance.py",
             "tools/test_vendor_state_capture.py",
+            "tools/test_dpkg_config_reference.py",
         },
     );
     audit_step.dependOn(&audit_tests.step);
@@ -599,6 +602,18 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-conffiles", "Compare native conffile and remove/purge phases with dpkg")
         .dependOn(&native_conffiles.step);
 
+    const dpkg_config_reference = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), "python3", "tools/dpkg-config-reference.py",
+    });
+    const dpkg_config_reference_tests = b.addSystemCommand(
+        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_config_reference.py" },
+    );
+    dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
+    test_step.dependOn(&dpkg_config_reference_tests.step);
+    b.step("test-dpkg-config-reference", "Verify amd64 direct pinned-dpkg config control-member behavior")
+        .dependOn(&dpkg_config_reference.step);
+
     const native_lifecycle_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -729,7 +744,7 @@ pub fn build(b: *std.Build) void {
     }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
         for ([_]*std.Build.Step.Run{
-            native_materialization, native_conffiles, native_lifecycle, native_triggers, native_recovery,
+            native_materialization, native_conffiles, dpkg_config_reference, native_lifecycle, native_triggers, native_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
     }
 
@@ -1015,6 +1030,7 @@ fn installReleaseFiles(
         "transaction-result-capability-v1.json",
         "native-install-capability-v1.json",
         "native-install-result-v1.json",
+        "dpkg-config-reference-v1.json",
         "vendor-state-inventory-v1.json",
         "vendor-state-reference-v1.json",
     };

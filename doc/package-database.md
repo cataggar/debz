@@ -74,6 +74,15 @@ execution; those remain opaque and guarded. Diversion and statoverride
 filesystem semantics belong to the
 [native unpack/lifecycle layer](native-unpack.md#diversion-routing).
 
+The pinned [amd64 direct-dpkg config reference](integration-roots.md) now
+specifies what eventual typed config handling must do on that architecture
+without changing that guard:
+retain exact executable bytes as non-lifecycle metadata, expose old/incoming
+versions at dpkg's callback boundaries, replace or restore them with the
+package lifecycle, remove them only after successful postrm remove, and never
+execute them as part of direct dpkg lifecycle processing. Frontend
+preconfiguration remains explicitly out of scope.
+
 The shared `triggers/Lock` is synchronization infrastructure, not a named
 interest file or consumed database generation. `File` and `Unincorp` retain
 their dedicated formats. Other trigger-directory entries must satisfy the
