@@ -543,7 +543,7 @@ printf '\\tinfo=%s\\tstaging=%s\\tcwd=%s\\tfds=%s\\n' \
     "$(read_config_identity /var/lib/dpkg/tmp.ci/config)" "$PWD" "$fds" >> /{TRACE}
 
 printf 'BEGIN\\t%s\\n' '{kind}@{token}' >> /{ENV_TRACE}
-/oracle-env >> /{ENV_TRACE}
+SHLVL=1 _=/oracle-env /oracle-env >> /{ENV_TRACE}
 printf 'END\\n' >> /{ENV_TRACE}
 
 if [ -f /{FAILURES} ]; then

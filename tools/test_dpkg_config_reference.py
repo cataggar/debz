@@ -91,6 +91,13 @@ class DpkgConfigReferenceTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_script_environment_shell_variables_are_explicit(self) -> None:
+        for body in oracle.maintainer_scripts("v1").values():
+            self.assertIn(
+                b"SHLVL=1 _=/oracle-env /oracle-env",
+                body,
+            )
+
     def test_vendor_config_fixtures_match_all_pinned_sizes(self) -> None:
         reference = oracle.load_reference()
         for architecture in ("amd64", "arm64"):
