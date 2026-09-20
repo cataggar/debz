@@ -438,6 +438,8 @@ def _capture_database_directory(
         entry: dict[str, Any] = {
             "path": relative,
             "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
         }
         if path.name.endswith(".list"):
             entry["kind"] = "path-list"

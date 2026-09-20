@@ -28585,6 +28585,71 @@ test "native_unpack.test.deferred lifecycle features are explicit handoffs" {
     }
 }
 
+test "native_unpack.test.config is root-owned inert metadata without script authority" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    const config_bytes =
+        "#!/bin/sh\nprintf invoked > /config-was-executed\nexit 97\n";
+    var data = [_]Entry{.{
+        .path = "usr/share/demo",
+        .content = "payload\n",
+    }};
+    const bytes = try buildOwnedArchive(.{
+        .package = "demo",
+        .version = "1.0",
+        .control = &.{.{
+            .path = "config",
+            .mode = 0o755,
+            .content = config_bytes,
+        }},
+    }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+
+    const config = model.script(.config).?;
+    try testing.expect(!config.kind.lifecycle());
+    try testing.expect(databaseScriptKind(.config) == null);
+    try testing.expect(lifecycleArchiveScriptKind(.config) == null);
+
+    const metadata = try stagedArchiveMetadata(testing.allocator, &model);
+    defer testing.allocator.free(metadata);
+    try testing.expectEqual(@as(usize, 1), metadata.len);
+    try testing.expectEqual(package_database.RetainedMetadataKind.config, metadata[0].kind);
+    try testing.expectEqualStrings(config_bytes, metadata[0].bytes);
+    try testing.expectEqual(@as(u32, 0o755), metadata[0].mode);
+    try testing.expectEqual(@as(u32, 0), metadata[0].uid);
+    try testing.expectEqual(@as(u32, 0), metadata[0].gid);
+
+    var evidence_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer evidence_arena.deinit();
+    var evidence_models = [_]archive_application.Model{model};
+    const evidence = try lifecycleArchiveEvidence(
+        evidence_arena.allocator(),
+        &evidence_models,
+        &.{bytes},
+    );
+    try testing.expectEqual(@as(usize, 1), evidence.len);
+    try testing.expectEqual(@as(usize, 0), evidence[0].scripts.len);
+
+    const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    var planned = try expectPlan(try planFor(
+        &fixture,
+        &program,
+        &.{.{ .artifact = 0, .bytes = bytes }},
+    ));
+    defer planned.deinit();
+    const write = planned.database.find("info/demo.config").?;
+    try testing.expectEqual(package_database_changes.WriteKind.replace, write.kind);
+    try testing.expectEqualStrings(config_bytes, write.bytes);
+    try testing.expectEqual(@as(u32, 0o755), write.mode);
+    try testing.expectEqual(@as(?u32, 0), write.uid);
+    try testing.expectEqual(@as(?u32, 0), write.gid);
+}
+
 test "native_unpack.test.shared roots and unsupported snapshots hand off" {
     var fixture: Fixture = undefined;
     try fixture.init(empty_status, &.{});
