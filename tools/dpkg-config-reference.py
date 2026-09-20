@@ -240,11 +240,13 @@ def validate_observation_architecture(
     reference: dict[str, Any],
     architecture: str,
 ) -> None:
-    observed = reference["boundary"].get("observed_architecture")
-    if architecture != observed:
+    observed = reference["boundary"].get("observed_architectures")
+    if observed is None:
+        observed = [reference["boundary"]["observed_architecture"]]
+    if architecture not in observed:
         raise OracleError(
             "published direct-dpkg observation is architecture-specific: "
-            f"host={architecture}, observed={observed}"
+            f"requested={architecture}, observed={','.join(observed)}"
         )
 
 
@@ -1731,10 +1733,29 @@ def select_reference(path: Path | None, architecture: str) -> str:
     return lifecycle.m.reference_dpkg.select(selected, architecture)
 
 
+def write_capture(path: Path, observed: dict[str, Any]) -> None:
+    temporary_root = (ROOT / ".tmp").resolve()
+    destination = path.resolve()
+    if destination.parent.parent != temporary_root:
+        raise OracleError(
+            "captured observation must be a file in a directory directly under .tmp"
+        )
+    if destination.exists() or destination.is_symlink():
+        raise OracleError("captured observation path already exists")
+    destination.parent.mkdir(exist_ok=True)
+    m.write(destination, canonical_json(observed).encode())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
     parser.add_argument("--reference-dpkg", type=Path)
     parser.add_argument("--workspace", type=Path)
+    parser.add_argument(
+        "--capture-observed",
+        type=Path,
+        help="write a canonical bounded observation without publishing it",
+    )
     parser.add_argument(
         "--print-observed",
         action="store_true",
@@ -1746,26 +1767,30 @@ def main() -> int:
         help="replace only observed_behavior after a bounded successful execution",
     )
     arguments = parser.parse_args()
-    if arguments.print_observed and arguments.update_reference:
-        parser.error("--print-observed and --update-reference are mutually exclusive")
+    selected_outputs = sum(
+        value is not None and value is not False
+        for value in (
+            arguments.capture_observed,
+            arguments.print_observed,
+            arguments.update_reference,
+        )
+    )
+    if selected_outputs > 1:
+        parser.error(
+            "--capture-observed, --print-observed and --update-reference are "
+            "mutually exclusive"
+        )
     if os.geteuid() != 0:
         raise OracleError("dpkg config reference execution requires root")
-    for command in ("dpkg", "ldd"):
+    for command in ("ldd",):
         if shutil.which(command) is None:
             raise OracleError(f"required reference tool is missing: {command}")
-    architecture = subprocess.run(
-        ["dpkg", "--print-architecture"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    ).stdout.strip()
-    if architecture not in ("amd64", "arm64"):
-        raise OracleError(f"unsupported reference architecture: {architecture}")
+    architecture = arguments.architecture
 
     reference = load_reference()
     verify_source_bindings(reference)
-    validate_observation_architecture(reference, architecture)
+    if arguments.capture_observed is None:
+        validate_observation_architecture(reference, architecture)
     executable = select_reference(arguments.reference_dpkg, architecture)
     m.REFERENCE_DPKG = executable
     temporary_root = ROOT / ".tmp"
@@ -1798,7 +1823,11 @@ def main() -> int:
                 executable,
                 reference,
             )
-            if not arguments.update_reference and observed != reference["observed_behavior"]:
+            if (
+                not arguments.update_reference
+                and arguments.capture_observed is None
+                and observed != reference["observed_behavior"]
+            ):
                 diagnostic = workspace / "observed.json"
                 m.write(diagnostic, canonical_json(observed).encode())
                 raise OracleError(
@@ -1814,6 +1843,8 @@ def main() -> int:
     if arguments.update_reference:
         reference["observed_behavior"] = observed
         m.write(REFERENCE, canonical_json(reference).encode())
+    if arguments.capture_observed is not None:
+        write_capture(arguments.capture_observed, observed)
     if arguments.print_observed:
         print(canonical_json(observed), end="")
     print(

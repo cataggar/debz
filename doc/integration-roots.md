@@ -247,9 +247,10 @@ environment, fd probe, update fragment, log, timeout, and process, and rejects
 traversing, symlink, and special-file control fixtures.
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
 zig build test-dpkg-config-reference \
-  -Dnative-reference-dpkg="$reference_dpkg" -j2
+  -Dnative-reference-dpkg="$reference_dpkg" \
+  -Dnative-reference-architecture=amd64 -j2
 ```
 
 On amd64, direct dpkg never executes `config`: nonzero scripts and a script with a

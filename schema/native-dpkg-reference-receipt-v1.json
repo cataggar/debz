@@ -1,0 +1,81 @@
+{
+  "$id": "https://debz.dev/schema/native-dpkg-reference-receipt-v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "file": {
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sha256",
+        "size"
+      ],
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "architecture": {
+      "enum": [
+        "amd64",
+        "arm64"
+      ]
+    },
+    "archive": {
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "size": {
+          "maximum": 8388608,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "url": {
+          "pattern": "^https://deb\\.debian\\.org/debian/pool/main/d/dpkg/dpkg_1\\.22\\.22_(amd64|arm64)\\.deb$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sha256",
+        "size",
+        "url"
+      ],
+      "type": "object"
+    },
+    "dpkg": {
+      "$ref": "#/$defs/file"
+    },
+    "schema": {
+      "const": "https://debz.dev/schema/native-dpkg-reference-receipt-v1"
+    },
+    "update_alternatives": {
+      "$ref": "#/$defs/file"
+    },
+    "version": {
+      "const": "1.22.22"
+    }
+  },
+  "required": [
+    "architecture",
+    "archive",
+    "dpkg",
+    "schema",
+    "update_alternatives",
+    "version"
+  ],
+  "type": "object"
+}

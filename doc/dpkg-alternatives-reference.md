@@ -54,14 +54,22 @@ executable is used to identify the architecture.
 Prepare and run the reference:
 
 ```sh
-reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
 zig build test-dpkg-alternatives-reference \
-  -Dnative-reference-dpkg="$reference_dpkg" -j2
+  -Dnative-reference-dpkg="$reference_dpkg" \
+  -Dnative-reference-architecture=amd64 -j2
 ```
 
 The current canonical execution is amd64 only. Arm64 archive and executable
 pins are evidence inputs, not observed behavior. The runner rejects arm64
 publication until it is executed natively and reviewed separately.
+
+The `CI` workflow's opt-in `run_arm64_dpkg_oracles` dispatch target performs
+that review capture on `ubuntu-24.04-arm`. It passes the architecture
+explicitly, verifies the downloaded archive and private binaries against the
+pinned digests, executes both references with an empty inherited environment,
+and uploads only canonical bounded observations plus their execution-evidence
+manifest.
 
 ## External `update-alternatives` behavior
 

@@ -17,6 +17,11 @@ on:
         required: true
         type: string
         default: "resolute"
+      run_arm64_dpkg_oracles:
+        description: "Capture pinned dpkg 1.22.22 ARM64 oracle evidence"
+        required: true
+        type: boolean
+        default: false
   schedule:
     - cron: "23 3 * * 1"
 
@@ -855,6 +860,119 @@ jobs:
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
           zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+
+  arm64-dpkg-oracles:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_arm64_dpkg_oracles
+    name: Pinned dpkg 1.22.22 ARM64 oracles
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Bind source and runner architecture
+        env:
+          EXPECTED_INVOCATION_CLOCK: "2026-09-20T16:29:21.965+00:00"
+        run: |
+          test "$RUNNER_ARCH" = ARM64
+          test "$(uname -m)" = aarch64
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_REF_NAME" = issue-86-arm64-oracles
+          test "$EXPECTED_INVOCATION_CLOCK" = "2026-09-20T16:29:21.965+00:00"
+      - name: Prepare digest-verified private ARM64 tools
+        run: |
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture arm64)"
+          reference_prefix="$(dirname "$(dirname "$reference_dpkg")")"
+          test "$reference_dpkg" = "$PWD/.cache/native-dpkg-reference/1.22.22/arm64/usr/bin/dpkg"
+          test -x "$reference_prefix/bin/update-alternatives"
+          test -f "$PWD/.cache/native-dpkg-reference/1.22.22/arm64/reference-receipt-v1.json"
+      - name: Execute bounded ARM64 references
+        run: |
+          output="$PWD/.tmp/arm64-dpkg-oracles"
+          reference="$PWD/.cache/native-dpkg-reference/1.22.22/arm64/usr/bin"
+          mkdir -p "$output"
+          if ! sudo -n env -i \
+            PATH=/usr/bin:/bin \
+            LANG=C \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            TMPDIR="$PWD/.tmp" \
+            XDG_CACHE_HOME="$PWD/.cache" \
+            /usr/bin/python3 tools/dpkg-config-reference.py \
+              --architecture arm64 \
+              --reference-dpkg "$reference/dpkg" \
+              --capture-observed \
+                "$output/dpkg-config-reference-arm64-observed-v1.json" \
+              >"$output/config.stdout" 2>"$output/config.stderr"; then
+            sed -n '1,160p' "$output/config.stderr"
+            exit 1
+          fi
+          if ! sudo -n env -i \
+            PATH=/usr/bin:/bin \
+            LANG=C \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            TMPDIR="$PWD/.tmp" \
+            XDG_CACHE_HOME="$PWD/.cache" \
+            /usr/bin/python3 tools/dpkg-alternatives-reference.py \
+              --architecture arm64 \
+              --reference-dpkg "$reference/dpkg" \
+              --reference-update-alternatives "$reference/update-alternatives" \
+              --capture-observed \
+                "$output/dpkg-alternatives-reference-arm64-observed-v1.json" \
+              >"$output/alternatives.stdout" 2>"$output/alternatives.stderr"; then
+            sed -n '1,160p' "$output/alternatives.stderr"
+            exit 1
+          fi
+          sudo chown -R "$USER:$USER" "$output"
+      - name: Bind and validate canonical evidence
+        env:
+          INVOCATION_CLOCK: "2026-09-20T16:29:21.965+00:00"
+        run: |
+          output="$PWD/.tmp/arm64-dpkg-oracles"
+          reference="$PWD/.cache/native-dpkg-reference/1.22.22/arm64/usr/bin"
+          python3 tools/dpkg-oracle-evidence.py create \
+            --architecture arm64 \
+            --source-commit "$GITHUB_SHA" \
+            --invocation-clock "$INVOCATION_CLOCK" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "$GITHUB_WORKFLOW" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --job "$GITHUB_JOB" \
+            --runner-label ubuntu-24.04-arm \
+            --runner-arch "$RUNNER_ARCH" \
+            --machine aarch64 \
+            --dpkg "$reference/dpkg" \
+            --update-alternatives "$reference/update-alternatives" \
+            --receipt \
+              "$PWD/.cache/native-dpkg-reference/1.22.22/arm64/reference-receipt-v1.json" \
+            --config-observation \
+              "$output/dpkg-config-reference-arm64-observed-v1.json" \
+            --config-stdout "$output/config.stdout" \
+            --config-stderr "$output/config.stderr" \
+            --alternatives-observation \
+              "$output/dpkg-alternatives-reference-arm64-observed-v1.json" \
+            --alternatives-stdout "$output/alternatives.stdout" \
+            --alternatives-stderr "$output/alternatives.stderr" \
+            --output "$output/dpkg-oracle-execution-evidence-arm64-v1.json"
+          python3 tools/dpkg-oracle-evidence.py verify \
+            --evidence "$output/dpkg-oracle-execution-evidence-arm64-v1.json" \
+            --artifact-root "$output"
+          python3 -m unittest \
+            tools/test_dpkg_config_reference.py \
+            tools/test_dpkg_alternatives_reference.py \
+            tools/test_dpkg_oracle_evidence.py
+      - name: Upload canonical ARM64 oracle evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dpkg-oracle-execution-evidence-arm64-${{ github.sha }}
+          path: |
+            .tmp/arm64-dpkg-oracles/dpkg-config-reference-arm64-observed-v1.json
+            .tmp/arm64-dpkg-oracles/dpkg-alternatives-reference-arm64-observed-v1.json
+            .tmp/arm64-dpkg-oracles/dpkg-oracle-execution-evidence-arm64-v1.json
+          if-no-files-found: error
+          retention-days: 14
 
   build-and-test:
     name: Build and test (${{ matrix.name }})
