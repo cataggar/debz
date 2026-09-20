@@ -1,0 +1,626 @@
+{
+  "boundary": {
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "cross_architecture_behavior": "identical except DPKG_MAINTSCRIPT_ARCH; all seven pinned config facts are identical",
+    "excluded_frontends": [
+      "apt",
+      "apt-get",
+      "debconf",
+      "dpkg-preconfigure"
+    ],
+    "invocation": "direct-dpkg-only",
+    "limits": {
+      "maximum_argument_bytes": 256,
+      "maximum_arguments": 16,
+      "maximum_control_bytes": 262144,
+      "maximum_control_members": 16,
+      "maximum_environment_line_bytes": 4096,
+      "maximum_environment_records": 128,
+      "maximum_environment_variables": 32,
+      "maximum_file_bytes": 262144,
+      "maximum_log_bytes": 131072,
+      "maximum_packages": 16,
+      "maximum_status_bytes": 262144,
+      "maximum_trace_bytes": 131072,
+      "maximum_trace_records": 128,
+      "maximum_updates": 32,
+      "pause_script_timeout_seconds": 30,
+      "pause_timeout_seconds": 10,
+      "subprocess_timeout_seconds": 60
+    },
+    "operations": [
+      "install",
+      "reinstall",
+      "upgrade",
+      "configure",
+      "remove",
+      "purge",
+      "interrupted-retry"
+    ]
+  },
+  "implementation_requirement": {
+    "current_native_guards": "unchanged: installed config remains opaque package metadata and incoming config still causes pre-mutation unsupported-archive-metadata handoff",
+    "required_behavior": "A future native implementation must retain config as executable-mode, byte-exact, non-lifecycle package metadata; stage incoming bytes for preinst, keep installed bytes visible through old prerm/preinst/postrm, publish incoming bytes before new postinst, remove them only after successful postrm remove settlement, keep or restore them on failed or interrupted removal and failed upgrade rollback, leave them absent for postrm purge, and never execute them in the direct-dpkg lifecycle. Any debconf or preconfiguration execution belongs to a separately specified frontend.",
+    "support_status": "reference-only-not-enabled"
+  },
+  "members": [
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/chrony.config",
+          "referenced_paths": [],
+          "sha256": "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0",
+          "size": 204,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/chrony.config",
+          "referenced_paths": [],
+          "sha256": "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0",
+          "size": 204,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "chrony.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "chrony"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/console-setup.config",
+          "referenced_paths": [],
+          "sha256": "9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8",
+          "size": 32119,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/console-setup.config",
+          "referenced_paths": [],
+          "sha256": "9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8",
+          "size": 32119,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "console-setup.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "console-setup"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/debconf.config",
+          "referenced_paths": [],
+          "sha256": "e91259e40c51b1dfb94d9a49eb58d6808096f291bc238c9da1e901f55639106d",
+          "size": 505,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/debconf.config",
+          "referenced_paths": [],
+          "sha256": "e91259e40c51b1dfb94d9a49eb58d6808096f291bc238c9da1e901f55639106d",
+          "size": 505,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "debconf.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "debconf"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/iproute2.config",
+          "referenced_paths": [],
+          "sha256": "869cc5faa0408240da4688cfd77548bd9039ea07ac0c94b4a89498694aa7be7f",
+          "size": 104,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/iproute2.config",
+          "referenced_paths": [],
+          "sha256": "869cc5faa0408240da4688cfd77548bd9039ea07ac0c94b4a89498694aa7be7f",
+          "size": 104,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "iproute2.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "iproute2"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/keyboard-configuration.config",
+          "referenced_paths": [],
+          "sha256": "385d56699c0cb381cb5a5253bbb2a02cdbcc134a90c62b2ca966f8e49efc61f0",
+          "size": 91581,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/keyboard-configuration.config",
+          "referenced_paths": [],
+          "sha256": "385d56699c0cb381cb5a5253bbb2a02cdbcc134a90c62b2ca966f8e49efc61f0",
+          "size": 91581,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "keyboard-configuration.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "keyboard-configuration"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/locales.config",
+          "referenced_paths": [],
+          "sha256": "439d7a556bad252fd4dd0c21e54235fae3e5570e4522aae39cdadbeebc272805",
+          "size": 8327,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/locales.config",
+          "referenced_paths": [],
+          "sha256": "439d7a556bad252fd4dd0c21e54235fae3e5570e4522aae39cdadbeebc272805",
+          "size": 8327,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "locales.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "locales"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    },
+    {
+      "architectures": {
+        "amd64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/tzdata.config",
+          "referenced_paths": [],
+          "sha256": "24fb276659bc741b3efa9896094f738d32583deb8086caf86cc027f0e63d9d87",
+          "size": 8080,
+          "uid": 0
+        },
+        "arm64": {
+          "gid": 0,
+          "mode": "0755",
+          "path": "var/lib/dpkg/info/tzdata.config",
+          "referenced_paths": [],
+          "sha256": "24fb276659bc741b3efa9896094f738d32583deb8086caf86cc027f0e63d9d87",
+          "size": 8080,
+          "uid": 0
+        }
+      },
+      "classification": "debconf-config",
+      "handling": "reference-execution-required",
+      "identity": "tzdata.config",
+      "owner": {
+        "architecture_qualified": false,
+        "kind": "package",
+        "package": "tzdata"
+      },
+      "rationale": "The config script is bounded and preserved, but this manifest does not prove invocation or effects.",
+      "reference_execution_requirement": "Observe reference frontend invocation, ordering, arguments, environment, outcome, and resulting state."
+    }
+  ],
+  "observed_behavior": {
+    "config_invocation_count": 0,
+    "failure_recovery": [
+      {
+        "case": "fresh-postinst-failure",
+        "failed_config": "v1",
+        "failed_state": {
+          "status": "install ok half-configured",
+          "version": "1"
+        },
+        "failed_trace": [
+          "preinst@v1\t[\"install\"]\t-\tv1",
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ],
+        "recovery_config": "v1",
+        "recovery_state": {
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ]
+      },
+      {
+        "case": "upgrade-postinst-failure",
+        "failed_config": "v2",
+        "failed_state": {
+          "config_version": "1",
+          "status": "install ok half-configured",
+          "version": "2"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ],
+        "recovery_config": "v2",
+        "recovery_state": {
+          "status": "install ok installed",
+          "version": "2"
+        },
+        "recovery_trace": [
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ]
+      },
+      {
+        "case": "incoming-preinst-failure",
+        "failed_config": "v1",
+        "failed_state": {
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v2\t[\"abort-upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postinst@v1\t[\"abort-upgrade\",\"2\"]\tv1\tv2"
+        ]
+      },
+      {
+        "case": "double-postrm-upgrade-failure",
+        "failed_config": "v1",
+        "failed_state": {
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "postrm@v2\t[\"failed-upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "preinst@v1\t[\"abort-upgrade\",\"2\"]\tv1\tv2",
+          "postrm@v2\t[\"abort-upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postinst@v1\t[\"abort-upgrade\",\"2\"]\tv1\tv2"
+        ]
+      },
+      {
+        "case": "remove-postrm-failure",
+        "failed_config": "v1",
+        "failed_state": {
+          "config_version": "1",
+          "status": "deinstall ok half-installed",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ],
+        "recovery_config": null,
+        "recovery_state": {
+          "config_version": "1",
+          "status": "deinstall ok config-files",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ]
+      },
+      {
+        "case": "purge-postrm-failure",
+        "failed_config": null,
+        "failed_state": {
+          "status": "purge ok config-files",
+          "version": "1"
+        },
+        "failed_trace": [
+          "prerm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"purge\"]\t-\t-"
+        ],
+        "recovery_config": null,
+        "recovery_state": null,
+        "recovery_trace": [
+          "postrm@v1\t[\"purge\"]\t-\t-"
+        ]
+      }
+    ],
+    "frontend_invocation_count": 0,
+    "interruption_recovery": [
+      {
+        "case": "postinst-interruption",
+        "interrupted_config": "v1",
+        "interrupted_database": {
+          "committed": null,
+          "journal_latest": {
+            "status": "install ok half-configured",
+            "version": "1"
+          },
+          "journal_nonempty": true,
+          "temporary_update": true
+        },
+        "interrupted_staging_config": null,
+        "interrupted_trace": [
+          "preinst@v1\t[\"install\"]\t-\tv1",
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ],
+        "recovery_config": "v1",
+        "recovery_state": {
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ]
+      },
+      {
+        "case": "upgrade-preinst-interruption",
+        "interrupted_config": "v1",
+        "interrupted_database": {
+          "committed": {
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": {
+            "config_version": "1",
+            "status": "install reinstreq half-installed",
+            "version": "1"
+          },
+          "journal_nonempty": true,
+          "temporary_update": true
+        },
+        "interrupted_staging_config": "v2",
+        "interrupted_trace": [
+          "prerm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2"
+        ],
+        "recovery_config": "v2",
+        "recovery_state": {
+          "status": "install ok installed",
+          "version": "2"
+        },
+        "recovery_trace": [
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1\tv2",
+          "postrm@v1\t[\"upgrade\",\"2\"]\tv1\tv2",
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ]
+      },
+      {
+        "case": "remove-postrm-interruption",
+        "interrupted_config": "v1",
+        "interrupted_database": {
+          "committed": {
+            "status": "install ok installed",
+            "version": "1"
+          },
+          "journal_latest": {
+            "config_version": "1",
+            "status": "deinstall ok half-installed",
+            "version": "1"
+          },
+          "journal_nonempty": true,
+          "temporary_update": true
+        },
+        "interrupted_staging_config": null,
+        "interrupted_trace": [
+          "prerm@v1\t[\"remove\"]\tv1\t-",
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ],
+        "recovery_config": null,
+        "recovery_state": {
+          "config_version": "1",
+          "status": "deinstall ok config-files",
+          "version": "1"
+        },
+        "recovery_trace": [
+          "postrm@v1\t[\"remove\"]\tv1\t-"
+        ]
+      }
+    ],
+    "script_context": {
+      "closed_probe_fds": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "cwd": "/",
+      "environment": "exact-bounded-direct-dpkg-maintscript-environment",
+      "open_fds": [
+        0,
+        1,
+        2
+      ]
+    },
+    "successful_lifecycle": [
+      {
+        "config": "v1",
+        "operation": "install",
+        "state": {
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "trace": [
+          "preinst@v1\t[\"install\"]\t-\tv1",
+          "postinst@v1\t[\"configure\",\"\"]\tv1\t-"
+        ]
+      },
+      {
+        "config": "v1r",
+        "operation": "reinstall",
+        "state": {
+          "status": "install ok installed",
+          "version": "1"
+        },
+        "trace": [
+          "prerm@v1\t[\"upgrade\",\"1\"]\tv1\tv1r",
+          "preinst@v1r\t[\"upgrade\",\"1\",\"1\"]\tv1\tv1r",
+          "postrm@v1\t[\"upgrade\",\"1\"]\tv1\tv1r",
+          "postinst@v1r\t[\"configure\",\"1\"]\tv1r\t-"
+        ]
+      },
+      {
+        "config": "v2",
+        "operation": "upgrade",
+        "state": {
+          "status": "install ok installed",
+          "version": "2"
+        },
+        "trace": [
+          "prerm@v1r\t[\"upgrade\",\"2\"]\tv1r\tv2",
+          "preinst@v2\t[\"upgrade\",\"1\",\"2\"]\tv1r\tv2",
+          "postrm@v1r\t[\"upgrade\",\"2\"]\tv1r\tv2",
+          "postinst@v2\t[\"configure\",\"1\"]\tv2\t-"
+        ]
+      },
+      {
+        "config": null,
+        "operation": "remove",
+        "state": {
+          "config_version": "2",
+          "status": "deinstall ok config-files",
+          "version": "2"
+        },
+        "trace": [
+          "prerm@v2\t[\"remove\"]\tv2\t-",
+          "postrm@v2\t[\"remove\"]\tv2\t-"
+        ]
+      },
+      {
+        "config": null,
+        "operation": "purge",
+        "state": null,
+        "trace": [
+          "postrm@v2\t[\"purge\"]\t-\t-"
+        ]
+      }
+    ],
+    "vendor_identity_cohort": {
+      "config_invocation_count": 0,
+      "install_exit": 0,
+      "installed_identities": [
+        "chrony.config",
+        "console-setup.config",
+        "debconf.config",
+        "iproute2.config",
+        "keyboard-configuration.config",
+        "locales.config",
+        "tzdata.config"
+      ],
+      "remove_exit": 0,
+      "retained_after_remove": []
+    }
+  },
+  "schema": "https://debz.dev/schema/dpkg-config-reference-v1",
+  "source": {
+    "dpkg": {
+      "architectures": {
+        "amd64": {
+          "archive_sha256": "3e800c6d75e8e709007ed1c356e5fa8509a75c1694fb0a1183709abc9cfdc1f3",
+          "executable_sha256": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5"
+        },
+        "arm64": {
+          "archive_sha256": "1142468e57f69e13d174f517dff739508c61ee97d81c182c120cd6b281d8cdfa",
+          "executable_sha256": "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79"
+        }
+      },
+      "version": "1.22.22"
+    },
+    "vendor_reference": {
+      "index": {
+        "path": "index-v1.json",
+        "sha256": "682bff167a4bc2386ceb78fb554be0adbe6fbfab16f4eab77aff3b63af04dd34",
+        "size": 3256
+      },
+      "manifests": [
+        {
+          "architecture": "amd64",
+          "path": "ubuntu-resolute-20260816T000000Z-amd64-v1.json",
+          "sha256": "9ae81ea204a2cf608860451a41d477068a11ab77e8762e61e53d95bc0a70570b",
+          "size": 320842
+        },
+        {
+          "architecture": "arm64",
+          "path": "ubuntu-resolute-20260816T000000Z-arm64-v1.json",
+          "sha256": "90698d5a1eae643dfc68a0acbb38cca48b98b297453fdc5d1a10509c792fa16c",
+          "size": 320842
+        }
+      ],
+      "reference": {
+        "path": "reference-v1.json",
+        "sha256": "73228f959a335956c58d48712c891ccc372082dfc4f78f4405c18a37f98efe08",
+        "size": 1290490
+      },
+      "requirement_id": "debconf-config-execution"
+    }
+  },
+  "version": 1
+}

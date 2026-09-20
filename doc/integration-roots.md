@@ -200,7 +200,8 @@ before emitting canonical JSON.
 The paired reference accounts for every item in each manifest. Of the 829
 control members, 664 are already-supported typed package-database or lifecycle
 state, 158 are bounded inert `templates`/`shlibs`/`symbols`, and the seven
-debconf `*.config` scripts require reference-execution evidence. There are
+debconf `*.config` scripts are the input to the separate direct-dpkg reference
+oracle. There are
 zero package `*.alternatives` and zero unclassified members. The 14
 alternatives records produce 72 current relationships (14 masters and 58
 slaves), 189 complete requested-path resolutions, and all 190 linked entries:
@@ -219,9 +220,43 @@ metadata members, and three trigger members. Alternatives records and topology
 are identical. Exactly ten regular linked targets differ in size and SHA-256.
 Difference entries index the authoritative per-architecture facts above rather
 than duplicating them in the generated fixture.
-Remaining oracle work is bounded reference execution for config-script
-invocation/effects and alternatives record decoding plus install, upgrade,
-remove, purge, failure, and recovery mutations. Until that evidence and an
-explicit support contract exist, native preflight continues handing off or
-rejecting active config/alternatives or unclassified semantics before
-mutation.
+
+The [direct-dpkg config reference
+schema](../schema/dpkg-config-reference-v1.json) and canonical
+`tools/fixtures/vendor-state/dpkg-config-reference-v1.json` bind dpkg 1.22.22
+and both executable/archive pins, the index, both manifests, the derived
+reference digest, and all seven package/config identities. All seven facts are
+identical on amd64 and arm64; the direct-dpkg contract is identical except for
+the expected `DPKG_MAINTSCRIPT_ARCH` environment value. The elevated
+`tools/dpkg-config-reference.py` runner invokes only the pinned dpkg binary
+against guarded disposable roots; apt, debconf, and `dpkg-preconfigure` are not
+present or invoked. It generates exact-size adversarial config members for all
+seven identities plus instrumented lifecycle packages, bounds every path,
+control member, trace, environment, fd probe, update fragment, log, timeout,
+and process, and rejects traversing, symlink, and special-file control
+fixtures.
+
+```sh
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+zig build test-dpkg-config-reference \
+  -Dnative-reference-dpkg="$reference_dpkg" -j2
+```
+
+Direct dpkg never executes `config`: nonzero scripts and a script with a
+missing interpreter are installed and replaced without affecting command
+success. Incoming bytes are visible at `tmp.ci/config` to old `prerm`, incoming
+`preinst`, and old `postrm`; the installed info member remains the old version
+through those calls and changes before new `postinst`. Successful removal
+keeps the member through `prerm remove` and `postrm remove`, then deletes it;
+`postrm purge` sees it absent. Failed postinst retains the incoming member,
+failed or interrupted remove retains the installed member, failed upgrade
+rollback restores the old member, and retries settle without invoking config.
+The interruption rows additionally bind committed status versus the latest
+bounded `updates/` fragment.
+
+This closes the config direct-dpkg behavior question, not debconf frontend
+behavior and not native support. A future native implementation must reproduce
+that byte/mode publication, rollback, removal, and non-execution contract.
+Current opaque-info and unsupported-archive-metadata guards remain unchanged.
+Remaining oracle work is alternatives record decoding and install, upgrade,
+remove, purge, failure, and recovery mutation behavior.
