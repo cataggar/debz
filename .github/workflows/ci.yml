@@ -890,36 +890,47 @@ jobs:
         run: |
           output="$PWD/.tmp/arm64-dpkg-oracles"
           reference="$PWD/.cache/native-dpkg-reference/1.22.22/arm64/usr/bin"
-          mkdir -p "$output"
-          if ! sudo -n env -i \
+          mkdir -p "$output/host-config/dpkg.cfg.d"
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location(
+              "debz_config_reference",
+              Path("tools/dpkg-config-reference.py"),
+          )
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          Path(".tmp/arm64-dpkg-oracles/host-config/dpkg.cfg").write_bytes(
+              module.PINNED_DPKG_CONFIG
+          )
+          PY
+          if ! sudo -n /usr/bin/unshare --mount --propagation private \
+            /usr/bin/env -i \
             PATH=/usr/bin:/bin \
             LANG=C \
             LC_ALL=C \
             PYTHONDONTWRITEBYTECODE=1 \
             TMPDIR="$PWD/.tmp" \
             XDG_CACHE_HOME="$PWD/.cache" \
-            /usr/bin/python3 tools/dpkg-config-reference.py \
-              --architecture arm64 \
-              --reference-dpkg "$reference/dpkg" \
-              --capture-observed \
-                "$output/dpkg-config-reference-arm64-observed-v1.json" \
+            /bin/sh tools/run-dpkg-oracle-isolated.sh \
+              "$PWD" config arm64 "$reference/dpkg" \
+              "$output/dpkg-config-reference-arm64-observed-v1.json" \
               >"$output/config.stdout" 2>"$output/config.stderr"; then
             sed -n '1,160p' "$output/config.stderr"
             exit 1
           fi
-          if ! sudo -n env -i \
+          if ! sudo -n /usr/bin/unshare --mount --propagation private \
+            /usr/bin/env -i \
             PATH=/usr/bin:/bin \
             LANG=C \
             LC_ALL=C \
             PYTHONDONTWRITEBYTECODE=1 \
             TMPDIR="$PWD/.tmp" \
             XDG_CACHE_HOME="$PWD/.cache" \
-            /usr/bin/python3 tools/dpkg-alternatives-reference.py \
-              --architecture arm64 \
-              --reference-dpkg "$reference/dpkg" \
-              --reference-update-alternatives "$reference/update-alternatives" \
-              --capture-observed \
-                "$output/dpkg-alternatives-reference-arm64-observed-v1.json" \
+            /bin/sh tools/run-dpkg-oracle-isolated.sh \
+              "$PWD" alternatives arm64 "$reference/dpkg" \
+              "$output/dpkg-alternatives-reference-arm64-observed-v1.json" \
+              "$reference/update-alternatives" \
               >"$output/alternatives.stdout" 2>"$output/alternatives.stderr"; then
             sed -n '1,160p' "$output/alternatives.stderr"
             exit 1

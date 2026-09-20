@@ -67,9 +67,10 @@ publication until it is executed natively and reviewed separately.
 The `CI` workflow's opt-in `run_arm64_dpkg_oracles` dispatch target performs
 that review capture on `ubuntu-24.04-arm`. It passes the architecture
 explicitly, verifies the downloaded archive and private binaries against the
-pinned digests, executes both references with an empty inherited environment,
-and uploads only canonical bounded observations plus their execution-evidence
-manifest.
+pinned digests, hides host dpkg configuration and fragments inside a private
+mount namespace, executes both references with an empty inherited environment,
+and uploads only canonical bounded observations plus their
+execution-evidence manifest.
 
 ## External `update-alternatives` behavior
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
@@ -40,6 +41,14 @@ class DpkgOracleEvidenceTests(unittest.TestCase):
         ):
             schema = json.loads((ROOT / "schema" / name).read_bytes())
             jsonschema.Draft202012Validator.check_schema(schema)
+
+        result = subprocess.run(
+            ["/bin/sh", "-n", "tools/run-dpkg-oracle-isolated.sh"],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_published_observations_have_the_expected_shape(self) -> None:
         config = json.loads(evidence.CONFIG_REFERENCE.read_bytes())
