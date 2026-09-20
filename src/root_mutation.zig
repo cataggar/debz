@@ -4986,14 +4986,20 @@ pub fn lowerDatabasePlan(
 
     const intents = try owned.alloc(Intent, plan.writes.len);
     for (plan.writes, 0..) |write, index| {
+        if ((write.uid == null) != (write.gid == null))
+            return .{ .diagnostic = .{
+                .surface = .database,
+                .code = .database_plan_mismatch,
+                .path = write.path,
+            } };
         const path = try std.fmt.allocPrint(owned, "{s}/{s}", .{ directory, write.path });
         intents[index] = switch (write.kind) {
             .replace => .{ .file = .{
                 .path = path,
                 .bytes = write.bytes,
                 .mode = write.mode,
-                .uid = options.uid,
-                .gid = options.gid,
+                .uid = write.uid orelse options.uid,
+                .gid = write.gid orelse options.gid,
                 .modified_nanoseconds = options.modified_nanoseconds,
                 .expected_sha256 = write.sha256,
             } },
@@ -5002,8 +5008,8 @@ pub fn lowerDatabasePlan(
                 .source = try std.fmt.allocPrint(owned, "{s}/{s}", .{ directory, write.source }),
                 .source_sha256 = write.sha256,
                 .mode = write.mode,
-                .uid = options.uid,
-                .gid = options.gid,
+                .uid = write.uid orelse options.uid,
+                .gid = write.gid orelse options.gid,
                 .modified_nanoseconds = options.modified_nanoseconds,
             } },
             .remove => .{ .remove = .{ .path = path, .removal = .allow_absent } },

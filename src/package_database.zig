@@ -143,6 +143,8 @@ pub const InfoEntry = struct {
     bytes: []const u8 = &.{},
     kind: EntryKind = .regular,
     mode: u32 = 0o644,
+    uid: u32 = 0,
+    gid: u32 = 0,
 
     pub fn file(self: InfoEntry) FileEntry {
         return .{ .bytes = self.bytes, .kind = self.kind, .mode = self.mode };
@@ -244,6 +246,7 @@ pub const MaintainerScript = struct {
 };
 
 pub const RetainedMetadataKind = enum {
+    config,
     templates,
     shlibs,
     symbols,
@@ -261,6 +264,8 @@ pub const RetainedMetadataKind = enum {
 pub const RetainedMetadata = struct {
     kind: RetainedMetadataKind,
     mode: u32,
+    uid: u32 = 0,
+    gid: u32 = 0,
     size: usize,
     sha256: [32]u8,
 };
@@ -2152,9 +2157,21 @@ const Importer = struct {
             }
 
             if (RetainedMetadataKind.fromSuffix(suffix_text)) |kind| {
+                if (kind == .config and
+                    (!executableMode(entry.mode) or entry.uid != 0 or entry.gid != 0))
+                {
+                    return self.failPackage(
+                        .info_script,
+                        .unsafe_mode,
+                        entry.name,
+                        records[position].name,
+                    );
+                }
                 try metadata[position].append(self.scratch, .{
                     .kind = kind,
                     .mode = entry.mode,
+                    .uid = if (kind == .config) entry.uid else 0,
+                    .gid = if (kind == .config) entry.gid else 0,
                     .size = entry.bytes.len,
                     .sha256 = digestOf(entry.bytes),
                 });
@@ -2440,6 +2457,7 @@ const GenerationEntry = struct {
     path: []const u8,
     kind: EntryKind,
     mode: u32,
+    owner: ?struct { uid: u32, gid: u32 } = null,
     size: usize,
     sha256: [32]u8,
 };
@@ -2487,6 +2505,10 @@ pub fn generation(
             .path = path,
             .kind = entry.kind,
             .mode = entry.mode,
+            .owner = if (std.mem.endsWith(u8, entry.name, ".config"))
+                .{ .uid = entry.uid, .gid = entry.gid }
+            else
+                null,
             .size = entry.bytes.len,
             .sha256 = digestOf(entry.bytes),
         });
@@ -2531,6 +2553,8 @@ pub fn generation(
             entry.mode,
             entry.size,
         }) catch unreachable;
+        if (entry.owner) |owner|
+            writer.print("owner={d}:{d}\x00", .{ owner.uid, owner.gid }) catch unreachable;
         writeHex(writer, &entry.sha256) catch unreachable;
         writer.writeByte('\n') catch unreachable;
         total += entry.size;
@@ -2838,6 +2862,9 @@ const Validator = struct {
         for (record.metadata) |entry| {
             if (!safeFileMode(entry.mode))
                 return self.fail(.info_directory, .unsafe_mode, record.name);
+            if (entry.kind == .config and
+                (!executableFileMode(entry.mode) or entry.uid != 0 or entry.gid != 0))
+                return self.fail(.info_script, .unsafe_mode, record.name);
             if (entry.size > limits.max_info_file_bytes)
                 return self.fail(.info_directory, .file_too_large, record.name);
             if (metadata_seen.contains(entry.kind))
@@ -3520,6 +3547,7 @@ test "package_database.test.literal package paths round trip every database surf
 
 test "package_database.test.inert metadata is typed without interpreting its bytes" {
     const extra = [_]InfoEntry{
+        .{ .name = "toolz.config", .bytes = "#!/bin/sh\nexit 0\n", .mode = 0o755 },
         .{ .name = "toolz.templates", .bytes = "binary\x00\xffmetadata", .mode = 0o640 },
         .{ .name = "toolz.shlibs", .bytes = "unterminated metadata" },
         .{ .name = "toolz.symbols", .bytes = "" },
@@ -3537,15 +3565,21 @@ test "package_database.test.inert metadata is typed without interpreting its byt
     };
     defer imported.deinit();
     const record = imported.model.find("toolz", "amd64").?;
-    try testing.expectEqual(@as(usize, 3), record.metadata.len);
+    try testing.expectEqual(@as(usize, 4), record.metadata.len);
     try testing.expectEqual(@as(usize, 1), imported.model.opaque_info.len);
     try testing.expectEqualStrings("toolz.vendor-data", imported.model.opaque_info[0].name);
+    const config = record.metadataMember(.config).?;
+    try testing.expectEqual(@as(u32, 0o755), config.mode);
+    try testing.expectEqual(@as(u32, 0), config.uid);
+    try testing.expectEqual(@as(u32, 0), config.gid);
+    try testing.expectEqual(extra[0].bytes.len, config.size);
+    try testing.expectEqual(digestOf(extra[0].bytes), config.sha256);
     const member = record.metadataMember(.templates).?;
     try testing.expectEqual(@as(u32, 0o640), member.mode);
-    try testing.expectEqual(extra[0].bytes.len, member.size);
-    try testing.expectEqual(digestOf(extra[0].bytes), member.sha256);
+    try testing.expectEqual(extra[1].bytes.len, member.size);
+    try testing.expectEqual(digestOf(extra[1].bytes), member.sha256);
     try testing.expectEqual(@as(usize, 0), record.metadataMember(.symbols).?.size);
-    inline for (.{ "config", "alternatives", "../shlibs", "shlibs.old" }) |unsupported|
+    inline for (.{ "alternatives", "../shlibs", "shlibs.old" }) |unsupported|
         try testing.expect(RetainedMetadataKind.fromSuffix(unsupported) == null);
 }
 
@@ -4574,6 +4608,47 @@ test "package_database.test.generation digest covers entry kind and mode" {
         database,
         test_fixtures.snapshot(),
     ) == null);
+}
+
+test "package_database.test.config ownership is validated and generation bound" {
+    var config_entries: [test_fixtures.info.len + 1]InfoEntry = undefined;
+    @memcpy(config_entries[0..test_fixtures.info.len], test_fixtures.info);
+    config_entries[config_entries.len - 1] = .{
+        .name = "toolz.config",
+        .bytes = "#!/bin/sh\nexit 0\n",
+        .mode = 0o755,
+    };
+    var snapshot = test_fixtures.snapshot();
+    snapshot.info = &config_entries;
+    var database = switch (try importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+
+    var changed_entries = config_entries;
+    changed_entries[changed_entries.len - 1].uid = 1;
+    var changed = snapshot;
+    changed.info = &changed_entries;
+    try testing.expectEqual(
+        Code.external_generation_change,
+        (try verifyGeneration(testing.allocator, database, changed)).?.code,
+    );
+    try expectImportFailure(changed, .unsafe_mode);
+
+    changed_entries = config_entries;
+    changed_entries[changed_entries.len - 1].mode = 0o644;
+    changed.info = &changed_entries;
+    try expectImportFailure(changed, .unsafe_mode);
+
+    changed_entries = config_entries;
+    changed_entries[changed_entries.len - 1].kind = .symlink;
+    changed.info = &changed_entries;
+    try expectImportFailure(changed, .unsupported_entry_kind);
 }
 
 test "package_database.test.status field values must survive serialization unchanged" {

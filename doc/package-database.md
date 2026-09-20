@@ -42,6 +42,7 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `info/*.conffiles` | Declared conffiles, each of which must appear in the package's status `Conffiles`. |
 | `info/*.triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations. |
 | `info/*.{preinst,postinst,prerm,postrm}` | Regular executable files with safe modes; size, mode, and SHA-256 recorded. |
+| `info/*.config` | Root-owned executable-mode inert metadata typed per package by mode, uid/gid, size, and SHA-256; exact bytes retained without execution. |
 | `info/*.{templates,shlibs,symbols}` | Known inert metadata typed per package by kind, safe mode, size, and SHA-256; exact bytes retained without interpretation. |
 | `info/*` (other) | Retained as opaque evidence (owner, mode, size, SHA-256). Names must still be package qualified. |
 | `triggers/File` | File-trigger interests with `package` or `package/noawait` listeners. |
@@ -68,20 +69,20 @@ must resolve to exactly one status record. Unqualified names that match more
 than one instance are ambiguous and rejected rather than guessed.
 
 Inert metadata is a byte payload, not database text: empty contents, binary
-bytes, and missing final newlines are preserved. This classification does not
-admit `config` scripts, alternatives, or arbitrary vendor info files into native
-execution; those remain opaque and guarded. Diversion and statoverride
-filesystem semantics belong to the
+bytes, and missing final newlines are preserved. Config is the one
+executable-mode inert member: import requires a regular executable root-owned
+file and binds its uid/gid into the database generation. It is never promoted
+to maintainer-script authority. Alternatives and arbitrary vendor info files
+remain opaque and guarded. Diversion and statoverride filesystem semantics
+belong to the
 [native unpack/lifecycle layer](native-unpack.md#diversion-routing).
 
-The pinned [amd64 direct-dpkg config reference](integration-roots.md) now
-specifies what eventual typed config handling must do on that architecture
-without changing that guard:
-retain exact executable bytes as non-lifecycle metadata, expose old/incoming
-versions at dpkg's callback boundaries, replace or restore them with the
-package lifecycle, remove them only after successful postrm remove, and never
-execute them as part of direct dpkg lifecycle processing. Frontend
-preconfiguration remains explicitly out of scope.
+Native lifecycle execution now follows the pinned
+[amd64 direct-dpkg config reference](integration-roots.md): it retains exact
+executable bytes as non-lifecycle metadata, exposes old/incoming versions at
+dpkg's callback boundaries, replaces or restores them with the package
+lifecycle, removes them only after successful `postrm remove`, and never
+executes them. Frontend preconfiguration remains explicitly out of scope.
 
 The shared `triggers/Lock` is synchronization infrastructure, not a named
 interest file or consumed database generation. `File` and `Unincorp` retain

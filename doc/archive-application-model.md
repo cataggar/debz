@@ -27,7 +27,7 @@ the engine refuses to approximate. Call `deinit` on a successful model.
 | `relationshipText` / `relationship` | Exact declared text and the parsed AST for `Pre-Depends`, `Depends`, `Recommends`, `Suggests`, `Enhances`, `Conflicts`, `Breaks`, `Replaces`, and `Provides`. |
 | `files` | Every payload entry with its normalized archive-root-relative path, kind, permission and special mode bits, numeric uid/gid, USTAR owner/group names, mtime, size, bounded content offsets, SHA-256, verified MD5, canonical link identity, exact symlink bytes, and conffile flag. |
 | `root` | Metadata of the conventional `./` archive root record when the archive ships one. |
-| `scripts` | `preinst`, `postinst`, `prerm`, `postrm`, and the debconf `config` script with safe name, kind, mode, size, SHA-256, and bounded bytes. |
+| `scripts` | `preinst`, `postinst`, `prerm`, `postrm`, and the debconf `config` script with safe name, kind, mode, numeric ownership, size, SHA-256, and bounded bytes. Accepted `config` members must be root-owned. |
 | `metadata` | `templates`, `shlibs`, and `symbols` retained verbatim with digests and never interpreted. |
 | `conffiles` | Declarations including Debian `remove-on-upgrade`, each resolved against the payload. |
 | `checksums` | Parsed and verified `md5sums` entries bound to payload file indexes. |
@@ -46,9 +46,11 @@ root-relative; they are never absolute and never traverse.
 origin, filename, artifact size and SHA-256, control facts, every relationship
 field, the archive root record, both member compressions, and every file,
 script, retained metadata member, conffile, checksum, and trigger in archive
-order. Identical archive bytes with identical expectations always produce the
-same digest, and any modeled metadata change produces a different one. The
-future native program compiler binds this digest into the authorized program.
+order. Config ownership is included in its script encoding; other script
+encoding retains its original v1 semantics. Identical archive bytes with
+identical expectations always produce the same digest, and any modeled metadata
+change produces a different one. The native program compiler binds this digest
+into the authorized program.
 
 ## Artifact binding and pre-application revalidation
 
@@ -101,7 +103,8 @@ Rejected before mutation, with the classification in parentheses:
 - absolute, traversing, duplicate, conflicting, symlink-mediated, or forward
   link paths (`path_or_link`);
 - any control member outside the table above, non-regular control entries,
-  setuid or setgid control members (`control_member`);
+  setuid or setgid control members, or non-root `config` ownership
+  (`control_member`);
 - a maintainer script that is not executable (`maintainer_script`);
 - malformed, duplicate, mismatched, or out-of-inventory `md5sums` entries
   (`checksum_manifest`);
@@ -122,9 +125,9 @@ shows that direct dpkg 1.22.22 copies opaque package `.alternatives` bytes into
 the info database but does not interpret them or invoke `update-alternatives`;
 maintainer scripts cause all observed group mutations. That reference also
 binds the external tool's record/link behavior and does not relax this guard.
-The debconf `config` script is modeled and preserved but never executed by v1,
-because debconf preconfiguration is a frontend responsibility outside the dpkg
-replacement boundary.
+The debconf `config` script is modeled and preserved as inert lifecycle state,
+but never executed by v1, because debconf preconfiguration remains a frontend
+responsibility outside the dpkg replacement boundary.
 
 A missing `md5sums` member is supported because Debian packages do not
 universally ship one, and `dh_md5sums` omits conffiles by default. Every entry
@@ -148,8 +151,11 @@ seven bounded `*.config` members but no archive bytes. The separate
 [amd64 direct-dpkg config oracle](integration-roots.md) generates bounded
 adversarial archives at each pinned member size and proves their exact direct-dpkg
 publication, replacement, failure, interruption, removal, and non-execution
-behavior. It does not claim the unavailable vendor bytes or any apt/debconf
-frontend behavior. Those archive-model paths are also
+behavior. The native lifecycle differential generates the same seven package
+identities and exact pinned sizes and compares install, reinstall, upgrade,
+remove, and purge with that direct-dpkg boundary. It does not claim the
+unavailable vendor bytes, arm64 runtime evidence, or any apt/debconf frontend
+behavior. Those archive-model paths are also
 covered by the adversarial and positive unit tests in
 `src/archive_application.zig` and by the `archive-application-model`,
 `archive-checksum-verification`, and `archive-unsupported-feature` scenarios in

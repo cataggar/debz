@@ -270,10 +270,12 @@ The interruption rows additionally bind committed status versus the latest
 bounded `updates/` fragment.
 
 This closes the config direct-dpkg behavior question for the pinned amd64 and
-arm64 tools, not debconf frontend behavior or native support. A future native
-implementation must reproduce the applicable byte/mode/ownership publication,
-rollback, removal, and non-execution contract.
-Current opaque-info and unsupported-archive-metadata guards remain unchanged.
+arm64 tools, not debconf frontend behavior. Native lifecycle execution
+reproduces the byte/mode/ownership publication, rollback, removal, and
+non-execution contract for bounded root-owned config members. Arm64 admission
+is based on the executed, canonical architecture-specific observation rather
+than architecture-independent parser coverage. Current opaque-info and
+unsupported-archive-metadata guards remain unchanged.
 
 The remaining alternatives reference requirement is closed separately by the
 [pinned dpkg/update-alternatives oracle](dpkg-alternatives-reference.md).

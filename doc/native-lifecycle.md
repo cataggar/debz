@@ -28,7 +28,7 @@ is not a substitute for its last configured version. Upgrade preinst and the
 incoming failed-upgrade/abort-upgrade scripts include both old and new versions
 where dpkg does.
 
-Known inert control members (`templates`, `shlibs`, `symbols`) are installed
+Known inert control members (`config`, `templates`, `shlibs`, `symbols`) are installed
 with their exact bytes and safe modes, replaced or retired on upgrade,
 reinstall and downgrade, and removed on successful removal/purge. Old upgrade
 `postrm` sees the new payload but the original installed control metadata;
@@ -39,7 +39,12 @@ Lifecycle fixtures compare these observations with dpkg for unqualified,
 architecture-qualified and changing info stems, compensation, failures and
 configure/purge retries with and without conffiles. Existing admission guards
 for otherwise unsupported half-installed states remain unchanged.
-No debconf preconfiguration or other active/unknown metadata support is implied.
+Config additionally requires executable mode and root ownership. It is staged
+at `var/lib/dpkg/tmp.ci/config` before pre-unpack callbacks, published before
+the incoming postinst, retained after postinst failure for configure retry,
+restored on upgrade unwind, and removed before purge postrm. Native execution
+never calls it or invokes apt, debconf, or frontend behavior. No other
+active/unknown metadata support is implied.
 
 The separate [amd64 direct-dpkg config reference](integration-roots.md) closes
 the dpkg side of that boundary for the seven pinned vendor `*.config`
@@ -50,11 +55,12 @@ It stages incoming config for the pre-unpack callbacks, publishes it before
 the incoming postinst, keeps it through remove postrm, and deletes it only
 after successful remove settlement. Failed/interrupted removal keeps it;
 failed upgrade rollback restores the old bytes; purge postrm sees it absent.
-These are requirements for future native support, not current support:
-installed config remains opaque package metadata and an incoming config still
-causes pre-mutation handoff. Debconf or another frontend invoking config is a
-different contract. Arm64 remains unpublished pending its own executable
-oracle run.
+Native lifecycle execution now implements that bounded state contract and the
+native/dpkg differential covers the seven pinned package identities at their
+exact observed sizes plus general bounded config members. Debconf or another
+frontend invoking config is a different contract. Arm64 remains unpublished
+pending its own executable oracle run; architecture-independent parsing is not
+claimed as arm64 runtime evidence.
 
 Statoverrides use file-backed target-root identities and are resolved once
 before scripts, not separately at unpack and configure. A preinst or postinst
@@ -205,6 +211,13 @@ counts and length-prefixed arguments (including empties), and payload bytes
 visible at each script invocation. Filesystem metadata/content, ownership,
 hardlinks, package status and status-old, info records, and script bytes are
 compared independently of the native outcome report.
+
+The retained-metadata matrix includes executable root-owned config members. It
+checks live and `tmp.ci` identities at every maintainer-script callback,
+postinst failure/configure retry, upgrade unwind, failed remove/purge, and
+successful settlement. A separate config-only cohort covers all seven pinned
+vendor package names and sizes, and ambient `tmp.ci` files, directories,
+symlinks, or occupants refuse before mutation.
 
 Advanced fixtures exercise:
 

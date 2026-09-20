@@ -3728,12 +3728,15 @@ fn inspectDeferredState(builder: *Builder) PlanError!void {
                 .detail = conffile.path,
             });
         if (!builder.request.lifecycle_execution)
-            for (archive.scripts) |script| try builder.deferFeature(.{
-                .feature = .maintainer_script,
-                .package = item.identity.name,
-                .architecture = item.identity.architecture,
-                .detail = script.name,
-            });
+            for (archive.scripts) |script| {
+                if (!script.kind.lifecycle()) continue;
+                try builder.deferFeature(.{
+                    .feature = .maintainer_script,
+                    .package = item.identity.name,
+                    .architecture = item.identity.architecture,
+                    .detail = script.name,
+                });
+            };
         if (!builder.request.trigger_execution)
             for (archive.triggers) |trigger| try builder.deferFeature(.{
                 .feature = .trigger,
@@ -7913,20 +7916,17 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
                 package_database_changes.StagedScript,
                 model.scripts.len,
             );
-            for (model.scripts, 0..) |script, index| {
-                const kind = databaseScriptKind(script.kind) orelse
-                    return builder.fail(.{
-                        .surface = .publication,
-                        .code = .program_incomplete,
-                        .package = item.identity.name,
-                    });
-                scripts[index] = .{
+            var script_count: usize = 0;
+            for (model.scripts) |script| {
+                const kind = databaseScriptKind(script.kind) orelse continue;
+                scripts[script_count] = .{
                     .kind = kind,
                     .bytes = model.scriptBytes(script),
                     .mode = script.mode,
                 };
+                script_count += 1;
             }
-            break :block scripts;
+            break :block scripts[0..script_count];
         } else &.{};
         const trigger_declarations = if (builder.request.trigger_execution) block: {
             const declarations = try builder.arena.alloc(
@@ -8426,6 +8426,37 @@ fn captureDatabaseFile(
     return .{ .bytes = bytes, .kind = kind, .mode = observed.mode };
 }
 
+const CapturedInfoFile = struct {
+    file: package_database.FileEntry,
+    uid: u32,
+    gid: u32,
+};
+
+fn captureDatabaseInfoFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    maximum_bytes: usize,
+) !?CapturedInfoFile {
+    const resolved = try root_fs.Path.initPackage(path);
+    const observed = (try root.entryIfExists(resolved)) orelse return null;
+    const kind: package_database.EntryKind = switch (observed.kind) {
+        .file => .regular,
+        .directory => .directory,
+        .sym_link => .symlink,
+        else => .other,
+    };
+    const bytes = if (kind == .regular)
+        try root.readFileAlloc(allocator, resolved, maximum_bytes)
+    else
+        &.{};
+    return .{
+        .file = .{ .bytes = bytes, .kind = kind, .mode = observed.mode },
+        .uid = observed.uid,
+        .gid = observed.gid,
+    };
+}
+
 fn captureDatabaseSnapshot(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -8592,7 +8623,7 @@ fn captureDatabaseSnapshotInto(
                 name,
             },
         );
-        const file = (try captureDatabaseFile(
+        const captured = (try captureDatabaseInfoFile(
             owned,
             root,
             path,
@@ -8600,9 +8631,11 @@ fn captureDatabaseSnapshotInto(
         )) orelse return error.DatabaseCaptureChanged;
         try info.append(owned, .{
             .name = name,
-            .bytes = file.bytes,
-            .kind = file.kind,
-            .mode = file.mode,
+            .bytes = captured.file.bytes,
+            .kind = captured.file.kind,
+            .mode = captured.file.mode,
+            .uid = captured.uid,
+            .gid = captured.gid,
         });
     }
     std.mem.sort(package_database.InfoEntry, info.items, {}, struct {
@@ -11031,6 +11064,20 @@ fn databaseScriptKind(kind: archive_application.ScriptKind) ?package_database.Sc
     };
 }
 
+fn hasLifecycleScripts(model: *const archive_application.Model) bool {
+    for (model.scripts) |script| {
+        if (script.kind.lifecycle()) return true;
+    }
+    return false;
+}
+
+fn hasConfigMembers(models: []const archive_application.Model) bool {
+    for (models) |*model| {
+        if (model.script(.config) != null) return true;
+    }
+    return false;
+}
+
 fn retainedMetadataKind(member: archive_application.MetadataMember) ?package_database.RetainedMetadataKind {
     if (!package_database.safeFileMode(member.mode) or
         member.size > (package_database.Limits{}).max_info_file_bytes) return null;
@@ -11048,7 +11095,11 @@ fn stagedArchiveMetadata(
     allocator: std.mem.Allocator,
     model: *const archive_application.Model,
 ) error{ OutOfMemory, UnsupportedNativeMetadata }![]const package_database_changes.StagedMetadata {
-    const result = try allocator.alloc(package_database_changes.StagedMetadata, model.metadata.len);
+    const config = model.script(.config);
+    const result = try allocator.alloc(
+        package_database_changes.StagedMetadata,
+        model.metadata.len + @intFromBool(config != null),
+    );
     errdefer allocator.free(result);
     for (model.metadata, 0..) |member, index| {
         result[index] = .{
@@ -11057,6 +11108,13 @@ fn stagedArchiveMetadata(
             .mode = member.mode,
         };
     }
+    if (config) |script| result[model.metadata.len] = .{
+        .kind = .config,
+        .bytes = model.scriptBytes(script.*),
+        .mode = script.mode,
+        .uid = 0,
+        .gid = 0,
+    };
     return result;
 }
 
@@ -11071,8 +11129,7 @@ fn stagedArchiveScripts(
     var count: usize = 0;
     errdefer allocator.free(scripts);
     for (archive.model.scripts) |script| {
-        const kind = databaseScriptKind(script.kind) orelse
-            return error.UnsupportedMaintainerScript;
+        const kind = databaseScriptKind(script.kind) orelse continue;
         scripts[count] = .{
             .kind = kind,
             .bytes = archive.model.scriptBytes(script),
@@ -11272,7 +11329,7 @@ fn materializeConfigure(
     defer ownership.deinit();
 
     for (bound.items) |*archive| {
-        if ((request.borrowed_attempt == null and archive.model.scripts.len != 0) or
+        if ((request.borrowed_attempt == null and hasLifecycleScripts(&archive.model)) or
             (!request.planning.trigger_execution and
                 archive.model.triggers.len != 0) or
             !supportedArchiveMetadata(&archive.model))
@@ -12070,9 +12127,25 @@ fn materializeRemoval(
             }
         };
 
-        // Dpkg leaves control records visible during postrm, then settles
-        // their conffile removal without deleting files recreated by the script.
-        if (phase == .purge_conffiles) continue;
+        // Dpkg removes config before postrm purge, while other control records
+        // remain visible until the later purge settlement.
+        if (phase == .purge_conffiles) {
+            if (record.metadataMember(.config) != null) {
+                try intents.append(allocator, .{ .remove = .{
+                    .path = try std.fmt.allocPrint(
+                        owned,
+                        "{s}/{s}/{s}.config",
+                        .{
+                            package_database.database_directory,
+                            package_database.info_directory,
+                            record.info_stem,
+                        },
+                    ),
+                    .removal = .require_present,
+                } });
+            }
+            continue;
+        }
         const change_index = changes.items.len;
         if (settling_purge) {
             try changes.append(allocator, .{ .put_package = .{
@@ -12757,6 +12830,11 @@ fn snapshotInfoMember(
     } else return error.InstalledInfoMissing;
     if (entry.kind != .regular or entry.mode != member.mode or entry.bytes.len != member.size)
         return error.InstalledInfoMismatch;
+    if (comptime @hasField(@TypeOf(member), "uid")) {
+        if (member.kind == .config and
+            (entry.uid != member.uid or entry.gid != member.gid))
+            return error.InstalledInfoMismatch;
+    }
     var digest: [32]u8 = undefined;
     Sha256.hash(entry.bytes, &digest, .{});
     if (!std.mem.eql(u8, &digest, &member.sha256))
@@ -12777,6 +12855,8 @@ fn snapshotMetadata(
             .kind = member.kind,
             .bytes = entry.bytes,
             .mode = entry.mode,
+            .uid = member.uid,
+            .gid = member.gid,
         };
     }
     return result;
@@ -13957,8 +14037,7 @@ fn programArchiveEvidence(
         );
         var script_count: usize = 0;
         for (model.scripts) |script| {
-            const kind = lifecycleArchiveScriptKind(script.kind) orelse
-                return error.UnsupportedMaintainerScript;
+            const kind = lifecycleArchiveScriptKind(script.kind) orelse continue;
             scripts[script_count] = .{
                 .kind = kind,
                 .sha256 = script.sha256,
@@ -16723,6 +16802,8 @@ fn lifecycleAuxiliary(
 const lifecycle_script_record_path =
     "var/lib/debz/native-lifecycle-script-v1.json";
 const lifecycle_tmp_ci = "var/lib/debz-lifecycle-scripts";
+const dpkg_control_staging_directory = "var/lib/dpkg/tmp.ci";
+const dpkg_config_staging_path = dpkg_control_staging_directory ++ "/config";
 const lifecycle_script_directories = [_][]const u8{
     lifecycle_tmp_ci,
     "var/lib/dpkg/info",
@@ -16854,11 +16935,14 @@ fn clearTriggerAuthority(
 const LifecycleStaging = struct {
     paths: std.ArrayList([]const u8) = .empty,
     packages: std.StringHashMapUnmanaged(void) = .empty,
+    config_packages: std.StringHashMapUnmanaged(void) = .empty,
     directory_created: bool = false,
+    config_directory_created: bool = false,
 
     fn deinit(self: *LifecycleStaging, allocator: std.mem.Allocator) void {
         self.paths.deinit(allocator);
         self.packages.deinit(allocator);
+        self.config_packages.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -16872,6 +16956,153 @@ fn lifecyclePackageKey(
         "{s}\x00{s}",
         .{ package.name, package.architecture },
     );
+}
+
+fn configFileMatches(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    script: archive_application.Script,
+) !bool {
+    const entry = (try root.entryIfExists(
+        try root_fs.Path.init(path),
+    )) orelse return false;
+    if (!entry.isRegularFile() or !entry.modeled or entry.link_count != 1 or
+        entry.mode != script.mode or entry.uid != 0 or entry.gid != 0 or
+        entry.size != script.size)
+        return error.StagedConfigChanged;
+    const digest = rootFileSha256(
+        allocator,
+        root,
+        path,
+        (package_database.Limits{}).max_info_file_bytes,
+    ) catch return error.StagedConfigChanged;
+    if (!std.mem.eql(u8, &digest, &script.sha256))
+        return error.StagedConfigChanged;
+    return true;
+}
+
+fn stagedConfigMatches(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    script: archive_application.Script,
+) !bool {
+    return configFileMatches(
+        allocator,
+        root,
+        dpkg_config_staging_path,
+        script,
+    );
+}
+
+fn installedConfigMatches(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    package: native_program.PackageIdentity,
+    script: archive_application.Script,
+) !bool {
+    var matches: usize = 0;
+    const candidates = [_][]const u8{
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}.config",
+            .{
+                package_database.database_directory,
+                package_database.info_directory,
+                package.name,
+            },
+        ),
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}:{s}.config",
+            .{
+                package_database.database_directory,
+                package_database.info_directory,
+                package.name,
+                package.architecture,
+            },
+        ),
+    };
+    defer for (candidates) |path| allocator.free(path);
+    for (candidates) |path| {
+        const present = configFileMatches(allocator, root, path, script) catch
+            return error.InstalledConfigChanged;
+        if (present) matches += 1;
+    }
+    if (matches > 1) return error.InstalledConfigChanged;
+    return matches == 1;
+}
+
+fn validateConfigStagingDirectory(root: root_fs.Root) !bool {
+    const entry = (try root.entryIfExists(
+        try root_fs.Path.init(dpkg_control_staging_directory),
+    )) orelse return false;
+    if (entry.kind != .directory or !entry.modeled or entry.uid != 0 or entry.gid != 0 or
+        entry.mode != 0o755)
+        return error.UnsafeConfigStagingDirectory;
+    var directory = try root.openDirectory(
+        try root_fs.Path.init(dpkg_control_staging_directory),
+    );
+    defer directory.close(root.io);
+    var iterator = directory.iterate();
+    while (try iterator.next(root.io)) |child| {
+        if (!std.mem.eql(u8, child.name, "config"))
+            return error.ConfigStagingCollision;
+    }
+    return true;
+}
+
+fn clearLifecycleConfig(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    models: []archive_application.Model,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageIdentity,
+    staging: *LifecycleStaging,
+) !MaterializationResult {
+    const model_index = lifecycleArchiveIndex(models, package) orelse
+        return .{ .outcome = .applied, .detail = "no_archive" };
+    const config = models[model_index].script(.config) orelse
+        return .{ .outcome = .applied, .detail = "no_config" };
+    const key = try lifecyclePackageKey(allocator, package);
+    defer allocator.free(key);
+    if (!(stagedConfigMatches(allocator, root, config.*) catch
+        return .{ .outcome = .refused, .detail = "staged_config_changed" }))
+    {
+        if (staging.config_packages.contains(key))
+            return .{ .outcome = .refused, .detail = "staged_config_missing" };
+        return .{ .outcome = .applied, .detail = "config_not_staged" };
+    }
+    const result = try lifecycleAuxiliary(
+        execution,
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        &.{ .{ .remove = .{
+            .path = dpkg_config_staging_path,
+            .removal = .require_present,
+        } }, .{ .remove_directory = .{
+            .path = dpkg_control_staging_directory,
+            .removal = .require_present,
+        } } },
+        "publish-config",
+    );
+    if (result.outcome == .applied)
+        _ = staging.config_packages.remove(key);
+    return result;
 }
 
 fn stageLifecycleScripts(
@@ -16889,11 +17120,33 @@ fn stageLifecycleScripts(
     operation: product_api.Operation,
     policy: transaction_executor.ConffilePolicy,
     package: native_program.PackageIdentity,
+    stage_config: bool,
     staging: *LifecycleStaging,
 ) !MaterializationResult {
     const key = try lifecyclePackageKey(scratch, package);
-    if (staging.packages.contains(key))
+    if (staging.packages.contains(key)) {
+        if (stage_config) if (lifecycleArchiveIndex(models, package)) |model_index| {
+            if (models[model_index].script(.config)) |config| {
+                if (staging.config_packages.contains(key)) {
+                    if (!(stagedConfigMatches(allocator, root, config.*) catch
+                        return .{ .outcome = .refused, .detail = "staged_config_changed" }))
+                        return .{ .outcome = .refused, .detail = "staged_config_missing" };
+                } else if (!(installedConfigMatches(
+                    allocator,
+                    root,
+                    package,
+                    config.*,
+                ) catch return .{
+                    .outcome = .refused,
+                    .detail = "installed_config_changed",
+                })) return .{
+                    .outcome = .refused,
+                    .detail = "staged_config_missing",
+                };
+            }
+        };
         return .{ .outcome = .applied, .detail = "already_staged" };
+    }
 
     var intents: std.ArrayList(root_mutation.Intent) = .empty;
     defer intents.deinit(allocator);
@@ -16917,9 +17170,36 @@ fn stageLifecycleScripts(
 
     if (lifecycleArchiveIndex(models, package)) |model_index| {
         const model = &models[model_index];
+        if (stage_config) if (model.script(.config)) |config| {
+            const directory_present = validateConfigStagingDirectory(root) catch
+                return .{ .outcome = .refused, .detail = "config_staging_collision" };
+            const already_staged = stagedConfigMatches(allocator, root, config.*) catch
+                return .{ .outcome = .refused, .detail = "staged_config_changed" };
+            if (!already_staged) {
+                if (directory_present)
+                    return .{ .outcome = .refused, .detail = "config_staging_collision" };
+                try intents.append(allocator, .{ .directory = .{
+                    .path = dpkg_control_staging_directory,
+                    .mode = 0o755,
+                    .uid = 0,
+                    .gid = 0,
+                    .overwrite = .require_absent,
+                } });
+                try intents.append(allocator, .{ .file = .{
+                    .path = dpkg_config_staging_path,
+                    .bytes = model.scriptBytes(config.*),
+                    .mode = config.mode,
+                    .uid = 0,
+                    .gid = 0,
+                    .overwrite = .require_absent,
+                    .expected_sha256 = config.sha256,
+                } });
+            }
+            staging.config_directory_created = true;
+            try staging.paths.append(allocator, dpkg_config_staging_path);
+        };
         for (model.scripts) |script| {
-            const kind = lifecycleArchiveScriptKind(script.kind) orelse
-                return .{ .outcome = .handoff, .detail = "config_script" };
+            const kind = lifecycleArchiveScriptKind(script.kind) orelse continue;
             const path = try std.fmt.allocPrint(
                 scratch,
                 "{s}/{s}.{s}",
@@ -17012,8 +17292,29 @@ fn stageLifecycleScripts(
         intents.items,
         "stage-scripts",
     );
-    if (result.outcome == .applied)
+    if (result.outcome == .applied) {
         try staging.packages.put(allocator, key, {});
+        if (stage_config) if (lifecycleArchiveIndex(models, package)) |model_index| {
+            if (models[model_index].script(.config)) |config| {
+                if (stagedConfigMatches(allocator, root, config.*) catch
+                    return .{ .outcome = .refused, .detail = "staged_config_changed" })
+                {
+                    try staging.config_packages.put(allocator, key, {});
+                } else if (!(installedConfigMatches(
+                    allocator,
+                    root,
+                    package,
+                    config.*,
+                ) catch return .{
+                    .outcome = .refused,
+                    .detail = "installed_config_changed",
+                })) return .{
+                    .outcome = .refused,
+                    .detail = "staged_config_missing",
+                };
+            }
+        };
+    }
     return result;
 }
 
@@ -17030,7 +17331,9 @@ fn cleanupLifecycleStaging(
     policy: transaction_executor.ConffilePolicy,
     staging: *LifecycleStaging,
 ) !MaterializationResult {
-    if (staging.paths.items.len == 0 and !staging.directory_created)
+    if (staging.paths.items.len == 0 and
+        !staging.directory_created and
+        !staging.config_directory_created)
         return .{ .outcome = .applied, .detail = "nothing_staged" };
     var intents: std.ArrayList(root_mutation.Intent) = .empty;
     defer intents.deinit(allocator);
@@ -17041,6 +17344,11 @@ fn cleanupLifecycleStaging(
     if (staging.directory_created)
         try intents.append(allocator, .{ .remove_directory = .{
             .path = lifecycle_tmp_ci,
+            .removal = .allow_absent,
+        } });
+    if (staging.config_directory_created)
+        try intents.append(allocator, .{ .remove_directory = .{
+            .path = dpkg_control_staging_directory,
             .removal = .allow_absent,
         } });
     return lifecycleAuxiliary(
@@ -20468,7 +20776,7 @@ fn productionArchives(
             .model => |value| value,
             .diagnostic => return error.RecoveryArtifactBindingMismatch,
         };
-        if (!supportedArchiveMetadata(&models[index]) or models[index].script(.config) != null)
+        if (!supportedArchiveMetadata(&models[index]))
             return error.InvalidExternalArchive;
     }
     return .{ .models = models, .bytes = ordered };
@@ -20581,8 +20889,7 @@ fn loadRecoveredLifecycleInputs(
             .model => |value| value,
             .diagnostic => return error.InvalidExternalArchive,
         };
-        if (!supportedArchiveMetadata(&models[index]) or
-            models[index].script(.config) != null)
+        if (!supportedArchiveMetadata(&models[index]))
             return error.InvalidExternalArchive;
     }
     return .{
@@ -21440,7 +21747,7 @@ pub const Runtime = struct {
             if (locked.declared_size != bytes.len or
                 !std.mem.eql(u8, &locked.sha256, &model.provenance().sha256))
                 return error.ArchiveEvidenceMismatch;
-            if (!supportedArchiveMetadata(model) or model.script(.config) != null)
+            if (!supportedArchiveMetadata(model))
                 return error.UnsupportedNativeArchive;
             origins[index] = locked.origin;
         }
@@ -22373,6 +22680,19 @@ fn executeLifecycleProgramWithRequest(
             .program_sha256 = program.digest_sha256,
         };
     }
+    if (recovery_intent == null and
+        hasConfigMembers(models) and
+        try root.entryIfExists(try root_fs.Path.init(
+            dpkg_control_staging_directory,
+        )) != null)
+    {
+        if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
+        return .{
+            .outcome = .refused,
+            .detail = "config_staging_collision",
+            .program_sha256 = program.digest_sha256,
+        };
+    }
     if (recovery_intent == null and borrowed_attempt == null) try attempt.advance(allocator, .{
         .state = .preflight,
         .phase = .preflight,
@@ -22597,6 +22917,30 @@ fn executeLifecycleProgramWithRequest(
         .publish_provenance,
         => {},
         .materialize_bootstrap_payload => |intent| {
+            if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
+                if (models[model_index].script(.config) != null) {
+                    const staged = try stageLifecycleScripts(
+                        execution,
+                        allocator,
+                        scratch,
+                        root,
+                        external.root,
+                        program,
+                        authorization,
+                        models,
+                        initial_model,
+                        locks,
+                        attempt,
+                        operation,
+                        conffile_policy,
+                        intent.package,
+                        true,
+                        &staging,
+                    );
+                    if (lifecycleMaterializationFailure(staged)) |failure|
+                        return failure;
+                }
+            }
             const result = try lifecycleDataStep(
                 execution,
                 allocator,
@@ -22620,6 +22964,30 @@ fn executeLifecycleProgramWithRequest(
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
         },
         .unpack_package => |intent| {
+            if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
+                if (models[model_index].script(.config) != null) {
+                    const staged = try stageLifecycleScripts(
+                        execution,
+                        allocator,
+                        scratch,
+                        root,
+                        external.root,
+                        program,
+                        authorization,
+                        models,
+                        initial_model,
+                        locks,
+                        attempt,
+                        operation,
+                        conffile_policy,
+                        intent.package,
+                        true,
+                        &staging,
+                    );
+                    if (lifecycleMaterializationFailure(staged)) |failure|
+                        return failure;
+                }
+            }
             // File triggers name the route used by publication, not a later script's cache.
             var publication_diversions = try captureUnpackDiversions(execution, allocator, root, step.sequence);
             defer if (publication_diversions) |*cache| cache.deinit();
@@ -22885,6 +23253,23 @@ fn executeLifecycleProgramWithRequest(
                 }
             }
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            const cleared_config = try clearLifecycleConfig(
+                execution,
+                allocator,
+                root,
+                external.root,
+                program,
+                authorization,
+                models,
+                locks,
+                attempt,
+                operation,
+                conffile_policy,
+                intent.package,
+                &staging,
+            );
+            if (lifecycleMaterializationFailure(cleared_config)) |failure|
+                return failure;
             if (program.trigger_authority != null) {
                 const synced = try lifecycleSyncTriggerRegistry(
                     execution,
@@ -23173,6 +23558,27 @@ fn executeLifecycleProgramWithRequest(
         },
         .run_maintainer_script => |call| {
             if (consumed_scripts.contains(step.sequence)) continue;
+            const published_config =
+                call.kind == .postinst and call.source == .new_package;
+            if (published_config) {
+                const cleared = try clearLifecycleConfig(
+                    execution,
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    models,
+                    locks,
+                    attempt,
+                    operation,
+                    conffile_policy,
+                    call.package,
+                    &staging,
+                );
+                if (lifecycleMaterializationFailure(cleared)) |failure|
+                    return failure;
+            }
             const staged = try stageLifecycleScripts(
                 execution,
                 allocator,
@@ -23188,6 +23594,7 @@ fn executeLifecycleProgramWithRequest(
                 operation,
                 conffile_policy,
                 call.package,
+                call.kind != .postinst,
                 &staging,
             );
             if (lifecycleMaterializationFailure(staged)) |failure| return failure;
@@ -26019,8 +26426,7 @@ test "native_unpack.test.lifecycle external fixture" {
         };
         errdefer model.deinit();
         if ((!external.triggers and model.triggers.len != 0) or
-            !supportedArchiveMetadata(&model) or
-            model.script(.config) != null)
+            !supportedArchiveMetadata(&model))
         {
             model.deinit();
             try writeLifecycleReport(
