@@ -12,6 +12,7 @@ import pathlib
 import re
 import stat
 import sys
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -74,6 +75,13 @@ class Limits:
     max_link_target_bytes: int = 4096
     max_linked_file_bytes: int = 256 * 1024 * 1024
     max_total_linked_bytes: int = 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ReferencePolicy:
+    etc_references: tuple[str, ...]
+    owned_etc_references: frozenset[str]
+    ordered_owned_etc_references: tuple[str, ...]
 
 
 class CaptureError(ValueError):
@@ -429,20 +437,47 @@ def _classification(name: str) -> str:
     return "unclassified"
 
 
-def _allowed_reference(relative: str, *, intermediate: bool = False) -> None:
+def _reject_sensitive_reference(relative: str) -> None:
     if any(
         relative == denied or relative.startswith(denied + "/")
         for denied in SENSITIVE_PATHS
     ):
         raise CaptureError(f"alternative reference enters excluded state: {relative}")
+
+
+def _is_etc_alternatives(relative: str) -> bool:
+    return relative == "etc/alternatives" or relative.startswith(
+        "etc/alternatives/"
+    )
+
+
+def _path_is_or_has_descendant(paths: tuple[str, ...], relative: str) -> bool:
+    index = bisect_left(paths, relative)
+    if index >= len(paths):
+        return False
+    candidate = paths[index]
+    return candidate == relative or candidate.startswith(relative + "/")
+
+
+def _allowed_declared_reference(relative: str) -> None:
+    _reject_sensitive_reference(relative)
     top_level = relative.split("/", 1)[0]
-    if (
-        top_level not in PUBLIC_REFERENCE_ROOTS
-        and not (intermediate and relative == "etc")
-        and relative != "etc/alternatives"
-        and not relative.startswith("etc/alternatives/")
-    ):
+    if top_level not in PUBLIC_REFERENCE_ROOTS and top_level != "etc":
         raise CaptureError(f"alternative reference enters excluded state: {relative}")
+
+
+def _allowed_reference(relative: str, policy: ReferencePolicy) -> None:
+    _reject_sensitive_reference(relative)
+    top_level = relative.split("/", 1)[0]
+    if top_level in PUBLIC_REFERENCE_ROOTS:
+        return
+    if (
+        relative == "etc"
+        or _is_etc_alternatives(relative)
+        or _path_is_or_has_descendant(policy.etc_references, relative)
+    ):
+        return
+    raise CaptureError(f"alternative reference enters excluded state: {relative}")
 
 
 def _absolute_reference(value: str, maximum_bytes: int) -> str:
@@ -458,7 +493,7 @@ def _absolute_reference(value: str, maximum_bytes: int) -> str:
     ):
         raise CaptureError(f"malformed absolute alternative path: {value!r}")
     relative = _normalize_relative(value[1:])
-    _allowed_reference(relative)
+    _allowed_declared_reference(relative)
     return relative
 
 
@@ -500,9 +535,15 @@ def _stat_entry_at(
 
 def _scan_metadata(
     root_descriptor: int, limits: Limits
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[str]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    set[str],
+    ReferencePolicy,
+]:
     budget = {"metadata_bytes": 0}
     references: set[str] = set()
+    ownership_lists: list[bytes] = []
     control_members: list[dict[str, Any]] = []
     info_descriptor = _open_directory_at(
         root_descriptor, "var/lib/dpkg/info", required=True
@@ -530,8 +571,12 @@ def _scan_metadata(
                 budget=budget,
                 budget_key="metadata_bytes",
                 total_maximum=limits.max_total_metadata_bytes,
-                retain=classification == "package-alternatives",
+                retain=classification
+                in {"ownership-list", "package-alternatives"},
             )
+            if classification == "ownership-list":
+                assert data is not None
+                ownership_lists.append(data)
             referenced = (
                 _extract_references(
                     data or b"",
@@ -619,14 +664,47 @@ def _scan_metadata(
 
     control_members.sort(key=lambda item: _path_key(item["path"]))
     alternatives_records.sort(key=lambda item: _path_key(item["path"]))
+    etc_references = {
+        reference
+        for reference in references
+        if (
+            reference == "etc"
+            or (
+                reference.startswith("etc/")
+                and not _is_etc_alternatives(reference)
+            )
+        )
+    }
+    encoded_etc_references = {
+        b"/" + _path_key(reference): reference
+        for reference in etc_references
+    }
+    owned_etc_references: set[str] = set()
+    for data in ownership_lists:
+        for line in data.splitlines():
+            reference = encoded_etc_references.get(line)
+            if reference is not None:
+                owned_etc_references.add(reference)
+    ordered_etc_references = tuple(sorted(etc_references))
+    ordered_owned_etc_references = tuple(sorted(owned_etc_references))
     return (
         control_members,
         alternatives_records,
         references,
+        ReferencePolicy(
+            etc_references=ordered_etc_references,
+            owned_etc_references=frozenset(owned_etc_references),
+            ordered_owned_etc_references=ordered_owned_etc_references,
+        ),
     )
 
 
-def _resolve_link_target(parent: list[str], target: str, limits: Limits) -> list[str]:
+def _resolve_link_target(
+    parent: list[str],
+    target: str,
+    limits: Limits,
+    policy: ReferencePolicy,
+) -> list[str]:
     encoded = _path_key(target)
     if (
         not target
@@ -650,7 +728,7 @@ def _resolve_link_target(parent: list[str], target: str, limits: Limits) -> list
     if not result:
         raise CaptureError(f"symlink target resolves to reference root: {target!r}")
     relative = _normalize_relative("/".join(result))
-    _allowed_reference(relative)
+    _allowed_reference(relative, policy)
     return relative.split("/")
 
 
@@ -719,6 +797,7 @@ def _capture_reference(
     root_descriptor: int,
     requested: str,
     limits: Limits,
+    policy: ReferencePolicy,
     entries: dict[str, dict[str, Any]],
     identities: dict[str, tuple[int, ...] | None],
     budget: dict[str, int],
@@ -733,7 +812,7 @@ def _capture_reference(
             component = unresolved.popleft()
             current_parts = [*resolved, component]
             relative = _normalize_relative("/".join(current_parts))
-            _allowed_reference(relative, intermediate=bool(unresolved))
+            _allowed_reference(relative, policy)
             parent_metadata = os.fstat(current_descriptor)
             try:
                 metadata = os.stat(
@@ -742,6 +821,24 @@ def _capture_reference(
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
+                pending = _normalize_relative(
+                    "/".join([*current_parts, *unresolved])
+                )
+                if (
+                    relative == "etc"
+                    or (
+                        relative.startswith("etc/")
+                        and not _is_etc_alternatives(relative)
+                    )
+                ) and not _is_etc_alternatives(
+                    pending
+                ) and not _path_is_or_has_descendant(
+                    policy.ordered_owned_etc_references, relative
+                ):
+                    raise CaptureError(
+                        "alternative reference enters unowned etc state: "
+                        f"{relative}"
+                    )
                 _add_entry(
                     entries,
                     identities,
@@ -764,6 +861,19 @@ def _capture_reference(
                 _require_unchanged_directory(
                     current_descriptor, parent_metadata, relative
                 )
+                resolved_target = _resolve_link_target(
+                    resolved, target, limits, policy
+                )
+                if (
+                    relative.startswith("etc/")
+                    and not _is_etc_alternatives(relative)
+                    and relative not in policy.owned_etc_references
+                    and not _is_etc_alternatives("/".join(resolved_target))
+                ):
+                    raise CaptureError(
+                        "unowned etc alternative link does not target "
+                        f"etc/alternatives: {relative}"
+                    )
                 _add_entry(
                     entries,
                     identities,
@@ -782,7 +892,7 @@ def _capture_reference(
                 combined = _normalize_relative(
                     "/".join(
                         [
-                            *_resolve_link_target(resolved, target, limits),
+                            *resolved_target,
                             *unresolved,
                         ]
                     )
@@ -811,6 +921,17 @@ def _capture_reference(
                     resolved.append(component)
                     continue
                 os.close(following)
+                if (
+                    relative == "etc"
+                    or (
+                        relative.startswith("etc/")
+                        and not _is_etc_alternatives(relative)
+                    )
+                ) and relative not in policy.owned_etc_references:
+                    raise CaptureError(
+                        "alternative reference enters unowned etc state: "
+                        f"{relative}"
+                    )
                 _add_entry(
                     entries,
                     identities,
@@ -828,6 +949,15 @@ def _capture_reference(
                     raise CaptureError(
                         f"non-directory component in linked path "
                         f"{requested}: {relative}"
+                    )
+                if (
+                    relative.startswith("etc/")
+                    and not _is_etc_alternatives(relative)
+                    and relative not in policy.owned_etc_references
+                ):
+                    raise CaptureError(
+                        "alternative reference enters unowned etc state: "
+                        f"{relative}"
                     )
                 previous = entries.get(relative)
                 if previous is not None:
@@ -884,6 +1014,7 @@ def _capture_linked_filesystem(
     root_descriptor: int,
     references: set[str],
     limits: Limits,
+    policy: ReferencePolicy,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     alternatives_descriptor = _open_directory_at(
         root_descriptor, "etc/alternatives", required=False
@@ -916,6 +1047,7 @@ def _capture_linked_filesystem(
                 root_descriptor,
                 relative,
                 limits,
+                policy,
                 entries,
                 identities,
                 budget,
@@ -961,11 +1093,14 @@ def capture(
     )
     root_metadata = os.fstat(root_descriptor)
     try:
-        control_members, alternatives_records, references = _scan_metadata(
-            root_descriptor, limits
-        )
+        (
+            control_members,
+            alternatives_records,
+            references,
+            policy,
+        ) = _scan_metadata(root_descriptor, limits)
         requested, linked_entries = _capture_linked_filesystem(
-            root_descriptor, references, limits
+            root_descriptor, references, limits, policy
         )
         _require_unchanged_directory(
             root_descriptor, root_metadata, "reference root"
