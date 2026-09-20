@@ -75,6 +75,13 @@ destination, but retain their logical name in control records and checksums.
 Routing uses the invocation's effective diversion cache, not just the latest
 live diversion bytes.
 Both administrator-conffile policies and side files apply at that destination.
+When authenticated old `postrm upgrade` changes that route, unpack retains the
+incoming `.dpkg-new` at the original payload route and leaves the old live
+conffile in place. The route capability carries the prior recorded MD5, so
+configure can authenticate and consume that stranded staging without
+normalizing it to the new destination. A later invocation reloads current
+routes independently and may produce a new-route `.dpkg-dist` while the
+old-route `.dpkg-new` remains, matching dpkg.
 Removal retains them; purge retires their package records without deleting
 diverted live or side files, matching dpkg. Retained diverted conffiles remain
 managed observations during recovery, even when purge has no deletion intent

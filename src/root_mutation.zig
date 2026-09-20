@@ -395,6 +395,7 @@ pub const Step = struct {
     /// True when the step reaches its desired state without touching the
     /// root, which happens for an already satisfied removal or directory.
     pub fn satisfied(self: Step) bool {
+        if (self.requiresFreshInode()) return false;
         return switch (self.expected) {
             .absent => switch (self.desired) {
                 .absent => true,
@@ -404,6 +405,17 @@ pub const Step = struct {
                 .absent => false,
                 .present => |desired| statesEqual(expected, desired),
             },
+        };
+    }
+
+    fn requiresFreshInode(self: Step) bool {
+        if (self.kind == .publish_hard_link) return true;
+        if (self.kind != .publish_file and self.kind != .copy_file)
+            return false;
+        return switch (self.expected) {
+            .absent => false,
+            .present => |state| state.kind == .regular and
+                state.inode != 0 and state.link_count > 1,
         };
     }
 
@@ -3569,11 +3581,40 @@ fn classify(engine: *Engine, step: Step, observation: Observation, phase: Phase)
     const actual = observation.state;
     const bound = precondition(engine, step);
     if (matchesPrecondition(actual, step.expected, bound)) return .expected;
-    if (matches(actual, step.desired)) return .desired;
+    if (try matchesDesired(engine, step, observation)) return .desired;
     return if (try selfProduced(engine, step, observation, phase, bound))
         .intermediate
     else
         .foreign;
+}
+
+fn matchesDesired(engine: *Engine, step: Step, observation: Observation) Error!bool {
+    if (!matches(observation.state, step.desired)) return false;
+    if (step.requiresFreshInode() and step.kind != .publish_hard_link) {
+        const expected = switch (step.expected) {
+            .absent => return true,
+            .present => |state| state,
+        };
+        const target = switch (observation.state) {
+            .absent => return false,
+            .present => |state| state,
+        };
+        if (!observation.modeled or target.inode == 0)
+            return false;
+        if (target.inode == expected.inode)
+            return false;
+    }
+    if (step.kind != .publish_hard_link) return true;
+    const target = switch (observation.state) {
+        .absent => return false,
+        .present => |state| state,
+    };
+    if (!observation.modeled or target.inode == 0) return false;
+    const source = engine.root.entry(.{
+        .text = step.source orelse return false,
+    }) catch return false;
+    return source.modeled and source.isRegularFile() and
+        source.device == observation.device and source.inode == target.inode;
 }
 
 /// Where the inode behind one step's recorded precondition comes from.
@@ -4340,7 +4381,8 @@ fn publishStep(engine: *Engine, step: Step) Error!void {
     var observation: Observation = .{};
     try requirePrecondition(engine, step, &observation, true);
     const actual = observation.state;
-    if (matches(actual, step.desired) and step.kind != .create_directory) return;
+    if (try matchesDesired(engine, step, observation) and
+        step.kind != .create_directory) return;
 
     switch (step.kind) {
         .publish_file, .copy_file, .publish_symlink, .publish_hard_link => {
@@ -4521,7 +4563,7 @@ fn verifyStep(engine: *Engine, step: Step) Error!Identity {
     try engine.hook(.verify, step.index);
     var observation: Observation = .{};
     try observeTarget(engine, step, targetPath(step), &observation);
-    if (!matches(observation.state, step.desired))
+    if (!try matchesDesired(engine, step, observation))
         return engine.reject(.verification, .verification_failed, step.index, .verify);
     const state = switch (observation.state) {
         // A removal publishes no entry, so it binds none.
@@ -5547,6 +5589,89 @@ test "root_mutation.test.applies creates, replacements, links, and removals" {
     try clear(&engine);
     try expectAbsent(root, journal_path);
     try expectAbsent(root, progress_path);
+}
+
+test "root_mutation.test.relinks same-content regular files to the authorized source" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+
+    try writeExisting(root, "usr/share/source", "payload\n");
+    try writeExisting(root, "usr/share/member", "payload\n");
+    const before_source = try root.entry(try root_fs.Path.init("usr/share/source"));
+    const before_member = try root.entry(try root_fs.Path.init("usr/share/member"));
+    try testing.expect(before_source.inode != before_member.inode);
+
+    var plan = try planFor(&fixture, &.{.{ .hard_link = .{
+        .path = "usr/share/member",
+        .source = "usr/share/source",
+    } }});
+    defer plan.deinit();
+    try testing.expect(!plan.steps[0].satisfied());
+
+    var engine = try prepare(
+        testing.allocator,
+        fixture.root(),
+        &fixture.attempt,
+        &plan,
+        .{},
+        .{},
+    );
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+
+    const source = try root.entry(try root_fs.Path.init("usr/share/source"));
+    const member = try root.entry(try root_fs.Path.init("usr/share/member"));
+    try testing.expectEqual(source.device, member.device);
+    try testing.expectEqual(source.inode, member.inode);
+}
+
+test "root_mutation.test.republishes a hardlink source before forming its new group" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+
+    try writeExisting(root, "usr/share/source", "payload\n");
+    try root.createHardLink(
+        try root_fs.Path.init("usr/share/source"),
+        try root_fs.Path.init("usr/share/old-member"),
+    );
+    try root.applyMetadata(try root_fs.Path.init("usr/share/source"), .{
+        .modified_nanoseconds = 1_000_000_000,
+    });
+    const original = try root.entry(try root_fs.Path.init("usr/share/source"));
+
+    var plan = try planFor(&fixture, &.{
+        fileIntent("usr/share/source", "payload\n"),
+        .{ .hard_link = .{
+            .path = "usr/share/new-member",
+            .source = "usr/share/source",
+        } },
+    });
+    defer plan.deinit();
+    try testing.expect(!plan.steps[0].satisfied());
+
+    var engine = try prepare(
+        testing.allocator,
+        fixture.root(),
+        &fixture.attempt,
+        &plan,
+        .{},
+        .{},
+    );
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+
+    const source = try root.entry(try root_fs.Path.init("usr/share/source"));
+    const old_member = try root.entry(try root_fs.Path.init("usr/share/old-member"));
+    const new_member = try root.entry(try root_fs.Path.init("usr/share/new-member"));
+    try testing.expect(source.inode != original.inode);
+    try testing.expectEqual(original.inode, old_member.inode);
+    try testing.expectEqual(source.inode, new_member.inode);
 }
 
 test "root_mutation.test.final directory timestamp follows child publication" {

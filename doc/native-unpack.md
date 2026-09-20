@@ -186,18 +186,21 @@ replacement or a newly created file reloads the effective records. A subsequent
 invocation starts from the current file. Live records are still validated:
 malformed or unsupported edits require recovery even when dpkg would continue
 using its old cache. The cache never replaces the genuine live database.
-Changes during an upgrade's old-postrm callback are also guarded, including
-after a fresh-process resume of the interrupted unpack. They require dpkg's
-previous-route trigger and retained `.dpkg-tmp` behavior, tracked in
-[#192](https://github.com/cataggar/debz/issues/192). This also blocks an atomic
-replacement that activates earlier in-place edits without changing live bytes.
+Changes during an upgrade's installed-package old `postrm upgrade` callback
+are admitted only when recovery is enabled and the exact
+`native-unpack-route-settlement-v1` capability can be published from the
+original unpack input, completed script outcome and refreshed effective cache.
+That route-aware path preserves previous-route triggers, retained
+`.dpkg-tmp` artifacts and cached activation of earlier in-place edits. Legacy
+unpack envelopes, other scripts or arguments, unknown outcomes and unsupported
+routes keep the existing pre-settlement guard.
 
 File-trigger routing keeps an owned snapshot of the cache used by each unpack.
 Recovery-enabled executions persist that snapshot, bound to the original
 intent and program step, so later script updates cannot retarget an earlier
-publication during re-entry. This is a foundation for the full #192
-previous-route, retained-backup and partial-rollback semantics; it does not
-remove the mid-unpack guard.
+publication during re-entry. The route-settlement capability separately binds
+the authenticated post-script cache and authorizes only its reviewed
+previous-route, retained-backup and partial-rollback semantics.
 
 ### Visible unpack backups
 
@@ -251,12 +254,12 @@ claiming the whole unpack rolled back. Older inputs retain their original
 combined journal and phase numbering.
 Recovery covers interruption after actual obsolete removal, including a second
 interruption during or after rollback, without replaying completed scripts.
-Rerouting removals after changed diversion records remains guarded under #192.
+Rerouting removals after changed diversion records uses the authenticated
+route contract; unassociated removals or unsupported endpoints remain guarded.
 Fresh-process recovery consumes committed payload and authenticated completed
 script outcomes without republishing that payload or rerunning those scripts.
 An unfinished payload may still be re-materialized after verified rollback for
-unfinished callbacks. Mid-unpack route changes remain guarded pending the full
-settlement/recovery work in #192.
+unfinished callbacks.
 
 For focused development, `-Dnative-diversions-only=true` selects just the
 diversion profiles in the existing lifecycle, trigger and recovery build
@@ -266,10 +269,10 @@ targets. Their default workloads and CI still run all profiles.
 
 `tools/native_diversion_settlement_oracle.py` codifies 24 pinned-dpkg upgrade
 profiles and 16 subsequent successful invocations. The default
-`test-native-triggers` workload runs this specification in addition to its
-native parity cases, on both CI architectures. Every specification result is
-explicitly labeled **reference-only**: the mid-unpack native guard remains,
-and passing this corpus does not establish native execution or recovery parity.
+`test-native-triggers` workload executes every profile independently through
+native and reference roots, then compares exact outcomes and observations.
+The corpus covers successful, unwind, rollback and later-postinst-failure
+results; the 16 eligible successful profiles also run a second invocation.
 
 The oracle requires old postrm to observe real `.dpkg-tmp` backups before
 settlement. Regular backups retain the original inode, mode, owner and
@@ -297,13 +300,13 @@ sudo -n env PYTHONDONTWRITEBYTECODE=1 python3 tools/test-native-triggers.py \
   --reference-dpkg "$reference_dpkg"
 ```
 
-This selector refuses native executable/helper arguments. The full #192
-runtime and fresh-process recovery implementation remains a separate
-requirement; legacy remains the default.
+This diagnostic selector refuses native executable/helper arguments and keeps
+the reference-only fixture check available independently of the normal
+native/reference differential workload.
 
 ### Route-settlement contract
 
-The first #192 implementation increment defines a separate
+The first reviewed #192 increment defined a separate
 `native-unpack-route-settlement-v1` evidence contract rather than extending
 `native-unpack-diversion-v1`. This preserves every existing v1 omission,
 canonical byte sequence and protocol selection. The new document is bound to
@@ -329,13 +332,10 @@ publication route, resolves authenticated cache references, verifies associated
 v1 settlement-write kinds and source paths, and emits only data: adjusted
 mutation intents, absolute trigger names and derived backup/conffile paths. It
 does not read or mutate the root, publish evidence, select a journal protocol,
-or change recovery. Production still rejects old-postrm diversion changes with
-`UnsupportedMidUnpackDiversionUpdate`; a later #192 increment must integrate
-the contract only after the corresponding success and recovery semantics exist.
+or change recovery.
 
-The second inactive increment adds a separate successful-old-`postrm` lowering
-mode and an internal executor, but ordinary lifecycle execution still cannot
-select either one. The lowering accepts only a separately authenticated cache
+The second reviewed increment added a separate successful-old-`postrm` lowering
+mode and an internal executor. The lowering accepts only a separately authenticated cache
 document; it does not turn live bytes into authority. Route changes are decided
 from effective records rather than the live diversion file digest alone, while
 live-observation changes are reported independently so an identity transition
@@ -356,11 +356,9 @@ database recipe and route contract derive new phase/database evidence.
 The internal executor requires the existing held operation and recovery
 runtime, then uses the generic mutation journal, stable managed-state
 validation and pre-mutation path checkpointing.
-It does not synthesize or publish a diversion database. It is intentionally
-unreachable from normal requests: no ordinary execution emits this capability
-and the existing mid-unpack guard remains.
+It does not synthesize or publish a diversion database.
 
-The third inactive increment extends the same lowering across successful
+The third reviewed increment extends the same lowering across successful
 failed-upgrade unwind, double-postrm rollback and later postinst failure. A
 rollback does not publish the incoming late database recipe: the verified
 payload journal restores the old status/list/control generation first, then
@@ -385,13 +383,23 @@ artifact copies remain recovery authority.
 
 Completed provenance retains the route contract as indexed evidence alongside
 the publication cache. Repeated completion therefore verifies the same
-immutable bytes. This remains inactive infrastructure only; production
-activation and the ordinary execution guard are unchanged.
+immutable bytes.
 
-The 15-profile success-lowering corpus covers successful old-`postrm`
-transitions. The 24-profile reference set has 16 overall successful upgrades;
-`unwind-success/regular` is the additional successful outcome, but its old
-`postrm` fails and therefore remains part of the guarded unwind path.
+The final activation increment selects this path only for a recovery-managed
+installed-package `postrm` whose first argument is exactly `upgrade`, after its
+exact outcome is durable. It refreshes the effective cache read-only, publishes
+the immutable route contract, publishes and checkpoints the private cache and
+all bound route artifacts, and only then permits route-aware mutation. Ordinary
+execution and fresh-process recovery reconstruct the same blueprint from the
+authenticated plan or intent-owned archive model. Missing or legacy
+capability, malformed evidence, unknown outcomes, unsupported endpoints and
+route, destination, cache, backup or journal drift still fail closed before
+further mutation; there is no generic reclaim path and the live diversion
+database is never rewritten.
+
+The 24-profile differential corpus covers the successful, unwind, rollback and
+postinst-failure lowerings, and all 16 eligible successful outcomes run the
+subsequent invocation against both engines.
 
 ## Package identity and ownership
 

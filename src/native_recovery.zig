@@ -1432,9 +1432,9 @@ pub fn updateManagedState(
             &observed_bytes,
         );
         initialized += 1;
+        const route_input_step = try unpackRouteSettlementStep(path);
         const immutable_input_step =
-            try unpackDiversionStep(path) orelse
-            try unpackRouteSettlementStep(path);
+            try unpackDiversionStep(path) orelse route_input_step;
         if (immutable_input_step) |program_step| {
             const previous: ?ManagedEntry = if (base) |snapshot| block: {
                 const previous_index = managedEntryLowerBound(snapshot.entries, path);
@@ -1447,17 +1447,29 @@ pub fn updateManagedState(
                 if (managedEntryEqual(entry, entries[index])) continue;
                 // The initial unpack anchor may publish an observed absent
                 // input once; later scripts and journals cannot rebind it.
-                if (entry.kind != .absent or entries[index].kind != .regular or transient or
-                    action.kind != .filesystem or action.program_step != program_step or
-                    action.substep != 0 or action.ordinal != 0)
+                const initial_anchor = !transient and
+                    action.kind == .filesystem and
+                    action.program_step == program_step and
+                    action.substep == 0 and action.ordinal == 0;
+                const route_script_publication = route_input_step != null and
+                    transient and action.kind == .script and
+                    action.ordinal == 0;
+                if (entry.kind != .absent or
+                    entries[index].kind != .regular or
+                    (!initial_anchor and !route_script_publication))
                     return error.ManagedStateChanged;
-            } else if (entries[index].kind != .absent and
-                (try unpackRouteSettlementStep(path) == null or
-                    entries[index].kind != .regular or transient or
-                    action.kind != .filesystem or
-                    action.program_step != program_step or
-                    action.substep != 0 or action.ordinal != 0))
-                return error.ManagedStateChanged;
+            } else if (entries[index].kind != .absent) {
+                const initial_anchor = route_input_step != null and
+                    entries[index].kind == .regular and !transient and
+                    action.kind == .filesystem and
+                    action.program_step == program_step and
+                    action.substep == 0 and action.ordinal == 0;
+                const route_script_publication = route_input_step != null and
+                    entries[index].kind == .regular and transient and
+                    action.kind == .script and action.ordinal == 0;
+                if (!initial_anchor and !route_script_publication)
+                    return error.ManagedStateChanged;
+            }
         }
     }
     var snapshot: ManagedSnapshot = .{

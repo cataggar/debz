@@ -118,6 +118,17 @@ against independent root/trace/provenance assertions. Core native
 integration is described below. See
 [Native recovery and provenance](native-recovery.md).
 
+The #86 native-transaction roadmap now includes #192's activated
+route-settlement increment. Recovery-managed installed-package
+`postrm upgrade` may durably publish the reviewed capability and continue
+through route-aware success, unwind, rollback and later postinst failure.
+Fresh-process recovery reconstructs the same authority from intent-owned
+artifacts, including after archive eviction. The 24-profile/16-reinvocation
+corpus executes natively and against pinned dpkg rather than serving only as a
+reference fixture. All legacy or absent capabilities, other script phases,
+unknown outcomes, malformed evidence and route/destination/cache/backup/journal
+drift retain the existing fail-closed guard.
+
 Item 15b's `debz.native_preparation` foundation binds actual solver plans and
 exact-lock v2 documents to native authorization and compiled programs without
 fixture request hashes or command-shaped reports. It preserves authenticated
