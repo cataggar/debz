@@ -79,8 +79,11 @@ original unpack step, substep zero and ordinal zero, independently of later
 journal phase numbering. Completed-result verification checks the original program step,
 managed bytes and envelope binding; pending cleanup checks surviving files and
 rejects unbound extra names. Cleanup validates all cache inputs before removing
-any of them. Older executions without initial per-step observations never gain
-retrospectively reconstructed input files.
+any of them. The same all-before-any cleanup rule applies to inactive
+route-settlement inputs, and an orphan route-settlement name remains active
+recovery evidence rather than becoming a clean-root operation input. Older
+executions without initial per-step observations never gain retrospectively
+reconstructed input files.
 
 The optional `backups` array extends this envelope without changing legacy
 canonical bytes. Omission selects the original cache-only phase protocol;
@@ -141,11 +144,32 @@ live-observation changes separately from effective-route changes. The executor
 requires the held operation and stable managed recovery state and uses generic
 journals; it never rewrites the live diversion database.
 
-This remains test-only infrastructure for the successful reference profiles.
-Ordinary v1 and legacy envelopes do not gain a route contract, no capability is
-emitted, and the old-postrm guard still fires before this path can be selected.
-Unknown, failed and unwind outcomes and route-aware fresh-process recovery
-retain their previous guarded behavior.
+This remains inactive infrastructure. Ordinary v1 and legacy envelopes do not
+gain a route contract, no capability is emitted, and the old-postrm guard still
+fires before this path can be selected.
+
+Outcome-aware lowering now covers successful failed-upgrade unwind,
+double-postrm rollback and a later postinst failure. The rollback recipe leaves
+the generic payload journal authoritative for old database restoration, then
+describes only the reference partial state: retained incoming publication
+routes, previous-only obsolete paths, stranded conffile staging, authenticated
+changed-route backups and original-route triggers. Successful and
+postinst-failure paths use the same route-adjusted late settlement.
+
+A route contract is write-once at the unpack filesystem anchor; an exact retry
+may finish the same managed checkpoint but cannot replace its bytes. It is
+retained as separate indexed provenance evidence. Recovery verifies the
+publication input/cache, current authenticated post-script cache, exact script
+outcome and progress, lowered destinations and directory observations, backup
+identity/content/metadata, conffile staging and digest, settlement recipe and
+the actual journal. The cache-refresh-before-checkpoint window is admitted only
+when the completed script outcome and managed route input authenticate the
+new cache, whose stable regular-file observation must retain private mode and a
+single link before and after checkpointing; unknown outcomes still return
+before any journal repair. Drift at any input or artifact refuses further
+mutation. Existing intent-owned artifact blobs, not caller archive paths,
+supply any recovery publication, and repeated completed recovery retains
+equivalent evidence.
 
 For nonempty inventories, journalled backup creation precedes payload
 publication and the status-old copy. Old postrm and its immediate failure/unwind
