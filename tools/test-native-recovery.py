@@ -1579,8 +1579,12 @@ def exercise_diversion_recovery(
         ("install", "after_trigger_outcome", "atomic-then-inplace"),
         ("upgrade", "during_filesystem_publication", "mid-unpack"),
         ("upgrade", "after_script_prepared", "mid-unpack"),
+        ("upgrade", "after_upgrade_postrm_route_publication", "mid-unpack"),
+        ("upgrade", "after_upgrade_postrm_outcome", "mid-unpack"),
         ("upgrade", "during_filesystem_publication", "mid-cached-route"),
         ("upgrade", "after_script_prepared", "mid-cached-route"),
+        ("upgrade", "after_upgrade_postrm_route_publication", "mid-cached-route"),
+        ("upgrade", "after_upgrade_postrm_outcome", "mid-cached-route"),
         ("install", "after_trigger_outcome", "postinst"),
         ("install", "after_execution_intent", "database-drift"),
         ("install", "after_trigger_outcome", "destination-drift"),
@@ -1621,6 +1625,8 @@ def exercise_diversion_recovery(
         ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-payload-drift"),
         ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-backup-drift"),
         ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-cache-drift"),
+        ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-route-drift"),
+        ("upgrade", "after_upgrade_postrm_outcome", "backup-postrm-route-missing-drift"),
         ("upgrade", "after_upgrade_postrm_marker_cleared", "backup-probe"),
         ("upgrade", "after_upgrade_postrm_marker_cleared", "backup-failure"),
         ("upgrade", "after_upgrade_postrm_completed", "backup-probe-atomic"),
@@ -1822,6 +1828,14 @@ def exercise_diversion_recovery(
                 m.write(path, b"external old backup\n")
             elif mutation == "backup-postrm-cache-drift":
                 m.write(current.candidate / NAMESPACE / "native-diversion-cache-v1.json", b"external cached inputs\n")
+            elif mutation == "backup-postrm-route-drift":
+                routes = list((current.candidate / NAMESPACE).glob("native-unpack-route-settlement-v1-*.json"))
+                assert len(routes) == 1
+                m.write(routes[0], b"external route evidence\n")
+            elif mutation == "backup-postrm-route-missing-drift":
+                routes = list((current.candidate / NAMESPACE).glob("native-unpack-route-settlement-v1-*.json"))
+                assert len(routes) == 1
+                routes[0].unlink()
             elif mutation == "backup-postrm-directory-drift":
                 m.write(current.candidate / lifecycle.DIVERSION_BASE / "tracked/unrecorded", b"external directory member\n")
             elif mutation == "backup-settlement-input-drift":
@@ -1855,7 +1869,7 @@ def exercise_diversion_recovery(
         before = triggers.snapshot(current.candidate)
         report = current.recover(trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True)
         assert helper_path.read_bytes() == helper_before and helper_path.stat().st_ino == helper_inode
-        if mutation in ("mid-unpack", "mid-cached-route", "inplace-unknown", "backup-unknown"):
+        if mutation in ("inplace-unknown", "backup-unknown"):
             assert report["outcome"] == "recovery_required", report
             if mutation == "inplace-unknown":
                 assert not (current.candidate / destination).exists()

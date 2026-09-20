@@ -79,7 +79,7 @@ original unpack step, substep zero and ordinal zero, independently of later
 journal phase numbering. Completed-result verification checks the original program step,
 managed bytes and envelope binding; pending cleanup checks surviving files and
 rejects unbound extra names. Cleanup validates all cache inputs before removing
-any of them. The same all-before-any cleanup rule applies to inactive
+any of them. The same all-before-any cleanup rule applies to
 route-settlement inputs, and an orphan route-settlement name remains active
 recovery evidence rather than becoming a clean-root operation input. Older
 executions without initial per-step observations never gain retrospectively
@@ -113,8 +113,8 @@ file only at its original unpack anchor. Once bound, its bytes, identity and
 metadata cannot be changed or adopted by later script or journal checkpoints,
 even through same-byte replacement.
 
-`native-unpack-route-settlement-v1.json` is a separate, inactive contract for
-the later #192 route-aware phases. It binds the original v1 unpack-input digest,
+`native-unpack-route-settlement-v1.json` is a separate capability for the
+reviewed #192 route-aware phases. It binds the original v1 unpack-input digest,
 package identity, logical and publication paths, a direct post-script route or
 an authenticated `native-diversion-cache-v1` digest, settlement-write
 associations, trigger origin, previous/resulting ownership,
@@ -126,13 +126,7 @@ before producing route-adjusted intents. The document is not embedded in or
 inferred from v1 evidence: existing v1 bytes, phase selection and recovery
 meaning remain unchanged.
 
-No production path writes or consumes this contract yet. In particular, it
-does not admit a mid-unpack diversion update, authorize journal replay, or
-weaken `UnsupportedMidUnpackDiversionUpdate`. Activation remains a later #192
-increment after successful settlement and failure/recovery behavior are
-implemented.
-
-An inactive successful-settlement lowering/execution path now consumes an
+The successful-settlement lowering/execution path consumes an
 explicit contract and a separately authenticated refreshed effective cache. It
 does not mint cache authority from live bytes. It derives
 new route-bound database/phase evidence, binds newly selected destinations
@@ -144,9 +138,10 @@ live-observation changes separately from effective-route changes. The executor
 requires the held operation and stable managed recovery state and uses generic
 journals; it never rewrites the live diversion database.
 
-This remains inactive infrastructure. Ordinary v1 and legacy envelopes do not
-gain a route contract, no capability is emitted, and the old-postrm guard still
-fires before this path can be selected.
+Ordinary v1 and legacy envelopes do not gain a route contract. Activation is
+limited to recovery-managed installed-package `postrm upgrade` after its exact
+outcome is durable; all other script kinds, phases and arguments retain the
+old-postrm guard.
 
 Outcome-aware lowering now covers successful failed-upgrade unwind,
 double-postrm rollback and a later postinst failure. The rollback recipe leaves
@@ -190,6 +185,21 @@ Actual caller-owned recovery covers interruption inside and around these phases,
 with original archives removed, immutable repeated completion, and backup/source
 drift refusals.
 
+If recovery begins before the old postrm invocation, it reconstructs the route
+blueprint from the intent-owned incoming archive model and authenticated
+initial package database. If it begins after a known outcome but before route
+checkpointing, it requires the route name to have been bound absent by the
+initial managed snapshot, authenticates a contract published before the cache
+transition, and validates the private refreshed cache before opening any
+settlement journal. A crash after durable contract publication but before
+cache publication reconstructs the exact cache transition from the managed
+pre-script cache and that contract. Older snapshots without the absent route
+slot cannot acquire the capability retrospectively.
+Committed settlement and cleanup phases consume their recorded journal rather
+than requiring already-consumed backup preconditions again. Archive eviction,
+marker-cleared recovery and repeated terminal completion retain the original
+script, program, intent, result and provenance bindings.
+
 After the generic engine verifies rollback, a new managed checkpoint may accept
 only journal-authorized identity effects: regular-inode ctime changes caused by
 hard links, and recreated symlink/directory inode/ctime changes at recorded paths.
@@ -225,11 +235,11 @@ match the original snapshot. The generic engine still validates those paths'
 actual intermediate states. This does not authorize arbitrary membership changes
 or changed-route settlement.
 
-Changes during old postrm still block resumed mutation before journal replay;
-the guard applies even if interruption causes the callback to resume outside
-the original in-memory mutation frame, or an identical atomic replacement would
-activate previously ignored in-place edits. Mid-unpack update parity remains
-tracked in [#192](https://github.com/cataggar/debz/issues/192).
+Changes during old postrm still block resumed mutation before journal replay
+unless the exact route-settlement capability described above is present and
+valid. This includes fresh-process callbacks outside the original in-memory
+frame and identical atomic replacements that activate previously ignored
+in-place edits.
 Older executions without cache evidence retain their atomic-update guards;
 they never reconstruct an effective cache from changed live bytes.
 An older checkpoint without diversion observations can resume only while the

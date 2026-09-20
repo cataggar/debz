@@ -124,7 +124,7 @@ pub const CachedRecords = struct {
         return digest.finalResult();
     }
 
-    /// Inactive #192 helper: refresh valid live input while reporting live
+    /// Refresh authenticated route-settlement input while reporting live
     /// observation changes separately from semantic effective-route changes.
     pub fn refreshRouteSettlement(
         self: *CachedRecords,
@@ -276,6 +276,19 @@ pub const Session = struct {
         return live;
     }
 
+    pub fn restoreRouteSettlement(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        expected: CachedRecords,
+    ) !Session {
+        var live = try Session.open(allocator, root);
+        errdefer live.deinit();
+        const cached = try expected.clone(allocator);
+        live.cache.deinit();
+        live.cache = cached;
+        return live;
+    }
+
     pub fn deinit(self: *Session) void {
         if (self.pinned) |*pinned| pinned.close();
         self.cache.deinit();
@@ -295,9 +308,8 @@ pub const Session = struct {
         return !std.meta.eql(previous, self.cache.observed);
     }
 
-    /// This does not relax `refresh(..., true)`. It is reserved for an
-    /// authenticated successful route-settlement path that is not activated
-    /// by ordinary execution.
+    /// This does not relax `refresh(..., true)`. It is reserved for the
+    /// authenticated old-postrm route-settlement capability.
     pub fn refreshRouteSettlement(
         self: *Session,
         root: root_fs.Root,

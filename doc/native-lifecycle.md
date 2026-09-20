@@ -54,9 +54,11 @@ Diversions use package-dependent logical/physical routing. Normal atomic
 edits retain the invocation's cached routes rather than becoming a fresh map.
 Malformed live edits remain refused, and the next invocation reads current
 records independently.
-Updates during an in-progress unpack's old postrm remain explicitly blocked;
-their previous-route/backup semantics are tracked in
-[#192](https://github.com/cataggar/debz/issues/192).
+Updates during an in-progress unpack's installed-package old `postrm upgrade`
+use the route-settlement capability only after the exact script outcome,
+refreshed cache and route/backup evidence are durably bound. Other callbacks,
+arguments, legacy evidence and unsupported route changes remain explicitly
+blocked.
 File-trigger matching uses the diversion destination spelling, including when
 that spelling resolves through a merged-/usr alias. Each unpack retains its own
 effective cache for that matching, including across recovery after later script
@@ -72,7 +74,9 @@ records, even with an unchanged diversion database. Native/dpkg profiles cover
 regular files, symlinks, both hard-link positions, introduced files and conffiles.
 Fresh-process recovery preserves this failed result without repeating completed
 scripts, and completes or defers file triggers according to the original policy.
-This does not enable the still-guarded mid-unpack route changes.
+For authenticated route changes it also preserves the original publication
+route as trigger authority across success, unwind, rollback and later postinst
+failure.
 
 Purge deletes conffile bytes and recognized side files before `postrm purge`,
 while leaving the original control records visible to that script. A known

@@ -1,4 +1,4 @@
-"""Pinned-dpkg settlement specification; these cases do not claim native parity."""
+"""Pinned-dpkg settlement specification and native differential corpus."""
 
 from __future__ import annotations
 
@@ -400,9 +400,25 @@ def assert_reinstall(upgrade: dict, observation: dict, epoch: int, architecture:
     assert_database(observation, "2", "2", "installed", controls)
 
 
-def exercise(lifecycle, reference, workspace: Path, environment: dict[str, str], architecture: str) -> None:
+def exercise(
+    lifecycle,
+    reference,
+    workspace: Path,
+    environment: dict[str, str],
+    architecture: str,
+    *,
+    executable: Path | None = None,
+    helper: Path | None = None,
+    native_runner=None,
+) -> None:
     m = lifecycle.m
-    workspace = workspace / "diversion-settlement-reference"
+    differential = executable is not None
+    if differential != (helper is not None and native_runner is not None):
+        raise ValueError("native settlement execution requires executable, helper, and runner")
+    workspace = workspace / (
+        "diversion-settlement-differential"
+        if differential else "diversion-settlement-reference"
+    )
     workspace.mkdir()
     probes = [
         "/" + path + suffix + ".dpkg-tmp"
@@ -437,45 +453,17 @@ fi
         }
     for update, member in CASES:
         directory = workspace / f"{update}-{member}"
-        root = directory / "reference"
-        m.make_root(root, architecture)
-        m.write(root / lifecycle.TRACE, b"")
-        for executable, destination in (
-            ("/bin/sh", "/bin/sh"), ("/usr/bin/dpkg-trigger", "/usr/bin/dpkg-trigger"),
-            ("/usr/bin/stat", "/diversion-stat"),
-        ):
-            lifecycle.runtime.copy_program(root, Path(executable), destination)
+        expected = directory / "reference"
+        candidate = directory / "native"
+        roots = (expected, candidate) if differential else (expected,)
         source = MEMBERS[member]
-        if member == "directory":
-            (root / BASE).mkdir(parents=True)
-            os.utime(root / BASE, (m.EPOCH, m.EPOCH))
         original = lifecycle.diversion_records(source, source + ".original")
         changed = lifecycle.diversion_records(source, source + ".changed")
-        if update != "create":
-            lifecycle.seed_diversions(root, original)
         receiver = m.make_package(
             directory / "receiver", environment, architecture, "1", package=WATCHER,
             scripts=lifecycle.scripts(WATCHER, "1"),
             triggers="".join(f"interest-noawait /{source}{suffix}\n" for suffix in ("", ".original", ".changed")).encode(),
         )
-        seed = directory / "seed"
-        seed.mkdir()
-        equal(reference(root, "install", [receiver, archives["1"]], [], environment, seed), 0, "reference seed")
-        m.write(root / lifecycle.TRACE, b"")
-        if update == "inplace":
-            lifecycle.seed_diversion_inplace(root, "postrm", changed)
-        elif update == "remove":
-            lifecycle.runtime.copy_program(root, Path("/usr/bin/rm"), "/diversion-remove")
-            m.write(root / "diversion-remove-record", b"")
-        else:
-            replacement = original if update == "unchanged" else changed
-            if update == "cached-activation":
-                lifecycle.seed_diversion_inplace(root, "preinst", changed)
-            elif update == "empty":
-                replacement = b""
-            elif update == "exempt":
-                replacement = lifecycle.diversion_records(source, source + ".original", PACKAGE)
-            lifecycle.seed_diversion_replacement(root, "postrm", replacement)
         failures = []
         if update in ("unwind-success", "rollback"):
             failures.append(f"{PACKAGE}@1:postrm:upgrade")
@@ -483,39 +471,214 @@ fi
             failures.append(f"{PACKAGE}@2:postrm:failed-upgrade")
         if update == "postinst-failure":
             failures.append(f"{PACKAGE}@2:postinst:configure")
-        if failures:
-            m.write(root / lifecycle.FAILURE, ("\n".join(failures) + "\n").encode())
-        upgrade = None
-        for operation in ("upgrade", "reinstall"):
-            destination = directory / operation
-            destination.mkdir()
-            before = m.snapshot(root)
-            before_inodes = {path: os.lstat(root / path).st_ino for path in selected_files(before)}
-            before_diversions = diversion_state(root)
-            started = time.time_ns()
-            result = reference(
-                root, operation, [archives["2"]], [], environment, destination, policy="keep_existing",
+        for root in roots:
+            m.make_root(root, architecture)
+            m.write(root / lifecycle.TRACE, b"")
+            for source_executable, destination in (
+                ("/bin/sh", "/bin/sh"),
+                ("/usr/bin/dpkg-trigger", "/usr/bin/dpkg-trigger"),
+                ("/usr/bin/stat", "/diversion-stat"),
+            ):
+                lifecycle.runtime.copy_program(
+                    root, Path(source_executable), destination,
+                )
+            if member == "directory":
+                (root / BASE).mkdir(parents=True)
+                os.utime(root / BASE, (m.EPOCH, m.EPOCH))
+            if update != "create":
+                lifecycle.seed_diversions(root, original)
+            seed = directory / f"seed-{root.name}"
+            seed.mkdir()
+            equal(
+                reference(
+                    root, "install", [receiver, archives["1"]], [],
+                    environment, seed,
+                ),
+                0,
+                f"{root.name} seed",
             )
-            finished = time.time_ns()
-            observation = {
+            m.write(root / lifecycle.TRACE, b"")
+            if update == "inplace":
+                lifecycle.seed_diversion_inplace(root, "postrm", changed)
+            elif update == "remove":
+                lifecycle.runtime.copy_program(
+                    root, Path("/usr/bin/rm"), "/diversion-remove",
+                )
+                m.write(root / "diversion-remove-record", b"")
+            else:
+                replacement = original if update == "unchanged" else changed
+                if update == "cached-activation":
+                    lifecycle.seed_diversion_inplace(root, "preinst", changed)
+                elif update == "empty":
+                    replacement = b""
+                elif update == "exempt":
+                    replacement = lifecycle.diversion_records(
+                        source, source + ".original", PACKAGE,
+                    )
+                lifecycle.seed_diversion_replacement(
+                    root, "postrm", replacement,
+                )
+            if failures:
+                m.write(
+                    root / lifecycle.FAILURE,
+                    ("\n".join(failures) + "\n").encode(),
+                )
+        if differential:
+            (candidate / "usr/bin/dpkg-trigger").write_bytes(helper.read_bytes())
+            (candidate / "usr/bin/dpkg-trigger").chmod(0o755)
+
+        def observe(root: Path, result: int, before: dict, before_inodes: dict, before_diversions: dict | None, started: int, finished: int) -> dict:
+            return {
                 "case": [update, member], "exit": result, "before": before,
                 "before_inodes": before_inodes, "after": m.snapshot(root),
-                "before_diversions": before_diversions, "diversions": diversion_state(root),
+                "before_diversions": before_diversions,
+                "diversions": diversion_state(root),
                 "started_ns": started, "finished_ns": finished,
                 "trace": (root / lifecycle.TRACE).read_text(),
                 "list": (root / f"var/lib/dpkg/info/{PACKAGE}.list").read_text(),
                 "controls": {
-                    name: hashlib.sha256((root / f"var/lib/dpkg/info/{PACKAGE}.{name}").read_bytes()).hexdigest()
+                    name: hashlib.sha256(
+                        (root / f"var/lib/dpkg/info/{PACKAGE}.{name}").read_bytes()
+                    ).hexdigest()
                     for name in controls["1"]
                 },
             }
-            m.write(destination / "observations.json", json.dumps(observation, indent=2).encode())
+
+        def comparison_snapshot(root: Path) -> dict:
+            snapshot = m.oracle.capture(
+                root,
+                excludes=(
+                    *m.oracle.DEFAULT_EXCLUDES,
+                    m.GUARD,
+                    "usr/bin/dpkg-trigger",
+                    lifecycle.TRACE,
+                ),
+            )
+            snapshot.pop("trace", None)
+            for entry in snapshot["filesystem"]:
+                if entry["path"] in (
+                    "diversion-remove-record",
+                    lifecycle.FAILURE,
+                ):
+                    entry["mtime_ns"] = "fixture-clock"
+                if (
+                    entry["kind"] == "symlink"
+                    and entry.get("mtime_ns") != m.EPOCH * 10**9
+                ):
+                    entry["mtime_ns"] = "invocation-clock"
+            return snapshot
+
+        upgrade = None
+        candidate_upgrade = None
+        for operation in ("upgrade", "reinstall"):
+            destination = directory / operation
+            destination.mkdir()
+            expected_before = m.snapshot(expected)
+            expected_inodes = {
+                path: os.lstat(expected / path).st_ino
+                for path in selected_files(expected_before)
+            }
+            expected_diversions = diversion_state(expected)
+            started = time.time_ns()
+            reference_result = reference(
+                expected, operation, [archives["2"]], [], environment,
+                destination, policy="keep_existing",
+            )
+            finished = time.time_ns()
+            observation = observe(
+                expected, reference_result, expected_before, expected_inodes,
+                expected_diversions, started, finished,
+            )
+            m.write(
+                destination / "reference.observations.json",
+                json.dumps(observation, indent=2).encode(),
+            )
             if operation == "upgrade":
                 assert_upgrade(observation, m.EPOCH, architecture, controls)
                 upgrade = observation
             else:
                 assert_reinstall(upgrade, observation, m.EPOCH, architecture, controls)
-            print(f"reference-only diversion settlement {update}-{member}/{operation}: exact outcome passed", flush=True)
-            if result:
+            if differential:
+                candidate_before = m.snapshot(candidate)
+                candidate_inodes = {
+                    path: os.lstat(candidate / path).st_ino
+                    for path in selected_files(candidate_before)
+                }
+                candidate_diversions = diversion_state(candidate)
+                native_started = time.time_ns()
+                report = native_runner(
+                    executable, candidate, architecture, operation,
+                    [archives["2"]], [], environment, destination,
+                    policy="keep_existing", recovery=True,
+                )
+                native_finished = time.time_ns()
+                expected_outcomes = (
+                    ("script_failed",)
+                    if reference_result else
+                    ("applied",)
+                )
+                if report["outcome"] not in expected_outcomes:
+                    raise AssertionError(
+                        f"{update}-{member}/{operation}: unexpected native result: {report}"
+                    )
+                candidate_observation = observe(
+                    candidate,
+                    0 if report["outcome"] == "applied" else 1,
+                    candidate_before,
+                    candidate_inodes,
+                    candidate_diversions,
+                    native_started,
+                    native_finished,
+                )
+                m.write(
+                    destination / "native.observations.json",
+                    json.dumps(candidate_observation, indent=2).encode(),
+                )
+                if operation == "upgrade":
+                    assert_upgrade(
+                        candidate_observation, m.EPOCH, architecture, controls,
+                    )
+                    candidate_upgrade = candidate_observation
+                else:
+                    assert_reinstall(
+                        candidate_upgrade, candidate_observation, m.EPOCH,
+                        architecture, controls,
+                    )
+                equal(
+                    calls(candidate_observation["trace"], architecture),
+                    calls(observation["trace"], architecture),
+                    f"{update}-{member}/{operation} native/reference script and trigger trace",
+                )
+                equal(
+                    sorted(candidate_observation["list"].splitlines()),
+                    sorted(observation["list"].splitlines()),
+                    f"{update}-{member}/{operation} native/reference file list",
+                )
+                equal(
+                    candidate_observation["controls"],
+                    observation["controls"],
+                    f"{update}-{member}/{operation} native/reference controls",
+                )
+                mismatches = m.oracle.differences(
+                    comparison_snapshot(expected),
+                    comparison_snapshot(candidate),
+                    maximum=30,
+                )
+                if mismatches:
+                    raise AssertionError(
+                        "native/dpkg diversion settlement mismatch:\n"
+                        + "\n".join(mismatches)
+                    )
+                print(
+                    f"native/dpkg diversion settlement {update}-{member}/{operation}: exact outcome passed",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"reference-only diversion settlement {update}-{member}/{operation}: exact outcome passed",
+                    flush=True,
+                )
+            if reference_result:
                 break
-            m.write(root / lifecycle.TRACE, b"")
+            for root in roots:
+                m.write(root / lifecycle.TRACE, b"")

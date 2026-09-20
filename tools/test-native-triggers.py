@@ -98,6 +98,8 @@ def native(
     *,
     defer: bool = False,
     fault: str | None = None,
+    policy: str | None = None,
+    recovery: bool = False,
 ) -> dict:
     request_path = destination / "native.request.json"
     report_path = destination / "native.report.json"
@@ -109,6 +111,10 @@ def native(
     }
     if fault is not None:
         request["fault"] = fault
+    if policy is not None:
+        request["policy"] = policy
+    if recovery:
+        request["recovery"] = True
     m.write(request_path, json.dumps(request).encode())
     m.run(
         [str(executable)],
@@ -720,12 +726,21 @@ def main() -> int:
             workspace = Path(temporary)
             environment = m.fixture_environment(workspace)
             if arguments.diversion_settlement_reference_only:
-                settlement.exercise(lifecycle, reference, workspace, environment, architecture)
+                settlement.exercise(
+                    lifecycle, reference, workspace, environment, architecture,
+                )
             elif arguments.diversions_only:
                 exercise_diversion_triggers(executable, helper, workspace, environment, architecture)
+                settlement.exercise(
+                    lifecycle, reference, workspace, environment, architecture,
+                    executable=executable, helper=helper, native_runner=native,
+                )
             else:
                 exercise(executable, helper, workspace, environment, architecture)
-                settlement.exercise(lifecycle, reference, workspace, environment, architecture)
+                settlement.exercise(
+                    lifecycle, reference, workspace, environment, architecture,
+                    executable=executable, helper=helper, native_runner=native,
+                )
     finally:
         if Path("/var/lib/dpkg/status").read_bytes() != host_status:
             raise AssertionError("host dpkg status changed during trigger acceptance")
