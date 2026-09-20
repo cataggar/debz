@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://debz.dev/schema/native-unpack-route-settlement-v1",
   "title": "Native unpack route settlement contract v1",
-  "description": "Inactive, authenticated route-settlement evidence for a postrm upgrade boundary. Presence alone does not authorize native execution.",
+  "description": "Authenticated route-settlement capability for a recovery-managed installed-package postrm upgrade boundary. Presence alone does not authorize native execution.",
   "type": "object",
   "additionalProperties": false,
   "required": [

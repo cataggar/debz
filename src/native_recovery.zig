@@ -104,6 +104,7 @@ pub const CrashPoint = enum {
     after_script_outcome,
     after_script_return_before_outcome,
     after_upgrade_postrm_return_before_outcome,
+    after_upgrade_postrm_route_publication,
     after_upgrade_postrm_cache_refresh,
     after_upgrade_postrm_route_checkpoint,
     after_upgrade_postrm_outcome,
@@ -1464,10 +1465,7 @@ pub fn updateManagedState(
                     action.kind == .filesystem and
                     action.program_step == program_step and
                     action.substep == 0 and action.ordinal == 0;
-                const route_script_publication = route_input_step != null and
-                    entries[index].kind == .regular and transient and
-                    action.kind == .script and action.ordinal == 0;
-                if (!initial_anchor and !route_script_publication)
+                if (!initial_anchor)
                     return error.ManagedStateChanged;
             }
         }
@@ -3044,6 +3042,17 @@ test "native_recovery.test.route settlement inputs bind once at their unpack anc
         try initializeProgress(testing.allocator, root, intent);
         try initializeManagedState(testing.allocator, root, intent);
         try root.publishFile(path, "bound route contract", .{});
+        try testing.expectError(
+            error.ManagedStateChanged,
+            updateManagedState(
+                testing.allocator,
+                root,
+                intent,
+                script,
+                &.{path.text},
+                true,
+            ),
+        );
         _ = try updateManagedState(
             testing.allocator,
             root,
@@ -3091,6 +3100,68 @@ test "native_recovery.test.route settlement inputs bind once at their unpack anc
                 ),
             );
     }
+}
+
+test "native_recovery.test.route settlement script publication requires an absent anchor" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    for ([_][]const u8{
+        "var",
+        "var/lib",
+        root_operation.namespace_path,
+    }) |path|
+        try root.ensureDirectory(
+            try root_fs.Path.init(path),
+            root_fs.default_directory_permissions,
+        );
+    const intent: Digest = @splat('1');
+    const initial: Action = .{
+        .kind = .verification,
+        .program_step = 0,
+        .substep = 0,
+        .ordinal = 0,
+    };
+    const script: Action = .{
+        .kind = .script,
+        .program_step = 8,
+        .substep = 0,
+        .ordinal = 0,
+    };
+    var buffer: [128]u8 = undefined;
+    const path = try root_fs.Path.init(
+        try unpackRouteSettlementPath(7, &buffer),
+    );
+    try initializeProgress(testing.allocator, root, intent);
+    try initializeManagedState(testing.allocator, root, intent);
+    _ = try updateManagedState(
+        testing.allocator,
+        root,
+        intent,
+        initial,
+        &.{path.text},
+        false,
+    );
+    try root.publishFile(path, "bound route contract", .{});
+    _ = try updateManagedState(
+        testing.allocator,
+        root,
+        intent,
+        script,
+        &.{path.text},
+        true,
+    );
+    const bytes = (try readManagedFile(
+        testing.allocator,
+        root,
+        intent,
+        path.text,
+        1024,
+    )).?;
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("bound route contract", bytes);
 }
 
 test "native_recovery.test.route settlement cleanup validates all inputs before removal" {

@@ -466,19 +466,24 @@ fn readManagedRouteSettlement(
     ))
         return error.InvalidManagedState;
     const snapshot = managed.document.transient orelse
-        managed.document.stable;
-    if (snapshot) |state| {
-        for (state.entries) |entry| {
-            if (!std.mem.eql(u8, entry.path, path)) continue;
-            if (entry.kind == .absent) {
-                if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
-                    return error.InvalidManagedState;
-                return null;
-            }
-            if (entry.kind != .regular)
+        managed.document.stable orelse return error.InvalidManagedState;
+    var bound = false;
+    for (snapshot.entries) |entry| {
+        if (!std.mem.eql(u8, entry.path, path)) continue;
+        bound = true;
+        if (entry.kind == .absent) {
+            if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
                 return error.InvalidManagedState;
-            break;
+            return null;
         }
+        if (entry.kind != .regular)
+            return error.InvalidManagedState;
+        break;
+    }
+    if (!bound) {
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.InvalidManagedState;
+        return null;
     }
     const bytes = (try native_recovery.readManagedFile(
         allocator,
@@ -499,6 +504,40 @@ fn readManagedRouteSettlement(
         program_step,
         unpack_input_sha256,
     );
+}
+
+fn routeSettlementSlotBoundAbsent(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: native_recovery.Digest,
+    program_step: u32,
+) !bool {
+    var path_buffer: [128]u8 = undefined;
+    const path = try native_recovery.unpackRouteSettlementPath(
+        program_step,
+        &path_buffer,
+    );
+    var managed = try native_recovery.readManagedState(
+        allocator,
+        root,
+    );
+    defer managed.deinit();
+    if (!std.mem.eql(
+        u8,
+        &managed.document.intent_sha256,
+        &intent_sha256,
+    ))
+        return error.InvalidManagedState;
+    const snapshot = managed.document.transient orelse
+        managed.document.stable orelse return false;
+    for (snapshot.entries) |entry| {
+        if (!std.mem.eql(u8, entry.path, path)) continue;
+        if (entry.kind != .absent) return false;
+        if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+            return error.InvalidManagedState;
+        return true;
+    }
+    return false;
 }
 
 fn routeSettlementCanonicalPath(
@@ -1111,6 +1150,13 @@ fn refreshExecutionRouteSettlement(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     if (active.contract.* == null) {
+        if (!try routeSettlementSlotBoundAbsent(
+            allocator,
+            root,
+            runtime.intent_sha256,
+            execution.program_step,
+        ))
+            return error.UnsupportedMidUnpackDiversionUpdate;
         const blueprint = active.blueprint orelse
             return error.UnsupportedMidUnpackDiversionUpdate;
         const contract = try finalizeRouteSettlementContract(
@@ -1126,6 +1172,7 @@ fn refreshExecutionRouteSettlement(
             root,
             contract,
         );
+        runtime.crash.hit(.after_upgrade_postrm_route_publication);
     }
     const contract = &active.contract.*.?;
     const lowered = try native_unpack_route_settlement.lowerSuccess(
@@ -9302,9 +9349,8 @@ fn publishInactiveRouteSettlement(
     };
 }
 
-/// Inactive #192 success path. Ordinary lifecycle execution neither creates
-/// route-settlement evidence nor calls this helper while the mid-unpack guard
-/// remains active.
+/// Explicit test/helper binding path. Production constructs and checkpoints
+/// the same evidence internally at the authenticated old-postrm boundary.
 pub fn bindInactiveRouteSettlement(
     allocator: std.mem.Allocator,
     runtime: *native_recovery.Runtime,
@@ -9394,6 +9440,11 @@ fn executeSuccessfulRouteSettlement(
         request.root,
         runtime.intent_sha256,
     );
+    try validateManagedDiversionUpdate(
+        allocator,
+        runtime,
+        false,
+    );
     if (!settlement_recovered)
         try native_unpack_route_settlement.validateBoundPaths(
             allocator,
@@ -9474,12 +9525,35 @@ fn materializeFailedUnpack(
     request: MaterializationRequest,
     prepared: ?*const Plan,
     backups: []const native_unpack_diversion.Backup,
+    route_bound_paths: ?[]const native_unpack_route_settlement.BoundPath,
 ) !MaterializationResult {
     const execution = request.execution orelse return error.InvalidLifecycleProgram;
     if (try consumeRecoveredDatabasePhase(execution))
         return .{ .outcome = .applied, .detail = "recovered_phase" };
-    if (execution.recovery) |runtime|
+    if (execution.recovery) |runtime| {
         try native_recovery.validateStableManagedState(allocator, request.root, runtime.intent_sha256);
+        if (route_bound_paths) |paths| {
+            try validateManagedDiversionUpdate(
+                allocator,
+                runtime,
+                false,
+            );
+            for (paths) |path| {
+                if (path.expectation == .present_regular) {
+                    if (try request.root.entryIfExists(
+                        try root_fs.Path.initPackage(path.path),
+                    ) != null)
+                        return error.UnexpectedUnpackRouteOccupant;
+                    continue;
+                }
+                try native_unpack_route_settlement.validateBoundPaths(
+                    allocator,
+                    request.root,
+                    &.{path},
+                );
+            }
+        }
+    }
     var owned_plan: ?Plan = null;
     defer if (owned_plan) |*value| value.deinit();
     const planned = if (prepared) |value| value.* else block: {
@@ -9691,6 +9765,12 @@ fn materialize(
         } else if (planned) |plan_value| {
             const hook = request.unpack_hook;
             if (hook != null and execution.recovery != null and
+                try routeSettlementSlotBoundAbsent(
+                    allocator,
+                    request.root,
+                    execution.recovery.?.intent_sha256,
+                    execution.program_step,
+                ) and
                 hook.?.script.call.kind == .postrm and
                 hook.?.script.call.source == .installed_package and
                 hook.?.script.call.arguments.len != 0 and
@@ -9714,6 +9794,12 @@ fn materialize(
             }
         } else if (request.unpack_hook) |hook| {
             if (execution.recovery != null and
+                try routeSettlementSlotBoundAbsent(
+                    allocator,
+                    request.root,
+                    execution.recovery.?.intent_sha256,
+                    execution.program_step,
+                ) and
                 hook.script.call.kind == .postrm and
                 hook.script.call.source == .installed_package and
                 hook.script.call.arguments.len != 0 and
@@ -9821,7 +9907,16 @@ fn materialize(
     }
     if (partial_rollback) {
         if (execution.recovery) |runtime| runtime.crash.hit(.before_failed_unpack_publication);
-        const preserved = try materializeFailedUnpack(allocator, request, if (planned) |*value| value else null, backups);
+        const preserved = try materializeFailedUnpack(
+            allocator,
+            request,
+            if (planned) |*value| value else null,
+            backups,
+            if (route_lowered) |lowered|
+                lowered.bound_paths
+            else
+                null,
+        );
         if (preserved.outcome != .applied) {
             const attempt = request.borrowed_attempt orelse return error.InvalidLifecycleProgram;
             try attempt.requireRecovery(allocator, .mutation);
@@ -19390,8 +19485,6 @@ fn authenticateRouteCacheTransition(
     script_action: native_recovery.Action,
     diversion_cache: *?native_diversion.Session,
     checkpoint_steps: ?[]const root_mutation.Step,
-    models: []const archive_application.Model,
-    initial_model: package_database.Model,
 ) !?u32 {
     const unpack_step = routeSettlementUnpackStep(
         program,
@@ -19419,26 +19512,6 @@ fn authenticateRouteCacheTransition(
     defer unpack_input.deinit();
     if (unpack_input.settlement == null or unpack_input.backups == null)
         return null;
-    const operation = program.steps[unpack_step].operation;
-    if (operation != .unpack_package)
-        return error.InvalidLifecycleProgram;
-    const model = for (models) |*candidate| {
-        if (std.mem.eql(
-            u8,
-            candidate.facts.package,
-            operation.unpack_package.package.name,
-        ) and std.mem.eql(
-            u8,
-            candidate.facts.version,
-            operation.unpack_package.package.version,
-        ) and std.mem.eql(
-            u8,
-            candidate.facts.architecture,
-            operation.unpack_package.package.architecture,
-        ))
-            break candidate;
-    } else return error.InvalidLifecycleProgram;
-
     var source_private_cache = try readPrivateDiversionCache(
         allocator,
         root,
@@ -19491,28 +19564,7 @@ fn authenticateRouteCacheTransition(
     defer if (route) |*value| value.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    if (route == null) {
-        const blueprint = try routeSettlementBlueprintFromModel(
-            arena.allocator(),
-            root,
-            model,
-            initial_model,
-            &unpack_input,
-        );
-        const contract = try finalizeRouteSettlementContract(
-            arena.allocator(),
-            blueprint,
-            runtime.intent_sha256,
-            unpack_step,
-            &unpack_input,
-            &cache,
-        );
-        route = try publishRouteSettlementContract(
-            allocator,
-            root,
-            contract,
-        );
-    }
+    if (route == null) return error.InvalidManagedState;
     const lowered = try native_unpack_route_settlement.lowerSuccess(
         arena.allocator(),
         route.?.contract,
@@ -19584,6 +19636,64 @@ fn authenticateRouteCacheTransition(
     if (diversion_cache.*) |*previous_session| previous_session.deinit();
     diversion_cache.* = session;
     return unpack_step;
+}
+
+fn routeSettlementNeedsAuthentication(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    runtime: *native_recovery.Runtime,
+    program: native_program.Program,
+    script_action: native_recovery.Action,
+) !bool {
+    const unpack_step = routeSettlementUnpackStep(
+        program,
+        script_action,
+    ) orelse return false;
+    var unpack_path_buffer: [128]u8 = undefined;
+    const unpack_path = try native_recovery.unpackDiversionPath(
+        unpack_step,
+        &unpack_path_buffer,
+    );
+    const unpack_bytes = (try native_recovery.readManagedFile(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        unpack_path,
+        native_unpack_diversion.maximum_document_bytes,
+    )) orelse return error.InvalidManagedState;
+    defer allocator.free(unpack_bytes);
+    var unpack_input = try native_unpack_diversion.decode(
+        allocator,
+        unpack_bytes,
+        runtime.intent_sha256,
+        unpack_step,
+    );
+    defer unpack_input.deinit();
+    if (unpack_input.settlement == null or unpack_input.backups == null)
+        return false;
+    var route = readManagedRouteSettlement(
+        allocator,
+        root,
+        runtime.intent_sha256,
+        unpack_step,
+        unpack_input.digest_sha256,
+    ) catch |err| switch (err) {
+        error.ManagedStateChanged,
+        error.InvalidManagedState,
+        => {
+            var route_path_buffer: [128]u8 = undefined;
+            const route_path = try native_recovery.unpackRouteSettlementPath(
+                unpack_step,
+                &route_path_buffer,
+            );
+            return try root.entryIfExists(
+                try root_fs.Path.init(route_path),
+            ) != null;
+        },
+        else => return err,
+    };
+    if (route) |*value| value.deinit();
+    return false;
 }
 
 fn completedRouteScriptCode(
@@ -20052,8 +20162,6 @@ fn recoverNativeRootMutation(
     program: native_program.Program,
     authorization: native_authorization.Authorization,
     script_recovery: ActiveScriptRecovery,
-    models: []const archive_application.Model,
-    initial_model: package_database.Model,
 ) !bool {
     try checkRuntimeBounds(bounds);
     var route_checkpoint_action: ?native_recovery.Action = null;
@@ -20083,21 +20191,50 @@ fn recoverNativeRootMutation(
                 action,
                 diversion_cache,
                 null,
-                models,
-                initial_model,
             );
             route_checkpoint_action = action;
             break :block null;
         },
         else => return err,
     };
+    if (route_checkpoint_action == null and pending_mutation) {
+        const action = switch (script_recovery) {
+            .known_outcome => |value| value,
+            else => null,
+        };
+        if (action) |known| {
+            if (try routeSettlementNeedsAuthentication(
+                allocator,
+                root,
+                runtime,
+                program,
+                known,
+            )) {
+                _ = try authenticateRouteCacheTransition(
+                    allocator,
+                    root,
+                    runtime,
+                    program,
+                    known,
+                    diversion_cache,
+                    null,
+                );
+                route_checkpoint_action = known;
+            }
+        }
+    }
     if (managed_cache) |value| {
         var cached = value;
         defer cached.deinit();
-        diversion_cache.* = native_diversion.Session.restore(allocator, root, cached.cache) catch |err| switch (err) {
-            error.InvalidDiversionObservation => return error.ManagedStateChanged,
-            else => return err,
-        };
+        if (route_checkpoint_action == null)
+            diversion_cache.* = native_diversion.Session.restore(
+                allocator,
+                root,
+                cached.cache,
+            ) catch |err| switch (err) {
+                error.InvalidDiversionObservation => return error.ManagedStateChanged,
+                else => return err,
+            };
     }
     var rollback_crash = runtime.crash;
     var opened = try root_mutation.open(
@@ -20132,8 +20269,6 @@ fn recoverNativeRootMutation(
             action,
             diversion_cache,
             opened.journal().steps,
-            models,
-            initial_model,
         );
     }
     try validateManagedDiversionUpdate(allocator, runtime, true);
@@ -22330,8 +22465,6 @@ fn executeLifecycleProgramWithRequest(
             program.*,
             authorization.*,
             script_recovery,
-            models,
-            initial_model,
         ) catch |err| switch (err) {
             error.ManagedStateChanged,
             error.InvalidManagedState,
@@ -22339,6 +22472,11 @@ fn executeLifecycleProgramWithRequest(
             error.ManagedStateLimit,
             error.UnsupportedInPlaceDiversionUpdate,
             error.UnsupportedMidUnpackDiversionUpdate,
+            error.InvalidUnpackRouteSettlement,
+            error.InvalidUnpackRouteSettlementJournal,
+            error.UnpackRouteArtifactMissing,
+            error.UnpackRouteArtifactMismatch,
+            error.UnexpectedUnpackRouteOccupant,
             => block: {
                 try attempt.requireRecovery(allocator, .verification);
                 break :block false;

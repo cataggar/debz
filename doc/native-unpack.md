@@ -371,9 +371,12 @@ routes remain the trigger authority.
 The route contract is a write-once managed input at its unpack anchor. An exact
 retry can finish an interrupted checkpoint without changing the contract.
 Fresh-process recovery can authenticate the narrow interruption after the
-postrm cache document is durably refreshed but before its script checkpoint,
-but requires its private mode, single-link identity and exact bytes before
-recording that transition. Later settlement and cleanup recovery
+contract is durably published and before the refreshed cache or script
+checkpoint is durable. The initial managed snapshot must already bind the
+route name absent; older evidence cannot acquire the capability
+retrospectively. Recovery requires the private cache's mode, single-link
+identity, exact bytes and contract-bound digest before recording that
+transition. Later settlement and cleanup recovery
 re-lowers the contract, checks completed script outcomes and progress, and
 matches the actual mutation journal before generic repair. Missing/unknown
 outcomes, changed caches or contract, destination occupants, backup or staging
@@ -399,7 +402,10 @@ database is never rewritten.
 
 The 24-profile differential corpus covers the successful, unwind, rollback and
 postinst-failure lowerings, and all 16 eligible successful outcomes run the
-subsequent invocation against both engines.
+subsequent invocation against both engines. It compares the executed roots'
+normalized filesystem, complete dpkg database snapshot, installed controls,
+file lists and script/trigger traces directly, in addition to independent
+profile assertions.
 
 ## Package identity and ownership
 

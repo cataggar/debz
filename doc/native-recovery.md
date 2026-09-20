@@ -188,8 +188,13 @@ drift refusals.
 If recovery begins before the old postrm invocation, it reconstructs the route
 blueprint from the intent-owned incoming archive model and authenticated
 initial package database. If it begins after a known outcome but before route
-checkpointing, it authenticates the private refreshed cache and publishes or
-validates the same immutable contract before opening any settlement journal.
+checkpointing, it requires the route name to have been bound absent by the
+initial managed snapshot, authenticates a contract published before the cache
+transition, and validates the private refreshed cache before opening any
+settlement journal. A crash after durable contract publication but before
+cache publication reconstructs the exact cache transition from the managed
+pre-script cache and that contract. Older snapshots without the absent route
+slot cannot acquire the capability retrospectively.
 Committed settlement and cleanup phases consume their recorded journal rather
 than requiring already-consumed backup preconditions again. Archive eviction,
 marker-cleared recovery and repeated terminal completion retain the original

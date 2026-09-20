@@ -1356,9 +1356,8 @@ pub fn lower(
     );
 }
 
-/// Inactive successful old-postrm lowering. This adds route preconditions,
-/// rerouted-removal semantics, backup cleanup and conffile status settlement
-/// without activating the production capability.
+/// Successful old-postrm lowering. This adds route preconditions,
+/// rerouted-removal semantics, backup cleanup and conffile status settlement.
 pub fn lowerSuccess(
     allocator: std.mem.Allocator,
     contract: Contract,
@@ -1403,10 +1402,10 @@ fn partialDisposition(route: LoweredRoute) PartialDisposition {
     };
 }
 
-/// Inactive outcome-aware lowering for the complete old-postrm reference
-/// boundary. Rollback consumes the same authenticated routes and artifacts
-/// but does not publish the incoming late database recipe; the generic payload
-/// rollback remains authoritative and only the described partial routes may be
+/// Outcome-aware lowering for the complete old-postrm reference boundary.
+/// Rollback consumes the same authenticated routes and artifacts but does not
+/// publish the incoming late database recipe; the generic payload rollback
+/// remains authoritative and only the described partial routes may be
 /// re-published afterwards.
 pub fn lowerOutcome(
     allocator: std.mem.Allocator,

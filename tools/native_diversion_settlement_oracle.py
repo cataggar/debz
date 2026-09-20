@@ -1,4 +1,4 @@
-"""Pinned-dpkg settlement specification; these cases do not claim native parity."""
+"""Pinned-dpkg settlement specification and native differential corpus."""
 
 from __future__ import annotations
 
@@ -555,7 +555,17 @@ fi
                 ),
             )
             snapshot.pop("trace", None)
-            snapshot.pop("filesystem", None)
+            for entry in snapshot["filesystem"]:
+                if entry["path"] in (
+                    "diversion-remove-record",
+                    lifecycle.FAILURE,
+                ):
+                    entry["mtime_ns"] = "fixture-clock"
+                if (
+                    entry["kind"] == "symlink"
+                    and entry.get("mtime_ns") != m.EPOCH * 10**9
+                ):
+                    entry["mtime_ns"] = "invocation-clock"
             return snapshot
 
         upgrade = None
@@ -634,6 +644,21 @@ fi
                         candidate_upgrade, candidate_observation, m.EPOCH,
                         architecture, controls,
                     )
+                equal(
+                    calls(candidate_observation["trace"], architecture),
+                    calls(observation["trace"], architecture),
+                    f"{update}-{member}/{operation} native/reference script and trigger trace",
+                )
+                equal(
+                    sorted(candidate_observation["list"].splitlines()),
+                    sorted(observation["list"].splitlines()),
+                    f"{update}-{member}/{operation} native/reference file list",
+                )
+                equal(
+                    candidate_observation["controls"],
+                    observation["controls"],
+                    f"{update}-{member}/{operation} native/reference controls",
+                )
                 mismatches = m.oracle.differences(
                     comparison_snapshot(expected),
                     comparison_snapshot(candidate),
