@@ -84,6 +84,10 @@ function harness(
         lockDigest: 'a'.repeat(64),
         downloadedCount: cacheHit ? 0 : 4,
         reusedCount: cacheHit ? 4 : 0,
+        backendCapability:
+          backend === 'legacy_dpkg'
+            ? 'legacy-dpkg-execution-deprecated-v1'
+            : 'native-transaction-execution-v1',
       };
     },
     async saveSetupCache() {

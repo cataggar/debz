@@ -417,6 +417,11 @@
       "cutover": "remove_legacy_dispatch_retain_historical_diagnostic"
     },
     {
+      "path": "actions/install/src/subprocess.ts",
+      "role": "install_action_nested_download_capability_binding",
+      "cutover": "remove_legacy_handoff_retain_native_capability_binding"
+    },
+    {
       "path": "actions/install/src/errors.ts",
       "role": "install_action_legacy_selector_diagnostic",
       "cutover": "remove_legacy_selection_error"

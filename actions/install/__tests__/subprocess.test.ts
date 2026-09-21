@@ -44,10 +44,15 @@ test('nested download handoff accepts only the explicitly selected cache key dom
     ['cache-matched-key', `debz-package-cas-v2-linux-x64-${'a'.repeat(64)}-${'b'.repeat(64)}`],
     ['cache-path', inputs.cachePath], ['cache-root', inputs.cacheRoot],
     ['lock-digest', 'a'.repeat(64)], ['downloaded-count', '0'], ['reused-count', '4'],
+    ['backend-capability', 'legacy-dpkg-execution-deprecated-v1'],
   ]);
   assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache-hit evidence/u);
   inputs.transactionBackend = 'native';
-  assert.equal(validateDownloadOutputs(outputs, inputs).reusedCount, 4);
+  assert.throws(() => validateDownloadOutputs(outputs, inputs), /backend capability/u);
+  outputs.set('backend-capability', 'native-transaction-execution-v1');
+  const validated = validateDownloadOutputs(outputs, inputs);
+  assert.equal(validated.reusedCount, 4);
+  assert.equal(validated.backendCapability, 'native-transaction-execution-v1');
   outputs.set('cache-matched-key', outputs.get('cache-matched-key')!.replace('-v2-', '-v1-'));
   assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache-hit evidence/u);
 });
