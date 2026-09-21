@@ -369,7 +369,7 @@ native_unavailable_status=$?
 set -e
 test "$native_unavailable_status" -eq 7
 test ! -s "$stderr_file"
-printf '%s' "$native_unavailable" | grep -q 'NativeHelperTargetMissing'
+printf '%s' "$native_unavailable" | grep -q 'NativeHelperBootstrapOwnerMissing'
 test ! -s "$root/var/lib/dpkg/status"
 test ! -e "$root/var/lib/debz/root-operation-v1.json"
 test ! -e "$root/var/lib/debz/native-execution-intent-v1.json"
