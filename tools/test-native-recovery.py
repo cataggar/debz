@@ -648,7 +648,14 @@ def assert_final_database(root: Path, architecture: str, proof: dict) -> None:
             raise AssertionError("database receipt describes a nonregular fixture entry")
         if name == "arch" and raw == f"{architecture}\n".encode():
             continue
-        files[name] = {"bytes": raw, "kind": "regular", "mode": stat.S_IMODE(metadata.st_mode)}
+        files[name] = {
+            "bytes": raw,
+            "kind": "regular",
+            "mode": stat.S_IMODE(metadata.st_mode),
+        }
+        if name.startswith("info/") and name.endswith(".config"):
+            files[name]["uid"] = metadata.st_uid
+            files[name]["gid"] = metadata.st_gid
     if "status" not in files:
         raise AssertionError("final database has no status document")
 
@@ -671,9 +678,10 @@ def assert_final_database(root: Path, architecture: str, proof: dict) -> None:
     generation = hashlib.sha256(b"debz.package-database.generation.v1\n")
     for name, entry in files.items():
         raw = entry["bytes"]
-        generation.update(
-            f"{name}\0regular\0{entry['mode']:o}\0{len(raw)}\0{hashlib.sha256(raw).hexdigest()}\n".encode()
-        )
+        generation.update(f"{name}\0regular\0{entry['mode']:o}\0{len(raw)}\0".encode())
+        if name.startswith("info/") and name.endswith(".config"):
+            generation.update(f"owner={entry['uid']}:{entry['gid']}\0".encode())
+        generation.update(f"{hashlib.sha256(raw).hexdigest()}\n".encode())
     if generation.hexdigest() != proof["final_database_generation_sha256"]:
         raise AssertionError("provenance generation differs from the actual complete database")
 
@@ -989,7 +997,16 @@ printf '%s\\n' '{kind}-end' >> /deadline-markers
 exit 0
 """.encode()
     archive = m.make_package(
-        workspace / "packages/deadline-script", environment, architecture, "1", scripts=scripts,
+        workspace / "packages/deadline-script",
+        environment,
+        architecture,
+        "1",
+        scripts=scripts,
+        prepare_payload=lambda source: m.write(
+            source / "DEBIAN/config",
+            lifecycle.metadata_contents("1")["config"],
+            0o755,
+        ),
     )
     destination = current.directory / "execute"
     destination.mkdir()
@@ -1001,6 +1018,11 @@ exit 0
     elapsed = time.monotonic() - started
     if report is None or report["outcome"] != "recovery_required" or report["detail"] != "deadline_exceeded":
         raise AssertionError(f"cumulative script deadline did not retain recovery: {report}")
+    config = current.candidate / f"var/lib/dpkg/info/{m.PACKAGE}.config"
+    if config.read_bytes() != lifecycle.metadata_contents("1")["config"]:
+        raise AssertionError("unknown postinst outcome did not retain published config")
+    if (current.candidate / "var/lib/dpkg/tmp.ci/config").exists():
+        raise AssertionError("unknown postinst outcome retained staged config after publication")
     markers = (current.candidate / "deadline-markers").read_text().splitlines()
     if markers != ["preinst-begin", "preinst-end", "postinst-begin"] or elapsed > deadline_seconds + 15:
         raise AssertionError(f"script deadline was reset, missed, or not polled: {markers}, {elapsed:.2f}s")
@@ -1187,11 +1209,28 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
 
     current = case("typed-runtime-unknown-script")
     shutil.copy2("/usr/bin/dpkg-trigger", current.candidate / triggers.HELPER)
-    archive = package("typed-runtime-unknown-script")
+    config_bytes = lifecycle.metadata_contents("1")["config"]
+    archive = m.make_package(
+        workspace / "packages/typed-runtime-unknown-script",
+        environment,
+        architecture,
+        "1",
+        scripts=lifecycle.scripts(m.PACKAGE, "1"),
+        prepare_payload=lambda source: m.write(
+            source / "DEBIAN/config",
+            config_bytes,
+            0o755,
+        ),
+    )
     binding = current.crash(
         "install", [archive], "after_script_return_before_outcome",
         compare_reference=False, caller_owned=True, isolated_helper=True,
     )
+    staged_config = current.candidate / "var/lib/dpkg/tmp.ci/config"
+    if staged_config.read_bytes() != config_bytes:
+        raise AssertionError("unknown preinst outcome did not retain staged config")
+    if (current.candidate / f"var/lib/dpkg/info/{m.PACKAGE}.config").exists():
+        raise AssertionError("unknown preinst outcome published config before unpack")
     current.blocked(binding, unknown_script=True, caller_owned=True, isolated_helper=True)
 
     current = case("caller-changed-request")
@@ -2188,6 +2227,10 @@ def exercise_metadata_recovery(
         ("install", "after_trigger_outcome", "bytes"),
         ("install", "after_trigger_outcome", "mode"),
         ("install", "after_trigger_outcome", "missing"),
+        ("install", "after_trigger_outcome", "config-bytes"),
+        ("install", "after_trigger_outcome", "config-mode"),
+        ("install", "after_trigger_outcome", "config-owner"),
+        ("install", "after_trigger_outcome", "config-missing"),
     ):
         name = f"metadata-{operation}-{boundary}" + (f"-{drift}-drift" if drift else "")
         current = Scenario(workspace, name, executable, helper, architecture, environment)
@@ -2217,14 +2260,25 @@ def exercise_metadata_recovery(
             if archive.exists():
                 archive.unlink()
         if drift:
-            path = current.candidate / f"var/lib/dpkg/info/{lifecycle.METADATA_PACKAGE}.symbols"
+            member, _, mutation = drift.partition("-")
+            path = current.candidate / (
+                f"var/lib/dpkg/info/{lifecycle.METADATA_PACKAGE}.config"
+                if member == "config"
+                else f"var/lib/dpkg/info/{lifecycle.METADATA_PACKAGE}.symbols"
+            )
             assert path.is_file() and not path.is_symlink()
-            if drift == "bytes":
+            if mutation == "bytes" or drift == "bytes":
                 m.write(path, b"changed during interruption\n", stat.S_IMODE(path.stat().st_mode))
+            elif mutation == "mode":
+                path.chmod(0o700)
             elif drift == "mode":
                 path.chmod(0o640)
-            else:
+            elif mutation == "owner":
+                os.chown(path, 1, 1)
+            elif mutation == "missing" or drift == "missing":
                 path.unlink()
+            else:
+                raise AssertionError(f"unknown metadata drift: {drift}")
         before = triggers.snapshot(current.candidate)
         report = current.recover(
             trigger_execution=True, caller_owned=True, isolated_helper=True, core_product=True,
@@ -2241,14 +2295,15 @@ def exercise_metadata_recovery(
         proof = document(proof_path, 16 * 1024 * 1024)
         retained = retained_documents(current.candidate, proof)
         if operation in ("upgrade", "remove"):
-            original = lifecycle.metadata_contents("1")["symbols"]
-            assert any(
-                blob["kind"] == "database"
-                and blob["logical_path"].endswith(f"{lifecycle.METADATA_PACKAGE}.symbols")
-                and blob["sha256"] == hashlib.sha256(original).hexdigest()
-                and blob["size"] == len(original)
-                for blob in retained["intent"][0]["blobs"]
-            )
+            for member in ("config", "symbols"):
+                original = lifecycle.metadata_contents("1")[member]
+                assert any(
+                    blob["kind"] == "database"
+                    and blob["logical_path"].endswith(f"{lifecycle.METADATA_PACKAGE}.{member}")
+                    and blob["sha256"] == hashlib.sha256(original).hexdigest()
+                    and blob["size"] == len(original)
+                    for blob in retained["intent"][0]["blobs"]
+                )
         completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
         assert completion["attempt_id"] == binding["attempt_id"]
         assert completion["transaction_provenance"]["document_sha256"] == proof["digest_sha256"]

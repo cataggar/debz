@@ -567,12 +567,17 @@ provenance to the original root, attempt, authorization and program, require
 terminal publication before clearing, and prove repeated recovery does not
 rerun work or replace the terminal receipt.
 
-Known inert metadata (`templates`, `shlibs`, `symbols`) participates in complete
+Known inert metadata (`config`, `templates`, `shlibs`, `symbols`) participates in complete
 database-generation and retained-blob evidence as raw bytes, including binary
-contents and safe non-default modes. Actual caller-owned core recovery covers
+contents and safe non-default modes. Config additionally binds executable mode
+and root ownership. Its authenticated archive/database evidence reconstructs
+pre-unpack staging after archive eviction, while completed publication remains
+immutable and does not restage it. Actual caller-owned core recovery covers
 install, upgrade, removal and purge with file triggers and original archives
 evicted. It preserves original metadata for restoration and refuses byte,
-mode or deletion drift without changing package state or the helper.
+mode, ownership, or deletion drift without changing package state or the
+helper. Unknown preinst outcomes retain exact `tmp.ci/config`; unknown postinst
+outcomes retain the published info member and no staged config.
 
 Caller-owned core cases also cover conffile purge and fresh/upgraded
 configuration retry, including partial database publication, prepared/recorded

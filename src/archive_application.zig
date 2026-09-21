@@ -138,6 +138,8 @@ pub const Script = struct {
     kind: ScriptKind,
     name: []const u8,
     mode: u32,
+    uid: u64,
+    gid: u64,
     size: u64,
     sha256: [32]u8,
     content: Content,
@@ -298,6 +300,7 @@ pub const Code = enum {
     control_member_not_regular,
     control_member_limit,
     control_member_unsafe_mode,
+    control_member_unsafe_owner,
     script_not_executable,
     file_limit,
     unsupported_mode_bits,
@@ -332,6 +335,7 @@ pub const Diagnostic = struct {
             .control_member_not_regular => "control.tar members must be regular files",
             .control_member_limit => "control.tar exceeds the configured member count or byte limit",
             .control_member_unsafe_mode => "control.tar member declares setuid or setgid bits",
+            .control_member_unsafe_owner => "config must declare root ownership",
             .script_not_executable => "maintainer script is not executable",
             .file_limit => "payload exceeds the configured application entry limit",
             .unsupported_mode_bits => "archive entry declares mode bits outside permission and special bits",
@@ -360,6 +364,7 @@ pub const Diagnostic = struct {
             .unsupported_control_member,
             .control_member_not_regular,
             .control_member_unsafe_mode,
+            .control_member_unsafe_owner,
             => .control_member,
             .script_not_executable => .maintainer_script,
             .unsupported_mode_bits => .file_metadata,
@@ -965,6 +970,14 @@ fn buildControlMembers(builder: *Builder, diagnostic: *Diagnostic) BuildError!vo
             .interpreted => {},
             .script => {
                 const kind = member.script_kind.?;
+                if (kind == .config and (entry.uid != 0 or entry.gid != 0))
+                    return reject(
+                        diagnostic,
+                        .control_members,
+                        .control_member_unsafe_owner,
+                        entry.header_offset,
+                        index,
+                    );
                 if (entry.mode & 0o111 == 0)
                     return reject(diagnostic, .control_members, .script_not_executable, entry.header_offset, index);
                 if (kind.lifecycle())
@@ -975,6 +988,8 @@ fn buildControlMembers(builder: *Builder, diagnostic: *Diagnostic) BuildError!vo
                     .kind = kind,
                     .name = member.name,
                     .mode = entry.mode,
+                    .uid = entry.uid,
+                    .gid = entry.gid,
                     .size = entry.size,
                     .sha256 = digest,
                     .content = content,
@@ -1348,6 +1363,10 @@ fn computeDigest(model: *const Model) [32]u8 {
         writer.tag(script.kind);
         writer.text(script.name);
         writer.number(script.mode);
+        if (script.kind == .config) {
+            writer.number(script.uid);
+            writer.number(script.gid);
+        }
         writer.number(script.size);
         writer.digest(&script.sha256);
     }
@@ -2024,9 +2043,38 @@ test "archive_application.test.debconf config script is modeled but not a lifecy
     const config = model.script(.config).?;
     try testing.expect(!config.kind.lifecycle());
     try testing.expectEqualStrings("config", config.name);
+    try testing.expectEqual(@as(u64, 0), config.uid);
+    try testing.expectEqual(@as(u64, 0), config.gid);
     try testing.expect(model.features.debconf_config_script);
     try testing.expect(!model.features.lifecycle_scripts);
     try testing.expect(model.features.retained_metadata);
+
+    try expectRejected(.{
+        .control = &.{.{
+            .path = "config",
+            .mode = 0o755,
+            .uid = 1,
+            .content = "#!/bin/sh\nexit 0\n",
+        }},
+    }, .control_member_unsafe_owner, .control_member);
+    try expectRejected(.{
+        .control = &.{.{
+            .path = "config",
+            .mode = 0o755,
+            .gid = 1,
+            .content = "#!/bin/sh\nexit 0\n",
+        }},
+    }, .control_member_unsafe_owner, .control_member);
+    try expectRejected(.{
+        .control = &.{.{
+            .path = "config",
+            .mode = 0o644,
+            .content = "#!/bin/sh\nexit 0\n",
+        }},
+    }, .script_not_executable, .maintainer_script);
+    try expectRejected(.{
+        .control = &.{.{ .path = "config", .kind = '2', .mode = 0o755 }},
+    }, .payload_rejected, .path_or_link);
 }
 
 test "archive_application.test.trigger declarations fail closed" {

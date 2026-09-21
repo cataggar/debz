@@ -4986,14 +4986,20 @@ pub fn lowerDatabasePlan(
 
     const intents = try owned.alloc(Intent, plan.writes.len);
     for (plan.writes, 0..) |write, index| {
+        if ((write.uid == null) != (write.gid == null))
+            return .{ .diagnostic = .{
+                .surface = .database,
+                .code = .database_plan_mismatch,
+                .path = write.path,
+            } };
         const path = try std.fmt.allocPrint(owned, "{s}/{s}", .{ directory, write.path });
         intents[index] = switch (write.kind) {
             .replace => .{ .file = .{
                 .path = path,
                 .bytes = write.bytes,
                 .mode = write.mode,
-                .uid = options.uid,
-                .gid = options.gid,
+                .uid = write.uid orelse options.uid,
+                .gid = write.gid orelse options.gid,
                 .modified_nanoseconds = options.modified_nanoseconds,
                 .expected_sha256 = write.sha256,
             } },
@@ -5002,8 +5008,8 @@ pub fn lowerDatabasePlan(
                 .source = try std.fmt.allocPrint(owned, "{s}/{s}", .{ directory, write.source }),
                 .source_sha256 = write.sha256,
                 .mode = write.mode,
-                .uid = options.uid,
-                .gid = options.gid,
+                .uid = write.uid orelse options.uid,
+                .gid = write.gid orelse options.gid,
                 .modified_nanoseconds = options.modified_nanoseconds,
             } },
             .remove => .{ .remove = .{ .path = path, .removal = .allow_absent } },
@@ -7377,6 +7383,71 @@ test "root_mutation.test.package database plans publish in their exact order" {
     Sha256.hash(package_database.test_fixtures.status, &previous, .{});
     try testing.expectEqualSlices(u8, &previous, &result.model.status_old.?.sha256);
     try clear(&engine);
+}
+
+test "root_mutation.test.database lowering preserves config root ownership" {
+    var plan_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer plan_arena.deinit();
+    const writes = [_]package_database_changes.PlannedWrite{
+        .{
+            .path = package_database.status_old_path,
+            .kind = .copy,
+            .source = package_database.status_path,
+        },
+        .{
+            .path = "info/demo.config",
+            .kind = .replace,
+            .bytes = "#!/bin/sh\nexit 0\n",
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+        },
+        .{
+            .path = package_database.status_path,
+            .kind = .replace,
+            .bytes = "",
+        },
+    };
+    const forged: package_database_changes.Plan = .{
+        .base_generation = .{ .sha256 = @splat(0), .file_count = 0, .total_bytes = 0 },
+        .base_status = .{ .sha256 = @splat(0), .size = 0, .package_count = 0 },
+        .resulting_status = .{ .sha256 = @splat(0), .size = 0, .package_count = 0 },
+        .writes = &writes,
+        .digest = @splat(0),
+        .arena = &plan_arena,
+        .backing_allocator = testing.allocator,
+    };
+    var lowered = switch (try lowerDatabasePlan(testing.allocator, forged, .{
+        .uid = 123,
+        .gid = 456,
+    })) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .intents => |value| value,
+    };
+    defer lowered.deinit();
+
+    switch (lowered.intents[0]) {
+        .copy => |copy| {
+            try testing.expectEqual(@as(u32, 123), copy.uid);
+            try testing.expectEqual(@as(u32, 456), copy.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (lowered.intents[1]) {
+        .file => |file| {
+            try testing.expectEqualStrings("var/lib/dpkg/info/demo.config", file.path);
+            try testing.expectEqual(@as(u32, 0), file.uid);
+            try testing.expectEqual(@as(u32, 0), file.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (lowered.intents[2]) {
+        .file => |file| {
+            try testing.expectEqual(@as(u32, 123), file.uid);
+            try testing.expectEqual(@as(u32, 456), file.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "root_mutation.test.database publication rolls back to the consumed generation" {

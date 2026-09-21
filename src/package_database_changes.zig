@@ -32,6 +32,8 @@ pub const StagedMetadata = struct {
     kind: database.RetainedMetadataKind,
     bytes: []const u8,
     mode: u32 = 0o644,
+    uid: u32 = 0,
+    gid: u32 = 0,
 };
 
 pub const MetadataUpdate = union(enum) {
@@ -127,6 +129,8 @@ pub const PlannedWrite = struct {
     /// zero for `remove`.
     sha256: [32]u8 = @splat(0),
     mode: u32 = 0o644,
+    uid: ?u32 = null,
+    gid: ?u32 = null,
 };
 
 pub const Plan = struct {
@@ -414,6 +418,27 @@ const Builder = struct {
         });
     }
 
+    fn stageReplaceOwned(
+        self: *Builder,
+        path: []const u8,
+        bytes: []const u8,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) PlanError!void {
+        var digest: [32]u8 = undefined;
+        Sha256.hash(bytes, &digest, .{});
+        try self.stage(.{
+            .path = path,
+            .kind = .replace,
+            .bytes = bytes,
+            .sha256 = digest,
+            .mode = mode,
+            .uid = uid,
+            .gid = gid,
+        });
+    }
+
     fn stageRemove(self: *Builder, path: []const u8) PlanError!void {
         try self.stage(.{ .path = path, .kind = .remove });
     }
@@ -617,11 +642,12 @@ const Builder = struct {
             );
         }
         for (metadata) |member| {
-            try self.stageReplace(
-                try self.infoPath(record.info_stem, member.kind.suffix()),
-                try self.arena.dupe(u8, member.bytes),
-                member.mode,
-            );
+            const path = try self.infoPath(record.info_stem, member.kind.suffix());
+            const bytes = try self.arena.dupe(u8, member.bytes);
+            if (member.kind == .config)
+                try self.stageReplaceOwned(path, bytes, member.mode, member.uid, member.gid)
+            else
+                try self.stageReplace(path, bytes, member.mode);
         }
     }
 
@@ -636,6 +662,9 @@ const Builder = struct {
         var seen = std.EnumSet(database.RetainedMetadataKind).initEmpty();
         for (entries, 0..) |entry, index| {
             if (!database.safeFileMode(entry.mode)) return self.fail(.unsafe_mode, package);
+            if (entry.kind == .config and
+                (!database.executableFileMode(entry.mode) or entry.uid != 0 or entry.gid != 0))
+                return self.fail(.unsafe_mode, package);
             if (entry.bytes.len > self.options.database.limits.max_info_file_bytes)
                 return self.fail(.file_too_large, package);
             if (seen.contains(entry.kind)) return self.fail(.duplicate_info_name, package);
@@ -645,6 +674,8 @@ const Builder = struct {
             result[index] = .{
                 .kind = entry.kind,
                 .mode = entry.mode,
+                .uid = entry.uid,
+                .gid = entry.gid,
                 .size = entry.bytes.len,
                 .sha256 = digest,
             };
@@ -1150,6 +1181,12 @@ fn planDigest(base: database.Generation, writes: []const PlannedWrite) [32]u8 {
             write.mode,
             write.sha256,
         }) catch unreachable;
+        if (write.uid) |uid| {
+            writer.print("owner\x00{d}\x00{d}\n", .{
+                uid,
+                write.gid orelse unreachable,
+            }) catch unreachable;
+        } else if (write.gid != null) unreachable;
     }
     writer.flush() catch unreachable;
     return sink.hasher.finalResult();
@@ -1326,6 +1363,8 @@ const SimulatedRoot = struct {
                             .name = try allocator.dupe(u8, name),
                             .bytes = try allocator.dupe(u8, write.bytes),
                             .mode = write.mode,
+                            .uid = write.uid orelse 0,
+                            .gid = write.gid orelse 0,
                         };
                         if (existing) |index| {
                             self.info.items[index] = entry;
@@ -2064,6 +2103,55 @@ test "package_database_changes.test.inert metadata replacement preserves exact b
             try testing.expectEqual(@as(u32, 0o640), record.metadataMember(.shlibs).?.mode);
         }
     }
+}
+
+test "package_database_changes.test.config publication binds root ownership" {
+    var source = switch (try database.importSnapshot(
+        testing.allocator,
+        database.test_fixtures.request(),
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer source.deinit();
+    var package = newPackage();
+    package.metadata = .{ .replace = &.{.{
+        .kind = .config,
+        .bytes = "#!/bin/sh\nexit 0\n",
+        .mode = 0o755,
+    }} };
+    var staged = switch (try plan(
+        testing.allocator,
+        source,
+        &.{.{ .put_package = package }},
+        .{},
+    )) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer staged.deinit();
+    const write = staged.find("info/newpkg.config").?;
+    try testing.expectEqual(WriteKind.replace, write.kind);
+    try testing.expectEqual(@as(u32, 0o755), write.mode);
+    try testing.expectEqual(@as(?u32, 0), write.uid);
+    try testing.expectEqual(@as(?u32, 0), write.gid);
+
+    package.metadata = .{ .replace = &.{.{
+        .kind = .config,
+        .bytes = "#!/bin/sh\nexit 0\n",
+        .mode = 0o755,
+        .uid = 1,
+    }} };
+    try expectPlanDiagnostic(
+        try plan(
+            testing.allocator,
+            source,
+            &.{.{ .put_package = package }},
+            .{},
+        ),
+        .unsafe_mode,
+    );
 }
 
 test "package_database_changes.test.inert metadata stem changes require explicit replacement bytes" {

@@ -38,7 +38,8 @@ TRACE = m.oracle.TRACE_PATH
 LITERAL_PACKAGE = "literal-paths"
 LITERAL_CONFFILE = Path("etc/literal\\config.conf")
 METADATA_PACKAGE = "retained-metadata"
-METADATA_KINDS = ("templates", "shlibs", "symbols")
+METADATA_KINDS = ("config", "templates", "shlibs", "symbols")
+CONFIG_REFERENCE = ROOT / "tools/fixtures/vendor-state/dpkg-config-reference-v1.json"
 CONFFILE_PACKAGE = "conffile-lifecycle"
 CONFFILE_PATHS = (Path("etc/debz-native.conf"), Path("etc/conffile\\extra.conf"))
 CONFFILE_TRIGGER = "conffile-purge"
@@ -399,6 +400,24 @@ for member in templates shlibs symbols; do
     fi
     printf '\\t%s=%s' "$member" "$value" >> /{TRACE}
 done
+for member in config staging-config; do
+    if [ "$member" = config ]; then
+        path="/var/lib/dpkg/info/{package}.config"
+        if [ ! -f "$path" ]; then
+            path="/var/lib/dpkg/info/{package}:$DPKG_MAINTSCRIPT_ARCH.config"
+        fi
+    else
+        path="/var/lib/dpkg/tmp.ci/config"
+    fi
+    value='<absent>'
+    if [ -f "$path" ]; then
+        {{
+            IFS= read -r first || :
+            IFS= read -r value || :
+        }} < "$path"
+    fi
+    printf '\\t%s=%s' "$member" "$value" >> /{TRACE}
+done
 printf '\\n' >> /{TRACE}
 """.encode()
         failure_guard = f"if [ -f /{FAILURE} ]; then\n".encode()
@@ -412,6 +431,11 @@ def metadata_contents(version: str) -> dict[str, bytes]:
     if version not in ("1", "2"):
         raise ValueError(f"unsupported metadata fixture version: {version}")
     result = {
+        "config": (
+            f"#!/bin/sh\n# config:{version}\n"
+            f"printf '%s\\n' 'config:{version}' >> /config-invoked\n"
+            "exit 97\n"
+        ).encode(),
         "templates": f"Template: {METADATA_PACKAGE}/v{version}\nType: string\nDescription: inert fixture\n".encode(),
         "shlibs": f"libretained-metadata 1 {METADATA_PACKAGE} (>= {version})\n".encode(),
     }
@@ -428,7 +452,8 @@ def make_metadata_packages(
     for version in ("1", "2", "3"):
         def prepare_payload(source: Path, version: str = version) -> None:
             for name, content in metadata_contents(version).items():
-                m.write(source / "DEBIAN" / name, content, 0o640 if name == "shlibs" else 0o644)
+                mode = 0o755 if name == "config" else 0o640 if name == "shlibs" else 0o644
+                m.write(source / "DEBIAN" / name, content, mode)
 
         result[version] = m.make_package(
             workspace, environment, architecture, version, "conffile" if conffile else "data",
@@ -437,6 +462,48 @@ def make_metadata_packages(
             control_fields={"Multi-Arch": "same"} if multiarch else {},
             prepare_payload=prepare_payload,
         )
+    return result
+
+
+def vendor_config_body(package: str, version: str, size: int) -> bytes:
+    prefix = (
+        f"#!/bin/sh\n# vendor-config:{package}:{version}\n"
+        f"printf '%s\\n' '{package}:{version}' >> /vendor-config-called\n"
+        "exit 97\n# "
+    ).encode()
+    if len(prefix) > size:
+        raise ValueError(f"pinned vendor config is too small: {package}")
+    return prefix + b"x" * (size - len(prefix))
+
+
+def make_vendor_config_packages(
+    workspace: Path, environment: dict[str, str], architecture: str,
+) -> dict[str, dict[str, Path]]:
+    reference = json.loads(CONFIG_REFERENCE.read_bytes())
+    result = {"1": {}, "2": {}}
+    for member in reference["members"]:
+        package = member["owner"]["package"]
+        amd64 = member["architectures"]["amd64"]
+        arm64 = member["architectures"]["arm64"]
+        for field in ("size", "sha256", "mode", "uid", "gid"):
+            if amd64[field] != arm64[field]:
+                raise AssertionError(f"pinned config identity differs by architecture: {package}")
+        if member["identity"] != f"{package}.config" or amd64["mode"] != "0755":
+            raise AssertionError(f"invalid pinned config identity: {package}")
+        for version in result:
+            body = vendor_config_body(package, version, amd64["size"])
+
+            def prepare(source: Path, body: bytes = body) -> None:
+                m.write(source / "DEBIAN/config", body, 0o755)
+
+            result[version][package] = m.make_package(
+                workspace / version,
+                environment,
+                architecture,
+                version,
+                package=package,
+                prepare_payload=prepare,
+            )
     return result
 
 
@@ -1311,6 +1378,20 @@ def exercise(
     def case(name: str) -> Scenario:
         return Scenario(workspace, name, executable, architecture, environment)
 
+    vendor = make_vendor_config_packages(
+        workspace / "vendor-config-packages",
+        environment,
+        architecture,
+    )
+    vendor_names = tuple(sorted(vendor["1"]))
+    current = case("pinned-vendor-config-members")
+    current.phase("install", [vendor["1"][name] for name in vendor_names], names=vendor_names)
+    current.phase("reinstall", [vendor["1"][name] for name in vendor_names], names=vendor_names)
+    current.phase("upgrade", [vendor["2"][name] for name in vendor_names], names=vendor_names)
+    current.phase("remove", names=vendor_names)
+    current.phase("purge", names=vendor_names)
+    current.complete()
+
     metadata_archives = make_metadata_packages(workspace / "metadata-packages", environment, architecture)
     qualified_metadata = make_metadata_packages(
         workspace / "metadata-qualified-packages", environment, architecture, multiarch=True,
@@ -1318,6 +1399,64 @@ def exercise(
     data_metadata = make_metadata_packages(
         workspace / "metadata-data-packages", environment, architecture, conffile=False,
     )
+    if executable is not None:
+        for collision in ("empty-directory", "occupied-directory", "file", "symlink"):
+            current = case(f"config-staging-collision-{collision}")
+            staging = current.candidate / "var/lib/dpkg/tmp.ci"
+            if collision in ("empty-directory", "occupied-directory"):
+                staging.mkdir(parents=True)
+                if collision == "occupied-directory":
+                    m.write(staging / "other", b"ambient control state\n")
+            elif collision == "file":
+                m.write(staging, b"not a directory\n")
+            else:
+                staging.parent.mkdir(parents=True, exist_ok=True)
+                staging.symlink_to("info")
+            destination = current.directory / "refusal"
+            destination.mkdir()
+            status_path = current.candidate / "var/lib/dpkg/status"
+            trace_path = current.candidate / TRACE
+            before_status = status_path.read_bytes()
+            before_trace = trace_path.read_bytes()
+            before_staging = (
+                staging.lstat(),
+                os.readlink(staging) if staging.is_symlink() else None,
+                tuple(
+                    (entry.name, Path(entry.path).read_bytes())
+                    for entry in os.scandir(staging)
+                ) if staging.is_dir() and not staging.is_symlink() else (),
+                staging.read_bytes() if staging.is_file() and not staging.is_symlink() else None,
+            )
+            report = native(
+                executable,
+                current.candidate,
+                [metadata_archives["1"]],
+                "install",
+                architecture,
+                environment,
+                destination,
+                packages=current.identities((METADATA_PACKAGE,)),
+            )
+            assert report["outcome"] == "refused"
+            assert report["detail"] == "config_staging_collision"
+            after_staging = (
+                staging.lstat(),
+                os.readlink(staging) if staging.is_symlink() else None,
+                tuple(
+                    (entry.name, Path(entry.path).read_bytes())
+                    for entry in os.scandir(staging)
+                ) if staging.is_dir() and not staging.is_symlink() else (),
+                staging.read_bytes() if staging.is_file() and not staging.is_symlink() else None,
+            )
+            assert status_path.read_bytes() == before_status
+            assert trace_path.read_bytes() == before_trace
+            assert after_staging == before_staging
+            assert not (current.candidate / "var/lib/debz/root-operation-v1.json").exists()
+            assert not (current.candidate / "var/lib/debz/root-mutation-v1.json").exists()
+            print(
+                f"config-staging-collision-{collision}: refused before mutation",
+                flush=True,
+            )
     for label, first, later in (
         ("unqualified", metadata_archives, metadata_archives),
         ("qualified", qualified_metadata, qualified_metadata),

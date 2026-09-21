@@ -438,6 +438,8 @@ def _capture_database_directory(
         entry: dict[str, Any] = {
             "path": relative,
             "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
         }
         if path.name.endswith(".list"):
             entry["kind"] = "path-list"
@@ -473,6 +475,7 @@ def capture_dpkg(root: pathlib.Path, limits: Limits) -> dict[str, Any]:
             "updates": [],
             "alternatives": [],
             "parts": [],
+            "staging": [],
             "files": [],
         }
     if not stat.S_ISDIR(admin_metadata.st_mode) or stat.S_ISLNK(
@@ -493,6 +496,7 @@ def capture_dpkg(root: pathlib.Path, limits: Limits) -> dict[str, Any]:
         "updates",
         "alternatives",
         "parts",
+        "tmp.ci",
         "lock",
         "lock-frontend",
     }
@@ -549,6 +553,9 @@ def capture_dpkg(root: pathlib.Path, limits: Limits) -> dict[str, Any]:
         ),
         "parts": _capture_database_directory(
             admin / "parts", "var/lib/dpkg/parts", limits, budget
+        ),
+        "staging": _capture_database_directory(
+            admin / "tmp.ci", "var/lib/dpkg/tmp.ci", limits, budget
         ),
         "files": files,
     }
