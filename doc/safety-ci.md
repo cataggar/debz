@@ -58,6 +58,17 @@ requirements, moving repository failure, retained-closure GC, hostile
 tar-shaped cache blobs, relocation, executable-replacement attempts,
 maintainer-script failure, and explicit recovery.
 
+The manual `ubuntu-real-snapshot` CI job is an opt-in two-row amd64/arm64
+gate selected by the `run_native_real_snapshot` dispatch input. It builds the
+production candidate and Zig comparator, prepares the hash-pinned dpkg oracle
+outside the candidate path, proves the candidate root has no pre-existing
+dpkg/helper/package state, selects `native` explicitly, and exec-traces
+candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.
+Evidence members are capped at 128 MiB and the artifact at 512 MiB before
+upload. Repository freshness remains authoritative: the currently pinned
+Ubuntu snapshot is refused before mutation rather than obtaining a CI
+exception.
+
 `zig build security-audit` is network-free and rejects:
 
 - ambient APT/GnuPG/proxy/environment access and shell construction;

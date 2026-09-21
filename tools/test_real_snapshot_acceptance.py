@@ -32,6 +32,18 @@ def fixture_cli() -> int:
     with pathlib.Path(os.environ["SNAPSHOT_TEST_CALLS"]).open("a") as log:
         log.write(json.dumps(args) + "\n")
     scenario = os.environ.get("SNAPSHOT_TEST_SCENARIO", "")
+    if operation == "refresh" and scenario == "freshness-failure":
+        print(json.dumps({
+            "operation": "refresh",
+            "exit_status": 4,
+            "changed": False,
+            "summary": "ReleaseMissingValidUntil",
+            "diagnostics": [{
+                "id": "repository_authentication_failed",
+                "message": "ReleaseMissingValidUntil",
+            }],
+        }, separators=(",", ":")))
+        return 4
     lock_input = (
         json.loads(option("--lock-input").read_text())
         if "--lock-input" in args else None
@@ -56,6 +68,7 @@ def fixture_cli() -> int:
     if operation in ("install", "upgrade-all"):
         assert lock_input is not None and lock_input["fixture_intent"] == operation
         status = option("--install-root") / "var/lib/dpkg/status"
+        status.parent.mkdir(parents=True, exist_ok=True)
         if operation == "install":
             status.write_text(
                 "Package: ubuntu-minimal\nStatus: install ok installed\n"
@@ -66,10 +79,20 @@ def fixture_cli() -> int:
             status.write_text(status.read_text().replace("Version: 1.0", "Version: 2.0"))
         write(option("--state-path") / "transaction-result.json", {
             "outcome": "succeeded",
-            "commands": ["fixture-install"] if operation == "install"
-            or scenario == "update-command" else [],
+            "commands": ["fixture-install"] if operation == "install" else [],
             "fixture_lock_digest": lock_input["digest_sha256"],
         })
+        namespace = option("--install-root") / "var/lib/debz"
+        namespace.mkdir(parents=True, exist_ok=True)
+        if operation == "install":
+            write(namespace / "native-transaction-provenance-v1.json", {
+                "outcome": "succeeded",
+                "fixture_lock_digest": lock_input["digest_sha256"],
+            })
+            write(namespace / "root-operation-completion-v1.json", {
+                "outcome": "succeeded",
+                "fixture_lock_digest": lock_input["digest_sha256"],
+            })
     if operation == "transaction-result":
         assert args[1] == "verify" and lock_input is not None
         receipt = json.loads((option("--state-path") / "transaction-result.json").read_text())
@@ -77,7 +100,10 @@ def fixture_cli() -> int:
         print(json.dumps({"outcome": "failed" if scenario == "failed-verification"
                           else receipt["outcome"]}))
     else:
-        print('{"exit_status":0,"changed":true}')
+        print(json.dumps({
+            "exit_status": 0,
+            "changed": operation not in ("refresh", "plan", "download", "upgrade-all"),
+        }, separators=(",", ":")))
     return 0
 
 
@@ -100,6 +126,18 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
             + shlex.quote(str(pathlib.Path(__file__).resolve())) + ' --fixture-cli "$@"\n'
         )
         self.cli.chmod(0o700)
+        self.strace = self.directory / "strace"
+        self.strace.write_text(
+            "#!" + sys.executable + "\n"
+            "import pathlib, subprocess, sys\n"
+            "args = sys.argv[1:]\n"
+            "assert args[:5] == ['-f', '-qq', '-e', 'trace=execve', '-o']\n"
+            "output = pathlib.Path(args[5])\n"
+            "command = args[6:]\n"
+            "output.write_text(f'execve(\"{command[0]}\", [...], [...]) = 0\\n')\n"
+            "raise SystemExit(subprocess.run(command).returncode)\n"
+        )
+        self.strace.chmod(0o700)
         self.architecture = {"x86_64": "amd64", "aarch64": "arm64"}[platform.machine()]
         self.env = {
             **os.environ,
@@ -142,27 +180,38 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         self.assertEqual(marker.read_text(), "unchanged")
         self.assertFalse(self.calls.exists())
 
-    def test_legacy_zero_command_update_keeps_its_own_verified_receipt(self) -> None:
+    def test_native_zero_action_update_keeps_the_installed_receipt(self) -> None:
         result = self.run_acceptance()
         self.assertEqual(result.returncode, 0, result.stderr)
         evidence = self.workspace / "evidence"
-        create = json.loads((evidence / "create-transaction-result.json").read_text())
-        update = json.loads((evidence / "update-transaction-result.json").read_text())
-        self.assertNotEqual(create["fixture_lock_digest"], update["fixture_lock_digest"])
-        self.assertEqual(update["commands"], [])
-        self.assertTrue(json.loads((evidence / "update.json").read_text())["changed"])
+        create = json.loads(
+            (evidence / "create-native-transaction-provenance-v1.json").read_text()
+        )
+        self.assertEqual(create["outcome"], "succeeded")
+        self.assertFalse(json.loads((evidence / "update.json").read_text())["changed"])
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         verifications = [call for call in calls if call[:2] == ["transaction-result", "verify"]]
-        self.assertEqual(len(verifications), 2)
+        self.assertEqual(len(verifications), 1)
         self.assertIn(str(evidence / "ubuntu-minimal.lock.json"), verifications[0])
-        self.assertIn(str(evidence / "ubuntu-minimal.update.lock.json"), verifications[1])
+        self.assertIn("--transaction-backend", verifications[0])
+        self.assertIn("native", verifications[0])
         update_plans = [call for call in calls if call[0] == "plan"
                         and str(evidence / "ubuntu-minimal.update.lock.json") in call]
         self.assertEqual(len(update_plans), 1)
         self.assertNotIn("ubuntu-minimal", update_plans[0])
         self.assertNotIn("--lock-input", update_plans[0])
         self.assertEqual((evidence / "update-zero-actions.txt").read_text(),
-                         "command_count=0\nstatus_unchanged=true\n")
+                         "changed=false\nstatus_unchanged=true\nprovenance_unchanged=true\n")
+        mutating = [call for call in calls if call[0] in ("install", "upgrade-all")]
+        self.assertTrue(mutating)
+        for call in mutating:
+            self.assertIn("--transaction-backend", call)
+            self.assertIn("native", call)
+        self.assertEqual(
+            (evidence / "fresh-root-before.txt").read_text(),
+            "install_root_exists=true\ndpkg_database_present=false\n"
+            "helper_placeholder_present=false\npackage_state_present=false\n",
+        )
 
     def test_dangling_workspace_symlink_refuses_before_cli_or_mutation(self) -> None:
         self.workspace.parent.mkdir()
@@ -181,6 +230,25 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         calls = [json.loads(line)[0] for line in self.calls.read_text().splitlines()]
         self.assertEqual(calls, ["refresh", "plan"])
 
+    def test_failed_traced_refresh_still_rejects_forbidden_exec_fallback(self) -> None:
+        self.env["SNAPSHOT_TEST_SCENARIO"] = "freshness-failure"
+        self.env["DEBZ_REAL_SNAPSHOT_TRACE"] = "1"
+        self.env["PATH"] = str(self.directory) + os.pathsep + self.env["PATH"]
+        result = self.run_acceptance()
+        self.assertEqual(result.returncode, 4, result.stderr)
+        evidence = self.workspace / "evidence"
+        refresh = json.loads((evidence / "refresh.json").read_text())
+        self.assertEqual(refresh["summary"], "ReleaseMissingValidUntil")
+        self.assertEqual(
+            (evidence / "native-exec-audit.txt").read_text(),
+            "operation=refresh\nexit_status=4\nforbidden_dpkg_exec=false\n",
+        )
+        self.assertEqual(
+            [json.loads(line)[0] for line in self.calls.read_text().splitlines()],
+            ["refresh"],
+        )
+        self.assertEqual(list((self.workspace / "root").iterdir()), [])
+
     def test_failed_receipt_verification_refuses(self) -> None:
         self.env["SNAPSHOT_TEST_SCENARIO"] = "failed-verification"
         self.assertNotEqual(self.run_acceptance().returncode, 0)
@@ -192,11 +260,6 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         calls = [json.loads(line)[0] for line in self.calls.read_text().splitlines()]
         self.assertNotIn("upgrade-all", calls)
         self.assertEqual(calls[-1], "plan")
-
-    def test_update_commands_refuse_zero_action_evidence(self) -> None:
-        self.env["SNAPSHOT_TEST_SCENARIO"] = "update-command"
-        self.assertNotEqual(self.run_acceptance().returncode, 0)
-        self.assertFalse((self.workspace / "evidence/update-zero-actions.txt").exists())
 
     def test_update_status_change_refuses_zero_action_evidence(self) -> None:
         self.env["SNAPSHOT_TEST_SCENARIO"] = "changed-status"

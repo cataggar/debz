@@ -103,37 +103,46 @@ members produce identical repository and provenance digests. The Release
 validity window is fixed from 2024 through 2037. CI retains full-lane root,
 cache, state, and provenance artifacts for seven days.
 
-The mandatory release-acceptance command is the manual `workflow_dispatch`
-real-snapshot matrix in `.github/workflows/ci.yml`. It runs natively on
+The real-snapshot candidate is selected explicitly with
+`--transaction-backend native`; omission can never route this acceptance
+through the default legacy executor. The opt-in `ubuntu-real-snapshot` job in
+the existing manual `.github/workflows/ci.yml` dispatch runs on
 `ubuntu-24.04` amd64 and `ubuntu-24.04-arm` arm64 against
 `https://snapshot.ubuntu.com/ubuntu/20260816T000000Z`, suite `resolute`,
 component `main`, and the explicit Ubuntu archive keyring. Inputs remain
-visible but validation rejects any value other than that reviewed snapshot.
-Here "natively" describes the runner architecture: this snapshot lane still
-uses the default legacy transaction backend, not native transaction execution.
+fixed to that reviewed snapshot.
 Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
 regular, non-symlink Ubuntu archive keyring instead of installing trust material
 on the host. The authenticated lock must identify the reviewed Ubuntu 2018
 archive signer `F6ECB3762474EDA9D21B7022871920D1991BC93C`. Workspaces must be new;
 an existing root is never reused or reset by this script.
 
-Each row uses the production CLI to authenticate metadata, resolve and review
-an exact `ubuntu-minimal` closure lock without mutating a root, download and
-validate every payload, create the dpkg root under that exact lock, reproduce
-the install lock, and resolve a separate operation-bound lock for `upgrade-all`.
-The pinned update must execute zero dpkg commands and preserve package status.
-Its genuine legacy receipt is verified against the update lock, separately
-from the verified install receipt; it is not a copy of earlier provenance.
-Unlike a native unchanged result, this legacy replay can report `changed: true`
-and publish a new receipt despite executing zero commands.
-It verifies dpkg health,
-provenance, native architecture, failure-before-mutation for a tampered lock,
-and the absence of apt processes in the root. Metadata, package, total
-download, disk, retry, command, and workflow limits are bounded. Evidence is
-retained even on failure while package cache and staged root payloads are
-cleaned.
+The native side begins with only an existing empty directory: no dpkg
+database, helper placeholder, package state, merged-/usr links, or private
+debz namespace is pre-created. It authenticates metadata, resolves a genuine
+v2 lock, and can bootstrap the private trigger helper only from the exact
+authenticated `dpkg` archive and final owner evidence. Candidate commands are
+optionally exec-traced and fail if they launch `dpkg` or `dpkg-deb`.
+The isolated oracle is the architecture-pinned dpkg 1.22.22 payload prepared
+under `.cache`; Python is transport for that reference artifact, not the
+comparison authority. When both bounded captures exist,
+`test/real-snapshot-comparator.zig` is the canonical equality authority for the
+filesystem and normalized dpkg
+status/info/trigger/diversion/statoverride/alternatives sections. A missing
+reference capture is recorded as unavailable and cannot be reported as a
+successful comparison.
 
-Immediately before that cleanup, the workflow runs
+This gate is currently fail-closed rather than a completed parity claim. The
+reviewed `resolute` InRelease is dated 2026-04-23 and omits `Valid-Until`; the
+finite missing-expiry policy permits at most 31 days. A current invocation
+therefore returns `ReleaseMissingValidUntil` before lock resolution or root
+mutation. The gate retains that typed result and fresh-root proof instead of
+weakening repository freshness or silently selecting legacy. Full
+install/reinstall/upgrade/remove/purge, crash/restart, archive-evicted recovery,
+and final native/reference comparison remain blocked until a separately
+reviewed authenticated snapshot policy or pin satisfies current freshness.
+
+The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
 schema](../schema/vendor-state-inventory-v1.json) inventories every

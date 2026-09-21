@@ -201,6 +201,37 @@ pub fn build(b: *std.Build) void {
     b.step("test-integration", "Run hermetic signed-repository integration roots")
         .dependOn(&integration_tests.step);
 
+    const real_snapshot_comparator_module = b.createModule(.{
+        .root_source_file = b.path("test/real-snapshot-comparator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const real_snapshot_comparator = b.addExecutable(.{
+        .name = "real-snapshot-comparator",
+        .root_module = real_snapshot_comparator_module,
+    });
+    const install_real_snapshot_comparator = b.addInstallArtifact(
+        real_snapshot_comparator,
+        .{},
+    );
+    const real_snapshot_comparator_tests = b.addTest(.{
+        .root_module = real_snapshot_comparator_module,
+    });
+    const run_real_snapshot_comparator_tests = b.addRunArtifact(
+        real_snapshot_comparator_tests,
+    );
+    const real_snapshot_comparator_step = b.step(
+        "test-real-snapshot-comparator",
+        "Run Zig native/reference real-snapshot comparison assertions",
+    );
+    real_snapshot_comparator_step.dependOn(
+        &run_real_snapshot_comparator_tests.step,
+    );
+    real_snapshot_comparator_step.dependOn(
+        &install_real_snapshot_comparator.step,
+    );
+    test_step.dependOn(&run_real_snapshot_comparator_tests.step);
+
     const apt_system_acceptance = b.addSystemCommand(
         &.{ "python3", "tools/test-apt-system-acceptance.py" },
     );

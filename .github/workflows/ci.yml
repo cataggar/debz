@@ -22,6 +22,11 @@ on:
         required: true
         type: boolean
         default: false
+      run_native_real_snapshot:
+        description: "Run native real-snapshot acceptance on amd64 and arm64"
+        required: true
+        type: boolean
+        default: false
   schedule:
     - cron: "23 3 * * 1"
 
@@ -1322,10 +1327,10 @@ jobs:
           retention-days: 7
 
   ubuntu-real-snapshot:
-    if: github.event_name == 'workflow_dispatch'
-    name: Real Ubuntu snapshot (${{ matrix.architecture }})
+    if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot
+    name: Native Ubuntu snapshot (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -1360,32 +1365,102 @@ jobs:
       - name: Install test runner prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends dpkg jq liblzma-dev libzstd-dev
-      - name: Build production CLI
-        run: zig build -Doptimize=ReleaseSafe
-      - name: Create and replay exact Ubuntu root
+          sudo apt-get install --yes --no-install-recommends \
+            dpkg jq liblzma-dev libzstd-dev strace
+      - name: Build native candidate and Zig comparator
+        run: |
+          zig build -Doptimize=ReleaseSafe -j2
+          zig build test-real-snapshot-comparator -Doptimize=ReleaseSafe -j2
+      - name: Prepare pinned isolated dpkg oracle
+        id: reference
         env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py \
+            --architecture "$ARCHITECTURE")"
+          printf 'dpkg=%s\n' "$reference_dpkg" >>"$GITHUB_OUTPUT"
+      - name: Create and replay exact native Ubuntu root
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
           SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}
           SNAPSHOT_SUITE: ${{ inputs.ubuntu_snapshot_suite }}
         run: |
-          sudo --preserve-env=SNAPSHOT_URI,SNAPSHOT_SUITE \
+          sudo --preserve-env=ARCHITECTURE,GITHUB_JOB,GITHUB_RUN_ATTEMPT,GITHUB_RUN_ID,GITHUB_SHA,GITHUB_WORKFLOW,REFERENCE_DPKG,SNAPSHOT_SUITE,SNAPSHOT_URI \
+            env DEBZ_REAL_SNAPSHOT_TRACE=1 \
             tools/real-snapshot-acceptance.sh "$PWD/zig-out/bin/debz" \
-            "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "${{ matrix.architecture }}" \
-            "$PWD/.real-snapshot/${{ matrix.architecture }}"
+            "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "$ARCHITECTURE" \
+            "$PWD/.real-snapshot/$ARCHITECTURE"
       - name: Collect diagnostics and clean staged payloads
         if: always()
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
         run: |
-          work=".real-snapshot/${{ matrix.architecture }}"
+          set -euo pipefail
+          work=".real-snapshot/$ARCHITECTURE"
+          evidence="$work/evidence"
           manifest="$work/evidence/vendor-state-inventory-v1.json"
-          sudo mkdir -p "$work/evidence"
+          sudo mkdir -p "$evidence"
+          if [ -n "$REFERENCE_DPKG" ] && [ -f "$REFERENCE_DPKG" ]; then
+            reference_prefix="$(dirname "$(dirname "$(dirname "$REFERENCE_DPKG")")")"
+            sudo cp "$REFERENCE_DPKG" "$evidence/reference-dpkg"
+            sudo cp "$reference_prefix/reference-receipt-v1.json" \
+              "$evidence/reference-receipt-v1.json"
+            if [ -f "$(dirname "$REFERENCE_DPKG")/dpkg-deb" ]; then
+              sudo cp "$(dirname "$REFERENCE_DPKG")/dpkg-deb" \
+                "$evidence/reference-dpkg-deb"
+            fi
+          fi
           capture_status=0
-          sudo python3 tools/capture-vendor-state.py \
-            --reference-root "$PWD/$work/root" \
-            --architecture "${{ matrix.architecture }}" \
-            --output "$PWD/$manifest" \
-            || capture_status=$?
-          if [ "$capture_status" -eq 0 ]; then
-            sudo chown "$USER:$USER" "$manifest" || capture_status=$?
+          if [ -d "$work/root/var/lib/dpkg/info" ]; then
+            sudo python3 tools/capture-vendor-state.py \
+              --reference-root "$PWD/$work/root" \
+              --architecture "$ARCHITECTURE" \
+              --output "$PWD/$manifest" \
+              || capture_status=$?
+            if [ "$capture_status" -eq 0 ]; then
+              sudo chown "$USER:$USER" "$manifest" || capture_status=$?
+            fi
+          else
+            printf 'captured=false\nreason=no-candidate-dpkg-database\n' |
+              sudo tee "$evidence/vendor-state-capture-skipped.txt" >/dev/null
+          fi
+          differential_status=0
+          sudo python3 tools/native-differential.py capture \
+            --root "$PWD/$work/root" \
+            --output "$PWD/$evidence/native.snapshot.json" \
+            || differential_status=$?
+          if [ -f "$evidence/reference.snapshot.json" ] &&
+             [ -f "$evidence/native.snapshot.json" ]; then
+            sudo zig-out/bin/real-snapshot-comparator compare \
+              "$PWD/$evidence/reference.snapshot.json" \
+              "$PWD/$evidence/native.snapshot.json" \
+              "$PWD/$evidence/comparison-summary-v1.json" \
+              || differential_status=$?
+          else
+            printf 'compared=false\nreference_snapshot_present=%s\nnative_snapshot_present=%s\n' \
+              "$([ -f "$evidence/reference.snapshot.json" ] && echo true || echo false)" \
+              "$([ -f "$evidence/native.snapshot.json" ] && echo true || echo false)" |
+              sudo tee "$evidence/comparison-unavailable.txt" >/dev/null
+          fi
+          if [ -f "$evidence/refresh.json" ]; then
+            sudo jq '{
+              operation,
+              exit_status,
+              changed,
+              summary,
+              diagnostics
+            }' "$evidence/refresh.json" |
+              sudo tee "$evidence/acceptance-outcome-v1.json" >/dev/null
+          fi
+          sudo chown -R "$USER:$USER" "$evidence"
+          forbidden_exec_status=0
+          if grep -Eh 'execve\("(/usr)?/(s?bin/)?dpkg(-deb)?"' \
+            "$evidence"/*.execve >"$evidence/forbidden-exec.txt" 2>/dev/null; then
+            forbidden_exec_status=1
+          else
+            rm -f "$evidence/forbidden-exec.txt"
           fi
           sudo cp -a "$work/state/." "$work/evidence/state/" 2>/dev/null || true
           sudo cp "$work/root/var/lib/dpkg/status" "$work/evidence/status-final" 2>/dev/null || true
@@ -1393,12 +1468,35 @@ jobs:
           sudo cp "$work/ubuntu.json" "$work/evidence/" 2>/dev/null || true
           sudo du -sh "$work" 2>/dev/null \
             | sudo tee "$work/evidence/disk-usage-final.txt" >/dev/null || true
+          sudo chown -R "$USER:$USER" "$evidence"
+          oversized=$(find "$evidence" -type f -size +128M -print -quit)
+          if [ -n "$oversized" ]; then
+            echo "one evidence member exceeds 128 MiB: $oversized" >&2
+            exit 1
+          fi
+          read -r bytes _ < <(du -sb "$evidence")
+          test "$bytes" -le $((512 * 1024 * 1024))
+          printf 'artifact=ubuntu-real-snapshot-%s\nbytes_before_index=%s\n' \
+            "$ARCHITECTURE" "$bytes" >"$evidence/artifact-summary.txt"
+          (
+            cd "$evidence"
+            find . -type f ! -name SHA256SUMS -print0 \
+              | sort -z \
+              | xargs -0 sha256sum >SHA256SUMS
+          )
           cleanup_status=0
           sudo rm -rf "$work/root" "$work/cache" || cleanup_status=$?
+          sudo rm -rf "$work/reference-root" || cleanup_status=$?
           ownership_status=0
           sudo chown -R "$USER:$USER" .real-snapshot || ownership_status=$?
           if [ "$capture_status" -ne 0 ]; then
             exit "$capture_status"
+          fi
+          if [ "$differential_status" -ne 0 ]; then
+            exit "$differential_status"
+          fi
+          if [ "$forbidden_exec_status" -ne 0 ]; then
+            exit "$forbidden_exec_status"
           fi
           if [ "$cleanup_status" -ne 0 ]; then
             exit "$cleanup_status"
