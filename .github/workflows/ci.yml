@@ -1402,6 +1402,7 @@ jobs:
           evidence="$work/evidence"
           manifest="$work/evidence/vendor-state-inventory-v1.json"
           sudo mkdir -p "$evidence"
+          sudo chown "$USER:$USER" .real-snapshot "$work" "$evidence"
           if [ -n "$REFERENCE_DPKG" ] && [ -f "$REFERENCE_DPKG" ]; then
             reference_prefix="$(dirname "$(dirname "$(dirname "$REFERENCE_DPKG")")")"
             sudo cp "$REFERENCE_DPKG" "$evidence/reference-dpkg"
