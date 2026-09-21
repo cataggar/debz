@@ -43,6 +43,7 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `info/*.triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations. |
 | `info/*.{preinst,postinst,prerm,postrm}` | Regular executable files with safe modes; size, mode, and SHA-256 recorded. |
 | `info/*.config` | Root-owned executable-mode inert metadata typed per package by mode, uid/gid, size, and SHA-256; exact bytes retained without execution. |
+| `info/*.alternatives` | Root-owned inert binary metadata retained with exact bytes, mode, size, and SHA-256; direct dpkg does not interpret it. |
 | `info/*.{templates,shlibs,symbols}` | Known inert metadata typed per package by kind, safe mode, size, and SHA-256; exact bytes retained without interpretation. |
 | `info/*` (other) | Retained as opaque evidence (owner, mode, size, SHA-256). Names must still be package qualified. |
 | `triggers/File` | File-trigger interests with `package` or `package/noawait` listeners. |
@@ -50,6 +51,7 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `triggers/Unincorp` | Deferred activations with ordered awaiting-package tokens and explicit `-` no-await markers. |
 | `diversions` | Complete three-line records typed; malformed records fail. |
 | `statoverride` | Bounded user, group, mode, and path records typed; malformed records fail. |
+| `alternatives/*` | Root-owned `0644` canonical active records parsed as bounded auto/manual master/slave/provider state and authenticated with their selector, generic-link, and target topology. |
 
 Package paths use `src/package_path.zig` and preserve literal Linux backslashes
 in ownership lists, checksums, conffiles, file triggers, diversions and
@@ -72,8 +74,11 @@ Inert metadata is a byte payload, not database text: empty contents, binary
 bytes, and missing final newlines are preserved. Config is the one
 executable-mode inert member: import requires a regular executable root-owned
 file and binds its uid/gid into the database generation. It is never promoted
-to maintainer-script authority. Alternatives and arbitrary vendor info files
-remain opaque and guarded. Diversion and statoverride filesystem semantics
+to maintainer-script authority. Package `.alternatives` members are likewise
+inert exact bytes. Active alternatives records are separate typed state and
+may change only through authenticated literal maintainer-script authority;
+arbitrary vendor info files remain opaque and guarded. Diversion and
+statoverride filesystem semantics
 belong to the
 [native unpack/lifecycle layer](native-unpack.md#diversion-routing).
 

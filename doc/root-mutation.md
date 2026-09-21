@@ -581,6 +581,15 @@ digest, and `remove` becomes a removal that tolerates an already absent target.
 publication plan digest, and ownership of the published files is supplied
 explicitly by the caller rather than assumed.
 
+`native_alternatives.settlement` supplies the corresponding typed intent set
+for a native-owned alternatives transition. It canonicalizes the administrative
+record, publishes selected master/slave selectors and generic links, removes
+obsolete links or the final group, and hands the complete set to the same
+preflight and versioned journal. Record and links therefore share one
+authenticated recovery unit with backups, exact identities, parent fsyncs and
+immutable repeated completion. Maintainer-script side effects are not lowered
+this way; they use the separately checkpointed script boundary.
+
 ## Archive binding
 
 `bindArchive` re-proves, immediately before content is staged, that the

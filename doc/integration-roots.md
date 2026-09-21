@@ -166,10 +166,10 @@ inventory includes seven `*.config` members and no `*.alternatives` or
 unclassified members. Both architectures have the same classification counts,
 alternatives records, requested paths, and linked-path topology; their
 architecture-qualified control paths pair exactly, while expected package
-metadata and ten linked executable hashes differ. These references document
-observed vendor state but do not expand native production support: feature
-guards for config scripts, alternatives, and unclassified vendor metadata
-remain unchanged. The lane is manual because of bandwidth, but release
+metadata and ten linked executable hashes differ. These references document observed vendor state. Native alternatives admission
+uses the separately executed oracle because the inventory alone lacks record
+bytes and mutation causality; unclassified vendor metadata remains guarded.
+The lane is manual because of bandwidth, but release
 acceptance requires dispatching it successfully; it does not replace
 deterministic PR CI.
 
@@ -288,6 +288,8 @@ symlink/cycle attacks, and database/link partial states. Direct-dpkg rows cover
 opaque `.alternatives` info members plus maintainer-script-driven install,
 reinstall, upgrade, remove, purge, multiple providers, script failure/unwind,
 interruption, and recovery. Dpkg never interprets the member or invokes the
-tool implicitly. Exact arm64 architecture-derived differences are stored as a
-compact patch over the amd64 baseline; external `update-alternatives` behavior
-is identical. Current production guards remain unchanged.
+tool implicitly. Exact arm64 architecture-derived differences are stored as a compact patch
+over the amd64 baseline; external `update-alternatives` behavior is identical.
+The native parser/oracle replay and lifecycle boundary now admit exactly this
+pinned set while preserving fail-closed guards for evidence not represented by
+the oracle.

@@ -1,0 +1,9 @@
+auto
+/usr/bin/fuzz
+fuzz.1
+/usr/share/man/man1/fuzz.1
+
+/usr/lib/fuzz/a
+10
+/usr/share/man/man1/fuzz-a.1
+

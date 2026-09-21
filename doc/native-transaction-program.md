@@ -324,7 +324,9 @@ returns the typed unavailable result and never falls back.
 Diversion and statoverride records are preserved by the database contract.
 Their filesystem interpretation belongs to the
 [native unpack/lifecycle layer](native-unpack.md#diversion-routing), not separate
-program steps. Alternatives remain guarded. Live filesystem inspection,
+program steps. Alternatives likewise remain script-bound active state rather
+than separate program steps; the lifecycle layer admits only the pinned typed
+record/topology and literal-command boundary. Live filesystem inspection,
 package-database writes, and script execution remain outside this module by
 design.
 

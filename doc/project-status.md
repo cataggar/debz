@@ -137,8 +137,18 @@ artifacts, including after archive eviction. The 24-profile/16-reinvocation
 corpus executes natively and against pinned dpkg rather than serving only as a
 reference fixture. All legacy or absent capabilities, other script phases,
 unknown outcomes, malformed evidence and route/destination/cache/backup/journal
-drift retain the existing fail-closed guard. This closes #192 only; #86 remains
-open through roadmap item 16.
+drift retain the existing fail-closed guard.
+
+The item-16 alternatives increment is staged. It adds a bounded Zig parser and
+canonical writer for active records; exact auto/manual, priority/tie,
+missing-target, replacement and removal transitions; authenticated capture of
+the oracle's synthetic 14-group/189-requested/190-linked vendor projection;
+amd64/arm64 tool pins and reconstructed executed-evidence replay;
+root-mutation settlement for native-owned updates; and durable
+pre/post maintainer-script checkpoints. Opaque package `.alternatives` members
+are retained exactly. Unknown script outcomes, dynamic commands, unpinned
+tools, malformed or partial topology, unsupported vendor metadata and external
+drift remain fail-closed.
 
 Item 15b's `debz.native_preparation` foundation binds actual solver plans and
 exact-lock v2 documents to native authorization and compiled programs without

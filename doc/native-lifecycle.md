@@ -62,6 +62,26 @@ members. Debconf or another frontend invoking config is a different contract.
 Arm64 admission is backed by its executed canonical oracle observation, not by
 architecture-independent parsing.
 
+Alternatives use a separate active-state boundary. Opaque package
+`.alternatives` members follow ordinary retained-metadata replacement,
+failure, removal, and purge behavior, while direct dpkg never interprets them.
+For a script that contains literal direct `update-alternatives` command lines,
+with at most a literal `case` label before the command and a shell terminator
+after it, native
+execution verifies the architecture-pinned root-local tool, captures and
+checkpoints the complete pre-script record/link/target state, and limits
+post-script changes to the discovered groups and master/slave topology.
+Unmentioned groups and all provider/tool inputs must remain identity-exact.
+A normal return is captured and checkpointed before outcome settlement; a
+signal, injected unknown outcome, malformed/partial topology, or external
+drift marks recovery required and is never repaired by rerunning the script.
+Comments, wrappers, extra shell tokens, dynamic command construction and
+unsupported options remain rejected before spawn. Independently, every fresh
+native operation validates all existing active groups and orphan selector
+state while the operation is still pre-mutation, so a malformed root cannot be
+partially unpacked before this refusal. See the
+[pinned alternatives contract](dpkg-alternatives-reference.md).
+
 Statoverrides use file-backed target-root identities and are resolved once
 before scripts, not separately at unpack and configure. A preinst or postinst
 may change the account or override files, but the same invocation keeps its

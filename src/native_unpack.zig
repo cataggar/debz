@@ -33,6 +33,7 @@ const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
+const native_alternatives = @import("native_alternatives.zig");
 const native_program = @import("native_program.zig");
 const native_preparation = @import("native_preparation.zig");
 const native_execution_request = @import("native_execution_request.zig");
@@ -18083,6 +18084,229 @@ fn lifecycleScriptOwner(
     };
 }
 
+const AlternativesScriptBoundary = struct {
+    script: native_alternatives.ScriptAuthority,
+    before: native_alternatives.Snapshot,
+    immutable_before: native_alternatives.ImmutableSnapshot,
+    after_authority: native_alternatives.Authority,
+    managed_paths: []const []const u8,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    fn deinit(self: *AlternativesScriptBoundary) void {
+        self.immutable_before.deinit();
+        self.before.deinit();
+        self.script.deinit();
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+fn alternativesScriptGroupMutable(
+    script: native_alternatives.ScriptAuthority,
+    name: []const u8,
+) bool {
+    return script.group(name) != null;
+}
+
+fn appendAlternativeSlave(
+    allocator: std.mem.Allocator,
+    slaves: *std.ArrayList(native_alternatives.Slave),
+    incoming: native_alternatives.Slave,
+) !void {
+    for (slaves.items) |existing| {
+        if (std.mem.eql(u8, existing.name, incoming.name)) {
+            if (!std.mem.eql(u8, existing.link, incoming.link))
+                return error.InvalidAlternativesScriptAuthority;
+            return;
+        }
+        if (std.mem.eql(u8, existing.link, incoming.link))
+            return error.InvalidAlternativesScriptAuthority;
+    }
+    try slaves.append(allocator, incoming);
+}
+
+fn prepareAlternativesScriptBoundary(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    script_bytes: []const u8,
+) !?AlternativesScriptBoundary {
+    if (!native_alternatives.scriptMayInvoke(script_bytes)) return null;
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+    var script = try native_alternatives.discoverScriptAuthority(
+        allocator,
+        script_bytes,
+        .{},
+    );
+    errdefer script.deinit();
+    _ = try native_alternatives.verifyPinnedTool(
+        allocator,
+        root,
+        architecture,
+    );
+    var listed = try native_alternatives.listGroups(
+        allocator,
+        root,
+        .{},
+    );
+    defer listed.deinit();
+    const before_groups = try scratch.alloc(
+        native_alternatives.GroupAuthority,
+        listed.names.len + script.groups.len,
+    );
+    var before_count: usize = 0;
+    for (listed.names) |name| {
+        before_groups[before_count] = .{
+            .name = name,
+            .mutable = alternativesScriptGroupMutable(script, name),
+        };
+        before_count += 1;
+    }
+    for (script.groups) |group| {
+        var present = false;
+        for (listed.names) |name| {
+            if (std.mem.eql(u8, name, group.name)) {
+                present = true;
+                break;
+            }
+        }
+        if (present) continue;
+        before_groups[before_count] = .{
+            .name = group.name,
+            .topology = group.topology,
+            .allow_absent = true,
+            .mutable = true,
+        };
+        before_count += 1;
+    }
+    var before = try native_alternatives.capture(allocator, root, .{
+        .groups = before_groups[0..before_count],
+    });
+    errdefer before.deinit();
+    var immutable_before = try native_alternatives.captureScriptInputs(
+        allocator,
+        root,
+        script,
+        before,
+        .{},
+    );
+    errdefer immutable_before.deinit();
+
+    const after_groups = try scratch.alloc(
+        native_alternatives.GroupAuthority,
+        before.groups.len + script.groups.len,
+    );
+    var after_count: usize = 0;
+    for (before.groups) |group| {
+        const scripted = script.group(group.name);
+        var slaves: std.ArrayList(native_alternatives.Slave) = .empty;
+        defer slaves.deinit(scratch);
+        for (group.record.slaves) |slave|
+            try appendAlternativeSlave(scratch, &slaves, slave);
+        if (scripted) |authority| {
+            if (authority.topology) |topology| {
+                if (!std.mem.eql(
+                    u8,
+                    topology.master_link,
+                    group.record.master_link,
+                )) return error.InvalidAlternativesScriptAuthority;
+                for (topology.slaves) |slave|
+                    try appendAlternativeSlave(scratch, &slaves, slave);
+            }
+        }
+        after_groups[after_count] = .{
+            .name = group.name,
+            .topology = .{
+                .master_link = group.record.master_link,
+                .slaves = try scratch.dupe(
+                    native_alternatives.Slave,
+                    slaves.items,
+                ),
+            },
+            .allow_slave_subset = scripted != null,
+            .allow_absent = scripted != null,
+            .mutable = scripted != null,
+        };
+        after_count += 1;
+    }
+    for (script.groups) |group| {
+        if (before.group(group.name) != null) continue;
+        const topology = group.topology orelse continue;
+        after_groups[after_count] = .{
+            .name = group.name,
+            .topology = topology,
+            .allow_absent = true,
+            .mutable = true,
+        };
+        after_count += 1;
+    }
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(scratch);
+    try paths.appendSlice(scratch, before.paths);
+    for (immutable_before.facts) |fact| {
+        var duplicate = false;
+        for (paths.items) |existing| {
+            if (std.mem.eql(u8, existing, fact.path)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate)
+            try paths.append(
+                scratch,
+                try scratch.dupe(u8, fact.path),
+            );
+    }
+    for (script.paths) |path| {
+        const physical = try native_alternatives.physicalManagedPath(
+            scratch,
+            root,
+            path,
+            .{},
+        );
+        var duplicate = false;
+        for (paths.items) |existing| {
+            if (std.mem.eql(u8, existing, physical)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try paths.append(scratch, physical);
+    }
+    for ([_][]const u8{
+        native_alternatives.database_directory,
+        native_alternatives.selector_directory,
+        native_alternatives.tool_path,
+    }) |path| {
+        var duplicate = false;
+        for (paths.items) |existing| {
+            if (std.mem.eql(u8, existing, path)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) try paths.append(scratch, path);
+    }
+    return .{
+        .script = script,
+        .before = before,
+        .immutable_before = immutable_before,
+        .after_authority = .{
+            .groups = after_groups[0..after_count],
+        },
+        .managed_paths = try scratch.dupe([]const u8, paths.items),
+        .arena = arena,
+        .backing_allocator = allocator,
+    };
+}
+
 fn runLifecycleScript(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -18130,6 +18354,17 @@ fn runLifecycleScript(
     const observed = try rootFileSha256(allocator, root, path, 64 * 1024 * 1024);
     if (!std.mem.eql(u8, &expected, &observed))
         return error.InstalledScriptMismatch;
+    const script_bytes = try root.readFileAlloc(
+        allocator,
+        try root_fs.Path.init(path),
+        (package_database.Limits{}).max_maintainer_script_bytes,
+    );
+    defer allocator.free(script_bytes);
+    var alternatives_boundary: ?AlternativesScriptBoundary = null;
+    defer if (alternatives_boundary) |*boundary| boundary.deinit();
+    var alternatives_after: ?native_alternatives.Snapshot = null;
+    defer if (alternatives_after) |*snapshot| snapshot.deinit();
+    var alternatives_checkpoint_paths: []const []const u8 = &.{};
 
     if (execution.recovery) |runtime| {
         if (try native_recovery.readScriptOutcome(
@@ -18317,6 +18552,36 @@ fn runLifecycleScript(
         }
     }
 
+    alternatives_boundary = prepareAlternativesScriptBoundary(
+        allocator,
+        root,
+        program.target_architecture,
+        script_bytes,
+    ) catch |err| {
+        if (attempt.record().mutation_started)
+            try attempt.requireRecovery(allocator, .script);
+        return err;
+    };
+    if (alternatives_boundary) |boundary| {
+        alternatives_checkpoint_paths = boundary.managed_paths;
+        if (execution.recovery) |runtime| {
+            var pre_action = recovery_action;
+            pre_action.kind = .verification;
+            pre_action.substep |= 0x8000;
+            _ = native_recovery.updateManagedState(
+                allocator,
+                root,
+                runtime.intent_sha256,
+                pre_action,
+                boundary.managed_paths,
+                false,
+            ) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
+        }
+    }
+
     var helper_mount: ?maintainer_script.HelperMount = null;
     defer if (helper_mount) |*mount| mount.deinit();
     if (execution.recovery) |runtime| {
@@ -18390,6 +18655,76 @@ fn runLifecycleScript(
         try attempt.requireRecovery(allocator, .script);
         return .recovery_required;
     }
+    if (alternatives_boundary != null) switch (report.outcome) {
+        .exited => {},
+        else => {
+            try attempt.requireRecovery(allocator, .script);
+            return .recovery_required;
+        },
+    };
+    if (alternatives_boundary) |*boundary| {
+        _ = native_alternatives.verifyPinnedTool(
+            allocator,
+            root,
+            program.target_architecture,
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+        native_alternatives.validateScriptInputs(
+            allocator,
+            root,
+            boundary.script,
+            boundary.before,
+            boundary.immutable_before,
+            .{},
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+        alternatives_after = native_alternatives.capture(
+            allocator,
+            root,
+            boundary.after_authority,
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+        native_alternatives.validateScriptTransition(
+            allocator,
+            boundary.before,
+            alternatives_after.?,
+            boundary.script,
+            boundary.after_authority,
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+        var checkpoint_paths: std.ArrayList([]const u8) = .empty;
+        defer checkpoint_paths.deinit(boundary.arena.allocator());
+        try checkpoint_paths.appendSlice(
+            boundary.arena.allocator(),
+            boundary.managed_paths,
+        );
+        for (alternatives_after.?.paths) |alternative_path| {
+            var duplicate = false;
+            for (checkpoint_paths.items) |existing| {
+                if (std.mem.eql(u8, existing, alternative_path)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate)
+                try checkpoint_paths.append(
+                    boundary.arena.allocator(),
+                    alternative_path,
+                );
+        }
+        alternatives_checkpoint_paths = try boundary.arena.allocator().dupe(
+            []const u8,
+            checkpoint_paths.items,
+        );
+    }
     var native_outcome: ?native_recovery.ScriptOutcome = null;
     var managed_checkpoint_sha256: ?native_recovery.Digest = null;
     if (execution.recovery) |runtime| {
@@ -18451,6 +18786,19 @@ fn runLifecycleScript(
                     try attempt.requireRecovery(allocator, .script);
                     return err;
                 };
+        }
+        if (alternatives_checkpoint_paths.len != 0) {
+            managed_checkpoint_sha256 = native_recovery.updateManagedState(
+                allocator,
+                root,
+                runtime.intent_sha256,
+                recovery_action,
+                alternatives_checkpoint_paths,
+                execution.phase_steps != null,
+            ) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
         }
         try runtime.append(
             recovery_action,
@@ -22679,6 +23027,22 @@ fn executeLifecycleProgramWithRequest(
             .detail = "database_generation_drift",
             .program_sha256 = program.digest_sha256,
         };
+    }
+    if (recovery_intent == null) {
+        var alternatives = native_alternatives.captureExisting(
+            allocator,
+            root,
+            .{},
+        ) catch {
+            if (borrowed_attempt == null)
+                try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = "invalid_alternatives_state",
+                .program_sha256 = program.digest_sha256,
+            };
+        };
+        alternatives.deinit();
     }
     if (recovery_intent == null and
         hasConfigMembers(models) and

@@ -31,6 +31,12 @@ const ownership_corpus = &.{
     @embedFile("corpus/ownership/list"),
     @embedFile("corpus/ownership/alias"),
 };
+const alternatives_corpus = &.{
+    @embedFile("corpus/alternatives/record"),
+    @embedFile("corpus/alternatives/manual-record"),
+    @embedFile("corpus/alternatives/truncated-record"),
+    @embedFile("corpus/alternatives/script"),
+};
 const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),
     @embedFile("corpus/state/lock-v2.json"),
@@ -423,6 +429,20 @@ fn fuzzOwnership(_: void, smith: *std.testing.Smith) !void {
 
 fn exerciseOwnership(bytes: []const u8) !void {
     debz.native_unpack.fuzzOwnership(std.testing.allocator, bytes);
+}
+
+test "fuzz.native alternatives records" {
+    try std.testing.fuzz({}, fuzzAlternatives, .{
+        .corpus = alternatives_corpus,
+    });
+}
+
+fn fuzzAlternatives(_: void, smith: *std.testing.Smith) !void {
+    var storage: [max_input]u8 = undefined;
+    debz.native_alternatives.fuzzOne(
+        std.testing.allocator,
+        input(smith, &storage),
+    );
 }
 
 test "fuzz.lock provenance and transaction journals" {

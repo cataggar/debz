@@ -33,7 +33,7 @@
 - [Root-anchored filesystem primitives](root-filesystem.md) documents the traversal-safe path grammar, no-follow resolution, exclusive creation, atomic publication, and durability rules used by the native engine.
 - [Audited maintainer-script runner](maintainer-script-runner.md) documents the native maintainer-script contract: pre-spawn rejection, root isolation, environment allowlist, bounded output and runtime, process-tree termination, outcome taxonomy, and provenance evidence.
 - [Hermetic integration roots](integration-roots.md) documents deterministic signed fixtures, disposable native/foreign roots, CI lanes, and local prerequisites.
-- [Pinned dpkg/update-alternatives reference](dpkg-alternatives-reference.md) documents the bounded amd64/arm64 record, link, package lifecycle, failure, attack, atomicity, and recovery oracle for the 14 reviewed vendor groups without admitting native support.
+- [Pinned dpkg/update-alternatives reference](dpkg-alternatives-reference.md) documents and binds the admitted bounded amd64/arm64 record, link, package lifecycle, failure, attack, settlement, and recovery contract for the 14 reviewed vendor groups.
 - [zvmi Debian-family backend](zvmi-package-family.md) defines the versioned Ubuntu/Debian image-builder boundary, explicit inputs, locks, provenance, cache policy, and failure contract.
 - [Threat model and safety limits](threat-model.md) defines untrusted surfaces, security properties, and residual risks.
 - [Safety CI, fuzzing and audits](safety-ci.md) documents fuzz targets, bounded CI/local campaigns, safety modes, and static policy gates.

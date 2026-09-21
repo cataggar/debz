@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$1" in
+ configure) /usr/bin/update-alternatives --install /usr/bin/demo demo /usr/lib/demo 20 --slave /usr/share/man/man1/demo.1 demo.1 /usr/share/man/man1/demo-real.1 ;;
+ remove) /usr/bin/update-alternatives --remove demo /usr/lib/demo ;;
+esac
