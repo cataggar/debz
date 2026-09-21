@@ -97,8 +97,9 @@ callbacks, published before postinst, restored on upgrade unwind, retained
 through failed configuration/removal, removed before purge postrm or after
 successful remove settlement, and never executed. Application, database,
 plan, journal, recovery, result, provenance, and completion evidence bind their
-identity, bytes, mode, and fixed root ownership. The amd64 differential covers
-the seven pinned vendor identities and sizes; no arm64 runtime claim is made.
+identity, bytes, mode, and fixed root ownership. Native amd64 and arm64
+differentials cover the seven pinned vendor identities and sizes against their
+executed architecture-specific oracle observations.
 
 Item 13 extends that private lifecycle with named/file trigger registration,
 await/noawait activation, explicit deferral, and trigger-only processing.

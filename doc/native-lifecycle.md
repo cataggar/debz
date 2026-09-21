@@ -46,10 +46,10 @@ restored on upgrade unwind, and removed before purge postrm. Native execution
 never calls it or invokes apt, debconf, or frontend behavior. No other
 active/unknown metadata support is implied.
 
-The separate [amd64 direct-dpkg config reference](integration-roots.md) closes
-the dpkg side of that boundary for the seven pinned vendor `*.config`
-identities on that architecture. Pinned dpkg 1.22.22 never invokes config
-during install, reinstall, upgrade,
+The separate [amd64 and arm64 direct-dpkg config reference](integration-roots.md)
+closes the dpkg side of that boundary for the seven pinned vendor `*.config`
+identities on both admitted architectures. Pinned dpkg 1.22.22 never invokes
+config during install, reinstall, upgrade,
 configure retry, remove, purge, compensation, or interrupted-operation retry.
 It stages incoming config for the pre-unpack callbacks, publishes it before
 the incoming postinst, keeps it through remove postrm, and deletes it only
@@ -57,10 +57,10 @@ after successful remove settlement. Failed/interrupted removal keeps it;
 failed upgrade rollback restores the old bytes; purge postrm sees it absent.
 Native lifecycle execution now implements that bounded state contract and the
 native/dpkg differential covers the seven pinned package identities at their
-exact observed sizes plus general bounded config members. Debconf or another
-frontend invoking config is a different contract. Arm64 remains unpublished
-pending its own executable oracle run; architecture-independent parsing is not
-claimed as arm64 runtime evidence.
+exact observed sizes on both admitted architectures plus general bounded config
+members. Debconf or another frontend invoking config is a different contract.
+Arm64 admission is backed by its executed canonical oracle observation, not by
+architecture-independent parsing.
 
 Statoverrides use file-backed target-root identities and are resolved once
 before scripts, not separately at unpack and configure. A preinst or postinst

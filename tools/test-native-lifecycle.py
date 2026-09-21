@@ -1378,26 +1378,19 @@ def exercise(
     def case(name: str) -> Scenario:
         return Scenario(workspace, name, executable, architecture, environment)
 
-    if architecture == "amd64":
-        vendor = make_vendor_config_packages(
-            workspace / "vendor-config-packages",
-            environment,
-            architecture,
-        )
-        vendor_names = tuple(sorted(vendor["1"]))
-        current = case("pinned-vendor-config-members")
-        current.phase("install", [vendor["1"][name] for name in vendor_names], names=vendor_names)
-        current.phase("reinstall", [vendor["1"][name] for name in vendor_names], names=vendor_names)
-        current.phase("upgrade", [vendor["2"][name] for name in vendor_names], names=vendor_names)
-        current.phase("remove", names=vendor_names)
-        current.phase("purge", names=vendor_names)
-        current.complete()
-    else:
-        print(
-            f"pinned-vendor-config-members: identity facts validated for {architecture}; "
-            "runtime oracle is amd64-only",
-            flush=True,
-        )
+    vendor = make_vendor_config_packages(
+        workspace / "vendor-config-packages",
+        environment,
+        architecture,
+    )
+    vendor_names = tuple(sorted(vendor["1"]))
+    current = case("pinned-vendor-config-members")
+    current.phase("install", [vendor["1"][name] for name in vendor_names], names=vendor_names)
+    current.phase("reinstall", [vendor["1"][name] for name in vendor_names], names=vendor_names)
+    current.phase("upgrade", [vendor["2"][name] for name in vendor_names], names=vendor_names)
+    current.phase("remove", names=vendor_names)
+    current.phase("purge", names=vendor_names)
+    current.complete()
 
     metadata_archives = make_metadata_packages(workspace / "metadata-packages", environment, architecture)
     qualified_metadata = make_metadata_packages(

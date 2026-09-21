@@ -78,11 +78,12 @@ belong to the
 [native unpack/lifecycle layer](native-unpack.md#diversion-routing).
 
 Native lifecycle execution now follows the pinned
-[amd64 direct-dpkg config reference](integration-roots.md): it retains exact
-executable bytes as non-lifecycle metadata, exposes old/incoming versions at
-dpkg's callback boundaries, replaces or restores them with the package
-lifecycle, removes them only after successful `postrm remove`, and never
-executes them. Frontend preconfiguration remains explicitly out of scope.
+[amd64 and arm64 direct-dpkg config reference](integration-roots.md): it
+retains exact executable bytes as non-lifecycle metadata, exposes old/incoming
+versions at dpkg's callback boundaries, replaces or restores them with the
+package lifecycle, removes them only after successful `postrm remove`, and
+never executes them. Frontend preconfiguration remains explicitly out of
+scope.
 
 The shared `triggers/Lock` is synchronization infrastructure, not a named
 interest file or consumed database generation. `File` and `Unincorp` retain
