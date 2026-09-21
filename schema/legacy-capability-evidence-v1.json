@@ -11,6 +11,8 @@
     "artifact_version",
     "artifact_sha256",
     "backend",
+    "root_identity_sha256",
+    "attempt_id",
     "execution",
     "active_recovery",
     "historical_verification",
@@ -36,6 +38,20 @@
     },
     "artifact_sha256": { "$ref": "#/$defs/sha256" },
     "backend": { "const": "legacy_dpkg" },
+    "root_identity_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "attempt_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
     "execution": { "const": "deprecated_but_available" },
     "active_recovery": {
       "const": "requires_legacy_capable_release"
@@ -50,6 +66,30 @@
     },
     "digest_sha256": { "$ref": "#/$defs/sha256" }
   },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "root_identity_sha256": { "type": "null" },
+            "attempt_id": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "root_identity_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "attempt_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      ]
+    }
+  ],
   "$defs": {
     "sha256": {
       "type": "string",

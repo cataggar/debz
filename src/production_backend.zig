@@ -1629,6 +1629,8 @@ pub const Backend = struct {
                 report,
                 dependencies.status,
                 &verify,
+                guard.active().?.record().root_identity_sha256,
+                guard.active().?.record().attempt_id,
             ) catch |err| switch (err) {
                 error.RepositoryEvidenceMismatch,
                 error.MissingPackageEvidence,
@@ -4091,7 +4093,8 @@ fn mapRootOperationError(operation: api.Operation, err: anyerror) api.Result {
             operation,
             .recovery,
             .legacy_recovery_release_required,
-            "an active legacy_dpkg operation must be recovered by a legacy-capable debz release before using the native backend",
+            "an active legacy_dpkg operation cannot be claimed by this backend. " ++
+                legacy_compat.recovery_guidance,
         ),
         error.AuthorizationEvidenceMissing,
         error.DeferredAcknowledgmentMismatch,
@@ -4887,6 +4890,7 @@ const ProductLock = union(transaction_engine.Kind) {
                     exact_lock.schema_id,
                     exact_lock.schema_version,
                     bytes,
+                    .{},
                 );
             },
             .native => |owned| try writeLockVersion(exact_lock_v2, allocator, io, path, owned.lock),
@@ -5221,6 +5225,8 @@ fn writeExecutionProvenance(
     report: transaction_executor.Report,
     status: transaction_recovery.StatusReader,
     verify: *transaction_provenance.VerifyDiagnostic,
+    root_identity_sha256: [32]u8,
+    attempt_id: [32]u8,
 ) !void {
     // The lock records only repositories that actually supplied a package, so the
     // evidence has to be drawn from the lock rather than from every refreshed
@@ -5296,6 +5302,10 @@ fn writeExecutionProvenance(
         transaction_provenance.schema_id,
         transaction_provenance.schema_version,
         bytes,
+        .{
+            .root_identity_sha256 = root_identity_sha256,
+            .attempt_id = attempt_id,
+        },
     );
 }
 
@@ -5306,6 +5316,7 @@ fn publishLegacyCapabilityEvidence(
     artifact_schema: []const u8,
     artifact_version: u32,
     artifact_bytes: []const u8,
+    binding: legacy_compat.EvidenceBinding,
 ) !void {
     const sidecar_path = try std.fmt.allocPrint(
         allocator,
@@ -5317,7 +5328,7 @@ fn publishLegacyCapabilityEvidence(
         .schema = artifact_schema,
         .version = artifact_version,
         .backend = .legacy_dpkg,
-    }, artifact_bytes);
+    }, artifact_bytes, binding);
     const parent = std.fs.path.dirname(sidecar_path) orelse
         return error.InvalidAbsolutePath;
     var dir = try openAbsoluteDirectory(io, parent);
@@ -7353,7 +7364,7 @@ test "production legacy compatibility maps active legacy refusal to stable versi
     try std.testing.expect(std.mem.indexOf(
         u8,
         result.diagnostics[0].message,
-        "legacy-capable debz release",
+        legacy_compat.recovery_guidance,
     ) != null);
 }
 
@@ -7362,6 +7373,7 @@ fn expectLegacyCapabilitySidecar(
     artifact_path: []const u8,
     artifact_schema: []const u8,
     artifact_version: u32,
+    operation_bound: bool,
 ) !void {
     const artifact = try readFile(
         allocator,
@@ -7395,6 +7407,21 @@ fn expectLegacyCapabilitySidecar(
         u8,
         &artifact_sha256,
         &evidence.artifact_sha256,
+    );
+    try std.testing.expectEqual(operation_bound, evidence.root_identity_sha256 != null);
+    try std.testing.expectEqual(operation_bound, evidence.attempt_id != null);
+    try legacy_compat.verifyEvidence(
+        evidence,
+        .{
+            .schema = artifact_schema,
+            .version = artifact_version,
+            .backend = .legacy_dpkg,
+        },
+        artifact,
+        .{
+            .root_identity_sha256 = evidence.root_identity_sha256,
+            .attempt_id = evidence.attempt_id,
+        },
     );
 }
 
@@ -7456,6 +7483,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
             fixture.lock_path,
             exact_lock.schema_id,
             exact_lock.schema_version,
+            false,
         );
     } else {
         const sidecar_path = try std.fmt.allocPrint(
@@ -7515,6 +7543,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
             fixture.second_lock_path,
             exact_lock.schema_id,
             exact_lock.schema_version,
+            false,
         );
 
     backend.transaction_backend = if (kind == .native) .legacy_dpkg else .native;
@@ -7715,6 +7744,7 @@ test "production workflow plan-only batches do not mutate and removal locks repl
         result_path,
         transaction_provenance.schema_id,
         transaction_provenance.schema_version,
+        true,
     );
 }
 

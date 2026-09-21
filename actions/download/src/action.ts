@@ -127,7 +127,7 @@ export async function runAction(cache: CacheAdapter = defaultCache): Promise<voi
   );
   if (inputs.transactionBackend === 'legacy_dpkg') {
     core.warning(
-      'debz legacy_dpkg execution is deprecated; recover active legacy state with a legacy-capable release before selecting native',
+      'debz legacy_dpkg execution is deprecated. Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
     );
   }
 }

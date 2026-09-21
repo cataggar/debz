@@ -18,8 +18,11 @@ The normative Zig classifier and capability-evidence encoder are
 - `system-profile-v2` is backend-explicit. The selected backend must match the
   lock, result, active record, package-family surface, repository surface, and
   Actions input before mutation.
-- exact-lock v1 is legacy; exact-lock v2 is native. There is no conversion,
-  format detection, or cross-backend replay.
+- exact-lock v1 is legacy. Exact-lock v2 is native for product/package-cache
+  execution, while repository operations use v2 for both backends and must
+  supply the separately authenticated backend context. A v2 repository lock
+  without that context is refused. There is no conversion, format detection,
+  or cross-backend replay.
 - transaction-result v1 and v2 are legacy command-execution provenance.
   Native execution uses native transaction provenance and receipt-bound
   completion instead.
@@ -34,9 +37,13 @@ Canonical locks, profiles, results, journals, signatures, and digests are
 never rewritten to migrate them. Newly published legacy locks and transaction
 results receive a separate
 [`legacy-capability-evidence-v1`](../schema/legacy-capability-evidence-v1.json)
-sidecar binding the exact artifact bytes. The sidecar is deprecation evidence,
-not execution authority and not a substitute for the artifact's own canonical,
-signature, or digest verification.
+sidecar binding the exact artifact bytes. Operation-scoped sidecars also bind
+the immutable root identity and attempt ID; plan-only product locks use explicit
+null bindings. The sidecar is deprecation evidence, not execution authority and
+not a substitute for the artifact's own canonical, signature, digest, backend,
+profile, or root-operation verification. Older valid artifacts do not require a
+sidecar, and a sidecar can never make invalid or mismatched artifact bytes
+valid.
 
 ## Active versus completed evidence
 

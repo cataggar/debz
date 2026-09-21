@@ -319,7 +319,7 @@ export async function runAction(
   );
   if (inputs.transactionBackend === 'legacy_dpkg') {
     io.info(
-      'DEPRECATION[legacy-dpkg-execution-deprecated-v1]: recover active legacy state with a legacy-capable debz release before selecting native',
+      'DEPRECATION[legacy-dpkg-execution-deprecated-v1]: Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
     );
   }
 }

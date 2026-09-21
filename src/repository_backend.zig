@@ -8,6 +8,7 @@ const live_root = @import("live_root.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const native_operation = @import("native_operation.zig");
 const native_preparation = @import("native_preparation.zig");
@@ -3072,6 +3073,42 @@ pub const Backend = struct {
                     "lock",
                     @errorName(err),
                 );
+            if (!native) {
+                const lock_bytes = lock.lock.canonicalJson(allocator) catch |err|
+                    return progress.fail(
+                        state_store,
+                        allocator,
+                        .planning,
+                        .lock_publication_failed,
+                        "lock-capability",
+                        @errorName(err),
+                    );
+                defer allocator.free(lock_bytes);
+                const record = guard.active().?.record();
+                publishLegacyCapabilityEvidence(
+                    allocator,
+                    self.io,
+                    operation_dir,
+                    exact_lock_name,
+                    .{
+                        .schema = exact_lock_v2.schema_id,
+                        .version = exact_lock_v2.schema_version,
+                        .backend = .legacy_dpkg,
+                    },
+                    lock_bytes,
+                    .{
+                        .root_identity_sha256 = record.root_identity_sha256,
+                        .attempt_id = record.attempt_id,
+                    },
+                ) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    .planning,
+                    .lock_publication_failed,
+                    "lock-capability",
+                    @errorName(err),
+                );
+            }
             if (native_input) |input| try input.validate();
         }
         var recovery_needed = incomplete_descriptor;
@@ -3626,6 +3663,10 @@ pub const Backend = struct {
                     &lock.lock,
                     value,
                     dependency_published,
+                    .{
+                        .root_identity_sha256 = guard.active().?.record().root_identity_sha256,
+                        .attempt_id = guard.active().?.record().attempt_id,
+                    },
                 ) catch |err| return progress.fail(
                     state_store,
                     allocator,
@@ -3643,6 +3684,10 @@ pub const Backend = struct {
                     &lock.lock,
                     report.?,
                     dependency_published,
+                    .{
+                        .root_identity_sha256 = guard.active().?.record().root_identity_sha256,
+                        .attempt_id = guard.active().?.record().attempt_id,
+                    },
                 ) catch |err| return progress.fail(
                     state_store,
                     allocator,
@@ -4478,7 +4523,8 @@ fn mapRootOperationError(err: anyerror) api.Result {
             .recovery,
             .legacy_recovery_release_required,
             "root-operation",
-            "an active legacy_dpkg operation must be recovered by a legacy-capable debz release before using the native backend",
+            "an active legacy_dpkg operation cannot be claimed by this backend. " ++
+                legacy_compat.recovery_guidance,
         ),
         error.RecordCorrupt, error.UnsupportedSchema => api.failure(
             .recovery,
@@ -6243,6 +6289,7 @@ fn publishProvenance(
     lock: *const exact_lock_v2.Lock,
     report: transaction_executor.Report,
     refreshed: ?*repository_policy.RefreshResult,
+    binding: legacy_compat.EvidenceBinding,
 ) ![32]u8 {
     return publishBoundProvenance(
         allocator,
@@ -6252,6 +6299,7 @@ fn publishProvenance(
         lock,
         .{ .execution = report },
         refreshed,
+        binding,
     );
 }
 
@@ -6263,6 +6311,7 @@ fn publishRecoveryProvenance(
     lock: *const exact_lock_v2.Lock,
     report: transaction_executor.RecoveryReport,
     refreshed: ?*repository_policy.RefreshResult,
+    binding: legacy_compat.EvidenceBinding,
 ) ![32]u8 {
     return publishBoundProvenance(
         allocator,
@@ -6272,6 +6321,7 @@ fn publishRecoveryProvenance(
         lock,
         .{ .recovery = report },
         refreshed,
+        binding,
     );
 }
 
@@ -6288,6 +6338,7 @@ fn publishBoundProvenance(
     lock: *const exact_lock_v2.Lock,
     report: ProvenanceReport,
     refreshed: ?*repository_policy.RefreshResult,
+    binding: legacy_compat.EvidenceBinding,
 ) ![32]u8 {
     _ = refreshed;
     const repositories = try allocator.alloc(
@@ -6376,7 +6427,46 @@ fn publishBoundProvenance(
         provenance_name,
     );
     try store.writeAtomic(allocator, provenance.result);
+    const bytes = try provenance.result.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    try publishLegacyCapabilityEvidence(
+        allocator,
+        io,
+        operation_dir,
+        provenance_name,
+        .{
+            .schema = transaction_provenance_v2.schema_id,
+            .version = transaction_provenance_v2.schema_version,
+            .backend = .legacy_dpkg,
+        },
+        bytes,
+        binding,
+    );
     return provenance.result.digest_sha256;
+}
+
+fn publishLegacyCapabilityEvidence(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    operation_dir: std.Io.Dir,
+    artifact_name: []const u8,
+    identity: legacy_compat.Identity,
+    artifact_bytes: []const u8,
+    binding: legacy_compat.EvidenceBinding,
+) !void {
+    const sidecar_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}.legacy-capability-v1.json",
+        .{artifact_name},
+    );
+    defer allocator.free(sidecar_name);
+    const evidence = try legacy_compat.createEvidence(
+        identity,
+        artifact_bytes,
+        binding,
+    );
+    const store = try legacy_compat.Store.init(io, operation_dir, sidecar_name);
+    try store.writeAtomic(allocator, evidence);
 }
 
 fn verifyInstalledDescriptor(
@@ -7018,7 +7108,7 @@ test "repository backend native invocation preserves the outer clock and remaini
             try std.testing.expect(std.mem.indexOf(
                 u8,
                 result.diagnostics[0].message,
-                "legacy-capable debz release",
+                legacy_compat.recovery_guidance,
             ) != null);
         }
         fn sleep(raw: ?*anyopaque, milliseconds: u64) !void {
@@ -11724,6 +11814,50 @@ fn expectRepositoryEvidence(
     try directory.access(std.testing.io, relative, .{});
 }
 
+fn expectRepositoryCapabilitySidecar(
+    directory: std.Io.Dir,
+    logical_path: ?[]const u8,
+    identity: legacy_compat.Identity,
+) !void {
+    const logical = logical_path orelse return error.MissingEvidencePath;
+    const relative = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "root{s}",
+        .{logical},
+    );
+    defer std.testing.allocator.free(relative);
+    const artifact = try directory.readFileAlloc(
+        std.testing.io,
+        relative,
+        std.testing.allocator,
+        .limited(exact_lock_v2.maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(artifact);
+    const sidecar_relative = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}.legacy-capability-v1.json",
+        .{relative},
+    );
+    defer std.testing.allocator.free(sidecar_relative);
+    const sidecar = try directory.readFileAlloc(
+        std.testing.io,
+        sidecar_relative,
+        std.testing.allocator,
+        .limited(legacy_compat.maximum_evidence_bytes),
+    );
+    defer std.testing.allocator.free(sidecar);
+    const evidence = try legacy_compat.decodeEvidence(
+        std.testing.allocator,
+        sidecar,
+    );
+    const binding: legacy_compat.EvidenceBinding = .{
+        .root_identity_sha256 = evidence.root_identity_sha256 orelse
+            return error.MissingRootIdentity,
+        .attempt_id = evidence.attempt_id orelse return error.MissingAttemptId,
+    };
+    try legacy_compat.verifyEvidence(evidence, identity, artifact, binding);
+}
+
 test "repository backend snapshots selection before acquisition callbacks" {
     const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
     var directory = std.testing.tmpDir(.{});
@@ -11812,6 +11946,24 @@ test "repository backend completes and idempotently resumes every production pha
     try expectRepositoryEvidence(directory.dir, result.paths.provenance);
     try expectRepositoryEvidence(directory.dir, result.paths.target_manifest);
     try expectRepositoryEvidence(directory.dir, result.paths.operation_state);
+    try expectRepositoryCapabilitySidecar(
+        directory.dir,
+        result.paths.exact_lock,
+        .{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .backend = .legacy_dpkg,
+        },
+    );
+    try expectRepositoryCapabilitySidecar(
+        directory.dir,
+        result.paths.provenance,
+        .{
+            .schema = transaction_provenance_v2.schema_id,
+            .version = transaction_provenance_v2.schema_version,
+            .backend = .legacy_dpkg,
+        },
+    );
 
     result.deinit();
     result = try api.execute(std.testing.allocator, request, backend.interface());
@@ -12153,6 +12305,7 @@ test "repository backend holds bounded target locks for idempotent verification"
                 &lock.lock,
                 report,
                 null,
+                .{},
             );
         }
 

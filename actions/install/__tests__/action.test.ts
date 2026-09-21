@@ -195,7 +195,10 @@ test('an exact package-cache hit still executes and audits one install', async (
     'legacy-dpkg-execution-deprecated-v1',
   );
   assert.equal(value.infos.length, 1);
-  assert.match(value.infos[0] ?? '', /legacy-capable debz release/u);
+  assert.match(
+    value.infos[0] ?? '',
+    /Recover this operation with debz >=0\.3\.0,<0\.4\.0 before installing a native-only release\./u,
+  );
 });
 
 test('propagates the exact debz exit code and publishes no success outputs', async () => {

@@ -43,9 +43,9 @@
     {
       "schema": "https://debz.dev/schema/exact-closure-lock-v2",
       "versions": [2],
-      "backend": "native",
-      "new_execution": "native_only",
-      "active_recovery": "native_only",
+      "backend": "explicit_context",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "recorded_backend_only",
       "completed_history": "canonical_digest_read_only"
     },
     {
@@ -63,6 +63,30 @@
       "new_execution": "deprecated_but_available",
       "active_recovery": "legacy_capable_release_required",
       "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.transaction-result-summary.v1",
+      "versions": [1],
+      "backend": "legacy_dpkg",
+      "new_execution": "deprecated_but_available",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.transaction-result-summary.v2",
+      "versions": [2],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.transaction-result-capability.v1",
+      "versions": [1],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
     },
     {
       "schema": "debz:transaction-journal",
@@ -91,9 +115,65 @@
     {
       "schema": "https://debz.dev/schema/apt-system-operation-state-v1",
       "versions": [1],
-      "backend": "profile_and_lock_bound",
+      "backend": "explicit_context",
       "new_execution": "selected_backend_only",
       "active_recovery": "original_profile_and_backend_only",
+      "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/apt-system-result-v1",
+      "versions": [1],
+      "backend": "explicit_context",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "original_profile_and_backend_only",
+      "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/apt-system-result-v2",
+      "versions": [2],
+      "backend": "explicit_context",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "original_profile_and_backend_only",
+      "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/apt-system-result-v3",
+      "versions": [3],
+      "backend": "explicit_context",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "original_profile_and_backend_only",
+      "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/apt-system-execution-completion-v1",
+      "versions": [1],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "native_only",
+      "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.command.v1",
+      "versions": [1],
+      "backend": "explicit",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/repository-add-state-v1",
+      "versions": [1],
+      "backend": "explicit",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "recorded_backend_only",
+      "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/repository-operation-result-v1",
+      "versions": [1],
+      "backend": "explicit",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "recorded_backend_only",
       "completed_history": "canonical_digest_read_only"
     },
     {
@@ -129,6 +209,14 @@
       "completed_history": "exact_contract_read_only"
     },
     {
+      "schema": "io.github.cataggar.debz.package-cache-error.v1",
+      "versions": [1],
+      "backend": "explicit",
+      "new_execution": "selected_backend_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
       "schema": "io.github.cataggar.debz.package-family.capabilities.v1",
       "versions": [1],
       "backend": "legacy_dpkg",
@@ -145,12 +233,76 @@
       "completed_history": "exact_contract_read_only"
     },
     {
+      "schema": "io.github.cataggar.debz.package-family.request.v1",
+      "versions": [1],
+      "backend": "legacy_dpkg",
+      "new_execution": "deprecated_but_available",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.package-family.request.v2",
+      "versions": [2],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.package-family.result.v1",
+      "versions": [1],
+      "backend": "legacy_dpkg",
+      "new_execution": "deprecated_but_available",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.package-family.result.v2",
+      "versions": [2],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
       "schema": "https://debz.dev/schema/native-transaction-provenance-v1",
       "versions": [1],
       "backend": "native",
       "new_execution": "native_only",
       "active_recovery": "native_only",
       "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.native-install-capability.v1",
+      "versions": [1],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "io.github.cataggar.debz.native-install-result.v1",
+      "versions": [1],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "not_applicable",
+      "completed_history": "exact_contract_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/native-repository-unchanged-v1",
+      "versions": [1],
+      "backend": "native",
+      "new_execution": "native_only",
+      "active_recovery": "native_only",
+      "completed_history": "canonical_digest_read_only"
+    },
+    {
+      "schema": "https://debz.dev/schema/legacy-capability-evidence-v1",
+      "versions": [1],
+      "backend": "legacy_dpkg_non_authoritative",
+      "new_execution": "supplementary_evidence_only",
+      "active_recovery": "never_authoritative",
+      "completed_history": "exact_bytes_read_only"
     }
   ],
   "production_execution_paths": [
@@ -158,6 +310,21 @@
       "path": "src/transaction_executor.zig",
       "role": "legacy_dpkg_command_execution",
       "cutover": "delete"
+    },
+    {
+      "path": "src/exact_lock.zig",
+      "role": "legacy_exact_lock_generation_and_historical_decoder",
+      "cutover": "delete_generation_retain_exact_decoder_and_verifier"
+    },
+    {
+      "path": "src/transaction_provenance.zig",
+      "role": "legacy_transaction_result_generation_and_historical_decoder",
+      "cutover": "delete_generation_retain_exact_decoder_and_verifier"
+    },
+    {
+      "path": "src/transaction_provenance_v2.zig",
+      "role": "repository_legacy_result_generation_and_historical_decoder",
+      "cutover": "delete_generation_retain_exact_decoder_and_verifier"
     },
     {
       "path": "src/transaction_recovery.zig",
@@ -185,6 +352,16 @@
       "cutover": "delete_legacy_execution_retain_v1_capability_history"
     },
     {
+      "path": "src/package_cache_workflow.zig",
+      "role": "package_cache_legacy_contract_generation",
+      "cutover": "delete_v1_generation_retain_historical_verification"
+    },
+    {
+      "path": "src/transaction_result_summary.zig",
+      "role": "product_legacy_result_summary_generation",
+      "cutover": "delete_v1_generation_retain_historical_verification"
+    },
+    {
       "path": "src/system_profile.zig",
       "role": "profile_v1_legacy_default_and_v2_selector",
       "cutover": "retain_v1_decoder_delete_v1_execution"
@@ -203,6 +380,11 @@
       "path": "src/apt_system_orchestrator.zig",
       "role": "system_facade_legacy_profile_execution",
       "cutover": "delete_legacy_execution_retain_state_decoder"
+    },
+    {
+      "path": "src/target_apt_config.zig",
+      "role": "target_root_dpkg_architecture_probe",
+      "cutover": "delete_legacy_command_probe_retain_native_snapshot_logic"
     },
     {
       "path": "actions/download/src/inputs.ts",
@@ -235,6 +417,11 @@
       "cutover": "remove_legacy_dispatch_retain_historical_diagnostic"
     },
     {
+      "path": "actions/install/src/errors.ts",
+      "role": "install_action_legacy_selector_diagnostic",
+      "cutover": "remove_legacy_selection_error"
+    },
+    {
       "path": "actions/install/src/runner.ts",
       "role": "install_action_legacy_result_verifier",
       "cutover": "remove_legacy_execution_retain_historical_verifier_if_required"
@@ -245,32 +432,54 @@
       "cutover": "change_default_and_remove_legacy_input"
     }
   ],
-  "historical_reference_paths": [
+  "compatibility_guard_paths": [
     {
-      "path": "src/exact_lock.zig",
-      "role": "exact_lock_v1_decoder_and_verifier",
-      "retain_after_cutover": true
+      "path": "src/legacy_compat.zig",
+      "role": "exact_legacy_identity_classifier_and_non_authoritative_evidence",
+      "cutover": "retain_historical_classifier_delete_new_execution_disposition"
     },
     {
-      "path": "src/transaction_provenance.zig",
-      "role": "transaction_result_v1_decoder_and_verifier",
-      "retain_after_cutover": true
+      "path": "src/native_authorization.zig",
+      "role": "native_authorization_rejects_legacy_authority",
+      "cutover": "retain_guard"
     },
     {
-      "path": "src/transaction_provenance_v2.zig",
-      "role": "transaction_result_v2_decoder_and_verifier",
-      "retain_after_cutover": true
+      "path": "src/exact_lock_v2.zig",
+      "role": "native_lock_decoder_rejects_legacy_schema",
+      "cutover": "retain_guard"
+    },
+    {
+      "path": "src/native_transaction_result.zig",
+      "role": "native_result_verifier_rejects_legacy_schema",
+      "cutover": "retain_guard"
+    },
+    {
+      "path": "src/native_execution_request.zig",
+      "role": "native_request_rejects_legacy_backend",
+      "cutover": "retain_guard"
+    },
+    {
+      "path": "src/native_program.zig",
+      "role": "native_program_rejects_legacy_backend",
+      "cutover": "retain_guard"
+    },
+    {
+      "path": "src/native_unpack.zig",
+      "role": "native_runtime_rejects_legacy_capability",
+      "cutover": "retain_guard"
     },
     {
       "path": "src/root_operation.zig",
-      "role": "active_record_decoder_and_typed_refusal",
-      "retain_after_cutover": true
+      "role": "single_namespace_active_legacy_decoder_and_typed_refusal",
+      "cutover": "retain_decoder_and_refusal_delete_legacy_publication"
     },
     {
       "path": "src/root_operation_completion.zig",
-      "role": "completed_operation_verifier",
-      "retain_after_cutover": true
-    },
+      "role": "completed_operation_exact_verifier",
+      "cutover": "retain_verifier"
+    }
+  ],
+  "historical_reference_paths": [
     {
       "path": "tools/prepare-native-dpkg.py",
       "role": "pinned_reference_transport",
@@ -279,6 +488,63 @@
     {
       "path": "tools/native-differential.py",
       "role": "reference_oracle_comparison",
+      "retain_after_cutover": true
+    }
+  ],
+  "test_reference_paths": [
+    {
+      "path": "src/production_backend_customize_test.zig",
+      "role": "legacy_product_customization_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/download/__tests__/action.test.ts",
+      "role": "download_action_legacy_contract_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/download/__tests__/helpers.ts",
+      "role": "download_action_legacy_fixture",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/download/__tests__/inputs.test.ts",
+      "role": "download_action_legacy_input_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/download/__tests__/runner.test.ts",
+      "role": "download_action_legacy_result_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/install/__tests__/action.test.ts",
+      "role": "install_action_legacy_contract_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/install/__tests__/helpers.ts",
+      "role": "install_action_legacy_fixture",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/install/__tests__/inputs.test.ts",
+      "role": "install_action_legacy_input_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/install/__tests__/integration.test.ts",
+      "role": "install_action_legacy_integration_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/install/__tests__/runner.test.ts",
+      "role": "install_action_legacy_result_regression",
+      "retain_after_cutover": true
+    },
+    {
+      "path": "actions/install/__tests__/subprocess.test.ts",
+      "role": "install_action_legacy_subprocess_regression",
       "retain_after_cutover": true
     }
   ],

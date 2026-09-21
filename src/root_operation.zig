@@ -3188,15 +3188,15 @@ pub const Coordinator = struct {
         };
         errdefer if (prior) |*value| value.deinit();
 
+        if (!self.legacy_execution_capable and request.backend == .legacy_dpkg)
+            return error.LegacyCapabilityRequired;
         if (prior) |value| {
             if (!std.mem.eql(
                 u8,
                 &value.record.root_identity_sha256,
                 &self.identity.install_root_sha256,
             )) return error.RootIdentityMismatch;
-            if (value.record.backend == .legacy_dpkg and
-                !value.record.clearable())
-            {
+            if (value.record.backend == .legacy_dpkg) {
                 if (!self.legacy_execution_capable)
                     return error.LegacyCapabilityRequired;
                 if (request.backend != .legacy_dpkg)
@@ -5776,6 +5776,45 @@ test "root_operation.test.legacy compatibility refuses active ownership before m
         &original_digest,
         &preserved_again.record.digest_sha256,
     );
+
+    var settled_input = testInput();
+    settled_input.state = .completed;
+    settled_input.phase = .provenance;
+    settled_input.outcome = .abandoned_before_mutation;
+    settled_input.provenance = .not_required;
+    var settled = try create(testing.allocator, settled_input);
+    defer settled.deinit();
+    try testing.expect(settled.record.clearable());
+    try coordinator.store().writeAtomic(testing.allocator, settled.record);
+    const settled_digest = settled.record.digest_sha256;
+
+    coordinator.legacy_execution_capable = false;
+    try testing.expectError(
+        error.LegacyCapabilityRequired,
+        coordinator.acquire(testing.allocator, native_request),
+    );
+    var settled_preserved = (try coordinator.store().read(testing.allocator)).?;
+    defer settled_preserved.deinit();
+    try testing.expectEqualSlices(
+        u8,
+        &settled_digest,
+        &settled_preserved.record.digest_sha256,
+    );
+}
+
+test "root_operation.test.legacy compatibility native-only coordinator refuses a fresh legacy request without publication" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+    coordinator.legacy_execution_capable = false;
+
+    try testing.expectError(
+        error.LegacyCapabilityRequired,
+        coordinator.acquire(testing.allocator, packageRequest()),
+    );
+    try testing.expect((try coordinator.store().read(testing.allocator)) == null);
 }
 
 test "root_operation.test.different roots proceed independently" {

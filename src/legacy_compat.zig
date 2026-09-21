@@ -42,14 +42,28 @@ pub const Family = enum {
     system_profile,
     exact_lock,
     transaction_result,
+    transaction_result_summary,
+    transaction_result_capability,
     transaction_journal,
     root_operation,
     root_operation_completion,
     apt_system_operation,
+    apt_system_result,
+    apt_system_completion,
+    product_result,
+    repository_operation_state,
+    repository_operation_result,
     package_cache_fingerprint,
     package_cache_result,
+    package_cache_error,
     package_family_capability,
+    package_family_request,
+    package_family_result,
     native_provenance,
+    native_install_capability,
+    native_install_result,
+    native_repository_unchanged,
+    legacy_capability_evidence,
 };
 
 pub const Identity = struct {
@@ -97,14 +111,25 @@ pub fn classify(identity: Identity) PolicyError!Classification {
         return legacy(.exact_lock);
     }
     if (matches(identity, "https://debz.dev/schema/exact-closure-lock-v2", 2)) {
-        try requireBackend(identity.backend, .native);
-        return native(.exact_lock);
+        return explicit(.exact_lock, identity.backend);
     }
     if (matches(identity, "https://debz.dev/schema/transaction-result-v1", 1) or
         matches(identity, "https://debz.dev/schema/transaction-result-v2", 2))
     {
         try requireBackend(identity.backend, .legacy_dpkg);
         return legacy(.transaction_result);
+    }
+    if (matches(identity, "io.github.cataggar.debz.transaction-result-summary.v1", 1)) {
+        try requireBackend(identity.backend, .legacy_dpkg);
+        return legacy(.transaction_result_summary);
+    }
+    if (matches(identity, "io.github.cataggar.debz.transaction-result-summary.v2", 2)) {
+        try requireBackend(identity.backend, .native);
+        return native(.transaction_result_summary);
+    }
+    if (matches(identity, "io.github.cataggar.debz.transaction-result-capability.v1", 1)) {
+        try requireBackend(identity.backend, .native);
+        return native(.transaction_result_capability);
     }
     if (std.mem.eql(u8, identity.schema, "debz:transaction-journal") and
         identity.version >= 1 and identity.version <= 3)
@@ -120,6 +145,25 @@ pub fn classify(identity: Identity) PolicyError!Classification {
     }
     if (matches(identity, "https://debz.dev/schema/apt-system-operation-state-v1", 1)) {
         return explicit(.apt_system_operation, identity.backend);
+    }
+    if ((matches(identity, "https://debz.dev/schema/apt-system-result-v1", 1)) or
+        (matches(identity, "https://debz.dev/schema/apt-system-result-v2", 2)) or
+        (matches(identity, "https://debz.dev/schema/apt-system-result-v3", 3)))
+    {
+        return explicit(.apt_system_result, identity.backend);
+    }
+    if (matches(identity, "https://debz.dev/schema/apt-system-execution-completion-v1", 1)) {
+        try requireBackend(identity.backend, .native);
+        return native(.apt_system_completion);
+    }
+    if (matches(identity, "io.github.cataggar.debz.command.v1", 1)) {
+        return explicit(.product_result, identity.backend);
+    }
+    if (matches(identity, "https://debz.dev/schema/repository-add-state-v1", 1)) {
+        return explicit(.repository_operation_state, identity.backend);
+    }
+    if (matches(identity, "https://debz.dev/schema/repository-operation-result-v1", 1)) {
+        return explicit(.repository_operation_result, identity.backend);
     }
     if (matches(identity, "io.github.cataggar.debz.package-cache-fingerprint.v1", 1)) {
         try requireBackend(identity.backend, .legacy_dpkg);
@@ -137,6 +181,9 @@ pub fn classify(identity: Identity) PolicyError!Classification {
         try requireBackend(identity.backend, .native);
         return native(.package_cache_result);
     }
+    if (matches(identity, "io.github.cataggar.debz.package-cache-error.v1", 1)) {
+        return explicit(.package_cache_error, identity.backend);
+    }
     if (matches(identity, "io.github.cataggar.debz.package-family.capabilities.v1", 1)) {
         try requireBackend(identity.backend, .legacy_dpkg);
         return legacy(.package_family_capability);
@@ -145,9 +192,41 @@ pub fn classify(identity: Identity) PolicyError!Classification {
         try requireBackend(identity.backend, .native);
         return native(.package_family_capability);
     }
+    if (matches(identity, "io.github.cataggar.debz.package-family.request.v1", 1)) {
+        try requireBackend(identity.backend, .legacy_dpkg);
+        return legacy(.package_family_request);
+    }
+    if (matches(identity, "io.github.cataggar.debz.package-family.request.v2", 2)) {
+        try requireBackend(identity.backend, .native);
+        return native(.package_family_request);
+    }
+    if (matches(identity, "io.github.cataggar.debz.package-family.result.v1", 1)) {
+        try requireBackend(identity.backend, .legacy_dpkg);
+        return legacy(.package_family_result);
+    }
+    if (matches(identity, "io.github.cataggar.debz.package-family.result.v2", 2)) {
+        try requireBackend(identity.backend, .native);
+        return native(.package_family_result);
+    }
     if (matches(identity, "https://debz.dev/schema/native-transaction-provenance-v1", 1)) {
         try requireBackend(identity.backend, .native);
         return native(.native_provenance);
+    }
+    if (matches(identity, "io.github.cataggar.debz.native-install-capability.v1", 1)) {
+        try requireBackend(identity.backend, .native);
+        return native(.native_install_capability);
+    }
+    if (matches(identity, "io.github.cataggar.debz.native-install-result.v1", 1)) {
+        try requireBackend(identity.backend, .native);
+        return native(.native_install_result);
+    }
+    if (matches(identity, "https://debz.dev/schema/native-repository-unchanged-v1", 1)) {
+        try requireBackend(identity.backend, .native);
+        return native(.native_repository_unchanged);
+    }
+    if (matches(identity, evidence_schema_id, evidence_schema_version)) {
+        try requireBackend(identity.backend, .legacy_dpkg);
+        return legacy(.legacy_capability_evidence);
     }
     return error.UnsupportedIdentity;
 }
@@ -216,6 +295,8 @@ pub const Evidence = struct {
     artifact_schema: []const u8,
     artifact_version: u32,
     artifact_sha256: [32]u8,
+    root_identity_sha256: ?[32]u8,
+    attempt_id: ?[32]u8,
     digest_sha256: [32]u8,
 
     pub fn canonicalJson(
@@ -244,40 +325,96 @@ pub const Evidence = struct {
 pub fn createEvidence(
     artifact: Identity,
     exact_artifact_bytes: []const u8,
+    binding: EvidenceBinding,
 ) !Evidence {
     const classified = try classify(artifact);
     if (classified.backend != .legacy_dpkg) return error.BackendMismatch;
+    try binding.validate();
     var result: Evidence = .{
         .artifact_schema = canonicalSchema(artifact),
         .artifact_version = artifact.version,
         .artifact_sha256 = sha256(exact_artifact_bytes),
+        .root_identity_sha256 = binding.root_identity_sha256,
+        .attempt_id = binding.attempt_id,
         .digest_sha256 = undefined,
     };
     result.digest_sha256 = evidenceDigest(result);
     return result;
 }
 
+pub const EvidenceBinding = struct {
+    root_identity_sha256: ?[32]u8 = null,
+    attempt_id: ?[32]u8 = null,
+
+    pub fn validate(self: EvidenceBinding) !void {
+        if ((self.root_identity_sha256 == null) != (self.attempt_id == null))
+            return error.IncompleteOperationBinding;
+    }
+};
+
+pub fn verifyEvidence(
+    evidence: Evidence,
+    artifact: Identity,
+    exact_artifact_bytes: []const u8,
+    binding: EvidenceBinding,
+) !void {
+    const classified = try classify(artifact);
+    if (classified.backend != .legacy_dpkg) return error.BackendMismatch;
+    try binding.validate();
+    if (!std.mem.eql(u8, evidence.artifact_schema, canonicalSchema(artifact)) or
+        evidence.artifact_version != artifact.version)
+        return error.ArtifactIdentityMismatch;
+    if (!std.mem.eql(u8, &evidence.artifact_sha256, &sha256(exact_artifact_bytes)))
+        return error.ArtifactDigestMismatch;
+    if (!optionalDigestEqual(evidence.root_identity_sha256, binding.root_identity_sha256))
+        return error.RootIdentityMismatch;
+    if (!optionalDigestEqual(evidence.attempt_id, binding.attempt_id))
+        return error.AttemptMismatch;
+    if (!std.mem.eql(u8, &evidence.digest_sha256, &evidenceDigest(evidence)))
+        return error.DigestMismatch;
+}
+
+const canonical_schemas = [_][]const u8{
+    "https://debz.dev/schema/system-profile-v1",
+    "https://debz.dev/schema/system-profile-v2",
+    "https://debz.dev/schema/exact-closure-lock-v1",
+    "https://debz.dev/schema/exact-closure-lock-v2",
+    "https://debz.dev/schema/transaction-result-v1",
+    "https://debz.dev/schema/transaction-result-v2",
+    "io.github.cataggar.debz.transaction-result-summary.v1",
+    "io.github.cataggar.debz.transaction-result-summary.v2",
+    "io.github.cataggar.debz.transaction-result-capability.v1",
+    "debz:transaction-journal",
+    "https://debz.dev/schema/root-operation-record-v1",
+    "https://debz.dev/schema/root-operation-completion-v1",
+    "https://debz.dev/schema/apt-system-operation-state-v1",
+    "https://debz.dev/schema/apt-system-result-v1",
+    "https://debz.dev/schema/apt-system-result-v2",
+    "https://debz.dev/schema/apt-system-result-v3",
+    "https://debz.dev/schema/apt-system-execution-completion-v1",
+    "io.github.cataggar.debz.command.v1",
+    "https://debz.dev/schema/repository-add-state-v1",
+    "https://debz.dev/schema/repository-operation-result-v1",
+    "io.github.cataggar.debz.package-cache-fingerprint.v1",
+    "io.github.cataggar.debz.package-cache-fingerprint.v2",
+    "io.github.cataggar.debz.package-cache-result.v1",
+    "io.github.cataggar.debz.package-cache-result.v2",
+    "io.github.cataggar.debz.package-cache-error.v1",
+    "io.github.cataggar.debz.package-family.capabilities.v1",
+    "io.github.cataggar.debz.package-family.capabilities.v2",
+    "io.github.cataggar.debz.package-family.request.v1",
+    "io.github.cataggar.debz.package-family.request.v2",
+    "io.github.cataggar.debz.package-family.result.v1",
+    "io.github.cataggar.debz.package-family.result.v2",
+    "https://debz.dev/schema/native-transaction-provenance-v1",
+    "io.github.cataggar.debz.native-install-capability.v1",
+    "io.github.cataggar.debz.native-install-result.v1",
+    "https://debz.dev/schema/native-repository-unchanged-v1",
+    evidence_schema_id,
+};
+
 fn canonicalSchema(identity: Identity) []const u8 {
-    const known = [_][]const u8{
-        "https://debz.dev/schema/system-profile-v1",
-        "https://debz.dev/schema/system-profile-v2",
-        "https://debz.dev/schema/exact-closure-lock-v1",
-        "https://debz.dev/schema/exact-closure-lock-v2",
-        "https://debz.dev/schema/transaction-result-v1",
-        "https://debz.dev/schema/transaction-result-v2",
-        "debz:transaction-journal",
-        "https://debz.dev/schema/root-operation-record-v1",
-        "https://debz.dev/schema/root-operation-completion-v1",
-        "https://debz.dev/schema/apt-system-operation-state-v1",
-        "io.github.cataggar.debz.package-cache-fingerprint.v1",
-        "io.github.cataggar.debz.package-cache-fingerprint.v2",
-        "io.github.cataggar.debz.package-cache-result.v1",
-        "io.github.cataggar.debz.package-cache-result.v2",
-        "io.github.cataggar.debz.package-family.capabilities.v1",
-        "io.github.cataggar.debz.package-family.capabilities.v2",
-        "https://debz.dev/schema/native-transaction-provenance-v1",
-    };
-    for (known) |schema|
+    for (canonical_schemas) |schema|
         if (std.mem.eql(u8, identity.schema, schema)) return schema;
     unreachable;
 }
@@ -289,6 +426,8 @@ const WireEvidence = struct {
     artifact_version: u32,
     artifact_sha256: []const u8,
     backend: Backend,
+    root_identity_sha256: ?[]const u8,
+    attempt_id: ?[]const u8,
     execution: []const u8,
     active_recovery: []const u8,
     historical_verification: []const u8,
@@ -323,6 +462,8 @@ pub fn decodeEvidence(
         !std.mem.eql(u8, wire.legacy_release_range, legacy_release_range) or
         !std.mem.eql(u8, wire.guidance, recovery_guidance))
         return error.InvalidDocument;
+    if ((wire.root_identity_sha256 == null) != (wire.attempt_id == null))
+        return error.InvalidDocument;
     const classified = try classify(.{
         .schema = wire.artifact_schema,
         .version = wire.artifact_version,
@@ -336,6 +477,14 @@ pub fn decodeEvidence(
         }),
         .artifact_version = wire.artifact_version,
         .artifact_sha256 = try parseHex32(wire.artifact_sha256),
+        .root_identity_sha256 = if (wire.root_identity_sha256) |value|
+            try parseHex32(value)
+        else
+            null,
+        .attempt_id = if (wire.attempt_id) |value|
+            try parseHex32(value)
+        else
+            null,
         .digest_sha256 = try parseHex32(wire.digest_sha256),
     };
     if (!std.mem.eql(u8, &result.digest_sha256, &evidenceDigest(result)))
@@ -390,6 +539,31 @@ pub const Store = struct {
             else => {},
         }
     }
+
+    pub fn read(
+        self: Store,
+        allocator: std.mem.Allocator,
+    ) !?Evidence {
+        var file = self.dir.openFile(self.io, self.name, .{
+            .mode = .read_only,
+            .allow_directory = false,
+            .follow_symlinks = false,
+            .resolve_beneath = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        if (stat.kind != .file) return error.NotRegularFile;
+        var reader = file.reader(self.io, &.{});
+        const source = try reader.interface.allocRemaining(
+            allocator,
+            .limited(maximum_evidence_bytes),
+        );
+        defer allocator.free(source);
+        return try decodeEvidence(allocator, source);
+    }
 };
 
 fn evidenceDigest(evidence: Evidence) [32]u8 {
@@ -415,7 +589,11 @@ fn writeEvidencePayload(evidence: Evidence, writer: *std.Io.Writer) !void {
     try writeString(writer, evidence.artifact_schema);
     try writer.print(",\"artifact_version\":{},\"artifact_sha256\":", .{evidence.artifact_version});
     try writeHex(writer, &evidence.artifact_sha256);
-    try writer.writeAll(",\"backend\":\"legacy_dpkg\",\"execution\":\"deprecated_but_available\"");
+    try writer.writeAll(",\"backend\":\"legacy_dpkg\",\"root_identity_sha256\":");
+    try writeOptionalHex(writer, evidence.root_identity_sha256);
+    try writer.writeAll(",\"attempt_id\":");
+    try writeOptionalHex(writer, evidence.attempt_id);
+    try writer.writeAll(",\"execution\":\"deprecated_but_available\"");
     try writer.writeAll(",\"active_recovery\":\"requires_legacy_capable_release\"");
     try writer.writeAll(",\"historical_verification\":\"read_only_exact_bytes\"");
     try writer.writeAll(",\"native_reinterpretation\":false,\"legacy_release_range\":");
@@ -441,6 +619,18 @@ fn parseHex32(text: []const u8) ![32]u8 {
 fn writeHex(writer: *std.Io.Writer, bytes: *const [32]u8) !void {
     const encoded = std.fmt.bytesToHex(bytes.*, .lower);
     try writeString(writer, &encoded);
+}
+
+fn writeOptionalHex(writer: *std.Io.Writer, value: ?[32]u8) !void {
+    if (value) |bytes|
+        try writeHex(writer, &bytes)
+    else
+        try writer.writeAll("null");
+}
+
+fn optionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, &left.?, &right.?);
 }
 
 fn writeString(writer: *std.Io.Writer, value: []const u8) !void {
@@ -480,7 +670,12 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             .backend = .legacy_dpkg,
         },
         .{
-            .identity = .{ .schema = "https://debz.dev/schema/exact-closure-lock-v2", .version = 2 },
+            .identity = .{ .schema = "https://debz.dev/schema/exact-closure-lock-v2", .version = 2, .backend = .legacy_dpkg },
+            .family = .exact_lock,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/exact-closure-lock-v2", .version = 2, .backend = .native },
             .family = .exact_lock,
             .backend = .native,
         },
@@ -488,6 +683,21 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             .identity = .{ .schema = "https://debz.dev/schema/transaction-result-v1", .version = 1 },
             .family = .transaction_result,
             .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.transaction-result-summary.v1", .version = 1 },
+            .family = .transaction_result_summary,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.transaction-result-summary.v2", .version = 2 },
+            .family = .transaction_result_summary,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.transaction-result-capability.v1", .version = 1 },
+            .family = .transaction_result_capability,
+            .backend = .native,
         },
         .{
             .identity = .{ .schema = "https://debz.dev/schema/transaction-result-v2", .version = 2 },
@@ -540,6 +750,71 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             .backend = .native,
         },
         .{
+            .identity = .{ .schema = "https://debz.dev/schema/apt-system-result-v1", .version = 1, .backend = .legacy_dpkg },
+            .family = .apt_system_result,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/apt-system-result-v1", .version = 1, .backend = .native },
+            .family = .apt_system_result,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/apt-system-result-v2", .version = 2, .backend = .legacy_dpkg },
+            .family = .apt_system_result,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/apt-system-result-v2", .version = 2, .backend = .native },
+            .family = .apt_system_result,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/apt-system-result-v3", .version = 3, .backend = .legacy_dpkg },
+            .family = .apt_system_result,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/apt-system-result-v3", .version = 3, .backend = .native },
+            .family = .apt_system_result,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/apt-system-execution-completion-v1", .version = 1, .backend = .native },
+            .family = .apt_system_completion,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.command.v1", .version = 1, .backend = .legacy_dpkg },
+            .family = .product_result,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.command.v1", .version = 1, .backend = .native },
+            .family = .product_result,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/repository-add-state-v1", .version = 1, .backend = .legacy_dpkg },
+            .family = .repository_operation_state,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/repository-add-state-v1", .version = 1, .backend = .native },
+            .family = .repository_operation_state,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/repository-operation-result-v1", .version = 1, .backend = .legacy_dpkg },
+            .family = .repository_operation_result,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/repository-operation-result-v1", .version = 1, .backend = .native },
+            .family = .repository_operation_result,
+            .backend = .native,
+        },
+        .{
             .identity = .{ .schema = "io.github.cataggar.debz.package-cache-fingerprint.v1", .version = 1 },
             .family = .package_cache_fingerprint,
             .backend = .legacy_dpkg,
@@ -560,6 +835,16 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             .backend = .native,
         },
         .{
+            .identity = .{ .schema = "io.github.cataggar.debz.package-cache-error.v1", .version = 1, .backend = .legacy_dpkg },
+            .family = .package_cache_error,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.package-cache-error.v1", .version = 1, .backend = .native },
+            .family = .package_cache_error,
+            .backend = .native,
+        },
+        .{
             .identity = .{ .schema = "io.github.cataggar.debz.package-family.capabilities.v1", .version = 1 },
             .family = .package_family_capability,
             .backend = .legacy_dpkg,
@@ -570,9 +855,49 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             .backend = .native,
         },
         .{
+            .identity = .{ .schema = "io.github.cataggar.debz.package-family.request.v1", .version = 1 },
+            .family = .package_family_request,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.package-family.request.v2", .version = 2 },
+            .family = .package_family_request,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.package-family.result.v1", .version = 1 },
+            .family = .package_family_result,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.package-family.result.v2", .version = 2 },
+            .family = .package_family_result,
+            .backend = .native,
+        },
+        .{
             .identity = .{ .schema = "https://debz.dev/schema/native-transaction-provenance-v1", .version = 1 },
             .family = .native_provenance,
             .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.native-install-capability.v1", .version = 1 },
+            .family = .native_install_capability,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "io.github.cataggar.debz.native-install-result.v1", .version = 1 },
+            .family = .native_install_result,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/native-repository-unchanged-v1", .version = 1 },
+            .family = .native_repository_unchanged,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/legacy-capability-evidence-v1", .version = 1 },
+            .family = .legacy_capability_evidence,
+            .backend = .legacy_dpkg,
         },
     };
     for (cases) |case| {
@@ -624,6 +949,16 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             ),
         );
     }
+    for (canonical_schemas) |schema| {
+        var found = false;
+        for (cases) |entry| {
+            if (std.mem.eql(u8, schema, entry.identity.schema)) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
     try std.testing.expectError(
         error.BackendMismatch,
         classify(.{
@@ -666,7 +1001,11 @@ test "legacy_compat.test.capability evidence binds exact historical bytes canoni
         .schema = "https://debz.dev/schema/exact-closure-lock-v1",
         .version = 1,
     };
-    const evidence = try createEvidence(identity, source);
+    const binding: EvidenceBinding = .{
+        .root_identity_sha256 = @splat(0x31),
+        .attempt_id = @splat(0x42),
+    };
+    const evidence = try createEvidence(identity, source, binding);
     const source_sha256 = sha256(source);
     try std.testing.expectEqualSlices(u8, &source_sha256, &evidence.artifact_sha256);
     const encoded = try evidence.canonicalJson(std.testing.allocator);
@@ -679,6 +1018,136 @@ test "legacy_compat.test.capability evidence binds exact historical bytes canoni
         u8,
         &evidence.artifact_sha256,
         &decoded.artifact_sha256,
+    );
+    try verifyEvidence(decoded, identity, source, binding);
+    try std.testing.expectError(
+        error.ArtifactDigestMismatch,
+        verifyEvidence(decoded, identity, source ++ "changed", binding),
+    );
+    try std.testing.expectError(
+        error.RootIdentityMismatch,
+        verifyEvidence(decoded, identity, source, .{
+            .root_identity_sha256 = @splat(0x32),
+            .attempt_id = binding.attempt_id,
+        }),
+    );
+    try std.testing.expectError(
+        error.AttemptMismatch,
+        verifyEvidence(decoded, identity, source, .{
+            .root_identity_sha256 = binding.root_identity_sha256,
+            .attempt_id = @splat(0x43),
+        }),
+    );
+    try std.testing.expectError(
+        error.IncompleteOperationBinding,
+        createEvidence(identity, source, .{
+            .root_identity_sha256 = @splat(0x31),
+        }),
+    );
+}
+
+test "legacy_compat.test.capability store is confined atomic and replaces only the sidecar" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const store = try Store.init(std.testing.io, directory.dir, "evidence.json");
+    const identity: Identity = .{
+        .schema = "https://debz.dev/schema/exact-closure-lock-v1",
+        .version = 1,
+    };
+    const first = try createEvidence(identity, "first", .{});
+    try store.writeAtomic(std.testing.allocator, first);
+    var loaded = (try store.read(std.testing.allocator)).?;
+    try verifyEvidence(loaded, identity, "first", .{});
+
+    var evidence_file = try directory.dir.openFile(
+        std.testing.io,
+        "evidence.json",
+        .{ .mode = .read_only },
+    );
+    defer evidence_file.close(std.testing.io);
+    const evidence_stat = try evidence_file.stat(std.testing.io);
+    if (@import("builtin").os.tag != .windows)
+        try std.testing.expectEqual(
+            @as(std.posix.mode_t, 0o600),
+            evidence_stat.permissions.toMode() & 0o7777,
+        );
+
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "outside",
+        .data = "unchanged",
+    });
+    try directory.dir.symLink(
+        std.testing.io,
+        "outside",
+        ".evidence.json.new",
+        .{},
+    );
+    const second_binding: EvidenceBinding = .{
+        .root_identity_sha256 = @splat(0x51),
+        .attempt_id = @splat(0x52),
+    };
+    const second = try createEvidence(identity, "second", second_binding);
+    try store.writeAtomic(std.testing.allocator, second);
+    loaded = (try store.read(std.testing.allocator)).?;
+    try verifyEvidence(loaded, identity, "second", second_binding);
+    const outside_after_stage = try directory.dir.readFileAlloc(
+        std.testing.io,
+        "outside",
+        std.testing.allocator,
+        .limited(32),
+    );
+    defer std.testing.allocator.free(outside_after_stage);
+    try std.testing.expectEqualStrings("unchanged", outside_after_stage);
+
+    try directory.dir.deleteFile(std.testing.io, "evidence.json");
+    try directory.dir.symLink(std.testing.io, "outside", "evidence.json", .{});
+    try store.writeAtomic(std.testing.allocator, first);
+    const outside_after_target = try directory.dir.readFileAlloc(
+        std.testing.io,
+        "outside",
+        std.testing.allocator,
+        .limited(32),
+    );
+    defer std.testing.allocator.free(outside_after_target);
+    try std.testing.expectEqualStrings("unchanged", outside_after_target);
+    loaded = (try store.read(std.testing.allocator)).?;
+    try verifyEvidence(loaded, identity, "first", .{});
+}
+
+test "legacy_compat.test.capability evidence parser is bounded exact and version closed" {
+    var oversized: [maximum_evidence_bytes + 1]u8 = @splat('x');
+    try std.testing.expectError(
+        error.DocumentTooLarge,
+        decodeEvidence(std.testing.allocator, &oversized),
+    );
+
+    const evidence = try createEvidence(.{
+        .schema = "https://debz.dev/schema/exact-closure-lock-v1",
+        .version = 1,
+    }, "artifact", .{});
+    const canonical = try evidence.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+
+    const version_marker = "\"version\":1";
+    const version_offset = std.mem.indexOf(u8, canonical, version_marker) orelse
+        return error.MissingVersion;
+    const future = try std.testing.allocator.dupe(u8, canonical);
+    defer std.testing.allocator.free(future);
+    future[version_offset + version_marker.len - 1] = '2';
+    try std.testing.expectError(
+        error.InvalidDocument,
+        decodeEvidence(std.testing.allocator, future),
+    );
+
+    const unexpected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s},\"unexpected\":true}}\n",
+        .{std.mem.trimEnd(u8, canonical, "}\n")},
+    );
+    defer std.testing.allocator.free(unexpected);
+    try std.testing.expectError(
+        error.InvalidDocument,
+        decodeEvidence(std.testing.allocator, unexpected),
     );
 }
 
@@ -703,6 +1172,21 @@ test "legacy_compat.test.unknown versions and mixed explicit profiles fail close
             .schema = "https://debz.dev/schema/system-profile-v1",
             .version = 1,
             .backend = .native,
+        }),
+    );
+    try std.testing.expectError(
+        error.BackendRequired,
+        classify(.{
+            .schema = "https://debz.dev/schema/exact-closure-lock-v2",
+            .version = 2,
+        }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedIdentity,
+        classify(.{
+            .schema = "https://debz.dev/schema/repository-operation-result-v1",
+            .version = 2,
+            .backend = .legacy_dpkg,
         }),
     );
 }
