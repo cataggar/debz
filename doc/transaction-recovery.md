@@ -1,10 +1,17 @@
 # Transaction recovery
 
-`executeTransaction` now requires an injected journal store and installed-state
-reader. Before any dpkg mutation it writes a checksummed version-1 journal that
-binds the plan digest, install-root identity, package archive digests, exact
-command digests, and executor policy. Each command is bracketed by atomic,
-durable journal updates.
+`executeTransaction` requires an injected journal store and installed-state
+reader. Before any dpkg mutation it writes a checksummed version-3 journal that
+binds the plan digest, install-root identity, exact-lock digest, package archive
+digests, exact command digests, executor policy, the explicit `legacy_dpkg`
+backend, and `legacy-dpkg-execution-deprecated-v1`. Each command is bracketed
+by atomic, durable journal updates.
+
+Historical journal v1 (without an exact-lock digest) and v2 (with that digest)
+remain exact, implicit-legacy read/recovery formats. They are never promoted to
+native authority or rewritten as v3. An active v1/v2/v3 journal requires a
+legacy-capable release; native-only code refuses before cleanup or mutation.
+See [Legacy compatibility](legacy-compatibility.md).
 
 States are `not_started`, `in_progress`, `dpkg_failed`, `interrupted`,
 `verification_failed`, and `complete`. A normal execute never silently resumes

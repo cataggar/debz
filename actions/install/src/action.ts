@@ -44,6 +44,9 @@ import {
   type SetupOutputs,
 } from './subprocess.js';
 
+export const LEGACY_BACKEND_CAPABILITY = 'legacy-dpkg-execution-deprecated-v1';
+export const NATIVE_BACKEND_CAPABILITY = 'native-transaction-execution-v1';
+
 export interface ActionIO {
   info(message: string): void;
   error(message: string): void;
@@ -308,6 +311,17 @@ export async function runAction(
   io.setOutput('provenance', outputs.resultPath);
   io.setOutput('installed-count', String(outputs.installedCount));
   io.setOutput('changed', outputs.changed ? 'true' : 'false');
+  io.setOutput(
+    'backend-capability',
+    inputs.transactionBackend === 'legacy_dpkg'
+      ? LEGACY_BACKEND_CAPABILITY
+      : NATIVE_BACKEND_CAPABILITY,
+  );
+  if (inputs.transactionBackend === 'legacy_dpkg') {
+    io.info(
+      'DEPRECATION[legacy-dpkg-execution-deprecated-v1]: recover active legacy state with a legacy-capable debz release before selecting native',
+    );
+  }
 }
 
 async function verifyIdentities(

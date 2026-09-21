@@ -2849,6 +2849,8 @@ pub const Error = LockError || ValidationError || error{
     RootIdentityMismatch,
     OperationInProgress,
     RecoveryRequired,
+    LegacyCapabilityRequired,
+    LegacyRecoveryRequired,
     ProvenancePending,
     ResolvedAttemptPresent,
     NoActiveAttempt,
@@ -3073,6 +3075,9 @@ pub const Coordinator = struct {
     identity: Identity,
     locks: LockBackend,
     now_unix: ?i64 = null,
+    /// Set false by native-only releases. Active legacy ownership is then
+    /// refused before deferred cleanup, reclamation, or publication.
+    legacy_execution_capable: bool = true,
     /// Borrowed from the current private-root callback; never persisted.
     root_projection: ?*const live_root.Projection = null,
 
@@ -3189,6 +3194,14 @@ pub const Coordinator = struct {
                 &value.record.root_identity_sha256,
                 &self.identity.install_root_sha256,
             )) return error.RootIdentityMismatch;
+            if (value.record.backend == .legacy_dpkg and
+                !value.record.clearable())
+            {
+                if (!self.legacy_execution_capable)
+                    return error.LegacyCapabilityRequired;
+                if (request.backend != .legacy_dpkg)
+                    return error.LegacyRecoveryRequired;
+            }
         }
 
         const continuing_native = request.intent == .same_operation and prior != null and
@@ -5724,6 +5737,47 @@ test "root_operation.test.a record written for another root fails closed" {
     );
 }
 
+test "root_operation.test.legacy compatibility refuses active ownership before mutation or cleanup" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    var created = try create(testing.allocator, testInput());
+    defer created.deinit();
+    try coordinator.store().writeAtomic(testing.allocator, created.record);
+    const original_digest = created.record.digest_sha256;
+
+    coordinator.legacy_execution_capable = false;
+    try testing.expectError(
+        error.LegacyCapabilityRequired,
+        coordinator.acquire(testing.allocator, packageRequest()),
+    );
+    var preserved = (try coordinator.store().read(testing.allocator)).?;
+    defer preserved.deinit();
+    try testing.expectEqualSlices(
+        u8,
+        &original_digest,
+        &preserved.record.digest_sha256,
+    );
+
+    coordinator.legacy_execution_capable = true;
+    var native_request = packageRequest();
+    native_request.backend = .native;
+    try testing.expectError(
+        error.LegacyRecoveryRequired,
+        coordinator.acquire(testing.allocator, native_request),
+    );
+    var preserved_again = (try coordinator.store().read(testing.allocator)).?;
+    defer preserved_again.deinit();
+    try testing.expectEqualSlices(
+        u8,
+        &original_digest,
+        &preserved_again.record.digest_sha256,
+    );
+}
+
 test "root_operation.test.different roots proceed independently" {
     var first_tmp = testing.tmpDir(.{ .iterate = true });
     defer first_tmp.cleanup();
@@ -6493,7 +6547,10 @@ test "root_operation.test.only the same operation may adopt an unresolved attemp
     };
     for (mismatches) |request| {
         try testing.expectError(
-            error.AttemptMismatch,
+            if (request.backend == .native)
+                error.LegacyRecoveryRequired
+            else
+                error.AttemptMismatch,
             coordinator.acquire(testing.allocator, request),
         );
         var observed = (try coordinator.inspect(testing.allocator)).?;

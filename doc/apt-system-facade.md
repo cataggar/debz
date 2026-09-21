@@ -271,6 +271,14 @@ conffile fields but requires an explicit `transaction_backend`, either
 Missing, null, unknown, duplicate, or version-mismatched backend selections
 are rejected rather than defaulted or inferred.
 
+The loader also retains the exact profile format independently from its
+effective backend: v1 remains permanently legacy, while v2 remains explicit.
+Neither a later native-only runtime nor recovery may reinterpret a v1 digest
+as native. Active legacy profile-bound state must be recovered by a
+legacy-capable release before native selection; completed history preserves
+the original profile bytes. See
+[Legacy compatibility](legacy-compatibility.md).
+
 The typed profile loader preserves this backend authority and hashes the
 complete reviewed profile bytes. Changing the backend therefore changes the
 profile binding even when every referenced repository/keyring file is identical.

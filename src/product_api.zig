@@ -117,6 +117,7 @@ pub const ErrorId = enum {
     recovery_failed,
     root_operation_conflict,
     root_operation_recovery_required,
+    legacy_recovery_release_required,
     lock_verification_failed,
     internal_error,
 };

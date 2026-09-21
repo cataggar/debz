@@ -1,6 +1,9 @@
 # Documentation
 
 - [Stable product API and CLI contract](product-api.md)
+- [Legacy compatibility and native-only cutover policy](legacy-compatibility.md)
+  defines exact version/backend identities, active-operation refusal, immutable
+  historical verification, deprecation evidence, and the deletion inventory.
 - [Apt-shaped system facade contracts](apt-system-facade.md) defines the
   separate trusted profile, request/result, evidence, and durable active-state
   contracts without promising apt compatibility.

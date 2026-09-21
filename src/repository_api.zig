@@ -67,6 +67,7 @@ pub const DiagnosticId = enum {
     state_persistence_failed,
     state_corrupt,
     recovery_required,
+    legacy_recovery_release_required,
     internal_error,
 };
 

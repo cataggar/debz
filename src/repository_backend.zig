@@ -1928,6 +1928,7 @@ fn validateNativePreparationEvidence(allocator: std.mem.Allocator, input: Native
 pub const Backend = struct {
     io: std.Io,
     transaction_backend: transaction_engine.Kind = .legacy_dpkg,
+    legacy_execution_capable: bool = true,
     executor: Executor = .legacy_dpkg,
     native_executor: ?Executor = null,
     /// Borrowed only for this native invocation; never request or state data.
@@ -2036,6 +2037,7 @@ pub const Backend = struct {
             .io = self.io,
             .allocator = allocator,
             .root_projection = self.root_projection,
+            .legacy_execution_capable = self.legacy_execution_capable,
             .native_resume_completion = native,
             .deadline = if (native) budget.executionDeadline() else null,
         };
@@ -4058,6 +4060,7 @@ const RootOperationGuard = struct {
     attempt: ?root_operation.Attempt = null,
     acquisition_observer: ?root_operation.AcquisitionObserver = null,
     root_projection: ?*const live_root.Projection = null,
+    legacy_execution_capable: bool = true,
     native_completion_only: bool = false,
     native_resume_completion: bool = false,
     deadline: ?transaction_executor.Deadline = null,
@@ -4091,6 +4094,8 @@ const RootOperationGuard = struct {
         ) catch |err| return mapRootOperationError(err);
         self.coordinator.root_projection = if (backend == .native) self.root_projection else null;
         self.coordinator.now_unix = now_unix;
+        self.coordinator.legacy_execution_capable =
+            self.legacy_execution_capable;
         const request_digest = repositoryRequestDigest(request, backend);
         const policy_digest = repositoryPolicyDigest(request, backend);
         var native_architecture = request.architecture orelse "all";
@@ -4468,6 +4473,12 @@ fn mapRootOperationError(err: anyerror) api.Result {
             .recovery_required,
             "root-operation",
             "a previous debz operation mutated this root and requires recovery",
+        ),
+        error.LegacyCapabilityRequired, error.LegacyRecoveryRequired => api.failure(
+            .recovery,
+            .legacy_recovery_release_required,
+            "root-operation",
+            "an active legacy_dpkg operation must be recovered by a legacy-capable debz release before using the native backend",
         ),
         error.RecordCorrupt, error.UnsupportedSchema => api.failure(
             .recovery,
@@ -6995,6 +7006,20 @@ test "repository backend native invocation preserves the outer clock and remaini
         fn now(raw: ?*anyopaque) u64 {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             return self.value;
+        }
+
+        test "repository_backend.test.legacy compatibility maps active legacy refusal before mutation" {
+            const result = mapRootOperationError(error.LegacyRecoveryRequired);
+            try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+            try std.testing.expectEqual(
+                api.DiagnosticId.legacy_recovery_release_required,
+                result.diagnostics[0].id,
+            );
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                result.diagnostics[0].message,
+                "legacy-capable debz release",
+            ) != null);
         }
         fn sleep(raw: ?*anyopaque, milliseconds: u64) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -10801,7 +10826,13 @@ test "repository backend binds root callers while sharing live and unresolved ex
                 return error.TestUnexpectedResult;
             defer refused.deinit();
             try std.testing.expectEqual(api.ExitStatus.recovery, refused.exit_status);
-            try std.testing.expectEqual(api.DiagnosticId.recovery_required, refused.diagnostics[0].id);
+            try std.testing.expectEqual(
+                if (backend == .legacy_dpkg)
+                    api.DiagnosticId.legacy_recovery_release_required
+                else
+                    api.DiagnosticId.recovery_required,
+                refused.diagnostics[0].id,
+            );
         }
         var observed = (try readRootAttempt(directory.dir)).?;
         defer observed.deinit();

@@ -17,6 +17,24 @@ pub const schema_version: u32 = 1;
 pub const backend_schema_id = "https://debz.dev/schema/system-profile-v2";
 pub const backend_schema_version: u32 = 2;
 pub const TransactionBackend = transaction_engine.Kind;
+pub const Format = enum {
+    v1_legacy,
+    v2_explicit,
+
+    pub fn schema(self: Format) []const u8 {
+        return switch (self) {
+            .v1_legacy => schema_id,
+            .v2_explicit => backend_schema_id,
+        };
+    }
+
+    pub fn version(self: Format) u32 {
+        return switch (self) {
+            .v1_legacy => schema_version,
+            .v2_explicit => backend_schema_version,
+        };
+    }
+};
 pub const default_profile_path = "/etc/debz/default.json";
 pub const default_cache_path = "/var/cache/debz";
 pub const default_state_path = "/var/lib/debz";
@@ -144,6 +162,7 @@ pub const TrustedFileEvidence = struct {
 
 pub const LoadedProfile = struct {
     profile: Profile,
+    format: Format,
     profile_path: []const u8,
     profile_sha256: [32]u8,
     profile_identity_sha256: [32]u8,
@@ -244,12 +263,23 @@ fn parseWire(comptime T: type, allocator: std.mem.Allocator, source: []const u8,
     };
 }
 
-fn parseProfile(allocator: std.mem.Allocator, source: []const u8) !Profile {
+const ParsedProfile = struct {
+    profile: Profile,
+    format: Format,
+};
+
+fn parseProfile(allocator: std.mem.Allocator, source: []const u8) !ParsedProfile {
     const header = try parseWire(struct { schema: []const u8, version: u32 }, allocator, source, true);
     if (std.mem.eql(u8, header.schema, schema_id) and header.version == schema_version)
-        return profileFromWire(try parseWire(WireProfile, allocator, source, false));
+        return .{
+            .profile = profileFromWire(try parseWire(WireProfile, allocator, source, false)),
+            .format = .v1_legacy,
+        };
     if (std.mem.eql(u8, header.schema, backend_schema_id) and header.version == backend_schema_version)
-        return profileFromWire(try parseWire(WireBackendProfile, allocator, source, false));
+        return .{
+            .profile = profileFromWire(try parseWire(WireBackendProfile, allocator, source, false)),
+            .format = .v2_explicit,
+        };
     return error.UnsupportedSchema;
 }
 
@@ -308,7 +338,8 @@ pub fn load(
 
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    const profile = try parseProfile(scratch.allocator(), profile_capture.bytes);
+    const parsed_profile = try parseProfile(scratch.allocator(), profile_capture.bytes);
+    const profile = parsed_profile.profile;
     try validateProfile(profile, limits);
 
     var trusted_file_count: usize = 1 + profile.keyring_paths.len;
@@ -408,6 +439,7 @@ pub fn load(
     };
     return .{
         .profile = owned_profile,
+        .format = parsed_profile.format,
         .profile_path = profile_path_owned,
         .profile_sha256 = sha256(profile_capture.bytes),
         .profile_identity_sha256 = identityDigest(profile_capture.metadata),
@@ -1004,6 +1036,9 @@ test "system_profile.test.versioned backend authority preserves reference trust 
     fake.profile_source = legacy_backend_profile_json;
     var legacy = try load(std.testing.allocator, fake.interface(), default_profile_path, .{});
     defer legacy.deinit();
+    try std.testing.expectEqual(Format.v1_legacy, original.format);
+    try std.testing.expectEqual(Format.v2_explicit, native.format);
+    try std.testing.expectEqual(Format.v2_explicit, legacy.format);
     try std.testing.expectEqual(TransactionBackend.legacy_dpkg, original.profile.transaction_backend);
     try std.testing.expectEqual(TransactionBackend.legacy_dpkg, legacy.profile.transaction_backend);
     try std.testing.expectEqual(TransactionBackend.native, native.profile.transaction_backend);
@@ -1021,6 +1056,26 @@ test "system_profile.test.versioned backend authority preserves reference trust 
     fake.override_metadata.uid = 1000;
     try std.testing.expectError(error.NotRootOwned, load(std.testing.allocator, fake.interface(), default_profile_path, .{}));
     try std.testing.expectError(error.NotRootOwned, native.readTrustedFile(std.testing.allocator, fake.interface(), source_path, .{}));
+}
+
+test "system_profile.test.legacy compatibility keeps v1 permanently legacy and preserves signed bytes" {
+    var fake: FakeFileSystem = .{ .profile_source = defaulted_profile_json };
+    var loaded = try load(
+        std.testing.allocator,
+        fake.interface(),
+        default_profile_path,
+        .{},
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(Format.v1_legacy, loaded.format);
+    try std.testing.expectEqual(TransactionBackend.legacy_dpkg, loaded.profile.transaction_backend);
+    try std.testing.expectEqualStrings(schema_id, loaded.format.schema());
+    try std.testing.expectEqual(schema_version, loaded.format.version());
+    try std.testing.expectEqualSlices(
+        u8,
+        &sha256(defaulted_profile_json),
+        &loaded.profile_sha256,
+    );
 }
 
 test "system_profile.test.backend selection requires v2 and one explicit recognized backend" {

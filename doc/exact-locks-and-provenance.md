@@ -5,6 +5,11 @@ package identity includes exact Debian version spelling, architecture,
 authenticated repository/snapshot identity, package SHA-256, and declared
 size. Entries are sorted by package, architecture, version, and repository.
 The document digest covers canonical JSON without its final digest member.
+V1 is permanently `legacy_dpkg` authority; it is never inferred or translated
+as native. Newly generated v1 locks receive a separate capability sidecar that
+binds the exact canonical lock bytes without changing their digest or any
+historical signature. Exact-lock v2 remains native-only. See
+[Legacy compatibility](legacy-compatibility.md).
 
 `debz.exact_lock_v2` adds a tagged package origin. Authenticated repository
 origins retain repository and snapshot identity. Verified local-artifact

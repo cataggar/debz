@@ -58,6 +58,9 @@ The default `transaction-backend: legacy_dpkg` requires `package-cache-v1`
 CLI build/release implementing `package-cache-v2`, with native v2 lock,
 fingerprint, preparation, and archive support. An older or incompatible CLI
 fails before cache restore; neither backend is automatically substituted.
+Legacy execution remains available for this compatibility increment, but is
+deprecated. The action emits one bounded warning and publishes an exact
+`backend-capability` value for the selected backend.
 `contents: read` is sufficient for checkout and public repository files;
 `attestations: read` is needed by the default setup-action provenance path.
 The download action itself calls no GitHub content or attestation API; the
@@ -147,6 +150,7 @@ receipt-backed completion integration.
 | `lock-digest` | Canonical exact-lock digest verified and reported by `debz`. |
 | `downloaded-count` | Current-lock objects acquired from package transport. |
 | `reused-count` | Current-lock objects reopened, size/SHA-256 checked, and payload-validated from the CAS. |
+| `backend-capability` | `legacy-dpkg-execution-deprecated-v1` or `native-transaction-execution-v1`, matching the selected backend. |
 
 Outputs are emitted only after authenticated repository matching, complete
 closure preparation, staging cleanup, and retained-closure garbage collection
