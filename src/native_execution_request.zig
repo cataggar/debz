@@ -18,6 +18,8 @@ pub const logical_path = "request/native-execution-request-v1.json";
 pub const maximum_document_bytes = 64 * 1024;
 pub const helper_schema_id = "https://debz.dev/schema/native-execution-request-v2";
 pub const helper_logical_path = "request/native-execution-request-v2.json";
+pub const bootstrap_schema_id = "https://debz.dev/schema/native-execution-request-v3";
+pub const bootstrap_logical_path = "request/native-execution-request-v3.json";
 
 pub const Caller = struct {
     attempt_id: Digest,
@@ -85,9 +87,28 @@ pub const OwnedHelperDocument = struct {
     }
 };
 
+pub const BootstrapDocument = struct {
+    schema: []const u8 = bootstrap_schema_id,
+    version: u32 = 3,
+    execution: Document,
+    bootstrap: native_helper.Bootstrap,
+    digest_sha256: Digest = @splat('0'),
+};
+
+pub const OwnedBootstrapDocument = struct {
+    document: BootstrapDocument,
+    parsed: std.json.Parsed(BootstrapDocument),
+
+    pub fn deinit(self: *OwnedBootstrapDocument) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const OwnedRequest = union(enum) {
     plain: OwnedDocument,
     isolated_helper: OwnedHelperDocument,
+    fresh_root_bootstrap: OwnedBootstrapDocument,
 
     pub fn deinit(self: *OwnedRequest) void {
         switch (self.*) {
@@ -100,6 +121,7 @@ pub const OwnedRequest = union(enum) {
         return switch (self) {
             .plain => |value| value.document,
             .isolated_helper => |value| value.document.execution,
+            .fresh_root_bootstrap => |value| value.document.execution,
         };
     }
 
@@ -107,6 +129,14 @@ pub const OwnedRequest = union(enum) {
         return switch (self) {
             .plain => null,
             .isolated_helper => |value| value.document.helper,
+            .fresh_root_bootstrap => |value| value.document.bootstrap.helper,
+        };
+    }
+
+    pub fn bootstrap(self: OwnedRequest) ?native_helper.Bootstrap {
+        return switch (self) {
+            .fresh_root_bootstrap => |value| value.document.bootstrap,
+            else => null,
         };
     }
 
@@ -120,6 +150,7 @@ pub const OwnedRequest = union(enum) {
         return switch (self) {
             .plain => logical_path,
             .isolated_helper => helper_logical_path,
+            .fresh_root_bootstrap => bootstrap_logical_path,
         };
     }
 };
@@ -159,6 +190,64 @@ pub fn encodeWithHelper(allocator: std.mem.Allocator, document: HelperDocument) 
     return output.toOwnedSlice();
 }
 
+fn bootstrapDigest(document: BootstrapDocument) Digest {
+    var payload = document;
+    payload.digest_sha256 = @splat('0');
+    var buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+    sink.writer.writeAll("debz-native-execution-request-v3\x00") catch unreachable;
+    std.json.Stringify.value(payload, .{ .whitespace = .minified }, &sink.writer) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return native_recovery.hexDigest(sink.hasher.finalResult());
+}
+
+fn validateBootstrapExecution(
+    document: Document,
+    bootstrap: native_helper.Bootstrap,
+) !void {
+    try validate(document);
+    try bootstrap.validate();
+    if (!std.mem.eql(u8, &bootstrap.attempt_id, &document.caller.attempt_id) or
+        !std.mem.eql(u8, &bootstrap.root_identity_sha256, &document.root_identity_sha256) or
+        bootstrap.root_inode != document.root_inode or
+        !std.mem.eql(u8, &bootstrap.plan_sha256, &document.program.plan_sha256) or
+        !std.mem.eql(u8, &bootstrap.authorization_sha256, &document.program.authorization_sha256) or
+        !std.mem.eql(u8, &bootstrap.program_sha256, &document.program.program_sha256) or
+        !std.mem.eql(u8, &bootstrap.exact_lock_sha256, &document.program.exact_lock_sha256))
+        return error.NativeHelperBootstrapBindingMismatch;
+}
+
+pub fn withBootstrap(
+    document: Document,
+    bootstrap: native_helper.Bootstrap,
+) !BootstrapDocument {
+    try validateBootstrapExecution(document, bootstrap);
+    var result: BootstrapDocument = .{
+        .execution = document,
+        .bootstrap = bootstrap,
+    };
+    result.digest_sha256 = bootstrapDigest(result);
+    return result;
+}
+
+pub fn encodeWithBootstrap(
+    allocator: std.mem.Allocator,
+    document: BootstrapDocument,
+) ![]u8 {
+    if (!std.mem.eql(u8, document.schema, bootstrap_schema_id) or document.version != 3)
+        return error.InvalidExecutionRequest;
+    try validateBootstrapExecution(document.execution, document.bootstrap);
+    if (!std.mem.eql(u8, &document.digest_sha256, &bootstrapDigest(document)))
+        return error.DigestMismatch;
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    std.json.Stringify.value(document, .{ .whitespace = .minified }, &output.writer) catch
+        return error.OutOfMemory;
+    output.writer.writeByte('\n') catch return error.OutOfMemory;
+    if (output.written().len > maximum_document_bytes) return error.LimitExceeded;
+    return output.toOwnedSlice();
+}
+
 pub fn decodePersisted(allocator: std.mem.Allocator, bytes: []const u8) !OwnedRequest {
     if (bytes.len > maximum_document_bytes) return error.LimitExceeded;
     const Header = struct { schema: []const u8, version: u32 };
@@ -166,17 +255,29 @@ pub fn decodePersisted(allocator: std.mem.Allocator, bytes: []const u8) !OwnedRe
     defer header.deinit();
     if (std.mem.eql(u8, header.value.schema, schema_id) and header.value.version == 1)
         return .{ .plain = try decode(allocator, bytes) };
-    if (!std.mem.eql(u8, header.value.schema, helper_schema_id) or header.value.version != 2)
+    if (std.mem.eql(u8, header.value.schema, helper_schema_id) and header.value.version == 2) {
+        var parsed = try std.json.parseFromSlice(HelperDocument, allocator, bytes, .{
+            .ignore_unknown_fields = false,
+            .allocate = .alloc_always,
+        });
+        errdefer parsed.deinit();
+        const canonical = try encodeWithHelper(allocator, parsed.value);
+        defer allocator.free(canonical);
+        if (!std.mem.eql(u8, bytes, canonical)) return error.NonCanonicalDocument;
+        return .{ .isolated_helper = .{ .document = parsed.value, .parsed = parsed } };
+    }
+    if (!std.mem.eql(u8, header.value.schema, bootstrap_schema_id) or
+        header.value.version != 3)
         return error.InvalidExecutionRequest;
-    var parsed = try std.json.parseFromSlice(HelperDocument, allocator, bytes, .{
+    var parsed = try std.json.parseFromSlice(BootstrapDocument, allocator, bytes, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
     });
     errdefer parsed.deinit();
-    const canonical = try encodeWithHelper(allocator, parsed.value);
+    const canonical = try encodeWithBootstrap(allocator, parsed.value);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, bytes, canonical)) return error.NonCanonicalDocument;
-    return .{ .isolated_helper = .{ .document = parsed.value, .parsed = parsed } };
+    return .{ .fresh_root_bootstrap = .{ .document = parsed.value, .parsed = parsed } };
 }
 
 fn digest(document: Document) Digest {
@@ -442,4 +543,86 @@ fn roundTripHelper(allocator: std.mem.Allocator) !void {
 
 test "native_execution_request.test.helper wrapper preserves v1 bytes and handles allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, roundTripHelper, .{});
+}
+
+fn roundTripBootstrap(allocator: std.mem.Allocator) !void {
+    const source = native_helper.bundled();
+    const plain = fixtureDocument();
+    const helper = try native_helper.bootstrapBinding(
+        allocator,
+        plain.caller.attempt_id,
+        source,
+    );
+    defer allocator.free(helper.source_path);
+    const bootstrap: native_helper.Bootstrap = .{
+        .attempt_id = plain.caller.attempt_id,
+        .root_identity_sha256 = plain.root_identity_sha256,
+        .root_inode = plain.root_inode,
+        .root_uid = 0,
+        .root_gid = 0,
+        .plan_sha256 = plain.program.plan_sha256,
+        .authorization_sha256 = plain.program.authorization_sha256,
+        .program_sha256 = plain.program.program_sha256,
+        .exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v2",
+        .exact_lock_version = 2,
+        .exact_lock_sha256 = plain.program.exact_lock_sha256,
+        .helper = helper,
+        .owner = .{
+            .package = "dpkg",
+            .version = "1.0",
+            .architecture = "amd64",
+            .final_state = "installed",
+            .artifact = 0,
+            .archive_sha256 = @splat('c'),
+            .archive_size = 4096,
+            .application_sha256 = @splat('d'),
+            .program_step = 7,
+        },
+        .target = .{
+            .sha256 = @splat('e'),
+            .size = 42,
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+        },
+    };
+    const document = try withBootstrap(plain, bootstrap);
+    const bytes = try encodeWithBootstrap(allocator, document);
+    defer allocator.free(bytes);
+    var parsed = try decodePersisted(allocator, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqual(document.digest_sha256, parsed.documentDigest());
+    try std.testing.expect(parsed.bootstrap() != null);
+    try std.testing.expectEqualStrings(
+        bootstrap.helper.source_path,
+        parsed.helper().?.source_path,
+    );
+    try parsed.helper().?.matches(source);
+    var changed = bootstrap;
+    changed.root_identity_sha256 = @splat('f');
+    try std.testing.expectError(
+        error.NativeHelperBootstrapBindingMismatch,
+        withBootstrap(plain, changed),
+    );
+    var stale = plain;
+    stale.caller.attempt_id = @splat('9');
+    seal(&stale);
+    try std.testing.expectError(
+        error.NativeHelperBootstrapBindingMismatch,
+        withBootstrap(stale, bootstrap),
+    );
+    changed = bootstrap;
+    changed.root_uid = 1;
+    try std.testing.expectError(
+        error.InvalidNativeHelperBootstrap,
+        withBootstrap(plain, changed),
+    );
+}
+
+test "native_execution_request.test.fresh-root bootstrap binds attempt owner archive target and helper" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        roundTripBootstrap,
+        .{},
+    );
 }

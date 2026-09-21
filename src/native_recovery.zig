@@ -23,7 +23,7 @@ pub const progress_path = "var/lib/debz/native-execution-progress-v1.log";
 pub const authorization_name = "native-transaction-authorization-v1.json";
 pub const program_name = "native-transaction-program-v1.json";
 pub const blob_prefix = "native-recovery-v1-blob-";
-pub const workspace_directory = "var/lib/debz/native-recovery-v1";
+pub const workspace_directory = native_helper.bootstrap_directory;
 pub const artifact_directory = workspace_directory ++ "/artifacts";
 pub const database_directory = workspace_directory ++ "/database";
 pub const scripts_directory = workspace_directory ++ "/scripts";
@@ -98,6 +98,17 @@ pub fn unpackRouteSettlementStep(path: []const u8) !?u32 {
 
 pub const CrashPoint = enum {
     after_execution_intent,
+    after_helper_source_prepared,
+    during_helper_source_publication,
+    after_helper_source_publication,
+    after_helper_probe_prepared,
+    after_helper_probe_in_flight,
+    after_helper_probe_return_before_outcome,
+    after_helper_probe_outcome,
+    after_helper_probe_completed,
+    after_helper_cleanup_prepared,
+    during_helper_cleanup,
+    after_helper_cleanup_completed,
     during_filesystem_publication,
     during_database_publication,
     after_script_prepared,
@@ -393,6 +404,7 @@ pub fn decodeIntent(allocator: std.mem.Allocator, bytes: []const u8) !OwnedInten
 pub const ActionKind = enum {
     filesystem,
     database,
+    helper,
     script,
     compensation,
     trigger,
@@ -407,6 +419,9 @@ pub const Action = struct {
     substep: u16,
     ordinal: u32,
 };
+
+pub const helper_source_substep = std.math.maxInt(u16) - 1;
+pub const helper_probe_substep = std.math.maxInt(u16);
 
 pub const Stage = enum {
     prepared,
@@ -522,19 +537,27 @@ fn validateProgress(document: ProgressDocument) !void {
             .prepared => if (record.result != .none or
                 (prior != null and
                     !(prior.?.stage == .completed and
-                        prior.?.result == .rolled_back)))
+                        prior.?.result == .rolled_back)) or
+                (record.action.kind == .helper and
+                    record.action.substep != helper_source_substep and
+                    record.action.substep != helper_probe_substep))
                 return error.InvalidProgress,
             .in_flight => if (record.result != .none or prior == null or
                 prior.?.stage != .prepared or
-                (record.action.kind != .script and
+                (record.action.kind != .helper and
+                    record.action.kind != .script and
                     record.action.kind != .compensation and
-                    record.action.kind != .trigger))
+                    record.action.kind != .trigger) or
+                (record.action.kind == .helper and
+                    record.action.substep != helper_probe_substep))
                 return error.InvalidProgress,
             .outcome => if (prior == null or prior.?.stage != .in_flight or
                 (record.result != .exited and
                     record.result != .not_started and
                     record.result != .recovery_required) or
-                record.evidence_sha256 == null)
+                record.evidence_sha256 == null or
+                (record.action.kind == .helper and
+                    record.action.substep != helper_probe_substep))
                 return error.InvalidProgress,
             .completed => {
                 if (record.result == .none or prior == null)
@@ -542,6 +565,15 @@ fn validateProgress(document: ProgressDocument) !void {
                 switch (record.action.kind) {
                     .script, .compensation, .trigger => if (prior.?.stage != .outcome)
                         return error.InvalidProgress,
+                    .helper => {
+                        if ((record.action.substep == helper_source_substep and
+                            prior.?.stage != .prepared) or
+                            (record.action.substep == helper_probe_substep and
+                                prior.?.stage != .outcome) or
+                            (record.action.substep != helper_source_substep and
+                                record.action.substep != helper_probe_substep))
+                            return error.InvalidProgress;
+                    },
                     .filesystem, .database => if (prior.?.stage != .prepared)
                         return error.InvalidProgress,
                     .verification, .provenance, .cleanup => return error.InvalidProgress,
@@ -604,6 +636,7 @@ pub fn initializeProgress(
         "debz-native-execution-progress-v1\x00",
         document,
     );
+    try validateProgress(document);
     const bytes = try canonicalJson(allocator, document);
     defer allocator.free(bytes);
     try root.publishFile(try root_fs.Path.init(progress_path), bytes, .{
@@ -687,6 +720,7 @@ pub fn appendProgress(
         "debz-native-execution-progress-v1\x00",
         document,
     );
+    try validateProgress(document);
     const bytes = try canonicalJson(allocator, document);
     defer allocator.free(bytes);
     if (bytes.len > maximum_progress_bytes) return error.LimitExceeded;
@@ -725,6 +759,8 @@ pub const Runtime = struct {
     staging_directory_initially_present: bool = false,
     caller_owned: bool = false,
     helper_binding: ?native_helper.Binding = null,
+    helper_bootstrap: ?native_helper.Bootstrap = null,
+    helper_source: ?native_helper.Source = null,
 
     pub fn append(
         self: *Runtime,
@@ -3396,6 +3432,63 @@ pub fn testContracts() !void {
 
 test "native_recovery.test.progress chain rejects reordered records" {
     try checkProgressChain();
+}
+
+test "native_recovery.test.helper publication probe and unknown outcome transitions are exact" {
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(
+        try root_fs.Path.init(root_operation.namespace_path),
+        root_fs.default_directory_permissions,
+    );
+    const intent: Digest = @splat('a');
+    try initializeProgress(testing.allocator, root, intent);
+    const source: Action = .{
+        .kind = .helper,
+        .program_step = 7,
+        .substep = helper_source_substep,
+        .ordinal = 0,
+    };
+    const probe: Action = .{
+        .kind = .helper,
+        .program_step = 7,
+        .substep = helper_probe_substep,
+        .ordinal = 0,
+    };
+    try appendProgress(testing.allocator, root, intent, source, .prepared, .none, null);
+    try appendProgress(testing.allocator, root, intent, source, .completed, .applied, null);
+    try appendProgress(testing.allocator, root, intent, probe, .prepared, .none, null);
+    try appendProgress(testing.allocator, root, intent, probe, .in_flight, .none, null);
+    try appendProgress(testing.allocator, root, intent, probe, .outcome, .exited, @splat('b'));
+    try appendProgress(testing.allocator, root, intent, probe, .completed, .succeeded, null);
+    var progress = try readProgress(testing.allocator, root);
+    defer progress.deinit();
+    try testing.expectEqual(Stage.completed, latest(progress.document, source).?.stage);
+    try testing.expectEqual(Stage.completed, latest(progress.document, probe).?.stage);
+    try testing.expectError(
+        error.InvalidProgress,
+        appendProgress(testing.allocator, root, intent, source, .in_flight, .none, null),
+    );
+    var invalid_probe = probe;
+    invalid_probe.ordinal = 1;
+    try appendProgress(testing.allocator, root, intent, invalid_probe, .prepared, .none, null);
+    try appendProgress(testing.allocator, root, intent, invalid_probe, .in_flight, .none, null);
+    try testing.expectError(
+        error.InvalidProgress,
+        appendProgress(testing.allocator, root, intent, invalid_probe, .outcome, .exited, null),
+    );
+    const wrong: Action = .{
+        .kind = .helper,
+        .program_step = 7,
+        .substep = 1,
+        .ordinal = 0,
+    };
+    try testing.expectError(
+        error.InvalidProgress,
+        appendProgress(testing.allocator, root, intent, wrong, .prepared, .none, null),
+    );
 }
 
 test "native_recovery.test.intent binds immutable execution evidence" {

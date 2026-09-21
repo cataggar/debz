@@ -115,6 +115,8 @@ def native(
     recovery_crash: str | None = None,
     deadline_after_ms: int | None = None,
     policy: str | None = None,
+    helper_bootstrap_expectation: str | None = None,
+    ordered_actions: list[dict] | None = None,
 ) -> dict | None:
     m.reference_command(root)
     if operation == "recover" and (archives or packages or crash_at is not None or policy is not None):
@@ -133,6 +135,8 @@ def native(
     if recovery_crash is not None:
         if operation != "recover" or not caller_owned or not isolated_helper or core_product or recovery_crash not in (
             "during_known_unpack_rollback", "after_known_unpack_rollback",
+            "after_helper_cleanup_prepared", "during_helper_cleanup",
+            "after_helper_cleanup_completed",
         ):
             raise ValueError("rollback crashes require a recovering helper-bound runtime caller")
         request["crash_at"] = recovery_crash
@@ -160,6 +164,20 @@ def native(
         if deadline_after_ms < 0 or not caller_owned or not isolated_helper or core_product:
             raise ValueError("execution deadlines require a typed helper-bound caller")
         request["deadline_after_ms"] = deadline_after_ms
+    if helper_bootstrap_expectation is not None:
+        if helper_bootstrap_expectation not in (
+            "completed", "script_completed", "cleaned", "outcome_unknown",
+            "script_outcome_unknown", "ambient_target_rejected",
+            "ambient_source_rejected",
+        ):
+            raise ValueError("invalid helper bootstrap expectation")
+        if not caller_owned or not isolated_helper:
+            raise ValueError("helper bootstrap expectations require the typed native caller")
+        request["helper_bootstrap_expectation"] = helper_bootstrap_expectation
+    if ordered_actions is not None:
+        if operation == "recover":
+            raise ValueError("recovery reuses persisted ordered actions")
+        request["ordered_actions"] = ordered_actions
     m.write(request_path, json.dumps(request).encode())
     with (destination / "native.log").open("wb") as output:
         result = subprocess.run(
@@ -388,8 +406,8 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
             continue
         value = json.loads(raw)
         schema = EVIDENCE_SCHEMAS[kind]
-        if kind == "execution_request" and value.get("version") == 2:
-            schema = "native-execution-request-v2"
+        if kind == "execution_request" and value.get("version") in (2, 3):
+            schema = f"native-execution-request-v{value['version']}"
         validator(schema).validate(value)
         assert_digest(value, schema)
         if value["digest_sha256"] != entry["document_sha256"]:
@@ -477,7 +495,9 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
     if len(request_blobs) != 1:
         raise AssertionError("intent did not retain exactly one request binding")
     if request_blobs[0]["logical_path"] in (
-        "request/native-execution-request-v1.json", "request/native-execution-request-v2.json",
+        "request/native-execution-request-v1.json",
+        "request/native-execution-request-v2.json",
+        "request/native-execution-request-v3.json",
     ):
         requests = documents.get("execution_request", [])
         if len(requests) != 1:
@@ -485,8 +505,12 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
         request_bytes = canonical(requests[0]) + b"\n"
         if hashlib.sha256(request_bytes).hexdigest() != request_blobs[0]["sha256"]:
             raise AssertionError("retained production request differs from the execution intent")
-        if requests[0]["version"] == 2:
-            helper = requests[0]["helper"]
+        if requests[0]["version"] in (2, 3):
+            helper = (
+                requests[0]["helper"]
+                if requests[0]["version"] == 2
+                else requests[0]["bootstrap"]["helper"]
+            )
             binaries = [entry for entry in proof["evidence_files"] if entry["kind"] == "helper_binary"]
             if len(binaries) != 1 or binaries[0]["sha256"] != helper["sha256"] or binaries[0]["size"] != helper["size"]:
                 raise AssertionError("retained helper differs from the original request")
@@ -589,7 +613,11 @@ def assert_helper_invocations(request: dict, program: dict, scripts: list[dict])
         encoded = value.encode()
         return len(encoded).to_bytes(8, "little") + encoded
 
-    helper = request["helper"]
+    helper = (
+        request["helper"]
+        if "helper" in request
+        else request["bootstrap"]["helper"]
+    )
     for script in scripts:
         name, architecture, kind = script["package"], script["architecture"], script["kind"]
         staged_name = name if script["source"] == "new_package" else f"{name}:{architecture}"
@@ -733,7 +761,7 @@ def provenance(root: Path, report: dict, binding: dict, *, script_sources: dict 
     retained_binding = intent_binding(intent)
     if "execution_request" in retained:
         request = retained["execution_request"][0]
-        if request["version"] == 2:
+        if request["version"] in (2, 3):
             request = request["execution"]
         caller = request["caller"]
         program = retained["program"][0]
@@ -758,7 +786,7 @@ def provenance(root: Path, report: dict, binding: dict, *, script_sources: dict 
     assert_progress(value, retained["progress"][0], scripts)
     for script in scripts:
         assert_script_output(script, script_sources)
-    if retained.get("execution_request", [{}])[0].get("version") == 2:
+    if retained.get("execution_request", [{}])[0].get("version") in (2, 3):
         assert_helper_invocations(retained["execution_request"][0], retained["program"][0], scripts)
     assert_script_trace(root, value, scripts)
     managed = retained["managed_state"][0]
@@ -804,6 +832,7 @@ class Scenario(triggers.Scenario):
         core_product: bool = False,
         policy: str | None = None,
         packages: tuple[str, ...] = (),
+        ordered_actions: list[dict] | None = None,
     ) -> dict:
         destination = self.directory / "crash"
         destination.mkdir()
@@ -823,6 +852,7 @@ class Scenario(triggers.Scenario):
             isolated_helper=isolated_helper,
             core_product=core_product,
             policy=policy,
+            ordered_actions=ordered_actions,
         )
         binding = caller_binding(self.candidate) if caller_owned else intent_binding(
             document(self.candidate / INTENT, 16 * 1024 * 1024),
@@ -840,7 +870,9 @@ class Scenario(triggers.Scenario):
     def recover(self, *, trigger_execution: bool = False, label: str = "recover",
                 caller_owned: bool = False, acknowledge_native: bool = False,
                 isolated_helper: bool = False, core_product: bool = False,
-                deadline_after_ms: int | None = None) -> dict:
+                deadline_after_ms: int | None = None,
+                recovery_crash: str | None = None,
+                helper_bootstrap_expectation: str | None = None) -> dict | None:
         destination = self.directory / label
         destination.mkdir()
         report = native(
@@ -850,8 +882,11 @@ class Scenario(triggers.Scenario):
             isolated_helper=isolated_helper,
             core_product=core_product,
             deadline_after_ms=deadline_after_ms,
+            recovery_crash=recovery_crash,
+            helper_bootstrap_expectation=helper_bootstrap_expectation,
         )
-        assert report is not None
+        if recovery_crash is None:
+            assert report is not None
         return report
 
     def caller_completed(self, binding: dict, *, failure: bool = False, isolated_helper: bool = False) -> None:
@@ -4681,6 +4716,337 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         print(f"native-repository-dispatch-{case}: original request lifecycle and typed results passed", flush=True)
 
 
+def fresh_helper_scenario(
+    executable: Path,
+    helper: Path,
+    workspace: Path,
+    environment: dict[str, str],
+    architecture: str,
+    name: str,
+    *,
+    postinst: bool = False,
+) -> tuple[Scenario, Path, str]:
+    package = f"debz-fresh-helper-{name}"
+    current = Scenario(
+        workspace,
+        f"fresh-helper-{name}",
+        executable,
+        helper,
+        architecture,
+        environment,
+    )
+    for root in current.roots:
+        (root / triggers.HELPER).unlink()
+    archive = m.make_package(
+        workspace / f"packages/fresh-helper-{name}",
+        environment,
+        architecture,
+        "1",
+        package=package,
+        scripts={
+            "postinst": b"#!/bin/sh\nexit 0\n",
+        } if postinst else None,
+        control_fields={"Essential": "yes"},
+        prepare_payload=lambda source: m.write(
+            source / triggers.HELPER,
+            f"package-owned dpkg-trigger for {name}\n".encode(),
+            0o755,
+        ),
+    )
+    return current, archive, package
+
+
+def exercise_fresh_helper_bootstrap(
+    executable: Path,
+    helper: Path,
+    workspace: Path,
+    environment: dict[str, str],
+    architecture: str,
+) -> None:
+    recoverable = (
+        "after_execution_intent",
+        "during_filesystem_publication",
+        "during_database_publication",
+        "after_helper_source_prepared",
+        "during_helper_source_publication",
+        "after_helper_source_publication",
+        "after_helper_probe_prepared",
+        "after_helper_probe_outcome",
+        "after_helper_probe_completed",
+        "after_provenance",
+    )
+    for boundary in recoverable:
+        name = boundary.replace("_", "-")
+        current, archive, package = fresh_helper_scenario(
+            executable,
+            helper,
+            workspace,
+            environment,
+            architecture,
+            name,
+        )
+        current.crash(
+            "install",
+            [archive],
+            boundary,
+            caller_owned=True,
+            isolated_helper=True,
+            ordered_actions=lifecycle.ordered(architecture, [
+                ("bootstrap_extract", package),
+                ("unpack", package),
+                ("configure_pending", package),
+            ]),
+        )
+        report = current.recover(
+            caller_owned=True,
+            isolated_helper=True,
+            helper_bootstrap_expectation="completed",
+        )
+        assert report is not None
+        report = current.recover(
+            label="acknowledge",
+            caller_owned=True,
+            isolated_helper=True,
+            acknowledge_native=True,
+            helper_bootstrap_expectation="cleaned",
+        )
+        assert report is not None
+        compare(current.expected, current.candidate)
+
+    for boundary in (
+        "after_helper_probe_in_flight",
+        "after_helper_probe_return_before_outcome",
+    ):
+        name = boundary.replace("_", "-")
+        current, archive, package = fresh_helper_scenario(
+            executable,
+            helper,
+            workspace,
+            environment,
+            architecture,
+            name,
+        )
+        current.crash(
+            "install",
+            [archive],
+            boundary,
+            caller_owned=True,
+            isolated_helper=True,
+            ordered_actions=lifecycle.ordered(architecture, [
+                ("bootstrap_extract", package),
+                ("unpack", package),
+                ("configure_pending", package),
+            ]),
+        )
+        for index in range(2):
+            report = current.recover(
+                label=f"blocked-{index}",
+                caller_owned=True,
+                isolated_helper=True,
+                helper_bootstrap_expectation="outcome_unknown",
+            )
+            assert report is not None
+
+    current, archive, package = fresh_helper_scenario(
+        executable,
+        helper,
+        workspace,
+        environment,
+        architecture,
+        "ambient-target",
+    )
+    current.crash(
+        "install",
+        [archive],
+        "after_execution_intent",
+        caller_owned=True,
+        isolated_helper=True,
+        ordered_actions=lifecycle.ordered(architecture, [
+            ("bootstrap_extract", package),
+            ("unpack", package),
+            ("configure_pending", package),
+        ]),
+    )
+    m.write(
+        current.candidate / triggers.HELPER,
+        b"package-owned dpkg-trigger for ambient-target\n",
+        0o755,
+    )
+    for index in range(2):
+        report = current.recover(
+            label=f"ambient-target-blocked-{index}",
+            caller_owned=True,
+            isolated_helper=True,
+            helper_bootstrap_expectation="ambient_target_rejected",
+        )
+        assert report is not None
+
+    current, archive, package = fresh_helper_scenario(
+        executable,
+        helper,
+        workspace,
+        environment,
+        architecture,
+        "ambient-source",
+    )
+    current.crash(
+        "install",
+        [archive],
+        "after_execution_intent",
+        caller_owned=True,
+        isolated_helper=True,
+        ordered_actions=lifecycle.ordered(architecture, [
+            ("bootstrap_extract", package),
+            ("unpack", package),
+            ("configure_pending", package),
+        ]),
+    )
+    request = document(
+        current.candidate / NAMESPACE /
+        "native-recovery-v1/request/native-lifecycle.json",
+    )
+    m.write(
+        current.candidate / request["bootstrap"]["helper"]["source_path"],
+        helper.read_bytes(),
+        0o500,
+    )
+    for index in range(2):
+        report = current.recover(
+            label=f"ambient-source-blocked-{index}",
+            caller_owned=True,
+            isolated_helper=True,
+            helper_bootstrap_expectation="ambient_source_rejected",
+        )
+        assert report is not None
+
+    for boundary in (
+        "after_helper_cleanup_prepared",
+        "during_helper_cleanup",
+        "after_helper_cleanup_completed",
+    ):
+        name = boundary.replace("_", "-")
+        current, archive, package = fresh_helper_scenario(
+            executable,
+            helper,
+            workspace,
+            environment,
+            architecture,
+            f"cleanup-{name}",
+        )
+        current.crash(
+            "install",
+            [archive],
+            "after_helper_probe_completed",
+            caller_owned=True,
+            isolated_helper=True,
+            ordered_actions=lifecycle.ordered(architecture, [
+                ("bootstrap_extract", package),
+                ("unpack", package),
+                ("configure_pending", package),
+            ]),
+        )
+        report = current.recover(
+            caller_owned=True,
+            isolated_helper=True,
+            helper_bootstrap_expectation="completed",
+        )
+        assert report is not None
+        crashed = current.recover(
+            label="cleanup-crash",
+            caller_owned=True,
+            isolated_helper=True,
+            acknowledge_native=True,
+            recovery_crash=boundary,
+        )
+        assert crashed is None
+        report = current.recover(
+            label="cleanup-retry",
+            caller_owned=True,
+            isolated_helper=True,
+            acknowledge_native=True,
+            helper_bootstrap_expectation="cleaned",
+        )
+        assert report is not None
+        compare(current.expected, current.candidate)
+
+    for boundary in (
+        "after_script_prepared",
+        "after_script_outcome",
+    ):
+        name = f"script-{boundary.replace('_', '-')}"
+        current, archive, package = fresh_helper_scenario(
+            executable,
+            helper,
+            workspace,
+            environment,
+            architecture,
+            name,
+            postinst=True,
+        )
+        current.crash(
+            "install",
+            [archive],
+            boundary,
+            caller_owned=True,
+            isolated_helper=True,
+            ordered_actions=lifecycle.ordered(architecture, [
+                ("bootstrap_extract", package),
+                ("unpack", package),
+                ("configure_pending", package),
+            ]),
+        )
+        report = current.recover(
+            caller_owned=True,
+            isolated_helper=True,
+            helper_bootstrap_expectation="script_completed",
+        )
+        assert report is not None
+        report = current.recover(
+            label="acknowledge",
+            caller_owned=True,
+            isolated_helper=True,
+            acknowledge_native=True,
+            helper_bootstrap_expectation="cleaned",
+        )
+        assert report is not None
+        compare(current.expected, current.candidate)
+
+    for boundary in (
+        "after_script_return_before_outcome",
+    ):
+        name = f"script-{boundary.replace('_', '-')}"
+        current, archive, package = fresh_helper_scenario(
+            executable,
+            helper,
+            workspace,
+            environment,
+            architecture,
+            name,
+            postinst=True,
+        )
+        current.crash(
+            "install",
+            [archive],
+            boundary,
+            caller_owned=True,
+            isolated_helper=True,
+            ordered_actions=lifecycle.ordered(architecture, [
+                ("bootstrap_extract", package),
+                ("unpack", package),
+                ("configure_pending", package),
+            ]),
+        )
+        for index in range(2):
+            report = current.recover(
+                label=f"blocked-script-{index}",
+                caller_owned=True,
+                isolated_helper=True,
+                helper_bootstrap_expectation="script_outcome_unknown",
+            )
+            assert report is not None
+    print("native-fresh-helper-bootstrap: journal, recovery, eviction and cleanup passed", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("native_test", type=Path)
@@ -4694,11 +5060,12 @@ def main() -> int:
     parser.add_argument("--repository-cli-only", action="store_true")
     parser.add_argument("--consumer-parity-only", action="store_true")
     parser.add_argument("--diversions-only", action="store_true")
+    parser.add_argument("--fresh-helper-only", action="store_true")
     parser.add_argument("--result-cli", type=Path)
     arguments = parser.parse_args()
     if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only,
             arguments.repository_execution_only, arguments.repository_cli_only, arguments.consumer_parity_only,
-            arguments.diversions_only)) > 1:
+            arguments.diversions_only, arguments.fresh_helper_only)) > 1:
         parser.error("native recovery workload selectors are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -4733,6 +5100,14 @@ def main() -> int:
             environment = m.fixture_environment(workspace)
             if arguments.diversions_only:
                 exercise_diversion_recovery(executable, helper, workspace, environment, architecture)
+            elif arguments.fresh_helper_only:
+                exercise_fresh_helper_bootstrap(
+                    executable,
+                    helper,
+                    workspace,
+                    environment,
+                    architecture,
+                )
             elif arguments.consumer_parity_only:
                 if result_cli is None:
                     parser.error("consumer parity requires --result-cli")
@@ -4776,6 +5151,13 @@ def main() -> int:
                         exercise(executable, helper, workspace, environment, architecture)
                         exercise_scriptless_recovery(executable, helper, workspace, environment, architecture)
                     exercise_core(executable, helper, workspace, environment, architecture)
+                    exercise_fresh_helper_bootstrap(
+                        executable,
+                        helper,
+                        workspace,
+                        environment,
+                        architecture,
+                    )
                     exercise_workflows(executable, workspace, environment, architecture, result_cli)
                     if not arguments.core_only:
                         if result_cli is None:

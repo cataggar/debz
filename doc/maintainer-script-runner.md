@@ -117,10 +117,14 @@ target and helper digest, which are also bound into invocation evidence.
 Requests without a helper retain their existing execution and digest contract.
 
 The experimental `debz.native_runtime` API supplies build-bound helper bytes through
-`debz.native_helper`, records the deployment in a v2 execution request, and
-requires the probe before package mutation. It refuses absent targets without
-creating placeholders. Helper-aware recovery revalidates the original binding;
-it never falls back to a package-owned executable. See
+`debz.native_helper`, records seeded-root deployment in a v2 execution request,
+and requires the probe before package mutation. It refuses absent targets
+without creating placeholders except for the authenticated v3 fresh-root
+protocol: the owning archive's exact target is first published by the normal
+journaled package payload step, then an attempt-scoped private source is
+published and probed. Helper-aware recovery revalidates the original binding;
+it never falls back to a package-owned executable or treats bootstrap bytes as
+the final target. See
 [native recovery and helper deployment](native-recovery.md#isolated-helper-request-v2).
 
 The privileged `test-native-helper-namespace` target requires the positive

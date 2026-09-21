@@ -55,6 +55,7 @@
           "enum": [
             "filesystem",
             "database",
+            "helper",
             "script",
             "compensation",
             "trigger",
