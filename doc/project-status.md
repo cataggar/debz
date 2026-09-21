@@ -115,6 +115,16 @@ retain invocation/authority evidence and block re-entry. The helper is not
 installed as a standalone release executable; core execution embeds it. See
 [Native trigger execution](native-triggers.md).
 
+Fresh roots use a v3 helper bootstrap only when the exact authenticated `dpkg`
+archive carries `usr/bin/dpkg-trigger`: the ordinary package payload journal
+publishes the final target before an attempt-scoped private helper is created.
+The request binds root/attempt/program/lock/archive/target/helper/final-owner
+evidence, final database ownership must be unique, unknown probe outcomes
+block, and terminal cleanup removes the private source without ever publishing
+a placeholder or invoking dpkg tools. Other script tools, including
+`update-alternatives`, remain independently fail-closed on their authenticated
+root payload and pinned architecture digest.
+
 Item 14 adds private native-step journaling, persisted execution inputs, and
 recovery/provenance orchestration. Recovery consumes the original compiled
 authority without caller archives or recompilation, delegates primitive repair

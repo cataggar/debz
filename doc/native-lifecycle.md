@@ -173,11 +173,17 @@ refused before mutation. The separate typed
 [production request and recovery boundary](native-recovery.md#caller-owned-production-request-and-completion)
 persists both hash domains, resumes original inputs, and publishes native
 terminal evidence without completing the caller. Cleanup requires explicit
-receipt acknowledgment. The helper-aware variant embeds and stages trusted
-helper bytes, probes namespace capability before package mutation, and records
-the isolated helper binding in a v2 request. Missing targets are refused without
-creating placeholders. `debz.native_runtime` now exposes the trusted-helper-only
-typed execution/recovery/acknowledgment path; fixture controls remain private.
+receipt acknowledgment. On seeded roots, the helper-aware variant embeds and
+stages trusted helper bytes, probes namespace capability before package
+mutation, and records the isolated helper binding in a v2 request. Missing
+targets are refused without creating placeholders unless a v3 fresh-root
+request proves an empty settled database and the exact authenticated owner
+archive. In that case the normal bootstrap payload step publishes the final
+package bytes first; only then may an attempt-scoped private helper source be
+journaled, probed and mounted for later scripts. Final verification requires
+the bound package database record to own the target. `debz.native_runtime` now
+exposes the trusted-helper-only typed execution/recovery/acknowledgment path;
+fixture controls remain private.
 Core product/CLI execution/recovery binds native receipts to outer completion
 before acknowledgment and cleanup. Other consumers remain independently gated.
 

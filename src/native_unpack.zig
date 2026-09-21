@@ -270,7 +270,8 @@ fn checkpointRolledBackNativePhase(
     steps: []const root_mutation.Step,
     journal_device: u64,
 ) !?native_recovery.Digest {
-    if (try unpackInputProtocol(allocator, runtime, action) != .legacy)
+    if (action.kind == .database or
+        try unpackInputProtocol(allocator, runtime, action) != .legacy)
         return try native_recovery.checkpointRolledBackMutation(
             allocator,
             runtime.root,
@@ -13765,6 +13766,16 @@ const ExternalLifecycleAction = struct {
     architecture: []const u8,
 };
 
+const HelperBootstrapExpectation = enum {
+    completed,
+    script_completed,
+    cleaned,
+    outcome_unknown,
+    script_outcome_unknown,
+    ambient_target_rejected,
+    ambient_source_rejected,
+};
+
 const ExternalLifecycleRequest = struct {
     root: []const u8,
     architecture: []const u8,
@@ -13785,6 +13796,7 @@ const ExternalLifecycleRequest = struct {
     core_completion_crash: ?@import("production_backend.zig").CompletionPoint = null,
     isolated_helper: bool = false,
     deadline_after_ms: ?u64 = null,
+    helper_bootstrap_expectation: ?HelperBootstrapExpectation = null,
 };
 
 const LifecycleOutcome = enum {
@@ -17731,7 +17743,8 @@ fn retainNativeEvidence(
     for (intent.blobs) |blob| {
         if (blob.kind != .request or
             (!std.mem.eql(u8, blob.logical_path, native_execution_request.logical_path) and
-                !std.mem.eql(u8, blob.logical_path, native_execution_request.helper_logical_path)))
+                !std.mem.eql(u8, blob.logical_path, native_execution_request.helper_logical_path) and
+                !std.mem.eql(u8, blob.logical_path, native_execution_request.bootstrap_logical_path)))
             continue;
         const bytes = try native_recovery.verifyBlob(scratch, root, blob);
         var request = try native_execution_request.decodePersisted(scratch, bytes);
@@ -18586,7 +18599,11 @@ fn runLifecycleScript(
     defer if (helper_mount) |*mount| mount.deinit();
     if (execution.recovery) |runtime| {
         if (runtime.helper_binding) |helper| {
-            helper_mount = native_helper.bind(allocator, root, helper) catch |err| {
+            try requireNativeHelperBootstrapReady(allocator, root, runtime.*);
+            helper_mount = (if (runtime.helper_bootstrap) |bootstrap|
+                native_helper.bindBootstrap(allocator, root, bootstrap)
+            else
+                native_helper.bind(allocator, root, helper)) catch |err| {
                 if (attempt.record().mutation_started)
                     try attempt.requireRecovery(allocator, .script);
                 return err;
@@ -19279,6 +19296,10 @@ fn finishLifecycleAttempt(
     );
     var progress = try native_recovery.readProgress(allocator, root);
     defer progress.deinit();
+    try native_recovery.validateHelperActions(
+        progress.document,
+        runtime.helper_bootstrap,
+    );
     var terminal_result: native_recovery.Result = if (succeeded)
         if (runtime.recovering) .recovered else .succeeded
     else
@@ -19477,7 +19498,13 @@ fn finishLifecycleAttempt(
     runtime.crash.hit(.after_provenance);
     try attempt.clear();
     runtime.crash.hit(.after_active_clear);
-    try cleanupNativeExecutionEvidence(allocator, root, owned_intent.intent, progress.document);
+    try cleanupNativeExecutionEvidence(
+        allocator,
+        root,
+        owned_intent.intent,
+        progress.document,
+        runtime.crash,
+    );
 }
 
 fn cleanupNativeExecutionEvidence(
@@ -19485,7 +19512,46 @@ fn cleanupNativeExecutionEvidence(
     root: root_fs.Root,
     intent: native_recovery.Intent,
     progress: native_recovery.ProgressDocument,
+    crash: native_recovery.CrashController,
 ) !void {
+    const active_evidence =
+        try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null;
+    for (intent.blobs) |blob| {
+        if (blob.kind != .request or
+            !std.mem.eql(u8, blob.logical_path, native_execution_request.bootstrap_logical_path))
+            continue;
+        if (!active_evidence) continue;
+        const bytes = try native_recovery.verifyBlob(allocator, root, blob);
+        defer allocator.free(bytes);
+        var request = try native_execution_request.decodePersisted(allocator, bytes);
+        defer request.deinit();
+        const bootstrap = request.bootstrap() orelse
+            return error.NativeHelperBootstrapBindingMismatch;
+        if (native_helper.prepareBootstrapCleanup(
+            allocator,
+            root,
+            bootstrap,
+        )) |_| {
+            crash.hit(.after_helper_cleanup_prepared);
+            try native_helper.removeBootstrapSource(allocator, root, bootstrap);
+            crash.hit(.during_helper_cleanup);
+            try native_helper.completeBootstrapCleanup(allocator, root, bootstrap);
+            crash.hit(.after_helper_cleanup_completed);
+        } else |err| switch (err) {
+            error.NativeHelperEvidenceMissing => try native_helper.verifyBootstrapCompletionState(
+                allocator,
+                root,
+                bootstrap,
+                true,
+            ),
+            else => return err,
+        }
+        try native_helper.finishBootstrapCleanupJournal(
+            allocator,
+            root,
+            bootstrap,
+        );
+    }
     for (progress.records) |entry| {
         if (entry.action.kind != .script and
             entry.action.kind != .compensation and
@@ -19609,6 +19675,62 @@ fn verifyLifecycleFinalClosure(
     return lifecycleFinalClosureMatches(expected_state, database);
 }
 
+fn verifyNativeHelperBootstrapFinalOwner(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    runtime: native_recovery.Runtime,
+) !bool {
+    const bootstrap = runtime.helper_bootstrap orelse return true;
+    try requireNativeHelperBootstrapReady(allocator, root, runtime);
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return false,
+    };
+    defer database.deinit();
+    return nativeHelperBootstrapFinalOwnerMatches(
+        allocator,
+        database.model,
+        bootstrap.owner,
+    );
+}
+
+fn nativeHelperBootstrapFinalOwnerMatches(
+    allocator: std.mem.Allocator,
+    model: package_database.Model,
+    expected: native_helper.BootstrapOwner,
+) !bool {
+    const owner = model.find(
+        expected.package,
+        expected.architecture,
+    ) orelse return false;
+    if (!std.mem.eql(u8, owner.version, expected.version) or
+        owner.status.error_state != .ok or
+        !std.mem.eql(u8, @tagName(owner.status.current), expected.final_state))
+        return false;
+    var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const owned_path = try std.fmt.bufPrint(
+        &buffer,
+        "/{s}",
+        .{native_helper.target_path},
+    );
+    const owners = try model.owners(allocator, owned_path);
+    defer allocator.free(owners);
+    return owners.len == 1 and
+        std.mem.eql(u8, owners[0].name, expected.package) and
+        std.mem.eql(u8, owners[0].architecture, expected.architecture);
+}
+
 fn recoveryBlobEntryKind(
     value: package_database.EntryKind,
 ) native_recovery.EntryKind {
@@ -19730,6 +19852,8 @@ fn prepareNativeRecovery(
     attempt: *root_operation.Attempt,
     production_request: ?native_execution_request.Document,
     helper_binding: ?native_helper.Binding,
+    helper_bootstrap: ?native_helper.Bootstrap,
+    helper_source: ?native_helper.Source,
 ) !native_recovery.Runtime {
     if (production_request) |request| {
         try native_execution_request.validateBinding(request, root, attempt, compiled.program.program);
@@ -19738,6 +19862,10 @@ fn prepareNativeRecovery(
         if (!std.mem.eql(u8, &decoded.execution().digest_sha256, &request.digest_sha256))
             return error.RecoveryRequestBindingMismatch;
         try matchNativeHelperBinding(decoded.helper(), helper_binding);
+        if ((decoded.bootstrap() == null) != (helper_bootstrap == null) or
+            (decoded.bootstrap() != null and
+                !decoded.bootstrap().?.eql(helper_bootstrap.?)))
+            return error.NativeHelperBootstrapBindingMismatch;
     } else {
         var observed: [32]u8 = undefined;
         Sha256.hash(raw_request, &observed, .{});
@@ -19787,7 +19915,9 @@ fn prepareNativeRecovery(
         &blobs,
         .request,
         "request",
-        if (helper_binding != null)
+        if (helper_bootstrap != null)
+            native_execution_request.bootstrap_logical_path
+        else if (helper_binding != null)
             native_execution_request.helper_logical_path
         else if (production_request != null)
             native_execution_request.logical_path
@@ -20014,11 +20144,18 @@ fn prepareNativeRecovery(
     native_recovery.sealIntent(&intent);
     if (production_request) |request| try native_execution_request.validateIntent(request, intent);
     try native_recovery.publishIntent(allocator, root, intent);
-    try native_recovery.initializeProgress(
-        allocator,
-        root,
-        intent.digest_sha256,
-    );
+    if (helper_bootstrap != null)
+        try native_recovery.initializeBootstrapProgress(
+            allocator,
+            root,
+            intent.digest_sha256,
+        )
+    else
+        try native_recovery.initializeProgress(
+            allocator,
+            root,
+            intent.digest_sha256,
+        );
     try native_recovery.initializeTriggerEvents(
         allocator,
         root,
@@ -20078,6 +20215,8 @@ fn prepareNativeRecovery(
         .staging_directory_initially_present = staging_directory_initially_present,
         .caller_owned = production_request != null,
         .helper_binding = helper_binding,
+        .helper_bootstrap = helper_bootstrap,
+        .helper_source = helper_source,
     };
 }
 
@@ -22243,8 +22382,9 @@ pub const Runtime = struct {
         return report(allocator, attempt, bounded);
     }
 
-    /// Returns independently owned terminal evidence without probing or
-    /// requiring the current package-owned helper target.
+    /// Returns independently owned terminal evidence without probing. Seeded
+    /// v2 requests retain their historical target-independent completion read;
+    /// v3 requests revalidate the final target and private source.
     pub fn readCompletion(
         allocator: std.mem.Allocator,
         attempt: *root_operation.Attempt,
@@ -22258,6 +22398,16 @@ pub const Runtime = struct {
         defer request.deinit();
         const helper = request.helper() orelse return error.NativeHelperBindingRequired;
         try helper.matches(native_helper.bundled());
+        if (request.bootstrap()) |bootstrap| {
+            const active_evidence =
+                try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null;
+            try native_helper.verifyBootstrapCompletionState(
+                allocator,
+                root,
+                bootstrap,
+                active_evidence,
+            );
+        }
         return receipt;
     }
 
@@ -22319,7 +22469,17 @@ pub const Runtime = struct {
         attempt: *root_operation.Attempt,
         expected_receipt: native_provenance.Digest,
     ) !void {
-        var receipt = try readCompletion(allocator, attempt) orelse return error.RecoveryEvidenceMissing;
+        return acknowledgeWithCrash(allocator, attempt, expected_receipt, null);
+    }
+
+    fn acknowledgeWithCrash(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        expected_receipt: native_provenance.Digest,
+        crash_at: ?native_recovery.CrashPoint,
+    ) !void {
+        var receipt = try readCompletion(allocator, attempt) orelse
+            return error.RecoveryEvidenceMissing;
         defer receipt.deinit();
         if (!std.mem.eql(u8, &receipt.document.digest_sha256, &expected_receipt))
             return error.InvalidRecoveryProvenance;
@@ -22328,6 +22488,7 @@ pub const Runtime = struct {
             attempt.coordinator.root,
             attempt,
             expected_receipt,
+            crash_at,
         );
     }
 
@@ -22433,9 +22594,12 @@ fn matchNativeHelperBinding(left: ?native_helper.Binding, right: ?native_helper.
         if ((left == null) != (right == null)) return error.NativeHelperBindingRequired;
         return;
     }
-    try left.?.validate();
-    try right.?.validate();
-    if (left.?.size != right.?.size or !std.mem.eql(u8, &left.?.sha256, &right.?.sha256))
+    try left.?.validateAny();
+    try right.?.validateAny();
+    if (left.?.size != right.?.size or
+        !std.mem.eql(u8, &left.?.sha256, &right.?.sha256) or
+        !std.mem.eql(u8, left.?.source_path, right.?.source_path) or
+        !std.mem.eql(u8, left.?.target_path, right.?.target_path))
         return error.NativeHelperDigestMismatch;
 }
 
@@ -22444,7 +22608,7 @@ fn verifyNativeHelperBytes(
     root: root_fs.Root,
     helper: native_helper.Binding,
 ) !void {
-    try helper.validate();
+    try helper.validateAny();
     const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init(helper.source_path), native_helper.maximum_bytes);
     defer allocator.free(bytes);
     var sha256: [32]u8 = undefined;
@@ -22476,19 +22640,7 @@ fn executePreparedNativeProgramWithHelper(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var deployment: ?native_helper.Deployment = null;
-    defer if (deployment) |*value| value.deinit();
-    if (helper_source) |source| {
-        deployment = try native_helper.stage(allocator, root, source);
-        try probeNativeHelperWithBounds(allocator, root, deployment.?.binding, bounds);
-    }
     const document = try native_execution_request.create(root, attempt, program, operation);
-    const bytes = if (deployment) |value|
-        try native_execution_request.encodeWithHelper(scratch, try native_execution_request.withHelper(document, value.binding))
-    else
-        try native_execution_request.encode(scratch, document);
-    var request = try native_execution_request.decodePersisted(scratch, bytes);
-    defer request.deinit();
     const archives = try productionArchives(scratch, program.artifacts, archive_bytes);
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
@@ -22503,6 +22655,43 @@ fn executePreparedNativeProgramWithHelper(
     defer database.deinit();
     if (helper_source != null)
         try validateNativeHelperTargetPlan(compiled.authorization.authorization, archives.models, database.model);
+    var deployment: ?native_helper.Deployment = null;
+    defer if (deployment) |*value| value.deinit();
+    var bootstrap: ?native_helper.Bootstrap = null;
+    if (helper_source) |source| {
+        if (try root.entryIfExists(try root_fs.Path.init(native_helper.target_path)) == null) {
+            if (!nativeHelperFreshDatabase(database.model))
+                return error.NativeHelperTargetMissing;
+            bootstrap = try authorizeNativeHelperBootstrap(
+                scratch,
+                root,
+                document,
+                source,
+                compiled.authorization.authorization,
+                program,
+                archives.models,
+                database.model,
+                true,
+            );
+        } else {
+            deployment = try native_helper.stage(allocator, root, source);
+            try probeNativeHelperWithBounds(allocator, root, deployment.?.binding, bounds);
+        }
+    }
+    const bytes = if (bootstrap) |value|
+        try native_execution_request.encodeWithBootstrap(
+            scratch,
+            try native_execution_request.withBootstrap(document, value),
+        )
+    else if (deployment) |value|
+        try native_execution_request.encodeWithHelper(
+            scratch,
+            try native_execution_request.withHelper(document, value.binding),
+        )
+    else
+        try native_execution_request.encode(scratch, document);
+    var request = try native_execution_request.decodePersisted(scratch, bytes);
+    defer request.deinit();
     return executeLifecycleProgramWithRequest(
         allocator,
         root,
@@ -22518,6 +22707,8 @@ fn executePreparedNativeProgramWithHelper(
         attempt,
         request.execution(),
         request.helper(),
+        request.bootstrap(),
+        helper_source,
         bounds,
     ) catch |err| return lifecycleExecutionError(err);
 }
@@ -22539,6 +22730,275 @@ fn probeNativeHelperWithBounds(
         return err;
     };
     try checkRuntimeBounds(bounds);
+}
+
+fn nativeHelperSourceAction(bootstrap: native_helper.Bootstrap) native_recovery.Action {
+    return nativeAction(.helper, bootstrap.owner.program_step, native_recovery.helper_source_substep, 0);
+}
+
+fn nativeHelperProbeAction(bootstrap: native_helper.Bootstrap) native_recovery.Action {
+    return nativeAction(.helper, bootstrap.owner.program_step, native_recovery.helper_probe_substep, 0);
+}
+
+fn nativeHelperProbeOutcomeDigest(outcome: maintainer_script.LaunchOutcome) native_recovery.Digest {
+    var hasher = Sha256.init(.{});
+    hasher.update("debz-native-helper-probe-outcome-v1\x00");
+    switch (outcome) {
+        .exited => |code| {
+            hasher.update("exited\x00");
+            hasher.update(&.{code});
+        },
+        .signaled => |signal| {
+            hasher.update("signaled\x00");
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, signal, .big);
+            hasher.update(&bytes);
+        },
+        .timed_out => hasher.update("timed_out\x00"),
+        .cancelled => hasher.update("cancelled\x00"),
+        .setup_failed => |failure| {
+            hasher.update("setup_failed\x00");
+            hasher.update(@tagName(failure.stage));
+            hasher.update("\x00");
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, failure.errno, .big);
+            hasher.update(&bytes);
+        },
+        .output_limit_exceeded => hasher.update("output_limit_exceeded\x00"),
+    }
+    return native_recovery.hexDigest(hasher.finalResult());
+}
+
+fn nativeHelperProbeSucceeded(outcome: maintainer_script.LaunchOutcome) bool {
+    return switch (outcome) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn verifyNativeHelperBootstrapBeforeRecovery(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    runtime: *native_recovery.Runtime,
+) !void {
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    try native_recovery.validateHelperActions(
+        progress.document,
+        runtime.helper_bootstrap,
+    );
+    const bootstrap = runtime.helper_bootstrap orelse return;
+    try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, false);
+    try native_helper.verifyBootstrapCleanupAbsent(allocator, root, bootstrap);
+    const source_record = native_recovery.latest(
+        progress.document,
+        nativeHelperSourceAction(bootstrap),
+    );
+    const probe_record = native_recovery.latest(
+        progress.document,
+        nativeHelperProbeAction(bootstrap),
+    );
+    if (source_record == null and
+        try root.entryIfExists(
+            try root_fs.Path.init(bootstrap.helper.source_path),
+        ) != null)
+        return error.NativeHelperEvidenceChanged;
+    const target_present = try root.entryIfExists(
+        try root_fs.Path.init(native_helper.target_path),
+    ) != null;
+    const target_action = nativeAction(
+        .filesystem,
+        bootstrap.owner.program_step,
+        0,
+        0,
+    );
+    const target_record = native_recovery.latest(
+        progress.document,
+        target_action,
+    );
+    if (target_record) |record| switch (record.stage) {
+        .prepared => {
+            const pending = pendingNativeMutationAction(progress.document) orelse
+                return error.InvalidNativeHelperBootstrapState;
+            if (!std.meta.eql(pending, target_action) or
+                source_record != null or probe_record != null)
+                return error.InvalidNativeHelperBootstrapState;
+            if (target_present and
+                try root.entryIfExists(
+                    try root_fs.Path.init(root_mutation.journal_path),
+                ) == null)
+                return error.NativeHelperEvidenceChanged;
+        },
+        .completed => switch (record.result) {
+            .applied, .recovered => try native_helper.verifyBootstrapTarget(
+                allocator,
+                root,
+                bootstrap.target,
+            ),
+            .rolled_back => {
+                if (target_present or source_record != null or probe_record != null)
+                    return error.NativeHelperEvidenceChanged;
+            },
+            else => return error.InvalidNativeHelperBootstrapState,
+        },
+        else => return error.InvalidNativeHelperBootstrapState,
+    } else {
+        if (target_present or source_record != null or probe_record != null)
+            return error.NativeHelperEvidenceChanged;
+    }
+    if (source_record) |record| switch (record.stage) {
+        .prepared => try native_helper.verifyBootstrapPrivateState(
+            allocator,
+            root,
+            bootstrap,
+            false,
+        ),
+        .completed => {
+            if (record.result != .applied and record.result != .recovered)
+                return error.InvalidNativeHelperBootstrapState;
+            try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+        },
+        else => return error.InvalidNativeHelperBootstrapState,
+    };
+    if (probe_record) |record| switch (record.stage) {
+        .prepared => try native_helper.verifyBootstrapPrivateState(
+            allocator,
+            root,
+            bootstrap,
+            true,
+        ),
+        .in_flight => return error.NativeHelperOutcomeUnknown,
+        .outcome => {
+            try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+            if (record.evidence_sha256 == null)
+                return error.InvalidNativeHelperBootstrapState;
+        },
+        .completed => {
+            try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+            if (record.result != .succeeded and record.result != .recovered)
+                return error.NativeHelperNamespaceUnavailable;
+        },
+        else => return error.InvalidNativeHelperBootstrapState,
+    };
+}
+
+fn ensureNativeHelperBootstrap(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !void {
+    const runtime = execution.recovery orelse return error.NativeHelperBindingRequired;
+    const bootstrap = runtime.helper_bootstrap orelse return;
+    const source = runtime.helper_source orelse return error.NativeHelperBindingRequired;
+    if (execution.program_step != bootstrap.owner.program_step)
+        return error.NativeHelperBootstrapProgramMismatch;
+    try native_helper.verifyBootstrapTarget(allocator, root, bootstrap.target);
+    try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, false);
+    try native_helper.verifyBootstrapCleanupAbsent(allocator, root, bootstrap);
+
+    const source_action = nativeHelperSourceAction(bootstrap);
+    const source_record = try runtime.latest(source_action);
+    if (source_record == null) {
+        if (try root.entryIfExists(
+            try root_fs.Path.init(bootstrap.helper.source_path),
+        ) != null)
+            return error.NativeHelperEvidenceChanged;
+        try runtime.append(source_action, .prepared, .none, null);
+        runtime.crash.hit(.after_helper_source_prepared);
+        try native_helper.stageBootstrap(allocator, root, bootstrap, source);
+        runtime.crash.hit(.during_helper_source_publication);
+        try runtime.append(source_action, .completed, .applied, null);
+        runtime.crash.hit(.after_helper_source_publication);
+    } else switch (source_record.?.stage) {
+        .prepared => {
+            try native_helper.stageBootstrap(allocator, root, bootstrap, source);
+            runtime.crash.hit(.during_helper_source_publication);
+            try runtime.append(source_action, .completed, .recovered, null);
+            runtime.recovered_phase_count += 1;
+            runtime.crash.hit(.after_helper_source_publication);
+        },
+        .completed => {
+            if (source_record.?.result != .applied and source_record.?.result != .recovered)
+                return error.InvalidNativeHelperBootstrapState;
+            try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+        },
+        else => return error.InvalidNativeHelperBootstrapState,
+    }
+
+    const probe_action = nativeHelperProbeAction(bootstrap);
+    const probe_record = try runtime.latest(probe_action);
+    if (probe_record) |record| switch (record.stage) {
+        .in_flight => return error.NativeHelperOutcomeUnknown,
+        .outcome => {
+            const success = nativeHelperProbeOutcomeDigest(.{ .exited = 0 });
+            if (record.evidence_sha256 == null or
+                !std.mem.eql(u8, &record.evidence_sha256.?, &success))
+            {
+                try runtime.append(probe_action, .completed, .failed, null);
+                return error.NativeHelperNamespaceUnavailable;
+            }
+            try runtime.append(probe_action, .completed, .recovered, null);
+            runtime.recovered_phase_count += 1;
+            runtime.crash.hit(.after_helper_probe_completed);
+            return;
+        },
+        .completed => {
+            if (record.result != .succeeded and record.result != .recovered)
+                return error.NativeHelperNamespaceUnavailable;
+            try native_helper.verifyBootstrapTarget(allocator, root, bootstrap.target);
+            try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+            return;
+        },
+        .prepared => {},
+        else => return error.InvalidNativeHelperBootstrapState,
+    };
+    if (probe_record == null) {
+        try runtime.append(probe_action, .prepared, .none, null);
+        runtime.crash.hit(.after_helper_probe_prepared);
+    }
+    try runtime.append(probe_action, .in_flight, .none, null);
+    runtime.crash.hit(.after_helper_probe_in_flight);
+    var probe = try native_helper.probeBootstrapExecutionWithCancellation(
+        allocator,
+        root,
+        bootstrap,
+        if (execution.bounds) |value| value.cancellation() else .never(),
+    );
+    defer probe.deinit(allocator);
+    runtime.crash.hit(.after_helper_probe_return_before_outcome);
+    const outcome_digest = nativeHelperProbeOutcomeDigest(probe.outcome);
+    const outcome_result: native_recovery.Result =
+        if (maintainer_script.Outcome.fromLaunch(probe.outcome).spawned())
+            .exited
+        else
+            .not_started;
+    try runtime.append(probe_action, .outcome, outcome_result, outcome_digest);
+    runtime.crash.hit(.after_helper_probe_outcome);
+    const succeeded = nativeHelperProbeSucceeded(probe.outcome);
+    try runtime.append(
+        probe_action,
+        .completed,
+        if (succeeded) .succeeded else .failed,
+        null,
+    );
+    runtime.crash.hit(.after_helper_probe_completed);
+    if (!succeeded) return error.NativeHelperNamespaceUnavailable;
+}
+
+fn requireNativeHelperBootstrapReady(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    runtime: native_recovery.Runtime,
+) !void {
+    const bootstrap = runtime.helper_bootstrap orelse return;
+    const record = try runtime.latest(nativeHelperProbeAction(bootstrap)) orelse
+        return error.NativeHelperBindingRequired;
+    if (record.stage != .completed or
+        (record.result != .succeeded and record.result != .recovered))
+        return error.NativeHelperBindingRequired;
+    try native_helper.verifyBootstrapTarget(allocator, root, bootstrap.target);
+    try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+    try native_helper.verifyBootstrapCleanupAbsent(allocator, root, bootstrap);
 }
 
 fn validateNativeHelperTargetPlan(
@@ -22574,6 +23034,212 @@ fn validateNativeHelperTargetPlan(
             },
         }
     }
+}
+
+fn nativeHelperFreshDatabase(model: package_database.Model) bool {
+    if (model.status.size != 0 or model.status.package_count != 0 or
+        model.packages.len != 0 or model.foreign_architectures.len != 0 or
+        model.triggers.interests.len != 0 or model.triggers.pending.len != 0 or
+        model.diversions.len != 0 or model.stat_overrides.len != 0 or
+        model.opaque_info.len != 0 or model.pending_updates.len != 0)
+        return false;
+    if (model.status_old) |old|
+        if (old.size != 0 or old.package_count != 0)
+            return false;
+    return true;
+}
+
+fn samePackageIdentity(
+    identity: native_program.PackageIdentity,
+    name: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+) bool {
+    return std.mem.eql(u8, identity.name, name) and
+        std.mem.eql(u8, identity.version, version) and
+        std.mem.eql(u8, identity.architecture, architecture);
+}
+
+fn authorizeNativeHelperBootstrap(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    execution: native_execution_request.Document,
+    source: native_helper.Source,
+    authorization: native_authorization.Authorization,
+    program: native_program.Program,
+    models: []const archive_application.Model,
+    initial_database: package_database.Model,
+    require_target_absent: bool,
+) !native_helper.Bootstrap {
+    try source.validate();
+    if (!std.mem.eql(u8, execution.install_root, program.install_root) or
+        !std.mem.eql(u8, execution.architecture, program.target_architecture) or
+        !std.mem.eql(u8, &execution.root_identity_sha256, &program.root_identity_sha256))
+        return error.NativeHelperBootstrapExecutionMismatch;
+    if (!std.mem.eql(u8, &execution.program.plan_sha256, &program.plan_sha256) or
+        !std.mem.eql(u8, &execution.program.program_sha256, &program.digest_sha256))
+        return error.NativeHelperBootstrapProgramMismatch;
+    if (!std.mem.eql(u8, &execution.program.authorization_sha256, &native_recovery.hexDigest(
+        authorization.digest_sha256,
+    )) or
+        !std.mem.eql(u8, &execution.program.exact_lock_sha256, &program.exact_lock.digest_sha256) or
+        !std.mem.eql(u8, program.install_root, authorization.install_root) or
+        !std.mem.eql(u8, program.target_architecture, authorization.target_architecture))
+        return error.NativeHelperBootstrapAuthorizationMismatch;
+    if (!std.mem.eql(u8, &program.exact_lock.digest_sha256, &native_recovery.hexDigest(
+        authorization.exact_lock.digest_sha256,
+    )))
+        return error.NativeHelperBootstrapLockMismatch;
+    if (!nativeHelperFreshDatabase(initial_database))
+        return error.NativeHelperBootstrapFreshRootRequired;
+    if (require_target_absent and
+        try root.entryIfExists(try root_fs.Path.init(native_helper.target_path)) != null)
+        return error.NativeHelperBootstrapTargetPresent;
+
+    var owner_model: ?*const archive_application.Model = null;
+    var target_file: ?archive_application.File = null;
+    for (models) |*model| for (model.files) |file| {
+        if (!std.mem.eql(u8, file.path, native_helper.target_path)) continue;
+        if (owner_model != null or file.kind != .regular or file.sha256 == null or
+            file.content == null or file.size == 0)
+            return error.NativeHelperBootstrapOwnerAmbiguous;
+        owner_model = model;
+        target_file = file;
+    };
+    const model = owner_model orelse return error.NativeHelperBootstrapOwnerMissing;
+    if (!std.mem.eql(u8, model.facts.package, native_helper.owner_package))
+        return error.NativeHelperBootstrapOwnerUnauthorized;
+    const target = target_file.?;
+    const action = authorization.findAction(
+        model.facts.package,
+        model.facts.architecture,
+    ) orelse return error.NativeHelperBootstrapOwnerUnauthorized;
+    if (action.kind != .install or action.prior_version != null or
+        !std.mem.eql(u8, action.version, model.facts.version))
+        return error.NativeHelperBootstrapOwnerUnauthorized;
+    const action_artifact = action.artifact orelse
+        return error.NativeHelperBootstrapOwnerUnauthorized;
+
+    const artifact = for (program.artifacts) |candidate| {
+        if (samePackageIdentity(
+            candidate.package,
+            model.facts.package,
+            model.facts.version,
+            model.facts.architecture,
+        )) break candidate;
+    } else return error.NativeHelperBootstrapOwnerUnauthorized;
+    const archive_sha256 = std.fmt.bytesToHex(action_artifact.sha256, .lower);
+    if (artifact.size != action_artifact.size or
+        !std.mem.eql(u8, &artifact.sha256, &archive_sha256) or
+        !std.mem.eql(u8, &artifact.application_sha256, &std.fmt.bytesToHex(model.digest, .lower)) or
+        !std.mem.eql(u8, &artifact.sha256, &std.fmt.bytesToHex(model.provenance().sha256, .lower)))
+        return error.NativeHelperBootstrapArchiveMismatch;
+
+    var owner_step: ?u32 = null;
+    for (program.steps) |step| switch (step.operation) {
+        .materialize_bootstrap_payload => |intent| {
+            if (!samePackageIdentity(
+                intent.package,
+                model.facts.package,
+                model.facts.version,
+                model.facts.architecture,
+            )) continue;
+            if (owner_step != null or intent.artifact != artifact.index or
+                !std.mem.eql(u8, &intent.application_sha256, &artifact.application_sha256))
+                return error.NativeHelperBootstrapProgramMismatch;
+            owner_step = step.sequence;
+        },
+        else => {},
+    };
+    const bootstrap_step = owner_step orelse
+        return error.NativeHelperBootstrapProgramMismatch;
+    for (program.steps) |step| switch (step.operation) {
+        .run_maintainer_script, .process_deferred_triggers => {
+            if (step.sequence <= bootstrap_step)
+                return error.NativeHelperBootstrapProgramMismatch;
+        },
+        else => {},
+    };
+
+    const final_owner = for (authorization.final_state) |package| {
+        if (std.mem.eql(u8, package.name, model.facts.package) and
+            std.mem.eql(u8, package.architecture, model.facts.architecture))
+            break package;
+    } else return error.NativeHelperBootstrapFinalOwnerMissing;
+    if (!std.mem.eql(u8, final_owner.version, model.facts.version) or
+        final_owner.state == .config_files)
+        return error.NativeHelperBootstrapFinalOwnerMissing;
+
+    const root_entry = try root.rootEntry();
+    if (root_entry.inode != execution.root_inode)
+        return error.NativeHelperBootstrapBindingMismatch;
+    const helper = try native_helper.bootstrapBinding(
+        allocator,
+        execution.caller.attempt_id,
+        source,
+    );
+    return .{
+        .attempt_id = execution.caller.attempt_id,
+        .root_identity_sha256 = execution.root_identity_sha256,
+        .root_inode = execution.root_inode,
+        .root_uid = 0,
+        .root_gid = 0,
+        .plan_sha256 = execution.program.plan_sha256,
+        .authorization_sha256 = execution.program.authorization_sha256,
+        .program_sha256 = execution.program.program_sha256,
+        .exact_lock_schema = program.exact_lock.schema,
+        .exact_lock_version = program.exact_lock.version,
+        .exact_lock_sha256 = execution.program.exact_lock_sha256,
+        .helper = helper,
+        .owner = .{
+            .package = model.facts.package,
+            .version = model.facts.version,
+            .architecture = model.facts.architecture,
+            .final_state = @tagName(final_owner.state),
+            .artifact = artifact.index,
+            .archive_sha256 = artifact.sha256,
+            .archive_size = artifact.size,
+            .application_sha256 = artifact.application_sha256,
+            .program_step = bootstrap_step,
+        },
+        .target = .{
+            .sha256 = std.fmt.bytesToHex(target.sha256.?, .lower),
+            .size = target.size,
+            .mode = target.mode,
+            .uid = std.math.cast(u32, target.uid) orelse
+                return error.NativeHelperBootstrapTargetMetadataInvalid,
+            .gid = std.math.cast(u32, target.gid) orelse
+                return error.NativeHelperBootstrapTargetMetadataInvalid,
+        },
+    };
+}
+
+fn validateNativeHelperBootstrap(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    bootstrap: native_helper.Bootstrap,
+    execution: native_execution_request.Document,
+    source: native_helper.Source,
+    authorization: native_authorization.Authorization,
+    program: native_program.Program,
+    models: []const archive_application.Model,
+    initial_database: package_database.Model,
+) !void {
+    try bootstrap.validate();
+    const expected = try authorizeNativeHelperBootstrap(
+        allocator,
+        root,
+        execution,
+        source,
+        authorization,
+        program,
+        models,
+        initial_database,
+        false,
+    );
+    defer allocator.free(expected.helper.source_path);
+    if (!bootstrap.eql(expected))
+        return error.NativeHelperBootstrapBindingMismatch;
 }
 
 fn retainedNativeBytes(
@@ -22615,6 +23281,24 @@ fn readProductionCompletion(
         Sha256.hash(helper_bytes, &sha256, .{});
         try helper.matches(.{ .bytes = helper_bytes, .sha256 = sha256 });
     }
+    const progress_bytes = try retainedNativeBytes(
+        allocator,
+        root,
+        receipt.document,
+        .progress,
+    );
+    defer allocator.free(progress_bytes);
+    var retained_progress = try native_recovery.decodeProgress(
+        allocator,
+        progress_bytes,
+    );
+    defer retained_progress.deinit();
+    try native_recovery.validateHelperActions(
+        retained_progress.document,
+        request.bootstrap(),
+    );
+    if (request.bootstrap()) |bootstrap|
+        try native_helper.verifyBootstrapTarget(allocator, root, bootstrap.target);
     const program_bytes = try retainedNativeBytes(allocator, root, receipt.document, .program);
     defer allocator.free(program_bytes);
     var program = try native_program.decode(allocator, program_bytes, native_program.maximum_document_bytes);
@@ -22686,7 +23370,8 @@ fn recoverPreparedNativeProgramWithHelper(
         if (blob.kind == .request) break blob;
     } else return error.RecoveryEvidenceMissing;
     if (!std.mem.eql(u8, request_blob.logical_path, native_execution_request.logical_path) and
-        !std.mem.eql(u8, request_blob.logical_path, native_execution_request.helper_logical_path))
+        !std.mem.eql(u8, request_blob.logical_path, native_execution_request.helper_logical_path) and
+        !std.mem.eql(u8, request_blob.logical_path, native_execution_request.bootstrap_logical_path))
         return error.ProductionRecoveryRequestRequired;
     const request_bytes = try native_recovery.verifyBlob(allocator, root, request_blob);
     defer allocator.free(request_bytes);
@@ -22709,7 +23394,10 @@ fn recoverPreparedNativeProgramWithHelper(
     var compiled: CompiledLifecycle = .{ .authorization = authorization, .program = program };
     try native_execution_request.validateBinding(request.execution(), root, attempt, program.program);
     try native_execution_request.validateIntent(request.execution(), intent.intent);
-    if (request.helper()) |helper| try probeNativeHelperWithBounds(allocator, root, helper, bounds);
+    if (request.helper()) |helper| {
+        if (request.bootstrap() == null)
+            try probeNativeHelperWithBounds(allocator, root, helper, bounds);
+    }
     if (!std.mem.eql(u8, &program.program.script_policy_sha256, &native_recovery.hexDigest(
         maintainer_script.policyDigest(lifecycleScriptPolicy()),
     ))) return error.UnsupportedScriptPolicy;
@@ -22745,6 +23433,8 @@ fn recoverPreparedNativeProgramWithHelper(
         attempt,
         request.execution(),
         request.helper(),
+        request.bootstrap(),
+        helper_source,
         bounds,
     ) catch |err| return lifecycleExecutionError(err);
 }
@@ -22754,6 +23444,7 @@ fn acknowledgePreparedNativeProgram(
     root: root_fs.Root,
     attempt: *root_operation.Attempt,
     expected_receipt: native_provenance.Digest,
+    crash_at: ?native_recovery.CrashPoint,
 ) !void {
     var receipt = try readProductionCompletion(allocator, root, attempt) orelse
         return error.RecoveryEvidenceMissing;
@@ -22768,6 +23459,22 @@ fn acknowledgePreparedNativeProgram(
     defer allocator.free(progress_bytes);
     var progress = try native_recovery.decodeProgress(allocator, progress_bytes);
     defer progress.deinit();
+    const retained_request_bytes = try retainedNativeBytes(
+        allocator,
+        root,
+        receipt.document,
+        .execution_request,
+    );
+    defer allocator.free(retained_request_bytes);
+    var retained_request = try native_execution_request.decodePersisted(
+        allocator,
+        retained_request_bytes,
+    );
+    defer retained_request.deinit();
+    try native_recovery.validateHelperActions(
+        progress.document,
+        retained_request.bootstrap(),
+    );
     if (!std.mem.eql(u8, &intent.intent.digest_sha256, &receipt.document.execution_intent_sha256) or
         !std.mem.eql(u8, &progress.document.intent_sha256, &intent.intent.digest_sha256) or
         !std.mem.eql(u8, &progress.document.head_sha256, &receipt.document.progress_head_sha256))
@@ -22778,7 +23485,13 @@ fn acknowledgePreparedNativeProgram(
         if (!std.mem.eql(u8, &active.intent.digest_sha256, &intent.intent.digest_sha256))
             return error.InvalidRecoveryIntent;
     }
-    try cleanupNativeExecutionEvidence(allocator, root, intent.intent, progress.document);
+    try cleanupNativeExecutionEvidence(
+        allocator,
+        root,
+        intent.intent,
+        progress.document,
+        .{ .selected = crash_at },
+    );
 }
 
 fn executeLifecycleProgram(
@@ -22840,6 +23553,8 @@ fn executeLifecycleProgramInOperation(
         null,
         null,
         null,
+        null,
+        null,
     ) catch |err| return lifecycleExecutionError(err);
 }
 
@@ -22876,6 +23591,8 @@ fn executeLifecycleProgramWithRequest(
     borrowed_attempt: ?*root_operation.Attempt,
     production_request: ?native_execution_request.Document,
     helper_binding: ?native_helper.Binding,
+    helper_bootstrap: ?native_helper.Bootstrap,
+    helper_source: ?native_helper.Source,
     bounds: ?*RuntimeBounds,
 ) !LifecycleResult {
     try checkRuntimeBounds(bounds);
@@ -22889,6 +23606,13 @@ fn executeLifecycleProgramWithRequest(
     if ((helper_binding != null and production_request == null) or
         (production_request != null and !external.recovery))
         return error.ProductionRecoveryRequestRequired;
+    if (helper_bootstrap) |bootstrap| {
+        if (helper_binding == null or helper_source == null or
+            !bootstrap.helper.eql(helper_binding.?))
+            return error.NativeHelperBootstrapBindingMismatch;
+    }
+    if (helper_source != null and helper_binding == null)
+        return error.NativeHelperBindingRequired;
     const program = &compiled.program.program;
     const authorization = &compiled.authorization.authorization;
     if (!program.matchesAuthorization(authorization.*) or
@@ -22974,6 +23698,17 @@ fn executeLifecycleProgramWithRequest(
         try native_operation.bind(allocator, root, attempt, program.*);
     if (production_request) |request|
         try native_execution_request.validateBinding(request, root, attempt, program.*);
+    if (helper_bootstrap) |bootstrap| try validateNativeHelperBootstrap(
+        scratch,
+        root,
+        bootstrap,
+        production_request orelse return error.ProductionRecoveryRequestRequired,
+        helper_source orelse return error.NativeHelperBindingRequired,
+        authorization.*,
+        program.*,
+        models,
+        initial_model,
+    );
     if (recovery_intent) |intent| {
         if (!std.mem.eql(
             u8,
@@ -23099,8 +23834,37 @@ fn executeLifecycleProgramWithRequest(
             .staging_directory_initially_present = intent.staging_directory_initially_present,
             .caller_owned = production_request != null,
             .helper_binding = helper_binding,
+            .helper_bootstrap = helper_bootstrap,
+            .helper_source = helper_source,
         };
         execution.recovery = &recovery_runtime;
+        verifyNativeHelperBootstrapBeforeRecovery(
+            allocator,
+            root,
+            &recovery_runtime,
+        ) catch |err| {
+            try attempt.requireRecovery(
+                allocator,
+                if (err == error.NativeHelperOutcomeUnknown) .script else .verification,
+            );
+            const detail = if (err == error.NativeHelperOutcomeUnknown)
+                "native_helper_outcome_unknown"
+            else
+                "native_helper_evidence_invalid";
+            try publishNativeRecoveryRequiredProvenance(
+                execution,
+                allocator,
+                root,
+                attempt,
+                program_sha256,
+                detail,
+            );
+            return .{
+                .outcome = .recovery_required,
+                .detail = detail,
+                .program_sha256 = program.digest_sha256,
+            };
+        };
         const script_recovery = classifyActiveScriptBeforeMutationRecovery(
             allocator,
             root,
@@ -23202,8 +23966,17 @@ fn executeLifecycleProgramWithRequest(
             attempt,
             production_request,
             helper_binding,
+            helper_bootstrap,
+            helper_source,
         );
         execution.recovery = &recovery_runtime;
+        if (helper_bootstrap) |bootstrap|
+            try native_helper.verifyBootstrapPrivateState(
+                allocator,
+                root,
+                bootstrap,
+                false,
+            );
         recovery_runtime.crash.hit(.after_execution_intent);
     }
     if (recovery_intent != null) {
@@ -23326,6 +24099,38 @@ fn executeLifecycleProgramWithRequest(
                 null,
             );
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            if (execution.recovery) |runtime|
+                if (runtime.helper_bootstrap != null and
+                    runtime.helper_bootstrap.?.owner.program_step == step.sequence)
+                    ensureNativeHelperBootstrap(execution, allocator, root) catch |err| {
+                        try attempt.requireRecovery(
+                            allocator,
+                            if (err == error.NativeHelperOutcomeUnknown or
+                                err == error.NativeHelperNamespaceUnavailable)
+                                .script
+                            else
+                                .verification,
+                        );
+                        const detail = if (err == error.NativeHelperOutcomeUnknown)
+                            "native_helper_outcome_unknown"
+                        else if (err == error.NativeHelperNamespaceUnavailable)
+                            "native_helper_probe_failed"
+                        else
+                            "native_helper_evidence_invalid";
+                        try publishNativeRecoveryRequiredProvenance(
+                            execution,
+                            allocator,
+                            root,
+                            attempt,
+                            program_sha256,
+                            detail,
+                        );
+                        return .{
+                            .outcome = .recovery_required,
+                            .detail = detail,
+                            .program_sha256 = program.digest_sha256,
+                        };
+                    };
         },
         .unpack_package => |intent| {
             if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
@@ -24512,6 +25317,22 @@ fn executeLifecycleProgramWithRequest(
             .detail = "final_closure_mismatch",
             .program_sha256 = program.digest_sha256,
         };
+    }
+    if (execution.recovery) |runtime| {
+        const owner_matches = verifyNativeHelperBootstrapFinalOwner(
+            allocator,
+            root,
+            program.target_architecture,
+            runtime.*,
+        ) catch false;
+        if (!owner_matches) {
+            try attempt.requireRecovery(allocator, .verification);
+            return .{
+                .outcome = .recovery_required,
+                .detail = "native_helper_final_owner_mismatch",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
     }
     try clearTriggerAuthority(
         allocator,
@@ -26426,14 +27247,28 @@ fn callerOwnedLifecycleFixture(
             if (external.isolated_helper) {
                 try testing.expectError(error.InvalidRecoveryProvenance, Runtime.acknowledge(allocator, &attempt, @splat('0')));
                 try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null);
-                try Runtime.acknowledge(allocator, &attempt, receipt.document.digest_sha256);
+                try Runtime.acknowledgeWithCrash(
+                    allocator,
+                    &attempt,
+                    receipt.document.digest_sha256,
+                    if (external.crash_at) |point|
+                        if (nativeHelperCleanupCrashPoint(point)) point else null
+                    else
+                        null,
+                );
                 try Runtime.acknowledge(allocator, &attempt, receipt.document.digest_sha256);
                 var repeated = try Runtime.recover(allocator, &attempt);
                 defer repeated.deinit();
                 try testing.expectEqual(result.outcome, typedRuntimeFixtureResult(repeated).outcome);
                 try testing.expect(attempt.locked());
                 try testing.expectEqual(root_operation.Outcome.pending, attempt.record().outcome);
-            } else try acknowledgePreparedNativeProgram(allocator, root, &attempt, receipt.document.digest_sha256);
+            } else try acknowledgePreparedNativeProgram(
+                allocator,
+                root,
+                &attempt,
+                receipt.document.digest_sha256,
+                null,
+            );
             if (attempt.record().state != .recovering)
                 try attempt.advance(allocator, .{ .state = .verifying, .phase = .verification });
             try attempt.complete(allocator, if (receipt.document.outcome == .succeeded) .succeeded else .failed_after_mutation);
@@ -26508,6 +27343,334 @@ fn callerOwnedLifecycleFixture(
     );
 }
 
+fn nativeHelperCleanupCrashPoint(point: native_recovery.CrashPoint) bool {
+    return switch (point) {
+        .after_helper_cleanup_prepared,
+        .during_helper_cleanup,
+        .after_helper_cleanup_completed,
+        => true,
+        else => false,
+    };
+}
+
+fn activeFixtureBootstrapRequest(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !native_execution_request.OwnedRequest {
+    var intent = try native_recovery.readIntent(allocator, root);
+    defer intent.deinit();
+    for (intent.intent.blobs) |blob| {
+        if (blob.kind != .request or
+            !std.mem.eql(u8, blob.logical_path, native_execution_request.bootstrap_logical_path))
+            continue;
+        const bytes = try native_recovery.verifyBlob(allocator, root, blob);
+        defer allocator.free(bytes);
+        return native_execution_request.decodePersisted(allocator, bytes);
+    }
+    return error.NativeHelperBootstrapBindingMismatch;
+}
+
+fn retainedFixtureBootstrapRequest(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !native_execution_request.OwnedRequest {
+    var receipt = try native_provenance.read(allocator, root) orelse
+        return error.RecoveryEvidenceMissing;
+    defer receipt.deinit();
+    const bytes = try retainedNativeBytes(
+        allocator,
+        root,
+        receipt.document,
+        .execution_request,
+    );
+    defer allocator.free(bytes);
+    return native_execution_request.decodePersisted(allocator, bytes);
+}
+
+fn assertFixtureBootstrapFinalOwner(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    bootstrap: native_helper.Bootstrap,
+) !void {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    const owner = database.model.find(
+        bootstrap.owner.package,
+        bootstrap.owner.architecture,
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(bootstrap.owner.version, owner.version);
+    var path_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        "/{s}",
+        .{native_helper.target_path},
+    );
+    try testing.expect(owner.ownsPath(path));
+}
+
+fn assertFixtureBootstrapOwnerAbsent(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+    bootstrap: native_helper.Bootstrap,
+) !void {
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    try testing.expect(
+        database.model.find(
+            bootstrap.owner.package,
+            bootstrap.owner.architecture,
+        ) == null,
+    );
+}
+
+fn assertFixtureHelperBootstrap(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    external: ExternalLifecycleRequest,
+    result: LifecycleResult,
+) !void {
+    const expectation = external.helper_bootstrap_expectation orelse return;
+    var request = switch (expectation) {
+        .completed,
+        .script_completed,
+        .outcome_unknown,
+        .script_outcome_unknown,
+        .ambient_target_rejected,
+        .ambient_source_rejected,
+        => try activeFixtureBootstrapRequest(allocator, root),
+        .cleaned => try retainedFixtureBootstrapRequest(allocator, root),
+    };
+    defer request.deinit();
+    const bootstrap = request.bootstrap() orelse
+        return error.NativeHelperBootstrapBindingMismatch;
+    try testing.expect(!std.mem.eql(
+        u8,
+        &bootstrap.helper.sha256,
+        &bootstrap.target.sha256,
+    ));
+    try testing.expect(
+        try root.entryIfExists(try root_fs.Path.init("usr/bin/dpkg")) == null,
+    );
+    try testing.expect(
+        try root.entryIfExists(try root_fs.Path.init("usr/bin/dpkg-deb")) == null,
+    );
+    switch (expectation) {
+        .completed, .script_completed => {
+            try native_helper.verifyBootstrapTarget(
+                allocator,
+                root,
+                bootstrap.target,
+            );
+            try testing.expectEqual(LifecycleOutcome.applied, result.outcome);
+            try native_helper.verifyBootstrapCompletionState(
+                allocator,
+                root,
+                bootstrap,
+                true,
+            );
+            var progress = try native_recovery.readProgress(allocator, root);
+            defer progress.deinit();
+            const source = native_recovery.latest(
+                progress.document,
+                nativeHelperSourceAction(bootstrap),
+            ) orelse return error.TestUnexpectedResult;
+            const probe = native_recovery.latest(
+                progress.document,
+                nativeHelperProbeAction(bootstrap),
+            ) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(native_recovery.Stage.completed, source.stage);
+            try testing.expect(source.result == .applied or source.result == .recovered);
+            try testing.expectEqual(native_recovery.Stage.completed, probe.stage);
+            try testing.expect(probe.result == .succeeded or probe.result == .recovered);
+            if (expectation == .script_completed) {
+                var script_completed = false;
+                for (progress.document.records) |record| {
+                    if (record.action.kind == .script and record.stage == .completed) {
+                        script_completed = true;
+                        break;
+                    }
+                }
+                try testing.expect(script_completed);
+            }
+            try assertFixtureBootstrapFinalOwner(
+                allocator,
+                root,
+                external.architecture,
+                bootstrap,
+            );
+        },
+        .cleaned => {
+            try native_helper.verifyBootstrapTarget(
+                allocator,
+                root,
+                bootstrap.target,
+            );
+            try testing.expectEqual(LifecycleOutcome.applied, result.outcome);
+            try testing.expect(
+                try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null,
+            );
+            try native_helper.verifyBootstrapCompletionState(
+                allocator,
+                root,
+                bootstrap,
+                false,
+            );
+            try assertFixtureBootstrapFinalOwner(
+                allocator,
+                root,
+                external.architecture,
+                bootstrap,
+            );
+        },
+        .outcome_unknown => {
+            try native_helper.verifyBootstrapTarget(
+                allocator,
+                root,
+                bootstrap.target,
+            );
+            try testing.expectEqual(LifecycleOutcome.recovery_required, result.outcome);
+            try testing.expectEqualStrings("native_helper_outcome_unknown", result.detail);
+            try native_helper.verifyBootstrapCompletionState(
+                allocator,
+                root,
+                bootstrap,
+                true,
+            );
+            var progress = try native_recovery.readProgress(allocator, root);
+            defer progress.deinit();
+            const probe = native_recovery.latest(
+                progress.document,
+                nativeHelperProbeAction(bootstrap),
+            ) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(native_recovery.Stage.in_flight, probe.stage);
+            try testing.expectEqual(native_recovery.Result.none, probe.result);
+        },
+        .script_outcome_unknown => {
+            try native_helper.verifyBootstrapTarget(
+                allocator,
+                root,
+                bootstrap.target,
+            );
+            try testing.expectEqual(LifecycleOutcome.recovery_required, result.outcome);
+            try testing.expectEqualStrings("script_outcome_unknown", result.detail);
+            try native_helper.verifyBootstrapCompletionState(
+                allocator,
+                root,
+                bootstrap,
+                true,
+            );
+            var progress = try native_recovery.readProgress(allocator, root);
+            defer progress.deinit();
+            const probe = native_recovery.latest(
+                progress.document,
+                nativeHelperProbeAction(bootstrap),
+            ) orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(native_recovery.Stage.completed, probe.stage);
+            var unknown = false;
+            for (progress.document.records) |record| {
+                if (record.action.kind == .script and record.stage == .in_flight) {
+                    unknown = true;
+                    break;
+                }
+            }
+            try testing.expect(unknown);
+        },
+        .ambient_target_rejected, .ambient_source_rejected => {
+            try testing.expectEqual(
+                LifecycleOutcome.recovery_required,
+                result.outcome,
+            );
+            try testing.expectEqualStrings(
+                "MutationEvidenceRequired",
+                result.detail,
+            );
+            var progress = try native_recovery.readProgress(allocator, root);
+            defer progress.deinit();
+            try testing.expect(
+                native_recovery.latest(
+                    progress.document,
+                    nativeAction(
+                        .filesystem,
+                        bootstrap.owner.program_step,
+                        0,
+                        0,
+                    ),
+                ) == null,
+            );
+            try testing.expect(
+                native_recovery.latest(
+                    progress.document,
+                    nativeHelperSourceAction(bootstrap),
+                ) == null,
+            );
+            try testing.expect(
+                native_recovery.latest(
+                    progress.document,
+                    nativeHelperProbeAction(bootstrap),
+                ) == null,
+            );
+            if (expectation == .ambient_target_rejected) {
+                try native_helper.verifyBootstrapTarget(
+                    allocator,
+                    root,
+                    bootstrap.target,
+                );
+                try testing.expect(
+                    try root.entryIfExists(try root_fs.Path.init(
+                        bootstrap.helper.source_path,
+                    )) == null,
+                );
+            } else {
+                try testing.expect(
+                    try root.entryIfExists(try root_fs.Path.init(
+                        bootstrap.target.path,
+                    )) == null,
+                );
+                try native_helper.verifyBootstrapPrivateState(
+                    allocator,
+                    root,
+                    bootstrap,
+                    true,
+                );
+            }
+            try assertFixtureBootstrapOwnerAbsent(
+                allocator,
+                root,
+                external.architecture,
+                bootstrap,
+            );
+        },
+    }
+}
+
 test "native_unpack.test.lifecycle external fixture" {
     const raw_request = std.c.getenv("DEBZ_NATIVE_LIFECYCLE_REQUEST") orelse
         return error.SkipZigTest;
@@ -26534,6 +27697,11 @@ test "native_unpack.test.lifecycle external fixture" {
         (external.core_product and (!external.caller_owned or !external.isolated_helper)) or
         (external.core_completion_crash != null and (!external.core_product or external.operation != .recover)) or
         (external.deadline_after_ms != null and (!external.isolated_helper or external.core_product)) or
+        (external.helper_bootstrap_expectation != null and
+            (!external.caller_owned or !external.isolated_helper or
+                external.operation != .recover or
+                (external.helper_bootstrap_expectation == .cleaned and
+                    !external.acknowledge_native))) or
         (external.isolated_helper and !external.caller_owned))
         return error.InvalidExternalLifecycleRequest;
     const archive_phase = switch (external.operation) {
@@ -26591,7 +27759,9 @@ test "native_unpack.test.lifecycle external fixture" {
             return error.InvalidExternalLifecycleRequest;
         if (external.crash_at) |point| {
             if (!external.caller_owned or !external.isolated_helper or external.core_product or
-                (point != .during_known_unpack_rollback and point != .after_known_unpack_rollback))
+                (point != .during_known_unpack_rollback and
+                    point != .after_known_unpack_rollback and
+                    !nativeHelperCleanupCrashPoint(point)))
                 return error.InvalidExternalLifecycleRequest;
         }
         if (external.core_product) {
@@ -26655,6 +27825,12 @@ test "native_unpack.test.lifecycle external fixture" {
             .detail = @errorName(err),
         };
         try attachLifecycleProvenance(testing.allocator, root, &result);
+        try assertFixtureHelperBootstrap(
+            testing.allocator,
+            root,
+            external,
+            result,
+        );
         try writeLifecycleReport(
             testing.allocator,
             testing.io,
@@ -26903,6 +28079,12 @@ test "native_unpack.test.lifecycle external fixture" {
         .program_sha256 = compiled.program.program.digest_sha256,
     };
     try attachLifecycleProvenance(testing.allocator, root, &result);
+    try assertFixtureHelperBootstrap(
+        testing.allocator,
+        root,
+        external,
+        result,
+    );
     try writeLifecycleReport(
         testing.allocator,
         testing.io,
@@ -26911,7 +28093,7 @@ test "native_unpack.test.lifecycle external fixture" {
     );
 }
 
-test "native_unpack.test.interleaved execution state isolates progress counters and trigger evidence" {
+test "native_unpack.test.interleaved state and fresh-root helper authority remain isolated" {
     var outer_fixture: Fixture = undefined;
     try outer_fixture.init(empty_status, &.{});
     defer outer_fixture.deinit();
@@ -26935,6 +28117,294 @@ test "native_unpack.test.interleaved execution state isolates progress counters 
         );
         try native_recovery.initializeProgress(testing.allocator, runtime.root, runtime.intent_sha256);
         try native_recovery.initializeTriggerEvents(testing.allocator, runtime.root, runtime.intent_sha256);
+    }
+
+    {
+        for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
+            var fixture: Fixture = undefined;
+            try fixture.init(empty_status, &.{});
+            defer fixture.deinit();
+            var data = [_]Entry{
+                .{ .path = "usr", .kind = '5', .mode = 0o755 },
+                .{ .path = "usr/bin", .kind = '5', .mode = 0o755 },
+                .{
+                    .path = native_helper.target_path,
+                    .content = "package-owned dpkg-trigger\n",
+                    .mode = 0o755,
+                },
+            };
+            const bytes = try buildOwnedArchive(.{
+                .package = "dpkg",
+                .version = "1.22.0",
+                .architecture = architecture,
+                .control_fields = "Essential: yes\n",
+            }, &data);
+            defer testing.allocator.free(bytes);
+            var model = try modelOf(bytes);
+            defer model.deinit();
+            var database = try fixture.database();
+            defer database.deinit();
+            var initial_model = database.model;
+            initial_model.native_architecture = architecture;
+
+            const steps = [_]native_program.Step{bootstrapStep(0, &model, 0)};
+            var artifacts = [_]native_program.ProgramArtifact{
+                testArtifact(0, &model, bytes.len),
+            };
+            var program = testProgram(
+                database.generation.sha256,
+                0,
+                &artifacts,
+                &steps,
+            );
+            program.target_architecture = architecture;
+            var root_buffer: [4096]u8 = undefined;
+            const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+            program.install_root = install_root;
+            program.root_identity_sha256 = native_recovery.hexDigest(
+                transaction_recovery.rootIdentity(install_root),
+            );
+            const authorization_digest: [32]u8 = @splat(0x0a);
+            program.authorization_sha256 = native_recovery.hexDigest(authorization_digest);
+
+            const local_origin: exact_lock_v2.PackageOrigin = .{ .local_artifact = .{
+                .artifact_id = @splat('0'),
+                .sha256 = model.provenance().sha256,
+                .size = bytes.len,
+                .package = model.facts.package,
+                .version = model.facts.version,
+                .architecture = model.facts.architecture,
+                .acquisition_url = "file:///dpkg.deb",
+                .trust_mode = .pinned_sha256,
+            } };
+            var actions = [_]native_authorization.Action{.{
+                .sequence = 0,
+                .kind = .install,
+                .package = model.facts.package,
+                .version = model.facts.version,
+                .architecture = model.facts.architecture,
+                .prior_version = null,
+                .artifact = .{
+                    .sha256 = model.provenance().sha256,
+                    .size = bytes.len,
+                    .origin = local_origin,
+                },
+            }};
+            var final_state = [_]native_authorization.FinalPackage{.{
+                .name = model.facts.package,
+                .version = model.facts.version,
+                .architecture = model.facts.architecture,
+                .state = .installed,
+                .dpkg_selection_hold = false,
+            }};
+            const authorization: native_authorization.Authorization = .{
+                .backend = .native,
+                .target_architecture = architecture,
+                .foreign_architectures = &.{},
+                .install_root = install_root,
+                .root_identity_sha256 = transaction_recovery.rootIdentity(install_root),
+                .request_sha256 = @splat(0),
+                .solver_policy_sha256 = @splat(0),
+                .executor_policy_sha256 = @splat(0),
+                .plan_sha256 = @splat(0),
+                .exact_lock = .{
+                    .schema = program.exact_lock.schema,
+                    .version = program.exact_lock.version,
+                    .digest_sha256 = @splat(0),
+                },
+                .policy = .{
+                    .conffile = .keep_existing,
+                    .force = &.{},
+                    .allow_host_root = false,
+                },
+                .actions = &actions,
+                .final_state = &final_state,
+                .trigger_authority = null,
+                .final_state_sha256 = @splat(0),
+                .digest_sha256 = authorization_digest,
+            };
+            const root_entry = try fixture.root().rootEntry();
+            var execution: native_execution_request.Document = .{
+                .install_root = install_root,
+                .root_identity_sha256 = program.root_identity_sha256,
+                .root_inode = root_entry.inode,
+                .architecture = architecture,
+                .caller = .{
+                    .attempt_id = @splat('a'),
+                    .operation = .{ .package_transaction = .install },
+                    .request_sha256 = @splat('b'),
+                    .policy_sha256 = @splat('c'),
+                },
+                .program = .{
+                    .request_sha256 = program.request_sha256,
+                    .solver_policy_sha256 = program.solver_policy_sha256,
+                    .executor_policy_sha256 = program.executor_policy_sha256,
+                    .plan_sha256 = program.plan_sha256,
+                    .authorization_sha256 = program.authorization_sha256,
+                    .program_sha256 = program.digest_sha256,
+                    .exact_lock_sha256 = program.exact_lock.digest_sha256,
+                    .artifact_evidence_sha256 = program.artifacts_sha256,
+                    .database_generation_sha256 = program.installed_database.generation_sha256,
+                    .script_policy_sha256 = program.script_policy_sha256,
+                },
+                .operation = .install,
+                .policy = .keep_existing,
+                .triggers = false,
+                .defer_triggers = false,
+            };
+            native_execution_request.seal(&execution);
+
+            const bootstrap = try authorizeNativeHelperBootstrap(
+                testing.allocator,
+                fixture.root(),
+                execution,
+                native_helper.bundled(),
+                authorization,
+                program,
+                &.{model},
+                initial_model,
+                true,
+            );
+            defer testing.allocator.free(bootstrap.helper.source_path);
+            try testing.expectEqualStrings(architecture, bootstrap.owner.architecture);
+            try testing.expectEqualStrings(model.facts.package, bootstrap.owner.package);
+            try testing.expectEqual(@as(u32, 0), bootstrap.owner.artifact);
+            try testing.expectEqual(@as(u32, 0), bootstrap.owner.program_step);
+
+            var wrong_owner_model = model;
+            wrong_owner_model.facts.package = "not-dpkg";
+            try testing.expectError(
+                error.NativeHelperBootstrapOwnerUnauthorized,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{wrong_owner_model},
+                    initial_model,
+                    true,
+                ),
+            );
+            try testing.expectError(
+                error.NativeHelperBootstrapOwnerMissing,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{},
+                    initial_model,
+                    true,
+                ),
+            );
+            const original_archive_digest = artifacts[0].sha256;
+            artifacts[0].sha256 = @splat('f');
+            try testing.expectError(
+                error.NativeHelperBootstrapArchiveMismatch,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{model},
+                    initial_model,
+                    true,
+                ),
+            );
+            artifacts[0].sha256 = original_archive_digest;
+            var changed = bootstrap;
+            changed.target.mode ^= 1;
+            try testing.expectError(
+                error.NativeHelperBootstrapBindingMismatch,
+                validateNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    changed,
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{model},
+                    initial_model,
+                ),
+            );
+            var seeded = initial_model;
+            seeded.status.size = 1;
+            try testing.expectError(
+                error.NativeHelperBootstrapFreshRootRequired,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{model},
+                    seeded,
+                    true,
+                ),
+            );
+            actions[0].package = "not-dpkg";
+            try testing.expectError(
+                error.NativeHelperBootstrapOwnerUnauthorized,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{model},
+                    initial_model,
+                    true,
+                ),
+            );
+            actions[0].package = model.facts.package;
+            final_state[0].name = "not-dpkg";
+            try testing.expectError(
+                error.NativeHelperBootstrapFinalOwnerMissing,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{model},
+                    initial_model,
+                    true,
+                ),
+            );
+            final_state[0].name = model.facts.package;
+            try fixture.root().createDirectoryPath(
+                try root_fs.Path.init("usr/bin"),
+                .fromMode(0o755),
+            );
+            try fixture.root().createSymbolicLink(
+                try root_fs.Path.init(native_helper.target_path),
+                "/outside",
+            );
+            try testing.expectError(
+                error.NativeHelperBootstrapTargetPresent,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{model},
+                    initial_model,
+                    true,
+                ),
+            );
+        }
     }
     var outer: ExecutionState = .{ .recovery = &outer_runtime };
     var inner: ExecutionState = .{ .recovery = &inner_runtime };
@@ -27016,6 +28486,140 @@ test "native_unpack.test.interleaved execution state isolates progress counters 
     try testing.expectEqual(@as(u32, 4), outer.script_ordinal);
     try testing.expect(outer.recovery == &outer_runtime);
     try testing.expect(inner.recovery == &inner_runtime);
+}
+
+test "native_unpack.test.helper progress is exclusive to its exact v3 authority" {
+    const bootstrap: native_helper.Bootstrap = .{
+        .attempt_id = @splat('a'),
+        .root_identity_sha256 = @splat('b'),
+        .root_inode = 1,
+        .root_uid = 0,
+        .root_gid = 0,
+        .plan_sha256 = @splat('c'),
+        .authorization_sha256 = @splat('d'),
+        .program_sha256 = @splat('e'),
+        .exact_lock_schema = native_helper.exact_lock_schema,
+        .exact_lock_version = native_helper.exact_lock_version,
+        .exact_lock_sha256 = @splat('f'),
+        .helper = .{
+            .source_path = "var/lib/debz/native-recovery-v1/helper-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            .target_path = native_helper.target_path,
+            .sha256 = @splat('1'),
+            .size = 1,
+        },
+        .owner = .{
+            .package = native_helper.owner_package,
+            .version = "1",
+            .architecture = "amd64",
+            .final_state = "installed",
+            .artifact = 0,
+            .archive_sha256 = @splat('2'),
+            .archive_size = 1,
+            .application_sha256 = @splat('3'),
+            .program_step = 7,
+        },
+        .target = .{
+            .sha256 = @splat('4'),
+            .size = 1,
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+        },
+    };
+    var records = [_]native_recovery.Record{.{
+        .sequence = 0,
+        .action = nativeHelperSourceAction(bootstrap),
+        .stage = .prepared,
+        .previous_sha256 = @splat('0'),
+        .digest_sha256 = @splat('0'),
+    }};
+    const progress: native_recovery.ProgressDocument = .{
+        .schema = native_recovery.bootstrap_progress_schema_id,
+        .version = 2,
+        .intent_sha256 = @splat('0'),
+        .records = &records,
+        .head_sha256 = @splat('0'),
+        .digest_sha256 = @splat('0'),
+    };
+    try testing.expectError(
+        error.InvalidNativeHelperBootstrapState,
+        native_recovery.validateHelperActions(progress, null),
+    );
+    try native_recovery.validateHelperActions(progress, bootstrap);
+    records[0].action.ordinal = 1;
+    try testing.expectError(
+        error.InvalidNativeHelperBootstrapState,
+        native_recovery.validateHelperActions(progress, bootstrap),
+    );
+    records[0].action.kind = .filesystem;
+    var legacy_progress = progress;
+    legacy_progress.schema = native_recovery.progress_schema_id;
+    legacy_progress.version = 1;
+    try native_recovery.validateHelperActions(legacy_progress, null);
+}
+
+test "native_unpack.test.fresh helper final package ownership is exact and unique" {
+    const status =
+        \\Package: dpkg
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: owner
+        \\
+        \\Package: other
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: duplicate
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{
+            .name = "dpkg.list",
+            .bytes = "/.\n/usr/bin/dpkg-trigger\n",
+        },
+        .{
+            .name = "other.list",
+            .bytes = "/.\n/usr/bin/dpkg-trigger\n",
+        },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.initFull(status, &info, null);
+    defer fixture.deinit();
+    var database = try fixture.database();
+    defer database.deinit();
+    const expected: native_helper.BootstrapOwner = .{
+        .package = native_helper.owner_package,
+        .version = "1",
+        .architecture = "amd64",
+        .final_state = "installed",
+        .artifact = 0,
+        .archive_sha256 = @splat('a'),
+        .archive_size = 1,
+        .application_sha256 = @splat('b'),
+        .program_step = 0,
+    };
+    try testing.expect(!try nativeHelperBootstrapFinalOwnerMatches(
+        testing.allocator,
+        database.model,
+        expected,
+    ));
+    var packages = [_]package_database.PackageRecord{database.model.packages[0]};
+    var unique = database.model;
+    unique.packages = &packages;
+    try testing.expect(try nativeHelperBootstrapFinalOwnerMatches(
+        testing.allocator,
+        unique,
+        expected,
+    ));
+    var wrong_state = expected;
+    wrong_state.final_state = "triggers_pending";
+    try testing.expect(!try nativeHelperBootstrapFinalOwnerMatches(
+        testing.allocator,
+        unique,
+        wrong_state,
+    ));
 }
 
 test "native_unpack.test.production preparation drives a mixed install and removal program" {
@@ -27706,6 +29310,8 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             &caller,
             document,
             null,
+            null,
+            null,
         );
         try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
         var refused = try Runtime.report(testing.allocator, &caller, .{
@@ -27829,13 +29435,26 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
                 root,
                 &caller,
                 @splat('0'),
+                null,
             ));
             try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null);
             // Retry also works if a previous acknowledgment stopped partway
             // through cleanup: immutable evidence supplies the original set.
             try root.removeFile(try root_fs.Path.init(native_recovery.progress_path));
-            try acknowledgePreparedNativeProgram(testing.allocator, root, &caller, receipt.document.digest_sha256);
-            try acknowledgePreparedNativeProgram(testing.allocator, root, &caller, receipt.document.digest_sha256);
+            try acknowledgePreparedNativeProgram(
+                testing.allocator,
+                root,
+                &caller,
+                receipt.document.digest_sha256,
+                null,
+            );
+            try acknowledgePreparedNativeProgram(
+                testing.allocator,
+                root,
+                &caller,
+                receipt.document.digest_sha256,
+                null,
+            );
             try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) == null);
             try testing.expect(try root.entryIfExists(try root_fs.Path.init(native_recovery.workspace_directory)) == null);
             try native_provenance.verifyEvidence(testing.allocator, root, receipt.document);

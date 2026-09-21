@@ -696,6 +696,33 @@ class RecoveryOracleTests(unittest.TestCase):
             },
             "digest_sha256": "b" * 64,
         }
+        bootstrap_request = {
+            "schema": "https://debz.dev/schema/native-execution-request-v3",
+            "version": 3, "execution": execution,
+            "bootstrap": {
+                "attempt_id": "b" * 64, "root_identity_sha256": "a" * 64,
+                "root_inode": self.root.stat().st_ino, "root_uid": 0, "root_gid": 0,
+                "plan_sha256": "e" * 64, "authorization_sha256": "e" * 64,
+                "program_sha256": "e" * 64,
+                "exact_lock_schema": "https://debz.dev/schema/exact-closure-lock-v2",
+                "exact_lock_version": 2, "exact_lock_sha256": "e" * 64,
+                "helper": {
+                    "source_path": f"var/lib/debz/native-recovery-v1/helper-{'b' * 64}.bin",
+                    "target_path": "usr/bin/dpkg-trigger", "sha256": "a" * 64, "size": 1,
+                },
+                "owner": {
+                    "package": "dpkg", "version": "1", "architecture": "amd64",
+                    "final_state": "installed", "artifact": 0,
+                    "archive_sha256": "c" * 64, "archive_size": 1,
+                    "application_sha256": "d" * 64, "program_step": 1,
+                },
+                "target": {
+                    "path": "usr/bin/dpkg-trigger", "sha256": "f" * 64,
+                    "size": 1, "mode": 0o755, "uid": 0, "gid": 0,
+                },
+            },
+            "digest_sha256": "b" * 64,
+        }
         for module in (acceptance, compatibility):
             with self.subTest(registry=module.Registry is not None):
                 with mock.patch("socket.socket.connect") as connect:
@@ -703,6 +730,7 @@ class RecoveryOracleTests(unittest.TestCase):
                     module.validator("native-execution-request-v1").validate(execution)
                     validator = module.validator("native-execution-request-v2")
                     validator.validate(request)
+                    module.validator("native-execution-request-v3").validate(bootstrap_request)
                     invalid = {
                         **execution,
                         "program": {**execution["program"], "script_policy_sha256": "invalid"},
@@ -892,6 +920,44 @@ class RecoveryOracleTests(unittest.TestCase):
         record["previous_sha256"] = "d" * 64
         with self.assertRaisesRegex(AssertionError, "progress chain"):
             acceptance.assert_progress(proof, progress, [script])
+
+    def test_bootstrap_progress_uses_its_v2_record_domain(self) -> None:
+        record = {
+            "sequence": 0,
+            "action": {
+                "kind": "helper",
+                "program_step": 1,
+                "substep": 65534,
+                "ordinal": 0,
+            },
+            "stage": "prepared",
+            "result": "none",
+            "evidence_sha256": None,
+            "previous_sha256": "0" * 64,
+            "digest_sha256": "0" * 64,
+        }
+        record["digest_sha256"] = acceptance.digest(
+            "debz-native-execution-progress-record-v2\0",
+            record,
+        )
+        proof = {
+            "progress_head_sha256": record["digest_sha256"],
+            "progress_record_count": 1,
+            "recovered_phase_count": 0,
+            "script_outcomes_sha256": acceptance.hashlib.sha256(
+                b"debz-native-script-outcomes-v1\0",
+            ).hexdigest(),
+            "outcome": "recovery_required",
+        }
+        acceptance.assert_progress(
+            proof,
+            {
+                "version": 2,
+                "records": [record],
+                "head_sha256": record["digest_sha256"],
+            },
+            [],
+        )
 
     def test_receipt_arguments_must_match_the_actual_script_trace(self) -> None:
         script = {

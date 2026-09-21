@@ -793,6 +793,10 @@ fn verifyStateEvidence(
     defer allocator.free(progress_bytes);
     var progress = try native_recovery.decodeProgress(allocator, progress_bytes);
     defer progress.deinit();
+    try native_recovery.validateHelperActions(
+        progress.document,
+        request.bootstrap(),
+    );
     try evidenceDigest(proof, .progress, progress.document.digest_sha256);
     try equalDigest(progress.document.intent_sha256, proof.execution_intent_sha256);
     try equalDigest(progress.document.head_sha256, proof.progress_head_sha256);

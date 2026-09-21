@@ -1282,6 +1282,22 @@ fn exposeHelper(child: ChildDescriptor) HelperExposure {
     if (target.err != .SUCCESS) return target;
     defer _ = linux.close(target.root);
 
+    const target_tree_result = live_root.cloneMountDescriptor(target.root, false);
+    const target_tree_error = linux.errno(target_tree_result);
+    if (target_tree_error != .SUCCESS) return .{ .err = target_tree_error };
+    const target_tree: i32 = @intCast(target_tree_result);
+    defer _ = linux.close(target_tree);
+    const hidden_source_attributes: live_root.MountAttribute = .{
+        .attr_set = 1 | 2 | 4 | 8,
+        .attr_clear = 0,
+        .propagation = 0,
+    };
+    const hidden_source_protected = linux.errno(
+        live_root.setMountAttributes(target_tree, false, &hidden_source_attributes),
+    );
+    if (hidden_source_protected != .SUCCESS)
+        return .{ .err = hidden_source_protected };
+
     const opened = live_root.cloneMountDescriptor(source.root, false);
     const opened_error = linux.errno(opened);
     if (opened_error != .SUCCESS) return .{ .err = opened_error };
@@ -1295,6 +1311,16 @@ fn exposeHelper(child: ChildDescriptor) HelperExposure {
     };
     const protected = linux.errno(live_root.setMountAttributes(tree, false, &attributes));
     if (protected != .SUCCESS) return .{ .err = protected };
+    const hidden = linux.errno(linux.move_mount(target_tree, "", source.root, "", .{
+        .F_SYMLINKS = false,
+        .F_AUTOMOUNTS = false,
+        .F_EMPTY_PATH = true,
+        .T_SYMLINKS = false,
+        .T_AUTOMOUNTS = false,
+        .T_EMPTY_PATH = true,
+        .SET_GROUP = false,
+    }));
+    if (hidden != .SUCCESS) return .{ .err = hidden };
     const moved = linux.errno(linux.move_mount(tree, "", target.root, "", .{
         .F_SYMLINKS = false,
         .F_AUTOMOUNTS = false,
@@ -2926,16 +2952,21 @@ test "maintainer_script.test.private helper namespace preserves target bytes" {
         \\export PATH
         \\dpkg-trigger || exit 82
         \\if (printf 'changed\n' > "$2") 2>/dev/null; then exit 83; fi
+        \\if "$3" 2>/dev/null; then exit 84; fi
+        \\cat "$3" || exit 85
         \\
     );
     defer script.deinit(testing.allocator);
-    var request = script.request(&.{ "configure", target });
+    var request = script.request(&.{ "configure", target, source });
     request.helper_mount = &mount;
     var launcher: SystemLauncher = .{};
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
     defer report.deinit();
     try testing.expect(report.succeeded());
-    try testing.expectEqualStrings("native-helper\nnative-helper\n", report.stdout);
+    try testing.expectEqualStrings(
+        "native-helper\nnative-helper\n" ++ original_body,
+        report.stdout,
+    );
     try mount.verify(testing.allocator);
     const actual = try mount.target.observeAlloc(testing.allocator, 1024);
     defer testing.allocator.free(actual.bytes);

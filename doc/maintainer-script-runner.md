@@ -102,6 +102,9 @@ The child unshares its mount namespace, disables mount propagation, reopens the
 paths without symlinks in the new namespace, and matches their pinned inode
 identities. It then mounts the helper over the target using descriptor-based
 mount operations. The helper view is read-only, nosuid, nodev and executable.
+In the same private namespace, the source path is covered by a read-only,
+nosuid, nodev, noexec view of the original package target, so the script cannot
+invoke or copy the private helper through its staging name.
 Both normal command lookup and absolute invocation paths see that helper, but
 the package-owned target bytes and the parent's mount namespace are unchanged.
 Alternate-root execution still enters the verified root before executing the
@@ -117,10 +120,14 @@ target and helper digest, which are also bound into invocation evidence.
 Requests without a helper retain their existing execution and digest contract.
 
 The experimental `debz.native_runtime` API supplies build-bound helper bytes through
-`debz.native_helper`, records the deployment in a v2 execution request, and
-requires the probe before package mutation. It refuses absent targets without
-creating placeholders. Helper-aware recovery revalidates the original binding;
-it never falls back to a package-owned executable. See
+`debz.native_helper`, records seeded-root deployment in a v2 execution request,
+and requires the probe before package mutation. It refuses absent targets
+without creating placeholders except for the authenticated v3 fresh-root
+protocol: the owning archive's exact target is first published by the normal
+journaled package payload step, then an attempt-scoped private source is
+published and probed. Helper-aware recovery revalidates the original binding;
+it never falls back to a package-owned executable or treats bootstrap bytes as
+the final target. See
 [native recovery and helper deployment](native-recovery.md#isolated-helper-request-v2).
 
 The privileged `test-native-helper-namespace` target requires the positive

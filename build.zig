@@ -821,6 +821,8 @@ pub fn build(b: *std.Build) void {
         native_recovery.addArg("--repository-cli-only");
     if (b.option(bool, "native-consumer-parity-only", "Select family and public core parity across signed fixture suites") orelse false)
         native_recovery.addArg("--consumer-parity-only");
+    if (b.option(bool, "native-fresh-helper-only", "Select authenticated fresh-root helper bootstrap cases") orelse false)
+        native_recovery.addArg("--fresh-helper-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
     );
@@ -1109,8 +1111,10 @@ fn installReleaseFiles(
         "exact-closure-lock-v2.json",
         "native-execution-intent-v1.json",
         "native-execution-progress-v1.json",
+        "native-execution-progress-v2.json",
         "native-execution-request-v1.json",
         "native-execution-request-v2.json",
+        "native-execution-request-v3.json",
         "native-managed-state-v1.json",
         "native-diversion-cache-v1.json",
         "native-unpack-diversion-v1.json",
