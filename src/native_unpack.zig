@@ -18600,7 +18600,10 @@ fn runLifecycleScript(
     if (execution.recovery) |runtime| {
         if (runtime.helper_binding) |helper| {
             try requireNativeHelperBootstrapReady(allocator, root, runtime.*);
-            helper_mount = native_helper.bind(allocator, root, helper) catch |err| {
+            helper_mount = (if (runtime.helper_bootstrap) |bootstrap|
+                native_helper.bindBootstrap(allocator, root, bootstrap)
+            else
+                native_helper.bind(allocator, root, helper)) catch |err| {
                 if (attempt.record().mutation_started)
                     try attempt.requireRecovery(allocator, .script);
                 return err;
@@ -19293,6 +19296,10 @@ fn finishLifecycleAttempt(
     );
     var progress = try native_recovery.readProgress(allocator, root);
     defer progress.deinit();
+    try native_recovery.validateHelperActions(
+        progress.document,
+        runtime.helper_bootstrap,
+    );
     var terminal_result: native_recovery.Result = if (succeeded)
         if (runtime.recovering) .recovered else .succeeded
     else
@@ -19691,11 +19698,25 @@ fn verifyNativeHelperBootstrapFinalOwner(
         .diagnostic => return false,
     };
     defer database.deinit();
-    const owner = database.model.find(
-        bootstrap.owner.package,
-        bootstrap.owner.architecture,
+    return nativeHelperBootstrapFinalOwnerMatches(
+        allocator,
+        database.model,
+        bootstrap.owner,
+    );
+}
+
+fn nativeHelperBootstrapFinalOwnerMatches(
+    allocator: std.mem.Allocator,
+    model: package_database.Model,
+    expected: native_helper.BootstrapOwner,
+) !bool {
+    const owner = model.find(
+        expected.package,
+        expected.architecture,
     ) orelse return false;
-    if (!std.mem.eql(u8, owner.version, bootstrap.owner.version))
+    if (!std.mem.eql(u8, owner.version, expected.version) or
+        owner.status.error_state != .ok or
+        !std.mem.eql(u8, @tagName(owner.status.current), expected.final_state))
         return false;
     var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
     const owned_path = try std.fmt.bufPrint(
@@ -19703,7 +19724,11 @@ fn verifyNativeHelperBootstrapFinalOwner(
         "/{s}",
         .{native_helper.target_path},
     );
-    return owner.ownsPath(owned_path);
+    const owners = try model.owners(allocator, owned_path);
+    defer allocator.free(owners);
+    return owners.len == 1 and
+        std.mem.eql(u8, owners[0].name, expected.package) and
+        std.mem.eql(u8, owners[0].architecture, expected.architecture);
 }
 
 fn recoveryBlobEntryKind(
@@ -20119,11 +20144,18 @@ fn prepareNativeRecovery(
     native_recovery.sealIntent(&intent);
     if (production_request) |request| try native_execution_request.validateIntent(request, intent);
     try native_recovery.publishIntent(allocator, root, intent);
-    try native_recovery.initializeProgress(
-        allocator,
-        root,
-        intent.digest_sha256,
-    );
+    if (helper_bootstrap != null)
+        try native_recovery.initializeBootstrapProgress(
+            allocator,
+            root,
+            intent.digest_sha256,
+        )
+    else
+        try native_recovery.initializeProgress(
+            allocator,
+            root,
+            intent.digest_sha256,
+        );
     try native_recovery.initializeTriggerEvents(
         allocator,
         root,
@@ -22749,11 +22781,15 @@ fn verifyNativeHelperBootstrapBeforeRecovery(
     root: root_fs.Root,
     runtime: *native_recovery.Runtime,
 ) !void {
+    var progress = try native_recovery.readProgress(allocator, root);
+    defer progress.deinit();
+    try native_recovery.validateHelperActions(
+        progress.document,
+        runtime.helper_bootstrap,
+    );
     const bootstrap = runtime.helper_bootstrap orelse return;
     try native_helper.verifyBootstrapPrivateState(allocator, root, bootstrap, false);
     try native_helper.verifyBootstrapCleanupAbsent(allocator, root, bootstrap);
-    var progress = try native_recovery.readProgress(allocator, root);
-    defer progress.deinit();
     const source_record = native_recovery.latest(
         progress.document,
         nativeHelperSourceAction(bootstrap),
@@ -22922,10 +22958,10 @@ fn ensureNativeHelperBootstrap(
     }
     try runtime.append(probe_action, .in_flight, .none, null);
     runtime.crash.hit(.after_helper_probe_in_flight);
-    var probe = try native_helper.probeExecutionWithCancellation(
+    var probe = try native_helper.probeBootstrapExecutionWithCancellation(
         allocator,
         root,
-        bootstrap.helper,
+        bootstrap,
         if (execution.bounds) |value| value.cancellation() else .never(),
     );
     defer probe.deinit(allocator);
@@ -23071,6 +23107,8 @@ fn authorizeNativeHelperBootstrap(
         target_file = file;
     };
     const model = owner_model orelse return error.NativeHelperBootstrapOwnerMissing;
+    if (!std.mem.eql(u8, model.facts.package, native_helper.owner_package))
+        return error.NativeHelperBootstrapOwnerUnauthorized;
     const target = target_file.?;
     const action = authorization.findAction(
         model.facts.package,
@@ -23243,6 +23281,22 @@ fn readProductionCompletion(
         Sha256.hash(helper_bytes, &sha256, .{});
         try helper.matches(.{ .bytes = helper_bytes, .sha256 = sha256 });
     }
+    const progress_bytes = try retainedNativeBytes(
+        allocator,
+        root,
+        receipt.document,
+        .progress,
+    );
+    defer allocator.free(progress_bytes);
+    var retained_progress = try native_recovery.decodeProgress(
+        allocator,
+        progress_bytes,
+    );
+    defer retained_progress.deinit();
+    try native_recovery.validateHelperActions(
+        retained_progress.document,
+        request.bootstrap(),
+    );
     if (request.bootstrap()) |bootstrap|
         try native_helper.verifyBootstrapTarget(allocator, root, bootstrap.target);
     const program_bytes = try retainedNativeBytes(allocator, root, receipt.document, .program);
@@ -23405,6 +23459,22 @@ fn acknowledgePreparedNativeProgram(
     defer allocator.free(progress_bytes);
     var progress = try native_recovery.decodeProgress(allocator, progress_bytes);
     defer progress.deinit();
+    const retained_request_bytes = try retainedNativeBytes(
+        allocator,
+        root,
+        receipt.document,
+        .execution_request,
+    );
+    defer allocator.free(retained_request_bytes);
+    var retained_request = try native_execution_request.decodePersisted(
+        allocator,
+        retained_request_bytes,
+    );
+    defer retained_request.deinit();
+    try native_recovery.validateHelperActions(
+        progress.document,
+        retained_request.bootstrap(),
+    );
     if (!std.mem.eql(u8, &intent.intent.digest_sha256, &receipt.document.execution_intent_sha256) or
         !std.mem.eql(u8, &progress.document.intent_sha256, &intent.intent.digest_sha256) or
         !std.mem.eql(u8, &progress.document.head_sha256, &receipt.document.progress_head_sha256))
@@ -28201,6 +28271,22 @@ test "native_unpack.test.interleaved state and fresh-root helper authority remai
             try testing.expectEqual(@as(u32, 0), bootstrap.owner.artifact);
             try testing.expectEqual(@as(u32, 0), bootstrap.owner.program_step);
 
+            var wrong_owner_model = model;
+            wrong_owner_model.facts.package = "not-dpkg";
+            try testing.expectError(
+                error.NativeHelperBootstrapOwnerUnauthorized,
+                authorizeNativeHelperBootstrap(
+                    testing.allocator,
+                    fixture.root(),
+                    execution,
+                    native_helper.bundled(),
+                    authorization,
+                    program,
+                    &.{wrong_owner_model},
+                    initial_model,
+                    true,
+                ),
+            );
             try testing.expectError(
                 error.NativeHelperBootstrapOwnerMissing,
                 authorizeNativeHelperBootstrap(
@@ -28400,6 +28486,140 @@ test "native_unpack.test.interleaved state and fresh-root helper authority remai
     try testing.expectEqual(@as(u32, 4), outer.script_ordinal);
     try testing.expect(outer.recovery == &outer_runtime);
     try testing.expect(inner.recovery == &inner_runtime);
+}
+
+test "native_unpack.test.helper progress is exclusive to its exact v3 authority" {
+    const bootstrap: native_helper.Bootstrap = .{
+        .attempt_id = @splat('a'),
+        .root_identity_sha256 = @splat('b'),
+        .root_inode = 1,
+        .root_uid = 0,
+        .root_gid = 0,
+        .plan_sha256 = @splat('c'),
+        .authorization_sha256 = @splat('d'),
+        .program_sha256 = @splat('e'),
+        .exact_lock_schema = native_helper.exact_lock_schema,
+        .exact_lock_version = native_helper.exact_lock_version,
+        .exact_lock_sha256 = @splat('f'),
+        .helper = .{
+            .source_path = "var/lib/debz/native-recovery-v1/helper-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bin",
+            .target_path = native_helper.target_path,
+            .sha256 = @splat('1'),
+            .size = 1,
+        },
+        .owner = .{
+            .package = native_helper.owner_package,
+            .version = "1",
+            .architecture = "amd64",
+            .final_state = "installed",
+            .artifact = 0,
+            .archive_sha256 = @splat('2'),
+            .archive_size = 1,
+            .application_sha256 = @splat('3'),
+            .program_step = 7,
+        },
+        .target = .{
+            .sha256 = @splat('4'),
+            .size = 1,
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+        },
+    };
+    var records = [_]native_recovery.Record{.{
+        .sequence = 0,
+        .action = nativeHelperSourceAction(bootstrap),
+        .stage = .prepared,
+        .previous_sha256 = @splat('0'),
+        .digest_sha256 = @splat('0'),
+    }};
+    const progress: native_recovery.ProgressDocument = .{
+        .schema = native_recovery.bootstrap_progress_schema_id,
+        .version = 2,
+        .intent_sha256 = @splat('0'),
+        .records = &records,
+        .head_sha256 = @splat('0'),
+        .digest_sha256 = @splat('0'),
+    };
+    try testing.expectError(
+        error.InvalidNativeHelperBootstrapState,
+        native_recovery.validateHelperActions(progress, null),
+    );
+    try native_recovery.validateHelperActions(progress, bootstrap);
+    records[0].action.ordinal = 1;
+    try testing.expectError(
+        error.InvalidNativeHelperBootstrapState,
+        native_recovery.validateHelperActions(progress, bootstrap),
+    );
+    records[0].action.kind = .filesystem;
+    var legacy_progress = progress;
+    legacy_progress.schema = native_recovery.progress_schema_id;
+    legacy_progress.version = 1;
+    try native_recovery.validateHelperActions(legacy_progress, null);
+}
+
+test "native_unpack.test.fresh helper final package ownership is exact and unique" {
+    const status =
+        \\Package: dpkg
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: owner
+        \\
+        \\Package: other
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: duplicate
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{
+            .name = "dpkg.list",
+            .bytes = "/.\n/usr/bin/dpkg-trigger\n",
+        },
+        .{
+            .name = "other.list",
+            .bytes = "/.\n/usr/bin/dpkg-trigger\n",
+        },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.initFull(status, &info, null);
+    defer fixture.deinit();
+    var database = try fixture.database();
+    defer database.deinit();
+    const expected: native_helper.BootstrapOwner = .{
+        .package = native_helper.owner_package,
+        .version = "1",
+        .architecture = "amd64",
+        .final_state = "installed",
+        .artifact = 0,
+        .archive_sha256 = @splat('a'),
+        .archive_size = 1,
+        .application_sha256 = @splat('b'),
+        .program_step = 0,
+    };
+    try testing.expect(!try nativeHelperBootstrapFinalOwnerMatches(
+        testing.allocator,
+        database.model,
+        expected,
+    ));
+    var packages = [_]package_database.PackageRecord{database.model.packages[0]};
+    var unique = database.model;
+    unique.packages = &packages;
+    try testing.expect(try nativeHelperBootstrapFinalOwnerMatches(
+        testing.allocator,
+        unique,
+        expected,
+    ));
+    var wrong_state = expected;
+    wrong_state.final_state = "triggers_pending";
+    try testing.expect(!try nativeHelperBootstrapFinalOwnerMatches(
+        testing.allocator,
+        unique,
+        wrong_state,
+    ));
 }
 
 test "native_unpack.test.production preparation drives a mixed install and removal program" {

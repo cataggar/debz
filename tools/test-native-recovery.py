@@ -408,6 +408,8 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
         schema = EVIDENCE_SCHEMAS[kind]
         if kind == "execution_request" and value.get("version") in (2, 3):
             schema = f"native-execution-request-v{value['version']}"
+        if kind == "progress" and value.get("version") == 2:
+            schema = "native-execution-progress-v2"
         validator(schema).validate(value)
         assert_digest(value, schema)
         if value["digest_sha256"] != entry["document_sha256"]:
@@ -528,10 +530,15 @@ def assert_progress(proof: dict, progress: dict, scripts: list[dict]) -> None:
     previous = "0" * 64
     outcomes = {}
     script_hash = hashlib.sha256(b"debz-native-script-outcomes-v1\0")
+    record_schema = (
+        "native-execution-progress-record-v2"
+        if progress.get("version") == 2
+        else "native-execution-progress-record-v1"
+    )
     for sequence, record in enumerate(progress["records"]):
         if record["sequence"] != sequence or record["previous_sha256"] != previous:
             raise AssertionError("native progress chain is broken")
-        assert_digest(record, "native-execution-progress-record-v1")
+        assert_digest(record, record_schema)
         previous = record["digest_sha256"]
         if record["action"]["kind"] in ("script", "compensation", "trigger") and record["stage"] == "outcome":
             key = action_key(record["action"])
@@ -1192,7 +1199,7 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
     before = triggers.snapshot(current.candidate)
     report = native(executable, current.candidate, architecture, "install", [archive],
                     environment, destination, caller_owned=True, isolated_helper=True)
-    if report is None or report["detail"] != "NativeHelperTargetMissing":
+    if report is None or report["detail"] != "NativeHelperBootstrapOwnerMissing":
         raise AssertionError(f"missing target was not refused: {report}")
     if document(current.candidate / OPERATION)["mutation_started"]:
         raise AssertionError("missing target crossed the mutation boundary")
@@ -4726,7 +4733,7 @@ def fresh_helper_scenario(
     *,
     postinst: bool = False,
 ) -> tuple[Scenario, Path, str]:
-    package = f"debz-fresh-helper-{name}"
+    package = "dpkg"
     current = Scenario(
         workspace,
         f"fresh-helper-{name}",

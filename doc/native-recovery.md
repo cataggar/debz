@@ -405,13 +405,16 @@ refused.
 
 [`native-execution-request-v3`](../schema/native-execution-request-v3.json)
 is the only missing-target exception. It is available only for an empty,
-settled dpkg database and an exact transaction whose authenticated archive
-contains one regular `usr/bin/dpkg-trigger`. The bootstrap binding records the
-caller attempt and root identity/inode/owner, plan, authorization, program and
-exact lock, owner package/version/architecture and final state, archive digest,
-size, artifact index and application digest, and the target's exact payload
-digest, size, mode, uid and gid. Wrong, absent, ambiguous, non-regular or
-misordered owners fail before payload mutation.
+settled dpkg database and an exact transaction whose authenticated `dpkg`
+archive contains one regular `usr/bin/dpkg-trigger`. No differently named
+package may inherit this authority. The bootstrap binding records the caller
+attempt and root identity/inode, fixed private uid/gid, plan, authorization,
+program and exact v2 lock, owner package/version/architecture and final state,
+archive digest, size, artifact index and application digest, and the target's
+exact payload digest, size, mode, uid and gid. Wrong, absent, ambiguous,
+non-regular or misordered owners fail before payload mutation. Final
+verification requires that the bound `dpkg` generation is the target's sole
+database owner.
 
 The compiled program must publish that target in its ordinary
 `materialize_bootstrap_payload` step before any maintainer script or deferred
@@ -425,10 +428,16 @@ and publishes the embedded helper at
 bound to the request's helper digest and size, owned by uid/gid 0, mode `0500`,
 confined beneath the no-follow recovery workspace, and removed
 before that workspace is acknowledged and cleaned. The normal per-script
-private mount namespace overlays it on the now package-owned target.
+private mount namespace overlays it on the now package-owned target and masks
+the source path with a noexec view of the original authenticated target. A
+maintainer script therefore cannot execute or copy the staged helper by its
+attempt-derived name.
 
 Source publication and the namespace probe have separate durable progress
-actions. A crash before source publication may publish it once; an exact
+actions in `native-execution-progress-v2`. Legacy request v1/v2 executions keep
+their original progress-v1 schema and action vocabulary; helper actions are
+accepted only when the retained request is the exact bound v3 bootstrap. A
+crash before source publication may publish it once; an exact
 already-published source may be adopted. A crash before probe launch may
 launch it once, and a recorded successful outcome may be completed without
 relaunch. An in-flight probe with no outcome is immutable unknown evidence and
@@ -446,6 +455,15 @@ bytes are already retained by the execution intent. Repeated recovery, terminal
 completion and acknowledgment consume the same immutable evidence; they never
 re-solve, accept caller replacement bytes, invoke `dpkg`/`dpkg-deb`, or
 downgrade to the legacy backend.
+
+This closes only the private trigger-helper bootstrap. It does not inject
+`update-alternatives` or any other host executable. A script that may invoke
+`update-alternatives` remains behind the existing pinned-tool gate: the exact
+root-owned executable must already have been published from authenticated
+package payload, with the admitted architecture digest, mode and ownership.
+Absence or mismatch fails closed before that script. The fresh-root snapshot
+workflow must therefore obtain the tool from its authenticated `dpkg` archive;
+seeding it from the runner would not satisfy this gate.
 
 ### Experimental typed runtime API
 

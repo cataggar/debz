@@ -20,6 +20,8 @@ pub fn parseDigest(value: Digest) ?[32]u8 {
 
 pub const intent_path = root_operation.native_intent_path;
 pub const progress_path = "var/lib/debz/native-execution-progress-v1.log";
+pub const progress_schema_id = "https://debz.dev/schema/native-execution-progress-v1";
+pub const bootstrap_progress_schema_id = "https://debz.dev/schema/native-execution-progress-v2";
 pub const authorization_name = "native-transaction-authorization-v1.json";
 pub const program_name = "native-transaction-program-v1.json";
 pub const blob_prefix = "native-recovery-v1-blob-";
@@ -423,6 +425,39 @@ pub const Action = struct {
 pub const helper_source_substep = std.math.maxInt(u16) - 1;
 pub const helper_probe_substep = std.math.maxInt(u16);
 
+pub fn validateHelperActions(
+    progress: ProgressDocument,
+    bootstrap: ?native_helper.Bootstrap,
+) !void {
+    const bootstrap_progress = std.mem.eql(
+        u8,
+        progress.schema,
+        bootstrap_progress_schema_id,
+    ) and progress.version == 2;
+    if (bootstrap_progress != (bootstrap != null))
+        return error.InvalidNativeHelperBootstrapState;
+    for (progress.records) |record| {
+        if (record.action.kind != .helper) continue;
+        const authority = bootstrap orelse
+            return error.InvalidNativeHelperBootstrapState;
+        const source: Action = .{
+            .kind = .helper,
+            .program_step = authority.owner.program_step,
+            .substep = helper_source_substep,
+            .ordinal = 0,
+        };
+        const probe: Action = .{
+            .kind = .helper,
+            .program_step = authority.owner.program_step,
+            .substep = helper_probe_substep,
+            .ordinal = 0,
+        };
+        if (!std.meta.eql(record.action, source) and
+            !std.meta.eql(record.action, probe))
+            return error.InvalidNativeHelperBootstrapState;
+    }
+}
+
 pub const Stage = enum {
     prepared,
     in_flight,
@@ -455,7 +490,7 @@ pub const Record = struct {
 };
 
 pub const ProgressDocument = struct {
-    schema: []const u8 = "https://debz.dev/schema/native-execution-progress-v1",
+    schema: []const u8 = progress_schema_id,
     version: u32 = 1,
     intent_sha256: Digest,
     records: []const Record,
@@ -495,26 +530,35 @@ pub const OwnedProgress = struct {
     }
 };
 
-fn sealRecord(record: *Record) void {
+fn sealRecord(record: *Record, bootstrap: bool) void {
     record.digest_sha256 = @splat('0');
     record.digest_sha256 = digestValue(
-        "debz-native-execution-progress-record-v1\x00",
+        if (bootstrap)
+            "debz-native-execution-progress-record-v2\x00"
+        else
+            "debz-native-execution-progress-record-v1\x00",
         record.*,
     );
 }
 
 fn validateProgress(document: ProgressDocument) !void {
-    if (!std.mem.eql(
-        u8,
-        document.schema,
-        "https://debz.dev/schema/native-execution-progress-v1",
-    ) or document.version != 1 or document.records.len > maximum_records)
+    const bootstrap = if (std.mem.eql(u8, document.schema, progress_schema_id) and
+        document.version == 1)
+        false
+    else if (std.mem.eql(u8, document.schema, bootstrap_progress_schema_id) and
+        document.version == 2)
+        true
+    else
+        return error.InvalidProgress;
+    if (document.records.len > maximum_records)
         return error.InvalidProgress;
     var previous: Digest = @splat('0');
     var terminal_seen = false;
     for (document.records, 0..) |record, index| {
         if (record.sequence != index or terminal_seen or
             !std.mem.eql(u8, &record.previous_sha256, &previous))
+            return error.InvalidProgress;
+        if (record.action.kind == .helper and !bootstrap)
             return error.InvalidProgress;
         if (parseDigest(record.previous_sha256) == null or
             parseDigest(record.digest_sha256) == null or
@@ -599,7 +643,10 @@ fn validateProgress(document: ProgressDocument) !void {
             u8,
             &digest,
             &digestValue(
-                "debz-native-execution-progress-record-v1\x00",
+                if (bootstrap)
+                    "debz-native-execution-progress-record-v2\x00"
+                else
+                    "debz-native-execution-progress-record-v1\x00",
                 payload,
             ),
         )) return error.InvalidProgress;
@@ -617,7 +664,13 @@ fn validateProgress(document: ProgressDocument) !void {
     if (!std.mem.eql(
         u8,
         &digest,
-        &digestValue("debz-native-execution-progress-v1\x00", payload),
+        &digestValue(
+            if (bootstrap)
+                "debz-native-execution-progress-v2\x00"
+            else
+                "debz-native-execution-progress-v1\x00",
+            payload,
+        ),
     )) return error.DigestMismatch;
 }
 
@@ -626,14 +679,36 @@ pub fn initializeProgress(
     root: root_fs.Root,
     intent_sha256: Digest,
 ) !void {
+    return initializeProgressVersion(allocator, root, intent_sha256, false);
+}
+
+pub fn initializeBootstrapProgress(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+) !void {
+    return initializeProgressVersion(allocator, root, intent_sha256, true);
+}
+
+fn initializeProgressVersion(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+    bootstrap: bool,
+) !void {
     var document: ProgressDocument = .{
+        .schema = if (bootstrap) bootstrap_progress_schema_id else progress_schema_id,
+        .version = if (bootstrap) 2 else 1,
         .intent_sha256 = intent_sha256,
         .records = &.{},
         .head_sha256 = @splat('0'),
         .digest_sha256 = @splat('0'),
     };
     document.digest_sha256 = digestValue(
-        "debz-native-execution-progress-v1\x00",
+        if (bootstrap)
+            "debz-native-execution-progress-v2\x00"
+        else
+            "debz-native-execution-progress-v1\x00",
         document,
     );
     try validateProgress(document);
@@ -708,16 +783,26 @@ pub fn appendProgress(
         .previous_sha256 = current.document.head_sha256,
         .digest_sha256 = @splat('0'),
     };
-    sealRecord(&record);
+    const bootstrap = std.mem.eql(
+        u8,
+        current.document.schema,
+        bootstrap_progress_schema_id,
+    );
+    sealRecord(&record, bootstrap);
     records[records.len - 1] = record;
     var document: ProgressDocument = .{
+        .schema = if (bootstrap) bootstrap_progress_schema_id else progress_schema_id,
+        .version = if (bootstrap) 2 else 1,
         .intent_sha256 = intent_sha256,
         .records = records,
         .head_sha256 = record.digest_sha256,
         .digest_sha256 = @splat('0'),
     };
     document.digest_sha256 = digestValue(
-        "debz-native-execution-progress-v1\x00",
+        if (bootstrap)
+            "debz-native-execution-progress-v2\x00"
+        else
+            "debz-native-execution-progress-v1\x00",
         document,
     );
     try validateProgress(document);
@@ -2632,7 +2717,7 @@ fn checkProgressChain() !void {
         .previous_sha256 = @splat('0'),
         .digest_sha256 = @splat('0'),
     };
-    sealRecord(&first);
+    sealRecord(&first, false);
     var second: Record = .{
         .sequence = 1,
         .action = first.action,
@@ -2641,7 +2726,7 @@ fn checkProgressChain() !void {
         .previous_sha256 = first.digest_sha256,
         .digest_sha256 = @splat('0'),
     };
-    sealRecord(&second);
+    sealRecord(&second, false);
     var records = [_]Record{ first, second };
     var progress: ProgressDocument = .{
         .intent_sha256 = @splat('1'),
@@ -3444,7 +3529,7 @@ test "native_recovery.test.helper publication probe and unknown outcome transiti
         root_fs.default_directory_permissions,
     );
     const intent: Digest = @splat('a');
-    try initializeProgress(testing.allocator, root, intent);
+    try initializeBootstrapProgress(testing.allocator, root, intent);
     const source: Action = .{
         .kind = .helper,
         .program_step = 7,

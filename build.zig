@@ -1111,6 +1111,7 @@ fn installReleaseFiles(
         "exact-closure-lock-v2.json",
         "native-execution-intent-v1.json",
         "native-execution-progress-v1.json",
+        "native-execution-progress-v2.json",
         "native-execution-request-v1.json",
         "native-execution-request-v2.json",
         "native-execution-request-v3.json",

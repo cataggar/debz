@@ -921,6 +921,44 @@ class RecoveryOracleTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "progress chain"):
             acceptance.assert_progress(proof, progress, [script])
 
+    def test_bootstrap_progress_uses_its_v2_record_domain(self) -> None:
+        record = {
+            "sequence": 0,
+            "action": {
+                "kind": "helper",
+                "program_step": 1,
+                "substep": 65534,
+                "ordinal": 0,
+            },
+            "stage": "prepared",
+            "result": "none",
+            "evidence_sha256": None,
+            "previous_sha256": "0" * 64,
+            "digest_sha256": "0" * 64,
+        }
+        record["digest_sha256"] = acceptance.digest(
+            "debz-native-execution-progress-record-v2\0",
+            record,
+        )
+        proof = {
+            "progress_head_sha256": record["digest_sha256"],
+            "progress_record_count": 1,
+            "recovered_phase_count": 0,
+            "script_outcomes_sha256": acceptance.hashlib.sha256(
+                b"debz-native-script-outcomes-v1\0",
+            ).hexdigest(),
+            "outcome": "recovery_required",
+        }
+        acceptance.assert_progress(
+            proof,
+            {
+                "version": 2,
+                "records": [record],
+                "head_sha256": record["digest_sha256"],
+            },
+            [],
+        )
+
     def test_receipt_arguments_must_match_the_actual_script_trace(self) -> None:
         script = {
             "package": "example", "package_version": "1", "architecture": "amd64",

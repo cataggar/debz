@@ -102,6 +102,9 @@ The child unshares its mount namespace, disables mount propagation, reopens the
 paths without symlinks in the new namespace, and matches their pinned inode
 identities. It then mounts the helper over the target using descriptor-based
 mount operations. The helper view is read-only, nosuid, nodev and executable.
+In the same private namespace, the source path is covered by a read-only,
+nosuid, nodev, noexec view of the original package target, so the script cannot
+invoke or copy the private helper through its staging name.
 Both normal command lookup and absolute invocation paths see that helper, but
 the package-owned target bytes and the parent's mount namespace are unchanged.
 Alternate-root execution still enters the verified root before executing the

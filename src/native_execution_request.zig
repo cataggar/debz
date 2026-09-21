@@ -210,6 +210,7 @@ fn validateBootstrapExecution(
     if (!std.mem.eql(u8, &bootstrap.attempt_id, &document.caller.attempt_id) or
         !std.mem.eql(u8, &bootstrap.root_identity_sha256, &document.root_identity_sha256) or
         bootstrap.root_inode != document.root_inode or
+        !std.mem.eql(u8, bootstrap.owner.architecture, document.architecture) or
         !std.mem.eql(u8, &bootstrap.plan_sha256, &document.program.plan_sha256) or
         !std.mem.eql(u8, &bootstrap.authorization_sha256, &document.program.authorization_sha256) or
         !std.mem.eql(u8, &bootstrap.program_sha256, &document.program.program_sha256) or
@@ -613,6 +614,41 @@ fn roundTripBootstrap(allocator: std.mem.Allocator) !void {
     );
     changed = bootstrap;
     changed.root_uid = 1;
+    try std.testing.expectError(
+        error.InvalidNativeHelperBootstrap,
+        withBootstrap(plain, changed),
+    );
+    changed = bootstrap;
+    changed.owner.package = "not-dpkg";
+    try std.testing.expectError(
+        error.InvalidNativeHelperBootstrap,
+        withBootstrap(plain, changed),
+    );
+    changed = bootstrap;
+    changed.owner.final_state = "unpacked";
+    try std.testing.expectError(
+        error.InvalidNativeHelperBootstrap,
+        withBootstrap(plain, changed),
+    );
+    changed.owner.final_state = "config_files";
+    try std.testing.expectError(
+        error.InvalidNativeHelperBootstrap,
+        withBootstrap(plain, changed),
+    );
+    changed = bootstrap;
+    changed.exact_lock_version = 1;
+    try std.testing.expectError(
+        error.InvalidNativeHelperBootstrap,
+        withBootstrap(plain, changed),
+    );
+    changed = bootstrap;
+    changed.owner.architecture = "arm64";
+    try std.testing.expectError(
+        error.NativeHelperBootstrapBindingMismatch,
+        withBootstrap(plain, changed),
+    );
+    changed = bootstrap;
+    changed.target.size = native_helper.maximum_bytes + 1;
     try std.testing.expectError(
         error.InvalidNativeHelperBootstrap,
         withBootstrap(plain, changed),

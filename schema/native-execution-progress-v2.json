@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://debz.dev/schema/native-execution-progress-v1",
-  "title": "debz native execution progress v1",
+  "$id": "https://debz.dev/schema/native-execution-progress-v2",
+  "title": "debz native execution progress with fresh-root helper bootstrap v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,10 +14,10 @@
   ],
   "properties": {
     "schema": {
-      "const": "https://debz.dev/schema/native-execution-progress-v1"
+      "const": "https://debz.dev/schema/native-execution-progress-v2"
     },
     "version": {
-      "const": 1
+      "const": 2
     },
     "intent_sha256": {
       "$ref": "#/$defs/digest"
@@ -55,6 +55,7 @@
           "enum": [
             "filesystem",
             "database",
+            "helper",
             "script",
             "compensation",
             "trigger",

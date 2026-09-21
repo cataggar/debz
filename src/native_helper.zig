@@ -8,6 +8,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const directory = "var/lib/debz/native-helper-cache-v1";
 pub const bootstrap_directory = "var/lib/debz/native-recovery-v1";
 pub const target_path = "usr/bin/dpkg-trigger";
+pub const owner_package = "dpkg";
+pub const exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v2";
+pub const exact_lock_version: u32 = 2;
 pub const maximum_bytes = 32 * 1024 * 1024;
 const cleanup_prepared = "prepared\n";
 const cleanup_completed = "completed\n";
@@ -118,7 +121,7 @@ pub const BootstrapTarget = struct {
     pub fn validate(self: BootstrapTarget) !void {
         if (!std.mem.eql(u8, self.path, target_path) or
             !validDigest(self.sha256) or self.size == 0 or
-            self.size > std.math.maxInt(usize) or self.mode > 0o7777)
+            self.size > maximum_bytes or self.mode > 0o7777)
             return error.InvalidNativeHelperBootstrap;
     }
 };
@@ -135,10 +138,15 @@ pub const BootstrapOwner = struct {
     program_step: u32,
 
     pub fn validate(self: BootstrapOwner) !void {
-        if (self.package.len == 0 or self.version.len == 0 or
+        if (!std.mem.eql(u8, self.package, owner_package) or
+            self.version.len == 0 or
             self.architecture.len == 0 or self.final_state.len == 0 or
             !validDigest(self.archive_sha256) or
             !validDigest(self.application_sha256) or self.archive_size == 0)
+            return error.InvalidNativeHelperBootstrap;
+        if (!std.mem.eql(u8, self.final_state, "installed") and
+            !std.mem.eql(u8, self.final_state, "triggers_pending") and
+            !std.mem.eql(u8, self.final_state, "triggers_awaited"))
             return error.InvalidNativeHelperBootstrap;
     }
 };
@@ -197,8 +205,8 @@ pub const Bootstrap = struct {
         }) |digest| if (!validDigest(digest))
             return error.InvalidNativeHelperBootstrap;
         if (self.root_inode == 0 or self.root_uid != 0 or self.root_gid != 0 or
-            self.exact_lock_schema.len == 0 or
-            self.exact_lock_version == 0)
+            !std.mem.eql(u8, self.exact_lock_schema, exact_lock_schema) or
+            self.exact_lock_version != exact_lock_version)
             return error.InvalidNativeHelperBootstrap;
         try self.helper.validateBootstrap(self.attempt_id);
         try self.owner.validate();
@@ -552,6 +560,45 @@ pub fn bind(
     return mount;
 }
 
+pub fn bindBootstrap(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    bootstrap: Bootstrap,
+) !maintainer_script.HelperMount {
+    try bootstrap.validate();
+    try verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+    try verifyBootstrapTarget(allocator, root, bootstrap.target);
+    var mount = try bind(allocator, root, bootstrap.helper);
+    errdefer mount.deinit();
+    const root_entry = try root.rootEntry();
+    if (!root_entry.modeled or root_entry.inode != bootstrap.root_inode)
+        return error.NativeHelperRootDrift;
+    const source = try mount.source.observeAlloc(allocator, maximum_bytes);
+    defer allocator.free(source.bytes);
+    if (source.entry.size != bootstrap.helper.size or
+        source.entry.mode & 0o7777 != 0o500 or
+        source.entry.uid != bootstrap.root_uid or
+        source.entry.gid != bootstrap.root_gid or source.entry.link_count != 1)
+        return error.NativeHelperEvidenceChanged;
+    const target_maximum = std.math.cast(usize, bootstrap.target.size) orelse
+        return error.InvalidNativeHelperBootstrap;
+    const target = try mount.target.observeAlloc(allocator, target_maximum);
+    defer allocator.free(target.bytes);
+    if (target.entry.size != bootstrap.target.size or
+        target.entry.mode != bootstrap.target.mode or
+        target.entry.uid != bootstrap.target.uid or
+        target.entry.gid != bootstrap.target.gid or target.entry.link_count != 1)
+        return error.NativeHelperTargetDrift;
+    var observed: [32]u8 = undefined;
+    Sha256.hash(target.bytes, &observed, .{});
+    if (!std.mem.eql(
+        u8,
+        &std.fmt.bytesToHex(observed, .lower),
+        &bootstrap.target.sha256,
+    )) return error.NativeHelperTargetDrift;
+    return mount;
+}
+
 pub fn stage(allocator: std.mem.Allocator, root: root_fs.Root, source: Source) !Deployment {
     if (@import("builtin").os.tag != .linux) return error.UnsupportedPlatform;
     try source.validate();
@@ -613,6 +660,21 @@ pub fn probeExecutionWithCancellation(
     cancellation: maintainer_script.Cancellation,
 ) !maintainer_script.Execution {
     var mount = try bind(allocator, root, binding);
+    defer mount.deinit();
+    return maintainer_script.SystemLauncher.probeHelper(
+        allocator,
+        &mount,
+        cancellation,
+    );
+}
+
+pub fn probeBootstrapExecutionWithCancellation(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    bootstrap: Bootstrap,
+    cancellation: maintainer_script.Cancellation,
+) !maintainer_script.Execution {
+    var mount = try bindBootstrap(allocator, root, bootstrap);
     defer mount.deinit();
     return maintainer_script.SystemLauncher.probeHelper(
         allocator,

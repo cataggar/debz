@@ -37,8 +37,10 @@
         "plan_sha256": {"$ref": "#/$defs/digest"},
         "authorization_sha256": {"$ref": "#/$defs/digest"},
         "program_sha256": {"$ref": "#/$defs/digest"},
-        "exact_lock_schema": {"type": "string", "minLength": 1, "maxLength": 4096},
-        "exact_lock_version": {"type": "integer", "minimum": 1},
+        "exact_lock_schema": {
+          "const": "https://debz.dev/schema/exact-closure-lock-v2"
+        },
+        "exact_lock_version": {"const": 2},
         "exact_lock_sha256": {"$ref": "#/$defs/digest"},
         "helper": {
           "type": "object",
@@ -69,11 +71,11 @@
             "program_step"
           ],
           "properties": {
-            "package": {"type": "string", "minLength": 1},
+            "package": {"const": "dpkg"},
             "version": {"type": "string", "minLength": 1},
             "architecture": {"type": "string", "minLength": 1},
             "final_state": {
-              "enum": ["installed", "config_files", "triggers_pending", "triggers_awaited"]
+              "enum": ["installed", "triggers_pending", "triggers_awaited"]
             },
             "artifact": {"type": "integer", "minimum": 0},
             "archive_sha256": {"$ref": "#/$defs/digest"},
@@ -89,7 +91,7 @@
           "properties": {
             "path": {"const": "usr/bin/dpkg-trigger"},
             "sha256": {"$ref": "#/$defs/digest"},
-            "size": {"type": "integer", "minimum": 1},
+            "size": {"type": "integer", "minimum": 1, "maximum": 33554432},
             "mode": {"type": "integer", "minimum": 0, "maximum": 4095},
             "uid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
             "gid": {"type": "integer", "minimum": 0, "maximum": 4294967295}
