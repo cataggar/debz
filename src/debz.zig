@@ -261,6 +261,7 @@ pub const native_preparation = @import("native_preparation.zig");
 pub const native_execution_request = @import("native_execution_request.zig");
 pub const native_helper = @import("native_helper.zig");
 pub const native_unpack = @import("native_unpack.zig");
+pub const native_alternatives = @import("native_alternatives.zig");
 pub const native_runtime = native_unpack.Runtime;
 pub const transaction_provenance = @import("transaction_provenance.zig");
 pub const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");

@@ -38,7 +38,9 @@ TRACE = m.oracle.TRACE_PATH
 LITERAL_PACKAGE = "literal-paths"
 LITERAL_CONFFILE = Path("etc/literal\\config.conf")
 METADATA_PACKAGE = "retained-metadata"
-METADATA_KINDS = ("config", "templates", "shlibs", "symbols")
+METADATA_KINDS = ("alternatives", "config", "templates", "shlibs", "symbols")
+ALTERNATIVES_PACKAGE = "native-alternatives"
+ALTERNATIVES_GROUP = "debz-native-alternatives"
 CONFIG_REFERENCE = ROOT / "tools/fixtures/vendor-state/dpkg-config-reference-v1.json"
 CONFFILE_PACKAGE = "conffile-lifecycle"
 CONFFILE_PATHS = (Path("etc/debz-native.conf"), Path("etc/conffile\\extra.conf"))
@@ -223,6 +225,46 @@ def normalize_rollback_times(
         entry["mtime_ns"] = original if original is not None else 0
 
 
+def normalize_alternatives_times(
+    snapshot: dict,
+    root: Path,
+    started: int,
+    ended: int,
+) -> None:
+    exact = {
+        f"usr/bin/{ALTERNATIVES_GROUP}",
+        f"usr/share/man/man1/{ALTERNATIVES_GROUP}.1",
+        "var/log/alternatives.log",
+    }
+    prefixes = (
+        "etc/alternatives/",
+        "var/lib/dpkg/alternatives/",
+    )
+    for entry in snapshot["filesystem"]:
+        path = entry["path"]
+        if path not in exact and not path.startswith(prefixes):
+            continue
+        if path == "var/log/alternatives.log":
+            content = (root / path).read_bytes()
+            normalized = re.sub(
+                rb"(?m)^update-alternatives "
+                rb"[0-9]{4}-[0-9]{2}-[0-9]{2} "
+                rb"[0-9]{2}:[0-9]{2}:[0-9]{2}:",
+                b"update-alternatives <clock>:",
+                content,
+            )
+            entry["sha256"] = hashlib.sha256(normalized).hexdigest()
+            entry["size"] = len(normalized)
+            entry["mtime_ns"] = 0
+            continue
+        value = entry["mtime_ns"]
+        if value != m.EPOCH * 1_000_000_000 and not started <= value <= ended:
+            raise AssertionError(
+                f"unexpected alternatives timestamp: {path}: {value}"
+            )
+        entry["mtime_ns"] = 0
+
+
 def compare_roots(
     expected: Path,
     candidate: Path,
@@ -232,12 +274,17 @@ def compare_roots(
     ended: int,
 ) -> None:
     snapshots = [m.snapshot(expected), m.snapshot(candidate)]
-    for label, snapshot in zip(("reference", "native"), snapshots):
+    for label, root, snapshot in zip(
+        ("reference", "native"),
+        (expected, candidate),
+        snapshots,
+    ):
         m.write(
             destination / f"{label}.snapshot.json",
             m.oracle.canonical_json(snapshot).encode(),
         )
         normalize_rollback_times(snapshot, rollback_times, started, ended)
+        normalize_alternatives_times(snapshot, root, started, ended)
     mismatches = m.oracle.differences(*snapshots, maximum=30)
     if mismatches:
         raise AssertionError("native/dpkg mismatch:\n" + "\n".join(mismatches))
@@ -274,6 +321,31 @@ class Scenario:
 
     def identities(self, names: tuple[str, ...]) -> list[dict[str, str]]:
         return [{"name": name, "architecture": self.architecture} for name in names]
+
+    def enable_alternatives(self) -> None:
+        source = Path(m.REFERENCE_DPKG).with_name("update-alternatives")
+        expected = m.reference_dpkg.PINS[self.architecture]["update_alternatives"]
+        m.reference_dpkg.verify_file(source, expected)
+        for root in self.roots:
+            for relative in (
+                "etc/alternatives",
+                "usr/bin",
+                "usr/lib/debz-alternatives",
+                "usr/share/man/man1",
+                "var/lib/dpkg/alternatives",
+                "var/log",
+            ):
+                (root / relative).mkdir(parents=True, exist_ok=True)
+                (root / relative).chmod(0o755)
+            runtime.copy_program(
+                root,
+                source,
+                "/usr/bin/update-alternatives",
+            )
+            m.reference_dpkg.verify_file(
+                root / "usr/bin/update-alternatives",
+                expected,
+            )
 
     def seed(self, archive: Path, *, configure: bool = True) -> None:
         for root in self.roots:
@@ -431,6 +503,7 @@ def metadata_contents(version: str) -> dict[str, bytes]:
     if version not in ("1", "2"):
         raise ValueError(f"unsupported metadata fixture version: {version}")
     result = {
+        "alternatives": f"package-alternatives:{version}\n".encode() + b"\x00\xff",
         "config": (
             f"#!/bin/sh\n# config:{version}\n"
             f"printf '%s\\n' 'config:{version}' >> /config-invoked\n"
@@ -452,7 +525,13 @@ def make_metadata_packages(
     for version in ("1", "2", "3"):
         def prepare_payload(source: Path, version: str = version) -> None:
             for name, content in metadata_contents(version).items():
-                mode = 0o755 if name == "config" else 0o640 if name == "shlibs" else 0o644
+                mode = (
+                    0o755
+                    if name == "config"
+                    else 0o640
+                    if name in ("alternatives", "shlibs")
+                    else 0o644
+                )
                 m.write(source / "DEBIAN" / name, content, mode)
 
         result[version] = m.make_package(
@@ -474,6 +553,52 @@ def vendor_config_body(package: str, version: str, size: int) -> bytes:
     if len(prefix) > size:
         raise ValueError(f"pinned vendor config is too small: {package}")
     return prefix + b"x" * (size - len(prefix))
+
+
+def alternatives_scripts(version: str) -> dict[str, bytes]:
+    candidate = f"/usr/lib/debz-alternatives/{ALTERNATIVES_PACKAGE}-{version}"
+    manual = f"/usr/share/man/man1/{ALTERNATIVES_PACKAGE}-{version}.1"
+    return {
+        "postinst": f"""#!/bin/sh
+case "$1" in
+ configure|abort-upgrade|abort-remove|abort-deconfigure)
+  /usr/bin/update-alternatives --install /usr/bin/{ALTERNATIVES_GROUP} {ALTERNATIVES_GROUP} {candidate} {10 if version == "1" else 20} \\
+   --slave /usr/share/man/man1/{ALTERNATIVES_GROUP}.1 {ALTERNATIVES_GROUP}.1 {manual}
+  ;;
+esac
+""".encode(),
+        "prerm": f"""#!/bin/sh
+case "$1" in
+ remove|upgrade|deconfigure)
+  /usr/bin/update-alternatives --remove {ALTERNATIVES_GROUP} {candidate}
+  ;;
+esac
+""".encode(),
+    }
+
+
+def make_alternatives_packages(
+    workspace: Path,
+    environment: dict[str, str],
+    architecture: str,
+) -> dict[str, Path]:
+    result = {}
+    for version in ("1", "2"):
+        result[version] = m.make_package(
+            workspace,
+            environment,
+            architecture,
+            version,
+            package=ALTERNATIVES_PACKAGE,
+            scripts=alternatives_scripts(version),
+            extra_files={
+                f"usr/lib/debz-alternatives/{ALTERNATIVES_PACKAGE}-{version}":
+                    f"provider {version}\n".encode(),
+                f"usr/share/man/man1/{ALTERNATIVES_PACKAGE}-{version}.1":
+                    f"manual {version}\n".encode(),
+            },
+        )
+    return result
 
 
 def make_vendor_config_packages(
@@ -1399,6 +1524,31 @@ def exercise(
     data_metadata = make_metadata_packages(
         workspace / "metadata-data-packages", environment, architecture, conffile=False,
     )
+    alternatives_archives = make_alternatives_packages(
+        workspace / "alternatives-packages",
+        environment,
+        architecture,
+    )
+    current = case("native-alternatives-lifecycle")
+    current.enable_alternatives()
+    current.phase(
+        "install",
+        [alternatives_archives["1"]],
+        names=(ALTERNATIVES_PACKAGE,),
+    )
+    current.phase(
+        "reinstall",
+        [alternatives_archives["1"]],
+        names=(ALTERNATIVES_PACKAGE,),
+    )
+    current.phase(
+        "upgrade",
+        [alternatives_archives["2"]],
+        names=(ALTERNATIVES_PACKAGE,),
+    )
+    current.phase("remove", names=(ALTERNATIVES_PACKAGE,))
+    current.phase("purge", names=(ALTERNATIVES_PACKAGE,))
+    current.complete()
     if executable is not None:
         for collision in ("empty-directory", "occupied-directory", "file", "symlink"):
             current = case(f"config-staging-collision-{collision}")
@@ -1755,6 +1905,161 @@ def exercise(
             if mismatches:
                 raise AssertionError("blocked mutation reran or changed state:\n" + "\n".join(mismatches))
         print(f"{name}: durable re-entry blocking passed", flush=True)
+
+    if executable:
+        current = case("alternatives-script-outcome-unknown")
+        current.enable_alternatives()
+        destination = current.directory / "interrupted"
+        destination.mkdir()
+        report = native(
+            executable,
+            current.candidate,
+            [alternatives_archives["1"]],
+            "install",
+            architecture,
+            environment,
+            destination,
+            packages=current.identities((ALTERNATIVES_PACKAGE,)),
+            fault="after_script_before_record",
+        )
+        if report["outcome"] != "recovery_required":
+            raise AssertionError(
+                f"unknown alternatives outcome was accepted: {report}"
+            )
+        record = (
+            current.candidate
+            / "var/lib/dpkg/alternatives"
+            / ALTERNATIVES_GROUP
+        )
+        selector = (
+            current.candidate
+            / "etc/alternatives"
+            / ALTERNATIVES_GROUP
+        )
+        if not record.is_file() or not selector.is_symlink():
+            raise AssertionError(
+                "alternatives crash seam did not reach the external update"
+            )
+        before = m.snapshot(current.candidate)
+        retry = current.directory / "retry"
+        retry.mkdir()
+        retry_report = native(
+            executable,
+            current.candidate,
+            [alternatives_archives["1"]],
+            "install",
+            architecture,
+            environment,
+            retry,
+            packages=current.identities((ALTERNATIVES_PACKAGE,)),
+        )
+        if retry_report["outcome"] != "recovery_required":
+            raise AssertionError(
+                f"unknown alternatives outcome was replayed: {retry_report}"
+            )
+        mismatches = m.oracle.differences(
+            before,
+            m.snapshot(current.candidate),
+            maximum=30,
+        )
+        if mismatches:
+            raise AssertionError(
+                "blocked alternatives retry changed state:\n"
+                + "\n".join(mismatches)
+            )
+        print(
+            "alternatives-script-outcome-unknown: durable re-entry blocking passed",
+            flush=True,
+        )
+
+        drift_package = "native-alternatives-drift"
+        drift_group = "debz-native-alternatives-drift"
+        drift_candidate = (
+            f"/usr/lib/debz-alternatives/{drift_package}-1"
+        )
+        drift_script = f"""#!/bin/sh
+/usr/bin/update-alternatives --install /usr/bin/{drift_group} {drift_group} {drift_candidate} 10
+printf '%s\\n' auto /usr/bin/{drift_group} '' {drift_candidate} 99 '' > /var/lib/dpkg/alternatives/{drift_group}
+""".encode()
+        drift_archive = m.make_package(
+            workspace / "alternatives-drift-package",
+            environment,
+            architecture,
+            "1",
+            package=drift_package,
+            scripts={"postinst": drift_script},
+            extra_files={
+                drift_candidate.lstrip("/"): b"drift provider\n",
+            },
+        )
+        current = case("alternatives-record-drift")
+        current.enable_alternatives()
+        destination = current.directory / "install"
+        destination.mkdir()
+        report = native(
+            executable,
+            current.candidate,
+            [drift_archive],
+            "install",
+            architecture,
+            environment,
+            destination,
+            packages=current.identities((drift_package,)),
+        )
+        if report["outcome"] != "recovery_required":
+            raise AssertionError(
+                f"drifted alternatives record was accepted: {report}"
+            )
+        drift_record = (
+            current.candidate
+            / "var/lib/dpkg/alternatives"
+            / drift_group
+        ).read_bytes()
+        if b"\n99\n" not in drift_record:
+            raise AssertionError("drift fixture did not alter the record")
+        print(
+            "alternatives-record-drift: exact outcome validation blocked completion",
+            flush=True,
+        )
+
+        current = case("alternatives-preflight-malformed")
+        current.enable_alternatives()
+        malformed = current.candidate / "var/lib/dpkg/alternatives/bad"
+        m.write(malformed, b"not-an-alternatives-record\n", 0o644)
+        before = m.snapshot(current.candidate)
+        destination = current.directory / "install"
+        destination.mkdir()
+        report = native(
+            executable,
+            current.candidate,
+            [archives["1"]],
+            "install",
+            architecture,
+            environment,
+            destination,
+            packages=current.identities((m.PACKAGE,)),
+        )
+        if (
+            report["outcome"] != "refused"
+            or report["detail"] != "invalid_alternatives_state"
+        ):
+            raise AssertionError(
+                f"malformed alternatives preflight was accepted: {report}"
+            )
+        mismatches = m.oracle.differences(
+            before,
+            m.snapshot(current.candidate),
+            maximum=30,
+        )
+        if mismatches:
+            raise AssertionError(
+                "alternatives preflight refusal mutated the root:\n"
+                + "\n".join(mismatches)
+            )
+        print(
+            "alternatives-preflight-malformed: refused before mutation",
+            flush=True,
+        )
 
     if executable:
         unrelated = "debz-lifecycle-unrelated"

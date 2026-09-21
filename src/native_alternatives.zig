@@ -1,0 +1,2701 @@
+//! Bounded native model of dpkg's update-alternatives administrative records.
+//!
+//! The administrative file is active package-manager state, not opaque
+//! metadata. This module parses its exact line grammar, preserves the ordered
+//! slave topology, canonicalizes candidate ordering, and computes the
+//! selection/link settlement for the operations admitted by the pinned dpkg
+//! 1.22.22 oracle. Filesystem capture and publication are layered below the
+//! lifecycle integration so no ambient host alternatives state is consulted.
+
+const std = @import("std");
+const package_database = @import("package_database.zig");
+const root_fs = @import("root_fs.zig");
+const root_mutation = @import("root_mutation.zig");
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+pub const database_directory =
+    package_database.database_directory ++ "/alternatives";
+pub const selector_directory = "etc/alternatives";
+pub const tool_path = "usr/bin/update-alternatives";
+
+pub const Limits = struct {
+    max_record_bytes: usize = 256 * 1024,
+    max_groups: usize = 32,
+    max_slaves: usize = 128,
+    max_candidates: usize = 256,
+    max_path_bytes: usize = 4096,
+    max_name_bytes: usize = 256,
+    max_script_commands: usize = 10,
+};
+
+pub const Mode = enum {
+    auto,
+    manual,
+};
+
+pub const Slave = struct {
+    name: []const u8,
+    link: []const u8,
+};
+
+pub const Candidate = struct {
+    path: []const u8,
+    priority: i32,
+    /// Dense over `Record.slaves`. An empty target means this provider does
+    /// not supply that slave.
+    targets: []const []const u8,
+};
+
+pub const Record = struct {
+    name: []const u8,
+    mode: Mode,
+    master_link: []const u8,
+    slaves: []const Slave,
+    candidates: []const Candidate,
+
+    pub fn candidate(self: Record, path: []const u8) ?Candidate {
+        for (self.candidates) |item| {
+            if (std.mem.eql(u8, item.path, path)) return item;
+        }
+        return null;
+    }
+
+    pub fn slaveIndex(self: Record, name: []const u8) ?usize {
+        for (self.slaves, 0..) |slave, index| {
+            if (std.mem.eql(u8, slave.name, name)) return index;
+        }
+        return null;
+    }
+};
+
+pub const OwnedRecord = struct {
+    record: Record,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *OwnedRecord) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+pub const ParseError = error{
+    RecordTooLarge,
+    InvalidGroupName,
+    InvalidMode,
+    InvalidRecord,
+    InvalidPath,
+    InvalidSlave,
+    InvalidPriority,
+    DuplicateSlave,
+    DuplicateCandidate,
+    CandidateOrder,
+    LimitExceeded,
+    NonCanonical,
+};
+
+fn validText(value: []const u8, maximum: usize, allow_empty: bool) bool {
+    if ((!allow_empty and value.len == 0) or value.len > maximum) return false;
+    for (value) |byte| {
+        if (byte == 0 or byte == '\r' or byte == '\n' or
+            byte < 0x20 or byte == 0x7f)
+            return false;
+    }
+    return true;
+}
+
+pub fn validName(value: []const u8, limits: Limits) bool {
+    if (!validText(value, limits.max_name_bytes, false)) return false;
+    for (value) |byte| if (byte == '/') return false;
+    return !std.mem.eql(u8, value, ".") and
+        !std.mem.eql(u8, value, "..") and
+        !std.mem.endsWith(u8, value, ".dpkg-tmp");
+}
+
+pub fn validAbsolutePath(value: []const u8, limits: Limits) bool {
+    if (!validText(value, limits.max_path_bytes, false) or
+        !package_database.validAbsolutePath(value))
+        return false;
+    _ = root_fs.Path.initPackage(value[1..]) catch return false;
+    return true;
+}
+
+fn parsePriority(value: []const u8) ParseError!i32 {
+    if (value.len == 0 or value[0] == '+' or
+        (value.len > 1 and value[0] == '0') or
+        (value.len > 2 and value[0] == '-' and value[1] == '0'))
+        return error.InvalidPriority;
+    if (value[0] == '-') {
+        if (value.len == 1) return error.InvalidPriority;
+        for (value[1..]) |byte| if (!std.ascii.isDigit(byte))
+            return error.InvalidPriority;
+    } else for (value) |byte| if (!std.ascii.isDigit(byte))
+        return error.InvalidPriority;
+    return std.fmt.parseInt(i32, value, 10) catch error.InvalidPriority;
+}
+
+const Lines = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    fn next(self: *Lines) ParseError!?[]const u8 {
+        if (self.index == self.bytes.len) return null;
+        const end = std.mem.indexOfScalarPos(
+            u8,
+            self.bytes,
+            self.index,
+            '\n',
+        ) orelse return error.InvalidRecord;
+        const value = self.bytes[self.index..end];
+        self.index = end + 1;
+        return value;
+    }
+};
+
+fn createArena(
+    allocator: std.mem.Allocator,
+) std.mem.Allocator.Error!struct {
+    arena: *std.heap.ArenaAllocator,
+    owned: std.mem.Allocator,
+} {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    return .{ .arena = arena, .owned = arena.allocator() };
+}
+
+pub fn parse(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    bytes: []const u8,
+    limits: Limits,
+) (std.mem.Allocator.Error || ParseError)!OwnedRecord {
+    if (bytes.len > limits.max_record_bytes) return error.RecordTooLarge;
+    if (!validName(name, limits)) return error.InvalidGroupName;
+    var storage = try createArena(allocator);
+    errdefer {
+        storage.arena.deinit();
+        allocator.destroy(storage.arena);
+    }
+    const owned = storage.owned;
+    var lines: Lines = .{ .bytes = bytes };
+    const mode_text = (try lines.next()) orelse return error.InvalidRecord;
+    const mode: Mode = if (std.mem.eql(u8, mode_text, "auto"))
+        .auto
+    else if (std.mem.eql(u8, mode_text, "manual"))
+        .manual
+    else
+        return error.InvalidMode;
+    const master_link = (try lines.next()) orelse return error.InvalidRecord;
+    if (!validAbsolutePath(master_link, limits)) return error.InvalidPath;
+
+    var slaves: std.ArrayList(Slave) = .empty;
+    defer slaves.deinit(owned);
+    while (true) {
+        const slave_name = (try lines.next()) orelse return error.InvalidRecord;
+        if (slave_name.len == 0) break;
+        if (slaves.items.len >= limits.max_slaves or
+            !validName(slave_name, limits))
+            return error.InvalidSlave;
+        const link = (try lines.next()) orelse return error.InvalidRecord;
+        if (!validAbsolutePath(link, limits)) return error.InvalidPath;
+        for (slaves.items) |prior| {
+            if (std.mem.eql(u8, prior.name, slave_name) or
+                std.mem.eql(u8, prior.link, link))
+                return error.DuplicateSlave;
+        }
+        if (std.mem.eql(u8, master_link, link)) return error.DuplicateSlave;
+        try slaves.append(owned, .{
+            .name = try owned.dupe(u8, slave_name),
+            .link = try owned.dupe(u8, link),
+        });
+    }
+
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(owned);
+    var previous: ?[]const u8 = null;
+    while (true) {
+        const path = (try lines.next()) orelse return error.InvalidRecord;
+        if (path.len == 0) break;
+        if (candidates.items.len >= limits.max_candidates)
+            return error.LimitExceeded;
+        if (!validAbsolutePath(path, limits)) return error.InvalidPath;
+        if (previous) |prior| {
+            switch (std.mem.order(u8, prior, path)) {
+                .lt => {},
+                .eq => return error.DuplicateCandidate,
+                .gt => return error.CandidateOrder,
+            }
+        }
+        const priority_text = (try lines.next()) orelse
+            return error.InvalidRecord;
+        const priority = try parsePriority(priority_text);
+        const targets = try owned.alloc([]const u8, slaves.items.len);
+        for (targets) |*target| {
+            const value = (try lines.next()) orelse return error.InvalidRecord;
+            if (value.len != 0 and !validAbsolutePath(value, limits))
+                return error.InvalidPath;
+            target.* = try owned.dupe(u8, value);
+        }
+        const path_copy = try owned.dupe(u8, path);
+        try candidates.append(owned, .{
+            .path = path_copy,
+            .priority = priority,
+            .targets = targets,
+        });
+        previous = path_copy;
+    }
+    if (lines.index != bytes.len or candidates.items.len == 0)
+        return error.InvalidRecord;
+
+    const record: Record = .{
+        .name = try owned.dupe(u8, name),
+        .mode = mode,
+        .master_link = try owned.dupe(u8, master_link),
+        .slaves = try owned.dupe(Slave, slaves.items),
+        .candidates = try owned.dupe(Candidate, candidates.items),
+    };
+    const canonical = try canonicalBytes(owned, record);
+    if (!std.mem.eql(u8, canonical, bytes)) return error.NonCanonical;
+    return .{
+        .record = record,
+        .arena = storage.arena,
+        .backing_allocator = allocator,
+    };
+}
+
+pub fn canonicalBytes(
+    allocator: std.mem.Allocator,
+    record: Record,
+) std.mem.Allocator.Error![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const writer = &output.writer;
+    writer.writeAll(@tagName(record.mode)) catch return error.OutOfMemory;
+    writer.writeByte('\n') catch return error.OutOfMemory;
+    writer.writeAll(record.master_link) catch return error.OutOfMemory;
+    writer.writeByte('\n') catch return error.OutOfMemory;
+    for (record.slaves) |slave| {
+        writer.writeAll(slave.name) catch return error.OutOfMemory;
+        writer.writeByte('\n') catch return error.OutOfMemory;
+        writer.writeAll(slave.link) catch return error.OutOfMemory;
+        writer.writeByte('\n') catch return error.OutOfMemory;
+    }
+    writer.writeByte('\n') catch return error.OutOfMemory;
+    for (record.candidates) |candidate| {
+        writer.writeAll(candidate.path) catch return error.OutOfMemory;
+        writer.writeByte('\n') catch return error.OutOfMemory;
+        writer.print("{d}\n", .{candidate.priority}) catch
+            return error.OutOfMemory;
+        for (candidate.targets) |target| {
+            writer.writeAll(target) catch return error.OutOfMemory;
+            writer.writeByte('\n') catch return error.OutOfMemory;
+        }
+    }
+    writer.writeByte('\n') catch return error.OutOfMemory;
+    return output.toOwnedSlice();
+}
+
+pub fn recordDigest(record: Record) [32]u8 {
+    var digest = Sha256.init(.{});
+    digest.update("debz-native-alternatives-record-v1\x00");
+    digest.update(@tagName(record.mode));
+    digest.update(&.{0});
+    digest.update(record.name);
+    digest.update(&.{0});
+    digest.update(record.master_link);
+    digest.update(&.{0});
+    for (record.slaves) |slave| {
+        digest.update(slave.name);
+        digest.update(&.{0});
+        digest.update(slave.link);
+        digest.update(&.{0});
+    }
+    digest.update(&.{0xff});
+    var number: [4]u8 = undefined;
+    for (record.candidates) |candidate| {
+        digest.update(candidate.path);
+        digest.update(&.{0});
+        std.mem.writeInt(i32, &number, candidate.priority, .big);
+        digest.update(&number);
+        for (candidate.targets) |target| {
+            digest.update(&.{0});
+            digest.update(target);
+        }
+        digest.update(&.{0xfe});
+    }
+    return digest.finalResult();
+}
+
+pub const RegistrationSlave = struct {
+    name: []const u8,
+    link: []const u8,
+    target: []const u8,
+};
+
+pub const Registration = struct {
+    master_link: []const u8,
+    path: []const u8,
+    priority: i32,
+    master_target_present: bool = true,
+    slaves: []const RegistrationSlave = &.{},
+};
+
+pub const Command = union(enum) {
+    install: Registration,
+    set: []const u8,
+    auto,
+    remove: []const u8,
+    remove_all,
+};
+
+pub const MutationRequest = struct {
+    name: []const u8,
+    current: ?Record,
+    /// Exact target currently stored by the master selector.
+    selected: ?[]const u8,
+    /// Candidate master targets known absent or broken at mutation time.
+    missing_master_targets: []const []const u8 = &.{},
+    command: Command,
+    limits: Limits = .{},
+};
+
+pub const Mutation = struct {
+    record: ?Record,
+    selected: ?[]const u8,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Mutation) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+fn missing(request: MutationRequest, path: []const u8) bool {
+    for (request.missing_master_targets) |item| {
+        if (std.mem.eql(u8, item, path)) return true;
+    }
+    return false;
+}
+
+fn bestCandidate(
+    candidates: []const Candidate,
+    request: MutationRequest,
+) ?[]const u8 {
+    var best: ?Candidate = null;
+    for (candidates) |candidate| {
+        if (missing(request, candidate.path)) continue;
+        if (best == null or candidate.priority > best.?.priority or
+            (candidate.priority == best.?.priority and
+                std.mem.order(u8, candidate.path, best.?.path) == .lt))
+            best = candidate;
+    }
+    return if (best) |value| value.path else null;
+}
+
+fn cloneSlaves(
+    allocator: std.mem.Allocator,
+    source: []const Slave,
+) std.mem.Allocator.Error![]Slave {
+    const result = try allocator.alloc(Slave, source.len);
+    for (source, result) |slave, *copy| copy.* = .{
+        .name = try allocator.dupe(u8, slave.name),
+        .link = try allocator.dupe(u8, slave.link),
+    };
+    return result;
+}
+
+fn cloneCandidate(
+    allocator: std.mem.Allocator,
+    candidate: Candidate,
+) std.mem.Allocator.Error!Candidate {
+    const targets = try allocator.alloc([]const u8, candidate.targets.len);
+    for (candidate.targets, targets) |target, *copy|
+        copy.* = try allocator.dupe(u8, target);
+    return .{
+        .path = try allocator.dupe(u8, candidate.path),
+        .priority = candidate.priority,
+        .targets = targets,
+    };
+}
+
+fn candidateLess(_: void, left: Candidate, right: Candidate) bool {
+    return std.mem.order(u8, left.path, right.path) == .lt;
+}
+
+fn validateRegistration(
+    registration: Registration,
+    limits: Limits,
+) ParseError!void {
+    if (!validAbsolutePath(registration.master_link, limits) or
+        !validAbsolutePath(registration.path, limits))
+        return error.InvalidPath;
+    if (!registration.master_target_present) return error.InvalidPath;
+    if (registration.slaves.len > limits.max_slaves)
+        return error.LimitExceeded;
+    for (registration.slaves, 0..) |slave, index| {
+        if (!validName(slave.name, limits)) return error.InvalidSlave;
+        if (!validAbsolutePath(slave.link, limits) or
+            (slave.target.len != 0 and
+                !validAbsolutePath(slave.target, limits)))
+            return error.InvalidPath;
+        if (std.mem.eql(u8, registration.master_link, slave.link))
+            return error.DuplicateSlave;
+        for (registration.slaves[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, slave.name) or
+                std.mem.eql(u8, prior.link, slave.link))
+                return error.DuplicateSlave;
+        }
+    }
+}
+
+fn installRecord(
+    owned: std.mem.Allocator,
+    request: MutationRequest,
+    registration: Registration,
+) (std.mem.Allocator.Error || ParseError)!struct {
+    record: Record,
+    previous_selected_valid: bool,
+} {
+    try validateRegistration(registration, request.limits);
+    const current = request.current;
+    if (current) |record| {
+        if (!std.mem.eql(u8, record.name, request.name) or
+            !std.mem.eql(u8, record.master_link, registration.master_link))
+            return error.InvalidRecord;
+    }
+
+    var slave_list: std.ArrayList(Slave) = .empty;
+    defer slave_list.deinit(owned);
+    if (current) |record|
+        try slave_list.appendSlice(owned, try cloneSlaves(owned, record.slaves));
+    for (registration.slaves) |incoming| {
+        var matched = false;
+        for (slave_list.items) |slave| {
+            if (std.mem.eql(u8, slave.name, incoming.name)) {
+                if (!std.mem.eql(u8, slave.link, incoming.link))
+                    return error.InvalidSlave;
+                matched = true;
+                break;
+            }
+            if (std.mem.eql(u8, slave.link, incoming.link))
+                return error.DuplicateSlave;
+        }
+        if (!matched) try slave_list.append(owned, .{
+            .name = try owned.dupe(u8, incoming.name),
+            .link = try owned.dupe(u8, incoming.link),
+        });
+    }
+
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer candidates.deinit(owned);
+    if (current) |record| {
+        for (record.candidates) |candidate| {
+            if (std.mem.eql(u8, candidate.path, registration.path)) continue;
+            const targets = try owned.alloc([]const u8, slave_list.items.len);
+            for (targets, 0..) |*target, target_index| {
+                target.* = "";
+                if (target_index >= record.slaves.len) continue;
+                const old_slave = record.slaves[target_index];
+                for (slave_list.items, 0..) |new_slave, new_index| {
+                    if (new_index == target_index and
+                        std.mem.eql(u8, old_slave.name, new_slave.name))
+                    {
+                        target.* = try owned.dupe(
+                            u8,
+                            candidate.targets[target_index],
+                        );
+                        break;
+                    }
+                }
+            }
+            try candidates.append(owned, .{
+                .path = try owned.dupe(u8, candidate.path),
+                .priority = candidate.priority,
+                .targets = targets,
+            });
+        }
+    }
+    const incoming_targets = try owned.alloc([]const u8, slave_list.items.len);
+    @memset(incoming_targets, "");
+    for (registration.slaves) |incoming| {
+        for (slave_list.items, 0..) |slave, index| {
+            if (std.mem.eql(u8, slave.name, incoming.name)) {
+                incoming_targets[index] = try owned.dupe(u8, incoming.target);
+                break;
+            }
+        }
+    }
+    try candidates.append(owned, .{
+        .path = try owned.dupe(u8, registration.path),
+        .priority = registration.priority,
+        .targets = incoming_targets,
+    });
+    std.mem.sort(Candidate, candidates.items, {}, candidateLess);
+
+    // A slave definition disappears only when no remaining provider supplies
+    // it. Re-registering one provider without a prior slave therefore removes
+    // that provider's link while preserving another provider's declaration.
+    var retained: std.ArrayList(usize) = .empty;
+    defer retained.deinit(owned);
+    for (slave_list.items, 0..) |_, index| {
+        var supplied = false;
+        for (candidates.items) |candidate| {
+            if (candidate.targets[index].len != 0) {
+                supplied = true;
+                break;
+            }
+        }
+        if (supplied) try retained.append(owned, index);
+    }
+    const slaves = try owned.alloc(Slave, retained.items.len);
+    for (retained.items, slaves) |old_index, *slave|
+        slave.* = slave_list.items[old_index];
+    for (candidates.items) |*candidate| {
+        const targets = try owned.alloc([]const u8, retained.items.len);
+        for (retained.items, targets) |old_index, *target|
+            target.* = candidate.targets[old_index];
+        candidate.targets = targets;
+    }
+    var selected_valid = false;
+    if (request.selected) |selected| {
+        for (candidates.items) |candidate| {
+            if (std.mem.eql(u8, candidate.path, selected) and
+                !missing(request, candidate.path))
+                selected_valid = true;
+        }
+    }
+    return .{
+        .record = .{
+            .name = try owned.dupe(u8, request.name),
+            .mode = if (current) |record| record.mode else .auto,
+            .master_link = try owned.dupe(u8, registration.master_link),
+            .slaves = slaves,
+            .candidates = try owned.dupe(Candidate, candidates.items),
+        },
+        .previous_selected_valid = selected_valid,
+    };
+}
+
+pub fn mutate(
+    allocator: std.mem.Allocator,
+    request: MutationRequest,
+) (std.mem.Allocator.Error || ParseError)!Mutation {
+    if (!validName(request.name, request.limits))
+        return error.InvalidGroupName;
+    var storage = try createArena(allocator);
+    errdefer {
+        storage.arena.deinit();
+        allocator.destroy(storage.arena);
+    }
+    const owned = storage.owned;
+    var result_record: ?Record = null;
+    var selected: ?[]const u8 = null;
+
+    switch (request.command) {
+        .remove_all => {},
+        .set => |path| {
+            const current = request.current orelse return error.InvalidRecord;
+            if (current.candidate(path) == null) return error.InvalidPath;
+            const candidates = try owned.alloc(Candidate, current.candidates.len);
+            for (current.candidates, candidates) |candidate, *copy|
+                copy.* = try cloneCandidate(owned, candidate);
+            result_record = .{
+                .name = try owned.dupe(u8, current.name),
+                .mode = .manual,
+                .master_link = try owned.dupe(u8, current.master_link),
+                .slaves = try cloneSlaves(owned, current.slaves),
+                .candidates = candidates,
+            };
+            selected = try owned.dupe(u8, path);
+        },
+        .auto => {
+            const current = request.current orelse return error.InvalidRecord;
+            var candidates: std.ArrayList(Candidate) = .empty;
+            defer candidates.deinit(owned);
+            for (current.candidates) |candidate| {
+                if (missing(request, candidate.path)) continue;
+                try candidates.append(owned, try cloneCandidate(
+                    owned,
+                    candidate,
+                ));
+            }
+            if (candidates.items.len != 0) {
+                result_record = .{
+                    .name = try owned.dupe(u8, current.name),
+                    .mode = .auto,
+                    .master_link = try owned.dupe(u8, current.master_link),
+                    .slaves = try cloneSlaves(owned, current.slaves),
+                    .candidates = try owned.dupe(Candidate, candidates.items),
+                };
+                selected = bestCandidate(
+                    result_record.?.candidates,
+                    request,
+                );
+            }
+        },
+        .remove => |path| {
+            const current = request.current orelse return error.InvalidRecord;
+            var candidates: std.ArrayList(Candidate) = .empty;
+            defer candidates.deinit(owned);
+            var found = false;
+            for (current.candidates) |candidate| {
+                if (std.mem.eql(u8, candidate.path, path)) {
+                    found = true;
+                    continue;
+                }
+                try candidates.append(owned, try cloneCandidate(
+                    owned,
+                    candidate,
+                ));
+            }
+            if (!found) return error.InvalidPath;
+            if (candidates.items.len != 0) {
+                var mode = current.mode;
+                const removed_selected = if (request.selected) |value|
+                    std.mem.eql(u8, value, path)
+                else
+                    false;
+                if (removed_selected) mode = .auto;
+                result_record = .{
+                    .name = try owned.dupe(u8, current.name),
+                    .mode = mode,
+                    .master_link = try owned.dupe(u8, current.master_link),
+                    .slaves = try cloneSlaves(owned, current.slaves),
+                    .candidates = try owned.dupe(Candidate, candidates.items),
+                };
+                if (!removed_selected and request.selected != null and
+                    result_record.?.candidate(request.selected.?) != null and
+                    !missing(request, request.selected.?))
+                {
+                    selected = try owned.dupe(u8, request.selected.?);
+                } else {
+                    selected = bestCandidate(
+                        result_record.?.candidates,
+                        request,
+                    );
+                }
+            }
+        },
+        .install => |registration| {
+            const installed = try installRecord(owned, request, registration);
+            result_record = installed.record;
+            const record = result_record.?;
+            if (record.mode == .manual and installed.previous_selected_valid) {
+                selected = try owned.dupe(u8, request.selected.?);
+            } else if (record.mode == .auto and
+                installed.previous_selected_valid)
+            {
+                const previous = record.candidate(request.selected.?).?;
+                const incoming = record.candidate(registration.path).?;
+                selected = if (incoming.priority > previous.priority)
+                    try owned.dupe(u8, incoming.path)
+                else
+                    try owned.dupe(u8, previous.path);
+            } else {
+                selected = bestCandidate(record.candidates, request);
+            }
+        },
+    }
+
+    if (result_record) |record| {
+        if (selected == null) return error.InvalidRecord;
+        const bytes = try canonicalBytes(owned, record);
+        var checked = try parse(owned, record.name, bytes, request.limits);
+        checked.deinit();
+    }
+    return .{
+        .record = result_record,
+        .selected = selected,
+        .arena = storage.arena,
+        .backing_allocator = allocator,
+    };
+}
+
+pub const Link = struct {
+    generic_path: []const u8,
+    selector_name: []const u8,
+    selector_target: []const u8,
+};
+
+pub fn selectedLinks(
+    allocator: std.mem.Allocator,
+    record: Record,
+    selected: []const u8,
+) (std.mem.Allocator.Error || ParseError)![]Link {
+    const candidate = record.candidate(selected) orelse
+        return error.InvalidPath;
+    var count: usize = 1;
+    for (candidate.targets) |target| count += @intFromBool(target.len != 0);
+    const links = try allocator.alloc(Link, count);
+    links[0] = .{
+        .generic_path = record.master_link,
+        .selector_name = record.name,
+        .selector_target = candidate.path,
+    };
+    var index: usize = 1;
+    for (record.slaves, candidate.targets) |slave, target| {
+        if (target.len == 0) continue;
+        links[index] = .{
+            .generic_path = slave.link,
+            .selector_name = slave.name,
+            .selector_target = target,
+        };
+        index += 1;
+    }
+    return links;
+}
+
+pub const SettlementState = struct {
+    record: Record,
+    selected: []const u8,
+};
+
+pub const Settlement = struct {
+    intents: []const root_mutation.Intent,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Settlement) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+fn selectorManagedPath(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) ![]const u8 {
+    if (!validName(name, .{})) return error.InvalidGroupName;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ selector_directory, name },
+    );
+}
+
+fn genericPathInLinks(links: []const Link, generic_path: []const u8) bool {
+    for (links) |link| {
+        if (std.mem.eql(u8, link.generic_path, generic_path)) return true;
+    }
+    return false;
+}
+
+fn selectorNameInLinks(links: []const Link, selector_name: []const u8) bool {
+    for (links) |link| {
+        if (std.mem.eql(u8, link.selector_name, selector_name)) return true;
+    }
+    return false;
+}
+
+/// Builds one journalable database-and-link settlement. The returned intents
+/// are consumed by `root_mutation.preflight`, which binds every precondition,
+/// publishes one versioned write-ahead journal, fsyncs parents, and recovers
+/// the complete set rather than repairing an individual alternatives path.
+pub fn settlement(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    before: ?SettlementState,
+    after: ?SettlementState,
+    limits: Limits,
+) !Settlement {
+    if (before != null and after != null and
+        !std.mem.eql(u8, before.?.record.name, after.?.record.name))
+        return error.InvalidRecord;
+    const state = after orelse before orelse return error.InvalidRecord;
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    defer intents.deinit(owned);
+
+    const before_links = if (before) |value|
+        try selectedLinks(owned, value.record, value.selected)
+    else
+        &.{};
+    const after_links = if (after) |value|
+        try selectedLinks(owned, value.record, value.selected)
+    else
+        &.{};
+
+    if (after) |value| {
+        const bytes = try canonicalBytes(owned, value.record);
+        const record_path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}",
+            .{ database_directory, value.record.name },
+        );
+        try intents.append(owned, .{ .file = .{
+            .path = record_path,
+            .bytes = bytes,
+            .mode = 0o644,
+            .uid = 0,
+            .gid = 0,
+        } });
+        for (after_links) |link| {
+            const selector_path = try selectorManagedPath(
+                owned,
+                link.selector_name,
+            );
+            try intents.append(owned, .{ .symlink = .{
+                .path = selector_path,
+                .target = link.selector_target,
+            } });
+        }
+        for (after_links) |link| {
+            const generic_path = try physicalManagedPath(
+                owned,
+                root,
+                link.generic_path[1..],
+                limits,
+            );
+            const target = try std.fmt.allocPrint(
+                owned,
+                "/{s}/{s}",
+                .{ selector_directory, link.selector_name },
+            );
+            try intents.append(owned, .{ .symlink = .{
+                .path = generic_path,
+                .target = target,
+            } });
+        }
+    }
+    for (before_links) |link| {
+        if (!genericPathInLinks(after_links, link.generic_path)) {
+            const generic_path = try physicalManagedPath(
+                owned,
+                root,
+                link.generic_path[1..],
+                limits,
+            );
+            try intents.append(owned, .{ .remove = .{
+                .path = generic_path,
+                .removal = .allow_absent,
+            } });
+        }
+        if (!selectorNameInLinks(after_links, link.selector_name)) {
+            const selector_path = try selectorManagedPath(
+                owned,
+                link.selector_name,
+            );
+            try intents.append(owned, .{ .remove = .{
+                .path = selector_path,
+                .removal = .allow_absent,
+            } });
+        }
+    }
+    if (after == null) {
+        const record_path = try std.fmt.allocPrint(
+            owned,
+            "{s}/{s}",
+            .{ database_directory, state.record.name },
+        );
+        try intents.append(owned, .{ .remove = .{
+            .path = record_path,
+            .removal = .allow_absent,
+        } });
+    }
+    return .{
+        .intents = try owned.dupe(root_mutation.Intent, intents.items),
+        .arena = arena,
+        .backing_allocator = allocator,
+    };
+}
+
+pub fn fuzzOne(allocator: std.mem.Allocator, bytes: []const u8) void {
+    var parsed = parse(allocator, "fuzz", bytes, .{
+        .max_record_bytes = 32 * 1024,
+        .max_groups = 4,
+        .max_slaves = 32,
+        .max_candidates = 64,
+        .max_path_bytes = 1024,
+        .max_name_bytes = 128,
+    }) catch return;
+    defer parsed.deinit();
+    const canonical = canonicalBytes(allocator, parsed.record) catch return;
+    defer allocator.free(canonical);
+    var reparsed = parse(allocator, "fuzz", canonical, .{
+        .max_record_bytes = 32 * 1024,
+        .max_groups = 4,
+        .max_slaves = 32,
+        .max_candidates = 64,
+        .max_path_bytes = 1024,
+        .max_name_bytes = 128,
+    }) catch return;
+    reparsed.deinit();
+}
+
+pub const pinned_vendor_groups = [_][]const u8{
+    "awk",
+    "builtins.7.gz",
+    "editor",
+    "ex",
+    "nc",
+    "newt-palette",
+    "pager",
+    "rmt",
+    "rview",
+    "sudo",
+    "vi",
+    "view",
+    "vtrgb",
+    "which",
+};
+
+pub const pinned_vendor_group_count: usize = 14;
+pub const pinned_vendor_relationship_count: usize = 72;
+pub const pinned_vendor_requested_path_count: usize = 189;
+pub const pinned_vendor_linked_entry_count: usize = 190;
+pub const pinned_vendor_reference_sha256 =
+    "73228f959a335956c58d48712c891ccc372082dfc4f78f4405c18a37f98efe08";
+pub const pinned_oracle_sha256 =
+    "2492f30fada7574fb6e9b07cbbf91cc0940d430322b35e94e744df7737e4a8db";
+
+pub const ToolBinding = struct {
+    architecture: []const u8,
+    sha256: [32]u8,
+};
+
+fn digestLiteral(comptime text: []const u8) [32]u8 {
+    var value: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&value, text) catch unreachable;
+    return value;
+}
+
+pub const pinned_tools = [_]ToolBinding{
+    .{
+        .architecture = "amd64",
+        .sha256 = digestLiteral(
+            "b02b581c6a7f85679f32efe18c9aaeb05316847fa90d3d3fda30b57defab9b13",
+        ),
+    },
+    .{
+        .architecture = "arm64",
+        .sha256 = digestLiteral(
+            "35616ec58ba58f3fb8b4820bdf893c47a842d56684b3335ba6ebf6df86b27cc5",
+        ),
+    },
+};
+
+pub fn pinnedTool(architecture: []const u8) ?ToolBinding {
+    for (pinned_tools) |binding| {
+        if (std.mem.eql(u8, binding.architecture, architecture))
+            return binding;
+    }
+    return null;
+}
+
+pub fn verifyPinnedTool(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+) ![32]u8 {
+    const binding = pinnedTool(architecture) orelse
+        return error.UnsupportedAlternativesArchitecture;
+    var pinned = try root.pinRegularFile(try root_fs.Path.init(tool_path));
+    defer pinned.close();
+    const observation = try pinned.observeStableAlloc(
+        allocator,
+        8 * 1024 * 1024,
+    );
+    defer allocator.free(observation.bytes);
+    if (observation.entry.uid != 0 or observation.entry.gid != 0 or
+        observation.entry.mode & 0o111 == 0 or
+        observation.entry.link_count != 1)
+        return error.InvalidAlternativesTool;
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(observation.bytes, &sha256, .{});
+    if (!std.crypto.timing_safe.eql([32]u8, binding.sha256, sha256))
+        return error.InvalidAlternativesTool;
+    return sha256;
+}
+
+pub fn scriptMayInvoke(bytes: []const u8) bool {
+    return std.mem.indexOf(u8, bytes, "update-alternatives") != null;
+}
+
+pub const ScriptAuthority = struct {
+    groups: []const GroupAuthority,
+    commands: []const ScriptCommand,
+    paths: []const []const u8,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ScriptAuthority) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+
+    pub fn group(self: ScriptAuthority, name: []const u8) ?GroupAuthority {
+        for (self.groups) |item| {
+            if (std.mem.eql(u8, item.name, name)) return item;
+        }
+        return null;
+    }
+};
+
+pub const ScriptCommand = struct {
+    name: []const u8,
+    command: Command,
+};
+
+pub const Topology = struct {
+    master_link: []const u8,
+    slaves: []const Slave,
+};
+
+pub const GroupAuthority = struct {
+    name: []const u8,
+    topology: ?Topology = null,
+    allow_slave_subset: bool = false,
+    allow_absent: bool = false,
+    mutable: bool = true,
+};
+
+pub const Authority = struct {
+    groups: []const GroupAuthority,
+    exact_group_set: bool = true,
+    require_vendor_counts: bool = false,
+    allow_retained_readme: bool = true,
+    limits: Limits = .{},
+
+    pub fn group(self: Authority, name: []const u8) ?GroupAuthority {
+        for (self.groups) |item| {
+            if (std.mem.eql(u8, item.name, name)) return item;
+        }
+        return null;
+    }
+};
+
+fn appendScriptPath(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    absolute: []const u8,
+    limits: Limits,
+) !void {
+    const relative = try rootRelativeAbsolute(allocator, absolute, limits);
+    try appendUniquePath(allocator, paths, relative);
+}
+
+fn shellTokenSafe(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| switch (byte) {
+        '$', '`', '\'', '"', '\\', '<', '>', '|', '&', ';', '(', ')', '{', '}', '[', ']', '*', '?', '!', '\n', '\r', 0 => return false,
+        else => if (byte < 0x20 or byte == 0x7f) return false,
+    };
+    return true;
+}
+
+fn commandEnd(token: []const u8) bool {
+    return std.mem.eql(u8, token, ";") or
+        std.mem.eql(u8, token, ";;") or
+        std.mem.eql(u8, token, "||") or
+        std.mem.eql(u8, token, "&&");
+}
+
+fn scriptGroup(
+    allocator: std.mem.Allocator,
+    groups: *std.ArrayList(GroupAuthority),
+    name: []const u8,
+    topology: ?Topology,
+    limits: Limits,
+) !void {
+    if (!validName(name, limits)) return error.InvalidAlternativesScript;
+    for (groups.items) |*existing| {
+        if (!std.mem.eql(u8, existing.name, name)) continue;
+        if (topology) |incoming| {
+            if (existing.topology) |current| {
+                if (!topologyMatches(current, .{
+                    .name = name,
+                    .mode = .auto,
+                    .master_link = incoming.master_link,
+                    .slaves = incoming.slaves,
+                    .candidates = &.{},
+                })) return error.InvalidAlternativesScript;
+            } else existing.topology = incoming;
+        }
+        return;
+    }
+    try groups.append(allocator, .{
+        .name = try allocator.dupe(u8, name),
+        .topology = topology,
+        .allow_absent = true,
+        .mutable = true,
+    });
+}
+
+/// Extracts only literal, direct update-alternatives commands. Dynamic shell
+/// construction, substitutions, redirections in arguments, unknown options,
+/// and inconsistent topology are rejected rather than granted authority.
+pub fn discoverScriptAuthority(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    limits: Limits,
+) !ScriptAuthority {
+    if (bytes.len > (package_database.Limits{}).max_maintainer_script_bytes)
+        return error.AlternativesScriptTooLarge;
+    var storage = try createArena(allocator);
+    errdefer {
+        storage.arena.deinit();
+        allocator.destroy(storage.arena);
+    }
+    const owned = storage.owned;
+    var normalized: std.ArrayList(u8) = .empty;
+    defer normalized.deinit(owned);
+    var index: usize = 0;
+    while (index < bytes.len) {
+        if (bytes[index] == '\\' and index + 1 < bytes.len and
+            bytes[index + 1] == '\n')
+        {
+            try normalized.append(owned, ' ');
+            index += 2;
+            continue;
+        }
+        try normalized.append(owned, bytes[index]);
+        index += 1;
+    }
+    var groups: std.ArrayList(GroupAuthority) = .empty;
+    defer groups.deinit(owned);
+    var commands: std.ArrayList(ScriptCommand) = .empty;
+    defer commands.deinit(owned);
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(owned);
+    var found = false;
+    var lines = std.mem.splitScalar(u8, normalized.items, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t");
+        if (std.mem.indexOf(u8, line, "update-alternatives") == null)
+            continue;
+        var tokens: std.ArrayList([]const u8) = .empty;
+        defer tokens.deinit(owned);
+        var words = std.mem.tokenizeAny(u8, line, " \t");
+        while (words.next()) |word| try tokens.append(owned, word);
+        var command_index: ?usize = null;
+        for (tokens.items, 0..) |token, token_index| {
+            if (std.mem.eql(u8, token, "update-alternatives") or
+                std.mem.eql(u8, token, "/usr/bin/update-alternatives"))
+            {
+                command_index = token_index;
+                break;
+            }
+        }
+        const command = command_index orelse
+            return error.InvalidAlternativesScript;
+        if (command + 1 >= tokens.items.len)
+            return error.InvalidAlternativesScript;
+        const operation = tokens.items[command + 1];
+        if (!shellTokenSafe(operation))
+            return error.InvalidAlternativesScript;
+        if (std.mem.eql(u8, operation, "--install")) {
+            if (command + 6 > tokens.items.len)
+                return error.InvalidAlternativesScript;
+            const master = tokens.items[command + 2];
+            const name = tokens.items[command + 3];
+            const candidate = tokens.items[command + 4];
+            const priority = tokens.items[command + 5];
+            if (!shellTokenSafe(master) or !shellTokenSafe(name) or
+                !shellTokenSafe(candidate))
+                return error.InvalidAlternativesScript;
+            _ = parsePriority(priority) catch
+                return error.InvalidAlternativesScript;
+            if (!validAbsolutePath(master, limits) or
+                !validAbsolutePath(candidate, limits) or
+                !validName(name, limits))
+                return error.InvalidAlternativesScript;
+            var slaves: std.ArrayList(Slave) = .empty;
+            defer slaves.deinit(owned);
+            var install_slaves: std.ArrayList(RegistrationSlave) = .empty;
+            defer install_slaves.deinit(owned);
+            var argument = command + 6;
+            while (argument < tokens.items.len) {
+                if (commandEnd(tokens.items[argument])) break;
+                if (!std.mem.eql(u8, tokens.items[argument], "--slave") or
+                    argument + 3 >= tokens.items.len)
+                    return error.InvalidAlternativesScript;
+                const link = tokens.items[argument + 1];
+                const slave_name = tokens.items[argument + 2];
+                const target = tokens.items[argument + 3];
+                if (!shellTokenSafe(link) or
+                    !shellTokenSafe(slave_name) or
+                    !shellTokenSafe(target) or
+                    !validAbsolutePath(link, limits) or
+                    !validName(slave_name, limits) or
+                    !validAbsolutePath(target, limits))
+                    return error.InvalidAlternativesScript;
+                for (slaves.items) |prior| {
+                    if (std.mem.eql(u8, prior.name, slave_name) or
+                        std.mem.eql(u8, prior.link, link))
+                        return error.InvalidAlternativesScript;
+                }
+                try slaves.append(owned, .{
+                    .name = try owned.dupe(u8, slave_name),
+                    .link = try owned.dupe(u8, link),
+                });
+                try install_slaves.append(owned, .{
+                    .name = try owned.dupe(u8, slave_name),
+                    .link = try owned.dupe(u8, link),
+                    .target = try owned.dupe(u8, target),
+                });
+                try appendScriptPath(owned, &paths, link, limits);
+                try appendScriptPath(owned, &paths, target, limits);
+                argument += 4;
+            }
+            try appendScriptPath(owned, &paths, master, limits);
+            try appendScriptPath(owned, &paths, candidate, limits);
+            try paths.append(
+                owned,
+                try std.fmt.allocPrint(
+                    owned,
+                    "{s}/{s}",
+                    .{ database_directory, name },
+                ),
+            );
+            try paths.append(
+                owned,
+                try std.fmt.allocPrint(
+                    owned,
+                    "{s}/{s}",
+                    .{ selector_directory, name },
+                ),
+            );
+            for (slaves.items) |slave| try paths.append(
+                owned,
+                try std.fmt.allocPrint(
+                    owned,
+                    "{s}/{s}",
+                    .{ selector_directory, slave.name },
+                ),
+            );
+            try scriptGroup(
+                owned,
+                &groups,
+                name,
+                .{
+                    .master_link = try owned.dupe(u8, master),
+                    .slaves = try owned.dupe(Slave, slaves.items),
+                },
+                limits,
+            );
+            try commands.append(owned, .{
+                .name = try owned.dupe(u8, name),
+                .command = .{ .install = .{
+                    .master_link = try owned.dupe(u8, master),
+                    .path = try owned.dupe(u8, candidate),
+                    .priority = parsePriority(priority) catch unreachable,
+                    .slaves = try owned.dupe(
+                        RegistrationSlave,
+                        install_slaves.items,
+                    ),
+                } },
+            });
+            found = true;
+        } else if (std.mem.eql(u8, operation, "--remove") or
+            std.mem.eql(u8, operation, "--set"))
+        {
+            if (command + 4 > tokens.items.len or
+                !shellTokenSafe(tokens.items[command + 2]) or
+                !shellTokenSafe(tokens.items[command + 3]) or
+                !validName(tokens.items[command + 2], limits) or
+                !validAbsolutePath(tokens.items[command + 3], limits))
+                return error.InvalidAlternativesScript;
+            try scriptGroup(
+                owned,
+                &groups,
+                tokens.items[command + 2],
+                null,
+                limits,
+            );
+            try appendScriptPath(
+                owned,
+                &paths,
+                tokens.items[command + 3],
+                limits,
+            );
+            try commands.append(owned, .{
+                .name = try owned.dupe(u8, tokens.items[command + 2]),
+                .command = if (std.mem.eql(u8, operation, "--remove"))
+                    .{ .remove = try owned.dupe(
+                        u8,
+                        tokens.items[command + 3],
+                    ) }
+                else
+                    .{ .set = try owned.dupe(
+                        u8,
+                        tokens.items[command + 3],
+                    ) },
+            });
+            found = true;
+        } else if (std.mem.eql(u8, operation, "--auto") or
+            std.mem.eql(u8, operation, "--remove-all"))
+        {
+            if (command + 3 > tokens.items.len or
+                !shellTokenSafe(tokens.items[command + 2]) or
+                !validName(tokens.items[command + 2], limits))
+                return error.InvalidAlternativesScript;
+            try scriptGroup(
+                owned,
+                &groups,
+                tokens.items[command + 2],
+                null,
+                limits,
+            );
+            try commands.append(owned, .{
+                .name = try owned.dupe(u8, tokens.items[command + 2]),
+                .command = if (std.mem.eql(u8, operation, "--auto"))
+                    .auto
+                else
+                    .remove_all,
+            });
+            found = true;
+        } else return error.InvalidAlternativesScript;
+    }
+    if (!found) return error.InvalidAlternativesScript;
+    if (groups.items.len > limits.max_groups)
+        return error.AlternativesLimit;
+    if (commands.items.len > limits.max_script_commands)
+        return error.AlternativesLimit;
+    std.mem.sort([]const u8, paths.items, {}, bytewisePathLess);
+    var unique: std.ArrayList([]const u8) = .empty;
+    defer unique.deinit(owned);
+    for (paths.items) |path| try appendUniquePath(owned, &unique, path);
+    return .{
+        .groups = try owned.dupe(GroupAuthority, groups.items),
+        .commands = try owned.dupe(ScriptCommand, commands.items),
+        .paths = try owned.dupe([]const u8, unique.items),
+        .arena = storage.arena,
+        .backing_allocator = allocator,
+    };
+}
+
+pub fn vendorAuthority() Authority {
+    const groups = comptime block: {
+        var result: [pinned_vendor_groups.len]GroupAuthority = undefined;
+        for (pinned_vendor_groups, 0..) |name, index| {
+            result[index] = .{ .name = name };
+        }
+        break :block result;
+    };
+    return .{
+        .groups = &groups,
+        .require_vendor_counts = true,
+    };
+}
+
+pub const EntryKind = enum {
+    absent,
+    regular,
+    symlink,
+};
+
+pub const EntryFact = struct {
+    path: []const u8,
+    kind: EntryKind,
+    mode: u32 = 0,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    device: u64 = 0,
+    inode: u64 = 0,
+    link_count: u64 = 0,
+    size: u64 = 0,
+    sha256: ?[32]u8 = null,
+    link_target: ?[]const u8 = null,
+};
+
+pub const GroupState = struct {
+    name: []const u8,
+    record: Record,
+    record_fact: EntryFact,
+    selected: []const u8,
+    links: []const Link,
+    missing_master_targets: []const []const u8,
+    facts: []const EntryFact,
+    digest: [32]u8,
+};
+
+pub const Snapshot = struct {
+    groups: []const GroupState,
+    paths: []const []const u8,
+    digest: [32]u8,
+    relationship_count: usize,
+    parsed_records: []OwnedRecord,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Snapshot) void {
+        for (self.parsed_records) |*record| record.deinit();
+        self.backing_allocator.free(self.parsed_records);
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+
+    pub fn group(self: Snapshot, name: []const u8) ?GroupState {
+        for (self.groups) |item| {
+            if (std.mem.eql(u8, item.name, name)) return item;
+        }
+        return null;
+    }
+};
+
+pub const ListedGroups = struct {
+    names: []const []const u8,
+    arena: *std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ListedGroups) void {
+        self.arena.deinit();
+        self.backing_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
+};
+
+pub fn listGroups(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    limits: Limits,
+) !ListedGroups {
+    var storage = try createArena(allocator);
+    errdefer {
+        storage.arena.deinit();
+        allocator.destroy(storage.arena);
+    }
+    const owned = storage.owned;
+    var database = validateDirectory(
+        root,
+        database_directory,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return .{
+            .names = &.{},
+            .arena = storage.arena,
+            .backing_allocator = allocator,
+        },
+        else => return err,
+    };
+    defer database.close();
+    var members = try database.observeAlloc(
+        owned,
+        limits.max_groups,
+        limits.max_groups * limits.max_name_bytes,
+    );
+    defer members.deinit();
+    const names = try owned.alloc([]const u8, members.members.len);
+    for (members.members, names) |member, *name| {
+        if (member.kind != .file or !validName(member.name, limits))
+            return error.UnsupportedAlternativesEntry;
+        name.* = try owned.dupe(u8, member.name);
+    }
+    std.mem.sort([]const u8, names, {}, bytewisePathLess);
+    return .{
+        .names = names,
+        .arena = storage.arena,
+        .backing_allocator = allocator,
+    };
+}
+
+fn rootRelativeAbsolute(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    limits: Limits,
+) ![]const u8 {
+    if (!validAbsolutePath(value, limits)) return error.InvalidAlternativesPath;
+    return allocator.dupe(u8, value[1..]);
+}
+
+fn expectedAliasTarget(component: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, component, "bin")) return "usr/bin";
+    if (std.mem.eql(u8, component, "sbin")) return "usr/sbin";
+    if (std.mem.eql(u8, component, "lib")) return "usr/lib";
+    if (std.mem.eql(u8, component, "lib32")) return "usr/lib32";
+    if (std.mem.eql(u8, component, "lib64")) return "usr/lib64";
+    return null;
+}
+
+fn physicalPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    absolute: []const u8,
+    limits: Limits,
+) ![]const u8 {
+    const relative = try rootRelativeAbsolute(allocator, absolute, limits);
+    errdefer allocator.free(relative);
+    const slash = std.mem.indexOfScalar(u8, relative, '/');
+    const first = if (slash) |index| relative[0..index] else relative;
+    const expected = expectedAliasTarget(first) orelse return relative;
+    const entry = (try root.entryIfExists(
+        try root_fs.Path.init(first),
+    )) orelse return relative;
+    if (!entry.isSymbolicLink()) return relative;
+    var buffer: [root_fs.maximum_link_target_bytes]u8 = undefined;
+    const target = try root.readSymbolicLink(
+        try root_fs.Path.init(first),
+        &buffer,
+    );
+    if (!std.mem.eql(u8, target, expected))
+        return error.InvalidAlternativesAlias;
+    const suffix = if (slash) |index| relative[index + 1 ..] else "";
+    const result = if (suffix.len == 0)
+        try allocator.dupe(u8, expected)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ expected, suffix });
+    allocator.free(relative);
+    return result;
+}
+
+pub fn physicalManagedPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    limits: Limits,
+) ![]const u8 {
+    _ = try root_fs.Path.initPackage(path);
+    const absolute = try std.fmt.allocPrint(allocator, "/{s}", .{path});
+    defer allocator.free(absolute);
+    return physicalPath(allocator, root, absolute, limits);
+}
+
+fn appendUniquePath(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    path: []const u8,
+) !void {
+    for (paths.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    try paths.append(allocator, path);
+}
+
+fn observeRegular(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    maximum_bytes: usize,
+) !EntryFact {
+    var pinned = try root.pinRegularFile(try root_fs.Path.init(path));
+    defer pinned.close();
+    const observation = try pinned.observeStableAlloc(allocator, maximum_bytes);
+    defer allocator.free(observation.bytes);
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(observation.bytes, &sha256, .{});
+    return .{
+        .path = path,
+        .kind = .regular,
+        .mode = observation.entry.mode,
+        .uid = observation.entry.uid,
+        .gid = observation.entry.gid,
+        .device = observation.entry.device,
+        .inode = observation.entry.inode,
+        .link_count = observation.entry.link_count,
+        .size = observation.entry.size,
+        .sha256 = sha256,
+    };
+}
+
+fn observeLink(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+) !EntryFact {
+    var pinned = try root.pinSymbolicLink(try root_fs.Path.init(path));
+    defer pinned.close();
+    var buffer: [root_fs.maximum_link_target_bytes]u8 = undefined;
+    const observation = try pinned.observe(&buffer);
+    return .{
+        .path = path,
+        .kind = .symlink,
+        .mode = observation.entry.mode,
+        .uid = observation.entry.uid,
+        .gid = observation.entry.gid,
+        .device = observation.entry.device,
+        .inode = observation.entry.inode,
+        .link_count = observation.entry.link_count,
+        .size = observation.entry.size,
+        .link_target = try allocator.dupe(u8, observation.target),
+    };
+}
+
+fn observeOptionalEntry(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+) !EntryFact {
+    const entry = (try root.entryIfExists(
+        try root_fs.Path.init(path),
+    )) orelse return .{ .path = path, .kind = .absent };
+    if (!entry.modeled or (!entry.isRegularFile() and
+        !entry.isSymbolicLink()))
+        return error.UnsupportedAlternativesEntry;
+    return if (entry.isRegularFile())
+        observeRegular(
+            allocator,
+            root,
+            path,
+            (package_database.Limits{}).max_info_file_bytes,
+        )
+    else
+        observeLink(allocator, root, path);
+}
+
+fn resolvedLinkTarget(
+    allocator: std.mem.Allocator,
+    current: []const u8,
+    target: []const u8,
+) ![]const u8 {
+    if (!validText(target, root_fs.maximum_link_target_bytes, false))
+        return error.InvalidAlternativesLinkTarget;
+    var components: std.ArrayList([]const u8) = .empty;
+    defer components.deinit(allocator);
+    if (target[0] != '/') {
+        if (std.mem.lastIndexOfScalar(u8, current, '/')) |index| {
+            var base = std.mem.splitScalar(u8, current[0..index], '/');
+            while (base.next()) |component| {
+                if (component.len != 0)
+                    try components.append(allocator, component);
+            }
+        }
+    }
+    const source = if (target[0] == '/') target[1..] else target;
+    var iterator = std.mem.splitScalar(u8, source, '/');
+    while (iterator.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, "."))
+            continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (components.items.len == 0)
+                return error.AlternativesTraversal;
+            _ = components.pop();
+            continue;
+        }
+        if (!validText(component, root_fs.maximum_component_bytes, false))
+            return error.InvalidAlternativesLinkTarget;
+        try components.append(allocator, component);
+    }
+    if (components.items.len == 0) return error.AlternativesTraversal;
+    return std.mem.join(allocator, "/", components.items);
+}
+
+fn appendFact(
+    allocator: std.mem.Allocator,
+    facts: *std.ArrayList(EntryFact),
+    fact: EntryFact,
+) !void {
+    for (facts.items) |existing| {
+        if (std.mem.eql(u8, existing.path, fact.path)) return;
+    }
+    try facts.append(allocator, fact);
+}
+
+fn observeTargetTopology(
+    owned: std.mem.Allocator,
+    root: root_fs.Root,
+    absolute: []const u8,
+    limits: Limits,
+    paths: *std.ArrayList([]const u8),
+    facts: *std.ArrayList(EntryFact),
+) !void {
+    var current = try physicalPath(owned, root, absolute, limits);
+    var visited: std.ArrayList([]const u8) = .empty;
+    defer visited.deinit(owned);
+    var depth: usize = 0;
+    while (true) : (depth += 1) {
+        if (depth >= 64) return error.AlternativesLinkCycle;
+        for (visited.items) |prior| {
+            if (std.mem.eql(u8, prior, current))
+                return error.AlternativesLinkCycle;
+        }
+        try visited.append(owned, current);
+        try appendUniquePath(owned, paths, current);
+        const fact = try observeOptionalEntry(owned, root, current);
+        try appendFact(owned, facts, fact);
+        switch (fact.kind) {
+            .absent, .regular => return,
+            .symlink => {
+                try validateRootOwnedLink(fact);
+                const next = try resolvedLinkTarget(
+                    owned,
+                    current,
+                    fact.link_target.?,
+                );
+                const absolute_next = try std.fmt.allocPrint(
+                    owned,
+                    "/{s}",
+                    .{next},
+                );
+                current = try physicalPath(
+                    owned,
+                    root,
+                    absolute_next,
+                    limits,
+                );
+            },
+        }
+    }
+}
+
+fn validateRootOwnedLink(fact: EntryFact) !void {
+    if (fact.kind != .symlink or fact.mode != 0o777 or
+        fact.uid != 0 or fact.gid != 0 or fact.link_count != 1 or
+        fact.link_target == null)
+        return error.InvalidAlternativesLink;
+}
+
+fn selectorPath(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ selector_directory, name },
+    );
+}
+
+fn recordPath(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ database_directory, name },
+    );
+}
+
+fn groupStateDigest(group: GroupState) [32]u8 {
+    var digest = Sha256.init(.{});
+    digest.update("debz-native-alternatives-group-state-v1\x00");
+    digest.update(&recordDigest(group.record));
+    digest.update(group.selected);
+    digest.update(&.{0});
+    for (group.facts) |fact| {
+        digest.update(fact.path);
+        digest.update(&.{ 0, @intFromEnum(fact.kind) });
+        var number: [8]u8 = undefined;
+        std.mem.writeInt(u64, &number, fact.inode, .big);
+        digest.update(&number);
+        std.mem.writeInt(u64, &number, fact.size, .big);
+        digest.update(&number);
+        if (fact.sha256) |sha256| digest.update(&sha256);
+        if (fact.link_target) |target| digest.update(target);
+        digest.update(&.{0xff});
+    }
+    return digest.finalResult();
+}
+
+fn snapshotDigest(groups: []const GroupState) [32]u8 {
+    var digest = Sha256.init(.{});
+    digest.update("debz-native-alternatives-snapshot-v1\x00");
+    for (groups) |group| digest.update(&group.digest);
+    return digest.finalResult();
+}
+
+fn topologyMatches(authority: Topology, record: Record) bool {
+    if (!std.mem.eql(u8, authority.master_link, record.master_link))
+        return false;
+    if (authority.slaves.len != record.slaves.len) return false;
+    for (record.slaves) |right| {
+        var found = false;
+        for (authority.slaves) |left| {
+            if (std.mem.eql(u8, left.name, right.name) and
+                std.mem.eql(u8, left.link, right.link))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn topologyWithin(authority: GroupAuthority, record: Record) bool {
+    const topology = authority.topology orelse return true;
+    if (!std.mem.eql(u8, topology.master_link, record.master_link))
+        return false;
+    if (!authority.allow_slave_subset and
+        topology.slaves.len != record.slaves.len)
+        return false;
+    for (record.slaves) |right| {
+        var found = false;
+        for (topology.slaves) |left| {
+            if (std.mem.eql(u8, left.name, right.name) and
+                std.mem.eql(u8, left.link, right.link))
+            {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn captureGroup(
+    allocator: std.mem.Allocator,
+    owned: std.mem.Allocator,
+    root: root_fs.Root,
+    authority: GroupAuthority,
+    limits: Limits,
+    parsed: *OwnedRecord,
+    expected_record_sha256: [32]u8,
+    paths: *std.ArrayList([]const u8),
+) !GroupState {
+    _ = allocator;
+    const record = parsed.record;
+    if (!topologyWithin(authority, record))
+        return error.AlternativesTopologyChanged;
+    const record_path = try recordPath(owned, record.name);
+    const record_fact = try observeRegular(
+        owned,
+        root,
+        record_path,
+        limits.max_record_bytes,
+    );
+    if (record_fact.mode != 0o644 or record_fact.uid != 0 or
+        record_fact.gid != 0 or record_fact.link_count != 1 or
+        !std.mem.eql(
+            u8,
+            &record_fact.sha256.?,
+            &expected_record_sha256,
+        ))
+        return error.InvalidAlternativesRecordMetadata;
+    try appendUniquePath(owned, paths, record_path);
+
+    const master_selector_path = try selectorPath(owned, record.name);
+    const master_selector = try observeOptionalEntry(
+        owned,
+        root,
+        master_selector_path,
+    );
+    try validateRootOwnedLink(master_selector);
+    const selected = master_selector.link_target.?;
+    const selected_candidate = record.candidate(selected) orelse
+        return error.InvalidAlternativesSelection;
+    const selected_links = try selectedLinks(
+        owned,
+        record,
+        selected_candidate.path,
+    );
+    var facts: std.ArrayList(EntryFact) = .empty;
+    defer facts.deinit(owned);
+    try appendFact(owned, &facts, record_fact);
+    try appendFact(owned, &facts, master_selector);
+    try appendUniquePath(owned, paths, master_selector_path);
+
+    for (record.slaves) |slave| {
+        const path = try selectorPath(owned, slave.name);
+        try appendUniquePath(owned, paths, path);
+        const fact = try observeOptionalEntry(owned, root, path);
+        const target = selected_candidate.targets[
+            record.slaveIndex(slave.name).?
+        ];
+        if (target.len == 0) {
+            if (fact.kind != .absent)
+                return error.InvalidAlternativesSelection;
+        } else {
+            try validateRootOwnedLink(fact);
+            if (!std.mem.eql(u8, fact.link_target.?, target))
+                return error.InvalidAlternativesSelection;
+        }
+        try appendFact(owned, &facts, fact);
+    }
+
+    for (record.slaves) |slave| {
+        const physical = try physicalPath(
+            owned,
+            root,
+            slave.link,
+            .{},
+        );
+        try appendUniquePath(owned, paths, physical);
+        const fact = try observeOptionalEntry(owned, root, physical);
+        const target = selected_candidate.targets[
+            record.slaveIndex(slave.name).?
+        ];
+        if (target.len == 0) {
+            if (fact.kind != .absent)
+                return error.InvalidAlternativesSelection;
+        } else {
+            try validateRootOwnedLink(fact);
+            const expected = try std.fmt.allocPrint(
+                owned,
+                "/etc/alternatives/{s}",
+                .{slave.name},
+            );
+            if (!std.mem.eql(u8, fact.link_target.?, expected))
+                return error.InvalidAlternativesSelection;
+        }
+        try appendFact(owned, &facts, fact);
+    }
+    const master_physical = try physicalPath(
+        owned,
+        root,
+        record.master_link,
+        .{},
+    );
+    try appendUniquePath(owned, paths, master_physical);
+    const master_generic = try observeOptionalEntry(
+        owned,
+        root,
+        master_physical,
+    );
+    try validateRootOwnedLink(master_generic);
+    const expected_master = try std.fmt.allocPrint(
+        owned,
+        "/etc/alternatives/{s}",
+        .{record.name},
+    );
+    if (!std.mem.eql(u8, master_generic.link_target.?, expected_master))
+        return error.InvalidAlternativesSelection;
+    try appendFact(owned, &facts, master_generic);
+
+    for (record.candidates) |candidate| {
+        try observeTargetTopology(
+            owned,
+            root,
+            candidate.path,
+            limits,
+            paths,
+            &facts,
+        );
+        for (candidate.targets) |target| {
+            if (target.len == 0) continue;
+            try observeTargetTopology(
+                owned,
+                root,
+                target,
+                limits,
+                paths,
+                &facts,
+            );
+        }
+    }
+    var missing_master_targets: std.ArrayList([]const u8) = .empty;
+    defer missing_master_targets.deinit(owned);
+    for (record.candidates) |candidate| {
+        const physical = try physicalPath(
+            owned,
+            root,
+            candidate.path,
+            .{},
+        );
+        for (facts.items) |fact| {
+            if (std.mem.eql(u8, fact.path, physical) and
+                fact.kind == .absent)
+            {
+                try missing_master_targets.append(
+                    owned,
+                    candidate.path,
+                );
+                break;
+            }
+        }
+    }
+    var group: GroupState = .{
+        .name = record.name,
+        .record = record,
+        .record_fact = record_fact,
+        .selected = selected,
+        .links = selected_links,
+        .missing_master_targets = try owned.dupe(
+            []const u8,
+            missing_master_targets.items,
+        ),
+        .facts = try owned.dupe(EntryFact, facts.items),
+        .digest = undefined,
+    };
+    group.digest = groupStateDigest(group);
+    return group;
+}
+
+fn bytewiseGroupLess(_: void, left: GroupState, right: GroupState) bool {
+    return std.mem.order(u8, left.name, right.name) == .lt;
+}
+
+fn bytewisePathLess(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
+fn validateDirectory(
+    root: root_fs.Root,
+    path: []const u8,
+) !root_fs.PinnedDirectory {
+    var pinned = try root.pinDirectory(try root_fs.Path.init(path));
+    errdefer pinned.close();
+    const metadata = try pinned.metadata();
+    if (metadata.entry.uid != 0 or metadata.entry.gid != 0 or
+        metadata.entry.link_count < 1 or
+        metadata.entry.mode & 0o022 != 0)
+        return error.InvalidAlternativesDirectory;
+    return pinned;
+}
+
+pub fn capture(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    authority: Authority,
+) !Snapshot {
+    if (authority.groups.len > authority.limits.max_groups)
+        return error.AlternativesLimit;
+    var storage = try createArena(allocator);
+    errdefer {
+        storage.arena.deinit();
+        allocator.destroy(storage.arena);
+    }
+    const owned = storage.owned;
+    var parsed_records: std.ArrayList(OwnedRecord) = .empty;
+    errdefer {
+        for (parsed_records.items) |*record| record.deinit();
+        parsed_records.deinit(allocator);
+    }
+    var groups: std.ArrayList(GroupState) = .empty;
+    defer groups.deinit(owned);
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer paths.deinit(owned);
+
+    var database: ?root_fs.PinnedDirectory = validateDirectory(
+        root,
+        database_directory,
+    ) catch |err| switch (err) {
+        error.FileNotFound => missing: {
+            for (authority.groups) |group| {
+                if (!group.allow_absent)
+                    return error.AlternativesDatabaseMissing;
+            }
+            break :missing null;
+        },
+        else => return err,
+    };
+    defer if (database) |*directory| directory.close();
+    if (database) |*directory| {
+        var members = try directory.observeAlloc(
+            owned,
+            authority.limits.max_groups,
+            authority.limits.max_groups * authority.limits.max_name_bytes,
+        );
+        defer members.deinit();
+        for (members.members) |member| {
+            if (member.kind != .file or
+                !validName(member.name, authority.limits))
+                return error.UnsupportedAlternativesEntry;
+            const group_authority = authority.group(member.name) orelse
+                return error.UnsupportedAlternativesGroup;
+            const path = try recordPath(owned, member.name);
+            const bytes = try root.readFileAlloc(
+                allocator,
+                try root_fs.Path.init(path),
+                authority.limits.max_record_bytes,
+            );
+            defer allocator.free(bytes);
+            var parsed = try parse(
+                allocator,
+                member.name,
+                bytes,
+                authority.limits,
+            );
+            var record_sha256: [32]u8 = undefined;
+            Sha256.hash(bytes, &record_sha256, .{});
+            errdefer parsed.deinit();
+            try parsed_records.append(allocator, parsed);
+            parsed = undefined;
+            try groups.append(
+                owned,
+                try captureGroup(
+                    allocator,
+                    owned,
+                    root,
+                    group_authority,
+                    authority.limits,
+                    &parsed_records.items[parsed_records.items.len - 1],
+                    record_sha256,
+                    &paths,
+                ),
+            );
+        }
+    }
+    for (authority.groups) |group| {
+        if (group.allow_absent) continue;
+        var found = false;
+        for (groups.items) |observed| {
+            if (std.mem.eql(u8, group.name, observed.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.AlternativesGroupMissing;
+    }
+
+    var selectors = validateDirectory(
+        root,
+        selector_directory,
+    ) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (groups.items.len != 0)
+                return error.AlternativesSelectorsMissing;
+            std.mem.sort(GroupState, groups.items, {}, bytewiseGroupLess);
+            std.mem.sort([]const u8, paths.items, {}, bytewisePathLess);
+            return .{
+                .groups = try owned.dupe(GroupState, groups.items),
+                .paths = try owned.dupe([]const u8, paths.items),
+                .digest = snapshotDigest(groups.items),
+                .relationship_count = 0,
+                .parsed_records = try parsed_records.toOwnedSlice(allocator),
+                .arena = storage.arena,
+                .backing_allocator = allocator,
+            };
+        },
+        else => return err,
+    };
+    defer selectors.close();
+    var selector_members = try selectors.observeAlloc(
+        owned,
+        authority.limits.max_groups * (authority.limits.max_slaves + 1) + 1,
+        authority.limits.max_groups * authority.limits.max_slaves *
+            authority.limits.max_name_bytes,
+    );
+    defer selector_members.deinit();
+    for (selector_members.members) |member| {
+        if (std.mem.eql(u8, member.name, "README") and
+            authority.allow_retained_readme)
+        {
+            if (member.kind != .file)
+                return error.UnsupportedAlternativesEntry;
+            const readme = try observeRegular(
+                owned,
+                root,
+                selector_directory ++ "/README",
+                1024,
+            );
+            if (readme.mode != 0o644 or readme.uid != 0 or readme.gid != 0 or
+                readme.link_count != 1 or readme.size != 100 or
+                !std.mem.eql(
+                    u8,
+                    &readme.sha256.?,
+                    &digestLiteral(
+                        "a44afdb50eacfc09e45f6dac1e18ae231c179feec633c106e1060bae8ae11df1",
+                    ),
+                ))
+                return error.InvalidAlternativesRetainedMetadata;
+            try appendUniquePath(
+                owned,
+                &paths,
+                selector_directory ++ "/README",
+            );
+            continue;
+        }
+        if (member.kind != .sym_link)
+            return error.UnsupportedAlternativesEntry;
+        var expected = false;
+        for (groups.items) |group| {
+            if (std.mem.eql(u8, member.name, group.name))
+                expected = true;
+            for (group.record.slaves) |slave| {
+                if (std.mem.eql(u8, member.name, slave.name))
+                    expected = true;
+            }
+        }
+        if (!expected) return error.UnsupportedAlternativesSelector;
+    }
+
+    std.mem.sort(GroupState, groups.items, {}, bytewiseGroupLess);
+    std.mem.sort([]const u8, paths.items, {}, bytewisePathLess);
+    var relationship_count: usize = 0;
+    for (groups.items) |group|
+        relationship_count += 1 + group.record.slaves.len;
+    if (authority.require_vendor_counts and
+        (groups.items.len != pinned_vendor_group_count or
+            relationship_count != pinned_vendor_relationship_count))
+        return error.PinnedAlternativesInventoryMismatch;
+    return .{
+        .groups = try owned.dupe(GroupState, groups.items),
+        .paths = try owned.dupe([]const u8, paths.items),
+        .digest = snapshotDigest(groups.items),
+        .relationship_count = relationship_count,
+        .parsed_records = try parsed_records.toOwnedSlice(allocator),
+        .arena = storage.arena,
+        .backing_allocator = allocator,
+    };
+}
+
+pub fn captureExisting(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    limits: Limits,
+) !Snapshot {
+    var listed = try listGroups(allocator, root, limits);
+    defer listed.deinit();
+    const groups = try allocator.alloc(GroupAuthority, listed.names.len);
+    defer allocator.free(groups);
+    for (listed.names, groups) |name, *group| group.* = .{
+        .name = name,
+        .mutable = false,
+    };
+    return capture(allocator, root, .{
+        .groups = groups,
+        .limits = limits,
+    });
+}
+
+pub fn authorityFromSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot: Snapshot,
+) ![]GroupAuthority {
+    const result = try allocator.alloc(GroupAuthority, snapshot.groups.len);
+    for (snapshot.groups, result) |group, *authority| {
+        authority.* = .{
+            .name = group.name,
+            .topology = .{
+                .master_link = group.record.master_link,
+                .slaves = group.record.slaves,
+            },
+            .allow_absent = true,
+        };
+    }
+    return result;
+}
+
+pub fn validateTransition(
+    before: Snapshot,
+    after: Snapshot,
+    authority: Authority,
+) !void {
+    for (after.groups) |group| {
+        const allowed = authority.group(group.name) orelse
+            return error.UnsupportedAlternativesGroup;
+        if (!topologyWithin(allowed, group.record))
+            return error.AlternativesTopologyChanged;
+        if (!allowed.mutable) {
+            const prior = before.group(group.name) orelse
+                return error.AlternativesStateChanged;
+            if (!std.mem.eql(u8, &prior.digest, &group.digest))
+                return error.AlternativesStateChanged;
+        }
+    }
+    for (before.groups) |group| {
+        if (after.group(group.name) == null) {
+            const allowed = authority.group(group.name) orelse
+                return error.UnsupportedAlternativesGroup;
+            if (!allowed.mutable) return error.AlternativesStateChanged;
+        }
+    }
+}
+
+fn transitionMatchesGroup(
+    allocator: std.mem.Allocator,
+    record: ?Record,
+    selected: ?[]const u8,
+    observed: ?GroupState,
+) !bool {
+    if (record == null) return observed == null;
+    const group = observed orelse return false;
+    if (selected == null or
+        !std.mem.eql(u8, selected.?, group.selected))
+        return false;
+    const expected = try canonicalBytes(
+        allocator,
+        record.?,
+    );
+    defer allocator.free(expected);
+    const actual = try canonicalBytes(allocator, group.record);
+    defer allocator.free(actual);
+    return std.mem.eql(u8, expected, actual);
+}
+
+/// Requires each changed group to equal an outcome reachable by executing a
+/// bounded, source-ordered subset of that script's literal commands. The
+/// subset accounts for shell branches without granting arbitrary record edits.
+pub fn validateScriptTransition(
+    allocator: std.mem.Allocator,
+    before: Snapshot,
+    after: Snapshot,
+    script: ScriptAuthority,
+    authority: Authority,
+) !void {
+    try validateTransition(before, after, authority);
+    for (script.groups) |script_group| {
+        var commands: [10]Command = undefined;
+        var command_count: usize = 0;
+        for (script.commands) |command| {
+            if (!std.mem.eql(u8, command.name, script_group.name)) continue;
+            if (command_count == commands.len)
+                return error.AlternativesLimit;
+            commands[command_count] = command.command;
+            command_count += 1;
+        }
+        if (command_count == 0)
+            return error.InvalidAlternativesScriptAuthority;
+        const prior = before.group(script_group.name);
+        const observed = after.group(script_group.name);
+        const outcomes = @as(usize, 1) << @intCast(command_count);
+        var matched = false;
+        masks: for (0..outcomes) |mask| {
+            var current_record: ?Record = if (prior) |group|
+                group.record
+            else
+                null;
+            var current_selected: ?[]const u8 = if (prior) |group|
+                group.selected
+            else
+                null;
+            var owned_transition: ?Mutation = null;
+            defer if (owned_transition) |*transition| transition.deinit();
+            for (commands[0..command_count], 0..) |command, index| {
+                if (mask & (@as(usize, 1) << @intCast(index)) == 0)
+                    continue;
+                const next = mutate(allocator, .{
+                    .name = script_group.name,
+                    .current = current_record,
+                    .selected = current_selected,
+                    .missing_master_targets = if (prior) |group|
+                        group.missing_master_targets
+                    else
+                        &.{},
+                    .command = command,
+                }) catch continue :masks;
+                if (owned_transition) |*transition| transition.deinit();
+                owned_transition = next;
+                current_record = next.record;
+                current_selected = next.selected;
+            }
+            if (owned_transition) |transition| {
+                if (try transitionMatchesGroup(
+                    allocator,
+                    transition.record,
+                    transition.selected,
+                    observed,
+                )) {
+                    matched = true;
+                    break;
+                }
+            } else {
+                if (try transitionMatchesGroup(
+                    allocator,
+                    current_record,
+                    current_selected,
+                    observed,
+                )) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched) return error.AlternativesStateChanged;
+    }
+}
+
+test "native_alternatives.test.parser round trips auto manual priorities and empty slaves" {
+    const testing = std.testing;
+    const bytes =
+        "manual\n" ++
+        "/usr/bin/demo\n" ++
+        "demo.1\n" ++
+        "/usr/share/man/man1/demo.1\n" ++
+        "\n" ++
+        "/usr/lib/demo/a\n" ++
+        "-10\n" ++
+        "\n" ++
+        "/usr/lib/demo/b\n" ++
+        "20\n" ++
+        "/usr/share/man/man1/demo-b.1\n" ++
+        "\n";
+    var parsed = try parse(testing.allocator, "demo", bytes, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(Mode.manual, parsed.record.mode);
+    try testing.expectEqual(@as(usize, 1), parsed.record.slaves.len);
+    try testing.expectEqual(@as(usize, 2), parsed.record.candidates.len);
+    try testing.expectEqual(@as(i32, -10), parsed.record.candidates[0].priority);
+    try testing.expectEqualStrings("", parsed.record.candidates[0].targets[0]);
+    const canonical = try canonicalBytes(testing.allocator, parsed.record);
+    defer testing.allocator.free(canonical);
+    try testing.expectEqualStrings(bytes, canonical);
+}
+
+test "native_alternatives.test.parser rejects malformed oversized and noncanonical records" {
+    const testing = std.testing;
+    const cases = [_]struct {
+        bytes: []const u8,
+        expected: anyerror,
+    }{
+        .{ .bytes = "", .expected = error.InvalidRecord },
+        .{ .bytes = "automatic\n/usr/bin/x\n\n/usr/bin/a\n1\n\n", .expected = error.InvalidMode },
+        .{ .bytes = "auto\n/usr/bin/x\n\n/usr/bin/a\n01\n\n", .expected = error.InvalidPriority },
+        .{ .bytes = "auto\n/usr/bin/x\n\n/usr/bin/b\n1\n/usr/bin/a\n2\n\n", .expected = error.CandidateOrder },
+        .{ .bytes = "auto\n/usr/bin/../x\n\n/usr/bin/a\n1\n\n", .expected = error.InvalidPath },
+        .{ .bytes = "auto\n/usr/bin/x\ns\n/usr/bin/s\ns\n/usr/bin/t\n\n/usr/bin/a\n1\n/a\n/b\n\n", .expected = error.DuplicateSlave },
+        .{ .bytes = "auto\n/usr/bin/x\n\n/usr/bin/a\n+1\n\n", .expected = error.InvalidPriority },
+    };
+    for (cases) |case| {
+        try testing.expectError(
+            case.expected,
+            parse(testing.allocator, "x", case.bytes, .{}),
+        );
+    }
+    try testing.expectError(
+        error.RecordTooLarge,
+        parse(
+            testing.allocator,
+            "x",
+            "auto\n/usr/bin/x\n\n/usr/bin/a\n1\n\n",
+            .{ .max_record_bytes = 4 },
+        ),
+    );
+}
+
+test "native_alternatives.test.selection matches ties manual preservation pruning and removal" {
+    const testing = std.testing;
+    const initial =
+        "auto\n/usr/bin/demo\ndemo.1\n/usr/share/man/man1/demo.1\n\n" ++
+        "/usr/lib/demo/b\n10\n/usr/share/man/man1/b.1\n\n";
+    var parsed = try parse(testing.allocator, "demo", initial, .{});
+    defer parsed.deinit();
+    var equal = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = parsed.record,
+        .selected = "/usr/lib/demo/b",
+        .command = .{ .install = .{
+            .master_link = "/usr/bin/demo",
+            .path = "/usr/lib/demo/a",
+            .priority = 10,
+            .slaves = &.{.{
+                .name = "demo.1",
+                .link = "/usr/share/man/man1/demo.1",
+                .target = "/usr/share/man/man1/a.1",
+            }},
+        } },
+    });
+    defer equal.deinit();
+    try testing.expectEqualStrings("/usr/lib/demo/b", equal.selected.?);
+
+    var higher = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = equal.record,
+        .selected = equal.selected,
+        .command = .{ .install = .{
+            .master_link = "/usr/bin/demo",
+            .path = "/usr/lib/demo/c",
+            .priority = 20,
+        } },
+    });
+    defer higher.deinit();
+    try testing.expectEqualStrings("/usr/lib/demo/c", higher.selected.?);
+    try testing.expectEqual(@as(usize, 1), higher.record.?.slaves.len);
+
+    var manual = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = higher.record,
+        .selected = higher.selected,
+        .command = .{ .set = "/usr/lib/demo/a" },
+    });
+    defer manual.deinit();
+    var manual_higher = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = manual.record,
+        .selected = manual.selected,
+        .command = .{ .install = .{
+            .master_link = "/usr/bin/demo",
+            .path = "/usr/lib/demo/c",
+            .priority = 30,
+            .slaves = &.{.{
+                .name = "demo.1",
+                .link = "/usr/share/man/man1/demo.1",
+                .target = "/usr/share/man/man1/c.1",
+            }},
+        } },
+    });
+    defer manual_higher.deinit();
+    try testing.expectEqual(Mode.manual, manual_higher.record.?.mode);
+    try testing.expectEqualStrings("/usr/lib/demo/a", manual_higher.selected.?);
+
+    var automatic = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = manual_higher.record,
+        .selected = manual_higher.selected,
+        .command = .auto,
+    });
+    defer automatic.deinit();
+    try testing.expectEqualStrings("/usr/lib/demo/c", automatic.selected.?);
+
+    var pruned = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = automatic.record,
+        .selected = automatic.selected,
+        .missing_master_targets = &.{"/usr/lib/demo/c"},
+        .command = .auto,
+    });
+    defer pruned.deinit();
+    try testing.expectEqual(@as(usize, 2), pruned.record.?.candidates.len);
+    try testing.expectEqualStrings("/usr/lib/demo/a", pruned.selected.?);
+
+    var removed = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = pruned.record,
+        .selected = pruned.selected,
+        .command = .{ .remove = "/usr/lib/demo/a" },
+    });
+    defer removed.deinit();
+    try testing.expectEqualStrings("/usr/lib/demo/b", removed.selected.?);
+}
+
+test "native_alternatives.test.provider replacement removes only globally obsolete slaves" {
+    const testing = std.testing;
+    const initial =
+        "auto\n/usr/bin/demo\none\n/usr/share/one\ntwo\n/usr/share/two\n\n" ++
+        "/usr/lib/a\n10\n/usr/share/a-one\n/usr/share/a-two\n" ++
+        "/usr/lib/b\n20\n/usr/share/b-one\n/usr/share/b-two\n\n";
+    var parsed = try parse(testing.allocator, "demo", initial, .{});
+    defer parsed.deinit();
+    var replaced = try mutate(testing.allocator, .{
+        .name = "demo",
+        .current = parsed.record,
+        .selected = "/usr/lib/b",
+        .command = .{ .install = .{
+            .master_link = "/usr/bin/demo",
+            .path = "/usr/lib/b",
+            .priority = 20,
+            .slaves = &.{.{
+                .name = "one",
+                .link = "/usr/share/one",
+                .target = "/usr/share/b-one-new",
+            }},
+        } },
+    });
+    defer replaced.deinit();
+    try testing.expectEqual(@as(usize, 2), replaced.record.?.slaves.len);
+    const provider = replaced.record.?.candidate("/usr/lib/b").?;
+    try testing.expectEqualStrings("/usr/share/b-one-new", provider.targets[0]);
+    try testing.expectEqualStrings("", provider.targets[1]);
+    const links = try selectedLinks(
+        testing.allocator,
+        replaced.record.?,
+        replaced.selected.?,
+    );
+    defer testing.allocator.free(links);
+    try testing.expectEqual(@as(usize, 2), links.len);
+}
+
+test "native_alternatives.test.settlement journals database links replacement and removal together" {
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    const before_bytes =
+        "auto\n" ++
+        "/usr/bin/demo\n" ++
+        "demo.1\n" ++
+        "/usr/share/man/man1/demo.1\n" ++
+        "demo.help\n" ++
+        "/usr/share/demo/help\n" ++
+        "\n" ++
+        "/usr/lib/demo/a\n" ++
+        "10\n" ++
+        "/usr/share/man/man1/demo-a.1\n" ++
+        "/usr/share/demo/a.help\n" ++
+        "\n";
+    const after_bytes =
+        "auto\n" ++
+        "/usr/bin/demo\n" ++
+        "demo.1\n" ++
+        "/usr/share/man/man1/demo.1\n" ++
+        "\n" ++
+        "/usr/lib/demo/a\n" ++
+        "10\n" ++
+        "/usr/share/man/man1/demo-a.1\n" ++
+        "\n";
+    var before = try parse(testing.allocator, "demo", before_bytes, .{});
+    defer before.deinit();
+    var after = try parse(testing.allocator, "demo", after_bytes, .{});
+    defer after.deinit();
+    var replace = try settlement(
+        testing.allocator,
+        root,
+        .{ .record = before.record, .selected = "/usr/lib/demo/a" },
+        .{ .record = after.record, .selected = "/usr/lib/demo/a" },
+        .{},
+    );
+    defer replace.deinit();
+    try testing.expectEqual(@as(usize, 7), replace.intents.len);
+    try testing.expectEqualStrings(
+        "var/lib/dpkg/alternatives/demo",
+        replace.intents[0].path(),
+    );
+    try testing.expectEqualStrings(
+        "usr/share/demo/help",
+        replace.intents[5].path(),
+    );
+    try testing.expectEqualStrings(
+        "etc/alternatives/demo.help",
+        replace.intents[6].path(),
+    );
+
+    var removal = try settlement(
+        testing.allocator,
+        root,
+        .{ .record = before.record, .selected = "/usr/lib/demo/a" },
+        null,
+        .{},
+    );
+    defer removal.deinit();
+    try testing.expectEqual(@as(usize, 7), removal.intents.len);
+    try testing.expectEqualStrings(
+        "var/lib/dpkg/alternatives/demo",
+        removal.intents[6].path(),
+    );
+}
+
+test "native_alternatives.test.script authority admits only literal bounded commands" {
+    const testing = std.testing;
+    const script =
+        "#!/bin/sh\n" ++
+        "case \"$1\" in\n" ++
+        " configure) /usr/bin/update-alternatives --install /usr/bin/demo demo /usr/lib/demo 20 \\\n" ++
+        "   --slave /usr/share/man/man1/demo.1 demo.1 /usr/share/man/man1/demo-real.1 ;;\n" ++
+        " remove) /usr/bin/update-alternatives --remove demo /usr/lib/demo ;;\n" ++
+        "esac\n";
+    var authority = try discoverScriptAuthority(
+        testing.allocator,
+        script,
+        .{},
+    );
+    defer authority.deinit();
+    try testing.expectEqual(@as(usize, 1), authority.groups.len);
+    try testing.expectEqualStrings("demo", authority.groups[0].name);
+    try testing.expectEqualStrings(
+        "/usr/bin/demo",
+        authority.groups[0].topology.?.master_link,
+    );
+    try testing.expectEqual(@as(usize, 1), authority.groups[0].topology.?.slaves.len);
+    try testing.expect(authority.paths.len >= 6);
+
+    const rejected = [_][]const u8{
+        "#!/bin/sh\nupdate-alternatives --install \"$link\" demo /usr/lib/demo 1\n",
+        "#!/bin/sh\ncmd=update-alternatives\n$cmd --auto demo\n",
+        "#!/bin/sh\nupdate-alternatives --display demo\n",
+        "#!/bin/sh\nupdate-alternatives --install /usr/bin/../escape demo /usr/lib/demo 1\n",
+        "#!/bin/sh\nupdate-alternatives --set demo /usr/lib/$(name)\n",
+    };
+    for (rejected) |bytes| try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(testing.allocator, bytes, .{}),
+    );
+}
+
+test "native_alternatives.test.link target resolution rejects traversal" {
+    const testing = std.testing;
+    const resolved = try resolvedLinkTarget(
+        testing.allocator,
+        "usr/lib/demo/provider",
+        "../real",
+    );
+    defer testing.allocator.free(resolved);
+    try testing.expectEqualStrings("usr/lib/real", resolved);
+    try testing.expectError(
+        error.AlternativesTraversal,
+        resolvedLinkTarget(testing.allocator, "provider", "../../escape"),
+    );
+}

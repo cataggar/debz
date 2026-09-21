@@ -1,9 +1,11 @@
 # Pinned dpkg/update-alternatives reference
 
 `tools/dpkg-alternatives-reference.py` is an executable reference for dpkg
-1.22.22 and its `update-alternatives` 1.22.22 binary. It documents behavior;
-it does not admit alternatives to native execution. The existing
-archive-member and installed-state guards remain fail-closed.
+1.22.22 and its `update-alternatives` 1.22.22 binary. Its reviewed boundary is
+now admitted by the native alternatives implementation. Admission remains
+limited to the pinned architectures, tool digests, bounded literal script
+commands, typed canonical records, and authenticated root topology described
+below; all state outside that boundary remains fail-closed.
 
 The canonical result is
 `tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json`, validated by
@@ -196,12 +198,28 @@ Thus dpkg status/info durability and alternatives durability are separate.
 Dpkg only compensates an alternatives update when a maintainer script invoked
 during unwind explicitly performs that inverse operation.
 
-## Later native requirements
+## Native admission
 
-Before native admission, implementation and review must cover the exact record
-grammar and ordering, group-wide link publication, all observed partial
-states, auto/manual selection, ties, missing targets, provider and package
-lifecycle, opaque `.alternatives` info members, script failure/unwind,
-interruption recovery, root confinement, bounded diagnostics, provenance, and
-native amd64/arm64 evidence. The canonical JSON contains the full requirement
-list. No current production guard is relaxed by this reference.
+`src/native_alternatives.zig` implements the bounded record grammar,
+canonical writer, selection transitions, master/slave topology, native-owned
+root-mutation settlement, and exact amd64/arm64 tool bindings. Native lifecycle
+execution retains opaque package `.alternatives` bytes but interprets active
+`var/lib/dpkg/alternatives` records as typed state.
+
+Before a maintainer script containing a literal `update-alternatives` command
+runs, the engine verifies the root-local tool digest, discovers the complete
+bounded command authority, captures all existing groups plus authorized new
+groups, and durably checkpoints database directories, records, selectors,
+generic links, provider chains, and target identities. After a normal script
+return it captures again, rejects changes to unmentioned groups or topology
+outside the command authority, and checkpoints the exact new state before the
+script outcome can complete. Unknown outcomes, partial or malformed state,
+external drift, dynamic shell construction, unpinned tools, extra groups,
+cycles, traversal, special files, or changed identities require recovery
+without repair or replay.
+
+External tool execution intentionally retains the oracle's observable
+non-atomic failure boundary. When native code itself owns a record/link
+transition, the complete database-plus-selector-plus-generic-link intent set is
+lowered into the versioned root-mutation journal, with fixed ordering, backups,
+parent fsyncs, exact verification, and crash recovery.

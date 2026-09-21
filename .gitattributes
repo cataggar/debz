@@ -12,6 +12,7 @@
 # bytes than it was recorded with is no longer testing what it claims to.
 src/fixtures/** -text
 fuzz/corpus/** -text
+fuzz/corpus/alternatives/** whitespace=-blank-at-eof
 
 # dpkg terminates every status record with a blank line, including the last, so
 # a faithful status fixture ends with one. That is exact database content, not

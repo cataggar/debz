@@ -68,9 +68,11 @@ immediately before application so the authenticated digest, size, and origin
 binding survives the gap between review and mutation. Feature support is an
 explicit classification rather than a best effort: `templates`, `shlibs`, and
 `symbols` are retained verbatim without interpretation, the debconf `config`
-script is preserved but never executed, and `alternatives` is rejected because
-dpkg acts on it. The complete supported and rejected tables, the pinned-fixture
-inventory, and the v1 support decision are in
+script is preserved but never executed, and package `.alternatives` bytes are
+retained as inert metadata because dpkg does not interpret them. Active
+alternatives records are admitted only through the typed, pinned
+maintainer-script boundary. The complete supported and rejected
+tables, the pinned-fixture inventory, and the v1 support decision are in
 [Native archive application model](archive-application-model.md).
 
 ## Package database profile
@@ -92,7 +94,7 @@ database path component.
 | `var/lib/dpkg/arch` | Preserve a validated unique foreign-architecture list. Native architecture comes from the authorized request and must agree with healthy installed state. |
 | `var/lib/dpkg/diversions` | Parse and honor complete three-line records with exact logical/physical routing and literal package exemptions. Atomic replacements reload the invocation cache; valid in-place edits preserve its loaded records. A recovery-managed installed-package `postrm upgrade` may publish and consume the separate route-settlement capability after its exact outcome, refreshed cache and bound artifacts are durable. Legacy evidence, other callbacks, malformed/conflicting or reserved-path records, unknown outcomes and any route/cache/destination/backup/journal drift remain refused before further mutation. The engine never rewrites the live diversion database. |
 | `var/lib/dpkg/statoverride` | Parse and honor bounded owner, group, mode, and path records using file-backed target-root identities. Malformed records fail preflight. Script-created state is re-read and validated after script boundaries, but metadata resolution stays frozen for the invocation, matching dpkg; a later invocation resolves anew. |
-| `var/lib/dpkg/alternatives/` | Preserve bounded regular-file records managed by package scripts and include their exact bytes in differential state. |
+| `var/lib/dpkg/alternatives/` | Parse canonical bounded auto/manual records and authenticate their complete master/slave selector, generic-link, provider, and target topology. Script mutations require pinned-tool and literal-command authority with durable pre/post checkpoints. |
 | `var/lib/dpkg/parts/` | Empty is accepted. Nonempty records are retained and classified during feature inventory before mutation. |
 | `var/lib/dpkg/available` | Preserve as non-authoritative compatibility data; the native engine does not use it for solving or authorization. |
 
@@ -109,8 +111,9 @@ provider ownership, selection mode, priorities, or before/after mutation
 evidence. Those gaps are closed for amd64 synthetic execution, rather than
 inferred from the vendor hashes, by the separate direct-dpkg config oracle and
 the [pinned dpkg/update-alternatives reference](dpkg-alternatives-reference.md).
-Arm64 execution and native implementation remain gates. Existing opaque-info
-and alternatives checks continue to refuse or hand off before mutation.
+The admitted implementation replays both architecture observations in Zig and
+retains guards for dynamic commands, unpinned tools, unknown groups, malformed
+or partial records/links, special files, traversal, cycles, and external drift.
 
 The typed model, import validation, canonical writers, generation evidence, and
 staged change-set plans for these surfaces are documented in

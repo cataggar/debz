@@ -657,9 +657,10 @@ const ControlMember = struct {
     script_kind: ?ScriptKind = null,
 };
 
-/// The complete v1 control-member profile. Members outside this table are
-/// rejected; `alternatives` is deliberately absent because dpkg acts on it and
-/// v1 must not silently ignore that behavior.
+/// The complete control-member profile. Members outside this table are
+/// rejected. A package `alternatives` member is retained byte-for-byte because
+/// dpkg copies but does not interpret it; active group semantics live in the
+/// native alternatives database model.
 const control_members = [_]ControlMember{
     .{ .name = "control", .class = .interpreted },
     .{ .name = "conffiles", .class = .interpreted },
@@ -670,6 +671,7 @@ const control_members = [_]ControlMember{
     .{ .name = "prerm", .class = .script, .script_kind = .prerm },
     .{ .name = "postrm", .class = .script, .script_kind = .postrm },
     .{ .name = "config", .class = .script, .script_kind = .config },
+    .{ .name = "alternatives", .class = .retained },
     .{ .name = "templates", .class = .retained },
     .{ .name = "shlibs", .class = .retained },
     .{ .name = "symbols", .class = .retained },
@@ -1824,11 +1826,6 @@ test "archive_application.test.revalidation preserves the authenticated binding"
 }
 
 test "archive_application.test.unsupported control members fail closed" {
-    try expectRejected(
-        .{ .control = &.{.{ .path = "alternatives", .content = "demo\n" }} },
-        .unsupported_control_member,
-        .control_member,
-    );
     try expectRejected(
         .{ .control = &.{.{ .path = "postinst", .mode = 0o644, .content = "#!/bin/sh\n" }} },
         .script_not_executable,

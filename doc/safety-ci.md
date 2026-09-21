@@ -35,7 +35,8 @@ Release/Packages, signed envelopes and OpenPGP packets, gzip/xz/zstd
 decompression, ar/deb/tar payloads, the native archive application model, exact
 locks, native transaction authorizations and programs, provenance JSON and
 journals, the root mutation journal with its write-ahead progress log, and
-the native ownership index built from `info/*.list` bytes.
+the native ownership index built from `info/*.list` bytes, plus canonical
+active alternatives records.
 Harnesses call production bounded APIs directly and never shell out.
 
 GitHub Actions lanes reproduce all three JavaScript bundles, audit their locked

@@ -575,6 +575,72 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-unpack", "Run native unpack and file ownership tests")
         .dependOn(&run_native_unpack_tests.step);
 
+    const native_alternatives_test_module = b.createModule(.{
+        .root_source_file = b.path("src/native_alternatives.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_alternatives_test_module.addOptions(
+        "debz_build_options",
+        build_options,
+    );
+    native_alternatives_test_module.addIncludePath(
+        libsolv_dependency.path("src"),
+    );
+    native_alternatives_test_module.addIncludePath(
+        xz_dependency.path("src/liblzma/api"),
+    );
+    native_alternatives_test_module.addIncludePath(
+        zstd_dependency.path("lib"),
+    );
+    native_alternatives_test_module.addCMacro("LZMA_API_STATIC", "1");
+    native_alternatives_test_module.linkLibrary(libsolv);
+    native_alternatives_test_module.linkLibrary(liblzma);
+    native_alternatives_test_module.linkLibrary(zstd);
+    native_alternatives_test_module.link_libc = true;
+    const native_alternatives_tests = b.addTest(.{
+        .root_module = native_alternatives_test_module,
+        .filters = &.{"native_alternatives.test."},
+    });
+    const run_native_alternatives_tests = b.addRunArtifact(
+        native_alternatives_tests,
+    );
+    b.step(
+        "test-native-alternatives",
+        "Run native alternatives parser, selection, and topology tests",
+    ).dependOn(&run_native_alternatives_tests.step);
+    test_step.dependOn(&run_native_alternatives_tests.step);
+    const native_alternatives_oracle_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "src/native_alternatives_oracle_test.zig",
+            ),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    native_alternatives_oracle_tests.root_module.addImport("debz", debz);
+    const native_alternatives_oracle_options = b.addOptions();
+    native_alternatives_oracle_options.addOption(
+        []const u8,
+        "path",
+        b.pathFromRoot(
+            "tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json",
+        ),
+    );
+    native_alternatives_oracle_tests.root_module.addOptions(
+        "native_alternatives_oracle_options",
+        native_alternatives_oracle_options,
+    );
+    const run_native_alternatives_oracle_tests = b.addRunArtifact(
+        native_alternatives_oracle_tests,
+    );
+    b.step(
+        "test-native-alternatives-oracle",
+        "Replay native alternatives parsing against admitted amd64/arm64 evidence",
+    ).dependOn(&run_native_alternatives_oracle_tests.step);
+    test_step.dependOn(&run_native_alternatives_oracle_tests.step);
+
     const native_materialization_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"native_unpack.test.materialization external fixture"},

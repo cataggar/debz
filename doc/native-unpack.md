@@ -152,9 +152,10 @@ the next invocation resolves afresh. Recovery retains the original inputs as
 described in [Native recovery](native-recovery.md).
 
 Native database plans explicitly preserve the override file without rewriting
-it, including remove and purge. Active `config` scripts, alternatives and other
-unsupported vendor state remain guarded. The exact pinned amd64/arm64 boundary,
-typed observed topology, and still-missing reference-execution evidence are in
+it, including remove and purge. Active `config` scripts and other unsupported
+vendor state remain guarded. Alternatives are admitted only through their
+typed record/topology and literal maintainer-script boundary. The exact pinned
+amd64/arm64 boundary and typed observed topology are in
 the [vendor-state reference specification](../schema/vendor-state-reference-v1.json);
 that evidence inventory does not grant mutation authority.
 
@@ -590,7 +591,8 @@ digested. Covered features include:
 - package disappearance;
 - held-selection changes;
 - malformed prior `Config-Version` evidence for an unpacked upgrade;
-- alternatives and unmodeled package metadata;
+- alternatives outside the pinned typed/literal-command authority and
+  unmodeled package metadata;
 - unmodeled `var/lib/dpkg` namespace entries;
 - shared-root interoperability; and
 - filesystem features a supplied observation cannot model safely.

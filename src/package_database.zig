@@ -246,6 +246,7 @@ pub const MaintainerScript = struct {
 };
 
 pub const RetainedMetadataKind = enum {
+    alternatives,
     config,
     templates,
     shlibs,
@@ -260,7 +261,9 @@ pub const RetainedMetadataKind = enum {
     }
 };
 
-/// Inert control-file bytes are retained exactly, not interpreted as database text.
+/// Retained control-file bytes are copied exactly. `alternatives` remains an
+/// opaque package info member because dpkg itself does not interpret it; the
+/// active alternatives database and links are modeled separately.
 pub const RetainedMetadata = struct {
     kind: RetainedMetadataKind,
     mode: u32,
@@ -3551,6 +3554,7 @@ test "package_database.test.inert metadata is typed without interpreting its byt
         .{ .name = "toolz.templates", .bytes = "binary\x00\xffmetadata", .mode = 0o640 },
         .{ .name = "toolz.shlibs", .bytes = "unterminated metadata" },
         .{ .name = "toolz.symbols", .bytes = "" },
+        .{ .name = "toolz.alternatives", .bytes = "opaque\x00\xffpackage-member", .mode = 0o640 },
         .{ .name = "toolz.vendor-data", .bytes = "still unmodeled\n" },
     };
     const entries = test_fixtures.info ++ extra;
@@ -3565,7 +3569,7 @@ test "package_database.test.inert metadata is typed without interpreting its byt
     };
     defer imported.deinit();
     const record = imported.model.find("toolz", "amd64").?;
-    try testing.expectEqual(@as(usize, 4), record.metadata.len);
+    try testing.expectEqual(@as(usize, 5), record.metadata.len);
     try testing.expectEqual(@as(usize, 1), imported.model.opaque_info.len);
     try testing.expectEqualStrings("toolz.vendor-data", imported.model.opaque_info[0].name);
     const config = record.metadataMember(.config).?;
@@ -3579,7 +3583,11 @@ test "package_database.test.inert metadata is typed without interpreting its byt
     try testing.expectEqual(extra[1].bytes.len, member.size);
     try testing.expectEqual(digestOf(extra[1].bytes), member.sha256);
     try testing.expectEqual(@as(usize, 0), record.metadataMember(.symbols).?.size);
-    inline for (.{ "alternatives", "../shlibs", "shlibs.old" }) |unsupported|
+    try testing.expectEqual(
+        extra[4].bytes.len,
+        record.metadataMember(.alternatives).?.size,
+    );
+    inline for (.{ "../shlibs", "shlibs.old" }) |unsupported|
         try testing.expect(RetainedMetadataKind.fromSuffix(unsupported) == null);
 }
 

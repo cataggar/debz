@@ -35,6 +35,18 @@ directory membership at completed phases and known script outcomes. Recovery
 checks these durable expectations before continuing; a completed phase marker
 alone cannot authorize resuming over externally changed payload.
 
+An alternatives-aware script adds a stable pre-script checkpoint before its
+in-flight marker. That checkpoint covers the active record directories, every
+record, selector, generic link, provider chain and target authorized by the
+literal command set, plus the pinned root-local tool. A normally returned
+script is recaptured and its exact post-state becomes the script checkpoint.
+If execution reaches in-flight without a durable outcome, or any record/link
+identity differs from the authorized checkpoint, recovery stops before root
+mutation repair and never reruns or synthesizes an alternatives operation.
+This uses the existing versioned execution-progress, script-outcome,
+managed-state, root-mutation, completion, and provenance documents; no wire
+schema is widened, and older evidence retains its original meaning.
+
 Statoverride resolution is frozen for the original invocation. Alongside the
 original override database, recovery stores the exact account-file bytes and
 modes actually required for named identities. These use bounded database-kind
