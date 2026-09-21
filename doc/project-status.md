@@ -135,11 +135,13 @@ The manual real-snapshot gate now selects the production native backend
 explicitly on amd64 and arm64 and starts from an empty directory with no dpkg
 database or helper placeholder. A Zig comparator owns canonical
 native/reference equality; shell and existing Python tooling are restricted to
-privileged execution and pinned oracle artifact preparation. The gate currently
-refuses before mutation because the fixed Ubuntu `resolute` InRelease is dated
-2026-04-23, has no `Valid-Until`, and exceeds the finite 31-day missing-expiry
-window. This is retained as a typed freshness blocker, not bypassed with legacy
-execution or an unbounded clock exception.
+privileged execution and pinned oracle artifact preparation. The gate's
+repository-specific config explicitly binds the finite 31-day missing-expiry
+policy. The frozen Ubuntu `resolute` InRelease is dated 2026-04-23 and therefore
+returns `ReleaseExpired` before mutation. Current update pockets are incomplete
+for a fresh `ubuntu-minimal` closure, while the current complete development
+suite publishes SHA512-only Release and package identities that exact-lock v2
+does not accept. No clock override or historical replay is used.
 
 Item 14 adds private native-step journaling, persisted execution inputs, and
 recovery/provenance orchestration. Recovery consumes the original compiled
@@ -421,7 +423,8 @@ lock from authenticated metadata and a deterministic plan. Create, customize,
 update, and recovery continue to require that reviewed lock as input. The
 manual native-architecture real-snapshot matrix is intended to exercise this
 sequence for Ubuntu 26.04 `ubuntu-minimal`, but its current reviewed snapshot
-is refused by repository freshness before lock resolution or mutation; see
+is refused by the explicit finite repository freshness policy before lock
+resolution or mutation; see
 [zvmi Debian-family backend](zvmi-package-family.md).
 
 ## Dependency solver

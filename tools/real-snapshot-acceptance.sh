@@ -8,6 +8,7 @@ readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archiv
 readonly max_download_bytes=$((1536 * 1024 * 1024))
 readonly max_package_bytes=$((512 * 1024 * 1024))
 readonly max_cache_bytes=$((2 * 1024 * 1024 * 1024))
+readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
 
 validate_values() {
   local uri=$1 suite=$2 architecture=$3
@@ -88,8 +89,8 @@ Components: main
 Architectures: $architecture
 Signed-By: $keyring
 EOF
-printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true}\n' \
-  "$source_file" "$suite" >"$config_file"
+printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
+  "$source_file" "$suite" "$maximum_release_age_seconds" >"$config_file"
 source_commit=${GITHUB_SHA:-}
 if [[ -z "$source_commit" ]]; then
   source_commit=$(git -C "$(dirname "$0")/.." rev-parse HEAD)
@@ -102,6 +103,8 @@ fi
     "$(date -u +%s)" "${GITHUB_WORKFLOW:-local}" "${GITHUB_RUN_ID:-local}" \
     "${GITHUB_RUN_ATTEMPT:-local}" "${GITHUB_JOB:-local}"
   printf 'candidate_backend=native\nreference_backend=pinned-dpkg-oracle\n'
+  printf 'repository_freshness=allow_missing_valid_until_with_max_age_seconds:%s\n' \
+    "$maximum_release_age_seconds"
   printf 'program_sha256=%s\nkeyring_sha256=%s\n' \
     "$(sha256sum "$debz" | cut -d' ' -f1)" \
     "$(sha256sum "$keyring" | cut -d' ' -f1)"

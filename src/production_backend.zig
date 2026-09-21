@@ -3167,13 +3167,7 @@ pub const Backend = struct {
         for (options.config_paths) |path| {
             const config_bytes = try readFile(allocator, self.io, path, 1024 * 1024);
             defer allocator.free(config_bytes);
-            const Wire = struct {
-                source_path: []const u8,
-                priority: i32 = 500,
-                default_release: ?[]const u8 = null,
-                immutable: bool = false,
-            };
-            var parsed = try std.json.parseFromSlice(Wire, allocator, config_bytes, .{
+            var parsed = try std.json.parseFromSlice(WireRepositoryConfig, allocator, config_bytes, .{
                 .allocate = .alloc_always,
                 .ignore_unknown_fields = false,
             });
@@ -3189,6 +3183,8 @@ pub const Backend = struct {
             else
                 options.default_release;
             policy.immutability.kind = if (parsed.value.immutable) .immutable_url else .moving;
+            if (parsed.value.freshness) |freshness|
+                policy.freshness = try configuredFreshness(freshness);
             try documents.append(allocator, .{
                 .bytes = contents,
                 .format = sourceFormat(parsed.value.source_path),
@@ -4356,6 +4352,74 @@ fn basePolicy(options: RepositoryOptions) repository_policy.Policy {
             null,
         .deadlines = deadlines(options.deadline_ms),
     };
+}
+
+const ConfigFreshnessMode = enum {
+    require_valid_until,
+    allow_missing_valid_until_with_max_age_seconds,
+};
+
+const ConfigFreshness = struct {
+    mode: ConfigFreshnessMode,
+    maximum_release_age_seconds: ?u64,
+};
+
+const WireRepositoryConfig = struct {
+    source_path: []const u8,
+    priority: i32 = 500,
+    default_release: ?[]const u8 = null,
+    immutable: bool = false,
+    freshness: ?ConfigFreshness = null,
+};
+
+fn configuredFreshness(
+    freshness: ConfigFreshness,
+) !repository_refresh.ExpiryPolicy {
+    const policy: repository_refresh.ExpiryPolicy = switch (freshness.mode) {
+        .require_valid_until => blk: {
+            if (freshness.maximum_release_age_seconds != null)
+                return error.InvalidRepositoryConfig;
+            break :blk .require_valid_until;
+        },
+        .allow_missing_valid_until_with_max_age_seconds => .{
+            .allow_missing_valid_until_with_max_age_seconds =
+                freshness.maximum_release_age_seconds orelse
+                return error.InvalidRepositoryConfig,
+        },
+    };
+    if (!repository_refresh.validExpiryPolicy(policy))
+        return error.InvalidRepositoryConfig;
+    return policy;
+}
+
+test "production repository config freshness is finite and explicit" {
+    const maximum = repository_refresh.maximum_missing_valid_until_age_seconds;
+    try std.testing.expectEqual(
+        repository_refresh.ExpiryPolicy.require_valid_until,
+        try configuredFreshness(.{
+            .mode = .require_valid_until,
+            .maximum_release_age_seconds = null,
+        }),
+    );
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        .{ .allow_missing_valid_until_with_max_age_seconds = maximum },
+        try configuredFreshness(.{
+            .mode = .allow_missing_valid_until_with_max_age_seconds,
+            .maximum_release_age_seconds = maximum,
+        }),
+    ));
+    try std.testing.expectError(error.InvalidRepositoryConfig, configuredFreshness(.{
+        .mode = .require_valid_until,
+        .maximum_release_age_seconds = maximum,
+    }));
+    try std.testing.expectError(error.InvalidRepositoryConfig, configuredFreshness(.{
+        .mode = .allow_missing_valid_until_with_max_age_seconds,
+        .maximum_release_age_seconds = null,
+    }));
+    try std.testing.expectError(error.InvalidRepositoryConfig, configuredFreshness(.{
+        .mode = .allow_missing_valid_until_with_max_age_seconds,
+        .maximum_release_age_seconds = maximum + 1,
+    }));
 }
 
 fn makeRuntimes(

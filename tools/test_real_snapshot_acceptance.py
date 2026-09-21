@@ -37,10 +37,10 @@ def fixture_cli() -> int:
             "operation": "refresh",
             "exit_status": 4,
             "changed": False,
-            "summary": "ReleaseMissingValidUntil",
+            "summary": "ReleaseExpired",
             "diagnostics": [{
                 "id": "repository_authentication_failed",
-                "message": "ReleaseMissingValidUntil",
+                "message": "ReleaseExpired",
             }],
         }, separators=(",", ":")))
         return 4
@@ -212,6 +212,11 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
             "install_root_exists=true\ndpkg_database_present=false\n"
             "helper_placeholder_present=false\npackage_state_present=false\n",
         )
+        config = json.loads((self.workspace / "ubuntu.json").read_text())
+        self.assertEqual(config["freshness"], {
+            "mode": "allow_missing_valid_until_with_max_age_seconds",
+            "maximum_release_age_seconds": 31 * 24 * 60 * 60,
+        })
 
     def test_dangling_workspace_symlink_refuses_before_cli_or_mutation(self) -> None:
         self.workspace.parent.mkdir()
@@ -238,7 +243,7 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 4, result.stderr)
         evidence = self.workspace / "evidence"
         refresh = json.loads((evidence / "refresh.json").read_text())
-        self.assertEqual(refresh["summary"], "ReleaseMissingValidUntil")
+        self.assertEqual(refresh["summary"], "ReleaseExpired")
         self.assertEqual(
             (evidence / "native-exec-audit.txt").read_text(),
             "operation=refresh\nexit_status=4\nforbidden_dpkg_exec=false\n",

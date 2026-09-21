@@ -65,9 +65,10 @@ outside the candidate path, proves the candidate root has no pre-existing
 dpkg/helper/package state, selects `native` explicitly, and exec-traces
 candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.
 Evidence members are capped at 128 MiB and the artifact at 512 MiB before
-upload. Repository freshness remains authoritative: the currently pinned
-Ubuntu snapshot is refused before mutation rather than obtaining a CI
-exception.
+upload. Repository freshness remains authoritative and repository-specific:
+the acceptance config explicitly binds the unchanged 31-day maximum for a
+missing `Valid-Until`. The frozen pin is refused as `ReleaseExpired`; no CI
+clock exception, hostname inference, or unbounded immutable exemption exists.
 
 `zig build security-audit` is network-free and rejects:
 

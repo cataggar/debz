@@ -132,15 +132,27 @@ status/info/trigger/diversion/statoverride/alternatives sections. A missing
 reference capture is recorded as unavailable and cannot be reported as a
 successful comparison.
 
-This gate is currently fail-closed rather than a completed parity claim. The
-reviewed `resolute` InRelease is dated 2026-04-23 and omits `Valid-Until`; the
-finite missing-expiry policy permits at most 31 days. A current invocation
-therefore returns `ReleaseMissingValidUntil` before lock resolution or root
-mutation. The gate retains that typed result and fresh-root proof instead of
-weakening repository freshness or silently selecting legacy. Full
-install/reinstall/upgrade/remove/purge, crash/restart, archive-evicted recovery,
-and final native/reference comparison remain blocked until a separately
-reviewed authenticated snapshot policy or pin satisfies current freshness.
+This gate is currently fail-closed rather than a completed parity claim.
+`resolute` is the frozen 26.04 release pocket: later snapshot timestamps retain
+the unchanged signed InRelease dated 2026-04-23 instead of re-signing it. The
+repository config now explicitly selects
+`allow_missing_valid_until_with_max_age_seconds` with the unchanged 31-day
+maximum. That policy is part of normalized repository identity, authenticated
+snapshot provenance, and exact-lock identity. The reviewed pin therefore
+returns `ReleaseExpired` before lock resolution or root mutation.
+
+No current replacement supplies the same complete closure to the current
+architecture. The current `resolute-updates` snapshot authenticates under the
+finite policy but is only a pocket: `ubuntu-minimal` planning lacks base
+packages, beginning with `libcrypt1`. The current complete `stonking` suite has
+a signed Date and `Valid-Until`, but Canonical publishes its Release and
+Packages transport identities only as SHA512; exact-lock v2 requires the
+repository-published SHA256 package digest and refuses the index before
+planning. There is no authorized historical verification-time replay artifact.
+Full install/reinstall/upgrade/remove/purge, crash/restart, archive-evicted
+recovery, and final native/reference comparison require either a current
+complete Ubuntu snapshot retaining SHA256 package identities or a separately
+reviewed SHA512 exact-lock/acquisition version across both architectures.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
