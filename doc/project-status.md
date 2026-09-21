@@ -142,8 +142,9 @@ drift retain the existing fail-closed guard.
 The item-16 alternatives increment is staged. It adds a bounded Zig parser and
 canonical writer for active records; exact auto/manual, priority/tie,
 missing-target, replacement and removal transitions; authenticated capture of
-the 14-group/189-path/190-entry vendor topology; amd64/arm64 tool pins and
-oracle replay; root-mutation settlement for native-owned updates; and durable
+the oracle's synthetic 14-group/189-requested/190-linked vendor projection;
+amd64/arm64 tool pins and reconstructed executed-evidence replay;
+root-mutation settlement for native-owned updates; and durable
 pre/post maintainer-script checkpoints. Opaque package `.alternatives` members
 are retained exactly. Unknown script outcomes, dynamic commands, unpinned
 tools, malformed or partial topology, unsupported vendor metadata and external

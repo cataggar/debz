@@ -628,6 +628,13 @@ pub fn build(b: *std.Build) void {
             "tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json",
         ),
     );
+    native_alternatives_oracle_options.addOption(
+        []const u8,
+        "vendor_path",
+        b.pathFromRoot(
+            "tools/fixtures/vendor-state/reference-v1.json",
+        ),
+    );
     native_alternatives_oracle_tests.root_module.addOptions(
         "native_alternatives_oracle_options",
         native_alternatives_oracle_options,

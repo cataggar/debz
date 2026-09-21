@@ -1,0 +1,12 @@
+manual
+/usr/bin/demo
+demo.1
+/usr/share/man/man1/demo.1
+
+/usr/lib/demo/a
+-10
+
+/usr/lib/demo/b
+20
+/usr/share/man/man1/demo-b.1
+

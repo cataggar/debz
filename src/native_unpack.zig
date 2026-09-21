@@ -18087,12 +18087,14 @@ fn lifecycleScriptOwner(
 const AlternativesScriptBoundary = struct {
     script: native_alternatives.ScriptAuthority,
     before: native_alternatives.Snapshot,
+    immutable_before: native_alternatives.ImmutableSnapshot,
     after_authority: native_alternatives.Authority,
     managed_paths: []const []const u8,
     arena: *std.heap.ArenaAllocator,
     backing_allocator: std.mem.Allocator,
 
     fn deinit(self: *AlternativesScriptBoundary) void {
+        self.immutable_before.deinit();
         self.before.deinit();
         self.script.deinit();
         self.arena.deinit();
@@ -18187,6 +18189,14 @@ fn prepareAlternativesScriptBoundary(
         .groups = before_groups[0..before_count],
     });
     errdefer before.deinit();
+    var immutable_before = try native_alternatives.captureScriptInputs(
+        allocator,
+        root,
+        script,
+        before,
+        .{},
+    );
+    errdefer immutable_before.deinit();
 
     const after_groups = try scratch.alloc(
         native_alternatives.GroupAuthority,
@@ -18240,6 +18250,20 @@ fn prepareAlternativesScriptBoundary(
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(scratch);
     try paths.appendSlice(scratch, before.paths);
+    for (immutable_before.facts) |fact| {
+        var duplicate = false;
+        for (paths.items) |existing| {
+            if (std.mem.eql(u8, existing, fact.path)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate)
+            try paths.append(
+                scratch,
+                try scratch.dupe(u8, fact.path),
+            );
+    }
     for (script.paths) |path| {
         const physical = try native_alternatives.physicalManagedPath(
             scratch,
@@ -18273,6 +18297,7 @@ fn prepareAlternativesScriptBoundary(
     return .{
         .script = script,
         .before = before,
+        .immutable_before = immutable_before,
         .after_authority = .{
             .groups = after_groups[0..after_count],
         },
@@ -18638,6 +18663,25 @@ fn runLifecycleScript(
         },
     };
     if (alternatives_boundary) |*boundary| {
+        _ = native_alternatives.verifyPinnedTool(
+            allocator,
+            root,
+            program.target_architecture,
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+        native_alternatives.validateScriptInputs(
+            allocator,
+            root,
+            boundary.script,
+            boundary.before,
+            boundary.immutable_before,
+            .{},
+        ) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
         alternatives_after = native_alternatives.capture(
             allocator,
             root,
@@ -18750,7 +18794,7 @@ fn runLifecycleScript(
                 runtime.intent_sha256,
                 recovery_action,
                 alternatives_checkpoint_paths,
-                false,
+                execution.phase_steps != null,
             ) catch |err| {
                 try attempt.requireRecovery(allocator, .script);
                 return err;

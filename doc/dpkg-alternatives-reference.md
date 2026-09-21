@@ -206,17 +206,21 @@ root-mutation settlement, and exact amd64/arm64 tool bindings. Native lifecycle
 execution retains opaque package `.alternatives` bytes but interprets active
 `var/lib/dpkg/alternatives` records as typed state.
 
-Before a maintainer script containing a literal `update-alternatives` command
-runs, the engine verifies the root-local tool digest, discovers the complete
-bounded command authority, captures all existing groups plus authorized new
-groups, and durably checkpoints database directories, records, selectors,
-generic links, provider chains, and target identities. After a normal script
-return it captures again, rejects changes to unmentioned groups or topology
-outside the command authority, and checkpoints the exact new state before the
-script outcome can complete. Unknown outcomes, partial or malformed state,
-external drift, dynamic shell construction, unpinned tools, extra groups,
-cycles, traversal, special files, or changed identities require recovery
-without repair or replay.
+Before a maintainer script containing a literal direct
+`update-alternatives` command line runs, the engine verifies the root-local
+tool digest, discovers the complete bounded command authority, captures all
+existing groups plus authorized new groups, and durably checkpoints database
+directories, records, selectors, generic links, provider chains, and target
+identities. The admitted shell shape is intentionally narrow: only the direct
+tool command, an optional literal `case` label, and an optional terminator are
+accepted. After a normal script return it captures again, requires provider
+and tool inputs to remain identity-exact, rejects changes to unmentioned
+groups or topology outside the command authority, and checkpoints the exact
+new state before the script outcome can complete. Unknown outcomes, partial or
+malformed state, external drift, comments or wrappers that merely mention the
+tool, extra shell tokens, dynamic shell construction, unpinned tools, extra
+groups, cycles, traversal, special files, or changed identities require
+recovery without repair or replay.
 
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link

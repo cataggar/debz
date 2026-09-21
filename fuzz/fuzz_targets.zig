@@ -33,6 +33,9 @@ const ownership_corpus = &.{
 };
 const alternatives_corpus = &.{
     @embedFile("corpus/alternatives/record"),
+    @embedFile("corpus/alternatives/manual-record"),
+    @embedFile("corpus/alternatives/truncated-record"),
+    @embedFile("corpus/alternatives/script"),
 };
 const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),

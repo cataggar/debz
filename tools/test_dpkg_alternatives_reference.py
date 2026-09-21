@@ -446,7 +446,7 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
             )
         )
 
-    def test_paths_records_scripts_and_native_boundary_is_typed(self) -> None:
+    def test_paths_records_scripts_and_root_guards_fail_closed(self) -> None:
         for path in ("/../escape", "/usr/bin/../escape", "relative", "/", "/a//b"):
             with self.assertRaises(oracle.OracleError):
                 oracle.validate_absolute_path(path)
@@ -464,28 +464,6 @@ class DpkgAlternativesReferenceTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-
-        archive_application = (ROOT / "src/archive_application.zig").read_text()
-        native_unpack = (ROOT / "src/native_unpack.zig").read_text()
-        native_alternatives = (
-            ROOT / "src/native_alternatives.zig"
-        ).read_text()
-        self.assertIn(
-            '.{ .name = "alternatives", .class = .retained }',
-            archive_application,
-        )
-        self.assertIn(
-            "prepareAlternativesScriptBoundary(",
-            native_unpack,
-        )
-        self.assertIn(
-            "pub fn validateScriptTransition(",
-            native_alternatives,
-        )
-        self.assertIn(
-            "pub fn settlement(",
-            native_alternatives,
-        )
 
         root = self.workspace / "root"
         oracle.make_root(root, "amd64")

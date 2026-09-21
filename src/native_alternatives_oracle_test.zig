@@ -60,6 +60,147 @@ fn oraclePath(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, oracle_options.path);
 }
 
+fn vendorPath(allocator: std.mem.Allocator) ![]u8 {
+    return allocator.dupe(u8, oracle_options.vendor_path);
+}
+
+fn hexDigest(text: []const u8) ![32]u8 {
+    var result: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&result, text);
+    return result;
+}
+
+fn jsonBytes(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    try std.json.Stringify.value(
+        value,
+        .{ .whitespace = .indent_2 },
+        &output.writer,
+    );
+    try output.writer.writeByte('\n');
+    return output.toOwnedSlice();
+}
+
+fn decodePointerPart(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) ![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    var index: usize = 0;
+    while (index < encoded.len) : (index += 1) {
+        if (encoded[index] != '~') {
+            try result.append(allocator, encoded[index]);
+            continue;
+        }
+        if (index + 1 >= encoded.len) return error.InvalidJsonPointer;
+        index += 1;
+        try result.append(allocator, switch (encoded[index]) {
+            '0' => '~',
+            '1' => '/',
+            else => return error.InvalidJsonPointer,
+        });
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+fn replaceJsonPointer(
+    allocator: std.mem.Allocator,
+    root: *std.json.Value,
+    pointer: []const u8,
+    replacement: std.json.Value,
+) !void {
+    if (pointer.len < 2 or pointer[0] != '/')
+        return error.InvalidJsonPointer;
+    var current = root;
+    var parts = std.mem.splitScalar(u8, pointer[1..], '/');
+    var encoded = parts.next() orelse return error.InvalidJsonPointer;
+    while (true) {
+        const part = try decodePointerPart(allocator, encoded);
+        defer allocator.free(part);
+        const next = parts.next();
+        if (next == null) {
+            switch (current.*) {
+                .object => |*object| {
+                    const slot = object.getPtr(part) orelse
+                        return error.MissingJsonPointer;
+                    slot.* = replacement;
+                },
+                .array => |*array| {
+                    const index = std.fmt.parseInt(
+                        usize,
+                        part,
+                        10,
+                    ) catch return error.InvalidJsonPointer;
+                    if (index >= array.items.len)
+                        return error.MissingJsonPointer;
+                    array.items[index] = replacement;
+                },
+                else => return error.InvalidJsonPointer,
+            }
+            return;
+        }
+        current = switch (current.*) {
+            .object => |*object| object.getPtr(part) orelse
+                return error.MissingJsonPointer,
+            .array => |*array| item: {
+                const index = std.fmt.parseInt(
+                    usize,
+                    part,
+                    10,
+                ) catch return error.InvalidJsonPointer;
+                if (index >= array.items.len)
+                    return error.MissingJsonPointer;
+                break :item &array.items[index];
+            },
+            else => return error.InvalidJsonPointer,
+        };
+        encoded = next.?;
+    }
+}
+
+fn applyArm64Evidence(
+    allocator: std.mem.Allocator,
+    root: *std.json.Value,
+) !std.json.Value {
+    const arm64 = try field(
+        try field(root.*, "architecture_evidence"),
+        "arm64",
+    );
+    const observed = root.object.getPtr("observed_behavior") orelse
+        return error.MissingOracleField;
+    const differences = (try field(
+        arm64,
+        "differences_from_baseline",
+    )).array.items;
+    for (differences) |difference| {
+        try replaceJsonPointer(
+            allocator,
+            observed,
+            try string(try field(difference, "path")),
+            try field(difference, "value"),
+        );
+    }
+    const encoded = try jsonBytes(allocator, observed.*);
+    defer allocator.free(encoded);
+    const observation = try field(arm64, "observation");
+    try std.testing.expectEqual(
+        try integer(try field(observation, "size")),
+        @as(i64, @intCast(encoded.len)),
+    );
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+    const expected = try hexDigest(
+        try string(try field(observation, "sha256")),
+    );
+    try std.testing.expectEqualSlices(u8, &expected, &digest);
+    return observed.*;
+}
+
 const ReplayCounts = struct {
     total: usize = 0,
     canonical: usize = 0,
@@ -200,6 +341,90 @@ test "native_alternatives.oracle.amd64 arm64 evidence and vendor projection pars
         )),
     );
 
+    const inventory_path = try vendorPath(testing.allocator);
+    defer testing.allocator.free(inventory_path);
+    const inventory_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        testing.io,
+        inventory_path,
+        testing.allocator,
+        .limited(2 * 1024 * 1024),
+    );
+    defer testing.allocator.free(inventory_bytes);
+    const reference_binding = try field(
+        try field(source, "vendor_reference"),
+        "reference",
+    );
+    try testing.expectEqual(
+        try integer(try field(reference_binding, "size")),
+        @as(i64, @intCast(inventory_bytes.len)),
+    );
+    var inventory_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(
+        inventory_bytes,
+        &inventory_sha256,
+        .{},
+    );
+    const expected_inventory_sha256 = try hexDigest(
+        try string(try field(reference_binding, "sha256")),
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &expected_inventory_sha256,
+        &inventory_sha256,
+    );
+    var parsed_inventory = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        inventory_bytes,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed_inventory.deinit();
+    const inventory_alternatives = try field(
+        parsed_inventory.value,
+        "alternatives",
+    );
+    const inventory_canonical = try jsonBytes(
+        testing.allocator,
+        inventory_alternatives,
+    );
+    defer testing.allocator.free(inventory_canonical);
+    var alternatives_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(
+        inventory_canonical,
+        &alternatives_sha256,
+        .{},
+    );
+    const expected_alternatives_sha256 = try hexDigest(
+        alternatives.pinned_oracle_sha256,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &expected_alternatives_sha256,
+        &alternatives_sha256,
+    );
+    const inventory_groups = (try field(
+        inventory_alternatives,
+        "groups",
+    )).array.items;
+    try testing.expectEqual(
+        alternatives.pinned_vendor_group_count,
+        inventory_groups.len,
+    );
+    try testing.expectEqual(
+        alternatives.pinned_vendor_requested_path_count,
+        (try field(
+            inventory_alternatives,
+            "requested_paths",
+        )).array.items.len,
+    );
+    try testing.expectEqual(
+        alternatives.pinned_vendor_linked_entry_count,
+        (try field(
+            inventory_alternatives,
+            "linked_entries",
+        )).array.items.len,
+    );
+
     const projection = try field(
         try field(
             try field(root, "observed_behavior"),
@@ -232,6 +457,106 @@ test "native_alternatives.oracle.amd64 arm64 evidence and vendor projection pars
             @as(i32, 50),
             record.record.candidates[0].priority,
         );
+        const links = try alternatives.selectedLinks(
+            testing.allocator,
+            record.record,
+            record.record.candidates[0].path,
+        );
+        defer testing.allocator.free(links);
+        const selectors = (try field(group, "selectors")).array.items;
+        const generics = (try field(group, "generic_links")).array.items;
+        try testing.expectEqual(links.len, selectors.len);
+        try testing.expectEqual(links.len, generics.len);
+        const inventory_group = inventory_groups[index];
+        try testing.expectEqualStrings(
+            name,
+            try string(try field(inventory_group, "name")),
+        );
+        const inventory_links = (try field(
+            inventory_group,
+            "links",
+        )).array.items;
+        try testing.expectEqual(links.len, inventory_links.len);
+        for (links, 0..) |link, link_index| {
+            const selector = selectors[link_index];
+            try testing.expectEqualStrings(
+                link.selector_name,
+                try string(try field(selector, "name")),
+            );
+            try testing.expectEqualStrings(
+                link.selector_target,
+                try string(try field(
+                    try field(selector, "fact"),
+                    "target",
+                )),
+            );
+            var generic: ?std.json.Value = null;
+            for (generics) |candidate_generic| {
+                if (std.mem.eql(
+                    u8,
+                    link.generic_path,
+                    try string(try field(candidate_generic, "path")),
+                )) {
+                    generic = candidate_generic;
+                    break;
+                }
+            }
+            const generic_entry = generic orelse
+                return error.MissingProjectedGenericLink;
+            try testing.expectEqualStrings(
+                link.generic_path,
+                try string(try field(generic_entry, "path")),
+            );
+            const expected_generic_target = try std.fmt.allocPrint(
+                testing.allocator,
+                "/etc/alternatives/{s}",
+                .{link.selector_name},
+            );
+            defer testing.allocator.free(expected_generic_target);
+            try testing.expectEqualStrings(
+                expected_generic_target,
+                try string(try field(
+                    try field(generic_entry, "fact"),
+                    "target",
+                )),
+            );
+            var inventory_link: ?std.json.Value = null;
+            for (inventory_links) |candidate_link| {
+                if (std.mem.eql(
+                    u8,
+                    link.generic_path[1..],
+                    try string(try field(candidate_link, "link_path")),
+                )) {
+                    inventory_link = candidate_link;
+                    break;
+                }
+            }
+            const inventory_entry = inventory_link orelse
+                return error.MissingInventoryRelationship;
+            try testing.expectEqualStrings(
+                link.generic_path[1..],
+                try string(try field(inventory_entry, "link_path")),
+            );
+            const inventory_selector = try string(try field(
+                inventory_entry,
+                "selector_path",
+            ));
+            try testing.expectEqualStrings(
+                link.selector_name,
+                inventory_selector[std.mem.lastIndexOfScalar(
+                    u8,
+                    inventory_selector,
+                    '/',
+                ).? + 1 ..],
+            );
+            try testing.expectEqualStrings(
+                link.selector_target,
+                try string(try field(
+                    inventory_entry,
+                    "selector_target",
+                )),
+            );
+        }
     }
     try testing.expectEqual(
         alternatives.pinned_vendor_relationship_count,
@@ -254,16 +579,9 @@ test "native_alternatives.oracle.amd64 arm64 evidence and vendor projection pars
         alternatives.pinned_oracle_sha256,
         try string(try field(vendor, "alternatives_sha256")),
     );
-    const reference = try field(
-        try field(
-            try field(source, "vendor_reference"),
-            "reference",
-        ),
-        "sha256",
-    );
     try testing.expectEqualStrings(
         alternatives.pinned_vendor_reference_sha256,
-        try string(reference),
+        try string(try field(reference_binding, "sha256")),
     );
 }
 
@@ -295,6 +613,20 @@ test "native_alternatives.oracle.selection and lifecycle records remain canonica
     try testing.expectEqual(@as(usize, 48), replayed.total);
     try testing.expectEqual(@as(usize, 42), replayed.canonical);
     try testing.expectEqual(@as(usize, 6), replayed.rejected);
+    _ = try applyArm64Evidence(
+        testing.allocator,
+        &parsed.value,
+    );
+    var arm64_replayed: ReplayCounts = .{};
+    try replayRecordFacts(
+        testing.allocator,
+        parsed.value,
+        null,
+        &arm64_replayed,
+    );
+    try testing.expectEqual(replayed.total, arm64_replayed.total);
+    try testing.expectEqual(replayed.canonical, arm64_replayed.canonical);
+    try testing.expectEqual(replayed.rejected, arm64_replayed.rejected);
     const observed = try field(parsed.value, "observed_behavior");
     const external = try field(observed, "external_update_alternatives");
     const malformed = (try field(
