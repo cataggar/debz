@@ -304,6 +304,7 @@ class SecurityAuditTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))
         for token in (
+            "    timeout-minutes: 180",
             "    needs: [build-and-test-workload, native-recovery]",
             "    if: ${{ always() }}",
             "        name: [linux-x64, linux-arm64]",
@@ -347,6 +348,7 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIsNotNone(match)
         workload = match[1]
         for token, replacement in (
+            ("    timeout-minutes: 60", "    timeout-minutes: 180"),
             ("name: [linux-x64, linux-arm64]", "name: [linux-x64]"),
             ("optimize: [Debug, ReleaseSafe]", "optimize: [Debug]"),
             ("optimize: [Debug, ReleaseSafe]", "optimize: [ReleaseSafe]"),

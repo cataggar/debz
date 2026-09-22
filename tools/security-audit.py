@@ -498,18 +498,22 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         text,
     ))
     failures = []
-    for name in ("build-and-test-workload", "native-recovery"):
+    timeout_lines = {
+        "build-and-test-workload": "    timeout-minutes: 60",
+        "native-recovery": "    timeout-minutes: 180",
+    }
+    for name, timeout_line in timeout_lines.items():
         body = jobs.get(name, "")
         lines = body.splitlines()
         if any(line not in lines for line in (
-            "    timeout-minutes: 60",
+            timeout_line,
             "      fail-fast: false",
             "          - os: ubuntu-24.04",
             "            name: linux-x64",
             "          - os: ubuntu-24.04-arm",
             "            name: linux-arm64",
         )) or re.search(r"(?m)^    if:", body) or "continue-on-error:" in body:
-            failures.append(f"ci.yml: {name} must require both architectures within the existing job limit")
+            failures.append(f"ci.yml: {name} must require both architectures within its reviewed job limit")
     workload = jobs.get("build-and-test-workload", "")
     if any(line not in workload.splitlines() for line in (
         "    name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})",
