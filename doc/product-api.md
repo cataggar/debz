@@ -78,8 +78,8 @@ Empty closures produce zero verified objects and a canonical empty v2 archive.
 Repository/bootstrap workflows with other solver-policy scopes remain gated
 until their own native integration.
 
-Native keys use a separate `debz-package-cas-v2-` prefix and fingerprint
-domain while retaining the shared `packages-v1/objects` layout. The download
+Native keys use a separate `debz-package-cas-v4-` prefix and fingerprint
+domain while retaining the shared `packages-v2/objects` layout. The download
 and install actions support matching explicit native selection. Other native
 consumer integrations remain separately gated.
 
@@ -337,13 +337,17 @@ Package-cache JSON schemas are:
 
 - [`package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
 - [`package-cache-fingerprint-v2.json`](../schema/package-cache-fingerprint-v2.json)
+- [`package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
+- [`package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
 - [`package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
 - [`package-cache-result-v2.json`](../schema/package-cache-result-v2.json)
+- [`package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
+- [`package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
 - [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 
 Their successful outputs include the canonical lock digest, CLI-owned
 fingerprint, exact/compatible cache keys or verified preparation counts, and
-the exact `packages-v1/objects` path. Fingerprint output also supplies the
+the exact `packages-v2/objects` path. Fingerprint output also supplies the
 maximum opaque archive byte count for a bounded pre-import download. Error
 documents contain no cache key or success-shaped path. The error v1 envelope
 is backend-neutral and remains shared by both modes.

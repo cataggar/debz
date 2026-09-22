@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const deb_archive = @import("deb_archive.zig");
 const metadata_decompression = @import("metadata_decompression.zig");
 const control_record = @import("control_record.zig");
@@ -41,7 +42,8 @@ pub const Expected = struct {
     requested_architecture: ?[]const u8 = null,
     filename: []const u8,
     size: u64,
-    sha256: [32]u8,
+    sha256: ?[32]u8 = null,
+    archive_identity: ?content_digest.Identity = null,
     require_conventional_filename: bool = true,
 };
 
@@ -429,7 +431,23 @@ fn validateInternal(
     switch (request) {
         .repository => |expected| {
             if (bytes.len != expected.size) return fail(.digest, .size_mismatch, 0, null, null);
-            if (!std.mem.eql(u8, &digest, &expected.sha256))
+            if (expected.sha256 == null and expected.archive_identity == null)
+                return fail(.digest, .digest_mismatch, 0, null, null);
+            if (expected.sha256) |sha256| {
+                if (!std.crypto.timing_safe.eql([32]u8, digest, sha256))
+                    return fail(.digest, .digest_mismatch, 0, null, null);
+            }
+            if (expected.archive_identity) |identity| {
+                identity.verify(bytes) catch
+                    return fail(.digest, .digest_mismatch, 0, null, null);
+            }
+            if (expected.sha256 != null and expected.archive_identity != null and
+                (expected.archive_identity.?.digests.sha256 == null or
+                    !std.crypto.timing_safe.eql(
+                        [32]u8,
+                        expected.sha256.?,
+                        expected.archive_identity.?.digests.sha256.?,
+                    )))
                 return fail(.digest, .digest_mismatch, 0, null, null);
         },
         .local => |expected| {
@@ -2111,7 +2129,7 @@ test "rejects traversal identity digest limits and corrupt tar" {
     bad_identity.requested_package = "other";
     try std.testing.expectEqual(Code.identity_mismatch, validate(allocator, bytes, bad_identity, .{}).diagnostic.code);
     var bad_digest = expectedFor(bytes);
-    bad_digest.sha256[0] ^= 1;
+    bad_digest.sha256.?[0] ^= 1;
     try std.testing.expectEqual(Code.digest_mismatch, validate(allocator, bytes, bad_digest, .{}).diagnostic.code);
     try std.testing.expectEqual(Code.decompression_failed, validate(allocator, bytes, expectedFor(bytes), .{
         .max_data_decompressed_bytes = 1,

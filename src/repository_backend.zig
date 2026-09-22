@@ -2,6 +2,7 @@ const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
 const archive_application = @import("archive_application.zig");
 const api = @import("repository_api.zig");
+const content_digest = @import("content_digest.zig");
 const state_module = @import("repository_state.zig");
 const local_artifact = @import("local_artifact.zig");
 const live_root = @import("live_root.zig");
@@ -1810,7 +1811,15 @@ pub fn prepareNativeFromCache(
     }
     for (verified_lock.lock.packages, archives) |package, *bytes| {
         _ = try input.deadline.remainingMs();
-        bytes.* = try input.cache.lookup(allocator, .{ .bytes = package.sha256 }, package.declared_size, .verify_sha256);
+        bytes.* = try input.cache.lookup(
+            allocator,
+            @import("content_digest.zig").Identity.init(
+                .{ .sha256 = package.sha256 },
+                .sha256,
+            ) catch unreachable,
+            package.declared_size,
+            .verify_all_supported,
+        );
         initialized += 1;
         _ = try input.deadline.remainingMs();
     }
@@ -6174,16 +6183,20 @@ fn acquirePlanArtifacts(
         const origin = action.origin orelse return error.MissingPackageOrigin;
         switch (origin) {
             .local_artifact => |local| {
-                var hex: [64]u8 = undefined;
-                formatHex(&hex, &local.evidence.sha256);
+                const identity = @import("content_digest.zig").Identity.init(
+                    .{ .sha256 = local.evidence.sha256 },
+                    .sha256,
+                ) catch unreachable;
+                var key_buffer: [135]u8 = undefined;
+                const key = identity.cacheKey(&key_buffer);
                 try artifacts.append(allocator, .{
                     .package = action.package,
                     .version = action.version,
                     .architecture = action.architecture,
                     .path = try std.fmt.allocPrint(
                         allocator,
-                        "{s}/packages-v1/objects/{s}",
-                        .{ cache_path, &hex },
+                        "{s}/packages-v2/objects/{s}",
+                        .{ cache_path, key },
                     ),
                 });
             },
@@ -6217,9 +6230,7 @@ fn acquirePlanArtifacts(
                     repository_origin,
                     try repository_acquisition.Uri.parse(normalized.uri),
                 );
-                const digest: metadata_cache.Digest = .{
-                    .bytes = selected.record.transport.sha256.bytes,
-                };
+                const digest = selected.record.transport.identity;
                 const existing_size = try cache.objectSize(digest);
                 try budget.reserveCacheGrowth(
                     selected.record.transport.size.value,
@@ -6257,7 +6268,8 @@ fn acquirePlanArtifacts(
                     .requested_architecture = action.architecture,
                     .filename = selected.record.transport.filename.value,
                     .size = package.provenance.declared_size,
-                    .sha256 = package.provenance.expected_sha256.bytes,
+                    .sha256 = package.provenance.expected_sha256,
+                    .archive_identity = package.provenance.expected_identity,
                 }, .{});
                 switch (payload) {
                     .diagnostic => return error.InvalidPackagePayload,
@@ -6265,8 +6277,8 @@ fn acquirePlanArtifacts(
                 }
                 const path = try std.fmt.allocPrint(
                     allocator,
-                    "{s}/packages-v1/objects/{s}",
-                    .{ cache_path, &package.provenance.cache_key },
+                    "{s}/packages-v2/objects/{s}",
+                    .{ cache_path, package.provenance.cache_key },
                 );
                 errdefer allocator.free(path);
                 try artifacts.append(allocator, .{
@@ -6698,15 +6710,21 @@ fn findPlanRecord(
     repository: solver.RepositoryInput,
     action: solver.PlanAction,
 ) ?usize {
-    const expected_digest = action.sha256 orelse return null;
+    if (action.archive_identity == null and action.sha256 == null) return null;
     const expected_size = action.package_size orelse return null;
     for (repository.packages.records, 0..) |record, index| {
-        var digest_hex: [64]u8 = undefined;
-        formatHex(&digest_hex, &record.transport.sha256.bytes);
+        const digest_matches = if (action.archive_identity) |expected|
+            content_digest.Identity.eql(expected, record.transport.identity)
+        else blk: {
+            const package_sha256 = record.transport.sha256 orelse break :blk false;
+            var digest_hex: [64]u8 = undefined;
+            formatHex(&digest_hex, &package_sha256.bytes);
+            break :blk std.mem.eql(u8, &digest_hex, &action.sha256.?);
+        };
         if (std.mem.eql(u8, record.control.package.text, action.package) and
             std.mem.eql(u8, record.control.version.value.original, action.version) and
             std.mem.eql(u8, record.control.architecture.text, action.architecture) and
-            std.mem.eql(u8, &digest_hex, &expected_digest) and
+            digest_matches and
             record.transport.size.value == expected_size)
             return index;
     }
@@ -8196,7 +8214,17 @@ fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *co
     });
     defer cache.deinit();
     if (case != .unchanged)
-        try cache.publish(allocator, .{ .bytes = sha256(bytes) }, bytes.len, bytes, .fail_fast, .{});
+        try cache.publish(
+            allocator,
+            @import("content_digest.zig").Identity.init(
+                .{ .sha256 = sha256(bytes) },
+                .sha256,
+            ) catch unreachable,
+            bytes.len,
+            bytes,
+            .fail_fast,
+            .{},
+        );
     var guard: RootOperationGuard = .{ .io = io, .allocator = allocator, .root_projection = projection };
     defer guard.deinit();
     try std.testing.expect(guard.open(request, .native, 1_700_000_000) == null);
@@ -8277,9 +8305,20 @@ fn executeProjectedRepositoryCase(case: RepositoryExecutionCase, projection: *co
         try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(root_operation.native_intent_path)) == null);
         try std.testing.expect(try root.entryIfExists(try root_fs.Path.init(@import("native_helper.zig").directory)) == null);
     }
-    if (case != .unchanged)
-        try cache.objects.deleteFile(io, &std.fmt.bytesToHex(sha256(bytes), .lower));
-    try std.testing.expect(try cache.objectSize(.{ .bytes = sha256(bytes) }) == null);
+    if (case != .unchanged) {
+        const object_identity = content_digest.Identity.init(
+            .{ .sha256 = sha256(bytes) },
+            .sha256,
+        ) catch unreachable;
+        var object_key_buffer: [135]u8 = undefined;
+        try cache.objects.deleteFile(io, object_identity.cacheKey(&object_key_buffer));
+    }
+    try std.testing.expect(try cache.objectSize(
+        @import("content_digest.zig").Identity.init(
+            .{ .sha256 = sha256(bytes) },
+            .sha256,
+        ) catch unreachable,
+    ) == null);
 }
 
 fn recoverProjectedRepositoryCase(
@@ -9733,11 +9772,15 @@ fn testProjectedNativeDispatch(projection: *const live_root.Projection, case: Na
     defer allocator.free(result_bytes);
     try root.publishFile(try root_fs.Path.init(result_name), result_bytes, .{});
     if (case == .scope_lost and pass == 0) return;
-    const cache_path = try root_fs.Path.init("var/cache/debz/packages-v1/objects");
+    const cache_path = try root_fs.Path.init("var/cache/debz/packages-v2/objects");
     var objects = try root.openDirectory(cache_path);
     defer objects.close(io);
-    const object = std.fmt.bytesToHex(request.expected_sha256.?, .lower);
-    objects.deleteFile(io, &object) catch |err| switch (err) {
+    const identity = @import("content_digest.zig").Identity.init(
+        .{ .sha256 = request.expected_sha256.? },
+        .sha256,
+    ) catch unreachable;
+    var object_buffer: [135]u8 = undefined;
+    objects.deleteFile(io, identity.cacheKey(&object_buffer)) catch |err| switch (err) {
         error.FileNotFound => if (case != .expired and pass == 0) return err,
         else => return err,
     };
@@ -10352,9 +10395,29 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
     });
     defer cache.deinit();
     if (package_count != 0 and case != .missing_object)
-        try cache.publish(allocator, .{ .bytes = local.sha256 }, local.size, descriptor_bytes, .fail_fast, .{});
+        try cache.publish(
+            allocator,
+            @import("content_digest.zig").Identity.init(
+                .{ .sha256 = local.sha256 },
+                .sha256,
+            ) catch unreachable,
+            local.size,
+            descriptor_bytes,
+            .fail_fast,
+            .{},
+        );
     if (package_count == 2)
-        try cache.publish(allocator, .{ .bytes = sha256(dependency_bytes) }, dependency_bytes.len, dependency_bytes, .fail_fast, .{});
+        try cache.publish(
+            allocator,
+            @import("content_digest.zig").Identity.init(
+                .{ .sha256 = sha256(dependency_bytes) },
+                .sha256,
+            ) catch unreachable,
+            dependency_bytes.len,
+            dependency_bytes,
+            .fail_fast,
+            .{},
+        );
     var locks: root_operation.TestLockBackend = .{ .allocator = allocator };
     defer locks.deinit();
     var coordinator = try root_operation.Coordinator.open(std.testing.io, root, root_path, locks.interface());
@@ -10387,7 +10450,12 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         .deadline = .{ .context = &clock, .nowMsFn = NativeCacheClock.now, .expires_at_ms = 10 },
     };
     var oversized = packages;
-    const key = std.fmt.bytesToHex(local.sha256, .lower);
+    const local_identity = @import("content_digest.zig").Identity.init(
+        .{ .sha256 = local.sha256 },
+        .sha256,
+    ) catch unreachable;
+    var key_buffer: [135]u8 = undefined;
+    const key = local_identity.cacheKey(&key_buffer);
     switch (case) {
         .changed_request => input.repository.no_refresh = true,
         .changed_plan => actions[0].requested = false,
@@ -10397,7 +10465,7 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
             oversized[0].declared_size = std.math.maxInt(u64);
             lock.lock.packages = &oversized;
         },
-        .corrupt_object => try cache.objects.writeFile(std.testing.io, .{ .sub_path = &key, .data = "corrupt" }),
+        .corrupt_object => try cache.objects.writeFile(std.testing.io, .{ .sub_path = key, .data = "corrupt" }),
         .active_evidence => try root.publishFile(
             try root_fs.Path.init(@import("native_recovery.zig").intent_path),
             "active native evidence",
@@ -10443,8 +10511,15 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
             try std.testing.expect(authorization.findAction("held", "amd64") == null);
             for (lock.lock.packages, result.archives) |package, bytes| {
                 try std.testing.expectEqual(package.sha256, sha256(bytes));
-                const object_key = std.fmt.bytesToHex(package.sha256, .lower);
-                try cache.objects.deleteFile(std.testing.io, &object_key);
+                const object_identity = @import("content_digest.zig").Identity.init(
+                    .{ .sha256 = package.sha256 },
+                    .sha256,
+                ) catch unreachable;
+                var object_key_buffer: [135]u8 = undefined;
+                try cache.objects.deleteFile(
+                    std.testing.io,
+                    object_identity.cacheKey(&object_key_buffer),
+                );
                 try std.testing.expectEqual(package.sha256, sha256(bytes));
             }
             try native_operation.bind(allocator, root, &attempt, result.preparation.prepared.program.program);
@@ -12580,13 +12655,17 @@ test "repository backend rejects changed transport and unavailable corrupt descr
         try std.testing.expectEqual(api.ExitStatus.unavailable, interrupted.exit_status);
         interrupted.deinit();
 
-        var digest_hex: [64]u8 = undefined;
         const descriptor_digest = sha256(descriptor);
-        formatHex(&digest_hex, &descriptor_digest);
+        const descriptor_identity = @import("content_digest.zig").Identity.init(
+            .{ .sha256 = descriptor_digest },
+            .sha256,
+        ) catch unreachable;
+        var digest_key_buffer: [135]u8 = undefined;
+        const digest_key = descriptor_identity.cacheKey(&digest_key_buffer);
         const object_path = try std.fmt.allocPrint(
             std.testing.allocator,
-            "root/var/cache/debz/packages-v1/objects/{s}",
-            .{&digest_hex},
+            "root/var/cache/debz/packages-v2/objects/{s}",
+            .{digest_key},
         );
         defer std.testing.allocator.free(object_path);
         var changed_storage: ?[]u8 = null;

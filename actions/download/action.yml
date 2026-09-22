@@ -128,7 +128,7 @@ outputs:
   cache-matched-key:
     description: Exact or compatible-prefix key restored, or empty when no cache was restored
   cache-path:
-    description: Absolute verified packages-v1/objects path used by later debz operations
+    description: Absolute verified packages-v2/objects path used by later debz operations
   cache-root:
     description: Absolute parent cache root accepted by debz --cache-path
   lock-digest:

@@ -108,7 +108,7 @@ export function fixtureInputs(root: string): Inputs {
     },
     packageCacheEnabled: true,
     cacheRoot: path.join(root, 'runner', 'cache'),
-    cachePath: path.join(root, 'runner', 'cache', 'packages-v1', 'objects'),
+    cachePath: path.join(root, 'runner', 'cache', 'packages-v2', 'objects'),
     offline: false,
     repairCorruptCache: false,
     debzVersion: 'v0.3.0',

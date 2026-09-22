@@ -1,6 +1,7 @@
 const std = @import("std");
 const repository_acquisition = @import("repository_acquisition.zig");
 const package_acquisition = @import("package_acquisition.zig");
+const content_digest = @import("content_digest.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const package_origin = @import("package_origin.zig");
 
@@ -40,7 +41,7 @@ pub const Provenance = struct {
     effective_uri: []u8,
     size: u64,
     sha256: Digest,
-    cache_key: [64]u8,
+    cache_key: [71]u8,
     trust_mode: TrustMode,
     outcome: Outcome,
     cache_growth_bytes: u64,
@@ -120,11 +121,17 @@ pub fn acquire(
     }
 
     if (request.expected_sha256) |digest| {
+        const cache_identity = try content_digest.Identity.init(
+            .{ .sha256 = digest.bytes },
+            .sha256,
+        );
         if (request.expected_size) |size| {
-            if (cache.lookup(allocator, digest, size, .verify_sha256)) |bytes| {
+            if (cache.lookup(allocator, cache_identity, size, .verify_all_supported)) |bytes| {
                 errdefer allocator.free(bytes);
-                var cache_key: [64]u8 = undefined;
-                digest.formatHex(&cache_key);
+                var cache_key_buffer: [135]u8 = undefined;
+                const key = cache_identity.cacheKey(&cache_key_buffer);
+                var cache_key: [71]u8 = undefined;
+                @memcpy(&cache_key, key);
                 const now = dependencies.clock.nowMs();
                 const effective_uri = try repository_acquisition.redactUri(allocator, request.uri);
                 return .{
@@ -197,18 +204,24 @@ pub fn acquire(
     if (request.expected_sha256) |expected| {
         if (!digest.eql(expected)) return error.DigestMismatch;
     }
-    const existing_size = try cache.objectSize(digest);
+    const cache_identity = try content_digest.Identity.init(
+        .{ .sha256 = digest.bytes },
+        .sha256,
+    );
+    const existing_size = try cache.objectSize(cache_identity);
     try cache.publish(
         allocator,
-        digest,
+        cache_identity,
         acquired.bytes.len,
         acquired.bytes,
         request.policy.cache_lock,
         .{},
     );
 
-    var cache_key: [64]u8 = undefined;
-    digest.formatHex(&cache_key);
+    var cache_key_buffer: [135]u8 = undefined;
+    const key = cache_identity.cacheKey(&cache_key_buffer);
+    var cache_key: [71]u8 = undefined;
+    @memcpy(&cache_key, key);
     const bytes = acquired.bytes;
     acquired.bytes = &.{};
     const provenance = acquired.provenance;
@@ -381,7 +394,12 @@ test "SHA-256 pin permits HTTP and publishes exact bytes to package CAS" {
         artifact.provenance.effective_uri,
     );
 
-    const cached = try cache.lookup(std.testing.allocator, digest, body.len, .verify_sha256);
+    const cached = try cache.lookup(
+        std.testing.allocator,
+        try content_digest.Identity.init(.{ .sha256 = digest.bytes }, .sha256),
+        body.len,
+        .verify_all_supported,
+    );
     defer std.testing.allocator.free(cached);
     try std.testing.expectEqualStrings(body, cached);
 }
@@ -542,7 +560,12 @@ test "pinned digest mismatch is not published" {
     ));
     try std.testing.expectError(
         error.CacheMiss,
-        cache.lookup(std.testing.allocator, expected, "expected".len, .verify_sha256),
+        cache.lookup(
+            std.testing.allocator,
+            try content_digest.Identity.init(.{ .sha256 = expected.bytes }, .sha256),
+            "expected".len,
+            .verify_all_supported,
+        ),
     );
 }
 
@@ -553,7 +576,14 @@ test "pinned size and digest use verified cache without acquisition" {
     defer cache.deinit();
     const body = "cached artifact";
     const digest = Digest.of(body);
-    try cache.publish(std.testing.allocator, digest, body.len, body, .fail_fast, .{});
+    try cache.publish(
+        std.testing.allocator,
+        try content_digest.Identity.init(.{ .sha256 = digest.bytes }, .sha256),
+        body.len,
+        body,
+        .fail_fast,
+        .{},
+    );
     var transport: TestTransport = .{ .body = "network must not run" };
 
     var artifact = try acquire(std.testing.allocator, &cache, .{

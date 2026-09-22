@@ -42,6 +42,17 @@ that `config-files` state belongs in the separate native final-state authority,
 not the lock's installed-package closure. Purge must remove the residual state.
 V1 creation, decoding, and schema are unchanged.
 
+`debz.exact_lock_v3` versions repository and package content identity without
+changing any v1/v2 bytes. Repository indexes and package archives carry an
+explicit primary algorithm plus the complete supported digest set. Supported
+algorithms are exactly lowercase `sha256` and `sha512`; encodings have exact
+lengths and canonical order is SHA256 then SHA512. If both are published, both
+are retained and verified. SHA512-only repository packages remain valid
+without a fabricated SHA256. Unknown algorithms, duplicate/conflicting
+entries, a missing primary, wrong case/length, and digest-set substitution are
+rejected. Transaction-plan schema v4 serializes the same tagged archive
+identity; v2/v3 plan serialization remains byte-for-byte unchanged.
+
 Exact-lock v2 keeps its complete-closure meaning by default. The transaction
 executor also exposes a separately policy-digested `locked_packages` mode for
 repository-add operations whose lock intentionally contains only non-remove
@@ -68,10 +79,12 @@ and total-work limits; sorted indexed matching and reference accounting avoid
 quadratic artifact/package validation. `ExactClosureLockStore` publishes with
 write/fsync/rename/fsync.
 
-Authenticated snapshot digest version 2 additionally binds the configured
+Authenticated snapshot digest version 3 additionally binds the configured
 freshness policy and maximum missing-expiry age, signed Release date,
 `Valid-Until` grace, bounded future-skew decision, and whether the
-missing-`Valid-Until` exception was exercised. Observation time and observed
+missing-`Valid-Until` exception was exercised, plus the complete
+algorithm-tagged index digest set and explicit primary selection. Observation
+time and observed
 age remain validated cache evidence but are excluded from lock identity, so
 independent authenticated refreshes of the same still-valid signed snapshot
 under the same policy produce the same digest. Repository and configuration
@@ -204,8 +217,13 @@ Schemas:
 
 - [`schema/exact-closure-lock-v1.json`](../schema/exact-closure-lock-v1.json)
 - [`schema/exact-closure-lock-v2.json`](../schema/exact-closure-lock-v2.json)
+- [`schema/exact-closure-lock-v3.json`](../schema/exact-closure-lock-v3.json)
 - [`schema/package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
+- [`schema/package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
+- [`schema/package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
 - [`schema/package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
+- [`schema/package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
+- [`schema/package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
 - [`schema/package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)

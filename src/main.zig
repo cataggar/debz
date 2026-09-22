@@ -176,7 +176,7 @@ const package_cache_help =
     \\Options:
     \\  -h, --help                   Show this help
     \\
-    \\The cache contract is versioned and CLI-owned. Only packages-v1/objects
+    \\The cache contract is versioned and CLI-owned. Only packages-v2/objects
     \\is suitable for an external cache; metadata, locks, and staging are not.
     \\
 ;

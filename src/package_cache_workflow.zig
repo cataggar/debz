@@ -10,20 +10,21 @@ const repository_acquisition = @import("repository_acquisition.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 
-pub const capability = "package-cache-v1";
-pub const fingerprint_schema = "io.github.cataggar.debz.package-cache-fingerprint.v1";
-pub const result_schema = "io.github.cataggar.debz.package-cache-result.v1";
+pub const capability = "package-cache-v3";
+pub const fingerprint_schema = "io.github.cataggar.debz.package-cache-fingerprint.v3";
+pub const result_schema = "io.github.cataggar.debz.package-cache-result.v3";
 pub const error_schema = "io.github.cataggar.debz.package-cache-error.v1";
-pub const api_version: u32 = 1;
-pub const fingerprint_domain = "debz-package-cache-fingerprint-v1";
+pub const api_version: u32 = 3;
+pub const error_api_version: u32 = 1;
+pub const fingerprint_domain = "debz-package-cache-fingerprint-v3";
 pub const abi_identity = "debian-package-archive-v1";
 pub const payload_policy = "deb-payload-default-limits-v1";
 pub const supported_origin_mode = "exact-lock-v1-authenticated-repository";
-pub const native_capability = "package-cache-v2";
-pub const native_fingerprint_schema = "io.github.cataggar.debz.package-cache-fingerprint.v2";
-pub const native_result_schema = "io.github.cataggar.debz.package-cache-result.v2";
-pub const native_api_version: u32 = 2;
-pub const native_fingerprint_domain = "debz-package-cache-fingerprint-v2";
+pub const native_capability = "package-cache-v4";
+pub const native_fingerprint_schema = "io.github.cataggar.debz.package-cache-fingerprint.v4";
+pub const native_result_schema = "io.github.cataggar.debz.package-cache-result.v4";
+pub const native_api_version: u32 = 4;
+pub const native_fingerprint_domain = "debz-package-cache-fingerprint-v4";
 pub const native_origin_mode = "exact-lock-v2-verified-origins";
 
 const Version = enum { v1, v2 };
@@ -515,7 +516,10 @@ fn preflightVersion(
         .corrupt_for_repair = 0,
     };
     for (lock.packages) |package| {
-        const digest: package_acquisition.Digest = .{ .bytes = package.sha256 };
+        const digest = try @import("content_digest.zig").Identity.init(
+            .{ .sha256 = package.sha256 },
+            .sha256,
+        );
         if (cache.lookup(
             allocator,
             digest,
@@ -659,7 +663,10 @@ fn prepareAfterCleanupVersion(
     const retained = try allocator.alloc(package_acquisition.Digest, request.lock.packages.len);
     defer allocator.free(retained);
     for (request.lock.packages, 0..) |package, index|
-        retained[index] = .{ .bytes = package.sha256 };
+        retained[index] = @import("content_digest.zig").Identity.init(
+            .{ .sha256 = package.sha256 },
+            .sha256,
+        ) catch unreachable;
     std.mem.sort(package_acquisition.Digest, retained, {}, lessDigest);
 
     var downloaded_count: usize = 0;
@@ -670,9 +677,12 @@ fn prepareAfterCleanupVersion(
             if (locked.origin == .local_artifact) {
                 const bytes = try request.cache.lookup(
                     allocator,
-                    .{ .bytes = locked.sha256 },
+                    @import("content_digest.zig").Identity.init(
+                        .{ .sha256 = locked.sha256 },
+                        .sha256,
+                    ) catch unreachable,
                     locked.declared_size,
-                    .verify_sha256,
+                    .verify_all_supported,
                 );
                 defer allocator.free(bytes);
                 var validation = deb_payload.inspectLocal(allocator, bytes, .{
@@ -834,7 +844,7 @@ pub fn errorJson(
     const writer = &output.writer;
     try writer.writeAll("{\"schema\":");
     try writeJsonString(writer, error_schema);
-    try writer.print(",\"api_version\":{},\"operation\":", .{api_version});
+    try writer.print(",\"api_version\":{},\"operation\":", .{error_api_version});
     try writeJsonString(writer, operation);
     try writer.print(",\"exit_status\":{},\"diagnostics\":[{{\"id\":", .{exit_status});
     try writeJsonString(writer, id);
@@ -959,7 +969,8 @@ fn matchPackages(
         for (repository.input.packages.records, 0..) |record, record_index| {
             if (scanned == maximum_records) return error.TooManyRepositoryRecords;
             scanned += 1;
-            const lock_index = by_digest.get(record.transport.sha256.bytes) orelse continue;
+            const sha256 = record.transport.sha256 orelse continue;
+            const lock_index = by_digest.get(sha256.bytes) orelse continue;
             const locked = lock.packages[lock_index];
             const repository_id = if (version == .v1) locked.repository_id else switch (locked.origin) {
                 .authenticated_repository => |origin| origin.repository_id,
@@ -1060,7 +1071,11 @@ fn formatHex(bytes: [32]u8, output: *[64]u8) void {
 }
 
 fn lessDigest(_: void, left: package_acquisition.Digest, right: package_acquisition.Digest) bool {
-    return std.mem.order(u8, &left.bytes, &right.bytes) == .lt;
+    return std.mem.order(
+        u8,
+        &left.digests.sha256.?,
+        &right.digests.sha256.?,
+    ) == .lt;
 }
 
 fn lessBytes32(_: void, left: [32]u8, right: [32]u8) bool {
@@ -1394,7 +1409,7 @@ test "package_cache_workflow.test.fingerprint JSON excludes secret and source pa
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "credential") == null);
     try std.testing.expect(std.mem.indexOf(u8, value.primary_key, "/runner/cache") == null);
-    try std.testing.expect(std.mem.startsWith(u8, value.primary_key, "debz-package-cas-v1-amd64-"));
+    try std.testing.expect(std.mem.startsWith(u8, value.primary_key, "debz-package-cas-v3-amd64-"));
 }
 
 const TestTransport = struct {
@@ -1462,8 +1477,8 @@ const TestRepository = struct {
 
 fn testRepository(allocator: std.mem.Allocator, payload: []const u8) !TestRepository {
     const digest = package_acquisition.Digest.of(payload);
-    var digest_hex: [64]u8 = undefined;
-    digest.formatHex(&digest_hex);
+    var digest_buffer: [128]u8 = undefined;
+    const digest_hex = digest.primaryValue().hex(&digest_buffer);
     const index_bytes = try std.fmt.allocPrint(
         allocator,
         \\Package: packages-microsoft-prod
@@ -1475,7 +1490,7 @@ fn testRepository(allocator: std.mem.Allocator, payload: []const u8) !TestReposi
         \\SHA256: {s}
         \\
     ,
-        .{ payload.len, &digest_hex },
+        .{ payload.len, digest_hex },
     );
     errdefer allocator.free(index_bytes);
     const repository_id: source.RepositoryId = .{ .bytes = @splat('a') };
@@ -1514,7 +1529,7 @@ fn testRepository(allocator: std.mem.Allocator, payload: []const u8) !TestReposi
             .architecture = "all",
             .repository_id = repository_id.bytes,
             .repository_snapshot_sha256 = @splat(1),
-            .sha256 = digest.bytes,
+            .sha256 = digest.digests.sha256.?,
             .declared_size = payload.len,
             .retention = .requested,
             .dpkg_selection_hold = false,
@@ -1558,7 +1573,7 @@ fn testNativeLock(
     const package_origin = @import("package_origin.zig");
     const has_repository = closure == .repository or closure == .mixed;
     const has_local = closure == .local or closure == .mixed;
-    const digest = package_acquisition.Digest.of(local_payload).bytes;
+    const digest = package_acquisition.Digest.of(local_payload).digests.sha256.?;
     const local: package_origin.LocalArtifactEvidence = .{
         .artifact_id = package_origin.artifactIdFromSha256(digest),
         .sha256 = digest,
@@ -1662,7 +1677,7 @@ test "package_cache_workflow.test.native policy and fingerprints preserve versio
         defer relocated.deinit();
         try std.testing.expectEqualStrings(first.primary_key, relocated.primary_key);
         try std.testing.expectEqualStrings(first.restore_prefix, relocated.restore_prefix);
-        try std.testing.expect(std.mem.startsWith(u8, first.primary_key, "debz-package-cas-v2-amd64-"));
+        try std.testing.expect(std.mem.startsWith(u8, first.primary_key, "debz-package-cas-v4-amd64-"));
         try std.testing.expect(!std.mem.eql(u8, first.restore_prefix, legacy.restore_prefix));
         try std.testing.expect(!std.mem.eql(u8, &first.acceptance_policy_digest, &legacy.acceptance_policy_digest));
         var repair = try createNativeFingerprint(
@@ -1677,8 +1692,8 @@ test "package_cache_workflow.test.native policy and fingerprints preserve versio
         try std.testing.expect(!std.mem.eql(u8, first.restore_prefix, repair.restore_prefix));
         const json = try first.canonicalJson(std.testing.allocator);
         defer std.testing.allocator.free(json);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"schema\":\"io.github.cataggar.debz.package-cache-fingerprint.v2\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"api_version\":2,\"capability\":\"package-cache-v2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"schema\":\"io.github.cataggar.debz.package-cache-fingerprint.v4\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"api_version\":4,\"capability\":\"package-cache-v4\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"archive_format\":\"debz-package-cache-archive-v2\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json, "artifacts.example.test") == null);
         try std.testing.expectError(error.ArchitectureMismatch, createNativeFingerprint(
@@ -1764,7 +1779,7 @@ test "package_cache_workflow.test.native preparation handles repository cached l
         try std.testing.expectEqual(@intFromBool(has_repository), transport.calls);
         const json = try cold.canonicalJson(std.testing.allocator);
         defer std.testing.allocator.free(json);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"schema\":\"io.github.cataggar.debz.package-cache-result.v2\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"schema\":\"io.github.cataggar.debz.package-cache-result.v4\"") != null);
         if (closure == .empty)
             try std.testing.expect(std.mem.indexOf(u8, json, "\"verified_count\":0") != null);
         var warm_request = request;
@@ -1776,7 +1791,15 @@ test "package_cache_workflow.test.native preparation handles repository cached l
         try std.testing.expectEqual(@intFromBool(has_repository), transport.calls);
         try std.testing.expectEqual(original_digest, lock.lock.digest_sha256);
         for (lock.lock.packages) |package| {
-            const cached = try cache.lookup(std.testing.allocator, .{ .bytes = package.sha256 }, package.declared_size, .verify_sha256);
+            const cached = try cache.lookup(
+                std.testing.allocator,
+                @import("content_digest.zig").Identity.init(
+                    .{ .sha256 = package.sha256 },
+                    .sha256,
+                ) catch unreachable,
+                package.declared_size,
+                .verify_all_supported,
+            );
             defer std.testing.allocator.free(cached);
             try std.testing.expectEqual(@as(usize, @intCast(package.declared_size)), cached.len);
         }
@@ -1800,9 +1823,9 @@ test "package_cache_workflow.test.native preparation handles repository cached l
                 &invalid_writer,
             ));
             const digest = package_acquisition.Digest.of(local);
-            var hex: [64]u8 = undefined;
-            digest.formatHex(&hex);
-            try cache.objects.writeFile(std.testing.io, .{ .sub_path = &hex, .data = "corrupt" });
+            var key_buffer: [135]u8 = undefined;
+            const key = digest.cacheKey(&key_buffer);
+            try cache.objects.writeFile(std.testing.io, .{ .sub_path = key, .data = "corrupt" });
             var repair_policy = policy;
             repair_policy.corrupt_cache = .repair_online;
             try std.testing.expectError(error.CorruptObject, preflightNative(
@@ -1986,12 +2009,13 @@ test "package_cache_workflow.test.prepare covers cold exact corrupt repair and b
     try std.testing.expectEqual(@as(usize, 1), exact.reused_count);
     try std.testing.expectEqual(@as(usize, 0), no_network.calls);
 
-    var name: [64]u8 = undefined;
-    const package_digest: package_acquisition.Digest = .{
-        .bytes = repository.lock.lock.packages[0].sha256,
-    };
-    package_digest.formatHex(&name);
-    try cache.objects.writeFile(std.testing.io, .{ .sub_path = &name, .data = "corrupt" });
+    var name_buffer: [135]u8 = undefined;
+    const package_digest = @import("content_digest.zig").Identity.init(
+        .{ .sha256 = repository.lock.lock.packages[0].sha256 },
+        .sha256,
+    ) catch unreachable;
+    const name = package_digest.cacheKey(&name_buffer);
+    try cache.objects.writeFile(std.testing.io, .{ .sub_path = name, .data = "corrupt" });
     try std.testing.expectError(error.CorruptObject, prepare(std.testing.allocator, .{
         .lock = &repository.lock.lock,
         .cache = &cache,
@@ -2151,11 +2175,12 @@ test "package_cache_workflow.test.preflight rejects directory symlink and FIFO o
         .maximum_object_bytes = 1024 * 1024,
     });
     defer cache.deinit();
-    const digest: package_acquisition.Digest = .{
-        .bytes = repository.lock.lock.packages[0].sha256,
-    };
-    var name: [64]u8 = undefined;
-    digest.formatHex(&name);
+    const digest = @import("content_digest.zig").Identity.init(
+        .{ .sha256 = repository.lock.lock.packages[0].sha256 },
+        .sha256,
+    ) catch unreachable;
+    var name_buffer: [135]u8 = undefined;
+    const name = digest.cacheKey(&name_buffer);
     var policy: Policy = .{
         .offline = true,
         .restored_cache = .exact,
@@ -2164,7 +2189,7 @@ test "package_cache_workflow.test.preflight rejects directory symlink and FIFO o
     var writer = try cache.acquireWriter(10);
     defer writer.release();
 
-    try cache.objects.createDir(std.testing.io, &name, .default_dir);
+    try cache.objects.createDir(std.testing.io, name, .default_dir);
     try std.testing.expectError(error.CorruptObject, preflight(
         std.testing.allocator,
         repository.lock.lock,
@@ -2172,9 +2197,9 @@ test "package_cache_workflow.test.preflight rejects directory symlink and FIFO o
         policy,
         &writer,
     ));
-    try cache.objects.deleteDir(std.testing.io, &name);
+    try cache.objects.deleteDir(std.testing.io, name);
 
-    try cache.objects.symLink(std.testing.io, "../../writer.lock", &name, .{});
+    try cache.objects.symLink(std.testing.io, "../../writer.lock", name, .{});
     try std.testing.expectError(error.CorruptObject, preflight(
         std.testing.allocator,
         repository.lock.lock,
@@ -2182,15 +2207,15 @@ test "package_cache_workflow.test.preflight rejects directory symlink and FIFO o
         policy,
         &writer,
     ));
-    try cache.objects.deleteFile(std.testing.io, &name);
+    try cache.objects.deleteFile(std.testing.io, name);
 
     if (builtin.os.tag == .linux) {
-        var name_z: [65:0]u8 = undefined;
-        @memcpy(name_z[0..64], &name);
-        name_z[64] = 0;
+        var name_z: [136:0]u8 = undefined;
+        @memcpy(name_z[0..name.len], name);
+        name_z[name.len] = 0;
         const result = std.os.linux.mknodat(
             cache.objects.handle,
-            &name_z,
+            name_z[0..name.len :0],
             std.os.linux.S.IFIFO | 0o600,
             0,
         );

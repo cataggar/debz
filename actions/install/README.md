@@ -209,7 +209,7 @@ diagnostics/stderr, and all protected input/executable/directory identity guards
 | `debz-path`, `debz-version`, `target` | Exact verified setup identity. |
 | `cli-cache-hit` | Exact verified CLI cache hit. |
 | `package-cache-hit` | Exact primary-key package cache hit. Prefix/partial and cold restores are `false`. |
-| `package-cache-path` | Verified `packages-v1/objects` directory. |
+| `package-cache-path` | Verified `packages-v2/objects` directory. |
 | `package-cache-root` | Parent passed unchanged to final `--cache-path`. |
 | `lock-digest` | Canonical exact-lock digest verified by download and transaction-result validation. |
 | `downloaded-count`, `reused-count` | Package preparation counts, not installed-state claims. |
@@ -277,7 +277,7 @@ symlinked, or digest-invalid evidence fails closed.
 ## What is never cached
 
 Only the CLI-owned opaque serialization of immutable
-`packages-v1/objects` is eligible for the package cache. The action never
+`packages-v2/objects` is eligible for the package cache. The action never
 caches or restores:
 
 - `install-root` or host `/`;

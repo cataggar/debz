@@ -49,23 +49,23 @@ export function fingerprint(inputs: Inputs): FingerprintDocument {
   const policy = 'a'.repeat(64);
   const lock = 'b'.repeat(64);
   const legacy: FingerprintDocument = {
-    schema: 'io.github.cataggar.debz.package-cache-fingerprint.v1',
-    api_version: 1,
-    capability: 'package-cache-v1',
+    schema: 'io.github.cataggar.debz.package-cache-fingerprint.v3',
+    api_version: 3,
+    capability: 'package-cache-v3',
     lock_schema: 'https://debz.dev/schema/exact-closure-lock-v1',
     lock_schema_version: 1,
     lock_digest: lock,
     target_architecture: inputs.architecture,
     abi: 'debian-package-archive-v1',
     debz_version: '0.3.0',
-    cas_layout: 'packages-v1',
+    cas_layout: 'packages-v2',
     archive_format: 'debz-package-cache-archive-v1',
     payload_policy: 'deb-payload-default-limits-v1',
     origin_mode: 'exact-lock-v1-authenticated-repository',
     acceptance_policy_digest: policy,
     fingerprint: 'c'.repeat(64),
-    primary_key: `debz-package-cas-v1-${inputs.architecture}-${policy}-${lock}`,
-    restore_prefix: `debz-package-cas-v1-${inputs.architecture}-${policy}-`,
+    primary_key: `debz-package-cas-v3-${inputs.architecture}-${policy}-${lock}`,
+    restore_prefix: `debz-package-cas-v3-${inputs.architecture}-${policy}-`,
     cache_root: inputs.cacheRoot,
     cache_path: inputs.cachePath,
     maximum_archive_bytes:
@@ -78,15 +78,15 @@ export function fingerprint(inputs: Inputs): FingerprintDocument {
   return inputs.transactionBackend === 'native'
     ? {
         ...legacy,
-        schema: 'io.github.cataggar.debz.package-cache-fingerprint.v2',
-        api_version: 2,
-        capability: 'package-cache-v2',
+        schema: 'io.github.cataggar.debz.package-cache-fingerprint.v4',
+        api_version: 4,
+        capability: 'package-cache-v4',
         lock_schema: 'https://debz.dev/schema/exact-closure-lock-v2',
         lock_schema_version: 2,
         archive_format: 'debz-package-cache-archive-v2',
         origin_mode: 'exact-lock-v2-verified-origins',
-        primary_key: `debz-package-cas-v2-${inputs.architecture}-${policy}-${lock}`,
-        restore_prefix: `debz-package-cas-v2-${inputs.architecture}-${policy}-`,
+        primary_key: `debz-package-cas-v4-${inputs.architecture}-${policy}-${lock}`,
+        restore_prefix: `debz-package-cas-v4-${inputs.architecture}-${policy}-`,
       }
     : legacy;
 }
@@ -96,13 +96,13 @@ export function preparation(
   expected: FingerprintDocument,
 ): PrepareDocument {
   const legacy: PrepareDocument = {
-    schema: 'io.github.cataggar.debz.package-cache-result.v1',
-    api_version: 1,
-    capability: 'package-cache-v1',
+    schema: 'io.github.cataggar.debz.package-cache-result.v3',
+    api_version: 3,
+    capability: 'package-cache-v3',
     lock_digest: expected.lock_digest,
     fingerprint: expected.fingerprint,
     target_architecture: inputs.architecture,
-    cas_layout: 'packages-v1',
+    cas_layout: 'packages-v2',
     cache_root: inputs.cacheRoot,
     cache_path: inputs.cachePath,
     downloaded_count: 1,
@@ -114,9 +114,9 @@ export function preparation(
   return inputs.transactionBackend === 'native'
     ? {
         ...legacy,
-        schema: 'io.github.cataggar.debz.package-cache-result.v2',
-        api_version: 2,
-        capability: 'package-cache-v2',
+        schema: 'io.github.cataggar.debz.package-cache-result.v4',
+        api_version: 4,
+        capability: 'package-cache-v4',
       }
     : legacy;
 }

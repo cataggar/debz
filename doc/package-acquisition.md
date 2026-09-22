@@ -1,6 +1,6 @@
 # Verified package acquisition
 
-`debz.package_acquisition` owns package download and SHA-256 CAS publication.
+`debz.package_acquisition` owns package download and algorithm-tagged CAS publication.
 It does not parse package payloads, execute transactions, invoke `dpkg`, or
 infer trust from archive names or paths.
 
@@ -73,16 +73,20 @@ exclusive.
 
 ## Verification and cache
 
-The declared size and SHA-256 from the authenticated Packages record are
-checked before publication. The streaming transport is limited to at most one
+The declared size and every supported digest from the authenticated Packages
+record are checked before publication. If both SHA256 and SHA512 are present,
+both must match; SHA512-only records do not receive a fabricated SHA256. The
+streaming transport is limited to at most one
 byte beyond the declared size, subject to the lower configured package limit.
 MD5, SHA-1, filenames, URLs, and pre-existing object paths never establish
 trust.
 
-Verified objects use `packages-v1/objects/<lowercase-sha256>`. Publication
+Verified objects use
+`packages-v2/objects/<algorithm>-<lowercase-canonical-hex>`, keyed by the
+explicit primary algorithm. Publication
 writes and syncs private same-filesystem staging, then renames and syncs the
 object directory while holding the cache writer lock. Cache hits are reopened,
-size checked, and SHA-256 revalidated. Corruption fails closed unless online
+size checked, and the complete digest set revalidated. Corruption fails closed unless online
 repair is explicitly enabled. Cache-only mode performs no acquisition call.
 Failed verification and interrupted publication remove staging data.
 
@@ -134,14 +138,15 @@ Both formats validate the complete envelope and every object before any
 matching object is published under the CAS writer lock. Exact restores require
 the entire lock closure, including an actually empty archive for an empty
 native lock. Partial restores publish only matching objects; unrelated objects
-are verified but skipped. Imported objects are reread and rehashed before
-publication, and the existing CAS layout remains unchanged.
+are verified but skipped. Imported historical SHA256 objects are reread and rehashed before publication
+into their tagged `sha256-...` CAS key. The archive bytes remain unchanged.
 
 `package-cache fingerprint` and `package-cache prepare` select these native
 contracts only with explicit `--transaction-backend native`; the default
-remains `legacy_dpkg` and v1. Native fingerprints/results use separate v2
-schemas, fingerprint domains, and restore-key prefixes. Empty closures need
-no repository inputs and produce zero verified objects.
+remains `legacy_dpkg` and archive v1. The packages-v2 CAS cutover uses
+fingerprint/result schemas v3 for legacy and v4 for native, with distinct
+fingerprint domains and restore-key prefixes. Empty closures need no repository
+inputs and produce zero verified objects.
 
 Native preparation authenticates repository evidence and validates each
 repository payload normally. Local-artifact entries must already be in the

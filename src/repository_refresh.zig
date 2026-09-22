@@ -1,6 +1,7 @@
 const std = @import("std");
 const acquisition = @import("repository_acquisition.zig");
 const cache_module = @import("metadata_cache.zig");
+const content_digest = @import("content_digest.zig");
 const decompression = @import("metadata_decompression.zig");
 const packages_index = @import("packages_index.zig");
 const release_metadata = @import("release_metadata.zig");
@@ -8,8 +9,8 @@ const signed_envelope = @import("signed_release_envelope.zig");
 const openpgp = @import("openpgp_verifier.zig");
 const source = @import("source.zig");
 
-const snapshot_magic = "debz-repository-snapshot-v3";
-const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v3" };
+const snapshot_magic = "debz-repository-snapshot-v4";
+const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v4" };
 const legacy_snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v2" };
 pub const maximum_future_release_seconds: u64 = 24 * 60 * 60;
 pub const maximum_missing_valid_until_age_seconds: u64 = 31 * 24 * 60 * 60;
@@ -161,6 +162,7 @@ pub const Provenance = struct {
     index_uri: []const u8,
     release_digest: cache_module.Digest,
     index_digest: cache_module.Digest,
+    index_identity: content_digest.Identity,
     selected_path: []const u8,
     compression: Compression,
     refreshed_at_unix: i64,
@@ -212,10 +214,16 @@ pub const AuthenticatedResult = struct {
 /// every refresh still revalidates those bounds at the current time.
 pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-authenticated-repository-snapshot-v2\x00");
+    hash.update("debz-authenticated-repository-snapshot-v3\x00");
     hash.update(result.snapshot.provenance.repository_id.slice());
     hash.update(&result.snapshot.provenance.release_digest.bytes);
     hash.update(&result.snapshot.provenance.index_digest.bytes);
+    hash.update(result.snapshot.provenance.index_identity.primary.name());
+    hash.update("\x00");
+    if (result.snapshot.provenance.index_identity.digests.sha256) |value|
+        hash.update(&value);
+    if (result.snapshot.provenance.index_identity.digests.sha512) |value|
+        hash.update(&value);
     if (result.snapshot.provenance.authentication_evidence.signature_digest) |digest|
         hash.update(&digest.bytes);
     for (result.snapshot.provenance.authentication_evidence.signatures) |signature| {
@@ -541,16 +549,16 @@ fn refreshInternal(
         repository,
         refresh_policy.compression_order,
     );
-    if (selected.entry.size > refresh_policy.maximum_compressed_bytes)
+    if (selected.size > refresh_policy.maximum_compressed_bytes)
         return decompression.Error.InputLimitExceeded;
 
-    const regular_uri = try repositoryUri(allocator, repository, selected.entry.path.value);
+    const regular_uri = try repositoryUri(allocator, repository, selected.path.value);
     defer allocator.free(regular_uri);
     var by_hash_uri: ?[]u8 = null;
     defer if (by_hash_uri) |value| allocator.free(value);
     const advertised = parsed_release.acquire_by_hash != null and
         parsed_release.acquire_by_hash.?.value;
-    if (advertised) by_hash_uri = try byHashUri(allocator, repository, selected.entry);
+    if (advertised) by_hash_uri = try byHashUri(allocator, repository, selected);
 
     var index_acquired: acquisition.Result = undefined;
     var fallback_used = false;
@@ -591,7 +599,7 @@ fn refreshInternal(
     }
     defer index_acquired.deinit(allocator);
 
-    try verifyIndexBytes(selected.entry, index_acquired.bytes);
+    try verifyIndexBytes(selected, index_acquired.bytes);
     const uncompressed = try decompressIndex(
         allocator,
         selected,
@@ -603,7 +611,7 @@ fn refreshInternal(
         allocator,
         uncompressed,
         repository,
-        selected.entry.path.value,
+        selected.path.value,
         refresh_policy.packages_options,
     );
     checked_packages.deinit();
@@ -614,6 +622,7 @@ fn refreshInternal(
         .valid_until_unix = release_policy.valid_until,
         .release_digest = cache_module.Digest.of(release_bytes),
         .index_digest = cache_module.Digest.of(index_acquired.bytes),
+        .index_identity = selected.identity,
         .authentication = authentication,
         .authentication_mode = authentication_mode,
         .authentication_payload = authentication_payload,
@@ -633,7 +642,7 @@ fn refreshInternal(
         .by_hash_advertised = advertised,
         .by_hash_used = advertised and !fallback_used,
         .fallback_used = fallback_used,
-        .selected_path = selected.entry.path.value,
+        .selected_path = selected.path.value,
         .release_uri = release_uri,
         .index_uri = index_acquired.provenance.effective_uri,
         .release_bytes = release_bytes,
@@ -683,7 +692,9 @@ fn refreshInternal(
 }
 
 const SelectedIndex = struct {
-    entry: release_metadata.Sha256Entry,
+    path: release_metadata.LocatedString,
+    size: u64,
+    identity: content_digest.Identity,
     compression: Compression,
     expected_uncompressed_size: ?usize,
 };
@@ -913,14 +924,11 @@ fn selectIndex(
         "{s}/binary-{s}/Packages",
         .{ repository.component, repository.architecture },
     ) catch return error.InvalidConfiguration;
-    var uncompressed_size: ?usize = null;
-    for (metadata.sha256_entries) |entry| {
-        if (std.mem.eql(u8, entry.path.value, base)) {
-            uncompressed_size = std.math.cast(usize, entry.size) orelse
-                return error.InvalidConfiguration;
-            break;
-        }
-    }
+    const uncompressed = try supportedIdentityForPath(metadata, base);
+    const uncompressed_size = if (uncompressed) |entry|
+        std.math.cast(usize, entry.size) orelse return error.InvalidConfiguration
+    else
+        null;
     for (order) |compression_kind| {
         var path_buffer: [4104]u8 = undefined;
         const path = std.fmt.bufPrint(
@@ -928,25 +936,65 @@ fn selectIndex(
             "{s}{s}",
             .{ base, compression_kind.suffix() },
         ) catch continue;
-        for (metadata.sha256_entries) |entry| {
-            if (std.mem.eql(u8, entry.path.value, path)) return .{
-                .entry = entry,
+        if (try supportedIdentityForPath(metadata, path)) |entry| {
+            return .{
+                .path = entry.path,
+                .size = entry.size,
+                .identity = entry.identity,
                 .compression = compression_kind,
                 .expected_uncompressed_size = if (compression_kind == .uncompressed)
-                    std.math.cast(usize, entry.size)
+                std.math.cast(usize, entry.size)
                 else
-                    uncompressed_size,
+                uncompressed_size,
             };
         }
     }
     return error.IndexNotFound;
 }
 
-fn verifyIndexBytes(entry: release_metadata.Sha256Entry, bytes: []const u8) !void {
+const SupportedPathIdentity = struct {
+    path: release_metadata.LocatedString,
+    size: u64,
+    identity: content_digest.Identity,
+};
+
+fn supportedIdentityForPath(
+    metadata: *const release_metadata.ReleaseMetadata,
+    path: []const u8,
+) !?SupportedPathIdentity {
+    var located: ?release_metadata.LocatedString = null;
+    var size: ?u64 = null;
+    var digests: content_digest.Set = .{};
+    for (metadata.sha256_entries) |entry| {
+        if (!std.mem.eql(u8, entry.path.value, path)) continue;
+        located = entry.path;
+        size = entry.size;
+        digests.put(.{ .sha256 = entry.digest.bytes }) catch
+            return error.InvalidConfiguration;
+    }
+    for (metadata.sha512_entries) |entry| {
+        if (!std.mem.eql(u8, entry.path.value, path)) continue;
+        if (size) |expected_size| {
+            if (expected_size != entry.size) return error.InvalidConfiguration;
+        } else {
+            size = entry.size;
+        }
+        located = entry.path;
+        digests.put(.{ .sha512 = entry.digest.bytes }) catch
+            return error.InvalidConfiguration;
+    }
+    if (size == null) return null;
+    return .{
+        .path = located.?,
+        .size = size.?,
+        .identity = content_digest.Identity.strongest(digests) catch
+            return error.InvalidConfiguration,
+    };
+}
+
+fn verifyIndexBytes(entry: SelectedIndex, bytes: []const u8) !void {
     if (bytes.len != entry.size) return error.IndexSizeMismatch;
-    const digest = cache_module.Digest.of(bytes);
-    if (!std.mem.eql(u8, &digest.bytes, &entry.digest.bytes))
-        return error.IndexDigestMismatch;
+    entry.identity.verify(bytes) catch return error.IndexDigestMismatch;
 }
 
 fn decompressIndex(
@@ -960,7 +1008,7 @@ fn decompressIndex(
             return decompression.Error.OutputLimitExceeded;
         return allocator.dupe(u8, bytes);
     }
-    const kind = try decompression.compressionFromFilename(selected.entry.path.value);
+    const kind = try decompression.compressionFromFilename(selected.path.value);
     return decompression.decompress(allocator, kind, bytes, .{
         .maximum_compressed_bytes = policy.maximum_compressed_bytes,
         .maximum_decompressed_bytes = policy.maximum_decompressed_bytes,
@@ -1025,16 +1073,20 @@ fn repositoryUri(
 fn byHashUri(
     allocator: std.mem.Allocator,
     repository: Repository,
-    entry: release_metadata.Sha256Entry,
+    entry: SelectedIndex,
 ) ![]u8 {
     const slash = std.mem.lastIndexOfScalar(u8, entry.path.value, '/') orelse
         return error.InvalidConfiguration;
-    var digest_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&digest_hex, "{x}", .{entry.digest.bytes}) catch unreachable;
+    var digest_hex: [128]u8 = undefined;
+    const encoded = entry.identity.primaryValue().hex(&digest_hex);
     const relative = try std.fmt.allocPrint(
         allocator,
-        "{s}/by-hash/SHA256/{s}",
-        .{ entry.path.value[0..slash], &digest_hex },
+        "{s}/by-hash/{s}/{s}",
+        .{
+            entry.path.value[0..slash],
+            entry.identity.primary.releaseName(),
+            encoded,
+        },
     );
     defer allocator.free(relative);
     return repositoryUri(allocator, repository, relative);
@@ -1101,6 +1153,7 @@ const SnapshotManifest = struct {
     valid_until_unix: ?i64,
     release_digest: cache_module.Digest,
     index_digest: cache_module.Digest,
+    index_identity: content_digest.Identity,
     authentication: AuthenticationStatus,
     authentication_mode: AuthenticationMode,
     authentication_payload: []const u8,
@@ -1184,6 +1237,17 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
     else
         @splat(0);
     try bytes.appendSlice(allocator, &signature_digest_bytes);
+    try bytes.appendSlice(allocator, &.{
+        @intFromEnum(manifest.index_identity.primary),
+        @intFromBool(manifest.index_identity.digests.sha256 != null) |
+            (@as(u8, @intFromBool(manifest.index_identity.digests.sha512 != null)) << 1),
+    });
+    const index_sha256 = manifest.index_identity.digests.sha256 orelse
+        @as([32]u8, @splat(0));
+    const index_sha512 = manifest.index_identity.digests.sha512 orelse
+        @as([64]u8, @splat(0));
+    try bytes.appendSlice(allocator, &index_sha256);
+    try bytes.appendSlice(allocator, &index_sha512);
     for (manifest.signature_results) |result| {
         try appendInt(&bytes, allocator, u32, @intFromEnum(result.status));
         try bytes.appendSlice(allocator, if (result.primary_fingerprint) |*value| value else &@as([20]u8, @splat(0)));
@@ -1271,6 +1335,23 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
     const release_digest: cache_module.Digest = .{ .bytes = reader.array(32) };
     const index_digest: cache_module.Digest = .{ .bytes = reader.array(32) };
     const signature_digest_raw: cache_module.Digest = .{ .bytes = reader.array(32) };
+    const index_primary: content_digest.Algorithm = switch (reader.byte()) {
+        1 => .sha256,
+        2 => .sha512,
+        else => return error.CorruptSnapshot,
+    };
+    const index_digest_flags = reader.byte();
+    if (index_digest_flags == 0 or index_digest_flags & 0xfc != 0)
+        return error.CorruptSnapshot;
+    const index_sha256 = reader.array(32);
+    const index_sha512 = reader.array(64);
+    if ((index_digest_flags & 1 == 0 and !allZero(&index_sha256)) or
+        (index_digest_flags & 2 == 0 and !allZero(&index_sha512)))
+        return error.CorruptSnapshot;
+    const index_identity = content_digest.Identity.init(.{
+        .sha256 = if (index_digest_flags & 1 != 0) index_sha256 else null,
+        .sha512 = if (index_digest_flags & 2 != 0) index_sha512 else null,
+    }, index_primary) catch return error.CorruptSnapshot;
     const signature_results = try allocator.alloc(openpgp.SignatureResult, signature_count);
     errdefer allocator.free(signature_results);
     for (signature_results) |*result| {
@@ -1305,6 +1386,7 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
         .release_date_unix = date,
         .release_digest = release_digest,
         .index_digest = index_digest,
+        .index_identity = index_identity,
         .authentication = authentication,
         .authentication_mode = authentication_mode,
         .authentication_payload = authentication_payload,
@@ -1357,6 +1439,8 @@ fn loadSnapshot(
     if (!cache_module.Digest.of(manifest.release_bytes).eql(manifest.release_digest) or
         !cache_module.Digest.of(manifest.index_bytes).eql(manifest.index_digest))
         return error.CorruptSnapshot;
+    manifest.index_identity.verify(manifest.index_bytes) catch
+        return error.CorruptSnapshot;
     const current_signatures = try revalidateAuthentication(
         allocator,
         manifest,
@@ -1390,10 +1474,11 @@ fn loadSnapshot(
         return error.CorruptSnapshot;
     const release_policy = try validateRelease(&release, repository, policy, now);
     const selected = try selectIndex(&release, repository, policy.compression_order);
-    if (!std.mem.eql(u8, selected.entry.path.value, manifest.selected_path) or
-        selected.compression != manifest.compression)
+    if (!std.mem.eql(u8, selected.path.value, manifest.selected_path) or
+        selected.compression != manifest.compression or
+        !selected.identity.eql(manifest.index_identity))
         return error.CorruptSnapshot;
-    try verifyIndexBytes(selected.entry, manifest.index_bytes);
+    try verifyIndexBytes(selected, manifest.index_bytes);
     const uncompressed = try decompressIndex(allocator, selected, manifest.index_bytes, policy);
     errdefer allocator.free(uncompressed);
     var packages = try parsePackages(
@@ -1418,6 +1503,7 @@ fn loadSnapshot(
             .index_uri = manifest.index_uri,
             .release_digest = manifest.release_digest,
             .index_digest = manifest.index_digest,
+            .index_identity = manifest.index_identity,
             .selected_path = manifest.selected_path,
             .compression = manifest.compression,
             .refreshed_at_unix = manifest.refreshed_at_unix,
@@ -2144,6 +2230,65 @@ test "tampered InRelease cleartext fails before Release parsing" {
         testRefreshPolicy(&.{.uncompressed}),
         authenticatedDependencies(&fixture, &cache),
     ));
+}
+
+test "SHA512-only Ubuntu-shaped indexes select and verify for amd64 and arm64" {
+    const allocator = std.testing.allocator;
+    const amd64_packages =
+        "Package: microsoft-demo\nVersion: 1.0\nArchitecture: amd64\n" ++
+        "Filename: pool/main/m/microsoft-demo_1.0_amd64.deb\nSize: 1\n" ++
+        "SHA512: " ++ ("a" ** 128) ++ "\nDescription: fixture\n\n";
+    const arm64_packages =
+        "Package: microsoft-demo\nVersion: 1.0\nArchitecture: arm64\n" ++
+        "Filename: pool/main/m/microsoft-demo_1.0_arm64.deb\nSize: 1\n" ++
+        "SHA512: " ++ ("b" ** 128) ++ "\nDescription: fixture\n\n";
+    const amd64_digest = content_digest.Value.of(.sha512, amd64_packages);
+    const arm64_digest = content_digest.Value.of(.sha512, arm64_packages);
+    var amd64_hex: [128]u8 = undefined;
+    var arm64_hex: [128]u8 = undefined;
+    const release = try std.fmt.allocPrint(
+        allocator,
+        \\Suite: stonking
+        \\Codename: stonking
+        \\Date: Fri, 14 Aug 2026 19:58:20 UTC
+        \\Valid-Until: Fri, 14 Aug 2026 20:58:20 UTC
+        \\Architectures: amd64 arm64
+        \\Components: main
+        \\Acquire-By-Hash: yes
+        \\SHA512:
+        \\ {s} {d} main/binary-amd64/Packages
+        \\ {s} {d} main/binary-arm64/Packages
+        \\
+    , .{
+        amd64_digest.hex(&amd64_hex),
+        amd64_packages.len,
+        arm64_digest.hex(&arm64_hex),
+        arm64_packages.len,
+    });
+    defer allocator.free(release);
+    var metadata = try parseRelease(allocator, release, .{});
+    defer metadata.deinit();
+
+    var repository = try testRepository();
+    repository.suite = "stonking";
+    inline for (.{
+        .{ "amd64", amd64_packages },
+        .{ "arm64", arm64_packages },
+    }) |fixture| {
+        repository.architecture = fixture[0];
+        const selected = try selectIndex(&metadata, repository, &.{.uncompressed});
+        try std.testing.expectEqual(content_digest.Algorithm.sha512, selected.identity.primary);
+        try std.testing.expect(selected.identity.digests.sha256 == null);
+        try std.testing.expect(selected.identity.digests.sha512 != null);
+        const by_hash = try byHashUri(allocator, repository, selected);
+        defer allocator.free(by_hash);
+        try std.testing.expect(std.mem.indexOf(u8, by_hash, "/by-hash/SHA512/") != null);
+        try verifyIndexBytes(selected, fixture[1]);
+        var changed = try allocator.dupe(u8, fixture[1]);
+        defer allocator.free(changed);
+        changed[0] ^= 1;
+        try std.testing.expectError(error.IndexDigestMismatch, verifyIndexBytes(selected, changed));
+    }
 }
 
 test "malformed signed envelope fails explicitly" {

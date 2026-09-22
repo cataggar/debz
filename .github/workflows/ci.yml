@@ -407,7 +407,7 @@ jobs:
           test "$REUSED" -gt 0
       - name: Corrupt one exact-restored object
         run: |
-          object=$(find "$RUNNER_TEMP/debz-download-exact/packages-v1/objects" \
+          object=$(find "$RUNNER_TEMP/debz-download-exact/packages-v2/objects" \
             -maxdepth 1 -type f -print -quit)
           test -n "$object"
           printf 'corrupt\n' >"$object"
@@ -503,7 +503,7 @@ jobs:
           test "$EXACT_DOWNLOADED" -eq 0
           test "$EXACT_REUSED" -gt 0
           case "$PARTIAL_KEY:$EXACT_KEY" in
-            debz-package-cas-v2-*:debz-package-cas-v2-*) ;;
+            debz-package-cas-v4-*:debz-package-cas-v4-*) ;;
             *) exit 1 ;;
           esac
       - name: Populate native empty cache

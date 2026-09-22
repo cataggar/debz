@@ -55,5 +55,5 @@ architectures after attestations and publication complete.
 The same post-publication matrix then creates a hermetic signed repository and
 exact lock and runs [`actions/download`](../actions/download/README.md) with
 caching disabled. This proves the just-published CLI implements the
-`package-cache-v1` contract and prepares the complete closure on both native
+`package-cache-v3` legacy contract and prepares the complete closure on both native
 architectures without treating setup or package cache state as installation.

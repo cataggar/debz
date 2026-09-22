@@ -988,7 +988,7 @@ pub fn build(b: *std.Build) void {
 
     const lock_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "exact_lock.test.", "exact_lock_v2.test." },
+        .filters = &.{ "exact_lock.test.", "exact_lock_v2.test.", "exact_lock_v3.test." },
     });
     const run_lock_tests = b.addRunArtifact(lock_tests);
     b.step("test-exact-lock", "Run exact solved-closure lock tests")
@@ -1127,6 +1127,7 @@ fn installReleaseFiles(
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
+        "exact-closure-lock-v3.json",
         "legacy-capability-evidence-v1.json",
         "legacy-compatibility-policy-v1.json",
         "native-execution-intent-v1.json",
@@ -1147,8 +1148,12 @@ fn installReleaseFiles(
         "package-cache-error-v1.json",
         "package-cache-fingerprint-v1.json",
         "package-cache-fingerprint-v2.json",
+        "package-cache-fingerprint-v3.json",
+        "package-cache-fingerprint-v4.json",
         "package-cache-result-v1.json",
         "package-cache-result-v2.json",
+        "package-cache-result-v3.json",
+        "package-cache-result-v4.json",
         "repository-add-state-v1.json",
         "repository-operation-result-v1.json",
         "root-operation-completion-v1.json",
@@ -1158,6 +1163,7 @@ fn installReleaseFiles(
         "transaction-plan-v1.json",
         "transaction-plan-v2.json",
         "transaction-plan-v3.json",
+        "transaction-plan-v4.json",
         "transaction-result-v1.json",
         "transaction-result-v2.json",
         "transaction-result-summary-v1.json",

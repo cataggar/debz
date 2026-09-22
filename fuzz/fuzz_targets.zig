@@ -40,6 +40,7 @@ const alternatives_corpus = &.{
 const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),
     @embedFile("corpus/state/lock-v2.json"),
+    @embedFile("corpus/state/lock-v3.json"),
     @embedFile("corpus/state/authorization.json"),
     @embedFile("corpus/state/program.json"),
     @embedFile("corpus/state/program-wide.json"),
@@ -460,6 +461,10 @@ fn exerciseState(bytes: []const u8) !void {
         lock.deinit();
     } else |_| {}
     if (debz.exact_lock_v2.decode(std.testing.allocator, bytes, max_input)) |value| {
+        var lock = value;
+        lock.deinit();
+    } else |_| {}
+    if (debz.exact_lock_v3.decode(std.testing.allocator, bytes, max_input)) |value| {
         var lock = value;
         lock.deinit();
     } else |_| {}

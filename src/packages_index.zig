@@ -1,5 +1,6 @@
 const std = @import("std");
 const control_record = @import("control_record.zig");
+const content_digest = @import("content_digest.zig");
 const deb822 = @import("deb822.zig");
 const source_module = @import("source.zig");
 
@@ -58,10 +59,17 @@ pub const Sha256 = struct {
     spelling: Text,
 };
 
+pub const Sha512 = struct {
+    bytes: [64]u8,
+    spelling: Text,
+};
+
 pub const Transport = struct {
     filename: Text,
     size: DecimalSize,
-    sha256: Sha256,
+    identity: content_digest.Identity,
+    sha256: ?Sha256,
+    sha512: ?Sha512,
 };
 
 pub const Location = struct {
@@ -101,8 +109,9 @@ pub const DiagnosticCode = enum {
     filename_too_long,
     missing_size,
     invalid_size,
-    missing_sha256,
+    missing_digest,
     invalid_sha256,
+    invalid_sha512,
     architecture_mismatch,
     duplicate_identity,
 };
@@ -303,25 +312,33 @@ const TransportParser = struct {
         const size = std.fmt.parseUnsigned(u64, size_text.value, 10) catch
             return self.fail(.invalid_size, size_text.span, size_field.name);
 
-        const sha_field = paragraph.get("SHA256") orelse
-            return self.fail(.missing_sha256, paragraph.span, "SHA256");
-        const sha_text = try self.exactScalar(sha_field, .invalid_sha256);
-        if (sha_text.value.len != 64) {
-            return self.fail(.invalid_sha256, sha_text.span, sha_field.name);
-        }
-        var digest: [32]u8 = undefined;
-        for (0..32) |index| {
-            const high = lowerHex(sha_text.value[index * 2]) orelse
+        var digests: content_digest.Set = .{};
+        const sha256 = if (paragraph.get("SHA256")) |sha_field| blk: {
+            const sha_text = try self.exactScalar(sha_field, .invalid_sha256);
+            const parsed = content_digest.Value.parse(.sha256, sha_text.value) catch
                 return self.fail(.invalid_sha256, sha_text.span, sha_field.name);
-            const low = lowerHex(sha_text.value[index * 2 + 1]) orelse
-                return self.fail(.invalid_sha256, sha_text.span, sha_field.name);
-            digest[index] = high * 16 + low;
-        }
+            const bytes = parsed.sha256;
+            digests.put(parsed) catch unreachable;
+            break :blk Sha256{ .bytes = bytes, .spelling = sha_text };
+        } else null;
+        const sha512 = if (paragraph.get("SHA512")) |sha_field| blk: {
+            const sha_text = try self.exactScalar(sha_field, .invalid_sha512);
+            const parsed = content_digest.Value.parse(.sha512, sha_text.value) catch
+                return self.fail(.invalid_sha512, sha_text.span, sha_field.name);
+            const bytes = parsed.sha512;
+            digests.put(parsed) catch unreachable;
+            break :blk Sha512{ .bytes = bytes, .spelling = sha_text };
+        } else null;
+        if (digests.count() == 0)
+            return self.fail(.missing_digest, paragraph.span, "SHA256/SHA512");
+        const identity = content_digest.Identity.strongest(digests) catch unreachable;
 
         return .{
             .filename = filename,
             .size = .{ .value = size, .spelling = size_text },
-            .sha256 = .{ .bytes = digest, .spelling = sha_text },
+            .identity = identity,
+            .sha256 = sha256,
+            .sha512 = sha512,
         };
     }
 
@@ -462,7 +479,8 @@ test "parses transport data, preserves control fields, and iterates without copy
     try std.testing.expectEqualStrings("libfoo1", record.identity().package.text);
     try std.testing.expectEqualStrings("pool/main/libfoo1/libfoo1_1.2-3_amd64.deb", record.transport.filename.value);
     try std.testing.expectEqual(@as(u64, 123), record.transport.size.value);
-    try std.testing.expectEqual(@as(u8, 0x01), record.transport.sha256.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x01), record.transport.sha256.?.bytes[0]);
+    try std.testing.expectEqual(content_digest.Algorithm.sha256, record.transport.identity.primary);
     try std.testing.expectEqualStrings(testContext("amd64").source_location, record.location.source);
     try std.testing.expectEqual(@as(usize, 1), record.location.span.start.line);
     try std.testing.expectEqual(@as(usize, 4), record.control.unknown_fields.len);
@@ -526,13 +544,53 @@ test "requires every single-line transport field" {
     const cases = .{
         .{ prefix ++ "Size: 1\nSHA256: " ++ hash ++ "\n", DiagnosticCode.missing_filename },
         .{ prefix ++ "Filename: pool/a.deb\nSHA256: " ++ hash ++ "\n", DiagnosticCode.missing_size },
-        .{ prefix ++ "Filename: pool/a.deb\nSize: 1\n", DiagnosticCode.missing_sha256 },
+        .{ prefix ++ "Filename: pool/a.deb\nSize: 1\n", DiagnosticCode.missing_digest },
         .{ prefix ++ "Filename: pool/a.deb\nSize: 1\nSHA256: " ++ hash ++ "\n continued\n", DiagnosticCode.invalid_sha256 },
     };
     inline for (cases) |case| {
         const result = try parseBorrowed(std.testing.allocator, case[0], testContext("amd64"), .{});
         try std.testing.expectEqual(case[1], result.diagnostic.code);
     }
+}
+
+test "accepts SHA512-only and binds both package digests without downgrade" {
+    const prefix = "Package: aa\nVersion: 1\nArchitecture: amd64\n" ++
+        "Filename: pool/a.deb\nSize: 1\n";
+    const sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const sha512 =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ++
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    inline for (.{
+        prefix ++ "SHA512: " ++ sha512 ++ "\n",
+        prefix ++ "SHA256: " ++ sha256 ++ "\nSHA512: " ++ sha512 ++ "\n",
+    }, 0..) |input, case_index| {
+        const result = try parseBorrowed(
+            std.testing.allocator,
+            input,
+            testContext("amd64"),
+            .{},
+        );
+        var index = switch (result) {
+            .index => |value| value,
+            .diagnostic => return error.UnexpectedDiagnostic,
+        };
+        defer index.deinit();
+        const transport = index.records[0].transport;
+        try std.testing.expectEqual(content_digest.Algorithm.sha512, transport.identity.primary);
+        try std.testing.expect(transport.sha512 != null);
+        try std.testing.expectEqual(case_index == 1, transport.sha256 != null);
+    }
+
+    const uppercase = prefix ++ "SHA512: " ++
+        "A123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ++
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+    const rejected = try parseBorrowed(
+        std.testing.allocator,
+        uppercase,
+        testContext("amd64"),
+        .{},
+    );
+    try std.testing.expectEqual(DiagnosticCode.invalid_sha512, rejected.diagnostic.code);
 }
 
 test "duplicate identity policy is deterministic" {

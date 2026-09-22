@@ -34,7 +34,7 @@ test('resolves explicit files and creates only the package object cache path', a
   assert.equal(inputs.cacheEnabled, false);
   assert.equal(
     inputs.cachePath,
-    path.join(runnerTemp, 'debz-package-cache', 'packages-v1', 'objects'),
+    path.join(runnerTemp, 'debz-package-cache', 'packages-v2', 'objects'),
   );
 });
 

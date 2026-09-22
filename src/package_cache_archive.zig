@@ -193,7 +193,7 @@ fn importVersion(
         defer allocator.free(bytes);
         try readHashed(archive, io, bytes, &offset, &hasher);
         const actual_digest = package_acquisition.Digest.of(bytes);
-        if (!std.mem.eql(u8, &actual_digest.bytes, &digest))
+        if (!std.mem.eql(u8, &actual_digest.digests.sha256.?, &digest))
             return error.ObjectDigestMismatch;
 
         const lock_index = lock_by_digest.get(digest) orelse {
@@ -230,9 +230,12 @@ fn importVersion(
         var payload_offset = match.payload_offset;
         try readExact(archive, io, bytes, &payload_offset);
         const actual_digest = package_acquisition.Digest.of(bytes);
-        if (!std.mem.eql(u8, &actual_digest.bytes, &match.digest))
+        if (!std.mem.eql(u8, &actual_digest.digests.sha256.?, &match.digest))
             return error.ObjectDigestMismatch;
-        const object_digest: package_acquisition.Digest = .{ .bytes = match.digest };
+        const object_digest = try @import("content_digest.zig").Identity.init(
+            .{ .sha256 = match.digest },
+            .sha256,
+        );
         if (cache.lookup(allocator, object_digest, match.size, .verify_sha256)) |existing| {
             allocator.free(existing);
             result.reused += 1;
@@ -345,7 +348,10 @@ fn exportVersion(
         var size_buffer: [8]u8 = undefined;
         std.mem.writeInt(u64, &size_buffer, package.declared_size, .big);
         try writeHashed(output, io, &size_buffer, &offset, &hasher);
-        const digest: package_acquisition.Digest = .{ .bytes = package.sha256 };
+        const digest = try @import("content_digest.zig").Identity.init(
+            .{ .sha256 = package.sha256 },
+            .sha256,
+        );
         const bytes = try cache.lookup(
             allocator,
             digest,
@@ -416,7 +422,7 @@ fn testLock(
             .architecture = "amd64",
             .repository_id = repository_id,
             .repository_snapshot_sha256 = snapshot,
-            .sha256 = package_acquisition.Digest.of(bytes).bytes,
+            .sha256 = package_acquisition.Digest.of(bytes).digests.sha256.?,
             .declared_size = bytes.len,
             .retention = if (index == 0) .requested else .dependency,
             .dpkg_selection_hold = false,
@@ -453,7 +459,7 @@ fn testNativeLock(
     var artifacts: std.ArrayList(package_origin.LocalArtifactEvidence) = .empty;
     for (objects, 0..) |bytes, index| {
         const name = try std.fmt.allocPrint(temporary, "package-{d}", .{index});
-        const digest = package_acquisition.Digest.of(bytes).bytes;
+        const digest = package_acquisition.Digest.of(bytes).digests.sha256.?;
         const origin: exact_lock_v2.PackageOrigin = if (index % 2 == 0)
             .{ .authenticated_repository = .{
                 .repository_id = repository_id,
@@ -558,8 +564,16 @@ test "package_cache_archive.test.native roundtrip preserves mixed and empty v2 c
         try std.testing.expectEqual(@as(u32, @intCast(count)), std.mem.readInt(u32, encoded[native_magic.len..][0..4], .big));
         try std.testing.expectEqual(exported.archive_bytes, encoded.len);
         const digest = package_acquisition.Digest.of(encoded[0 .. encoded.len - trailer_bytes]);
-        try std.testing.expectEqualSlices(u8, &digest.bytes, &exported.content_sha256);
-        try std.testing.expectEqualSlices(u8, &digest.bytes, encoded[encoded.len - trailer_bytes ..]);
+        try std.testing.expectEqualSlices(
+            u8,
+            &digest.digests.sha256.?,
+            &exported.content_sha256,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            &digest.digests.sha256.?,
+            encoded[encoded.len - trailer_bytes ..],
+        );
         try std.testing.expect(exported.archive_bytes <= try maximumNativeArchiveBytes(limits));
         if (count == 0) {
             try std.testing.expectEqual(@as(u64, native_magic.len + 4 + trailer_bytes), exported.archive_bytes);
@@ -680,7 +694,10 @@ test "package_cache_archive.test.native import does not autodetect legacy archiv
     var archive = try tmp.dir.createFile(std.testing.io, "legacy.archive", .{ .exclusive = true, .read = true });
     defer archive.close(std.testing.io);
     const digest = package_acquisition.Digest.of("object");
-    try writeTestArchive(archive, &.{.{ .digest = digest.bytes, .bytes = "object" }});
+    try writeTestArchive(archive, &.{.{
+        .digest = digest.digests.sha256.?,
+        .bytes = "object",
+    }});
     const limits: Limits = .{ .maximum_objects = 10, .maximum_object_bytes = 1024, .maximum_total_object_bytes = 4096 };
     try std.testing.expectError(error.InvalidArchive, importNativeFile(
         std.testing.allocator,
@@ -747,9 +764,9 @@ test "package_cache_archive.test.native invalid closures publish no objects" {
         var archive = try tmp.dir.createFile(std.testing.io, "native.archive", .{ .exclusive = true, .read = true });
         defer archive.close(std.testing.io);
         var entries = [_]TestArchiveEntry{
-            .{ .digest = package_acquisition.Digest.of(objects[0]).bytes, .bytes = objects[0] },
-            .{ .digest = package_acquisition.Digest.of(objects[1]).bytes, .bytes = objects[1] },
-            .{ .digest = package_acquisition.Digest.of("extra").bytes, .bytes = "extra" },
+            .{ .digest = package_acquisition.Digest.of(objects[0]).digests.sha256.?, .bytes = objects[0] },
+            .{ .digest = package_acquisition.Digest.of(objects[1]).digests.sha256.?, .bytes = objects[1] },
+            .{ .digest = package_acquisition.Digest.of("extra").digests.sha256.?, .bytes = "extra" },
         };
         const length: usize = switch (fault) {
             .empty => 0,
@@ -1030,8 +1047,8 @@ const TestArchiveEntry = struct {
 test "package_cache_archive.test.duplicate and noncanonical objects are rejected" {
     var lock = try testLock(std.testing.allocator, &.{ "a", "b" });
     defer lock.deinit();
-    const digest_a = package_acquisition.Digest.of("a").bytes;
-    const digest_b = package_acquisition.Digest.of("b").bytes;
+    const digest_a = package_acquisition.Digest.of("a").digests.sha256.?;
+    const digest_b = package_acquisition.Digest.of("b").digests.sha256.?;
     const cases = [_]struct {
         entries: [2]TestArchiveEntry,
         expected: anyerror,
@@ -1178,7 +1195,7 @@ test "package_cache_archive.test.exact restore requires the complete lock and im
     });
     defer archive.close(std.testing.io);
     const entry = TestArchiveEntry{
-        .digest = package_acquisition.Digest.of("a").bytes,
+        .digest = package_acquisition.Digest.of("a").digests.sha256.?,
         .bytes = "a",
     };
     try writeTestArchive(archive, &.{entry});

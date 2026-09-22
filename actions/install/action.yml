@@ -175,7 +175,7 @@ outputs:
   package-cache-hit:
     description: "'true' only when the exact CLI-provided package cache key was restored"
   package-cache-path:
-    description: Absolute verified packages-v1/objects directory
+    description: Absolute verified packages-v2/objects directory
   package-cache-root:
     description: Absolute cache root passed to the final debz transaction
   lock-digest:

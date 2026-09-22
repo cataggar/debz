@@ -1421,7 +1421,8 @@ pub const Backend = struct {
                 .requested_architecture = action.architecture,
                 .filename = selected.record.transport.filename.value,
                 .size = package.provenance.declared_size,
-                .sha256 = package.provenance.expected_sha256.bytes,
+                .sha256 = package.provenance.expected_sha256,
+                .archive_identity = package.provenance.expected_identity,
             }, .{});
             switch (validation_result) {
                 .diagnostic => |diagnostic| {
@@ -1450,8 +1451,8 @@ pub const Backend = struct {
             }
             const path = try std.fmt.allocPrint(
                 allocator,
-                "{s}/packages-v1/objects/{s}",
-                .{ request.options.cache_path, &package.provenance.cache_key },
+                "{s}/packages-v2/objects/{s}",
+                .{ request.options.cache_path, package.provenance.cache_key },
             );
             try artifacts.append(allocator, .{
                 .package = action.package,
@@ -5027,7 +5028,8 @@ fn lockFromPlan(
             .repository_id = repository_id,
             .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
                 return error.MissingRepository,
-            .sha256 = record.transport.sha256.bytes,
+            .sha256 = (record.transport.sha256 orelse
+                return error.MissingPackageDigest).bytes,
             .declared_size = record.transport.size.value,
             .retention = if (action.requested) .requested else .dependency,
             .dpkg_selection_hold = false,
@@ -5063,7 +5065,8 @@ fn lockFromPlan(
             .repository_id = repository_id,
             .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
                 return error.MissingRepository,
-            .sha256 = record.transport.sha256.bytes,
+            .sha256 = (record.transport.sha256 orelse
+                return error.MissingPackageDigest).bytes,
             .declared_size = record.transport.size.value,
             .retention = .retained,
             .dpkg_selection_hold = package.status.want == .hold,
