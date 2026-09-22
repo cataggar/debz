@@ -27,6 +27,7 @@ import {
 interface Harness {
   inputs: Inputs;
   outputs: Map<string, string>;
+  infos: string[];
   calls: { arguments: string[]; sudo?: string }[];
   cleanup: boolean;
   saved: boolean;
@@ -42,6 +43,7 @@ function harness(
   const inputs = fixtureInputs('/work');
   inputs.transactionBackend = backend;
   const outputs = new Map<string, string>();
+  const infos: string[] = [];
   const calls: { arguments: string[]; sudo?: string }[] = [];
   let cleanup = false;
   let saved = false;
@@ -82,6 +84,10 @@ function harness(
         lockDigest: 'a'.repeat(64),
         downloadedCount: cacheHit ? 0 : 4,
         reusedCount: cacheHit ? 4 : 0,
+        backendCapability:
+          backend === 'legacy_dpkg'
+            ? 'legacy-dpkg-execution-deprecated-v1'
+            : 'native-transaction-execution-v1',
       };
     },
     async saveSetupCache() {
@@ -136,7 +142,9 @@ function harness(
     },
   };
   const io: ActionIO = {
-    info() {},
+    info(message) {
+      infos.push(message);
+    },
     error() {},
     setOutput(name, value) {
       outputs.set(name, value);
@@ -151,6 +159,7 @@ function harness(
   return {
     inputs,
     outputs,
+    infos,
     calls,
     get cleanup() {
       return cleanup;
@@ -185,6 +194,15 @@ test('an exact package-cache hit still executes and audits one install', async (
   );
   assert.equal(value.saved, true);
   assert.equal(value.cleanup, true);
+  assert.equal(
+    value.outputs.get('backend-capability'),
+    'legacy-dpkg-execution-deprecated-v1',
+  );
+  assert.equal(value.infos.length, 1);
+  assert.match(
+    value.infos[0] ?? '',
+    /Recover this operation with debz >=0\.3\.0,<0\.4\.0 before installing a native-only release\./u,
+  );
 });
 
 test('propagates the exact debz exit code and publishes no success outputs', async () => {
@@ -258,6 +276,11 @@ test('unchanged native installs publish no historical or fabricated receipt', as
   assert.equal(value.outputs.get('transaction-result'), '');
   assert.equal(value.outputs.get('provenance'), '');
   assert.equal(value.outputs.get('installed-count'), '4');
+  assert.equal(
+    value.outputs.get('backend-capability'),
+    'native-transaction-execution-v1',
+  );
+  assert.equal(value.infos.length, 0);
 });
 
 test('unsupported native capability refuses before package preparation or installation', async () => {

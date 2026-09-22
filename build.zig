@@ -1002,6 +1002,23 @@ pub fn build(b: *std.Build) void {
     b.step("test-transaction-provenance", "Run transaction provenance tests")
         .dependOn(&run_provenance_tests.step);
 
+    const legacy_compat_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "legacy_compat.test.",
+            "system_profile.test.legacy compatibility",
+            "transaction_recovery.test.legacy compatibility",
+            "root_operation.test.legacy compatibility",
+            "production legacy compatibility",
+            "repository_backend.test.legacy compatibility",
+        },
+    });
+    const run_legacy_compat_tests = b.addRunArtifact(legacy_compat_tests);
+    b.step(
+        "test-legacy-compat",
+        "Run legacy artifact, profile, journal, and active-operation policy tests",
+    ).dependOn(&run_legacy_compat_tests.step);
+
     const production_customize_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/production_backend_customize_test.zig"),
@@ -1067,6 +1084,7 @@ fn installReleaseFiles(
         "exact-locks-and-provenance.md",
         "github-actions.md",
         "integration-roots.md",
+        "legacy-compatibility.md",
         "maintainer-script-runner.md",
         "multi-repository-policy.md",
         "native-conffiles.md",
@@ -1109,6 +1127,8 @@ fn installReleaseFiles(
         "command-result-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
+        "legacy-capability-evidence-v1.json",
+        "legacy-compatibility-policy-v1.json",
         "native-execution-intent-v1.json",
         "native-execution-progress-v1.json",
         "native-execution-progress-v2.json",
@@ -1156,6 +1176,8 @@ fn installReleaseFiles(
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },
         .{ .source = "LICENSE", .destination = "share/doc/debz/LICENSE" },
         .{ .source = "THIRD_PARTY_NOTICES", .destination = "share/doc/debz/THIRD_PARTY_NOTICES" },
+        .{ .source = "security/legacy-cutover-policy.json", .destination = "share/debz/legacy-cutover-policy.json" },
+        .{ .source = "security/legacy-cutover-policy.json", .destination = "share/doc/debz/legacy-cutover-policy.json" },
     };
 
     const regular_modes = b.addSystemCommand(&.{ "chmod", "0644" });

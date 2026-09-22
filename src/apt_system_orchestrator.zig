@@ -14,6 +14,7 @@ const lower_ownership_token =
     @import("apt_system_lower_ownership_token.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const live_root = @import("live_root.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_transaction_result = @import("native_transaction_result.zig");
@@ -44,6 +45,7 @@ pub const completion_schema_version: u32 = 1;
 
 pub const ProfileView = struct {
     transaction_backend: system_profile.TransactionBackend = .legacy_dpkg,
+    profile_format: system_profile.Format = .v1_legacy,
     binding: api.ProfileBinding,
     source_paths: []const []const u8,
     config_paths: []const []const u8,
@@ -151,6 +153,22 @@ pub const SystemProfileLoader = struct {
             self.limits,
         );
         errdefer loaded.deinit();
+        _ = try legacy_compat.decide(
+            .legacy_capable,
+            switch (loaded.profile.transaction_backend) {
+                .legacy_dpkg => .legacy_dpkg,
+                .native => .native,
+            },
+            .new_execution,
+            .{
+                .schema = loaded.format.schema(),
+                .version = loaded.format.version(),
+                .backend = switch (loaded.profile.transaction_backend) {
+                    .legacy_dpkg => .legacy_dpkg,
+                    .native => .native,
+                },
+            },
+        );
         const sources = try allocator.alloc(
             []const u8,
             loaded.profile.repositories.len,
@@ -180,6 +198,7 @@ pub const SystemProfileLoader = struct {
             .context = lease,
             .view = .{
                 .transaction_backend = lease.loaded.profile.transaction_backend,
+                .profile_format = lease.loaded.format,
                 .binding = .{
                     .path = lease.loaded.profile_path,
                     .sha256 = lease.loaded.profile_sha256,

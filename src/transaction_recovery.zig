@@ -3,10 +3,18 @@ const solver = @import("solver.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const package_origin = @import("package_origin.zig");
 
-pub const journal_version: u32 = 2;
+pub const legacy_journal_version: u32 = 1;
+pub const lock_journal_version: u32 = 2;
+pub const journal_version: u32 = 3;
 pub const maximum_journal_bytes: usize = 8 * 1024 * 1024;
+
+pub const Compatibility = enum {
+    implicit_historical,
+    legacy_execution_deprecated_v1,
+};
 
 pub const State = enum {
     not_started,
@@ -28,6 +36,8 @@ pub const Command = struct {
 
 pub const Journal = struct {
     version: u32 = journal_version,
+    backend: legacy_compat.Backend = .legacy_dpkg,
+    compatibility: Compatibility = .legacy_execution_deprecated_v1,
     state: State,
     boundary: Boundary,
     plan_sha256: [32]u8,
@@ -364,6 +374,17 @@ pub fn archive(allocator: std.mem.Allocator, store: Store, root: []const u8, jou
 }
 
 pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
+    if (journal.version < legacy_journal_version or journal.version > journal_version)
+        return error.UnsupportedJournalVersion;
+    if (journal.backend != .legacy_dpkg) return error.BackendMismatch;
+    if (journal.version < journal_version and
+        journal.compatibility != .implicit_historical)
+        return error.ContradictoryJournal;
+    if (journal.version == journal_version and
+        journal.compatibility != .legacy_execution_deprecated_v1)
+        return error.ContradictoryJournal;
+    if (journal.version == legacy_journal_version and journal.lock_sha256 != null)
+        return error.ContradictoryJournal;
     var payload: std.Io.Writer.Allocating = .init(allocator);
     defer payload.deinit();
     const writer = &payload.writer;
@@ -375,9 +396,17 @@ pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
     try writeDigest(writer, "plan", journal.plan_sha256);
     try writeDigest(writer, "root", journal.root_identity);
     try writeDigest(writer, "policy", journal.policy_sha256);
-    try writer.writeAll("lock\t");
-    if (journal.lock_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
-    try writer.writeByte('\n');
+    if (journal.version >= journal_version) {
+        try writer.print("backend\t{s}\ncapability\t{s}\n", .{
+            @tagName(journal.backend),
+            legacy_compat.legacy_capability,
+        });
+    }
+    if (journal.version >= lock_journal_version) {
+        try writer.writeAll("lock\t");
+        if (journal.lock_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
+        try writer.writeByte('\n');
+    }
     try writer.print("next\t{d}\ncommands\t{d}\n", .{ journal.next_command, journal.commands.len });
     for (journal.commands) |command| {
         try writer.writeAll("command\t");
@@ -443,14 +472,31 @@ pub fn decodeBounded(
     var header_fields = std.mem.splitScalar(u8, header, '\t');
     if (!std.mem.eql(u8, header_fields.next() orelse "", "DEBZ-TXN")) return error.MalformedJournal;
     const version = try std.fmt.parseInt(u32, header_fields.next() orelse return error.MalformedJournal, 10);
-    if (version != journal_version) return error.UnsupportedJournalVersion;
+    if (version < legacy_journal_version or version > journal_version)
+        return error.UnsupportedJournalVersion;
 
     const state = try parseEnumLine(State, lines.next(), "state");
     const boundary = try parseEnumLine(Boundary, lines.next(), "boundary");
     const plan = try parseDigestLine(lines.next(), "plan");
     const root = try parseDigestLine(lines.next(), "root");
     const policy = try parseDigestLine(lines.next(), "policy");
-    const lock = try parseOptionalDigestLine(lines.next(), "lock");
+    const backend: legacy_compat.Backend =
+        if (version >= journal_version)
+            try parseEnumLine(legacy_compat.Backend, lines.next(), "backend")
+        else
+            .legacy_dpkg;
+    if (backend != .legacy_dpkg) return error.BackendMismatch;
+    const compatibility: Compatibility =
+        if (version >= journal_version) blk: {
+            const capability = try parseTextLine(lines.next(), "capability");
+            if (!std.mem.eql(u8, capability, legacy_compat.legacy_capability))
+                return error.UnsupportedJournalCapability;
+            break :blk .legacy_execution_deprecated_v1;
+        } else .implicit_historical;
+    const lock = if (version >= lock_journal_version)
+        try parseOptionalDigestLine(lines.next(), "lock")
+    else
+        null;
     const next = try parseIntLine(lines.next(), "next");
     const count = try parseIntLine(lines.next(), "commands");
     if (count > 300_001 or next > count) return error.ContradictoryJournal;
@@ -487,6 +533,8 @@ pub fn decodeBounded(
     return .{
         .journal = .{
             .version = version,
+            .backend = backend,
+            .compatibility = compatibility,
             .state = state,
             .boundary = boundary,
             .plan_sha256 = plan,
@@ -503,10 +551,92 @@ pub fn decodeBounded(
     };
 }
 
+fn parseTextLine(line: ?[]const u8, name: []const u8) ![]const u8 {
+    var fields = std.mem.splitScalar(u8, line orelse return error.MalformedJournal, '\t');
+    if (!std.mem.eql(u8, fields.next() orelse "", name))
+        return error.MalformedJournal;
+    const value = fields.next() orelse return error.MalformedJournal;
+    if (value.len == 0 or fields.next() != null) return error.MalformedJournal;
+    return value;
+}
+
 test "transaction_recovery journal decoding is caller bounded" {
     try std.testing.expectError(
         error.JournalTooLarge,
         decodeBounded(std.testing.allocator, "12345", 4),
+    );
+}
+
+test "transaction_recovery.test.legacy compatibility preserves v1 v2 and emits explicit v3 evidence" {
+    const command: Command = .{
+        .phase = "unpack",
+        .package = "demo",
+        .command_sha256 = @splat(4),
+        .artifact_sha256 = @splat(5),
+    };
+    inline for ([_]u32{ legacy_journal_version, lock_journal_version, journal_version }) |version| {
+        const historical = version < journal_version;
+        const journal: Journal = .{
+            .version = version,
+            .compatibility = if (historical)
+                .implicit_historical
+            else
+                .legacy_execution_deprecated_v1,
+            .state = if (version == legacy_journal_version) .complete else .interrupted,
+            .boundary = if (version == legacy_journal_version) .verifying else .after_command,
+            .plan_sha256 = @splat(1),
+            .root_identity = @splat(2),
+            .policy_sha256 = @splat(3),
+            .lock_sha256 = if (version >= lock_journal_version) @splat(6) else null,
+            .next_command = 1,
+            .commands = &.{command},
+            .failure = if (version == legacy_journal_version) null else "interrupted",
+        };
+        const encoded = try encode(std.testing.allocator, journal);
+        defer std.testing.allocator.free(encoded);
+        if (version == journal_version) {
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                encoded,
+                "backend\tlegacy_dpkg\ncapability\tlegacy-dpkg-execution-deprecated-v1\n",
+            ) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "backend\t") == null);
+            try std.testing.expect(std.mem.indexOf(u8, encoded, "capability\t") == null);
+        }
+        var decoded = try decode(std.testing.allocator, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(version, decoded.journal.version);
+        try std.testing.expectEqual(
+            if (historical) Compatibility.implicit_historical else .legacy_execution_deprecated_v1,
+            decoded.journal.compatibility,
+        );
+        const round_trip = try encode(std.testing.allocator, decoded.journal);
+        defer std.testing.allocator.free(round_trip);
+        try std.testing.expectEqualSlices(u8, encoded, round_trip);
+    }
+}
+
+test "transaction_recovery.test.legacy compatibility rejects unknown and native journal identities" {
+    var unknown: Journal = .{
+        .version = journal_version + 1,
+        .state = .not_started,
+        .boundary = .prepared,
+        .plan_sha256 = @splat(1),
+        .root_identity = @splat(2),
+        .policy_sha256 = @splat(3),
+        .next_command = 0,
+        .commands = &.{},
+    };
+    try std.testing.expectError(
+        error.UnsupportedJournalVersion,
+        encode(std.testing.allocator, unknown),
+    );
+    unknown.version = journal_version;
+    unknown.backend = .native;
+    try std.testing.expectError(
+        error.BackendMismatch,
+        encode(std.testing.allocator, unknown),
     );
 }
 

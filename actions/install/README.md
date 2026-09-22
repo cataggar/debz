@@ -10,6 +10,9 @@ A package cache hit saves transfer only. It never means that a root is
 installed and never skips the install request or any work required by the
 selected engine. Legacy remains the default. Explicit `transaction-backend:
 native` uses native execution and genuine v2 locks, without fallback.
+Legacy execution is deprecated but remains functional in this increment. A
+successful legacy invocation emits one bounded notice; every successful
+invocation publishes the selected `backend-capability`.
 When the native planner produces no work, the action accepts an honest unchanged
 result rather than inventing a transaction. An explicit install selector may
 still select a reinstall on an already-installed root; the action preserves
@@ -214,6 +217,7 @@ diagnostics/stderr, and all protected input/executable/directory identity guards
 | `provenance` | Alias of `transaction-result`; unchanged native installs claim no receipt. |
 | `installed-count` | Package count in the final exact closure, not the number newly changed. |
 | `changed` | The CLI's changed flag; false for a verified unchanged native closure. |
+| `backend-capability` | `legacy-dpkg-execution-deprecated-v1` or `native-transaction-execution-v1`, matching the selected backend. |
 
 No output contains credentials, authorization headers, keyring contents, or
 repository URLs.

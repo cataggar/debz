@@ -21,6 +21,7 @@ const transaction_recovery = @import("transaction_recovery.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
 const native_recovery = @import("native_recovery.zig");
 const native_provenance = @import("native_provenance.zig");
@@ -218,6 +219,7 @@ const RepositoryOptions = struct {
 pub const Backend = struct {
     io: std.Io,
     transaction_backend: transaction_engine.Kind = .legacy_dpkg,
+    legacy_execution_capable: bool = true,
     root_projection: ?*const live_root.Projection = null,
     executor: Executor = .legacy_dpkg,
     native_executor: ?Executor = null,
@@ -1627,6 +1629,8 @@ pub const Backend = struct {
                 report,
                 dependencies.status,
                 &verify,
+                guard.active().?.record().root_identity_sha256,
+                guard.active().?.record().attempt_id,
             ) catch |err| switch (err) {
                 error.RepositoryEvidenceMismatch,
                 error.MissingPackageEvidence,
@@ -3609,6 +3613,8 @@ const RootOperationGuard = struct {
             self.locks.interface(),
         ) catch |err| return mapRootOperationError(request.operation, err);
         self.coordinator.now_unix = self.backend.now_unix;
+        self.coordinator.legacy_execution_capable =
+            self.backend.legacy_execution_capable;
         self.coordinator.root_projection = if (self.native_owned) self.backend.root_projection else null;
         self.attempt = self.coordinator.acquire(allocator, .{
             .intent = if (request.operation == .recover)
@@ -4082,6 +4088,13 @@ fn mapRootOperationError(operation: api.Operation, err: anyerror) api.Result {
             .recovery,
             .root_operation_recovery_required,
             "a previous debz operation mutated this root and requires recovery",
+        ),
+        error.LegacyCapabilityRequired, error.LegacyRecoveryRequired => api.failure(
+            operation,
+            .recovery,
+            .legacy_recovery_release_required,
+            "an active legacy_dpkg operation cannot be claimed by this backend. " ++
+                legacy_compat.recovery_guidance,
         ),
         error.AuthorizationEvidenceMissing,
         error.DeferredAcknowledgmentMismatch,
@@ -4866,7 +4879,20 @@ const ProductLock = union(transaction_engine.Kind) {
 
     fn write(self: ProductLock, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
         switch (self) {
-            .legacy_dpkg => |owned| try writeLock(allocator, io, path, owned.lock),
+            .legacy_dpkg => |owned| {
+                try writeLock(allocator, io, path, owned.lock);
+                const bytes = try owned.lock.canonicalJson(allocator);
+                defer allocator.free(bytes);
+                try publishLegacyCapabilityEvidence(
+                    allocator,
+                    io,
+                    path,
+                    exact_lock.schema_id,
+                    exact_lock.schema_version,
+                    bytes,
+                    .{},
+                );
+            },
             .native => |owned| try writeLockVersion(exact_lock_v2, allocator, io, path, owned.lock),
         }
     }
@@ -5199,6 +5225,8 @@ fn writeExecutionProvenance(
     report: transaction_executor.Report,
     status: transaction_recovery.StatusReader,
     verify: *transaction_provenance.VerifyDiagnostic,
+    root_identity_sha256: [32]u8,
+    attempt_id: [32]u8,
 ) !void {
     // The lock records only repositories that actually supplied a package, so the
     // evidence has to be drawn from the lock rather than from every refreshed
@@ -5260,6 +5288,57 @@ fn writeExecutionProvenance(
     defer dir.close(io);
     const store = try transaction_provenance.Store.init(io, dir, transaction_result_name);
     try store.writeAtomic(allocator, provenance.result);
+    const bytes = try provenance.result.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    const result_path = try std.fs.path.join(
+        allocator,
+        &.{ request.options.state_path, transaction_result_name },
+    );
+    defer allocator.free(result_path);
+    try publishLegacyCapabilityEvidence(
+        allocator,
+        io,
+        result_path,
+        transaction_provenance.schema_id,
+        transaction_provenance.schema_version,
+        bytes,
+        .{
+            .root_identity_sha256 = root_identity_sha256,
+            .attempt_id = attempt_id,
+        },
+    );
+}
+
+fn publishLegacyCapabilityEvidence(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    artifact_path: []const u8,
+    artifact_schema: []const u8,
+    artifact_version: u32,
+    artifact_bytes: []const u8,
+    binding: legacy_compat.EvidenceBinding,
+) !void {
+    const sidecar_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.legacy-capability-v1.json",
+        .{artifact_path},
+    );
+    defer allocator.free(sidecar_path);
+    const evidence = try legacy_compat.createEvidence(.{
+        .schema = artifact_schema,
+        .version = artifact_version,
+        .backend = .legacy_dpkg,
+    }, artifact_bytes, binding);
+    const parent = std.fs.path.dirname(sidecar_path) orelse
+        return error.InvalidAbsolutePath;
+    var dir = try openAbsoluteDirectory(io, parent);
+    defer dir.close(io);
+    const store = try legacy_compat.Store.init(
+        io,
+        dir,
+        std.fs.path.basename(sidecar_path),
+    );
+    try store.writeAtomic(allocator, evidence);
 }
 
 fn planResult(allocator: std.mem.Allocator, operation: api.Operation, plan: solver.Plan) !api.Result {
@@ -7272,6 +7351,80 @@ test "production workflow plans a successful batch install into one exact lock" 
     try testWorkflowLockPlanning(.native);
 }
 
+test "production legacy compatibility maps active legacy refusal to stable version guidance" {
+    const result = mapRootOperationError(
+        .install,
+        error.LegacyCapabilityRequired,
+    );
+    try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+    try std.testing.expectEqual(
+        api.ErrorId.legacy_recovery_release_required,
+        result.diagnostics[0].id,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        result.diagnostics[0].message,
+        legacy_compat.recovery_guidance,
+    ) != null);
+}
+
+fn expectLegacyCapabilitySidecar(
+    allocator: std.mem.Allocator,
+    artifact_path: []const u8,
+    artifact_schema: []const u8,
+    artifact_version: u32,
+    operation_bound: bool,
+) !void {
+    const artifact = try readFile(
+        allocator,
+        std.testing.io,
+        artifact_path,
+        exact_lock.maximum_document_bytes,
+    );
+    defer allocator.free(artifact);
+    const sidecar_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}.legacy-capability-v1.json",
+        .{artifact_path},
+    );
+    defer allocator.free(sidecar_path);
+    const evidence_source = try readFile(
+        allocator,
+        std.testing.io,
+        sidecar_path,
+        legacy_compat.maximum_evidence_bytes,
+    );
+    defer allocator.free(evidence_source);
+    const evidence = try legacy_compat.decodeEvidence(
+        allocator,
+        evidence_source,
+    );
+    try std.testing.expectEqualStrings(artifact_schema, evidence.artifact_schema);
+    try std.testing.expectEqual(artifact_version, evidence.artifact_version);
+    var artifact_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(artifact, &artifact_sha256, .{});
+    try std.testing.expectEqualSlices(
+        u8,
+        &artifact_sha256,
+        &evidence.artifact_sha256,
+    );
+    try std.testing.expectEqual(operation_bound, evidence.root_identity_sha256 != null);
+    try std.testing.expectEqual(operation_bound, evidence.attempt_id != null);
+    try legacy_compat.verifyEvidence(
+        evidence,
+        .{
+            .schema = artifact_schema,
+            .version = artifact_version,
+            .backend = .legacy_dpkg,
+        },
+        artifact,
+        .{
+            .root_identity_sha256 = evidence.root_identity_sha256,
+            .attempt_id = evidence.attempt_id,
+        },
+    );
+}
+
 fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -7324,6 +7477,30 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
         kind,
     );
     defer lock.deinit();
+    if (kind == .legacy_dpkg) {
+        try expectLegacyCapabilitySidecar(
+            allocator,
+            fixture.lock_path,
+            exact_lock.schema_id,
+            exact_lock.schema_version,
+            false,
+        );
+    } else {
+        const sidecar_path = try std.fmt.allocPrint(
+            allocator,
+            "{s}.legacy-capability-v1.json",
+            .{fixture.lock_path},
+        );
+        try std.testing.expectError(
+            error.FileNotFound,
+            readFile(
+                allocator,
+                std.testing.io,
+                sidecar_path,
+                legacy_compat.maximum_evidence_bytes,
+            ),
+        );
+    }
     var requested: usize = 0;
     var dependencies: usize = 0;
     switch (lock) {
@@ -7360,6 +7537,14 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     );
     defer allocator.free(replay_bytes);
     try std.testing.expectEqualStrings(lock_bytes, replay_bytes);
+    if (kind == .legacy_dpkg)
+        try expectLegacyCapabilitySidecar(
+            allocator,
+            fixture.second_lock_path,
+            exact_lock.schema_id,
+            exact_lock.schema_version,
+            false,
+        );
 
     backend.transaction_backend = if (kind == .native) .legacy_dpkg else .native;
     const crossed = try backend.executeWorkflow(allocator, .{
@@ -7550,6 +7735,17 @@ test "production workflow plan-only batches do not mutate and removal locks repl
     );
     defer allocator.free(final_status);
     try std.testing.expectEqual(@as(usize, 0), final_status.len);
+    const result_path = try std.fs.path.join(
+        allocator,
+        &.{ fixture.state_path, transaction_result_name },
+    );
+    try expectLegacyCapabilitySidecar(
+        allocator,
+        result_path,
+        transaction_provenance.schema_id,
+        transaction_provenance.schema_version,
+        true,
+    );
 }
 
 test "production workflow recovery reconciles completion without a second mutation" {

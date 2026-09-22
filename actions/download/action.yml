@@ -137,6 +137,8 @@ outputs:
     description: Current-lock objects acquired from package transport
   reused-count:
     description: Current-lock objects reopened and fully verified from the CAS
+  backend-capability:
+    description: Explicit selected execution capability (legacy deprecated v1 or native transaction v1)
 
 runs:
   using: node24

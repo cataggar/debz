@@ -521,6 +521,12 @@ handed control over, so it resolves as observed mutation.
   native engine will bind program step sequences once it exists.
 - The legacy journal remains the command-level recovery authority. This module
   brackets it conservatively rather than reinterpreting it.
+- A root record explicitly bound to `legacy_dpkg` remains legacy authority.
+  Native selection returns a typed legacy-recovery refusal, and a native-only
+  runtime returns a typed legacy-capability refusal, before deferred cleanup,
+  reclamation, or publication. The active record bytes remain unchanged until
+  a legacy-capable release recovers them; completed historical records remain
+  read-only evidence. See [Legacy compatibility](legacy-compatibility.md).
 - Live-host-root operations do not use `/` as their durable install-root
   spelling. The Linux live-root supervisor projects the source root at the
   stable `/run/debz/system-root` path before product code starts. That spelling

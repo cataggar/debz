@@ -192,6 +192,8 @@ outputs:
     description: Exact final closure package count from verified transaction or unchanged native closure evidence
   changed:
     description: Whether this invocation executed a package transaction; false for verified unchanged native installs
+  backend-capability:
+    description: Explicit selected execution capability (legacy deprecated v1 or native transaction v1)
 
 runs:
   using: node24

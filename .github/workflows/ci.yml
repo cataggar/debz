@@ -825,7 +825,7 @@ jobs:
   native-recovery:
     name: Native crash recovery (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:

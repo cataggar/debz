@@ -498,18 +498,22 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         text,
     ))
     failures = []
-    for name in ("build-and-test-workload", "native-recovery"):
+    timeout_lines = {
+        "build-and-test-workload": "    timeout-minutes: 60",
+        "native-recovery": "    timeout-minutes: 180",
+    }
+    for name, timeout_line in timeout_lines.items():
         body = jobs.get(name, "")
         lines = body.splitlines()
         if any(line not in lines for line in (
-            "    timeout-minutes: 60",
+            timeout_line,
             "      fail-fast: false",
             "          - os: ubuntu-24.04",
             "            name: linux-x64",
             "          - os: ubuntu-24.04-arm",
             "            name: linux-arm64",
         )) or re.search(r"(?m)^    if:", body) or "continue-on-error:" in body:
-            failures.append(f"ci.yml: {name} must require both architectures within the existing job limit")
+            failures.append(f"ci.yml: {name} must require both architectures within its reviewed job limit")
     workload = jobs.get("build-and-test-workload", "")
     if any(line not in workload.splitlines() for line in (
         "    name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})",
@@ -740,6 +744,7 @@ def audit_download_action() -> None:
         "cache-matched-key:",
         "downloaded-count:",
         "reused-count:",
+        "backend-capability:",
         "maximum-repository-records:",
     ):
         if token not in manifest:
@@ -785,6 +790,8 @@ def audit_download_action() -> None:
             "cache.save(exportArchive, fingerprint.primary_key, archiveLimit)",
             "core.setOutput('cache-hit'",
             "core.setOutput('downloaded-count'",
+            "core.setOutput(\n    'backend-capability'",
+            "legacy-dpkg-execution-deprecated-v1",
         ),
     }
     for relative, tokens in source_requirements.items():
@@ -934,6 +941,7 @@ def audit_install_action() -> None:
         "package-cache-hit:",
         "transaction-result:",
         "installed-count:",
+        "backend-capability:",
     ):
         if token not in manifest:
             fail(f"install action metadata is missing policy token: {token}")
@@ -969,6 +977,8 @@ def audit_install_action() -> None:
             "validateTransactionSummary",
             "await composition.saveSetupCache()",
             "io.setOutput('transaction-result'",
+            "io.setOutput(\n    'backend-capability'",
+            "legacy-dpkg-execution-deprecated-v1",
         ),
     }
     for relative, tokens in source_requirements.items():
@@ -1061,6 +1071,258 @@ def audit_install_action() -> None:
         fail("transaction-result summary schema is missing")
 
 
+def audit_legacy_cutover_policy() -> None:
+    policy_path = ROOT / "security/legacy-cutover-policy.json"
+    schema_path = ROOT / "schema/legacy-compatibility-policy-v1.json"
+    if not policy_path.is_file() or not schema_path.is_file():
+        fail("legacy cutover policy or schema is missing")
+        return
+    policy = json.loads(policy_path.read_text())
+    if (
+        policy.get("schema")
+        != "https://debz.dev/schema/legacy-compatibility-policy-v1"
+        or policy.get("version") != 1
+        or policy.get("issue") != 86
+        or policy.get("current_release_mode") != "legacy_capable"
+    ):
+        fail("legacy cutover policy identity or current release mode changed")
+    blockers = policy.get("cutover_blockers")
+    if policy.get("native_only_cutover_ready") is not False or not isinstance(blockers, list) or not blockers:
+        fail("legacy cutover policy cannot claim native-only readiness while blockers remain")
+    invariants = policy.get("invariants")
+    required_invariants = {
+        "legacy_is_never_native_authority",
+        "active_legacy_requires_legacy_capable_recovery",
+        "native_only_must_not_clear_active_legacy",
+        "completed_history_is_read_only",
+        "historical_bytes_are_never_rewritten",
+        "no_fallback_after_native_mutation",
+        "no_success_shaped_default",
+        "single_root_operation_namespace",
+    }
+    if not isinstance(invariants, dict) or {
+        key for key, value in invariants.items() if value is True
+    } != required_invariants:
+        fail("legacy cutover invariants are incomplete or not fail-closed")
+
+    artifacts = policy.get("artifact_policy")
+    if not isinstance(artifacts, list):
+        fail("legacy artifact inventory is missing")
+        artifacts = []
+    required_artifacts = {
+        "https://debz.dev/schema/system-profile-v1": ((1,), "legacy_dpkg"),
+        "https://debz.dev/schema/system-profile-v2": ((2,), "explicit"),
+        "https://debz.dev/schema/exact-closure-lock-v1": ((1,), "legacy_dpkg"),
+        "https://debz.dev/schema/exact-closure-lock-v2": ((2,), "explicit_context"),
+        "https://debz.dev/schema/transaction-result-v1": ((1,), "legacy_dpkg"),
+        "https://debz.dev/schema/transaction-result-v2": ((2,), "legacy_dpkg"),
+        "io.github.cataggar.debz.transaction-result-summary.v1": ((1,), "legacy_dpkg"),
+        "io.github.cataggar.debz.transaction-result-summary.v2": ((2,), "native"),
+        "io.github.cataggar.debz.transaction-result-capability.v1": ((1,), "native"),
+        "debz:transaction-journal": ((1, 2, 3), "legacy_dpkg"),
+        "https://debz.dev/schema/root-operation-record-v1": ((1,), "explicit"),
+        "https://debz.dev/schema/root-operation-completion-v1": ((1,), "explicit"),
+        "https://debz.dev/schema/apt-system-operation-state-v1": (
+            (1,),
+            "explicit_context",
+        ),
+        "https://debz.dev/schema/apt-system-result-v1": ((1,), "explicit_context"),
+        "https://debz.dev/schema/apt-system-result-v2": ((2,), "explicit_context"),
+        "https://debz.dev/schema/apt-system-result-v3": ((3,), "explicit_context"),
+        "https://debz.dev/schema/apt-system-execution-completion-v1": (
+            (1,),
+            "native",
+        ),
+        "io.github.cataggar.debz.command.v1": ((1,), "explicit"),
+        "https://debz.dev/schema/repository-add-state-v1": ((1,), "explicit"),
+        "https://debz.dev/schema/repository-operation-result-v1": (
+            (1,),
+            "explicit",
+        ),
+        "io.github.cataggar.debz.package-cache-fingerprint.v1": (
+            (1,),
+            "legacy_dpkg",
+        ),
+        "io.github.cataggar.debz.package-cache-fingerprint.v2": ((2,), "native"),
+        "io.github.cataggar.debz.package-cache-result.v1": (
+            (1,),
+            "legacy_dpkg",
+        ),
+        "io.github.cataggar.debz.package-cache-result.v2": ((2,), "native"),
+        "io.github.cataggar.debz.package-cache-error.v1": ((1,), "explicit"),
+        "io.github.cataggar.debz.package-family.capabilities.v1": (
+            (1,),
+            "legacy_dpkg",
+        ),
+        "io.github.cataggar.debz.package-family.capabilities.v2": ((2,), "native"),
+        "io.github.cataggar.debz.package-family.request.v1": (
+            (1,),
+            "legacy_dpkg",
+        ),
+        "io.github.cataggar.debz.package-family.request.v2": ((2,), "native"),
+        "io.github.cataggar.debz.package-family.result.v1": (
+            (1,),
+            "legacy_dpkg",
+        ),
+        "io.github.cataggar.debz.package-family.result.v2": ((2,), "native"),
+        "https://debz.dev/schema/native-transaction-provenance-v1": (
+            (1,),
+            "native",
+        ),
+        "io.github.cataggar.debz.native-install-capability.v1": ((1,), "native"),
+        "io.github.cataggar.debz.native-install-result.v1": ((1,), "native"),
+        "https://debz.dev/schema/native-repository-unchanged-v1": (
+            (1,),
+            "native",
+        ),
+        "https://debz.dev/schema/legacy-capability-evidence-v1": (
+            (1,),
+            "legacy_dpkg_non_authoritative",
+        ),
+    }
+    actual_artifacts: dict[str, tuple[tuple[int, ...], str]] = {}
+    for item in artifacts:
+        if not isinstance(item, dict):
+            fail("legacy artifact inventory contains a malformed entry")
+            continue
+        schema = item.get("schema")
+        versions = item.get("versions")
+        backend = item.get("backend")
+        if (
+            not isinstance(schema, str)
+            or not isinstance(versions, list)
+            or not all(isinstance(version, int) for version in versions)
+            or not isinstance(backend, str)
+        ):
+            fail("legacy artifact inventory contains an invalid identity tuple")
+            continue
+        if schema in actual_artifacts:
+            fail(f"legacy artifact identity is multiply classified: {schema}")
+            continue
+        actual_artifacts[schema] = (tuple(versions), backend)
+    if actual_artifacts != required_artifacts:
+        fail("legacy artifact version/backend inventory is incomplete or ambiguous")
+    classifier = (ROOT / "src/legacy_compat.zig").read_text(errors="strict")
+    for schema in required_artifacts:
+        if schema not in classifier:
+            fail(f"normative Zig classifier omits policy artifact: {schema}")
+
+    classified: set[str] = set()
+    for section in (
+        "production_execution_paths",
+        "compatibility_guard_paths",
+        "historical_reference_paths",
+        "test_reference_paths",
+    ):
+        entries = policy.get(section)
+        if not isinstance(entries, list) or not entries:
+            fail(f"legacy cutover policy has no {section}")
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                fail(f"legacy cutover policy contains malformed {section} entry")
+                continue
+            relative = entry["path"]
+            if relative in classified:
+                fail(f"legacy cutover path is multiply classified: {relative}")
+            classified.add(relative)
+            if not (ROOT / relative).is_file():
+                fail(f"legacy cutover inventory path is missing: {relative}")
+            if section in ("historical_reference_paths", "test_reference_paths"):
+                if entry.get("retain_after_cutover") is not True:
+                    fail(f"legacy retained path lacks explicit retention: {relative}")
+            elif not isinstance(entry.get("cutover"), str):
+                fail(f"legacy executable/guard path lacks a cutover disposition: {relative}")
+    required_selectors = {
+        "src/transaction_engine.zig",
+        "src/production_backend.zig",
+        "src/repository_backend.zig",
+        "src/package_family_backend.zig",
+        "src/package_cache_workflow.zig",
+        "src/system_profile.zig",
+        "src/main.zig",
+        "src/repository_cli.zig",
+        "src/apt_system_orchestrator.zig",
+        "src/target_apt_config.zig",
+        "actions/download/src/inputs.ts",
+        "actions/download/src/action.ts",
+        "actions/download/src/runner.ts",
+        "actions/download/action.yml",
+        "actions/install/src/inputs.ts",
+        "actions/install/src/action.ts",
+        "actions/install/src/errors.ts",
+        "actions/install/action.yml",
+    }
+    production_paths = {
+        entry.get("path")
+        for entry in policy.get("production_execution_paths", [])
+        if isinstance(entry, dict)
+    }
+    if not required_selectors.issubset(production_paths):
+        fail(
+            "legacy cutover policy omits production selectors: "
+            f"{sorted(required_selectors - production_paths)!r}"
+        )
+    for relative in required_selectors:
+        text = (ROOT / relative).read_text(errors="strict")
+        if "legacy_dpkg" not in text and "dpkg" not in text:
+            fail(f"legacy production selector lost its auditable identity: {relative}")
+
+    marker_patterns = (
+        re.compile(r"legacy_dpkg"),
+        re.compile(r"legacy-dpkg-execution"),
+        re.compile(r"legacy-capability"),
+        re.compile(r"\bdpkg-query\b"),
+        re.compile(r'\.\{\s*"dpkg"'),
+        re.compile(r'"/usr/bin/dpkg"'),
+        re.compile(
+            r"exact-closure-lock-v1|transaction-result-v1|system-profile-v1|"
+            r"package-cache-(?:fingerprint|result)\.v1|"
+            r"package-family\.(?:capabilities|request|result)\.v1"
+        ),
+    )
+    marked_paths: set[str] = set()
+    for directory, patterns in (
+        (ROOT / "src", ("*.zig",)),
+        (ROOT / "actions", ("*.ts", "*.yml")),
+    ):
+        for pattern in patterns:
+            for path in directory.rglob(pattern):
+                if "dist" in path.parts or "node_modules" in path.parts:
+                    continue
+                text = path.read_text(errors="strict")
+                if any(marker.search(text) for marker in marker_patterns):
+                    marked_paths.add(str(path.relative_to(ROOT)))
+    unclassified = marked_paths - classified
+    if unclassified:
+        fail(
+            "legacy cutover policy has unclassified production/test paths: "
+            f"{sorted(unclassified)!r}"
+        )
+
+    contracts = policy.get("generated_contracts")
+    if not isinstance(contracts, list) or len(contracts) != 2:
+        fail("legacy cutover generated Actions inventory is incomplete")
+    else:
+        for contract in contracts:
+            path = ROOT / str(contract.get("path", ""))
+            if (
+                contract.get("required_evidence") != "backend-capability"
+                or not path.is_file()
+            ):
+                fail("legacy cutover generated Actions contract is malformed")
+                continue
+            bundle = path.read_text(errors="strict")
+            for token in (
+                "backend-capability",
+                "legacy-dpkg-execution-deprecated-v1",
+                "native-transaction-execution-v1",
+                "Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.",
+            ):
+                if token not in bundle:
+                    fail(f"{path.relative_to(ROOT)} lacks cutover capability evidence: {token}")
+
+
 def audit_docs() -> None:
     if (ROOT / "docs").exists():
         fail("stale docs/ directory exists; documentation belongs under doc/")
@@ -1136,6 +1398,7 @@ def main() -> int:
     audit_setup_action_dependencies()
     audit_download_action()
     audit_install_action()
+    audit_legacy_cutover_policy()
     audit_docs()
     audit_secrets_and_artifacts(files)
     if FAILURES:

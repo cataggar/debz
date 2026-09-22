@@ -30,6 +30,7 @@ const downloadOutputNames = new Set([
   'lock-digest',
   'downloaded-count',
   'reused-count',
+  'backend-capability',
 ]);
 const setupStateNames = new Set([
   'debz-cache-path',
@@ -55,6 +56,7 @@ export interface DownloadOutputs {
   lockDigest: string;
   downloadedCount: number;
   reusedCount: number;
+  backendCapability: string;
 }
 
 export interface CommandExecution {
@@ -491,6 +493,11 @@ export function validateDownloadOutputs(
   const lockDigest = requiredOutput(outputs, 'lock-digest');
   const downloadedCount = countOutput(outputs, 'downloaded-count');
   const reusedCount = countOutput(outputs, 'reused-count');
+  const backendCapability = requiredOutput(outputs, 'backend-capability');
+  const expectedBackendCapability =
+    inputs.transactionBackend === 'legacy_dpkg'
+      ? 'legacy-dpkg-execution-deprecated-v1'
+      : 'native-transaction-execution-v1';
   if (
     cachePath !== inputs.cachePath ||
     cacheRoot !== inputs.cacheRoot ||
@@ -498,6 +505,11 @@ export function validateDownloadOutputs(
   ) {
     throw new InstallActionError(
       'download action returned an unexpected cache or lock identity',
+    );
+  }
+  if (backendCapability !== expectedBackendCapability) {
+    throw new InstallActionError(
+      'download action returned the wrong backend capability',
     );
   }
   if (
@@ -520,6 +532,7 @@ export function validateDownloadOutputs(
     lockDigest,
     downloadedCount,
     reusedCount,
+    backendCapability,
   };
 }
 

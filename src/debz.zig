@@ -247,6 +247,7 @@ pub const openpgp_verifier = @import("openpgp_verifier.zig");
 pub const maintainer_script = @import("maintainer_script.zig");
 pub const transaction_executor = @import("transaction_executor.zig");
 pub const transaction_engine = @import("transaction_engine.zig");
+pub const legacy_compat = @import("legacy_compat.zig");
 pub const live_root = @import("live_root.zig");
 pub const root_fs = @import("root_fs.zig");
 pub const root_mutation = @import("root_mutation.zig");

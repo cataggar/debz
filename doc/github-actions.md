@@ -17,6 +17,12 @@ selects native v2 locks, fingerprints, preparation results, and archive keys,
 with no version autodetection or fallback. Native empty and local-only
 closures may omit repository inputs; local bytes must already be acquired or
 imported, never fetched from redacted provenance URLs.
+Legacy remains the default for this increment but is explicitly deprecated.
+Successful download and install invocations publish `backend-capability` as
+`legacy-dpkg-execution-deprecated-v1` or
+`native-transaction-execution-v1`; legacy selection also emits one bounded
+notice. Generated bundle bytes are checked by the
+[cutover policy](legacy-compatibility.md).
 
 [`actions/install`](../actions/install/README.md) composes those exact
 boundaries and then performs the mutation. It validates all typed inputs before

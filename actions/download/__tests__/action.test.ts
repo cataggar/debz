@@ -137,6 +137,16 @@ for (const transactionBackend of ['legacy_dpkg', 'native'] as const) {
       );
       assert.match(output, /downloaded-count<<[^\n]+\n1\n/);
       assert.match(output, /reused-count<<[^\n]+\n2\n/);
+      assert.match(
+        output,
+        new RegExp(
+          `backend-capability<<[^\\n]+\\n${
+            transactionBackend === 'legacy_dpkg'
+              ? 'legacy-dpkg-execution-deprecated-v1'
+              : 'native-transaction-execution-v1'
+          }\\n`,
+        ),
+      );
     } finally {
       restoreEnvironment(previous);
     }

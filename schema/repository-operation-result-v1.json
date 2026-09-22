@@ -248,7 +248,7 @@
             "target_import_failed", "refresh_failed",
             "provenance_publication_failed", "resource_limit_exceeded",
             "state_persistence_failed", "state_corrupt",
-            "recovery_required", "internal_error"
+            "recovery_required", "legacy_recovery_release_required", "internal_error"
           ]
         },
         "phase": {

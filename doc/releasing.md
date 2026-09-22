@@ -9,6 +9,12 @@ Releases are immutable `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tags on commits
 3. Confirm all required CI checks are green, including setup-action unit/bundle, native, and bare-container lanes; both native build/test lanes; both `Required release dry-run` lanes; `Required release workflow policy`; required disposable-root integration; security audit; and fuzzing.
 4. Run the separate `CI` workflow manually with the pinned immutable Ubuntu snapshot URI and suite selected for the release. Require both native real-snapshot acceptance jobs to pass, retain their architecture-tagged `vendor-state-inventory-v1.json` review artifacts, and compare them with the indexed references under `tools/fixtures/vendor-state/`. Require `python3 tools/derive-vendor-state-reference.py --index tools/fixtures/vendor-state/index-v1.json --check tools/fixtures/vendor-state/reference-v1.json` to reproduce the bounded typed reference. Refresh the manifests, index, and derived reference only in a separately reviewed change that records the exact workflow run, source commit, artifact and manifest digests, capture schema version, and inventory differences. Normal pull-request CI intentionally does not download real Ubuntu archives.
 5. Review `security/dependency-policy.json`, including the exact Zig-provided musl snapshot and reviewed vulnerability dispositions, runtime library versions reported by CI, `THIRD_PARTY_NOTICES`, and the exact four-archive plan from `python3 tools/release.py dry-run --tag v0.3.0`.
+   Also review `security/legacy-cutover-policy.json`. A legacy-capable release
+   must keep `native_only_cutover_ready: false`, retain every inventoried
+   production selector, and ship generated Actions capability evidence. A
+   later native-only release must not be tagged until every listed blocker has
+   been discharged in the cutover change and active legacy operations have
+   stable recovery guidance.
 6. Create one annotated tag without changing the commit: `git tag -a v0.3.0 -m "debz 0.3.0"`.
 7. Push only that tag: `git push origin refs/tags/v0.3.0`.
 8. Watch the `Release` workflow through both native packages, exact four-archive verification, gzip and xz provenance attestations, GitHub Release publication, and post-release first-party setup/download/install plus `ghr-bin==0.7.0` smoke jobs.

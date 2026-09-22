@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/legacy-compatibility-policy-v1",
+  "title": "debz legacy compatibility and native cutover policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "issue",
+    "current_release_mode",
+    "legacy_capable_release_range",
+    "native_only_cutover_ready",
+    "invariants",
+    "artifact_policy",
+    "production_execution_paths",
+    "compatibility_guard_paths",
+    "historical_reference_paths",
+    "test_reference_paths",
+    "generated_contracts",
+    "cutover_blockers"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/legacy-compatibility-policy-v1"
+    },
+    "version": { "const": 1 },
+    "issue": { "const": 86 },
+    "current_release_mode": {
+      "enum": ["legacy_capable", "native_only"]
+    },
+    "legacy_capable_release_range": {
+      "type": "string",
+      "minLength": 1
+    },
+    "native_only_cutover_ready": { "type": "boolean" },
+    "invariants": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "boolean" }
+    },
+    "artifact_policy": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "production_execution_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/productionPath" }
+    },
+    "compatibility_guard_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/productionPath" }
+    },
+    "historical_reference_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/referencePath" }
+    },
+    "test_reference_paths": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/referencePath" }
+    },
+    "generated_contracts": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/generatedContract" }
+    },
+    "cutover_blockers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "versions",
+        "backend",
+        "new_execution",
+        "active_recovery",
+        "completed_history"
+      ],
+      "properties": {
+        "schema": { "type": "string", "minLength": 1 },
+        "versions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "backend": { "type": "string", "minLength": 1 },
+        "new_execution": { "type": "string", "minLength": 1 },
+        "active_recovery": { "type": "string", "minLength": 1 },
+        "completed_history": { "type": "string", "minLength": 1 }
+      }
+    },
+    "productionPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "cutover"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "cutover": { "type": "string", "minLength": 1 }
+      }
+    },
+    "referencePath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "retain_after_cutover"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "retain_after_cutover": { "const": true }
+      }
+    },
+    "generatedContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "source", "required_evidence"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "required_evidence": { "const": "backend-capability" }
+      }
+    }
+  }
+}

@@ -2,6 +2,12 @@
 
 `debz` is an in-development, embeddable Debian-family package manager and CLI written in Zig. It owns repository configuration, verified metadata acquisition, dependency solving, downloads, transaction planning, diagnostics, and an install-root-aware `dpkg` execution boundary.
 
+The current release remains legacy-capable and does not change backend
+defaults. Exact legacy/native identity, active-operation refusal, immutable
+historical verification, Actions capability evidence, and the remaining
+native-only deletion inventory are tracked in
+[Legacy compatibility](legacy-compatibility.md).
+
 Required PR tests now exercise deterministic signed Debian stable and Ubuntu
 26.04 fixture repositories and disposable dpkg roots on native amd64 and arm64.
 Scheduled/manual lanes add foreign-architecture roots; see

@@ -143,6 +143,14 @@ access, including cache-only replay. The separate `package-cache` commands
 also support explicit native selection as described above; other consumer
 contracts remain gated where documented.
 
+New legacy locks and transaction results publish a separate capability sidecar
+that binds their exact canonical bytes without changing signed or digested
+artifact bytes. Active legacy root ownership encountered by native selection
+returns `legacy_recovery_release_required` before mutation or generic cleanup,
+with guidance to use a legacy-capable release. Completed legacy artifacts
+remain version-specific, read-only verification inputs. The complete matrix is
+defined by [Legacy compatibility](legacy-compatibility.md).
+
 Native execution captures the complete database and acquired archive evidence
 under its caller-owned root attempt, derives trigger authority, and revalidates
 the compiled program before mutation. An unchanged validated closure returns
