@@ -242,6 +242,32 @@ class SecurityAuditTests(unittest.TestCase):
             failures,
         )
 
+    def test_workflows_pin_verified_ghr_zig_installation(self) -> None:
+        for workflow_name, expected_count in (("ci.yml", 11), ("release.yml", 1)):
+            workflow = (ROOT / ".github/workflows" / workflow_name).read_text()
+            self.assertEqual(
+                [],
+                security_audit.ghr_zig_workflow_failures(
+                    workflow, workflow_name, expected_count
+                ),
+            )
+            self.assertNotEqual(
+                [],
+                security_audit.ghr_zig_workflow_failures(
+                    workflow.replace("ghr-version: v0.8.1", "ghr-version: v0.8.0", 1),
+                    workflow_name,
+                    expected_count,
+                ),
+            )
+            self.assertNotEqual(
+                [],
+                security_audit.ghr_zig_workflow_failures(
+                    workflow + "\nuses: mlugg/setup-zig@deadbeef\n",
+                    workflow_name,
+                    expected_count,
+                ),
+            )
+
     def test_download_cache_uses_opaque_cli_owned_archive(self) -> None:
         package = json.loads(
             (ROOT / "actions/download/package.json").read_text()
