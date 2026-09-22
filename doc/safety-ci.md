@@ -23,6 +23,13 @@ workload in both modes on both architectures. The existing `Build and test`
 checks require all four build jobs and both recovery jobs to succeed; failure,
 cancellation, or a skipped workload cannot make the aggregate pass.
 
+Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
+commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned
+minisign key and GitHub attestations, and checks `zig version` before use. The
+action cache contains only the exact installed tool and `ghr` transaction state;
+it does not restore Zig's local or global build caches, preserving the previous
+no-build-cache policy.
+
 The same tests are native `std.testing.fuzz` targets with seed corpora, so
 coverage-guided runs can use `zig build fuzz --fuzz=<cases>` on Zig toolchains
 where the built-in fuzzer is available. CI uses the deterministic runner

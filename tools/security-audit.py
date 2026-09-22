@@ -601,6 +601,35 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     return failures
 
 
+GHR_ZIG_INSTALL = """\
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+"""
+
+
+def ghr_zig_workflow_failures(
+    text: str, label: str, expected_count: int
+) -> list[str]:
+    failures: list[str] = []
+    if "mlugg/setup-zig" in text or "use-cache:" in text:
+        failures.append(f"{label}: obsolete setup-zig installation or cache input remains")
+    count = text.count(GHR_ZIG_INSTALL)
+    if count != expected_count:
+        failures.append(
+            f"{label}: expected {expected_count} exact verified ghr Zig install blocks, found {count}"
+        )
+    return failures
+
+
 def audit_ci_pins() -> None:
     workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
     for workflow in workflows:
@@ -615,8 +644,21 @@ def audit_ci_pins() -> None:
         if workflow.name == "ci.yml":
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
-        if not re.search(r"(?m)^permissions:\s*\n\s{2}contents:\s*read\s*$", text):
-            fail(f"{relative}: top-level permissions must be contents: read")
+        expected_ghr_installs = {"ci.yml": 11, "release.yml": 1}.get(workflow.name)
+        if expected_ghr_installs is not None:
+            for failure in ghr_zig_workflow_failures(
+                text, str(relative), expected_ghr_installs
+            ):
+                fail(failure)
+        if not re.search(
+            r"(?m)^permissions:\s*\n"
+            r"\s{2}contents:\s*read\s*\n"
+            r"\s{2}attestations:\s*read\s*$",
+            text,
+        ):
+            fail(
+                f"{relative}: top-level permissions must be contents and attestations read"
+            )
         checkout_blocks = re.findall(
             r"(?ms)^\s*-\s+uses:\s*actions/checkout@[^\n]+\n(?P<body>(?:\s{8,}[^\n]*\n)*)",
             text,

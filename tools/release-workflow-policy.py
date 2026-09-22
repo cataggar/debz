@@ -15,6 +15,19 @@ SETUP = ROOT / "actions/setup"
 DOWNLOAD = ROOT / "actions/download"
 INSTALL = ROOT / "actions/install"
 FAILURES: list[str] = []
+GHR_ZIG_INSTALL = """\
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+"""
 
 
 def require(pattern: str, message: str, text: str, flags: int = 0) -> None:
@@ -32,6 +45,20 @@ def audit_actions(text: str, workflow: pathlib.Path) -> None:
     )
     if not checkout_blocks or any("persist-credentials: false" not in block for block in checkout_blocks):
         FAILURES.append(f"{workflow.name}: every checkout must disable persisted credentials")
+
+
+def audit_zig_installation(ci: str, release: str) -> None:
+    for label, text, expected_count in (
+        ("ci.yml", ci, 11),
+        ("release.yml", release, 1),
+    ):
+        if "mlugg/setup-zig" in text or "use-cache:" in text:
+            FAILURES.append(f"{label}: obsolete setup-zig installation or cache input remains")
+        count = text.count(GHR_ZIG_INSTALL)
+        if count != expected_count:
+            FAILURES.append(
+                f"{label}: expected {expected_count} exact verified ghr Zig install blocks, found {count}"
+            )
 
 
 def audit_setup_action(ci: str, release: str) -> None:
@@ -319,7 +346,11 @@ def main() -> None:
     require(r"(?m)^on:\n  push:\n    tags:\n      - 'v\*'\n", "trigger must be only v* tag pushes", release)
     if re.search(r"(?m)^  (pull_request|workflow_dispatch|schedule):", release):
         FAILURES.append("release workflow has a non-tag trigger")
-    require(r"(?m)^permissions:\n  contents: read$", "top-level permissions must be contents: read", release)
+    require(
+        r"(?m)^permissions:\n  contents: read\n  attestations: read$",
+        "top-level permissions must be contents and attestations read",
+        release,
+    )
     require(
         r"(?ms)^  release:.*?permissions:\n      contents: write\n      id-token: write\n      attestations: write",
         "release job must hold publication permissions",
@@ -327,6 +358,7 @@ def main() -> None:
     )
     audit_actions(release, RELEASE)
     audit_actions(ci, CI)
+    audit_zig_installation(ci, release)
     audit_setup_action(ci, release)
     audit_download_action(ci, release)
     audit_install_action(ci, release)
