@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 
 pub const LocalArtifactTrustMode = enum {
     pinned_sha256,
@@ -14,6 +15,22 @@ pub const LocalArtifactEvidence = struct {
     architecture: []const u8,
     acquisition_url: []const u8,
     trust_mode: LocalArtifactTrustMode,
+};
+
+pub const LocalArtifactTrustModeV2 = enum {
+    pinned_content_digest,
+    verified_https,
+};
+
+pub const LocalArtifactEvidenceV2 = struct {
+    artifact_id: content_digest.Value,
+    archive_identity: content_digest.Identity,
+    size: u64,
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+    acquisition_url: []const u8,
+    trust_mode: LocalArtifactTrustModeV2,
 };
 
 pub const ValidationError = error{
@@ -48,6 +65,47 @@ pub fn eqlLocalArtifact(left: LocalArtifactEvidence, right: LocalArtifactEvidenc
         std.mem.eql(u8, left.architecture, right.architecture) and
         std.mem.eql(u8, left.acquisition_url, right.acquisition_url) and
         left.trust_mode == right.trust_mode;
+}
+
+pub fn validateLocalArtifactV2(evidence: LocalArtifactEvidenceV2) ValidationError!void {
+    _ = content_digest.Identity.init(
+        evidence.archive_identity.digests,
+        evidence.archive_identity.primary,
+    ) catch return error.InvalidArtifactId;
+    if (!content_digest.Value.eql(
+        evidence.artifact_id,
+        evidence.archive_identity.primaryValue(),
+    )) return error.InvalidArtifactId;
+    if (!validIdentity(evidence.package) or
+        !validIdentity(evidence.version) or
+        !validIdentity(evidence.architecture))
+        return error.InvalidPackageIdentity;
+    if (!validRedactedUrl(evidence.acquisition_url)) return error.InvalidAcquisitionUrl;
+    if (evidence.trust_mode == .verified_https and
+        (evidence.acquisition_url.len < "https://".len or
+            !std.ascii.eqlIgnoreCase(
+                evidence.acquisition_url[0.."https://".len],
+                "https://",
+            )))
+        return error.TrustModeMismatch;
+}
+
+pub fn eqlLocalArtifactV2(
+    left: LocalArtifactEvidenceV2,
+    right: LocalArtifactEvidenceV2,
+) bool {
+    return content_digest.Value.eql(left.artifact_id, right.artifact_id) and
+        content_digest.Identity.eql(left.archive_identity, right.archive_identity) and
+        left.size == right.size and
+        std.mem.eql(u8, left.package, right.package) and
+        std.mem.eql(u8, left.version, right.version) and
+        std.mem.eql(u8, left.architecture, right.architecture) and
+        std.mem.eql(u8, left.acquisition_url, right.acquisition_url) and
+        left.trust_mode == right.trust_mode;
+}
+
+pub fn artifactIdFromIdentity(identity: content_digest.Identity) content_digest.Value {
+    return identity.primaryValue();
 }
 
 pub fn artifactIdFromSha256(sha256: [32]u8) [64]u8 {
@@ -121,4 +179,24 @@ test "package_origin.test.local artifact evidence is explicit and redacted" {
     local.acquisition_url = "file:/packages/vendor.deb";
     local.trust_mode = .pinned_sha256;
     try validateLocalArtifact(local);
+}
+
+test "package_origin.test.v2 evidence preserves SHA512-only identity" {
+    const identity = try content_digest.Identity.init(
+        .{ .sha512 = content_digest.Value.of(.sha512, "artifact").sha512 },
+        .sha512,
+    );
+    const evidence: LocalArtifactEvidenceV2 = .{
+        .artifact_id = artifactIdFromIdentity(identity),
+        .archive_identity = identity,
+        .size = "artifact".len,
+        .package = "vendor-repo",
+        .version = "1.0",
+        .architecture = "all",
+        .acquisition_url = "file:///vendor.deb",
+        .trust_mode = .pinned_content_digest,
+    };
+    try validateLocalArtifactV2(evidence);
+    try std.testing.expect(eqlLocalArtifactV2(evidence, evidence));
+    try std.testing.expect(evidence.archive_identity.digests.sha256 == null);
 }

@@ -63,6 +63,7 @@ pub const LocalExpected = struct {
     filename: []const u8 = "",
     size: ?u64 = null,
     sha256: ?[32]u8 = null,
+    archive_identity: ?content_digest.Identity = null,
     identity: ?Identity = null,
     profile: LocalProfile = .general,
 };
@@ -254,6 +255,7 @@ pub const Provenance = struct {
     filename: []u8,
     size: u64,
     sha256: [32]u8,
+    archive_identity: ?content_digest.Identity = null,
 };
 
 pub const Relationships = struct {
@@ -458,6 +460,18 @@ fn validateInternal(
                 if (!std.mem.eql(u8, &digest, &sha256))
                     return fail(.digest, .digest_mismatch, 0, null, null);
             }
+            if (expected.archive_identity) |identity| {
+                identity.verify(bytes) catch
+                    return fail(.digest, .digest_mismatch, 0, null, null);
+            }
+            if (expected.sha256 != null and expected.archive_identity != null and
+                (expected.archive_identity.?.digests.sha256 == null or
+                    !std.crypto.timing_safe.eql(
+                        [32]u8,
+                        expected.sha256.?,
+                        expected.archive_identity.?.digests.sha256.?,
+                    )))
+                return fail(.digest, .digest_mismatch, 0, null, null);
         },
     }
 
@@ -622,6 +636,10 @@ fn validateInternal(
             .filename = filename,
             .size = bytes.len,
             .sha256 = digest,
+            .archive_identity = switch (request) {
+                .repository => |expected| expected.archive_identity,
+                .local => |expected| expected.archive_identity,
+            },
         },
         .relationships = .{
             .depends = depends,

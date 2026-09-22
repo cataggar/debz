@@ -8,7 +8,8 @@ const local_artifact = @import("local_artifact.zig");
 const live_root = @import("live_root.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
-const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v2 = @import("exact_lock_v3.zig");
+const exact_lock_legacy = @import("exact_lock_v2.zig");
 const legacy_compat = @import("legacy_compat.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const native_operation = @import("native_operation.zig");
@@ -40,6 +41,8 @@ const operation_directory_name = "repository";
 const operations_directory_name = "operations";
 const operation_state_name = "repo-add-state-v1.json";
 const operation_lock_name = "repo-add.lock";
+// The operation-scoped filename is a stable compatibility path; the document
+// schema inside it is exact-lock v3 for new operations.
 const exact_lock_name = "exact-lock-v2.json";
 const exact_plan_name = "transaction-plan-v3.json";
 const provenance_name = "transaction-result-v2.json";
@@ -1813,10 +1816,7 @@ pub fn prepareNativeFromCache(
         _ = try input.deadline.remainingMs();
         bytes.* = try input.cache.lookup(
             allocator,
-            @import("content_digest.zig").Identity.init(
-                .{ .sha256 = package.sha256 },
-                .sha256,
-            ) catch unreachable,
+            package.archive_identity,
             package.declared_size,
             .verify_all_supported,
         );
@@ -3536,7 +3536,7 @@ pub const Backend = struct {
                         .plan = &plan,
                         .install_root = request.root,
                         .policy = execution_policy,
-                        .exact_lock_v2 = &lock.lock,
+                        .exact_lock_v3 = &lock.lock,
                     },
                     dependencies,
                 ) catch |err| return progress.fail(
@@ -3553,7 +3553,7 @@ pub const Backend = struct {
                     .install_root = request.root,
                     .artifacts = artifacts.items,
                     .policy = execution_policy,
-                    .exact_lock_v2 = &lock.lock,
+                    .exact_lock_v3 = &lock.lock,
                 }, dependencies) catch |err| return progress.fail(
                     state_store,
                     allocator,
@@ -3574,7 +3574,7 @@ pub const Backend = struct {
                             .plan = &plan,
                             .install_root = request.root,
                             .policy = execution_policy,
-                            .exact_lock_v2 = &lock.lock,
+                            .exact_lock_v3 = &lock.lock,
                         },
                         dependencies,
                     ) catch |err| return progress.fail(
@@ -6020,18 +6020,19 @@ fn createUnchangedOperationLock(
         !std.mem.eql(u8, installed.version.spelling.value, evidence.version) or
         !std.mem.eql(u8, installed.architecture.value, evidence.architecture))
         return error.DescriptorIdentityMismatch;
+    const tagged_evidence = try upgradeLocalEvidence(evidence);
     return exact_lock_v2.create(allocator, .{
         .target_architecture = plan.target_architecture,
         .request_sha256 = try operationRequestDigest(allocator, request, plan, .native),
         .policy_sha256 = repositoryLockPolicyDigest(.native),
         .repositories = &.{},
-        .local_artifacts = &.{evidence},
+        .local_artifacts = &.{tagged_evidence},
         .packages = &.{.{
             .name = evidence.package,
             .version = evidence.version,
             .architecture = evidence.architecture,
-            .origin = .{ .local_artifact = evidence },
-            .sha256 = evidence.sha256,
+            .origin = .{ .local_artifact = tagged_evidence },
+            .archive_identity = tagged_evidence.archive_identity,
             .declared_size = evidence.size,
             .retention = .requested,
             .dpkg_selection_hold = installed.status.want == .hold,
@@ -6048,6 +6049,7 @@ fn createOperationLock(
     request: api.Request,
     backend: transaction_engine.Kind,
 ) !exact_lock_v2.OwnedLock {
+    const tagged_local_evidence = try upgradeLocalEvidence(local_evidence);
     var packages: std.ArrayList(exact_lock_v2.Package) = .empty;
     defer packages.deinit(allocator);
     var repository_ids: std.ArrayList([64]u8) = .empty;
@@ -6055,9 +6057,15 @@ fn createOperationLock(
     for (plan.actions) |action| {
         if (action.kind == .remove) continue;
         const origin = action.origin orelse return error.MissingPackageOrigin;
-        const digest = try parsePlanDigest(
-            action.sha256 orelse return error.MissingPackageDigest,
-        );
+        const identity = action.archive_identity orelse identity: {
+            const digest = try parsePlanDigest(
+                action.sha256 orelse return error.MissingPackageDigest,
+            );
+            break :identity try @import("content_digest.zig").Identity.init(
+                .{ .sha256 = digest },
+                .sha256,
+            );
+        };
         const declared_size = action.package_size orelse
             return error.MissingPackageSize;
         switch (origin) {
@@ -6066,7 +6074,11 @@ fn createOperationLock(
                     local.evidence,
                     local_evidence,
                 ) or
-                    !std.mem.eql(u8, &digest, &local.evidence.sha256) or
+                    !std.mem.eql(
+                        u8,
+                        &(identity.digests.sha256 orelse return error.LocalArtifactMismatch),
+                        &local.evidence.sha256,
+                    ) or
                     declared_size != local.evidence.size or
                     local.solver_priority != 1000)
                     return error.LocalArtifactMismatch;
@@ -6074,8 +6086,8 @@ fn createOperationLock(
                     .name = action.package,
                     .version = action.version,
                     .architecture = action.architecture,
-                    .origin = .{ .local_artifact = local.evidence },
-                    .sha256 = digest,
+                    .origin = .{ .local_artifact = tagged_local_evidence },
+                    .archive_identity = tagged_local_evidence.archive_identity,
                     .declared_size = declared_size,
                     .retention = if (action.requested) .requested else .dependency,
                     .dpkg_selection_hold = false,
@@ -6108,7 +6120,7 @@ fn createOperationLock(
                         .repository_id = repository_identity.id,
                         .repository_snapshot_sha256 = snapshot_digest,
                     } },
-                    .sha256 = digest,
+                    .archive_identity = identity,
                     .declared_size = declared_size,
                     .retention = if (action.requested) .requested else .dependency,
                     .dpkg_selection_hold = false,
@@ -6150,7 +6162,7 @@ fn createOperationLock(
             .id = id,
             .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
             .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
-            .index_sha256 = snapshot.snapshot.provenance.index_digest.bytes,
+            .index_identity = snapshot.snapshot.provenance.index_identity,
             .signer_fingerprints = signers[0..signer_count],
         });
     }
@@ -6159,10 +6171,61 @@ fn createOperationLock(
         .request_sha256 = try operationRequestDigest(allocator, request, plan, backend),
         .policy_sha256 = repositoryLockPolicyDigest(backend),
         .repositories = repositories.items,
-        .local_artifacts = &.{local_evidence},
+        .local_artifacts = &.{tagged_local_evidence},
         .packages = packages.items,
         .verified_origins = true,
     });
+}
+
+fn upgradeLocalEvidence(
+    evidence: package_origin.LocalArtifactEvidence,
+) !package_origin.LocalArtifactEvidenceV2 {
+    const identity = try @import("content_digest.zig").Identity.init(
+        .{ .sha256 = evidence.sha256 },
+        .sha256,
+    );
+    return .{
+        .artifact_id = package_origin.artifactIdFromIdentity(identity),
+        .archive_identity = identity,
+        .size = evidence.size,
+        .package = evidence.package,
+        .version = evidence.version,
+        .architecture = evidence.architecture,
+        .acquisition_url = evidence.acquisition_url,
+        .trust_mode = switch (evidence.trust_mode) {
+            .pinned_sha256 => .pinned_content_digest,
+            .verified_https => .verified_https,
+        },
+    };
+}
+
+fn legacyPackageOrigin(
+    origin: exact_lock_v2.PackageOrigin,
+    archive_sha256: [32]u8,
+) exact_lock_legacy.PackageOrigin {
+    return switch (origin) {
+        .authenticated_repository => |repository| .{
+            .authenticated_repository = .{
+                .repository_id = repository.repository_id,
+                .repository_snapshot_sha256 = repository.repository_snapshot_sha256,
+            },
+        },
+        .local_artifact => |artifact| .{
+            .local_artifact = .{
+                .artifact_id = package_origin.artifactIdFromSha256(archive_sha256),
+                .sha256 = archive_sha256,
+                .size = artifact.size,
+                .package = artifact.package,
+                .version = artifact.version,
+                .architecture = artifact.architecture,
+                .acquisition_url = artifact.acquisition_url,
+                .trust_mode = switch (artifact.trust_mode) {
+                    .pinned_content_digest => .pinned_sha256,
+                    .verified_https => .verified_https,
+                },
+            },
+        },
+    };
 }
 
 fn acquirePlanArtifacts(
@@ -6375,7 +6438,8 @@ fn publishBoundProvenance(
             .snapshot_sha256 = repository.snapshot_sha256,
             .release_sha256 = repository.release_sha256,
             .signature_sha256 = null,
-            .metadata_sha256 = repository.index_sha256,
+            .metadata_sha256 = repository.index_identity.digests.sha256 orelse
+                return error.MissingRepositoryDigest,
             .signer_fingerprints = signers,
             .signature_verified = true,
         };
@@ -6385,15 +6449,19 @@ fn publishBoundProvenance(
         lock.packages.len,
     );
     defer allocator.free(packages);
-    for (lock.packages, 0..) |package, index| packages[index] = .{
-        .name = package.name,
-        .version = package.version,
-        .architecture = package.architecture,
-        .origin = package.origin,
-        .package_sha256 = package.sha256,
-        .cas_sha256 = package.sha256,
-        .declared_size = package.declared_size,
-    };
+    for (lock.packages, 0..) |package, index| {
+        const archive_sha256 = package.archive_identity.digests.sha256 orelse
+            return error.MissingPackageDigest;
+        packages[index] = .{
+            .name = package.name,
+            .version = package.version,
+            .architecture = package.architecture,
+            .origin = legacyPackageOrigin(package.origin, archive_sha256),
+            .package_sha256 = archive_sha256,
+            .cas_sha256 = archive_sha256,
+            .declared_size = package.declared_size,
+        };
+    }
     var status_reader = transaction_recovery.SystemStatusFileReader{
         .io = io,
         .expected_root = root,
@@ -6405,8 +6473,66 @@ fn publishBoundProvenance(
     );
     defer allocator.free(status_bytes);
     const status_digest = sha256(status_bytes);
+    const legacy_repositories = try allocator.alloc(
+        exact_lock_legacy.Repository,
+        lock.repositories.len,
+    );
+    defer allocator.free(legacy_repositories);
+    for (lock.repositories, legacy_repositories) |repository, *legacy| legacy.* = .{
+        .id = repository.id,
+        .snapshot_sha256 = repository.snapshot_sha256,
+        .release_sha256 = repository.release_sha256,
+        .index_sha256 = repository.index_identity.digests.sha256 orelse
+            return error.MissingRepositoryDigest,
+        .signer_fingerprints = repository.signer_fingerprints,
+    };
+    const legacy_artifacts = try allocator.alloc(
+        package_origin.LocalArtifactEvidence,
+        lock.local_artifacts.len,
+    );
+    defer allocator.free(legacy_artifacts);
+    for (lock.local_artifacts, legacy_artifacts) |artifact, *legacy| {
+        const archive_sha256 = artifact.archive_identity.digests.sha256 orelse
+            return error.MissingPackageDigest;
+        legacy.* = legacyPackageOrigin(
+            .{ .local_artifact = artifact },
+            archive_sha256,
+        ).local_artifact;
+    }
+    const legacy_packages = try allocator.alloc(
+        exact_lock_legacy.Package,
+        lock.packages.len,
+    );
+    defer allocator.free(legacy_packages);
+    for (lock.packages, legacy_packages) |package, *legacy| {
+        const archive_sha256 = package.archive_identity.digests.sha256 orelse
+            return error.MissingPackageDigest;
+        legacy.* = .{
+            .name = package.name,
+            .version = package.version,
+            .architecture = package.architecture,
+            .origin = legacyPackageOrigin(package.origin, archive_sha256),
+            .sha256 = archive_sha256,
+            .declared_size = package.declared_size,
+            .retention = switch (package.retention) {
+                .requested => .requested,
+                .dependency => .dependency,
+                .retained => .retained,
+            },
+            .dpkg_selection_hold = package.dpkg_selection_hold,
+        };
+    }
+    const legacy_lock: exact_lock_legacy.Lock = .{
+        .target_architecture = lock.target_architecture,
+        .request_sha256 = lock.request_sha256,
+        .policy_sha256 = lock.policy_sha256,
+        .repositories = legacy_repositories,
+        .local_artifacts = legacy_artifacts,
+        .packages = legacy_packages,
+        .digest_sha256 = lock.digest_sha256,
+    };
     const input: transaction_provenance_v2.ExecutionInput = .{
-        .exact_lock = lock,
+        .exact_lock = &legacy_lock,
         .target_architecture = lock.target_architecture,
         .request_sha256 = lock.request_sha256,
         .solver_policy_sha256 = lock.policy_sha256,
@@ -6610,21 +6736,29 @@ fn validateLockDescriptor(
         descriptor.version,
         descriptor.architecture,
     ) orelse return error.DescriptorMissingFromLock;
-    if (!std.mem.eql(u8, &locked.sha256, &descriptor.sha256) or
-        locked.declared_size != descriptor.size)
+    if (locked.archive_identity.digests.sha256 == null or
+        !std.mem.eql(
+            u8,
+            &locked.archive_identity.digests.sha256.?,
+            &descriptor.sha256,
+        ) or locked.declared_size != descriptor.size)
         return error.DescriptorLockMismatch;
     switch (locked.origin) {
         .authenticated_repository => return error.DescriptorLockMismatch,
         .local_artifact => |local| {
-            const expected_trust: package_origin.LocalArtifactTrustMode =
+            const expected_trust: package_origin.LocalArtifactTrustModeV2 =
                 switch (descriptor.trust_mode) {
                     .verified_https => .verified_https,
-                    .pinned_sha256 => .pinned_sha256,
+                    .pinned_sha256 => .pinned_content_digest,
                 };
-            const expected_artifact_id =
-                package_origin.artifactIdFromSha256(descriptor.sha256);
-            if (!std.mem.eql(u8, &local.artifact_id, &expected_artifact_id) or
-                !std.mem.eql(u8, &local.sha256, &descriptor.sha256) or
+            if (local.artifact_id != .sha256 or
+                !std.mem.eql(u8, &local.artifact_id.sha256, &descriptor.sha256) or
+                local.archive_identity.digests.sha256 == null or
+                !std.mem.eql(
+                    u8,
+                    &local.archive_identity.digests.sha256.?,
+                    &descriptor.sha256,
+                ) or
                 local.size != descriptor.size or
                 !std.mem.eql(u8, local.package, descriptor.package) or
                 !std.mem.eql(u8, local.version, descriptor.version) or
@@ -6764,11 +6898,7 @@ fn validateLockSnapshots(
                 &repository.release_sha256,
                 &snapshot.snapshot.provenance.release_digest.bytes,
             ) or
-            !std.mem.eql(
-                u8,
-                &repository.index_sha256,
-                &snapshot.snapshot.provenance.index_digest.bytes,
-            ))
+            !repository.index_identity.eql(snapshot.snapshot.provenance.index_identity))
             return error.RepositorySnapshotMismatch;
         const signatures =
             snapshot.snapshot.provenance.authentication_evidence.signatures;
@@ -7060,6 +7190,19 @@ const BindingFixture = struct {
         .acquisition_url = request.descriptor_url,
         .trust_mode = .pinned_sha256,
     };
+    const tagged_artifact: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = .{ .sha256 = artifact.sha256 },
+        .archive_identity = .{
+            .digests = .{ .sha256 = artifact.sha256 },
+            .primary = .sha256,
+        },
+        .size = artifact.size,
+        .package = artifact.package,
+        .version = artifact.version,
+        .architecture = artifact.architecture,
+        .acquisition_url = artifact.acquisition_url,
+        .trust_mode = .pinned_content_digest,
+    };
 
     actions: [1]solver.PlanAction,
     ordered_actions: [2]solver.OrderedAction,
@@ -7073,6 +7216,10 @@ const BindingFixture = struct {
                 .architecture = evidence.architecture,
                 .repository = null,
                 .sha256 = evidence.artifact_id,
+                .archive_identity = .{
+                    .digests = .{ .sha256 = evidence.sha256 },
+                    .primary = .sha256,
+                },
                 .package_size = evidence.size,
                 .installed_size_delta_bytes = 0,
                 .source_package = evidence.package,
@@ -9446,6 +9593,7 @@ fn testProjectedNativeUnchanged(projection: *const live_root.Projection, no_refr
             .acquisition_url = request.value.descriptor_url,
             .trust_mode = .pinned_sha256,
         };
+        const tagged_artifact = try upgradeLocalEvidence(artifact);
         var fixture = BindingFixture.init(artifact);
         var plan = fixture.plan();
         plan.actions = &.{};
@@ -9457,14 +9605,14 @@ fn testProjectedNativeUnchanged(projection: *const live_root.Projection, no_refr
             .request_sha256 = try operationRequestDigest(allocator, request.value, plan, .native),
             .policy_sha256 = repositoryLockPolicyDigest(.native),
             .repositories = &.{},
-            .local_artifacts = &.{artifact},
+            .local_artifacts = &.{tagged_artifact},
             .verified_origins = true,
             .packages = &.{.{
                 .name = artifact.package,
                 .version = artifact.version,
                 .architecture = artifact.architecture,
-                .origin = .{ .local_artifact = artifact },
-                .sha256 = artifact.sha256,
+                .origin = .{ .local_artifact = tagged_artifact },
+                .archive_identity = tagged_artifact.archive_identity,
                 .declared_size = artifact.size,
                 .retention = .requested,
                 .dpkg_selection_hold = false,
@@ -10318,6 +10466,7 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         .acquisition_url = request.descriptor_url,
         .trust_mode = .pinned_sha256,
     };
+    const tagged_local = try upgradeLocalEvidence(local);
     var fixture = BindingFixture.init(local);
     const repository_id: [64]u8 = @splat('a');
     const snapshot: [32]u8 = @splat(0x11);
@@ -10328,6 +10477,10 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         .architecture = "amd64",
         .repository = .{ .id = repository_id, .priority = 500 },
         .sha256 = package_origin.artifactIdFromSha256(sha256(dependency_bytes)),
+        .archive_identity = .{
+            .digests = .{ .sha256 = sha256(dependency_bytes) },
+            .primary = .sha256,
+        },
         .package_size = dependency_bytes.len,
         .installed_size_delta_bytes = 0,
         .source_package = "demo",
@@ -10353,8 +10506,8 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
             .name = local.package,
             .version = local.version,
             .architecture = local.architecture,
-            .origin = .{ .local_artifact = local },
-            .sha256 = local.sha256,
+            .origin = .{ .local_artifact = tagged_local },
+            .archive_identity = tagged_local.archive_identity,
             .declared_size = local.size,
             .retention = .requested,
             .dpkg_selection_hold = false,
@@ -10367,7 +10520,10 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
                 .repository_id = repository_id,
                 .repository_snapshot_sha256 = snapshot,
             } },
-            .sha256 = sha256(dependency_bytes),
+            .archive_identity = .{
+                .digests = .{ .sha256 = sha256(dependency_bytes) },
+                .primary = .sha256,
+            },
             .declared_size = dependency_bytes.len,
             .retention = .dependency,
             .dpkg_selection_hold = false,
@@ -10382,10 +10538,13 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
             .id = repository_id,
             .snapshot_sha256 = snapshot,
             .release_sha256 = @splat(2),
-            .index_sha256 = @splat(3),
+            .index_identity = .{
+                .digests = .{ .sha256 = @splat(3) },
+                .primary = .sha256,
+            },
             .signer_fingerprints = &.{@splat(4)},
         }} else &.{},
-        .local_artifacts = if (package_count == 0) &.{} else &.{local},
+        .local_artifacts = if (package_count == 0) &.{} else &.{tagged_local},
         .packages = packages[0..package_count],
         .verified_origins = true,
     });
@@ -10510,17 +10669,20 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
             try std.testing.expect(authorization.findFinalPackage("held", "amd64").?.dpkg_selection_hold);
             try std.testing.expect(authorization.findAction("held", "amd64") == null);
             for (lock.lock.packages, result.archives) |package, bytes| {
-                try std.testing.expectEqual(package.sha256, sha256(bytes));
-                const object_identity = @import("content_digest.zig").Identity.init(
-                    .{ .sha256 = package.sha256 },
-                    .sha256,
-                ) catch unreachable;
+                try std.testing.expectEqual(
+                    package.archive_identity.digests.sha256.?,
+                    sha256(bytes),
+                );
+                const object_identity = package.archive_identity;
                 var object_key_buffer: [135]u8 = undefined;
                 try cache.objects.deleteFile(
                     std.testing.io,
                     object_identity.cacheKey(&object_key_buffer),
                 );
-                try std.testing.expectEqual(package.sha256, sha256(bytes));
+                try std.testing.expectEqual(
+                    package.archive_identity.digests.sha256.?,
+                    sha256(bytes),
+                );
             }
             try native_operation.bind(allocator, root, &attempt, result.preparation.prepared.program.program);
             try std.testing.expectEqualDeep(
@@ -10685,8 +10847,9 @@ test "repository backend lock domains retain exact origins and reject the other 
         try std.testing.expectEqual(@as(usize, 1), lock.packages.len);
         try std.testing.expectEqual(@as(usize, 1), lock.local_artifacts.len);
         try std.testing.expectEqual(@as(usize, 0), lock.repositories.len);
-        try std.testing.expect(package_origin.eqlLocalArtifact(BindingFixture.artifact, lock.local_artifacts[0]));
-        try std.testing.expect(package_origin.eqlLocalArtifact(BindingFixture.artifact, lock.packages[0].origin.local_artifact));
+        const tagged_artifact = try upgradeLocalEvidence(BindingFixture.artifact);
+        try std.testing.expect(package_origin.eqlLocalArtifactV2(tagged_artifact, lock.local_artifacts[0]));
+        try std.testing.expect(package_origin.eqlLocalArtifactV2(tagged_artifact, lock.packages[0].origin.local_artifact));
 
         try validateLockPolicy(lock, backend);
         try validateLockRequest(allocator, lock, request, plan, backend);
@@ -11669,7 +11832,11 @@ const RepositoryTestExecutor = struct {
         if (!found_lock) return error.LockNotPublishedBeforeInstall;
         self.saw_lock_before_install = true;
         self.last_allow_host_root = request.policy.risk.allow_host_root;
-        const exact_lock = request.exact_lock_v2 orelse
+        const lock_digest = if (request.exact_lock_v3) |lock|
+            lock.digest_sha256
+        else if (request.exact_lock_v2) |lock|
+            lock.digest_sha256
+        else
             return error.MissingExactLock;
         self.saw_exact_lock = true;
         const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -11685,7 +11852,7 @@ const RepositoryTestExecutor = struct {
             .transaction_state = .not_started,
             .root_identity = @splat(0x22),
             .policy_sha256 = transaction_executor.policyDigest(request.policy),
-            .lock_sha256 = exact_lock.digest_sha256,
+            .lock_sha256 = lock_digest,
             .failure = .{ .code = code, .diagnostic = "injected pre-spawn failure" },
         };
         if (self.recovery_transition_first) return .{
@@ -11696,7 +11863,7 @@ const RepositoryTestExecutor = struct {
             .transaction_state = .interrupted,
             .root_identity = @splat(0x22),
             .policy_sha256 = transaction_executor.policyDigest(request.policy),
-            .lock_sha256 = exact_lock.digest_sha256,
+            .lock_sha256 = lock_digest,
             .failure = .{
                 .code = .invalid_recovery_transition,
                 .diagnostic = "injected recovery requirement",
@@ -11736,7 +11903,7 @@ const RepositoryTestExecutor = struct {
             .root_identity = @splat(0x22),
             .policy_sha256 = transaction_executor.policyDigest(request.policy),
             .lock_sha256 = switch (self.lock_digest_mode) {
-                .exact => exact_lock.digest_sha256,
+                .exact => lock_digest,
                 .missing => null,
                 .mismatch => @splat(0xfe),
             },
@@ -11764,7 +11931,11 @@ const RepositoryTestExecutor = struct {
         const self: *RepositoryTestExecutor = @ptrCast(@alignCast(context));
         self.recover_calls += 1;
         self.recovery_plan_sha256 = transaction_executor.planDigest(request.plan.*);
-        const exact_lock = request.exact_lock_v2 orelse
+        const lock_digest = if (request.exact_lock_v3) |lock|
+            lock.digest_sha256
+        else if (request.exact_lock_v2) |lock|
+            lock.digest_sha256
+        else
             return error.MissingExactLock;
         self.recovered_exact_lock = true;
         if (self.no_start_recovery_failure) |code| {
@@ -11781,7 +11952,7 @@ const RepositoryTestExecutor = struct {
                 .plan_sha256 = transaction_executor.planDigest(request.plan.*),
                 .root_identity = @splat(0x22),
                 .policy_sha256 = transaction_executor.policyDigest(request.policy),
-                .lock_sha256 = exact_lock.digest_sha256,
+                .lock_sha256 = lock_digest,
                 .failure = .{ .code = code, .diagnostic = "injected pre-spawn failure" },
             };
         }
@@ -11798,7 +11969,7 @@ const RepositoryTestExecutor = struct {
             .root_identity = @splat(0x22),
             .policy_sha256 = transaction_executor.policyDigest(request.policy),
             .lock_sha256 = switch (self.lock_digest_mode) {
-                .exact => exact_lock.digest_sha256,
+                .exact => lock_digest,
                 .missing => null,
                 .mismatch => @splat(0xfe),
             },
@@ -13242,7 +13413,7 @@ test "repository backend rejects mismatched local artifact evidence on recovery"
     );
     defer original.deinit();
     var artifacts = try std.testing.allocator.dupe(
-        package_origin.LocalArtifactEvidence,
+        package_origin.LocalArtifactEvidenceV2,
         original.lock.local_artifacts,
     );
     defer std.testing.allocator.free(artifacts);
@@ -13252,11 +13423,14 @@ test "repository backend rejects mismatched local artifact evidence on recovery"
     );
     defer std.testing.allocator.free(packages);
     const tampered_digest: [32]u8 = @splat(0xee);
-    artifacts[0].sha256 = tampered_digest;
-    artifacts[0].artifact_id = package_origin.artifactIdFromSha256(tampered_digest);
+    artifacts[0].archive_identity = .{
+        .digests = .{ .sha256 = tampered_digest },
+        .primary = .sha256,
+    };
+    artifacts[0].artifact_id = .{ .sha256 = tampered_digest };
     for (packages) |*package| switch (package.origin) {
         .local_artifact => {
-            package.sha256 = tampered_digest;
+            package.archive_identity = artifacts[0].archive_identity;
             package.origin = .{ .local_artifact = artifacts[0] };
         },
         .authenticated_repository => {},
@@ -13572,15 +13746,18 @@ test "repository operation budget enforces exact boundaries and checked overflow
         budget.reserveCacheGrowth(1, null),
     );
 
-    const local_evidence: package_origin.LocalArtifactEvidence = .{
-        .artifact_id = @splat('a'),
-        .sha256 = @splat(0x11),
+    const local_evidence: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = .{ .sha256 = @splat(0x11) },
+        .archive_identity = .{
+            .digests = .{ .sha256 = @splat(0x11) },
+            .primary = .sha256,
+        },
         .size = 4,
         .package = "descriptor",
         .version = "1",
         .architecture = "amd64",
         .acquisition_url = "file:///descriptor.deb",
-        .trust_mode = .pinned_sha256,
+        .trust_mode = .pinned_content_digest,
     };
     const packages = [_]exact_lock_v2.Package{
         .{
@@ -13591,7 +13768,10 @@ test "repository operation budget enforces exact boundaries and checked overflow
                 .repository_id = @splat('b'),
                 .repository_snapshot_sha256 = @splat(0x22),
             } },
-            .sha256 = @splat(0x33),
+            .archive_identity = .{
+                .digests = .{ .sha256 = @splat(0x33) },
+                .primary = .sha256,
+            },
             .declared_size = 7,
             .retention = .dependency,
             .dpkg_selection_hold = false,
@@ -13601,7 +13781,7 @@ test "repository operation budget enforces exact boundaries and checked overflow
             .version = "1",
             .architecture = "amd64",
             .origin = .{ .local_artifact = local_evidence },
-            .sha256 = local_evidence.sha256,
+            .archive_identity = local_evidence.archive_identity,
             .declared_size = local_evidence.size,
             .retention = .requested,
             .dpkg_selection_hold = false,

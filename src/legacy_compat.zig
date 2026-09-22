@@ -113,6 +113,9 @@ pub fn classify(identity: Identity) PolicyError!Classification {
     if (matches(identity, "https://debz.dev/schema/exact-closure-lock-v2", 2)) {
         return explicit(.exact_lock, identity.backend);
     }
+    if (matches(identity, "https://debz.dev/schema/exact-closure-lock-v3", 3)) {
+        return explicit(.exact_lock, identity.backend);
+    }
     if (matches(identity, "https://debz.dev/schema/transaction-result-v1", 1) or
         matches(identity, "https://debz.dev/schema/transaction-result-v2", 2))
     {
@@ -379,6 +382,7 @@ const canonical_schemas = [_][]const u8{
     "https://debz.dev/schema/system-profile-v2",
     "https://debz.dev/schema/exact-closure-lock-v1",
     "https://debz.dev/schema/exact-closure-lock-v2",
+    "https://debz.dev/schema/exact-closure-lock-v3",
     "https://debz.dev/schema/transaction-result-v1",
     "https://debz.dev/schema/transaction-result-v2",
     "io.github.cataggar.debz.transaction-result-summary.v1",

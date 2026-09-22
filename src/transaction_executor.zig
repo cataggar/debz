@@ -6,6 +6,7 @@ const dpkg_status = @import("dpkg_status.zig");
 const recovery = @import("transaction_recovery.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const package_origin = @import("package_origin.zig");
 
 pub const Phase = enum { bootstrap_extract, remove, unpack, configure_pending, configure, triggers, audit };
@@ -62,6 +63,7 @@ pub const Request = struct {
     policy: Policy,
     exact_lock: ?*const exact_lock.Lock = null,
     exact_lock_v2: ?*const exact_lock_v2.Lock = null,
+    exact_lock_v3: ?*const exact_lock_v3.Lock = null,
 };
 
 pub const EnvironmentEntry = struct {
@@ -280,6 +282,7 @@ pub const RecoveryRequest = struct {
     policy: Policy,
     exact_lock: ?*const exact_lock.Lock = null,
     exact_lock_v2: ?*const exact_lock_v2.Lock = null,
+    exact_lock_v3: ?*const exact_lock_v3.Lock = null,
 };
 
 pub const RecoveryReport = struct {
@@ -346,6 +349,8 @@ pub fn execute(
     state.lock_sha256 = if (request.exact_lock) |lock|
         lock.digest_sha256
     else if (request.exact_lock_v2) |lock|
+        lock.digest_sha256
+    else if (request.exact_lock_v3) |lock|
         lock.digest_sha256
     else
         null;
@@ -837,6 +842,7 @@ pub fn execute(
         request.plan.*,
         request.exact_lock,
         request.exact_lock_v2,
+        request.exact_lock_v3,
         request.policy.exact_lock_verification,
         journal,
         request.install_root,
@@ -919,6 +925,8 @@ pub fn recover(
         lock.digest_sha256
     else if (request.exact_lock_v2) |lock|
         lock.digest_sha256
+    else if (request.exact_lock_v3) |lock|
+        lock.digest_sha256
     else
         null;
 
@@ -929,6 +937,7 @@ pub fn recover(
         .policy = request.policy,
         .exact_lock = request.exact_lock,
         .exact_lock_v2 = request.exact_lock_v2,
+        .exact_lock_v3 = request.exact_lock_v3,
     }, dependencies.filesystem) catch |err| {
         // Recovery does not need package artifacts, so only retain root, plan,
         // and policy validation errors from the shared preflight.
@@ -1000,6 +1009,7 @@ pub fn recover(
             request.plan.*,
             request.exact_lock,
             request.exact_lock_v2,
+            request.exact_lock_v3,
             request.policy.exact_lock_verification,
             journal,
             request.install_root,
@@ -1189,6 +1199,7 @@ pub fn recover(
         request.plan.*,
         request.exact_lock,
         request.exact_lock_v2,
+        request.exact_lock_v3,
         request.policy.exact_lock_verification,
         journal,
         request.install_root,
@@ -1265,6 +1276,7 @@ fn verifyFinal(
     plan: solver.Plan,
     lock: ?*const exact_lock.Lock,
     lock_v2: ?*const exact_lock_v2.Lock,
+    lock_v3: ?*const exact_lock_v3.Lock,
     verification: ExactLockVerification,
     journal: recovery.Journal,
     root: []const u8,
@@ -1283,6 +1295,26 @@ fn verifyFinal(
             64 * 1024 * 1024,
         ),
         .locked_packages => recovery.verifyExactLockV2LockedPackagesWithEvidence(
+            allocator,
+            closure.*,
+            plan,
+            journal,
+            root,
+            status,
+            64 * 1024 * 1024,
+        ),
+    };
+    if (lock_v3) |closure| return switch (verification) {
+        .full_closure => recovery.verifyExactLockV3WithEvidence(
+            allocator,
+            closure.*,
+            plan,
+            journal,
+            root,
+            status,
+            64 * 1024 * 1024,
+        ),
+        .locked_packages => recovery.verifyExactLockV3LockedPackagesWithEvidence(
             allocator,
             closure.*,
             plan,
@@ -1365,10 +1397,13 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
         if (ordered.kind == .purge) return error.UnsupportedPurgeAction;
     if (request.plan.actions.len > 100_000 or request.plan.ordered_actions.len > 300_000)
         return error.PlanTooLarge;
-    if (request.exact_lock != null and request.exact_lock_v2 != null)
+    const lock_count = @intFromBool(request.exact_lock != null) +
+        @intFromBool(request.exact_lock_v2 != null) +
+        @intFromBool(request.exact_lock_v3 != null);
+    if (lock_count > 1)
         return error.MultipleExactLocks;
     if (request.policy.exact_lock_verification == .locked_packages and
-        request.exact_lock_v2 == null)
+        request.exact_lock_v2 == null and request.exact_lock_v3 == null)
         return error.LockedPackageVerificationRequiresV2Lock;
     if (request.exact_lock) |lock| {
         if (!std.mem.eql(u8, lock.target_architecture, request.plan.target_architecture))
@@ -1401,6 +1436,25 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                 !std.mem.eql(u8, &locked.sha256, &digest) or
                 locked.declared_size != action.package_size.?)
                 return error.PlanLockEvidenceMismatch;
+        }
+        if (request.exact_lock_v3) |lock_v3| {
+            if (!std.mem.eql(u8, lock_v3.target_architecture, request.plan.target_architecture))
+                return error.LockArchitectureMismatch;
+            for (request.plan.actions) |action| {
+                if (solver.isRemoval(action.kind)) continue;
+                const locked = lock_v3.findPackage(
+                    action.package,
+                    action.version,
+                    action.architecture,
+                ) orelse return error.PlanOutsideLockedClosure;
+                const identity = action.archive_identity orelse
+                    return error.MissingAuthenticatedArtifactMetadata;
+                if (action.package_size == null or
+                    !actionMatchesLockV3(action, locked) or
+                    !identity.eql(locked.archive_identity) or
+                    locked.declared_size != action.package_size.?)
+                    return error.PlanLockEvidenceMismatch;
+            }
         }
     }
     if (request.policy.process_timeout_ms == 0) return error.InvalidProcessTimeout;
@@ -1538,6 +1592,36 @@ fn actionMatchesLockV2(
     };
 }
 
+fn actionMatchesLockV3(
+    action: solver.PlanAction,
+    locked: exact_lock_v3.Package,
+) bool {
+    const origin = action.origin orelse return false;
+    return switch (locked.origin) {
+        .authenticated_repository => |expected| switch (origin) {
+            .authenticated_repository => |actual| std.mem.eql(
+                u8,
+                &actual.id,
+                &expected.repository_id,
+            ),
+            .local_artifact => false,
+        },
+        .local_artifact => |expected| switch (origin) {
+            .authenticated_repository => false,
+            .local_artifact => |actual| blk: {
+                const sha256 = expected.archive_identity.digests.sha256 orelse
+                    break :blk false;
+                break :blk std.mem.eql(u8, &actual.evidence.sha256, &sha256) and
+                    actual.evidence.size == expected.size and
+                    std.mem.eql(u8, actual.evidence.package, expected.package) and
+                    std.mem.eql(u8, actual.evidence.version, expected.version) and
+                    std.mem.eql(u8, actual.evidence.architecture, expected.architecture) and
+                    std.mem.eql(u8, actual.evidence.acquisition_url, expected.acquisition_url);
+            },
+        },
+    };
+}
+
 fn validateArtifact(
     allocator: std.mem.Allocator,
     filesystem: FileSystem,
@@ -1546,20 +1630,31 @@ fn validateArtifact(
     limits: deb_payload.Limits,
 ) ![32]u8 {
     const expected_size = action.package_size orelse return error.MissingAuthenticatedSize;
-    const expected_hex = action.sha256 orelse return error.MissingAuthenticatedDigest;
-    const expected_digest = parseHexDigest(expected_hex) catch return error.InvalidAuthenticatedDigest;
     const maximum = std.math.cast(usize, expected_size) orelse return error.ArtifactTooLarge;
     const bytes = try filesystem.readArtifact(allocator, artifact.path, maximum);
     defer allocator.free(bytes);
+    const legacy_digest = if (action.archive_identity == null) blk: {
+        const expected_hex = action.sha256 orelse return error.MissingAuthenticatedDigest;
+        break :blk parseHexDigest(expected_hex) catch
+            return error.InvalidAuthenticatedDigest;
+    } else null;
+    if (action.archive_identity) |identity| {
+        identity.verify(bytes) catch return error.ArchiveDigestMismatch;
+    } else {
+        var observed: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &observed, .{});
+        if (!std.mem.eql(u8, &observed, &legacy_digest.?))
+            return error.ArchiveDigestMismatch;
+    }
     if (bytes.len != expected_size) return error.SizeMismatch;
     var actual: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
-    if (!std.mem.eql(u8, &actual, &expected_digest)) return error.DigestMismatch;
 
     const validation = if (isLocalArtifactAction(action))
         deb_payload.inspectLocal(allocator, bytes, .{
             .size = expected_size,
-            .sha256 = expected_digest,
+            .sha256 = legacy_digest,
+            .archive_identity = action.archive_identity,
             .filename = std.fs.path.basename(artifact.path),
             .identity = .{
                 .package = artifact.package,
@@ -1580,7 +1675,8 @@ fn validateArtifact(
             .requested_architecture = action.architecture,
             .filename = std.fs.path.basename(artifact.path),
             .size = expected_size,
-            .sha256 = expected_digest,
+            .sha256 = legacy_digest,
+            .archive_identity = action.archive_identity,
             .require_conventional_filename = false,
         }, limits);
     };

@@ -1713,17 +1713,23 @@ fn validateExactLockV3Input(
             return (try failureOne(backing, arena, .lock_repository_mismatch, null, null, "repository snapshot differs from the exact lock")).failure;
     }
     for (lock.local_artifacts) |locked_artifact| {
-        const repository_index = findRepositoryIndexSorted(
-            repositories,
-            repository_order,
-            .{ .bytes = locked_artifact.artifact_id },
-        ) orelse
+        var repository_index: ?usize = null;
+        for (repository_order) |candidate_index| {
+            const candidate = repositories[candidate_index];
+            if (candidate.local_artifact) |artifact| {
+                if (eqlLegacyLocalArtifactV2(artifact, locked_artifact)) {
+                    repository_index = candidate_index;
+                    break;
+                }
+            }
+        }
+        const resolved_index = repository_index orelse
             return (try failureOne(backing, arena, .lock_package_mismatch, locked_artifact.package, null, "locked local artifact is unavailable")).failure;
-        const repository = repositories[repository_index];
+        const repository = repositories[resolved_index];
         const artifact = repository.local_artifact orelse
             return (try failureOne(backing, arena, .lock_package_mismatch, locked_artifact.package, null, "verified local artifact evidence is unavailable")).failure;
         if (repository.eligibility != .verified_local_artifact or
-            !package_origin.eqlLocalArtifact(artifact, locked_artifact))
+            !eqlLegacyLocalArtifactV2(artifact, locked_artifact))
             return (try failureOne(backing, arena, .lock_package_mismatch, locked_artifact.package, null, "verified local artifact evidence differs from the exact lock")).failure;
     }
     return null;
@@ -2005,7 +2011,7 @@ fn originMatchesLockV3(
         .authenticated_repository => |repository| origin.local_artifact == null and
             std.mem.eql(u8, origin.repository_id.slice(), &repository.repository_id),
         .local_artifact => |artifact| if (origin.local_artifact) |observed|
-            package_origin.eqlLocalArtifact(observed, artifact)
+            eqlLegacyLocalArtifactV2(observed, artifact)
         else
             false,
     };
@@ -3266,9 +3272,26 @@ fn planActionMatchesLockV3(action: PlanAction, locked: exact_lock_v3.Package) bo
         },
         .local_artifact => |artifact| switch (origin) {
             .authenticated_repository => false,
-            .local_artifact => |observed| package_origin.eqlLocalArtifact(observed.evidence, artifact),
+            .local_artifact => |observed| eqlLegacyLocalArtifactV2(observed.evidence, artifact),
         },
     };
+}
+
+fn eqlLegacyLocalArtifactV2(
+    legacy: package_origin.LocalArtifactEvidence,
+    tagged: package_origin.LocalArtifactEvidenceV2,
+) bool {
+    const sha256 = tagged.archive_identity.digests.sha256 orelse return false;
+    return std.mem.eql(u8, &legacy.sha256, &sha256) and
+        legacy.size == tagged.size and
+        std.mem.eql(u8, legacy.package, tagged.package) and
+        std.mem.eql(u8, legacy.version, tagged.version) and
+        std.mem.eql(u8, legacy.architecture, tagged.architecture) and
+        std.mem.eql(u8, legacy.acquisition_url, tagged.acquisition_url) and
+        switch (legacy.trust_mode) {
+            .pinned_sha256 => tagged.trust_mode == .pinned_content_digest,
+            .verified_https => tagged.trust_mode == .verified_https,
+        };
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {

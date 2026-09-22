@@ -1371,6 +1371,61 @@ test "SHA512-only package uses tagged CAS and verifies without fabricated SHA256
     try std.testing.expectEqual(@as(usize, 0), offline_transport.count);
 }
 
+test "package_acquisition.test.tagged CAS reopens and rejects cross-algorithm poisoning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = "persistent tagged object";
+    const full = content_digest.Identity.ofSupported(bytes);
+    const sha512_only = try content_digest.Identity.init(
+        .{ .sha512 = full.digests.sha512.? },
+        .sha512,
+    );
+    {
+        var cache = try testCache(&tmp);
+        defer cache.deinit();
+        try cache.publish(
+            std.testing.allocator,
+            sha512_only,
+            bytes.len,
+            bytes,
+            .fail_fast,
+            .{},
+        );
+    }
+    {
+        var reopened = try testCache(&tmp);
+        defer reopened.deinit();
+        const mixed = try reopened.lookup(
+            std.testing.allocator,
+            full,
+            bytes.len,
+            .verify_all_supported,
+        );
+        defer std.testing.allocator.free(mixed);
+        try std.testing.expectEqualStrings(bytes, mixed);
+
+        var poisoned = full;
+        poisoned.digests.sha256.?[0] ^= 1;
+        try std.testing.expectError(
+            error.CorruptObject,
+            reopened.lookup(
+                std.testing.allocator,
+                poisoned,
+                bytes.len,
+                .verify_all_supported,
+            ),
+        );
+        const original = try reopened.lookup(
+            std.testing.allocator,
+            sha512_only,
+            bytes.len,
+            .verify_all_supported,
+        );
+        defer std.testing.allocator.free(original);
+        try std.testing.expectEqualStrings(bytes, original);
+    }
+}
+
 test "package locations reject platform path separators" {
     try std.testing.expectError(
         error.InvalidBaseUri,

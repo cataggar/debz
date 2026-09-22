@@ -127,18 +127,18 @@ commands additionally require `--conffile keep-existing` or
 retains `legacy_dpkg`. Embedders select the same backend with
 `ProductionBackend.transaction_backend`, without changing product API v1
 request or result encoding. Experimental core native execution requires an
-explicit reviewed v2 lock, confirmation, conffile policy, authenticated
+explicit reviewed v3 lock, confirmation, conffile policy, authenticated
 repositories, and a supported non-host Linux root. The existing package-owned
 `usr/bin/dpkg-trigger` target and private mount-namespace privileges are required;
 missing targets refuse without placeholders. Native execution never calls the
 command-shaped executor, including injected executors. There is no fallback.
 
-Native `plan`/`download` resolve and replay exact-lock v2 from authenticated
+Native `plan`/`download` resolve and replay exact-lock v3 from authenticated
 repository evidence. They do not convert v1 locks or invent local-artifact
 origins. Native solver policy uses a distinct digest domain, so locks cannot
 cross backend policy boundaries. V1 remains the legacy core format; neither
 backend silently accepts the other's format. Native package downloads bind
-identity, repository/snapshot, SHA-256, and size before cache or transport
+identity, repository/snapshot, the complete supported digest set, and size before cache or transport
 access, including cache-only replay. The separate `package-cache` commands
 also support explicit native selection as described above; other consumer
 contracts remain gated where documented.
@@ -339,10 +339,12 @@ Package-cache JSON schemas are:
 - [`package-cache-fingerprint-v2.json`](../schema/package-cache-fingerprint-v2.json)
 - [`package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
 - [`package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
+- [`package-cache-fingerprint-v5.json`](../schema/package-cache-fingerprint-v5.json)
 - [`package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
 - [`package-cache-result-v2.json`](../schema/package-cache-result-v2.json)
 - [`package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
 - [`package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
+- [`package-cache-result-v5.json`](../schema/package-cache-result-v5.json)
 - [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 
 Their successful outputs include the canonical lock digest, CLI-owned

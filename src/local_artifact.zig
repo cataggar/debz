@@ -37,6 +37,70 @@ pub const Request = struct {
     policy: Policy,
 };
 
+pub const TrustModeV2 = enum {
+    https,
+    content_digest,
+};
+
+pub const RequestV2 = struct {
+    uri: repository_acquisition.Uri,
+    expected_identity: ?content_digest.Identity = null,
+    expected_size: ?u64 = null,
+    require_https: bool = false,
+    policy: Policy,
+};
+
+pub const ProvenanceV2 = struct {
+    effective_uri: []u8,
+    size: u64,
+    archive_identity: content_digest.Identity,
+    cache_key: []u8,
+    trust_mode: TrustModeV2,
+    outcome: Outcome,
+    cache_growth_bytes: u64,
+    status: ?u16,
+    timing: repository_acquisition.Timing,
+
+    pub fn deinit(self: *ProvenanceV2, allocator: std.mem.Allocator) void {
+        allocator.free(self.effective_uri);
+        allocator.free(self.cache_key);
+        self.* = undefined;
+    }
+
+    pub fn originEvidence(
+        self: ProvenanceV2,
+        package: []const u8,
+        version: []const u8,
+        architecture: []const u8,
+    ) package_origin.LocalArtifactEvidenceV2 {
+        return .{
+            .artifact_id = package_origin.artifactIdFromIdentity(self.archive_identity),
+            .archive_identity = self.archive_identity,
+            .size = self.size,
+            .package = package,
+            .version = version,
+            .architecture = architecture,
+            .acquisition_url = self.effective_uri,
+            .trust_mode = switch (self.trust_mode) {
+                .content_digest => .pinned_content_digest,
+                .https => .verified_https,
+            },
+        };
+    }
+};
+
+pub const ArtifactV2 = struct {
+    allocator: std.mem.Allocator,
+    bytes: []u8,
+    provenance: ProvenanceV2,
+
+    pub fn deinit(self: *ArtifactV2) void {
+        self.allocator.free(self.bytes);
+        self.provenance.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
 pub const Provenance = struct {
     effective_uri: []u8,
     size: u64,
@@ -119,7 +183,150 @@ pub fn acquire(
             size > cache.limits.maximum_object_bytes)
             return error.ArtifactTooLarge;
     }
+    return acquireLegacyValidated(allocator, cache, request, dependencies);
+}
 
+pub fn acquireV2(
+    allocator: std.mem.Allocator,
+    cache: *package_acquisition.Cache,
+    request: RequestV2,
+    dependencies: repository_acquisition.Dependencies,
+) !ArtifactV2 {
+    if (request.policy.maximum_artifact_bytes == 0) return error.InvalidConfiguration;
+    if (request.uri.user != null or request.uri.password != null)
+        return error.CredentialBearingUri;
+    if (request.expected_identity) |identity|
+        _ = content_digest.Identity.init(identity.digests, identity.primary) catch
+            return error.InvalidConfiguration;
+
+    const pinned = request.expected_identity != null;
+    if (!allowedScheme(request.uri, pinned, request.require_https))
+        return error.UnsupportedScheme;
+    if (request.expected_size) |size| {
+        if (size > request.policy.maximum_artifact_bytes or
+            size > cache.limits.maximum_object_bytes)
+            return error.ArtifactTooLarge;
+    }
+
+    if (request.expected_identity) |identity| {
+        if (request.expected_size) |size| {
+            if (cache.lookup(allocator, identity, size, .verify_all_supported)) |bytes| {
+                errdefer allocator.free(bytes);
+                var key_buffer: [135]u8 = undefined;
+                const cache_key = try allocator.dupe(u8, identity.cacheKey(&key_buffer));
+                errdefer allocator.free(cache_key);
+                const now = dependencies.clock.nowMs();
+                const effective_uri = try repository_acquisition.redactUri(allocator, request.uri);
+                return .{
+                    .allocator = allocator,
+                    .bytes = bytes,
+                    .provenance = .{
+                        .effective_uri = effective_uri,
+                        .size = size,
+                        .archive_identity = identity,
+                        .cache_key = cache_key,
+                        .trust_mode = if (request.require_https) .https else .content_digest,
+                        .outcome = .cache_hit,
+                        .cache_growth_bytes = 0,
+                        .status = null,
+                        .timing = .{
+                            .started_ms = now,
+                            .completed_ms = now,
+                            .attempts = 0,
+                        },
+                    },
+                };
+            } else |err| switch (err) {
+                error.CacheMiss, error.CorruptObject => {},
+                error.PackageTooLarge => return error.ArtifactTooLarge,
+                else => |other| return other,
+            }
+        }
+    }
+
+    const maximum_transfer_bytes = @min(
+        request.policy.maximum_artifact_bytes,
+        cache.limits.maximum_object_bytes,
+    );
+    const response_limit = if (request.expected_size) |size|
+        @min(
+            maximum_transfer_bytes,
+            std.math.cast(usize, std.math.add(u64, size, 1) catch size) orelse
+                maximum_transfer_bytes,
+        )
+    else
+        maximum_transfer_bytes;
+    var acquired = repository_acquisition.acquire(allocator, .{
+        .uri = request.uri,
+        .proxy = request.policy.proxy,
+        .deadlines = request.policy.deadlines,
+        .redirect_limit = request.policy.redirect_limit,
+        .retry = request.policy.retry,
+        .max_response_bytes = response_limit,
+        .credentials = request.policy.credentials,
+        .require_https = request.require_https or !pinned,
+    }, dependencies) catch |err| switch (err) {
+        error.ResponseTooLarge => if (response_limit < maximum_transfer_bytes)
+            return error.SizeMismatch
+        else
+            return error.ArtifactTooLarge,
+        else => |other| return other,
+    };
+    defer acquired.deinit(allocator);
+
+    if ((!pinned or request.require_https) and
+        !acquired.provenance.https_chain_verified)
+        return error.UnsupportedScheme;
+    if (acquired.bytes.len > request.policy.maximum_artifact_bytes or
+        acquired.bytes.len > cache.limits.maximum_object_bytes)
+        return error.ArtifactTooLarge;
+    if (request.expected_size) |size| {
+        if (acquired.bytes.len != size) return error.SizeMismatch;
+    }
+    const identity = request.expected_identity orelse
+        content_digest.Identity.ofSupported(acquired.bytes);
+    identity.verify(acquired.bytes) catch return error.DigestMismatch;
+    const existing_size = try cache.objectSize(identity);
+    try cache.publish(
+        allocator,
+        identity,
+        acquired.bytes.len,
+        acquired.bytes,
+        request.policy.cache_lock,
+        .{},
+    );
+
+    var key_buffer: [135]u8 = undefined;
+    const cache_key = try allocator.dupe(u8, identity.cacheKey(&key_buffer));
+    errdefer allocator.free(cache_key);
+    const bytes = acquired.bytes;
+    acquired.bytes = &.{};
+    const provenance = acquired.provenance;
+    acquired.provenance.effective_uri = &.{};
+    return .{
+        .allocator = allocator,
+        .bytes = bytes,
+        .provenance = .{
+            .effective_uri = provenance.effective_uri,
+            .size = bytes.len,
+            .archive_identity = identity,
+            .cache_key = cache_key,
+            .trust_mode = if (!pinned or request.require_https) .https else .content_digest,
+            .outcome = .acquired,
+            .cache_growth_bytes = bytes.len -| (existing_size orelse 0),
+            .status = provenance.status,
+            .timing = provenance.timing,
+        },
+    };
+}
+
+fn acquireLegacyValidated(
+    allocator: std.mem.Allocator,
+    cache: *package_acquisition.Cache,
+    request: Request,
+    dependencies: repository_acquisition.Dependencies,
+) !Artifact {
+    const pinned = request.expected_sha256 != null;
     if (request.expected_sha256) |digest| {
         const cache_identity = try content_digest.Identity.init(
             .{ .sha256 = digest.bytes },
@@ -596,4 +803,73 @@ test "pinned size and digest use verified cache without acquisition" {
     try std.testing.expectEqual(Outcome.cache_hit, artifact.provenance.outcome);
     try std.testing.expectEqual(@as(usize, 0), transport.count);
     try std.testing.expectEqualStrings(body, artifact.bytes);
+}
+
+test "local_artifact.test.v2 SHA512-only pin persists without SHA256 synthesis" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    const body = "sha512-only local artifact";
+    const identity = try content_digest.Identity.init(
+        .{ .sha512 = content_digest.Value.of(.sha512, body).sha512 },
+        .sha512,
+    );
+    var transport: TestTransport = .{ .body = body };
+    var artifact = try acquireV2(std.testing.allocator, &cache, .{
+        .uri = try repository_acquisition.Uri.parse("file:///package.deb"),
+        .expected_identity = identity,
+        .expected_size = body.len,
+        .policy = testPolicy(),
+    }, transport.dependencies());
+    defer artifact.deinit();
+    try std.testing.expect(artifact.provenance.archive_identity.digests.sha256 == null);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        artifact.provenance.cache_key,
+        "sha512-",
+    ));
+    const evidence = artifact.provenance.originEvidence("demo", "1", "amd64");
+    try package_origin.validateLocalArtifactV2(evidence);
+
+    var cached = try acquireV2(std.testing.allocator, &cache, .{
+        .uri = try repository_acquisition.Uri.parse("file:///package.deb"),
+        .expected_identity = identity,
+        .expected_size = body.len,
+        .policy = testPolicy(),
+    }, transport.dependencies());
+    defer cached.deinit();
+    try std.testing.expectEqual(Outcome.cache_hit, cached.provenance.outcome);
+    try std.testing.expectEqual(@as(usize, 1), transport.count);
+}
+
+test "local_artifact.test.v2 mixed identity verifies every digest before publish" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    const body = "mixed local artifact";
+    var identity = content_digest.Identity.ofSupported(body);
+    identity.digests.sha256.?[0] ^= 1;
+    var transport: TestTransport = .{ .body = body };
+    try std.testing.expectError(error.DigestMismatch, acquireV2(
+        std.testing.allocator,
+        &cache,
+        .{
+            .uri = try repository_acquisition.Uri.parse("file:///package.deb"),
+            .expected_identity = identity,
+            .expected_size = body.len,
+            .policy = testPolicy(),
+        },
+        transport.dependencies(),
+    ));
+    try std.testing.expectError(
+        error.CacheMiss,
+        cache.lookup(
+            std.testing.allocator,
+            identity,
+            body.len,
+            .verify_all_supported,
+        ),
+    );
 }

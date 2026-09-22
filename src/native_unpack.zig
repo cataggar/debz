@@ -31,6 +31,8 @@ const archive_application = @import("archive_application.zig");
 const control_record = @import("control_record.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
+const package_origin = @import("package_origin.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_alternatives = @import("native_alternatives.zig");
@@ -22064,13 +22066,42 @@ fn productionLifecycleRequest(
     };
 }
 
+fn executorOrigin(
+    locked: exact_lock_v3.Package,
+    archive_sha256: [32]u8,
+) exact_lock_v2.PackageOrigin {
+    return switch (locked.origin) {
+        .authenticated_repository => |origin| .{
+            .authenticated_repository = .{
+                .repository_id = origin.repository_id,
+                .repository_snapshot_sha256 = origin.repository_snapshot_sha256,
+            },
+        },
+        .local_artifact => |artifact| .{
+            .local_artifact = .{
+                .artifact_id = package_origin.artifactIdFromSha256(archive_sha256),
+                .sha256 = archive_sha256,
+                .size = artifact.size,
+                .package = artifact.package,
+                .version = artifact.version,
+                .architecture = artifact.architecture,
+                .acquisition_url = artifact.acquisition_url,
+                .trust_mode = switch (artifact.trust_mode) {
+                    .pinned_content_digest => .pinned_sha256,
+                    .verified_https => .verified_https,
+                },
+            },
+        },
+    };
+}
+
 /// Experimental caller-owned runtime. Product/CLI backend selection remains
 /// separate; this interface never accepts fixture requests or alternate helpers.
 pub const Runtime = struct {
     pub const PrepareRequest = struct {
         attempt: *root_operation.Attempt,
         plan: *const solver.Plan,
-        exact_lock: *const exact_lock_v2.Lock,
+        exact_lock: *const exact_lock_v3.Lock,
         archives: []const []const u8,
         policy: transaction_executor.Policy,
     };
@@ -22231,12 +22262,13 @@ pub const Runtime = struct {
                 model.facts.version,
                 model.facts.architecture,
             ) orelse return error.ArchiveEvidenceMismatch;
-            if (locked.declared_size != bytes.len or
-                !std.mem.eql(u8, &locked.sha256, &model.provenance().sha256))
+            if (locked.declared_size != bytes.len)
+                return error.ArchiveEvidenceMismatch;
+            locked.archive_identity.verify(bytes) catch
                 return error.ArchiveEvidenceMismatch;
             if (!supportedArchiveMetadata(model))
                 return error.UnsupportedNativeArchive;
-            origins[index] = locked.origin;
+            origins[index] = executorOrigin(locked, model.provenance().sha256);
         }
         const archives = try programArchiveEvidence(temporary, models, request.archives, origins);
         var triggers = database.model.triggers.interests.len != 0 or
@@ -29019,7 +29051,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         &.{}
     else
         try programArchiveEvidence(arena.allocator(), &models, &.{bytes}, &.{origin});
-    var lock = try exact_lock_v2.create(testing.allocator, .{
+    var lock = try exact_lock_v3.create(testing.allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = @splat(7),
         .policy_sha256 = @splat(8),
@@ -29027,7 +29059,10 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .id = repository_id,
             .snapshot_sha256 = snapshot,
             .release_sha256 = @splat(3),
-            .index_sha256 = @splat(4),
+            .index_identity = .{
+                .digests = .{ .sha256 = @splat(4) },
+                .primary = .sha256,
+            },
             .signer_fingerprints = &.{@splat(5)},
         }},
         .local_artifacts = &.{},
@@ -29035,8 +29070,14 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .name = "app",
             .version = "1.2",
             .architecture = "amd64",
-            .origin = origin,
-            .sha256 = models[0].provenance().sha256,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } },
+            .archive_identity = .{
+                .digests = .{ .sha256 = models[0].provenance().sha256 },
+                .primary = .sha256,
+            },
             .declared_size = bytes.len,
             .retention = .requested,
             .dpkg_selection_hold = false,
@@ -29052,6 +29093,10 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .architecture = "amd64",
             .repository = .{ .id = repository_id, .priority = 500 },
             .sha256 = hex(32, models[0].provenance().sha256),
+            .archive_identity = .{
+                .digests = .{ .sha256 = models[0].provenance().sha256 },
+                .primary = .sha256,
+            },
             .package_size = bytes.len,
             .installed_size_delta_bytes = 0,
             .source_package = "app",
@@ -29208,7 +29253,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         try testing.expectEqual(.missing_archive, refused.diagnostic.diagnostic.code);
         var changed_lock = lock.lock;
         var changed_package = lock.lock.packages[0];
-        changed_package.sha256[0] ^= 1;
+        changed_package.archive_identity.digests.sha256.?[0] ^= 1;
         changed_lock.packages = &.{changed_package};
         var changed_request = request;
         changed_request.exact_lock = &changed_lock;

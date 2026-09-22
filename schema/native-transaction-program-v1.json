@@ -183,21 +183,16 @@
     "lockBinding": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "schema",
-        "version",
-        "digest_sha256"
-      ],
+      "required": ["schema", "version", "digest_sha256"],
       "properties": {
         "schema": {
-          "const": "https://debz.dev/schema/exact-closure-lock-v2"
+          "enum": [
+            "https://debz.dev/schema/exact-closure-lock-v2",
+            "https://debz.dev/schema/exact-closure-lock-v3"
+          ]
         },
-        "version": {
-          "const": 2
-        },
-        "digest_sha256": {
-          "$ref": "#/$defs/sha256"
-        }
+        "version": { "enum": [2, 3] },
+        "digest_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "policy": {

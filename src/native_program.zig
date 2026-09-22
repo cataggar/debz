@@ -37,6 +37,7 @@ const package_path = @import("package_path.zig");
 const debian_version = @import("debian_version.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const package_origin = @import("package_origin.zig");
@@ -1384,8 +1385,10 @@ fn validateBinding(self: *Compiler) CompileError!void {
         .native => {},
         .legacy_dpkg => return self.reject(.{ .code = .unsupported_backend }),
     }
-    if (!std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v2.schema_id) or
-        authorization.exact_lock.version != exact_lock_v2.schema_version)
+    if (!((std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v2.schema_id) and
+        authorization.exact_lock.version == exact_lock_v2.schema_version) or
+        (std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v3.schema_id) and
+            authorization.exact_lock.version == exact_lock_v3.schema_version)))
         return self.reject(.{ .code = .unsupported_lock_generation });
     if (authorization.actions.len == 0 and
         (authorization.trigger_authority == null or
@@ -3883,8 +3886,10 @@ pub fn validateDocument(program: Program) DecodeError!void {
             ))
             return error.InvalidProgram;
     }
-    if (!std.mem.eql(u8, program.exact_lock.schema, exact_lock_v2.schema_id) or
-        program.exact_lock.version != exact_lock_v2.schema_version)
+    if (!((std.mem.eql(u8, program.exact_lock.schema, exact_lock_v2.schema_id) and
+        program.exact_lock.version == exact_lock_v2.schema_version) or
+        (std.mem.eql(u8, program.exact_lock.schema, exact_lock_v3.schema_id) and
+            program.exact_lock.version == exact_lock_v3.schema_version)))
         return error.UnsupportedLockVersion;
     if (program.steps.len == 0 or program.steps.len > maximum_steps)
         return error.TooManySteps;
@@ -7346,14 +7351,14 @@ test "native_program.test.schema stays synchronized with the compiled contract" 
         definitions.get("packagePath").?.object.get("pattern").?.string,
     );
     const lock_binding = definitions.get("lockBinding").?.object.get("properties").?.object;
-    try testing.expectEqualStrings(
-        exact_lock_v2.schema_id,
-        lock_binding.get("schema").?.object.get("const").?.string,
-    );
-    try testing.expectEqual(
-        @as(i64, exact_lock_v2.schema_version),
-        lock_binding.get("version").?.object.get("const").?.integer,
-    );
+    const lock_schemas = lock_binding.get("schema").?.object.get("enum").?.array.items;
+    try testing.expectEqual(@as(usize, 2), lock_schemas.len);
+    try testing.expectEqualStrings(exact_lock_v2.schema_id, lock_schemas[0].string);
+    try testing.expectEqualStrings(exact_lock_v3.schema_id, lock_schemas[1].string);
+    const lock_versions = lock_binding.get("version").?.object.get("enum").?.array.items;
+    try testing.expectEqual(@as(usize, 2), lock_versions.len);
+    try testing.expectEqual(@as(i64, exact_lock_v2.schema_version), lock_versions[0].integer);
+    try testing.expectEqual(@as(i64, exact_lock_v3.schema_version), lock_versions[1].integer);
 
     var authorization = try testAuthorization(testing.allocator, &wide_actions, &wide_final);
     defer authorization.deinit();

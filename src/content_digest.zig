@@ -33,6 +33,8 @@ pub const Algorithm = enum(u8) {
     }
 };
 
+pub const supported_algorithms = [_]Algorithm{ .sha256, .sha512 };
+
 pub const Value = union(Algorithm) {
     sha256: [32]u8,
     sha512: [64]u8,
@@ -99,6 +101,18 @@ pub const Value = union(Algorithm) {
 
     pub fn verify(self: Value, bytes: []const u8) bool {
         return self.eql(Value.of(self.algorithm(), bytes));
+    }
+
+    pub fn order(left: Value, right: Value) std.math.Order {
+        const algorithm_order = std.math.order(
+            @intFromEnum(left.algorithm()),
+            @intFromEnum(right.algorithm()),
+        );
+        if (algorithm_order != .eq) return algorithm_order;
+        return switch (left) {
+            .sha256 => |value| std.mem.order(u8, &value, &right.sha256),
+            .sha512 => |value| std.mem.order(u8, &value, &right.sha512),
+        };
     }
 
     pub fn hex(self: Value, output: *[128]u8) []const u8 {
@@ -172,7 +186,7 @@ pub const Set = struct {
         return error.MissingDigest;
     }
 
-    pub fn verify(self: Set, bytes: []const u8) error{MissingDigest, DigestMismatch}!void {
+    pub fn verify(self: Set, bytes: []const u8) error{ MissingDigest, DigestMismatch }!void {
         try self.require();
         if (self.sha256) |expected| {
             var actual: [32]u8 = undefined;
@@ -233,6 +247,16 @@ pub const Identity = struct {
         return ofSha256(bytes);
     }
 
+    pub fn ofSupported(bytes: []const u8) Identity {
+        return .{
+            .digests = .{
+                .sha256 = Value.of(.sha256, bytes).sha256,
+                .sha512 = Value.of(.sha512, bytes).sha512,
+            },
+            .primary = .sha512,
+        };
+    }
+
     pub fn primaryValue(self: Identity) Value {
         return self.digests.get(self.primary) orelse unreachable;
     }
@@ -259,6 +283,36 @@ pub const Identity = struct {
         const hex = self.primaryValue().hex(&hex_buffer);
         @memcpy(output[name.len + 1 .. name.len + 1 + hex.len], hex);
         return output[0 .. name.len + 1 + hex.len];
+    }
+
+    pub fn order(left: Identity, right: Identity) std.math.Order {
+        const primary_order = std.math.order(
+            @intFromEnum(left.primary),
+            @intFromEnum(right.primary),
+        );
+        if (primary_order != .eq) return primary_order;
+        inline for (supported_algorithms) |algorithm| {
+            const left_value = left.digests.get(algorithm);
+            const right_value = right.digests.get(algorithm);
+            if (left_value == null and right_value != null) return .lt;
+            if (left_value != null and right_value == null) return .gt;
+            if (left_value) |value| {
+                const digest_order = Value.order(value, right_value.?);
+                if (digest_order != .eq) return digest_order;
+            }
+        }
+        return .eq;
+    }
+
+    pub fn overlaps(left: Identity, right: Identity) bool {
+        inline for (supported_algorithms) |algorithm| {
+            if (left.digests.get(algorithm)) |left_value| {
+                if (right.digests.get(algorithm)) |right_value| {
+                    if (Value.eql(left_value, right_value)) return true;
+                }
+            }
+        }
+        return false;
     }
 };
 
@@ -303,4 +357,15 @@ test "digest sets verify every published supported digest in canonical order" {
 
     var key: [135]u8 = undefined;
     try std.testing.expect(std.mem.startsWith(u8, identity.cacheKey(&key), "sha512-"));
+}
+
+test "supported identities are canonical ordered and detect overlapping content keys" {
+    const full = Identity.ofSupported("archive");
+    const sha512_only = try Identity.init(
+        .{ .sha512 = full.digests.sha512.? },
+        .sha512,
+    );
+    try std.testing.expect(full.overlaps(sha512_only));
+    try std.testing.expectEqual(std.math.Order.gt, Identity.order(full, sha512_only));
+    try full.verify("archive");
 }

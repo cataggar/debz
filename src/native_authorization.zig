@@ -14,6 +14,7 @@ const absolute_path = @import("absolute_path.zig");
 const package_path = @import("package_path.zig");
 const debian_version = @import("debian_version.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const package_origin = @import("package_origin.zig");
 const solver = @import("solver.zig");
@@ -271,8 +272,10 @@ pub fn create(
         .native => {},
         .legacy_dpkg => return error.UnsupportedBackend,
     }
-    if (!std.mem.eql(u8, input.exact_lock.schema, exact_lock_v2.schema_id) or
-        input.exact_lock.version != exact_lock_v2.schema_version)
+    if (!((std.mem.eql(u8, input.exact_lock.schema, exact_lock_v2.schema_id) and
+        input.exact_lock.version == exact_lock_v2.schema_version) or
+        (std.mem.eql(u8, input.exact_lock.schema, exact_lock_v3.schema_id) and
+            input.exact_lock.version == exact_lock_v3.schema_version)))
         return error.UnsupportedLockVersion;
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
     if (!validIdentity(input.target_architecture)) return error.InvalidIdentity;
@@ -2188,14 +2191,14 @@ test "native_authorization.test.schema and enums stay synchronized with the cont
         definitions.get("absolutePath").?.object.get("pattern").?.string,
     );
     const lock_binding = definitions.get("lockBinding").?.object.get("properties").?.object;
-    try std.testing.expectEqualStrings(
-        exact_lock_v2.schema_id,
-        lock_binding.get("schema").?.object.get("const").?.string,
-    );
-    try std.testing.expectEqual(
-        @as(i64, exact_lock_v2.schema_version),
-        lock_binding.get("version").?.object.get("const").?.integer,
-    );
+    const lock_schemas = lock_binding.get("schema").?.object.get("enum").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), lock_schemas.len);
+    try std.testing.expectEqualStrings(exact_lock_v2.schema_id, lock_schemas[0].string);
+    try std.testing.expectEqualStrings(exact_lock_v3.schema_id, lock_schemas[1].string);
+    const lock_versions = lock_binding.get("version").?.object.get("enum").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), lock_versions.len);
+    try std.testing.expectEqual(@as(i64, exact_lock_v2.schema_version), lock_versions[0].integer);
+    try std.testing.expectEqual(@as(i64, exact_lock_v3.schema_version), lock_versions[1].integer);
 
     var owned = try create(std.testing.allocator, testInput());
     defer owned.deinit();

@@ -100,27 +100,28 @@ The production CLI permits initial lock resolution only on non-mutating
 `plan` and `download` operations. The package-family API exposes that path as
 `resolve_lock`; all image mutations continue to require the reviewed lock.
 
-The core CLI selects genuine v2 planning and download with
+The core CLI selects genuine v3 planning and download with
 `--transaction-backend native`; embedders set
 `ProductionBackend.transaction_backend = .native`. Native resolution builds
 the tagged closure directly from authenticated repository snapshots, while
 native replay refuses v1 input. Its solver-policy digest is SHA-256 of
 `debz.product-native-solver-policy-v1\0` followed by the existing 32-byte solver
 policy digest. Legacy core resolution/replay keeps its original v1 format and
-policy bytes. Core native mutation consumes an explicit reviewed v2 lock and
+policy bytes. Core native mutation consumes an explicit reviewed v3 lock and
 publishes a native receipt rather than legacy command provenance. Core recovery
 consumes persisted inputs without re-resolution or replacement locks, binds outer
 completion to that receipt, and acknowledges native evidence before clearing the
 caller record. Other consumers remain independently gated.
 
-The separate `debz package-cache` interface supports canonical v1 locks only.
+The separate `debz package-cache` interface supports canonical v1, v2, and v3
+locks through explicit version-specific paths.
 `fingerprint` rejects unsupported schema versions, noncanonical/tampered
 documents, target or solver-policy drift, duplicate object digests, and
 resource-limit violations before cache restore. `prepare` reauthenticates all
 repository evidence and verifies the complete lock closure independent of
-installed state. V2/local-artifact origins are rejected explicitly rather than
-being omitted; they can be added only with an end-to-end reviewed acquisition
-path.
+installed state. Exact-lock v3 carries SHA512-only and mixed package identities
+through tagged CAS and archive v3; every supported digest is verified before
+publication or replay.
 
 The package-cache fingerprint is domain-separated and covers the lock digest,
 schema, target and foreign architectures, exact runtime version, package-CAS
@@ -172,7 +173,7 @@ compiler checks the authorized choice against installed evidence; authorizing
 absence does not permit it to discard conffiles that removal must retain.
 
 Authorization is native-only. Creating one for `legacy_dpkg` is rejected, and
-only exact-closure-lock v2 may be bound, so previously serialized v1 locks stay
+new authorization binds exact-closure-lock v3, so previously serialized v1/v2 locks stay
 readable for the legacy backend and can never be silently reinterpreted as
 native authorization. `transaction_engine.authorize` requires an authorization
 for native execution, rejects an authorization supplied to the legacy backend,
@@ -221,9 +222,11 @@ Schemas:
 - [`schema/package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
 - [`schema/package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
 - [`schema/package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
+- [`schema/package-cache-fingerprint-v5.json`](../schema/package-cache-fingerprint-v5.json)
 - [`schema/package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
 - [`schema/package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
 - [`schema/package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
+- [`schema/package-cache-result-v5.json`](../schema/package-cache-result-v5.json)
 - [`schema/package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)

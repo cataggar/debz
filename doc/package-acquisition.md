@@ -5,7 +5,8 @@ It does not parse package payloads, execute transactions, invoke `dpkg`, or
 infer trust from archive names or paths.
 
 `debz.package_cache_workflow` composes that primitive for a canonical exact
-lock. `debz package-cache fingerprint` validates exact-lock v1, architecture,
+lock. `debz package-cache fingerprint` validates the selected exact-lock generation,
+architecture,
 solver policy, package/count/byte limits, and the running CLI version before
 printing a versioned fingerprint, exact cache key, compatible restore prefix,
 and the sole externally cacheable path. Filesystem paths, URLs, keyring names,
@@ -13,7 +14,7 @@ proxy settings, and credentials do not enter key material.
 
 `debz package-cache prepare` authenticates current repository evidence, requires
 the repository ID/snapshot/Release/Packages/signer and every package
-name/version/architecture/size/SHA-256 to match the lock, then acquires and
+name/version/architecture/size/content identity to match the lock, then acquires and
 payload-validates the complete closure. It counts current-lock objects as
 downloaded or reused, cleans staging, and garbage-collects objects outside the
 lock under one bounded writer lock. Incomplete cleanup or lock contention is a
@@ -23,7 +24,8 @@ lock-by-index quadratic work.
 
 Immediately after acquiring the writer lock, preparation performs bounded
 staging cleanup before importing a restored opaque archive. It then preflights
-every present current-lock object against the lock's size and SHA-256 before
+every present current-lock object against the lock's size and every published
+supported digest before
 repository I/O. Missing online objects proceed to authenticated acquisition;
 missing offline objects and default-policy corruption fail immediately. A
 caller-declared exact restore also treats a missing current-lock object as
@@ -67,7 +69,7 @@ verification is performed by Zig's HTTPS client.
 The package-cache workflow adds an explicit online-only corruption repair
 policy. Without it, a wrong-size, wrong-digest, symlinked, truncated, or
 non-regular object fails closed. With repair enabled, the object is deleted and
-reacquired only after repository authentication, then size-, SHA-256-, and
+reacquired only after repository authentication, then size-, identity-, and
 payload-validated before publication. Offline mode and repair are mutually
 exclusive.
 
@@ -106,7 +108,7 @@ External caches contain one opaque, path-free archive exported from the
 verified current-lock objects. The cache service writes that blob only into a
 fresh private transfer directory; `debz.package_cache_archive` validates its
 framing, canonical digest ordering, object and expanded-byte limits, payload
-digests, and current-lock sizes before publishing lowercase-SHA256 objects
+digests, and current-lock sizes before publishing algorithm-tagged objects
 under the CAS writer lock. It never interprets tar paths, links, devices, or
 special entries. `metadata-v1`, `staging`, `locks`, exact locks, keyrings,
 credentials, installation roots, dpkg state, and transaction/recovery records
@@ -141,22 +143,36 @@ native lock. Partial restores publish only matching objects; unrelated objects
 are verified but skipped. Imported historical SHA256 objects are reread and rehashed before publication
 into their tagged `sha256-...` CAS key. The archive bytes remain unchanged.
 
+### Tagged archive contract
+
+Exact-lock v3 uses `debz-package-cache-archive-v3\n`. Each canonical record
+contains the primary algorithm tag, the complete supported digest set in
+SHA256/SHA512 order, an unsigned 64-bit size, and the payload. The final
+SHA-256 remains framing integrity rather than package identity. Import verifies
+the complete archive and every declared package digest before publication,
+rejecting unknown algorithms, duplicate or overlapping identities,
+noncanonical ordering, digest-set substitution, and cross-algorithm cache
+poisoning. Export, import, exact replay, and reopen preserve SHA512-only and
+mixed identities without synthesizing SHA256. The v1 and v2 readers and bytes
+remain unchanged and never auto-detect v3.
+
 `package-cache fingerprint` and `package-cache prepare` select these native
 contracts only with explicit `--transaction-backend native`; the default
 remains `legacy_dpkg` and archive v1. The packages-v2 CAS cutover uses
-fingerprint/result schemas v3 for legacy and v4 for native, with distinct
+fingerprint/result schemas v3 for legacy, v4 for exact-lock v2, and v5 for
+exact-lock v3, with distinct
 fingerprint domains and restore-key prefixes. Empty closures need no repository
 inputs and produce zero verified objects.
 
 Native preparation authenticates repository evidence and validates each
 repository payload normally. Local-artifact entries must already be in the
 verified CAS or imported archive and pass `deb_payload.inspectLocal` against
-the lock's exact identity, size, and digest. Missing local artifacts require
+the lock's exact identity, size, and complete digest set. Missing local artifacts require
 separate explicit acquisition; corrupt local artifacts refuse even under
 online repair. Preparation never fetches a lock's redacted provenance URL.
-The core native solver-policy domain remains required. The download action
-supports explicit native selection with these v2 contracts; other consumer
-policy scopes and native install-action integration are separate work.
+The core native solver-policy domain remains required. New native product,
+package-family, apt-system, and repository operations publish exact-lock v3;
+version-specific v1/v2 readers remain available for historical evidence.
 
 Errors never contain authorization values. Effective URLs omit user info,
 fragments, and all query data; cache keys and provenance contain only the

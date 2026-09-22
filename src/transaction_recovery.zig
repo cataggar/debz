@@ -1,8 +1,10 @@
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const solver = @import("solver.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const legacy_compat = @import("legacy_compat.zig");
 const package_origin = @import("package_origin.zig");
 
@@ -816,9 +818,55 @@ pub fn verifyExactLockV2LockedPackagesWithEvidence(
     return verifyExactLockV2LockedPackageEvidence(allocator, lock, plan, journal);
 }
 
+pub fn verifyExactLockV3WithEvidence(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v3.Lock,
+    plan: solver.Plan,
+    journal: Journal,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const verification = exactLockV2StatusVerification(
+        lock,
+        try verifyExactLockV2Status(
+            allocator,
+            lock,
+            root,
+            reader,
+            maximum_status_bytes,
+        ),
+    );
+    if (!verification.succeeded()) return verification;
+    return verifyExactLockV3Evidence(allocator, lock, plan, journal, false);
+}
+
+pub fn verifyExactLockV3LockedPackagesWithEvidence(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v3.Lock,
+    plan: solver.Plan,
+    journal: Journal,
+    root: []const u8,
+    reader: StatusReader,
+    maximum_status_bytes: usize,
+) !Verification {
+    const verification = exactLockV2StatusVerification(
+        lock,
+        try verifyExactLockV2LockedPackages(
+            allocator,
+            lock,
+            root,
+            reader,
+            maximum_status_bytes,
+        ),
+    );
+    if (!verification.succeeded()) return verification;
+    return verifyExactLockV3Evidence(allocator, lock, plan, journal, true);
+}
+
 fn verifyExactLockV2Status(
     allocator: std.mem.Allocator,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     root: []const u8,
     reader: StatusReader,
     maximum_status_bytes: usize,
@@ -881,7 +929,7 @@ fn verifyExactLockV2Status(
 /// from the temporary parsed status database.
 pub fn verifyExactLockV2LockedPackages(
     allocator: std.mem.Allocator,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     root: []const u8,
     reader: StatusReader,
     maximum_status_bytes: usize,
@@ -924,7 +972,7 @@ pub fn verifyExactLockV2LockedPackages(
 }
 
 fn exactLockV2StatusVerification(
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     status: ExactLockV2StatusVerification,
 ) Verification {
     return switch (status) {
@@ -944,6 +992,189 @@ fn exactLockV2StatusVerification(
                 }
             else
                 null,
+        },
+    };
+}
+
+fn verifyExactLockV3Evidence(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v3.Lock,
+    plan: solver.Plan,
+    journal: Journal,
+    all_packages: bool,
+) !Verification {
+    if ((plan.schema_version != 3 and plan.schema_version != 4) or
+        !std.mem.eql(u8, plan.target_architecture, lock.target_architecture) or
+        journal.lock_sha256 == null or
+        !std.mem.eql(u8, &journal.lock_sha256.?, &lock.digest_sha256) or
+        journal.next_command > journal.commands.len)
+        return .{ .failure = if (all_packages)
+            .locked_origin_evidence_mismatch
+        else
+            .local_origin_evidence_mismatch };
+
+    const action_seen = try allocator.alloc(bool, lock.packages.len);
+    defer allocator.free(action_seen);
+    @memset(action_seen, false);
+    const unpack_seen = try allocator.alloc(bool, lock.packages.len);
+    defer allocator.free(unpack_seen);
+    @memset(unpack_seen, false);
+
+    for (plan.actions) |action| {
+        if (solver.isRemoval(action.kind)) continue;
+        const package_index = lock.findPackageIndex(
+            action.package,
+            action.version,
+            action.architecture,
+        ) orelse if (all_packages) return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = action.package,
+        } else continue;
+        const locked = lock.packages[package_index];
+        if (!all_packages and locked.origin != .local_artifact) continue;
+        if (action_seen[package_index]) return .{
+            .failure = if (all_packages)
+                .locked_origin_evidence_mismatch
+            else
+                .local_origin_evidence_mismatch,
+            .package = action.package,
+        };
+        const identity = action.archive_identity orelse legacy: {
+            if (locked.archive_identity.digests.sha512 != null)
+                return .{
+                    .failure = if (all_packages)
+                        .locked_origin_evidence_missing
+                    else
+                        .local_origin_evidence_missing,
+                    .package = action.package,
+                };
+            const digest_hex = action.sha256 orelse return .{
+                .failure = if (all_packages)
+                    .locked_origin_evidence_missing
+                else
+                    .local_origin_evidence_missing,
+                .package = action.package,
+            };
+            const digest = parseDigest(&digest_hex) catch return .{
+                .failure = if (all_packages)
+                    .locked_origin_evidence_mismatch
+                else
+                    .local_origin_evidence_mismatch,
+                .package = action.package,
+            };
+            break :legacy content_digest.Identity.init(
+                .{ .sha256 = digest },
+                .sha256,
+            ) catch return .{
+                .failure = .locked_origin_evidence_mismatch,
+                .package = action.package,
+            };
+        };
+        if (!identity.eql(locked.archive_identity) or
+            action.package_size != locked.declared_size or
+            !planOriginMatchesV3(action.origin, locked.origin))
+            return .{
+                .failure = if (all_packages)
+                    .locked_origin_evidence_mismatch
+                else
+                    .local_origin_evidence_mismatch,
+                .package = action.package,
+            };
+        action_seen[package_index] = true;
+    }
+
+    const completed = @min(journal.next_command, journal.commands.len);
+    for (plan.ordered_actions, 0..) |ordered, command_index| {
+        if (ordered.kind != .unpack or command_index >= completed) continue;
+        const package_index = lock.findPackageIndex(
+            ordered.package,
+            ordered.version,
+            ordered.architecture,
+        ) orelse if (all_packages) return .{
+            .failure = .locked_origin_evidence_mismatch,
+            .package = ordered.package,
+        } else continue;
+        const locked = lock.packages[package_index];
+        if (!all_packages and locked.origin != .local_artifact) continue;
+        if (unpack_seen[package_index]) return .{
+            .failure = if (all_packages)
+                .locked_origin_evidence_mismatch
+            else
+                .local_origin_evidence_mismatch,
+            .package = ordered.package,
+        };
+        const command = journal.commands[command_index];
+        if (!std.mem.eql(u8, command.phase, "unpack") or
+            command.package == null or
+            !std.mem.eql(u8, command.package.?, ordered.package))
+            return .{
+                .failure = if (all_packages)
+                    .locked_origin_evidence_mismatch
+                else
+                    .local_origin_evidence_mismatch,
+                .package = ordered.package,
+            };
+        if (locked.archive_identity.digests.sha256) |sha256| {
+            const command_digest = command.artifact_sha256 orelse return .{
+                .failure = if (all_packages)
+                    .locked_origin_evidence_missing
+                else
+                    .local_origin_evidence_missing,
+                .package = ordered.package,
+            };
+            if (!std.mem.eql(u8, &command_digest, &sha256))
+                return .{
+                    .failure = if (all_packages)
+                        .locked_origin_evidence_mismatch
+                    else
+                        .local_origin_evidence_mismatch,
+                    .package = ordered.package,
+                };
+        }
+        unpack_seen[package_index] = true;
+    }
+
+    for (lock.packages, 0..) |package, index| {
+        if (!all_packages and package.origin != .local_artifact) continue;
+        if (!action_seen[index] or !unpack_seen[index])
+            return .{
+                .failure = if (all_packages)
+                    .locked_origin_evidence_missing
+                else
+                    .local_origin_evidence_missing,
+                .package = package.name,
+            };
+    }
+    return .{};
+}
+
+fn planOriginMatchesV3(
+    observed: ?solver.PlanOrigin,
+    expected: exact_lock_v3.PackageOrigin,
+) bool {
+    const origin = observed orelse return false;
+    return switch (expected) {
+        .authenticated_repository => |repository| switch (origin) {
+            .authenticated_repository => |value| std.mem.eql(
+                u8,
+                &value.id,
+                &repository.repository_id,
+            ),
+            .local_artifact => false,
+        },
+        .local_artifact => |artifact| switch (origin) {
+            .authenticated_repository => false,
+            .local_artifact => |value| blk: {
+                if (artifact.archive_identity.digests.sha256) |sha256| {
+                    if (!std.mem.eql(u8, &value.evidence.sha256, &sha256))
+                        break :blk false;
+                }
+                break :blk value.evidence.size == artifact.size and
+                    std.mem.eql(u8, value.evidence.package, artifact.package) and
+                    std.mem.eql(u8, value.evidence.version, artifact.version) and
+                    std.mem.eql(u8, value.evidence.architecture, artifact.architecture) and
+                    std.mem.eql(u8, value.evidence.acquisition_url, artifact.acquisition_url);
+            },
         },
     };
 }

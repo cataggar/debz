@@ -22,13 +22,15 @@ retains its transaction lock and the frontend lock, with
 `DPKG_FRONTEND_LOCKED=true`, across the transaction.
 
 Each cached archive is reread immediately before its bootstrap-extract or unpack command. Size,
-SHA-256, outer archive, payload paths, control identity, requested identity,
+the exact-lock v3 content identity, outer archive, payload paths, control identity, requested identity,
 scripts, and conffiles are revalidated with `deb_payload.validate` for
 repository packages or `deb_payload.inspectLocal` for tagged local artifacts.
-Every install-like action requires an exact SHA-256 and size. Origin checks
+Every install-like action requires an exact content identity and size. Native
+application evidence retains an independently computed SHA-256 for executor
+and recovery integrity without replacing or downgrading the package identity. Origin checks
 branch explicitly between authenticated repository identity and local artifact
 ID, acquisition URL, trust mode, digest, size, and control identity.
-An exact-lock-v2 local package is always replayed from its locked artifact when
+An exact-lock-v3 local package is always replayed from its locked artifact when
 dpkg status alone is the only installed-state evidence. Final execution and
 recovery verification require a completed unpack journal entry with that
 artifact digest and an exact plan-origin/size match; matching dpkg identity

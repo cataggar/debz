@@ -2,20 +2,22 @@
 //!
 //! Acquisition supplies validated archive evidence and root preflight supplies
 //! the installed database. This adapter binds those inputs to the real solver
-//! plan and exact-lock v2; it neither invents fixture bindings nor executes a
+//! plan and exact-lock v3; it neither invents fixture bindings nor executes a
 //! command. The runtime must revalidate the resulting program under its locks.
 const std = @import("std");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
+const package_origin = @import("package_origin.zig");
 const solver = @import("solver.zig");
 const transaction_engine = @import("transaction_engine.zig");
 const transaction_executor = @import("transaction_executor.zig");
 
 pub const Request = struct {
     plan: *const solver.Plan,
-    exact_lock: *const exact_lock_v2.Lock,
+    exact_lock: *const exact_lock_v3.Lock,
     install_root: []const u8,
     policy: transaction_executor.Policy,
     script_policy: maintainer_script.Policy,
@@ -114,13 +116,57 @@ fn retainsConfiguration(package: native_program.InstalledPackage) bool {
     return false;
 }
 
+fn findArchive(
+    archives: []const native_program.Archive,
+    package: []const u8,
+    version: []const u8,
+    architecture: []const u8,
+) ?native_program.Archive {
+    for (archives) |archive| {
+        if (sameText(archive.package, package) and
+            sameText(archive.version, version) and
+            sameText(archive.architecture, architecture))
+            return archive;
+    }
+    return null;
+}
+
+fn legacyOrigin(
+    origin: exact_lock_v3.PackageOrigin,
+    archive_sha256: [32]u8,
+) exact_lock_v2.PackageOrigin {
+    return switch (origin) {
+        .authenticated_repository => |repository| .{
+            .authenticated_repository = .{
+                .repository_id = repository.repository_id,
+                .repository_snapshot_sha256 = repository.repository_snapshot_sha256,
+            },
+        },
+        .local_artifact => |artifact| .{
+            .local_artifact = .{
+                .artifact_id = package_origin.artifactIdFromSha256(archive_sha256),
+                .sha256 = archive_sha256,
+                .size = artifact.size,
+                .package = artifact.package,
+                .version = artifact.version,
+                .architecture = artifact.architecture,
+                .acquisition_url = artifact.acquisition_url,
+                .trust_mode = switch (artifact.trust_mode) {
+                    .pinned_content_digest => .pinned_sha256,
+                    .verified_https => .verified_https,
+                },
+            },
+        },
+    };
+}
+
 const Fixture = struct {
     actions: [2]solver.PlanAction,
     ordered: [3]solver.OrderedAction,
     installed: [3]native_program.InstalledPackage,
     archives: [1]native_program.Archive,
     plan: solver.Plan,
-    lock: exact_lock_v2.OwnedLock,
+    lock: exact_lock_v3.OwnedLock,
 
     const repository_id: [64]u8 = @splat('a');
     const snapshot: [32]u8 = @splat(0x22);
@@ -132,7 +178,7 @@ const Fixture = struct {
         },
     };
     const local_origin: @import("package_origin.zig").LocalArtifactEvidence = .{
-        .artifact_id = @splat('b'),
+        .artifact_id = @import("package_origin.zig").artifactIdFromSha256(archive_sha256),
         .package = "app",
         .version = "1.2",
         .architecture = "amd64",
@@ -140,6 +186,19 @@ const Fixture = struct {
         .size = 100,
         .acquisition_url = "https://packages.example.test/app.deb",
         .trust_mode = .pinned_sha256,
+    };
+    const tagged_local_origin: @import("package_origin.zig").LocalArtifactEvidenceV2 = .{
+        .artifact_id = .{ .sha256 = archive_sha256 },
+        .package = "app",
+        .version = "1.2",
+        .architecture = "amd64",
+        .archive_identity = .{
+            .digests = .{ .sha256 = archive_sha256 },
+            .primary = .sha256,
+        },
+        .size = 100,
+        .acquisition_url = "https://packages.example.test/app.deb",
+        .trust_mode = .pinned_content_digest,
     };
 
     fn init(allocator: std.mem.Allocator, local: bool) !*Fixture {
@@ -153,6 +212,10 @@ const Fixture = struct {
                 .architecture = "amd64",
                 .repository = if (local) null else .{ .id = repository_id, .priority = 500 },
                 .sha256 = @import("package_origin.zig").artifactIdFromSha256(archive_sha256),
+                .archive_identity = .{
+                    .digests = .{ .sha256 = archive_sha256 },
+                    .primary = .sha256,
+                },
                 .package_size = 100,
                 .installed_size_delta_bytes = 0,
                 .source_package = "app",
@@ -223,7 +286,7 @@ const Fixture = struct {
             .backing_allocator = allocator,
             .arena = undefined,
         };
-        self.lock = try exact_lock_v2.create(allocator, .{
+        self.lock = try exact_lock_v3.create(allocator, .{
             .target_architecture = "amd64",
             .request_sha256 = @splat(7),
             .policy_sha256 = @splat(8),
@@ -231,17 +294,29 @@ const Fixture = struct {
                 .id = repository_id,
                 .snapshot_sha256 = snapshot,
                 .release_sha256 = @splat(3),
-                .index_sha256 = @splat(4),
+                .index_identity = .{
+                    .digests = .{ .sha256 = @splat(4) },
+                    .primary = .sha256,
+                },
                 .signer_fingerprints = &.{@splat(5)},
             }},
-            .local_artifacts = if (local) &.{local_origin} else &.{},
+            .local_artifacts = if (local) &.{tagged_local_origin} else &.{},
             .packages = &.{
                 .{
                     .name = "app",
                     .version = "1.2",
                     .architecture = "amd64",
-                    .origin = self.archives[0].origin,
-                    .sha256 = archive_sha256,
+                    .origin = if (local)
+                        .{ .local_artifact = tagged_local_origin }
+                    else
+                        .{ .authenticated_repository = .{
+                            .repository_id = repository_id,
+                            .repository_snapshot_sha256 = snapshot,
+                        } },
+                    .archive_identity = .{
+                        .digests = .{ .sha256 = archive_sha256 },
+                        .primary = .sha256,
+                    },
                     .declared_size = 100,
                     .retention = .requested,
                     .dpkg_selection_hold = false,
@@ -250,8 +325,14 @@ const Fixture = struct {
                     .name = "held",
                     .version = "3.0",
                     .architecture = "amd64",
-                    .origin = repository_origin,
-                    .sha256 = @splat(0x62),
+                    .origin = .{ .authenticated_repository = .{
+                        .repository_id = repository_id,
+                        .repository_snapshot_sha256 = snapshot,
+                    } },
+                    .archive_identity = .{
+                        .digests = .{ .sha256 = @splat(0x62) },
+                        .primary = .sha256,
+                    },
                     .declared_size = 123,
                     .retention = .retained,
                     .dpkg_selection_hold = true,
@@ -365,7 +446,7 @@ test "native_preparation.test.remove preserves an already residual record withou
 test "native_preparation.test.empty lock requires every removal and preserves residual configuration" {
     const fixture = try Fixture.init(std.testing.allocator, false);
     defer fixture.deinit(std.testing.allocator);
-    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+    var lock = try exact_lock_v3.create(std.testing.allocator, .{
         .target_architecture = fixture.lock.lock.target_architecture,
         .request_sha256 = fixture.lock.lock.request_sha256,
         .policy_sha256 = fixture.lock.lock.policy_sha256,
@@ -454,7 +535,10 @@ test "native_preparation.test.plan artifact and prior identity substitutions are
     const fixture = try Fixture.init(std.testing.allocator, false);
     defer fixture.deinit(std.testing.allocator);
     const original = fixture.actions;
-    fixture.actions[0].sha256 = @splat('0');
+    fixture.actions[0].archive_identity = .{
+        .digests = .{ .sha256 = @splat(0) },
+        .primary = .sha256,
+    };
     try std.testing.expectError(error.AuthorizationArtifactMismatch, prepare(std.testing.allocator, fixture.request()));
     fixture.actions = original;
     fixture.actions[0].origin = .{ .authenticated_repository = .{ .id = @splat('c'), .priority = 500 } };
@@ -524,7 +608,7 @@ test "native_preparation.test.operation-scoped locks preserve the complete captu
             .install_root = request.install_root,
             .artifacts = &.{},
             .policy = fixture.request().policy,
-            .exact_lock_v2 = request.exact_lock,
+            .exact_lock_v3 = request.exact_lock,
         }, &authorization));
 
         fixture.installed[2].version = "2.0";
@@ -548,14 +632,17 @@ test "native_preparation.test.operation-scoped locks cannot omit changed package
     fixture.installed[1].hold = false;
     try std.testing.expectError(error.LockClosureMismatch, prepare(std.testing.allocator, request));
     fixture.installed[1].hold = true;
-    const original_digest = fixture.actions[0].sha256;
-    fixture.actions[0].sha256 = @splat('0');
+    const original_identity = fixture.actions[0].archive_identity;
+    fixture.actions[0].archive_identity = .{
+        .digests = .{ .sha256 = @splat(0) },
+        .primary = .sha256,
+    };
     try std.testing.expectError(error.AuthorizationArtifactMismatch, prepare(std.testing.allocator, request));
-    fixture.actions[0].sha256 = original_digest;
+    fixture.actions[0].archive_identity = original_identity;
     request.archives = &.{};
     try expectDiagnostic(request, .missing_archive);
     request.archives = &fixture.archives;
-    var empty = try exact_lock_v2.create(std.testing.allocator, .{
+    var empty = try exact_lock_v3.create(std.testing.allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = fixture.lock.lock.request_sha256,
         .policy_sha256 = fixture.lock.lock.policy_sha256,
@@ -695,9 +782,9 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         request.plan.ordered_actions.len > native_program.maximum_steps or
         request.installed.packages.len > native_program.maximum_installed_packages or
         request.archives.len > native_program.maximum_artifacts or
-        request.exact_lock.packages.len > exact_lock_v2.maximum_packages or
-        request.exact_lock.repositories.len > exact_lock_v2.maximum_repositories or
-        request.exact_lock.local_artifacts.len > exact_lock_v2.maximum_local_artifacts)
+        request.exact_lock.packages.len > exact_lock_v3.maximum_packages or
+        request.exact_lock.repositories.len > exact_lock_v3.maximum_repositories or
+        request.exact_lock.local_artifacts.len > exact_lock_v3.maximum_local_artifacts)
         return error.LimitExceeded;
     if (!sameText(request.plan.target_architecture, request.exact_lock.target_architecture))
         return error.AuthorizationArchitectureMismatch;
@@ -711,7 +798,7 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
     };
-    var verified_lock = exact_lock_v2.decode(allocator, lock_bytes, exact_lock_v2.maximum_document_bytes) catch |err| switch (err) {
+    var verified_lock = exact_lock_v3.decode(allocator, lock_bytes, exact_lock_v3.maximum_document_bytes) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
     };
@@ -759,10 +846,23 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
             const package = selected orelse return error.LockClosureMismatch;
             if (!sameText(package.version, action.version))
                 return error.LockClosureMismatch;
+            const archive = findArchive(
+                request.archives,
+                package.name,
+                package.version,
+                package.architecture,
+            );
+            if (archive != null and archive.?.size != package.declared_size)
+                return error.ArchiveEvidenceMismatch;
+            const archive_sha256 = package.archive_identity.digests.sha256 orelse
+                if (archive) |value|
+                    value.sha256
+                else
+                    return error.ArchiveEvidenceMismatch;
             actions[index].artifact = .{
-                .sha256 = package.sha256,
+                .sha256 = archive_sha256,
                 .size = package.declared_size,
-                .origin = package.origin,
+                .origin = legacyOrigin(package.origin, archive_sha256),
             };
         }
     }
@@ -845,8 +945,8 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         .executor_policy_sha256 = transaction_executor.policyDigest(request.policy),
         .plan_sha256 = transaction_executor.planDigest(request.plan.*),
         .exact_lock = .{
-            .schema = exact_lock_v2.schema_id,
-            .version = exact_lock_v2.schema_version,
+            .schema = exact_lock_v3.schema_id,
+            .version = exact_lock_v3.schema_version,
             .digest_sha256 = lock.digest_sha256,
         },
         .policy = .{
@@ -865,7 +965,7 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         .install_root = request.install_root,
         .artifacts = &.{},
         .policy = request.policy,
-        .exact_lock_v2 = &lock,
+        .exact_lock_v3 = &lock,
     };
     try transaction_engine.authorize(.native, execution_request, &authorization.authorization);
     switch (native_program.compile(allocator, .{

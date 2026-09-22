@@ -653,7 +653,7 @@ only authenticated or stale-authenticated complete snapshots are solver
 eligible. Repository dependencies use verified acquisition; the descriptor
 uses its existing CAS object.
 
-The exact canonical executable plan and an exact-lock v2 file are atomically
+The exact canonical executable plan and an exact-lock v3 file are atomically
 persisted before dpkg and passed to both execution and recovery. The plan is
 reloaded byte-canonically on resume rather than regenerated from the
 potentially incomplete current dpkg state. Lock construction uses only the

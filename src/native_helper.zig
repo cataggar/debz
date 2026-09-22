@@ -9,8 +9,10 @@ pub const directory = "var/lib/debz/native-helper-cache-v1";
 pub const bootstrap_directory = "var/lib/debz/native-recovery-v1";
 pub const target_path = "usr/bin/dpkg-trigger";
 pub const owner_package = "dpkg";
-pub const exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v2";
-pub const exact_lock_version: u32 = 2;
+pub const exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v3";
+pub const exact_lock_version: u32 = 3;
+pub const legacy_exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v2";
+pub const legacy_exact_lock_version: u32 = 2;
 pub const maximum_bytes = 32 * 1024 * 1024;
 const cleanup_prepared = "prepared\n";
 const cleanup_completed = "completed\n";
@@ -205,8 +207,7 @@ pub const Bootstrap = struct {
         }) |digest| if (!validDigest(digest))
             return error.InvalidNativeHelperBootstrap;
         if (self.root_inode == 0 or self.root_uid != 0 or self.root_gid != 0 or
-            !std.mem.eql(u8, self.exact_lock_schema, exact_lock_schema) or
-            self.exact_lock_version != exact_lock_version)
+            !supportedExactLock(self.exact_lock_schema, self.exact_lock_version))
             return error.InvalidNativeHelperBootstrap;
         try self.helper.validateBootstrap(self.attempt_id);
         try self.owner.validate();
@@ -215,6 +216,13 @@ pub const Bootstrap = struct {
             return error.InvalidNativeHelperBootstrap;
     }
 };
+
+fn supportedExactLock(schema: []const u8, version: u32) bool {
+    return (std.mem.eql(u8, schema, exact_lock_schema) and
+        version == exact_lock_version) or
+        (std.mem.eql(u8, schema, legacy_exact_lock_schema) and
+            version == legacy_exact_lock_version);
+}
 
 pub fn bootstrapBinding(
     allocator: std.mem.Allocator,

@@ -13,7 +13,8 @@ const operation_state = @import("apt_system_state.zig");
 const lower_ownership_token =
     @import("apt_system_lower_ownership_token.zig");
 const exact_lock = @import("exact_lock.zig");
-const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v2 = @import("exact_lock_v3.zig");
+const exact_lock_legacy_v2 = @import("exact_lock_v2.zig");
 const legacy_compat = @import("legacy_compat.zig");
 const live_root = @import("live_root.zig");
 const native_provenance = @import("native_provenance.zig");
@@ -33,7 +34,7 @@ pub const operation_directory_name = "operations";
 pub const request_document_name = "request-v1.json";
 pub const retained_state_name = "state-v1.json";
 pub const exact_lock_name = "exact-lock-v1.json";
-pub const native_exact_lock_name = "exact-lock-v2.json";
+pub const native_exact_lock_name = "exact-lock-v3.json";
 pub const transaction_result_name = "transaction-result.json";
 pub const recovery_completion_name = "root-operation-recovery-completion-v1.json";
 pub const completion_document_name = "execution-completion-v1.json";
@@ -4650,30 +4651,85 @@ pub const SystemResultVerifier = struct {
         architecture: []const u8,
         expected_request_sha256: [32]u8,
     ) !VerifiedLock {
-        switch (backend) {
-            inline else => |kind| {
-                const Lock = if (kind == .native) exact_lock_v2 else exact_lock;
-                var decoded = Lock.decode(allocator, source, Lock.maximum_document_bytes) catch |err| switch (err) {
-                    // Canonical re-encoding uses only an allocating writer.
-                    error.WriteFailed => return error.OutOfMemory,
-                    else => return err,
-                };
-                defer decoded.deinit();
-                if (!std.mem.eql(u8, decoded.lock.target_architecture, architecture))
-                    return error.ArchitectureMismatch;
-                if (!std.mem.eql(u8, &decoded.lock.request_sha256, &expected_request_sha256))
-                    return error.RequestDigestMismatch;
-                return .{
-                    .binding = .{
-                        .path = path,
-                        .schema = Lock.schema_id,
-                        .version = Lock.schema_version,
-                        .digest_sha256 = decoded.lock.digest_sha256,
-                    },
-                    .semantic_request_sha256 = decoded.lock.request_sha256,
-                };
-            },
+        if (backend == .legacy_dpkg) {
+            var decoded = exact_lock.decode(
+                allocator,
+                source,
+                exact_lock.maximum_document_bytes,
+            ) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            };
+            defer decoded.deinit();
+            return verifiedLockBinding(
+                path,
+                architecture,
+                expected_request_sha256,
+                exact_lock.schema_id,
+                exact_lock.schema_version,
+                decoded.lock,
+            );
         }
+        if (exact_lock_v2.decode(
+            allocator,
+            source,
+            exact_lock_v2.maximum_document_bytes,
+        )) |decoded_value| {
+            var decoded = decoded_value;
+            defer decoded.deinit();
+            return verifiedLockBinding(
+                path,
+                architecture,
+                expected_request_sha256,
+                exact_lock_v2.schema_id,
+                exact_lock_v2.schema_version,
+                decoded.lock,
+            );
+        } else |err| switch (err) {
+            error.UnsupportedSchema => {},
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        }
+        var legacy = exact_lock_legacy_v2.decode(
+            allocator,
+            source,
+            exact_lock_legacy_v2.maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        defer legacy.deinit();
+        return verifiedLockBinding(
+            path,
+            architecture,
+            expected_request_sha256,
+            exact_lock_legacy_v2.schema_id,
+            exact_lock_legacy_v2.schema_version,
+            legacy.lock,
+        );
+    }
+
+    fn verifiedLockBinding(
+        path: []const u8,
+        architecture: []const u8,
+        expected_request_sha256: [32]u8,
+        schema: []const u8,
+        version: u32,
+        lock: anytype,
+    ) !VerifiedLock {
+        if (!std.mem.eql(u8, lock.target_architecture, architecture))
+            return error.ArchitectureMismatch;
+        if (!std.mem.eql(u8, &lock.request_sha256, &expected_request_sha256))
+            return error.RequestDigestMismatch;
+        return .{
+            .binding = .{
+                .path = path,
+                .schema = schema,
+                .version = version,
+                .digest_sha256 = lock.digest_sha256,
+            },
+            .semantic_request_sha256 = lock.request_sha256,
+        };
     }
 
     fn verifyTransaction(
@@ -14796,15 +14852,18 @@ test "apt_system_orchestrator.test.backend-bound locks preserve schema identity 
 
 test "apt_system_orchestrator.test.native lock verification retains mixed origin authority" {
     const origin = @import("package_origin.zig");
-    const artifact: origin.LocalArtifactEvidence = .{
-        .artifact_id = origin.artifactIdFromSha256(@splat(0xab)),
-        .sha256 = @splat(0xab),
+    const artifact: origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = .{ .sha256 = @splat(0xab) },
+        .archive_identity = .{
+            .digests = .{ .sha256 = @splat(0xab) },
+            .primary = .sha256,
+        },
         .size = 12,
         .package = "local",
         .version = "1",
         .architecture = "amd64",
         .acquisition_url = "https://example.test/local.deb?REDACTED",
-        .trust_mode = .pinned_sha256,
+        .trust_mode = .pinned_content_digest,
     };
     var lock = try exact_lock_v2.create(std.testing.allocator, .{
         .target_architecture = "amd64",
@@ -14814,7 +14873,10 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
             .id = @splat('a'),
             .snapshot_sha256 = @splat(1),
             .release_sha256 = @splat(2),
-            .index_sha256 = @splat(3),
+            .index_identity = .{
+                .digests = .{ .sha256 = @splat(3) },
+                .primary = .sha256,
+            },
             .signer_fingerprints = &.{@splat(4)},
         }},
         .local_artifacts = &.{artifact},
@@ -14824,7 +14886,7 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
                 .version = artifact.version,
                 .architecture = artifact.architecture,
                 .origin = .{ .local_artifact = artifact },
-                .sha256 = artifact.sha256,
+                .archive_identity = artifact.archive_identity,
                 .declared_size = artifact.size,
                 .retention = .requested,
                 .dpkg_selection_hold = false,
@@ -14837,7 +14899,10 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
                     .repository_id = @splat('a'),
                     .repository_snapshot_sha256 = @splat(1),
                 } },
-                .sha256 = @splat(9),
+                .archive_identity = .{
+                    .digests = .{ .sha256 = @splat(9) },
+                    .primary = .sha256,
+                },
                 .declared_size = 34,
                 .retention = .dependency,
                 .dpkg_selection_hold = false,

@@ -2,7 +2,7 @@ const std = @import("std");
 const product = @import("product_api.zig");
 const production = @import("production_backend.zig");
 const transaction_engine = @import("transaction_engine.zig");
-const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const native_transaction_result = @import("native_transaction_result.zig");
 const native_provenance = @import("native_provenance.zig");
 const root_fs = @import("root_fs.zig");
@@ -76,7 +76,7 @@ pub const NativeCapabilities = struct {
     architectures: []const []const u8 = capabilities().architectures,
     request_schema: []const u8 = native_request_schema,
     result_schema: []const u8 = native_result_schema,
-    exact_lock_schema: []const u8 = exact_lock_v2.schema_id,
+    exact_lock_schema: []const u8 = exact_lock_v3.schema_id,
     provenance_schema: ?[]const u8 = native_provenance.schema_id,
     recovery: RecoveryBehavior = .disposable_or_recoverable,
     invokes_apt: bool = false,
@@ -337,8 +337,8 @@ pub const NativeBackend = struct {
         const path = original.lock_input.?;
         var parent = try root_fs.openAbsoluteRoot(self.io, std.fs.path.dirname(path).?);
         defer parent.close();
-        const store = try exact_lock_v2.Store.init(self.io, parent.root.dir, std.fs.path.basename(path));
-        var lock = try store.read(allocator, exact_lock_v2.maximum_document_bytes);
+        const store = try exact_lock_v3.Store.init(self.io, parent.root.dir, std.fs.path.basename(path));
+        var lock = try store.read(allocator, exact_lock_v3.maximum_document_bytes);
         defer lock.deinit();
         var root = try root_fs.openAbsoluteRoot(self.io, original.root);
         defer root.close();
@@ -708,7 +708,7 @@ test "native capabilities advertise integrated native family contracts" {
     const value = nativeCapabilities();
     try std.testing.expectEqual(native_schema_version, value.version);
     try std.testing.expectEqual(transaction_engine.Kind.native, value.transaction_backend);
-    try std.testing.expectEqualStrings(exact_lock_v2.schema_id, value.exact_lock_schema);
+    try std.testing.expectEqualStrings(exact_lock_v3.schema_id, value.exact_lock_schema);
     try std.testing.expectEqual(@as(usize, 6), value.operations.len);
     try std.testing.expectEqualStrings("resolve-lock", value.operations[0]);
     try std.testing.expectEqualStrings(native_provenance.schema_id, value.provenance_schema.?);

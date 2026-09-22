@@ -1,5 +1,6 @@
 const std = @import("std");
-const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v2 = @import("exact_lock_v3.zig");
+const exact_lock_legacy = @import("exact_lock_v2.zig");
 const live_root = @import("live_root.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_execution_request = @import("native_execution_request.zig");
@@ -1252,15 +1253,20 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
         const artifact = action.artifact orelse continue;
         const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
             return error.LockEvidenceMismatch;
-        if (!std.mem.eql(u8, &artifact.sha256, &locked.sha256) or
-            artifact.size != locked.declared_size or !originsEqual(artifact.origin, locked.origin))
+        if (locked.archive_identity.digests.sha256) |sha256| {
+            if (!std.mem.eql(u8, &artifact.sha256, &sha256))
+                return error.LockEvidenceMismatch;
+        }
+        if (artifact.size != locked.declared_size or
+            !originMatches(artifact.origin, locked.origin))
             return error.LockEvidenceMismatch;
     }
     for (program.artifacts) |artifact| {
         const locked = lock.findPackage(artifact.package.name, artifact.package.version, artifact.package.architecture) orelse
             return error.LockEvidenceMismatch;
-        try equalDigest(artifact.sha256, native_recovery.hexDigest(locked.sha256));
-        const origin: exact_lock_v2.PackageOrigin = switch (artifact.origin) {
+        if (locked.archive_identity.digests.sha256) |sha256|
+            try equalDigest(artifact.sha256, native_recovery.hexDigest(sha256));
+        const origin: exact_lock_legacy.PackageOrigin = switch (artifact.origin) {
             .authenticated_repository => |value| .{ .authenticated_repository = .{
                 .repository_id = value.repository_id,
                 .repository_snapshot_sha256 = try parseDigest(value.repository_snapshot_sha256),
@@ -1276,7 +1282,7 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
                 .trust_mode = value.trust_mode,
             } },
         };
-        if (artifact.size != locked.declared_size or !originsEqual(origin, locked.origin))
+        if (artifact.size != locked.declared_size or !originMatches(origin, locked.origin))
             return error.LockEvidenceMismatch;
     }
 }
@@ -1318,12 +1324,36 @@ fn verifyFinalClosure(final_state: []const native_authorization.FinalPackage, lo
     if (installed != lock.packages.len) return error.LockEvidenceMismatch;
 }
 
-fn originsEqual(left: exact_lock_v2.PackageOrigin, right: exact_lock_v2.PackageOrigin) bool {
+fn originMatches(
+    left: exact_lock_legacy.PackageOrigin,
+    right: exact_lock_v2.PackageOrigin,
+) bool {
     return switch (left) {
         .authenticated_repository => |value| right == .authenticated_repository and
-            std.meta.eql(value, right.authenticated_repository),
-        .local_artifact => |value| right == .local_artifact and
-            package_origin.eqlLocalArtifact(value, right.local_artifact),
+            std.mem.eql(
+                u8,
+                &value.repository_id,
+                &right.authenticated_repository.repository_id,
+            ) and std.mem.eql(
+            u8,
+            &value.repository_snapshot_sha256,
+            &right.authenticated_repository.repository_snapshot_sha256,
+        ),
+        .local_artifact => |value| if (right == .local_artifact) local: {
+            const tagged = right.local_artifact;
+            if (tagged.archive_identity.digests.sha256) |sha256| {
+                if (!std.mem.eql(u8, &value.sha256, &sha256)) break :local false;
+            }
+            break :local value.size == tagged.size and
+                std.mem.eql(u8, value.package, tagged.package) and
+                std.mem.eql(u8, value.version, tagged.version) and
+                std.mem.eql(u8, value.architecture, tagged.architecture) and
+                std.mem.eql(u8, value.acquisition_url, tagged.acquisition_url) and
+                switch (value.trust_mode) {
+                    .pinned_sha256 => tagged.trust_mode == .pinned_content_digest,
+                    .verified_https => tagged.trust_mode == .verified_https,
+                };
+        } else false,
     };
 }
 

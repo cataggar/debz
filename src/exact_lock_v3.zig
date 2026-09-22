@@ -32,7 +32,7 @@ pub const AuthenticatedRepositoryOrigin = struct {
 
 pub const PackageOrigin = union(enum) {
     authenticated_repository: AuthenticatedRepositoryOrigin,
-    local_artifact: package_origin.LocalArtifactEvidence,
+    local_artifact: package_origin.LocalArtifactEvidenceV2,
 };
 
 pub const Package = struct {
@@ -51,7 +51,7 @@ pub const Input = struct {
     request_sha256: [32]u8,
     policy_sha256: [32]u8,
     repositories: []const Repository,
-    local_artifacts: []const package_origin.LocalArtifactEvidence,
+    local_artifacts: []const package_origin.LocalArtifactEvidenceV2,
     packages: []const Package,
     verified_origins: bool,
 };
@@ -61,7 +61,7 @@ pub const Lock = struct {
     request_sha256: [32]u8,
     policy_sha256: [32]u8,
     repositories: []const Repository,
-    local_artifacts: []const package_origin.LocalArtifactEvidence,
+    local_artifacts: []const package_origin.LocalArtifactEvidenceV2,
     packages: []const Package,
     digest_sha256: [32]u8,
 
@@ -231,24 +231,23 @@ pub fn create(
     }
 
     const local_artifacts = try owned.alloc(
-        package_origin.LocalArtifactEvidence,
+        package_origin.LocalArtifactEvidenceV2,
         input.local_artifacts.len,
     );
     for (input.local_artifacts, 0..) |artifact, index| {
-        try package_origin.validateLocalArtifact(artifact);
+        try package_origin.validateLocalArtifactV2(artifact);
         local_artifacts[index] = try dupeLocalArtifact(owned, artifact);
     }
     std.mem.sort(
-        package_origin.LocalArtifactEvidence,
+        package_origin.LocalArtifactEvidenceV2,
         local_artifacts,
         {},
         lessLocalArtifact,
     );
     for (local_artifacts, 0..) |artifact, index| {
-        if (index != 0 and std.mem.eql(
-            u8,
-            &artifact.artifact_id,
-            &local_artifacts[index - 1].artifact_id,
+        if (index != 0 and content_digest.Value.eql(
+            artifact.artifact_id,
+            local_artifacts[index - 1].artifact_id,
         )) return error.DuplicateArtifact;
     }
     const referenced_repositories = try owned.alloc(bool, repositories.len);
@@ -283,23 +282,20 @@ pub fn create(
                 referenced_repositories[repository_index] = true;
             },
             .local_artifact => |origin| {
-                try package_origin.validateLocalArtifact(origin);
+                try package_origin.validateLocalArtifactV2(origin);
                 const artifact_index = findLocalArtifactIndex(
                     local_artifacts,
                     origin.artifact_id,
                 ) orelse
                     return error.MissingArtifact;
                 const artifact = local_artifacts[artifact_index];
-                if (!package_origin.eqlLocalArtifact(artifact, origin) or
+                if (!package_origin.eqlLocalArtifactV2(artifact, origin) or
                     !std.mem.eql(u8, package.name, origin.package) or
                     !std.mem.eql(u8, package.version, origin.version) or
                     !std.mem.eql(u8, package.architecture, origin.architecture) or
-                    package.archive_identity.primary != .sha256 or
-                    package.archive_identity.digests.count() != 1 or
-                    !std.mem.eql(
-                        u8,
-                        &package.archive_identity.digests.sha256.?,
-                        &origin.sha256,
+                    !content_digest.Identity.eql(
+                        package.archive_identity,
+                        origin.archive_identity,
                     ) or
                     package.declared_size != origin.size)
                     return error.ArtifactEvidenceMismatch;
@@ -364,24 +360,24 @@ const WireIdentity = struct {
 };
 
 const WireLocalArtifact = struct {
-    artifact_id: []const u8,
-    sha256: []const u8,
+    artifact_id: WireDigest,
+    archive_identity: WireDigestIdentity,
     size: u64,
     package: WireIdentity,
     acquisition_url: []const u8,
-    trust_mode: package_origin.LocalArtifactTrustMode,
+    trust_mode: package_origin.LocalArtifactTrustModeV2,
 };
 
 const WireOrigin = struct {
     type: OriginType,
     repository_id: ?[]const u8 = null,
     repository_snapshot_sha256: ?[]const u8 = null,
-    artifact_id: ?[]const u8 = null,
-    sha256: ?[]const u8 = null,
+    artifact_id: ?WireDigest = null,
+    archive_identity: ?WireDigestIdentity = null,
     size: ?u64 = null,
     package: ?WireIdentity = null,
     acquisition_url: ?[]const u8 = null,
-    trust_mode: ?package_origin.LocalArtifactTrustMode = null,
+    trust_mode: ?package_origin.LocalArtifactTrustModeV2 = null,
 };
 
 const WirePackage = struct {
@@ -454,7 +450,7 @@ pub fn decode(
     }
 
     const local_artifacts = try allocator.alloc(
-        package_origin.LocalArtifactEvidence,
+        package_origin.LocalArtifactEvidenceV2,
         parsed.value.local_artifacts.len,
     );
     defer allocator.free(local_artifacts);
@@ -557,7 +553,7 @@ fn parseOrigin(origin: WireOrigin) ValidationError!PackageOrigin {
             if (origin.repository_id == null or
                 origin.repository_snapshot_sha256 == null or
                 origin.artifact_id != null or
-                origin.sha256 != null or
+                origin.archive_identity != null or
                 origin.size != null or
                 origin.package != null or
                 origin.acquisition_url != null or
@@ -575,7 +571,7 @@ fn parseOrigin(origin: WireOrigin) ValidationError!PackageOrigin {
             if (origin.repository_id != null or
                 origin.repository_snapshot_sha256 != null or
                 origin.artifact_id == null or
-                origin.sha256 == null or
+                origin.archive_identity == null or
                 origin.size == null or
                 origin.package == null or
                 origin.acquisition_url == null or
@@ -583,8 +579,8 @@ fn parseOrigin(origin: WireOrigin) ValidationError!PackageOrigin {
                 return error.InvalidIdentity;
             const identity = origin.package.?;
             break :blk .{ .local_artifact = .{
-                .artifact_id = try parseId(origin.artifact_id.?),
-                .sha256 = try parseHex(32, origin.sha256.?),
+                .artifact_id = try parseDigest(origin.artifact_id.?),
+                .archive_identity = try parseDigestIdentity(origin.archive_identity.?),
                 .size = origin.size.?,
                 .package = identity.name,
                 .version = identity.version,
@@ -598,10 +594,10 @@ fn parseOrigin(origin: WireOrigin) ValidationError!PackageOrigin {
 
 fn parseLocalArtifact(
     artifact: WireLocalArtifact,
-) ValidationError!package_origin.LocalArtifactEvidence {
+) ValidationError!package_origin.LocalArtifactEvidenceV2 {
     return .{
-        .artifact_id = try parseId(artifact.artifact_id),
-        .sha256 = try parseHex(32, artifact.sha256),
+        .artifact_id = try parseDigest(artifact.artifact_id),
+        .archive_identity = try parseDigestIdentity(artifact.archive_identity),
         .size = artifact.size,
         .package = artifact.package.name,
         .version = artifact.package.version,
@@ -613,8 +609,8 @@ fn parseLocalArtifact(
 
 fn dupeLocalArtifact(
     allocator: std.mem.Allocator,
-    artifact: package_origin.LocalArtifactEvidence,
-) !package_origin.LocalArtifactEvidence {
+    artifact: package_origin.LocalArtifactEvidenceV2,
+) !package_origin.LocalArtifactEvidenceV2 {
     var result = artifact;
     result.package = try allocator.dupe(u8, artifact.package);
     result.version = try allocator.dupe(u8, artifact.version);
@@ -714,6 +710,15 @@ fn writeDigestIdentity(
     try writer.writeAll("]}");
 }
 
+fn writeDigest(writer: *std.Io.Writer, digest: content_digest.Value) !void {
+    try writer.writeAll("{\"algorithm\":");
+    try writeJsonString(writer, digest.algorithm().name());
+    try writer.writeAll(",\"digest\":");
+    var encoded: [128]u8 = undefined;
+    try writeJsonString(writer, digest.hex(&encoded));
+    try writer.writeByte('}');
+}
+
 fn writeOrigin(writer: *std.Io.Writer, origin: PackageOrigin) !void {
     switch (origin) {
         .authenticated_repository => |repository| {
@@ -725,9 +730,9 @@ fn writeOrigin(writer: *std.Io.Writer, origin: PackageOrigin) !void {
         },
         .local_artifact => |artifact| {
             try writer.writeAll("{\"type\":\"local_artifact\",\"artifact_id\":");
-            try writeJsonString(writer, &artifact.artifact_id);
-            try writer.writeAll(",\"sha256\":");
-            try writeHexString(writer, &artifact.sha256);
+            try writeDigest(writer, artifact.artifact_id);
+            try writer.writeAll(",\"archive_identity\":");
+            try writeDigestIdentity(writer, artifact.archive_identity);
             try writer.print(",\"size\":{},\"package\":", .{artifact.size});
             try writeIdentity(writer, artifact);
             try writer.writeAll(",\"acquisition_url\":");
@@ -741,12 +746,12 @@ fn writeOrigin(writer: *std.Io.Writer, origin: PackageOrigin) !void {
 
 fn writeLocalArtifact(
     writer: *std.Io.Writer,
-    artifact: package_origin.LocalArtifactEvidence,
+    artifact: package_origin.LocalArtifactEvidenceV2,
 ) !void {
     try writer.writeAll("{\"artifact_id\":");
-    try writeJsonString(writer, &artifact.artifact_id);
-    try writer.writeAll(",\"sha256\":");
-    try writeHexString(writer, &artifact.sha256);
+    try writeDigest(writer, artifact.artifact_id);
+    try writer.writeAll(",\"archive_identity\":");
+    try writeDigestIdentity(writer, artifact.archive_identity);
     try writer.print(",\"size\":{},\"package\":", .{artifact.size});
     try writeIdentity(writer, artifact);
     try writer.writeAll(",\"acquisition_url\":");
@@ -758,7 +763,7 @@ fn writeLocalArtifact(
 
 fn writeIdentity(
     writer: *std.Io.Writer,
-    artifact: package_origin.LocalArtifactEvidence,
+    artifact: package_origin.LocalArtifactEvidenceV2,
 ) !void {
     try writer.writeAll("{\"name\":");
     try writeJsonString(writer, artifact.package);
@@ -811,9 +816,17 @@ fn parseDigestIdentity(wire: WireDigestIdentity) ValidationError!content_digest.
             return error.InvalidDigest;
         set.put(digest) catch return error.InvalidDigest;
     }
+
     const primary = content_digest.Algorithm.parse(wire.primary) catch
         return error.InvalidDigest;
     return content_digest.Identity.init(set, primary) catch error.InvalidDigest;
+}
+
+fn parseDigest(wire: WireDigest) ValidationError!content_digest.Value {
+    const algorithm = content_digest.Algorithm.parse(wire.algorithm) catch
+        return error.InvalidDigest;
+    return content_digest.Value.parse(algorithm, wire.digest) catch
+        error.InvalidDigest;
 }
 
 fn parseId(value: []const u8) ValidationError![64]u8 {
@@ -857,14 +870,14 @@ fn findRepositoryIndex(repositories: []const Repository, id: [64]u8) ?usize {
 }
 
 fn findLocalArtifactIndex(
-    artifacts: []const package_origin.LocalArtifactEvidence,
-    id: [64]u8,
+    artifacts: []const package_origin.LocalArtifactEvidenceV2,
+    id: content_digest.Value,
 ) ?usize {
     var low: usize = 0;
     var high = artifacts.len;
     while (low < high) {
         const middle = low + (high - low) / 2;
-        switch (std.mem.order(u8, &artifacts[middle].artifact_id, &id)) {
+        switch (content_digest.Value.order(artifacts[middle].artifact_id, id)) {
             .lt => low = middle + 1,
             .gt => high = middle,
             .eq => return middle,
@@ -892,10 +905,10 @@ fn lessRepository(_: void, left: Repository, right: Repository) bool {
 
 fn lessLocalArtifact(
     _: void,
-    left: package_origin.LocalArtifactEvidence,
-    right: package_origin.LocalArtifactEvidence,
+    left: package_origin.LocalArtifactEvidenceV2,
+    right: package_origin.LocalArtifactEvidenceV2,
 ) bool {
-    return std.mem.order(u8, &left.artifact_id, &right.artifact_id) == .lt;
+    return content_digest.Value.order(left.artifact_id, right.artifact_id) == .lt;
 }
 
 fn lessPackage(_: void, left: Package, right: Package) bool {
@@ -920,7 +933,10 @@ fn originOrder(left: PackageOrigin, right: PackageOrigin) std.math.Order {
         },
         .local_artifact => |left_artifact| switch (right) {
             .authenticated_repository => .gt,
-            .local_artifact => |right_artifact| std.mem.order(u8, &left_artifact.artifact_id, &right_artifact.artifact_id),
+            .local_artifact => |right_artifact| content_digest.Value.order(
+                left_artifact.artifact_id,
+                right_artifact.artifact_id,
+            ),
         },
     };
 }
@@ -969,9 +985,10 @@ test "exact_lock_v3.test.mixed origins canonical roundtrip and tamper rejection"
     const repository_id: [64]u8 = @splat('a');
     const snapshot: [32]u8 = @splat(1);
     const artifact_digest: [32]u8 = @splat(2);
-    const artifact: package_origin.LocalArtifactEvidence = .{
-        .artifact_id = package_origin.artifactIdFromSha256(artifact_digest),
-        .sha256 = artifact_digest,
+    const artifact_identity = sha256Identity(artifact_digest);
+    const artifact: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = package_origin.artifactIdFromIdentity(artifact_identity),
+        .archive_identity = artifact_identity,
         .size = 42,
         .package = "vendor-repo",
         .version = "1.0",
@@ -1008,7 +1025,7 @@ test "exact_lock_v3.test.mixed origins canonical roundtrip and tamper rejection"
             .version = artifact.version,
             .architecture = artifact.architecture,
             .origin = .{ .local_artifact = artifact },
-            .archive_identity = sha256Identity(artifact.sha256),
+            .archive_identity = artifact.archive_identity,
             .declared_size = artifact.size,
             .retention = .requested,
             .dpkg_selection_hold = false,
@@ -1107,30 +1124,32 @@ test "exact_lock_v3.test.empty closure is canonical bounded and still evidence c
     }};
     try std.testing.expectError(error.UnusedRepository, create(std.testing.allocator, input));
     input.repositories = &.{};
+    const removed_identity = sha256Identity(@splat(5));
     input.local_artifacts = &.{.{
-        .artifact_id = package_origin.artifactIdFromSha256(@splat(5)),
-        .sha256 = @splat(5),
+        .artifact_id = package_origin.artifactIdFromIdentity(removed_identity),
+        .archive_identity = removed_identity,
         .size = 1,
         .package = "removed",
         .version = "1",
         .architecture = "amd64",
         .acquisition_url = "file:///removed.deb",
-        .trust_mode = .pinned_sha256,
+        .trust_mode = .pinned_content_digest,
     }};
     try std.testing.expectError(error.UnusedArtifact, create(std.testing.allocator, input));
 }
 
 test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidence" {
     const digest: [32]u8 = @splat(9);
-    const artifact: package_origin.LocalArtifactEvidence = .{
-        .artifact_id = package_origin.artifactIdFromSha256(digest),
-        .sha256 = digest,
+    const artifact_identity = sha256Identity(digest);
+    const artifact: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = package_origin.artifactIdFromIdentity(artifact_identity),
+        .archive_identity = artifact_identity,
         .size = 9,
         .package = "demo",
         .version = "1",
         .architecture = "amd64",
         .acquisition_url = "file:///demo.deb",
-        .trust_mode = .pinned_sha256,
+        .trust_mode = .pinned_content_digest,
     };
     var mismatched = artifact;
     mismatched.size += 1;
@@ -1139,7 +1158,7 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
         .version = artifact.version,
         .architecture = artifact.architecture,
         .origin = .{ .local_artifact = mismatched },
-        .archive_identity = sha256Identity(artifact.sha256),
+        .archive_identity = artifact.archive_identity,
         .declared_size = artifact.size,
         .retention = .requested,
         .dpkg_selection_hold = false,
@@ -1169,7 +1188,7 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
         .version = artifact.version,
         .architecture = artifact.architecture,
         .origin = .{ .local_artifact = artifact },
-        .archive_identity = sha256Identity(artifact.sha256),
+        .archive_identity = artifact.archive_identity,
         .declared_size = artifact.size,
         .retention = .requested,
         .dpkg_selection_hold = false,
@@ -1197,7 +1216,12 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
     }) |mismatch_kind| {
         var changed = artifact;
         switch (mismatch_kind) {
-            .digest => changed.sha256 = @splat(0xaa),
+            .digest => {
+                changed.archive_identity = sha256Identity(@splat(0xaa));
+                changed.artifact_id = package_origin.artifactIdFromIdentity(
+                    changed.archive_identity,
+                );
+            },
             .size => changed.size += 1,
             .identity => changed.version = "2",
             .url => changed.acquisition_url = "file:///other.deb",
@@ -1208,15 +1232,16 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
             .version = artifact.version,
             .architecture = artifact.architecture,
             .origin = .{ .local_artifact = changed },
-            .archive_identity = sha256Identity(artifact.sha256),
+            .archive_identity = artifact.archive_identity,
             .declared_size = artifact.size,
             .retention = .requested,
             .dpkg_selection_hold = false,
         };
-        const expected_error: anyerror = if (mismatch_kind == .trust)
-            error.TrustModeMismatch
-        else
-            error.ArtifactEvidenceMismatch;
+        const expected_error: anyerror = switch (mismatch_kind) {
+            .digest => error.MissingArtifact,
+            .trust => error.TrustModeMismatch,
+            else => error.ArtifactEvidenceMismatch,
+        };
         try std.testing.expectError(expected_error, create(
             std.testing.allocator,
             .{
@@ -1236,7 +1261,7 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
         var input_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer input_arena.deinit();
         const allocator = input_arena.allocator();
-        const artifacts = try allocator.alloc(package_origin.LocalArtifactEvidence, count);
+        const artifacts = try allocator.alloc(package_origin.LocalArtifactEvidenceV2, count);
         const packages = try allocator.alloc(Package, count);
         for (0..count) |offset| {
             const value: u64 = @intCast(count - offset);
@@ -1244,15 +1269,16 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
             std.mem.writeInt(u64, package_digest[0..8], value, .big);
             const name = try std.fmt.allocPrint(allocator, "package-{d:0>5}", .{value});
             const url = try std.fmt.allocPrint(allocator, "file:///{s}.deb", .{name});
-            const large_artifact: package_origin.LocalArtifactEvidence = .{
-                .artifact_id = package_origin.artifactIdFromSha256(package_digest),
-                .sha256 = package_digest,
+            const package_identity = sha256Identity(package_digest);
+            const large_artifact: package_origin.LocalArtifactEvidenceV2 = .{
+                .artifact_id = package_origin.artifactIdFromIdentity(package_identity),
+                .archive_identity = package_identity,
                 .size = value + 1,
                 .package = name,
                 .version = "1",
                 .architecture = "amd64",
                 .acquisition_url = url,
-                .trust_mode = .pinned_sha256,
+                .trust_mode = .pinned_content_digest,
             };
             artifacts[offset] = large_artifact;
             packages[offset] = .{
@@ -1260,7 +1286,7 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
                 .version = large_artifact.version,
                 .architecture = large_artifact.architecture,
                 .origin = .{ .local_artifact = large_artifact },
-                .archive_identity = sha256Identity(large_artifact.sha256),
+                .archive_identity = large_artifact.archive_identity,
                 .declared_size = large_artifact.size,
                 .retention = .dependency,
                 .dpkg_selection_hold = false,
@@ -1318,7 +1344,8 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
     ));
 
     var unused = artifact;
-    unused.artifact_id = @splat('c');
+    unused.archive_identity = sha256Identity(@splat(0xcc));
+    unused.artifact_id = package_origin.artifactIdFromIdentity(unused.archive_identity);
     try std.testing.expectError(error.UnusedArtifact, create(
         std.testing.allocator,
         .{

@@ -755,7 +755,7 @@ process-runner, clock, and fault-injection configuration is preserved. Backend
 errors propagate directly without retrying through another engine. Explicit
 profile selection does not relax standalone host-root restrictions.
 
-Operation paths select `exact-lock-v1.json` for legacy and `exact-lock-v2.json`
+Operation paths select `exact-lock-v1.json` for legacy and `exact-lock-v3.json`
 for native from the trusted profile backend during preparation, recovery, and
 active-state reconciliation. Within a state path, both backends retain the same
 `apt/active-operation-v1.json` slot and `active-operation-v1.lock`; selecting

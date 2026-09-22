@@ -51,16 +51,90 @@
       ]
     },
     "digestIdentity": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256Identity" },
+        { "$ref": "#/$defs/sha512Identity" },
+        { "$ref": "#/$defs/mixedSha256Identity" },
+        { "$ref": "#/$defs/mixedSha512Identity" }
+      ]
+    },
+    "sha256Digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "sha512Digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha512" },
+        "digest": { "$ref": "#/$defs/sha512" }
+      }
+    },
+    "sha256Identity": {
       "type": "object",
       "additionalProperties": false,
       "required": ["primary", "digests"],
       "properties": {
-        "primary": { "enum": ["sha256", "sha512"] },
+        "primary": { "const": "sha256" },
         "digests": {
           "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/sha256Digest" }],
           "minItems": 1,
-          "maxItems": 2,
-          "items": { "$ref": "#/$defs/digest" }
+          "maxItems": 1
+        }
+      }
+    },
+    "sha512Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha512" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/sha512Digest" }],
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    "mixedSha256Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha256" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "$ref": "#/$defs/sha512Digest" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "mixedSha512Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha512" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "$ref": "#/$defs/sha512Digest" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
         }
       }
     },
@@ -95,14 +169,14 @@
     "localArtifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["artifact_id", "sha256", "size", "package", "acquisition_url", "trust_mode"],
+      "required": ["artifact_id", "archive_identity", "size", "package", "acquisition_url", "trust_mode"],
       "properties": {
-        "artifact_id": { "$ref": "#/$defs/sha256" },
-        "sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_id": { "$ref": "#/$defs/digest" },
+        "archive_identity": { "$ref": "#/$defs/digestIdentity" },
         "size": { "type": "integer", "minimum": 0 },
         "package": { "$ref": "#/$defs/identity" },
         "acquisition_url": { "type": "string", "minLength": 1 },
-        "trust_mode": { "enum": ["pinned_sha256", "verified_https"] }
+        "trust_mode": { "enum": ["pinned_content_digest", "verified_https"] }
       }
     },
     "repositoryOrigin": {
@@ -118,15 +192,15 @@
     "localOrigin": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "artifact_id", "sha256", "size", "package", "acquisition_url", "trust_mode"],
+      "required": ["type", "artifact_id", "archive_identity", "size", "package", "acquisition_url", "trust_mode"],
       "properties": {
         "type": { "const": "local_artifact" },
-        "artifact_id": { "$ref": "#/$defs/sha256" },
-        "sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_id": { "$ref": "#/$defs/digest" },
+        "archive_identity": { "$ref": "#/$defs/digestIdentity" },
         "size": { "type": "integer", "minimum": 0 },
         "package": { "$ref": "#/$defs/identity" },
         "acquisition_url": { "type": "string", "minLength": 1 },
-        "trust_mode": { "enum": ["pinned_sha256", "verified_https"] }
+        "trust_mode": { "enum": ["pinned_content_digest", "verified_https"] }
       }
     },
     "package": {

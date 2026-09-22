@@ -143,10 +143,10 @@ recovery returns no new provenance and does not turn a prior failed install
 into success. Unknown script outcomes remain unresolved without replay;
 another outer owner's marker cannot be finalized through this adapter.
 
-Native capability discovery advertises all six operations, exact-lock v2,
+Native capability discovery advertises all six operations, exact-lock v3,
 native transaction provenance and disposable-or-recoverable roots, with no
 apt/dpkg invocation. Selecting native never falls back to the legacy family
-adapter, and the ordinary v1 adapter rejects v2 requests.
+adapter, and the ordinary v1 adapter rejects v3 requests.
 
 ### Diagnostic inspection
 

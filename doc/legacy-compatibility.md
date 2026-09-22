@@ -18,8 +18,10 @@ The normative Zig classifier and capability-evidence encoder are
 - `system-profile-v2` is backend-explicit. The selected backend must match the
   lock, result, active record, package-family surface, repository surface, and
   Actions input before mutation.
-- exact-lock v1 is legacy. Exact-lock v2 is native for product/package-cache
-  execution, while repository operations use v2 for both backends and must
+- exact-lock v1 is legacy. Exact-lock v2 remains a version-specific historical
+  read format. New native product, package-cache, package-family, apt-system,
+  and repository operations use exact-lock v3 with complete tagged package
+  identities. Historical repository v2 operations must
   supply the separately authenticated backend context. A v2 repository lock
   without that context is refused. There is no conversion, format detection,
   or cross-backend replay.
@@ -68,7 +70,7 @@ backend. Historical verification never grants mutation authority.
 ## Migration
 
 1. Generate a backend-explicit `system-profile-v2`.
-2. Generate and review a native exact-lock v2. Do not translate or resign v1.
+2. Generate and review a native exact-lock v3. Do not translate or resign v1/v2.
 3. Run native preparation and execution with matching repository, package
    family, profile, Actions, and backend selection.
 4. Retain old profiles, locks, results, and signatures unchanged where audit
