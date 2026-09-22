@@ -822,6 +822,14 @@ pub const PlanInput = struct {
     exact_lock: ?*const exact_lock_module.Lock = null,
     exact_lock_v2: ?*const exact_lock_v2.Lock = null,
     exact_lock_v3: ?*const exact_lock_v3.Lock = null,
+    /// Selects the caller's wire authority for an unlocked plan.
+    output_schema_version: ?PlanSchemaVersion = null,
+};
+
+pub const PlanSchemaVersion = enum(u32) {
+    v2 = 2,
+    v3 = 3,
+    v4 = 4,
 };
 
 /// `purge` extends the plan/action layer for the native engine's remove plus
@@ -887,6 +895,16 @@ pub const PlanOrigin = union(enum) {
     local_artifact: PlanLocalArtifactOrigin,
 };
 
+pub const PlanLocalArtifactOriginV2 = struct {
+    evidence: package_origin.LocalArtifactEvidenceV2,
+    solver_priority: i32,
+};
+
+pub const PlanOriginV2 = union(enum) {
+    authenticated_repository: RepositoryIdentity,
+    local_artifact: PlanLocalArtifactOriginV2,
+};
+
 pub const PriorInstalled = struct {
     package: []const u8,
     version: []const u8,
@@ -919,6 +937,8 @@ pub const PlanAction = struct {
     /// Tagged production identity. Schema v2 continues serializing
     /// `repository`; schema v3 serializes this field as `origin`.
     origin: ?PlanOrigin = null,
+    /// Schema v4 package origin, carrying the complete local artifact identity.
+    origin_v2: ?PlanOriginV2 = null,
 };
 
 pub const Plan = struct {
@@ -1051,14 +1071,18 @@ pub fn planTransaction(
 }
 
 fn planInputSchemaVersion(input: PlanInput) u32 {
+    if (input.output_schema_version) |version| return @intFromEnum(version);
     if (input.exact_lock_v3 != null) return 4;
+    if (input.exact_lock != null) return 2;
+    if (input.exact_lock_v2) |lock| {
+        if (lock.local_artifacts.len != 0) return 3;
+        return 2;
+    }
     for (input.repositories) |repository| {
+        if (repository.packages.records.len != 0) return 4;
         if (repository.eligibility == .verified_local_artifact or
             repository.local_artifact != null)
             return 3;
-    }
-    if (input.exact_lock_v2) |lock| {
-        if (lock.local_artifacts.len != 0) return 3;
     }
     return 2;
 }
@@ -1379,12 +1403,7 @@ fn planTransactionInternal(
     const summary = summarizeActions(action_slice, download_bytes, size_delta);
     const target = try owned.dupe(u8, input.target_architecture);
     return .{ .plan = .{
-        .schema_version = if (input.exact_lock_v3 != null or hasSha512Action(action_slice))
-            4
-        else if (hasLocalArtifactAction(action_slice))
-            3
-        else
-            2,
+        .schema_version = planInputSchemaVersion(input),
         .target_architecture = target,
         .mode = input.mode,
         .actions = action_slice,
@@ -2816,6 +2835,7 @@ fn materializeAction(
     var archive_identity: ?content_digest.Identity = null;
     var repository: ?RepositoryIdentity = null;
     var plan_origin: ?PlanOrigin = null;
+    var plan_origin_v2: ?PlanOriginV2 = null;
     var installed_size: u64 = 0;
     var source_name: []const u8 = undefined;
     var package_name: []const u8 = undefined;
@@ -2852,12 +2872,34 @@ fn materializeAction(
                 .evidence = owned_artifact,
                 .solver_priority = available.repository_priority,
             } };
+            const identity = archive_identity orelse
+                content_digest.Identity.init(
+                    .{ .sha256 = owned_artifact.sha256 },
+                    .sha256,
+                ) catch unreachable;
+            plan_origin_v2 = .{ .local_artifact = .{
+                .evidence = .{
+                    .artifact_id = package_origin.artifactIdFromIdentity(identity),
+                    .archive_identity = identity,
+                    .size = owned_artifact.size,
+                    .package = owned_artifact.package,
+                    .version = owned_artifact.version,
+                    .architecture = owned_artifact.architecture,
+                    .acquisition_url = owned_artifact.acquisition_url,
+                    .trust_mode = switch (owned_artifact.trust_mode) {
+                        .pinned_sha256 => .pinned_content_digest,
+                        .verified_https => .verified_https,
+                    },
+                },
+                .solver_priority = available.repository_priority,
+            } };
         } else {
             repository = .{
                 .id = available.repository_id.bytes,
                 .priority = available.repository_priority,
             };
             plan_origin = .{ .authenticated_repository = repository.? };
+            plan_origin_v2 = .{ .authenticated_repository = repository.? };
         }
     } else {
         const index = installed_index.?;
@@ -2897,6 +2939,7 @@ fn materializeAction(
         .selected_origin = selected_origin,
         .selected_origin_v2 = selected_origin_v2,
         .origin = plan_origin,
+        .origin_v2 = plan_origin_v2,
     };
 }
 
@@ -3232,23 +3275,6 @@ fn lessAction(_: void, a: PlanAction, b: PlanAction) bool {
     return a.repository != null;
 }
 
-fn hasLocalArtifactAction(actions: []const PlanAction) bool {
-    for (actions) |action| if (action.origin) |origin| switch (origin) {
-        .authenticated_repository => {},
-        .local_artifact => return true,
-    };
-    return false;
-}
-
-fn hasSha512Action(actions: []const PlanAction) bool {
-    for (actions) |action| {
-        if (action.archive_identity) |identity| {
-            if (identity.digests.sha512 != null) return true;
-        }
-    }
-    return false;
-}
-
 fn planActionMatchesLockV2(action: PlanAction, locked: exact_lock_v2.Package) bool {
     const origin = action.origin orelse return false;
     return switch (locked.origin) {
@@ -3338,7 +3364,16 @@ fn writePlanJson(plan: Plan, writer: *std.Io.Writer) !void {
             } else try writer.writeAll("null");
         } else {
             try writer.writeAll(",\"origin\":");
-            if (action.origin) |origin| try writePlanOrigin(writer, origin) else try writer.writeAll("null");
+            if (plan.schema_version >= 4) {
+                if (action.origin_v2) |origin|
+                    try writePlanOriginV2(writer, origin)
+                else
+                    try writer.writeAll("null");
+            } else if (action.origin) |origin| {
+                try writePlanOrigin(writer, origin);
+            } else {
+                try writer.writeAll("null");
+            }
         }
         if (plan.schema_version >= 4) {
             try writer.writeAll(",\"archive_identity\":");
@@ -3449,6 +3484,46 @@ fn writePlanOrigin(writer: *std.Io.Writer, origin: PlanOrigin) !void {
             try writer.print(",\"solver_priority\":{}}}", .{local.solver_priority});
         },
     }
+}
+
+fn writePlanOriginV2(writer: *std.Io.Writer, origin: PlanOriginV2) !void {
+    switch (origin) {
+        .authenticated_repository => |repository| {
+            try writer.writeAll("{\"type\":\"authenticated_repository\",\"id\":");
+            try writeJsonString(writer, &repository.id);
+            try writer.print(",\"priority\":{}}}", .{repository.priority});
+        },
+        .local_artifact => |local| {
+            const artifact = local.evidence;
+            try writer.writeAll("{\"type\":\"local_artifact\",\"artifact_id\":");
+            try writeDigestValue(writer, artifact.artifact_id);
+            try writer.writeAll(",\"archive_identity\":");
+            try writeDigestIdentity(writer, artifact.archive_identity);
+            try writer.print(",\"size\":{},\"package\":{{\"name\":", .{artifact.size});
+            try writeJsonString(writer, artifact.package);
+            try writer.writeAll(",\"version\":");
+            try writeJsonString(writer, artifact.version);
+            try writer.writeAll(",\"architecture\":");
+            try writeJsonString(writer, artifact.architecture);
+            try writer.writeAll("},\"acquisition_url\":");
+            try writeJsonString(writer, artifact.acquisition_url);
+            try writer.writeAll(",\"trust_mode\":");
+            try writeJsonString(writer, @tagName(artifact.trust_mode));
+            try writer.print(",\"solver_priority\":{}}}", .{local.solver_priority});
+        },
+    }
+}
+
+fn writeDigestValue(
+    writer: *std.Io.Writer,
+    value: content_digest.Value,
+) !void {
+    try writer.writeAll("{\"algorithm\":");
+    try writeJsonString(writer, value.algorithm().name());
+    try writer.writeAll(",\"digest\":");
+    var encoded: [128]u8 = undefined;
+    try writeJsonString(writer, value.hex(&encoded));
+    try writer.writeByte('}');
 }
 
 fn writeFailureJson(failure: PlanFailure, writer: *std.Io.Writer) !void {
@@ -4487,6 +4562,7 @@ test "planner materializes owned install closure and stable canonical JSON" {
         },
         .target_architecture = "amd64",
         .request = .{ .install = &.{.{ .name = "app" }} },
+        .output_schema_version = .v2,
     });
     var plan = result.plan;
     defer plan.deinit();
@@ -4743,6 +4819,7 @@ test "solver.test.mixed authenticated repository and verified local artifact pro
         },
         .target_architecture = "amd64",
         .request = .{ .install = &.{.{ .name = "vendor-repo" }} },
+        .output_schema_version = .v3,
     });
     var plan = result.plan;
     defer plan.deinit();
@@ -4832,6 +4909,7 @@ test "solver.test.mixed authenticated repository and verified local artifact pro
         .target_architecture = "amd64",
         .request = .{ .install = &.{.{ .name = "vendor-repo" }} },
         .exact_lock_v2 = &lock.lock,
+        .output_schema_version = .v3,
     });
     var replay_plan = replay_result.plan;
     defer replay_plan.deinit();
@@ -4850,6 +4928,7 @@ test "solver.test.mixed authenticated repository and verified local artifact pro
         },
         .target_architecture = "amd64",
         .request = .{ .install = &.{.{ .name = "vendor-repo" }} },
+        .output_schema_version = .v3,
     });
     var reversed_plan = reversed_result.plan;
     defer reversed_plan.deinit();
@@ -5055,7 +5134,7 @@ test "solver.test.local planning failures use v3 while repository failures remai
     });
     var local_failure = local_result.failure;
     defer local_failure.deinit();
-    try std.testing.expectEqual(@as(u32, 3), local_failure.schema_version);
+    try std.testing.expectEqual(@as(u32, 4), local_failure.schema_version);
     try std.testing.expectEqual(
         ProblemKind.invalid_local_artifact,
         local_failure.problems[0].kind,
@@ -5065,7 +5144,7 @@ test "solver.test.local planning failures use v3 while repository failures remai
     try std.testing.expect(std.mem.startsWith(
         u8,
         local_json,
-        "{\"schema_version\":3,",
+        "{\"schema_version\":4,",
     ));
 
     var repository = RepositoryInput.trustedTest(artifact_id, 500, &index);
@@ -5083,7 +5162,7 @@ test "solver.test.local planning failures use v3 while repository failures remai
     });
     var repository_failure = repository_result.failure;
     defer repository_failure.deinit();
-    try std.testing.expectEqual(@as(u32, 2), repository_failure.schema_version);
+    try std.testing.expectEqual(@as(u32, 4), repository_failure.schema_version);
     try std.testing.expectEqual(
         ProblemKind.unauthenticated_repository,
         repository_failure.problems[0].kind,

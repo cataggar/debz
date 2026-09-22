@@ -133,7 +133,7 @@ for (const transactionBackend of ['legacy_dpkg', 'native'] as const) {
       assert.match(output, /cache-hit<<[^\n]+\nfalse\n/);
       assert.match(
         output,
-        new RegExp(`cache-matched-key<<[^\\n]+\\ndebz-package-cas-v${transactionBackend === 'native' ? 4 : 3}-`),
+        new RegExp(`cache-matched-key<<[^\\n]+\\ndebz-package-cas-v${transactionBackend === 'native' ? 5 : 3}-`),
       );
       assert.match(output, /downloaded-count<<[^\n]+\n1\n/);
       assert.match(output, /reused-count<<[^\n]+\n2\n/);

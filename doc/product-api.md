@@ -42,10 +42,11 @@ commands likewise use dedicated versioned schemas rather than changing product
 API v1. They expose `debz.package_cache_workflow` as a lock-oriented,
 non-installing API: fingerprinting performs no repository or package I/O, and
 preparation authenticates and verifies the complete lock closure. The default
-`legacy_dpkg` backend retains the v1 lock, fingerprint, result, and archive
-contracts. Explicit `--transaction-backend native` selects genuine v2 locks
-using the core native solver-policy domain, v2 fingerprint/result schemas,
-and the distinct v2 archive stream. Neither mode auto-detects the other.
+`legacy_dpkg` backend retains lock v1 and archive v1 while using the
+packages-v2 CAS fingerprint/result v3 envelopes. Explicit
+`--transaction-backend native` selects genuine v3 locks using the core native
+solver-policy domain, fingerprint/result v5, and the tagged v3 archive stream.
+Neither mode auto-detects another lock or archive version.
 The library provides corresponding typed `createNativeFingerprint`,
 `preflightNative`, and `prepareNative` entry points and writer-held variants.
 
@@ -74,11 +75,11 @@ Missing local artifacts require separate explicit acquisition; corrupt local
 artifacts refuse even with online repair enabled. Redacted provenance URLs
 are never treated as acquisition inputs or promoted to repository authority.
 Closures without repository origins require no source or keyring inputs.
-Empty closures produce zero verified objects and a canonical empty v2 archive.
+Empty closures produce zero verified objects and a canonical empty v3 archive.
 Repository/bootstrap workflows with other solver-policy scopes remain gated
 until their own native integration.
 
-Native keys use a separate `debz-package-cas-v4-` prefix and fingerprint
+Native keys use a separate `debz-package-cas-v5-` prefix and fingerprint
 domain while retaining the shared `packages-v2/objects` layout. The download
 and install actions support matching explicit native selection. Other native
 consumer integrations remain separately gated.
@@ -171,7 +172,7 @@ Recovered transactions report whether the original attempt reached mutation;
 recovery with no outstanding execution reports `changed: false`.
 The internal `ProductionBackend.executeWorkflow` seam also supports native
 batch install/remove and upgrade-all, including explicit outer ownership.
-Planning and execution share the same canonical selectors and genuine v2
+Planning and execution share the same canonical selectors and genuine v3
 authority. Workflow recovery supplies the original semantic operation,
 selectors, and request policy (recommends, repository priority, conffile, and
 downgrade settings), which must match the held original attempt; it accepts
@@ -192,7 +193,7 @@ pending owner marker until the outer caller durably accepts the exact token.
 Owned known failures use this same handoff while retaining exit 7 and their
 failure outcome; they are not relabeled as successes. Acknowledgment verifies
 the original operation, request policy, completion, native receipt, and exact
-reviewed v2 owner where present. It acknowledges native evidence before clearing
+reviewed v3 owner where present. It acknowledges native evidence before clearing
 the root record or owner marker, and retries do not replay package work.
 Callbacks refuse physical host roots and orphan native intents, including
 otherwise idempotent cleanup requests. Unresolved native programs, workspaces,
@@ -234,8 +235,9 @@ is already `completed` and only owes provenance — a crash between the terminal
 record and its published provenance — `recover` discharges that obligation
 without running dpkg again: it verifies any `transaction-result.json` that
 survived, publishes
-`INSTALL_ROOT/var/lib/debz/root-operation-completion-v1.json`
-([`schema/root-operation-completion-v1.json`](../schema/root-operation-completion-v1.json)),
+`INSTALL_ROOT/var/lib/debz/root-operation-completion-v2.json`
+([`schema/root-operation-completion-v2.json`](../schema/root-operation-completion-v2.json));
+historical v1 completion remains readable at its original path,
 binds the record to it, clears the active intent, and reports success with
 `changed` true, because it published durable provenance and unblocked the root
 even though no package state changed. The result item names the outcome, the
@@ -279,7 +281,7 @@ Verification acquires the existing root-operation lock without creating a
 namespace, lock file, or attempt. It requires a physically bound alternate
 root with no active native evidence, root attempt, or outstanding owner
 marker. It checks canonical completion and receipt digests, retained evidence
-bytes, original caller/program/authorization bindings, the exact v2 closure
+bytes, original caller/program/authorization bindings, the exact v3 closure
 and origin evidence, terminal success, and the current package-database
 generation and final state. The summary preserves the lock's request/solver
 policy domains separately from the original caller's request/policy domains.

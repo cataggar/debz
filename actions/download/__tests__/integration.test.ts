@@ -29,8 +29,8 @@ test('native empty closures round-trip through the real CLI and opaque action ca
       .digest();
     const architecture = process.arch === 'arm64' ? 'arm64' : 'amd64';
     const lock = {
-      schema: 'https://debz.dev/schema/exact-closure-lock-v2',
-      version: 2,
+      schema: 'https://debz.dev/schema/exact-closure-lock-v3',
+      version: 3,
       target_architecture: architecture,
       request_sha256: '1'.repeat(64),
       policy_sha256: createHash('sha256')
@@ -66,9 +66,9 @@ test('native empty closures round-trip through the real CLI and opaque action ca
       async save(source, key) {
         transferPaths.push(source);
         const bytes = await readFile(source);
-        const body = Buffer.concat([Buffer.from('debz-package-cache-archive-v2\n'), Buffer.alloc(4)]);
+        const body = Buffer.concat([Buffer.from('debz-package-cache-archive-v3\n'), Buffer.alloc(4)]);
         assert.deepEqual(bytes, Buffer.concat([body, createHash('sha256').update(body).digest()]));
-        assert.match(key, /^debz-package-cas-v4-/u);
+        assert.match(key, /^debz-package-cas-v5-/u);
         stored = { key, bytes };
         saves += 1;
       },
@@ -159,9 +159,9 @@ test('native repository and empty closures use real CLI cold, partial, and exact
         return matched;
       },
       async save(source, key) {
-        assert.match(key, /^debz-package-cas-v4-/u);
+        assert.match(key, /^debz-package-cas-v5-/u);
         const bytes = await readFile(source);
-        const magic = Buffer.from('debz-package-cache-archive-v2\n');
+        const magic = Buffer.from('debz-package-cache-archive-v3\n');
         assert.deepEqual(bytes.subarray(0, magic.length), magic);
         objectCounts.push(bytes.readUInt32BE(magic.length));
         stored.set(key, bytes);
@@ -192,7 +192,7 @@ test('native repository and empty closures use real CLI cold, partial, and exact
       assert.equal(Number(reused[1]) > 0, !empty && phase !== 'cold');
       assert.match(output, new RegExp(`cache-hit<<[^\\n]+\\n${exact}\\n`));
       if (phase !== 'cold') {
-        assert.match(output, /cache-matched-key<<[^\n]+\ndebz-package-cas-v4-/u);
+        assert.match(output, /cache-matched-key<<[^\n]+\ndebz-package-cas-v5-/u);
       }
     }
     assert.equal(saves, 3);

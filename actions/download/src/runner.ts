@@ -31,21 +31,21 @@ const contracts = {
   },
   native: {
     fingerprint: {
-      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v4',
-      api_version: 4,
-      capability: 'package-cache-v4',
-      lock_schema: 'https://debz.dev/schema/exact-closure-lock-v2',
-      lock_schema_version: 2,
-      archive_format: 'debz-package-cache-archive-v2',
-      origin_mode: 'exact-lock-v2-verified-origins',
+      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v5',
+      api_version: 5,
+      capability: 'package-cache-v5',
+      lock_schema: 'https://debz.dev/schema/exact-closure-lock-v3',
+      lock_schema_version: 3,
+      archive_format: 'debz-package-cache-archive-v3',
+      origin_mode: 'exact-lock-v3-content-identities',
     },
     prepare: {
-      schema: 'io.github.cataggar.debz.package-cache-result.v4',
-      api_version: 4,
-      capability: 'package-cache-v4',
+      schema: 'io.github.cataggar.debz.package-cache-result.v5',
+      api_version: 5,
+      capability: 'package-cache-v5',
     },
-    cacheKey: /^debz-package-cas-v4-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
-    restorePrefix: /^debz-package-cas-v4-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
+    cacheKey: /^debz-package-cas-v5-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
+    restorePrefix: /^debz-package-cas-v5-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
   },
 } as const;
 

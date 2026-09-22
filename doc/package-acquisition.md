@@ -122,19 +122,28 @@ no pathname, ownership, mode, link, or special-file fields.
 
 ### Native archive contract
 
-The lower-level archive API additionally provides `importNativeFile`,
-`exportNativeFile`, and `maximumNativeArchiveBytes` for typed exact-lock v2
-closures. These use `debz-package-cache-archive-v2\n` with the same sorted
-digest/size records and final checksum. Unlike v1, v2 permits a canonical
-zero-object stream for an empty closure. Existing `importFile`, `exportFile`,
-and `maximumArchiveBytes` retain their v1 behavior, including rejecting empty
-streams; neither reader auto-detects or accepts the other version.
+The current native archive API provides `importTaggedFile`,
+`exportTaggedFile`, and `maximumTaggedArchiveBytes` for exact-lock v3 closures.
+These use `debz-package-cache-archive-v3\n`. Each sorted record carries the
+primary algorithm, the complete supported digest set in canonical algorithm
+order, the object size, and exactly that many package bytes. A final SHA-256
+covers the transport envelope. The v3 reader verifies every published digest
+and rejects unknown, missing, reordered, downgraded, or conflicting identity
+data before publishing any object. It permits a canonical zero-object stream
+for an empty closure.
 
-The v2 transport binds object digests and sizes directly from the genuine v2
-lock without converting it to v1 or inventing repository origins. Repository
-and local-artifact origin evidence stays in the caller's authenticated lock,
-not the path-free archive. Transport does not grant origin authority or
-validate package installation policy.
+The historical `importNativeFile`, `exportNativeFile`, and
+`maximumNativeArchiveBytes` API and `debz-package-cache-archive-v2\n` bytes are
+retained for exact-lock v2 compatibility. Existing `importFile`, `exportFile`,
+and `maximumArchiveBytes` likewise retain their v1 behavior, including
+rejecting empty streams. No reader auto-detects or accepts another format
+version.
+
+The v3 transport binds complete object identities and sizes directly from the
+genuine v3 lock without converting it to an older lock or inventing repository
+origins. Repository and local-artifact origin evidence stays in the caller's
+authenticated lock, not the path-free archive. Transport does not grant origin
+authority or validate package installation policy.
 
 Both formats validate the complete envelope and every object before any
 matching object is published under the CAS writer lock. Exact restores require
@@ -176,7 +185,7 @@ version-specific v1/v2 readers remain available for historical evidence.
 
 Errors never contain authorization values. Effective URLs omit user info,
 fragments, and all query data; cache keys and provenance contain only the
-authenticated repository identity and expected SHA-256.
+authenticated repository identity and expected canonical content identity.
 
 ## Local artifacts
 

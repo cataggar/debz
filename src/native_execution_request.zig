@@ -4,6 +4,7 @@
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
 const native_operation = @import("native_operation.zig");
+const native_authorization = @import("native_authorization.zig");
 const native_helper = @import("native_helper.zig");
 const native_program = @import("native_program.zig");
 const native_recovery = @import("native_recovery.zig");
@@ -20,6 +21,8 @@ pub const helper_schema_id = "https://debz.dev/schema/native-execution-request-v
 pub const helper_logical_path = "request/native-execution-request-v2.json";
 pub const bootstrap_schema_id = "https://debz.dev/schema/native-execution-request-v3";
 pub const bootstrap_logical_path = "request/native-execution-request-v3.json";
+pub const authority_schema_id = "https://debz.dev/schema/native-execution-request-v4";
+pub const authority_logical_path = "request/native-execution-request-v4.json";
 
 pub const Caller = struct {
     attempt_id: Digest,
@@ -105,10 +108,40 @@ pub const OwnedBootstrapDocument = struct {
     }
 };
 
+pub const AuthorityBinding = struct {
+    authorization_schema: []const u8,
+    authorization_version: u32,
+    program_schema: []const u8,
+    program_version: u32,
+    exact_lock_schema: []const u8,
+    exact_lock_version: u32,
+};
+
+pub const AuthorityDocument = struct {
+    schema: []const u8 = authority_schema_id,
+    version: u32 = 4,
+    execution: Document,
+    authority: AuthorityBinding,
+    helper: ?native_helper.Binding = null,
+    bootstrap: ?native_helper.Bootstrap = null,
+    digest_sha256: Digest = @splat('0'),
+};
+
+pub const OwnedAuthorityDocument = struct {
+    document: AuthorityDocument,
+    parsed: std.json.Parsed(AuthorityDocument),
+
+    pub fn deinit(self: *OwnedAuthorityDocument) void {
+        self.parsed.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const OwnedRequest = union(enum) {
     plain: OwnedDocument,
     isolated_helper: OwnedHelperDocument,
     fresh_root_bootstrap: OwnedBootstrapDocument,
+    authority_v2: OwnedAuthorityDocument,
 
     pub fn deinit(self: *OwnedRequest) void {
         switch (self.*) {
@@ -122,6 +155,7 @@ pub const OwnedRequest = union(enum) {
             .plain => |value| value.document,
             .isolated_helper => |value| value.document.execution,
             .fresh_root_bootstrap => |value| value.document.execution,
+            .authority_v2 => |value| value.document.execution,
         };
     }
 
@@ -130,12 +164,17 @@ pub const OwnedRequest = union(enum) {
             .plain => null,
             .isolated_helper => |value| value.document.helper,
             .fresh_root_bootstrap => |value| value.document.bootstrap.helper,
+            .authority_v2 => |value| if (value.document.bootstrap) |bootstrap_value|
+                bootstrap_value.helper
+            else
+                value.document.helper,
         };
     }
 
     pub fn bootstrap(self: OwnedRequest) ?native_helper.Bootstrap {
         return switch (self) {
             .fresh_root_bootstrap => |value| value.document.bootstrap,
+            .authority_v2 => |value| value.document.bootstrap,
             else => null,
         };
     }
@@ -151,9 +190,119 @@ pub const OwnedRequest = union(enum) {
             .plain => logical_path,
             .isolated_helper => helper_logical_path,
             .fresh_root_bootstrap => bootstrap_logical_path,
+            .authority_v2 => authority_logical_path,
         };
     }
+
+    pub fn validateAuthorityDocuments(
+        self: OwnedRequest,
+        authorization: native_authorization.Authorization,
+        program: native_program.Program,
+    ) !void {
+        try validateProgram(self.execution(), program);
+        if (program.version == native_program.schema_v2_version) {
+            const document = switch (self) {
+                .authority_v2 => |value| value.document,
+                else => return error.RecoveryRequestBindingMismatch,
+            };
+            if (authorization.wire_version != native_authorization.schema_v2_version or
+                !std.mem.eql(
+                    u8,
+                    document.authority.authorization_schema,
+                    native_authorization.schema_v2_id,
+                ) or
+                document.authority.authorization_version != authorization.wire_version or
+                !std.mem.eql(u8, document.authority.program_schema, program.schema) or
+                document.authority.program_version != program.version or
+                !std.mem.eql(
+                    u8,
+                    document.authority.exact_lock_schema,
+                    program.exact_lock.schema,
+                ) or
+                document.authority.exact_lock_version != program.exact_lock.version)
+                return error.RecoveryRequestBindingMismatch;
+            return;
+        }
+        if ((switch (self) {
+            .authority_v2 => true,
+            else => false,
+        }) or
+            authorization.wire_version != native_authorization.schema_version)
+            return error.RecoveryRequestBindingMismatch;
+    }
 };
+
+fn authorityDigest(document: AuthorityDocument) Digest {
+    var payload = document;
+    payload.digest_sha256 = @splat('0');
+    var buffer: [4096]u8 = undefined;
+    var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+    sink.writer.writeAll("debz-native-execution-request-v4\x00") catch unreachable;
+    std.json.Stringify.value(payload, .{ .whitespace = .minified }, &sink.writer) catch unreachable;
+    sink.writer.flush() catch unreachable;
+    return native_recovery.hexDigest(sink.hasher.finalResult());
+}
+
+fn validateAuthority(document: AuthorityDocument) !void {
+    if (!std.mem.eql(u8, document.schema, authority_schema_id) or
+        document.version != 4 or
+        document.authority.authorization_schema.len == 0 or
+        document.authority.authorization_version == 0 or
+        document.authority.program_schema.len == 0 or
+        document.authority.program_version == 0 or
+        document.authority.exact_lock_schema.len == 0 or
+        document.authority.exact_lock_version == 0 or
+        document.helper != null and document.bootstrap != null)
+        return error.InvalidExecutionRequest;
+    try validate(document.execution);
+    if (document.helper) |helper| try helper.validate();
+    if (document.bootstrap) |bootstrap|
+        try validateBootstrapExecution(document.execution, bootstrap);
+    if (!std.mem.eql(u8, &document.digest_sha256, &authorityDigest(document)))
+        return error.DigestMismatch;
+}
+
+pub fn withAuthority(
+    execution: Document,
+    program: native_program.Program,
+    helper: ?native_helper.Binding,
+    bootstrap: ?native_helper.Bootstrap,
+) !AuthorityDocument {
+    try validateProgram(execution, program);
+    var document: AuthorityDocument = .{
+        .execution = execution,
+        .authority = .{
+            .authorization_schema = if (program.version == native_program.schema_v2_version)
+                native_authorization.schema_v2_id
+            else
+                native_authorization.schema_id,
+            .authorization_version = program.version,
+            .program_schema = program.schema,
+            .program_version = program.version,
+            .exact_lock_schema = program.exact_lock.schema,
+            .exact_lock_version = program.exact_lock.version,
+        },
+        .helper = helper,
+        .bootstrap = bootstrap,
+    };
+    document.digest_sha256 = authorityDigest(document);
+    try validateAuthority(document);
+    return document;
+}
+
+pub fn encodeWithAuthority(
+    allocator: std.mem.Allocator,
+    document: AuthorityDocument,
+) ![]u8 {
+    try validateAuthority(document);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    std.json.Stringify.value(document, .{ .whitespace = .minified }, &output.writer) catch
+        return error.OutOfMemory;
+    output.writer.writeByte('\n') catch return error.OutOfMemory;
+    if (output.written().len > maximum_document_bytes) return error.LimitExceeded;
+    return output.toOwnedSlice();
+}
 
 fn helperDigest(document: HelperDocument) Digest {
     var payload = document;
@@ -266,6 +415,20 @@ pub fn decodePersisted(allocator: std.mem.Allocator, bytes: []const u8) !OwnedRe
         defer allocator.free(canonical);
         if (!std.mem.eql(u8, bytes, canonical)) return error.NonCanonicalDocument;
         return .{ .isolated_helper = .{ .document = parsed.value, .parsed = parsed } };
+    }
+    if (std.mem.eql(u8, header.value.schema, authority_schema_id) and
+        header.value.version == 4)
+    {
+        var parsed = try std.json.parseFromSlice(AuthorityDocument, allocator, bytes, .{
+            .ignore_unknown_fields = false,
+            .allocate = .alloc_always,
+        });
+        errdefer parsed.deinit();
+        try validateAuthority(parsed.value);
+        const canonical = try encodeWithAuthority(allocator, parsed.value);
+        defer allocator.free(canonical);
+        if (!std.mem.eql(u8, bytes, canonical)) return error.NonCanonicalDocument;
+        return .{ .authority_v2 = .{ .document = parsed.value, .parsed = parsed } };
     }
     if (!std.mem.eql(u8, header.value.schema, bootstrap_schema_id) or
         header.value.version != 3)

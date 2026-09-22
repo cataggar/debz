@@ -9,7 +9,6 @@ const live_root = @import("live_root.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v3.zig");
-const exact_lock_legacy = @import("exact_lock_v2.zig");
 const legacy_compat = @import("legacy_compat.zig");
 const metadata_cache = @import("metadata_cache.zig");
 const native_operation = @import("native_operation.zig");
@@ -34,7 +33,7 @@ const source = @import("source.zig");
 const target_apt_config = @import("target_apt_config.zig");
 const transaction_engine = @import("transaction_engine.zig");
 const transaction_executor = @import("transaction_executor.zig");
-const transaction_provenance_v2 = @import("transaction_provenance_v2.zig");
+const transaction_provenance_v3 = @import("transaction_provenance_v3.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 
 const operation_directory_name = "repository";
@@ -45,8 +44,8 @@ const operation_lock_name = "repo-add.lock";
 // schema inside it is exact-lock v3 for new operations.
 const exact_lock_name = "exact-lock-v2.json";
 const exact_plan_name = "transaction-plan-v3.json";
-const provenance_name = "transaction-result-v2.json";
-const native_provenance_name = "native-transaction-provenance-v1.json";
+const provenance_name = "transaction-result-v3.json";
+const native_provenance_name = std.fs.path.basename(native_provenance.document_path);
 const manifest_name = "apt-config-snapshot-v1.json";
 
 pub const Executor = transaction_engine.Executor;
@@ -1587,6 +1586,7 @@ fn finishNativeRepository(
         .transaction_provenance = .{
             .status = .already_present,
             .schema = native_provenance.schema_id,
+            .version = native_provenance.schema_version,
             .document_sha256 = native_recovery.parseDigest(input.expected_receipt_sha256) orelse return error.NativeReceiptMismatch,
             .detail = "verified terminal native repository package receipt",
         },
@@ -5959,6 +5959,7 @@ fn planDescriptor(
             .hold_authority = .explicit_policy,
         },
         .target_architecture = architecture,
+        .output_schema_version = .v4,
         .request = if (reinstall) .{ .reinstall = .{
             .name = package,
             .version = version,
@@ -5994,7 +5995,7 @@ fn unchangedDescriptorPlan(allocator: std.mem.Allocator, architecture: []const u
     arena.* = .init(allocator);
     errdefer arena.deinit();
     return .{
-        .schema_version = 3,
+        .schema_version = 4,
         .target_architecture = try arena.allocator().dupe(u8, architecture),
         .mode = .plan_only,
         .actions = &.{},
@@ -6056,7 +6057,7 @@ fn createOperationLock(
     defer repository_ids.deinit(allocator);
     for (plan.actions) |action| {
         if (action.kind == .remove) continue;
-        const origin = action.origin orelse return error.MissingPackageOrigin;
+        const origin = try completePlanOrigin(action);
         const identity = action.archive_identity orelse identity: {
             const digest = try parsePlanDigest(
                 action.sha256 orelse return error.MissingPackageDigest,
@@ -6070,14 +6071,13 @@ fn createOperationLock(
             return error.MissingPackageSize;
         switch (origin) {
             .local_artifact => |local| {
-                if (!package_origin.eqlLocalArtifact(
+                if (!package_origin.eqlLocalArtifactV2(
                     local.evidence,
-                    local_evidence,
+                    tagged_local_evidence,
                 ) or
-                    !std.mem.eql(
-                        u8,
-                        &(identity.digests.sha256 orelse return error.LocalArtifactMismatch),
-                        &local.evidence.sha256,
+                    !@import("content_digest.zig").Identity.eql(
+                        identity,
+                        local.evidence.archive_identity,
                     ) or
                     declared_size != local.evidence.size or
                     local.solver_priority != 1000)
@@ -6199,32 +6199,16 @@ fn upgradeLocalEvidence(
     };
 }
 
-fn legacyPackageOrigin(
-    origin: exact_lock_v2.PackageOrigin,
-    archive_sha256: [32]u8,
-) exact_lock_legacy.PackageOrigin {
-    return switch (origin) {
+fn completePlanOrigin(action: solver.PlanAction) !solver.PlanOriginV2 {
+    if (action.origin_v2) |origin| return origin;
+    return switch (action.origin orelse return error.MissingPackageOrigin) {
         .authenticated_repository => |repository| .{
-            .authenticated_repository = .{
-                .repository_id = repository.repository_id,
-                .repository_snapshot_sha256 = repository.repository_snapshot_sha256,
-            },
+            .authenticated_repository = repository,
         },
-        .local_artifact => |artifact| .{
-            .local_artifact = .{
-                .artifact_id = package_origin.artifactIdFromSha256(archive_sha256),
-                .sha256 = archive_sha256,
-                .size = artifact.size,
-                .package = artifact.package,
-                .version = artifact.version,
-                .architecture = artifact.architecture,
-                .acquisition_url = artifact.acquisition_url,
-                .trust_mode = switch (artifact.trust_mode) {
-                    .pinned_content_digest => .pinned_sha256,
-                    .verified_https => .verified_https,
-                },
-            },
-        },
+        .local_artifact => |local| .{ .local_artifact = .{
+            .evidence = try upgradeLocalEvidence(local.evidence),
+            .solver_priority = local.solver_priority,
+        } },
     };
 }
 
@@ -6243,13 +6227,15 @@ fn acquirePlanArtifacts(
     try budget.checkTime();
     for (plan.actions) |action| {
         if (action.kind == .remove) continue;
-        const origin = action.origin orelse return error.MissingPackageOrigin;
+        const origin = try completePlanOrigin(action);
         switch (origin) {
             .local_artifact => |local| {
-                const identity = @import("content_digest.zig").Identity.init(
-                    .{ .sha256 = local.evidence.sha256 },
-                    .sha256,
-                ) catch unreachable;
+                const identity = action.archive_identity orelse
+                    local.evidence.archive_identity;
+                if (!@import("content_digest.zig").Identity.eql(
+                    identity,
+                    local.evidence.archive_identity,
+                )) return error.LocalArtifactMismatch;
                 var key_buffer: [135]u8 = undefined;
                 const key = identity.cacheKey(&key_buffer);
                 try artifacts.append(allocator, .{
@@ -6417,7 +6403,7 @@ fn publishBoundProvenance(
 ) ![32]u8 {
     _ = refreshed;
     const repositories = try allocator.alloc(
-        transaction_provenance_v2.RepositoryEvidence,
+        transaction_provenance_v3.RepositoryEvidence,
         lock.repositories.len,
     );
     defer allocator.free(repositories);
@@ -6445,20 +6431,18 @@ fn publishBoundProvenance(
         };
     }
     const packages = try allocator.alloc(
-        transaction_provenance_v2.PackageEvidence,
+        transaction_provenance_v3.PackageEvidence,
         lock.packages.len,
     );
     defer allocator.free(packages);
     for (lock.packages, 0..) |package, index| {
-        const archive_sha256 = package.archive_identity.digests.sha256 orelse
-            return error.MissingPackageDigest;
         packages[index] = .{
             .name = package.name,
             .version = package.version,
             .architecture = package.architecture,
-            .origin = legacyPackageOrigin(package.origin, archive_sha256),
-            .package_sha256 = archive_sha256,
-            .cas_sha256 = archive_sha256,
+            .origin = package.origin,
+            .package_identity = .init(package.archive_identity),
+            .cas_identity = .init(package.archive_identity),
             .declared_size = package.declared_size,
         };
     }
@@ -6473,66 +6457,8 @@ fn publishBoundProvenance(
     );
     defer allocator.free(status_bytes);
     const status_digest = sha256(status_bytes);
-    const legacy_repositories = try allocator.alloc(
-        exact_lock_legacy.Repository,
-        lock.repositories.len,
-    );
-    defer allocator.free(legacy_repositories);
-    for (lock.repositories, legacy_repositories) |repository, *legacy| legacy.* = .{
-        .id = repository.id,
-        .snapshot_sha256 = repository.snapshot_sha256,
-        .release_sha256 = repository.release_sha256,
-        .index_sha256 = repository.index_identity.digests.sha256 orelse
-            return error.MissingRepositoryDigest,
-        .signer_fingerprints = repository.signer_fingerprints,
-    };
-    const legacy_artifacts = try allocator.alloc(
-        package_origin.LocalArtifactEvidence,
-        lock.local_artifacts.len,
-    );
-    defer allocator.free(legacy_artifacts);
-    for (lock.local_artifacts, legacy_artifacts) |artifact, *legacy| {
-        const archive_sha256 = artifact.archive_identity.digests.sha256 orelse
-            return error.MissingPackageDigest;
-        legacy.* = legacyPackageOrigin(
-            .{ .local_artifact = artifact },
-            archive_sha256,
-        ).local_artifact;
-    }
-    const legacy_packages = try allocator.alloc(
-        exact_lock_legacy.Package,
-        lock.packages.len,
-    );
-    defer allocator.free(legacy_packages);
-    for (lock.packages, legacy_packages) |package, *legacy| {
-        const archive_sha256 = package.archive_identity.digests.sha256 orelse
-            return error.MissingPackageDigest;
-        legacy.* = .{
-            .name = package.name,
-            .version = package.version,
-            .architecture = package.architecture,
-            .origin = legacyPackageOrigin(package.origin, archive_sha256),
-            .sha256 = archive_sha256,
-            .declared_size = package.declared_size,
-            .retention = switch (package.retention) {
-                .requested => .requested,
-                .dependency => .dependency,
-                .retained => .retained,
-            },
-            .dpkg_selection_hold = package.dpkg_selection_hold,
-        };
-    }
-    const legacy_lock: exact_lock_legacy.Lock = .{
-        .target_architecture = lock.target_architecture,
-        .request_sha256 = lock.request_sha256,
-        .policy_sha256 = lock.policy_sha256,
-        .repositories = legacy_repositories,
-        .local_artifacts = legacy_artifacts,
-        .packages = legacy_packages,
-        .digest_sha256 = lock.digest_sha256,
-    };
-    const input: transaction_provenance_v2.ExecutionInput = .{
-        .exact_lock = &legacy_lock,
+    const input: transaction_provenance_v3.ExecutionInput = .{
+        .exact_lock = lock,
         .target_architecture = lock.target_architecture,
         .request_sha256 = lock.request_sha256,
         .solver_policy_sha256 = lock.policy_sha256,
@@ -6547,19 +6473,19 @@ fn publishBoundProvenance(
         },
     };
     var provenance = switch (report) {
-        .execution => |value| try transaction_provenance_v2.createFromExecution(
+        .execution => |value| try transaction_provenance_v3.createFromExecution(
             allocator,
             input,
             value,
         ),
-        .recovery => |value| try transaction_provenance_v2.createFromRecovery(
+        .recovery => |value| try transaction_provenance_v3.createFromRecovery(
             allocator,
             input,
             value,
         ),
     };
     defer provenance.deinit();
-    const store = try transaction_provenance_v2.Store.init(
+    const store = try transaction_provenance_v3.Store.init(
         io,
         operation_dir,
         provenance_name,
@@ -6573,8 +6499,8 @@ fn publishBoundProvenance(
         operation_dir,
         provenance_name,
         .{
-            .schema = transaction_provenance_v2.schema_id,
-            .version = transaction_provenance_v2.schema_version,
+            .schema = transaction_provenance_v3.schema_id,
+            .version = transaction_provenance_v3.schema_version,
             .backend = .legacy_dpkg,
         },
         bytes,
@@ -6688,13 +6614,13 @@ fn validateRecoveryEvidence(
     var reader = file.reader(io, &.{});
     const source_bytes = try reader.interface.allocRemaining(
         allocator,
-        .limited(transaction_provenance_v2.maximum_document_bytes),
+        .limited(transaction_provenance_v3.maximum_document_bytes),
     );
     defer allocator.free(source_bytes);
-    var document = try transaction_provenance_v2.validateDocument(
+    var document = try transaction_provenance_v3.validateDocument(
         allocator,
         source_bytes,
-        transaction_provenance_v2.maximum_document_bytes,
+        transaction_provenance_v3.maximum_document_bytes,
     );
     defer document.deinit();
     var parsed = try std.json.parseFromSlice(
@@ -12205,8 +12131,8 @@ test "repository backend completes and idempotently resumes every production pha
         directory.dir,
         result.paths.provenance,
         .{
-            .schema = transaction_provenance_v2.schema_id,
-            .version = transaction_provenance_v2.schema_version,
+            .schema = transaction_provenance_v3.schema_id,
+            .version = transaction_provenance_v3.schema_version,
             .backend = .legacy_dpkg,
         },
     );

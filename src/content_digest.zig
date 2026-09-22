@@ -316,6 +316,164 @@ pub const Identity = struct {
     }
 };
 
+const WireDigest = struct {
+    algorithm: Algorithm,
+    digest: []const u8,
+};
+
+/// Canonical JSON representation of one tagged digest. The wrapper keeps the
+/// runtime model on `Value` while letting versioned native documents use the
+/// same `{algorithm,digest}` wire shape as exact-lock v3 and plan v4.
+pub const JsonValue = struct {
+    value: Value,
+
+    pub fn init(value: Value) JsonValue {
+        return .{ .value = value };
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !JsonValue {
+        const wire = try std.json.innerParse(
+            WireDigest,
+            allocator,
+            source,
+            options,
+        );
+        return .{
+            .value = Value.parse(wire.algorithm, wire.digest) catch
+                return error.UnexpectedToken,
+        };
+    }
+
+    pub fn jsonStringify(self: JsonValue, writer: anytype) !void {
+        var encoded: [128]u8 = undefined;
+        try writer.write(.{
+            .algorithm = self.value.algorithm(),
+            .digest = self.value.hex(&encoded),
+        });
+    }
+};
+
+/// Canonical JSON representation of a complete supported digest identity.
+/// Digests are accepted only once and in the project-wide SHA256, SHA512
+/// order. Unknown algorithms, duplicate algorithms, missing primaries, and
+/// non-canonical digest text therefore fail during decoding.
+pub const JsonIdentity = struct {
+    value: Identity,
+
+    pub fn init(value: Identity) JsonIdentity {
+        return .{ .value = value };
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !JsonIdentity {
+        const Wire = struct {
+            primary: Algorithm,
+            digests: []const WireDigest,
+        };
+        const wire = try std.json.innerParse(Wire, allocator, source, options);
+        if (wire.digests.len == 0 or wire.digests.len > supported_algorithms.len)
+            return error.UnexpectedToken;
+        var set: Set = .{};
+        var previous: ?Algorithm = null;
+        for (wire.digests) |digest| {
+            if (previous) |algorithm| {
+                if (@intFromEnum(digest.algorithm) <= @intFromEnum(algorithm))
+                    return error.UnexpectedToken;
+            }
+            const value = Value.parse(digest.algorithm, digest.digest) catch
+                return error.UnexpectedToken;
+            set.put(value) catch return error.UnexpectedToken;
+            previous = digest.algorithm;
+        }
+        return .{
+            .value = Identity.init(set, wire.primary) catch
+                return error.UnexpectedToken,
+        };
+    }
+
+    pub fn jsonStringify(self: JsonIdentity, writer: anytype) !void {
+        var encoded: [supported_algorithms.len][128]u8 = undefined;
+        var digests: [supported_algorithms.len]WireDigest = undefined;
+        var count: usize = 0;
+        inline for (supported_algorithms) |algorithm| {
+            if (self.value.digests.get(algorithm)) |digest| {
+                digests[count] = .{
+                    .algorithm = algorithm,
+                    .digest = digest.hex(&encoded[count]),
+                };
+                count += 1;
+            }
+        }
+        try writer.write(.{
+            .primary = self.value.primary,
+            .digests = digests[0..count],
+        });
+    }
+};
+
+pub fn valueFromJson(value: std.json.Value) error{InvalidDigest}!Value {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidDigest,
+    };
+    if (object.count() != 2) return error.InvalidDigest;
+    const algorithm_text = switch (object.get("algorithm") orelse
+        return error.InvalidDigest) {
+        .string => |text| text,
+        else => return error.InvalidDigest,
+    };
+    const digest_text = switch (object.get("digest") orelse
+        return error.InvalidDigest) {
+        .string => |text| text,
+        else => return error.InvalidDigest,
+    };
+    const algorithm = Algorithm.parse(algorithm_text) catch
+        return error.InvalidDigest;
+    return Value.parse(algorithm, digest_text);
+}
+
+pub fn identityFromJson(value: std.json.Value) error{InvalidDigestIdentity}!Identity {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidDigestIdentity,
+    };
+    if (object.count() != 2) return error.InvalidDigestIdentity;
+    const primary_text = switch (object.get("primary") orelse
+        return error.InvalidDigestIdentity) {
+        .string => |text| text,
+        else => return error.InvalidDigestIdentity,
+    };
+    const digests = switch (object.get("digests") orelse
+        return error.InvalidDigestIdentity) {
+        .array => |items| items.items,
+        else => return error.InvalidDigestIdentity,
+    };
+    if (digests.len == 0 or digests.len > supported_algorithms.len)
+        return error.InvalidDigestIdentity;
+    const primary = Algorithm.parse(primary_text) catch
+        return error.InvalidDigestIdentity;
+    var set: Set = .{};
+    var previous: ?Algorithm = null;
+    for (digests) |digest_value| {
+        const digest = valueFromJson(digest_value) catch
+            return error.InvalidDigestIdentity;
+        if (previous) |algorithm| {
+            if (@intFromEnum(digest.algorithm()) <= @intFromEnum(algorithm))
+                return error.InvalidDigestIdentity;
+        }
+        set.put(digest) catch return error.InvalidDigestIdentity;
+        previous = digest.algorithm();
+    }
+    return Identity.init(set, primary) catch error.InvalidDigestIdentity;
+}
+
 test "algorithm tagged digests are strict canonical and not confusable" {
     const sha256 = try Value.parse(
         .sha256,
@@ -368,4 +526,40 @@ test "supported identities are canonical ordered and detect overlapping content 
     try std.testing.expect(full.overlaps(sha512_only));
     try std.testing.expectEqual(std.math.Order.gt, Identity.order(full, sha512_only));
     try full.verify("archive");
+}
+
+test "JSON digest identities reject downgrade order and preserve SHA512-only values" {
+    const testing = std.testing;
+    const identity = try Identity.init(
+        .{ .sha512 = Value.of(.sha512, "archive").sha512 },
+        .sha512,
+    );
+    const encoded = try std.json.Stringify.valueAlloc(
+        testing.allocator,
+        JsonIdentity.init(identity),
+        .{ .whitespace = .minified },
+    );
+    defer testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(
+        JsonIdentity,
+        testing.allocator,
+        encoded,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    try testing.expect(Identity.eql(identity, parsed.value.value));
+
+    const reversed =
+        "{\"primary\":\"sha512\",\"digests\":[" ++
+        "{\"algorithm\":\"sha512\",\"digest\":\"" ++ ("00" ** 64) ++ "\"}," ++
+        "{\"algorithm\":\"sha256\",\"digest\":\"" ++ ("00" ** 32) ++ "\"}]}";
+    try testing.expectError(
+        error.UnexpectedToken,
+        std.json.parseFromSlice(
+            JsonIdentity,
+            testing.allocator,
+            reversed,
+            .{ .allocate = .alloc_always },
+        ),
+    );
 }

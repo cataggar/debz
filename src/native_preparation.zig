@@ -177,6 +177,12 @@ const Fixture = struct {
             .repository_snapshot_sha256 = snapshot,
         },
     };
+    const repository_origin_v2: exact_lock_v3.PackageOrigin = .{
+        .authenticated_repository = .{
+            .repository_id = repository_id,
+            .repository_snapshot_sha256 = snapshot,
+        },
+    };
     const local_origin: @import("package_origin.zig").LocalArtifactEvidence = .{
         .artifact_id = @import("package_origin.zig").artifactIdFromSha256(archive_sha256),
         .package = "app",
@@ -227,6 +233,16 @@ const Fixture = struct {
                     .{ .local_artifact = .{ .evidence = local_origin, .solver_priority = 500 } }
                 else
                     .{ .authenticated_repository = .{ .id = repository_id, .priority = 500 } },
+                .origin_v2 = if (local)
+                    .{ .local_artifact = .{
+                        .evidence = tagged_local_origin,
+                        .solver_priority = 500,
+                    } }
+                else
+                    .{ .authenticated_repository = .{
+                        .id = repository_id,
+                        .priority = 500,
+                    } },
             },
             .{
                 .kind = .remove,
@@ -270,12 +286,20 @@ const Fixture = struct {
             .version = "1.2",
             .architecture = "amd64",
             .sha256 = archive_sha256,
+            .archive_identity = .{
+                .digests = .{ .sha256 = archive_sha256 },
+                .primary = .sha256,
+            },
             .size = 100,
             .origin = if (local) .{ .local_artifact = local_origin } else repository_origin,
+            .origin_v2 = if (local)
+                .{ .local_artifact = tagged_local_origin }
+            else
+                repository_origin_v2,
             .application_sha256 = @splat(0x56),
         }};
         self.plan = .{
-            .schema_version = 3,
+            .schema_version = 4,
             .target_architecture = "amd64",
             .mode = .plan_only,
             .actions = &self.actions,
@@ -404,7 +428,7 @@ test "native_preparation.test.production hashes origins and mixed final closure 
     try std.testing.expectEqual(.config_files, authorization.findFinalPackage("old", "amd64").?.state);
     try std.testing.expectEqual(.config_files, authorization.findFinalPackage("residue", "amd64").?.state);
     try std.testing.expect(authorization.findFinalPackage("held", "amd64").?.dpkg_selection_hold);
-    const origin = authorization.findAction("app", "amd64").?.artifact.?.origin.authenticated_repository;
+    const origin = authorization.findAction("app", "amd64").?.artifact.?.origin_v2.?.authenticated_repository;
     try std.testing.expectEqual(Fixture.repository_id, origin.repository_id);
     try std.testing.expectEqual(Fixture.snapshot, origin.repository_snapshot_sha256);
     try std.testing.expectEqualStrings(
@@ -518,9 +542,9 @@ test "native_preparation.test.local origins are preserved and not reinterpreted 
     var result = try prepare(std.testing.allocator, fixture.request());
     defer result.deinit();
     const prepared = try preparedResult(&result);
-    const origin = prepared.authorization.authorization.actions[0].artifact.?.origin.local_artifact;
-    try std.testing.expect(@import("package_origin.zig").eqlLocalArtifact(Fixture.local_origin, origin));
-    fixture.archives[0].origin = Fixture.repository_origin;
+    const origin = prepared.authorization.authorization.actions[0].artifact.?.origin_v2.?.local_artifact;
+    try std.testing.expect(@import("package_origin.zig").eqlLocalArtifactV2(Fixture.tagged_local_origin, origin));
+    fixture.archives[0].origin_v2 = Fixture.repository_origin_v2;
     try expectDiagnostic(fixture.request(), .archive_origin_mismatch);
 }
 
@@ -541,7 +565,10 @@ test "native_preparation.test.plan artifact and prior identity substitutions are
     };
     try std.testing.expectError(error.AuthorizationArtifactMismatch, prepare(std.testing.allocator, fixture.request()));
     fixture.actions = original;
-    fixture.actions[0].origin = .{ .authenticated_repository = .{ .id = @splat('c'), .priority = 500 } };
+    fixture.actions[0].origin_v2 = .{ .authenticated_repository = .{
+        .id = @splat('c'),
+        .priority = 500,
+    } };
     try std.testing.expectError(error.AuthorizationArtifactMismatch, prepare(std.testing.allocator, fixture.request()));
     fixture.actions = original;
     fixture.actions[1].prior_installed.?.package = "another";
@@ -597,9 +624,9 @@ test "native_preparation.test.operation-scoped locks preserve the complete captu
             &@import("package_origin.zig").artifactIdFromSha256(request.installed.generation_sha256),
             &program.installed_database.generation_sha256,
         );
-        const origin = authorization.findAction("app", "amd64").?.artifact.?.origin;
+        const origin = authorization.findAction("app", "amd64").?.artifact.?.origin_v2.?;
         if (local) {
-            try std.testing.expect(@import("package_origin.zig").eqlLocalArtifact(Fixture.local_origin, origin.local_artifact));
+            try std.testing.expect(@import("package_origin.zig").eqlLocalArtifactV2(Fixture.tagged_local_origin, origin.local_artifact));
         } else {
             try std.testing.expectEqual(Fixture.repository_id, origin.authenticated_repository.repository_id);
         }
@@ -687,12 +714,12 @@ test "native_preparation.test.compiler retains missing archive and lifecycle dia
     var request = fixture.request();
     request.archives = &.{};
     try expectDiagnostic(request, .missing_archive);
-    fixture.archives[0].sha256[0] ^= 1;
+    fixture.archives[0].archive_identity.?.digests.sha256.?[0] ^= 1;
     try expectDiagnostic(fixture.request(), .archive_evidence_mismatch);
-    fixture.archives[0].sha256[0] ^= 1;
-    fixture.archives[0].origin.authenticated_repository.repository_snapshot_sha256[0] ^= 1;
+    fixture.archives[0].archive_identity.?.digests.sha256.?[0] ^= 1;
+    fixture.archives[0].origin_v2.?.authenticated_repository.repository_snapshot_sha256[0] ^= 1;
     try expectDiagnostic(fixture.request(), .archive_origin_mismatch);
-    fixture.archives[0].origin = Fixture.repository_origin;
+    fixture.archives[0].origin_v2 = Fixture.repository_origin_v2;
     fixture.plan.ordered_actions = fixture.ordered[0..2];
     try expectDiagnostic(fixture.request(), .missing_configure_barrier);
 }
@@ -846,23 +873,10 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
             const package = selected orelse return error.LockClosureMismatch;
             if (!sameText(package.version, action.version))
                 return error.LockClosureMismatch;
-            const archive = findArchive(
-                request.archives,
-                package.name,
-                package.version,
-                package.architecture,
-            );
-            if (archive != null and archive.?.size != package.declared_size)
-                return error.ArchiveEvidenceMismatch;
-            const archive_sha256 = package.archive_identity.digests.sha256 orelse
-                if (archive) |value|
-                    value.sha256
-                else
-                    return error.ArchiveEvidenceMismatch;
             actions[index].artifact = .{
-                .sha256 = archive_sha256,
+                .archive_identity = package.archive_identity,
                 .size = package.declared_size,
-                .origin = legacyOrigin(package.origin, archive_sha256),
+                .origin_v2 = package.origin,
             };
         }
     }

@@ -10,7 +10,8 @@ const package_origin = @import("package_origin.zig");
 
 pub const legacy_journal_version: u32 = 1;
 pub const lock_journal_version: u32 = 2;
-pub const journal_version: u32 = 3;
+pub const capability_journal_version: u32 = 3;
+pub const journal_version: u32 = 4;
 pub const maximum_journal_bytes: usize = 8 * 1024 * 1024;
 
 pub const Compatibility = enum {
@@ -34,6 +35,7 @@ pub const Command = struct {
     package: ?[]const u8,
     command_sha256: [32]u8,
     artifact_sha256: ?[32]u8,
+    artifact_identity: ?content_digest.Identity = null,
 };
 
 pub const Journal = struct {
@@ -379,14 +381,28 @@ pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
     if (journal.version < legacy_journal_version or journal.version > journal_version)
         return error.UnsupportedJournalVersion;
     if (journal.backend != .legacy_dpkg) return error.BackendMismatch;
-    if (journal.version < journal_version and
+    if (journal.version < capability_journal_version and
         journal.compatibility != .implicit_historical)
         return error.ContradictoryJournal;
-    if (journal.version == journal_version and
+    if (journal.version >= capability_journal_version and
         journal.compatibility != .legacy_execution_deprecated_v1)
         return error.ContradictoryJournal;
     if (journal.version == legacy_journal_version and journal.lock_sha256 != null)
         return error.ContradictoryJournal;
+    for (journal.commands) |command| {
+        if (journal.version >= journal_version) {
+            if (command.artifact_sha256 != null and command.artifact_identity != null)
+                return error.ContradictoryJournal;
+            if (command.artifact_identity) |identity| {
+                _ = content_digest.Identity.init(
+                    identity.digests,
+                    identity.primary,
+                ) catch return error.ContradictoryJournal;
+            }
+        } else if (command.artifact_identity != null) {
+            return error.ContradictoryJournal;
+        }
+    }
     var payload: std.Io.Writer.Allocating = .init(allocator);
     defer payload.deinit();
     const writer = &payload.writer;
@@ -398,7 +414,7 @@ pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
     try writeDigest(writer, "plan", journal.plan_sha256);
     try writeDigest(writer, "root", journal.root_identity);
     try writeDigest(writer, "policy", journal.policy_sha256);
-    if (journal.version >= journal_version) {
+    if (journal.version >= capability_journal_version) {
         try writer.print("backend\t{s}\ncapability\t{s}\n", .{
             @tagName(journal.backend),
             legacy_compat.legacy_capability,
@@ -418,7 +434,25 @@ pub fn encode(allocator: std.mem.Allocator, journal: Journal) ![]u8 {
         try writer.writeByte('\t');
         try writeRawDigest(writer, command.command_sha256);
         try writer.writeByte('\t');
-        if (command.artifact_sha256) |digest| try writeRawDigest(writer, digest) else try writer.writeByte('-');
+        if (journal.version >= journal_version) {
+            if (command.artifact_identity) |identity| {
+                try writeArtifactIdentity(writer, identity);
+            } else if (command.artifact_sha256) |sha256| {
+                try writeArtifactIdentity(
+                    writer,
+                    content_digest.Identity.init(
+                        .{ .sha256 = sha256 },
+                        .sha256,
+                    ) catch unreachable,
+                );
+            } else {
+                try writer.writeByte('-');
+            }
+        } else if (command.artifact_sha256) |digest| {
+            try writeRawDigest(writer, digest);
+        } else {
+            try writer.writeByte('-');
+        }
         try writer.writeByte('\n');
     }
     try writer.writeAll("failure\t");
@@ -483,13 +517,13 @@ pub fn decodeBounded(
     const root = try parseDigestLine(lines.next(), "root");
     const policy = try parseDigestLine(lines.next(), "policy");
     const backend: legacy_compat.Backend =
-        if (version >= journal_version)
+        if (version >= capability_journal_version)
             try parseEnumLine(legacy_compat.Backend, lines.next(), "backend")
         else
             .legacy_dpkg;
     if (backend != .legacy_dpkg) return error.BackendMismatch;
     const compatibility: Compatibility =
-        if (version >= journal_version) blk: {
+        if (version >= capability_journal_version) blk: {
             const capability = try parseTextLine(lines.next(), "capability");
             if (!std.mem.eql(u8, capability, legacy_compat.legacy_capability))
                 return error.UnsupportedJournalCapability;
@@ -508,11 +542,22 @@ pub fn decodeBounded(
         const line = lines.next() orelse return error.MalformedJournal;
         var fields = std.mem.splitScalar(u8, line, '\t');
         if (!std.mem.eql(u8, fields.next() orelse "", "command")) return error.MalformedJournal;
+        const phase_field = fields.next() orelse return error.MalformedJournal;
+        const package_field = fields.next() orelse return error.MalformedJournal;
+        const command_field = fields.next() orelse return error.MalformedJournal;
+        const artifact_field = fields.next() orelse return error.MalformedJournal;
         command.* = .{
-            .phase = try decodeHexInPlace(@constCast(fields.next() orelse return error.MalformedJournal)),
-            .package = try optionalHexInPlace(@constCast(fields.next() orelse return error.MalformedJournal)),
-            .command_sha256 = try parseDigest(fields.next() orelse return error.MalformedJournal),
-            .artifact_sha256 = try optionalDigest(fields.next() orelse return error.MalformedJournal),
+            .phase = try decodeHexInPlace(@constCast(phase_field)),
+            .package = try optionalHexInPlace(@constCast(package_field)),
+            .command_sha256 = try parseDigest(command_field),
+            .artifact_sha256 = if (version >= journal_version)
+                null
+            else
+                try optionalDigest(artifact_field),
+            .artifact_identity = if (version >= journal_version)
+                try optionalArtifactIdentity(artifact_field)
+            else
+                null,
         };
         if (fields.next() != null) return error.MalformedJournal;
     }
@@ -569,15 +614,25 @@ test "transaction_recovery journal decoding is caller bounded" {
     );
 }
 
-test "transaction_recovery.test.legacy compatibility preserves v1 v2 and emits explicit v3 evidence" {
-    const command: Command = .{
-        .phase = "unpack",
-        .package = "demo",
-        .command_sha256 = @splat(4),
-        .artifact_sha256 = @splat(5),
-    };
-    inline for ([_]u32{ legacy_journal_version, lock_journal_version, journal_version }) |version| {
-        const historical = version < journal_version;
+test "transaction_recovery.test.legacy compatibility preserves v1 through v3 and emits v4 identities" {
+    const identity = try content_digest.Identity.init(
+        .{ .sha512 = @splat(5) },
+        .sha512,
+    );
+    inline for ([_]u32{
+        legacy_journal_version,
+        lock_journal_version,
+        capability_journal_version,
+        journal_version,
+    }) |version| {
+        const historical = version < capability_journal_version;
+        const command: Command = .{
+            .phase = "unpack",
+            .package = "demo",
+            .command_sha256 = @splat(4),
+            .artifact_sha256 = if (version < journal_version) @splat(5) else null,
+            .artifact_identity = if (version >= journal_version) identity else null,
+        };
         const journal: Journal = .{
             .version = version,
             .compatibility = if (historical)
@@ -596,7 +651,23 @@ test "transaction_recovery.test.legacy compatibility preserves v1 v2 and emits e
         };
         const encoded = try encode(std.testing.allocator, journal);
         defer std.testing.allocator.free(encoded);
-        if (version == journal_version) {
+        var encoded_sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &encoded_sha256, .{});
+        const expected_hex = switch (version) {
+            1 => "6fa7e7e5aa8d13e827708b4b4304f0eacb868a518359976f6d8eb22e7042063c",
+            2 => "fb3d50cb83c91bbf8ed40a140c9bd5bd7b5e1ea2fcc3f4a010922bd5a844efdd",
+            3 => "7202671704e23369de417543f39c12bcc19bf589e4adb5c07a20fbd1eced7096",
+            4 => "48d563b3aa149db8e09e139cfac62ec89b9b4bd2fc0d3f64748af79ddd7936eb",
+            else => unreachable,
+        };
+        var expected_sha256: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected_sha256, expected_hex);
+        try std.testing.expectEqualSlices(
+            u8,
+            &expected_sha256,
+            &encoded_sha256,
+        );
+        if (version >= capability_journal_version) {
             try std.testing.expect(std.mem.indexOf(
                 u8,
                 encoded,
@@ -1072,7 +1143,7 @@ fn verifyExactLockV3Evidence(
         };
         if (!identity.eql(locked.archive_identity) or
             action.package_size != locked.declared_size or
-            !planOriginMatchesV3(action.origin, locked.origin))
+            !planOriginMatchesV3(action, locked.origin))
             return .{
                 .failure = if (all_packages)
                     .locked_origin_evidence_mismatch
@@ -1114,23 +1185,21 @@ fn verifyExactLockV3Evidence(
                     .local_origin_evidence_mismatch,
                 .package = ordered.package,
             };
-        if (locked.archive_identity.digests.sha256) |sha256| {
-            const command_digest = command.artifact_sha256 orelse return .{
+        const command_identity = commandArtifactIdentity(command) orelse return .{
+            .failure = if (all_packages)
+                .locked_origin_evidence_missing
+            else
+                .local_origin_evidence_missing,
+            .package = ordered.package,
+        };
+        if (!command_identity.eql(locked.archive_identity))
+            return .{
                 .failure = if (all_packages)
-                    .locked_origin_evidence_missing
+                    .locked_origin_evidence_mismatch
                 else
-                    .local_origin_evidence_missing,
+                    .local_origin_evidence_mismatch,
                 .package = ordered.package,
             };
-            if (!std.mem.eql(u8, &command_digest, &sha256))
-                return .{
-                    .failure = if (all_packages)
-                        .locked_origin_evidence_mismatch
-                    else
-                        .local_origin_evidence_mismatch,
-                    .package = ordered.package,
-                };
-        }
         unpack_seen[package_index] = true;
     }
 
@@ -1149,10 +1218,33 @@ fn verifyExactLockV3Evidence(
 }
 
 fn planOriginMatchesV3(
-    observed: ?solver.PlanOrigin,
+    action: solver.PlanAction,
     expected: exact_lock_v3.PackageOrigin,
 ) bool {
-    const origin = observed orelse return false;
+    if (action.origin_v2) |origin| return switch (expected) {
+        .authenticated_repository => |repository| switch (origin) {
+            .authenticated_repository => |value| std.mem.eql(
+                u8,
+                &value.id,
+                &repository.repository_id,
+            ),
+            .local_artifact => false,
+        },
+        .local_artifact => |artifact| switch (origin) {
+            .authenticated_repository => false,
+            .local_artifact => |value| package_origin.eqlLocalArtifactV2(
+                value.evidence,
+                artifact,
+            ),
+        },
+    };
+    const origin = action.origin orelse return switch (expected) {
+        .authenticated_repository => |repository| if (action.repository) |value|
+            std.mem.eql(u8, &value.id, &repository.repository_id)
+        else
+            false,
+        .local_artifact => false,
+    };
     return switch (expected) {
         .authenticated_repository => |repository| switch (origin) {
             .authenticated_repository => |value| std.mem.eql(
@@ -1164,17 +1256,29 @@ fn planOriginMatchesV3(
         },
         .local_artifact => |artifact| switch (origin) {
             .authenticated_repository => false,
-            .local_artifact => |value| blk: {
-                if (artifact.archive_identity.digests.sha256) |sha256| {
-                    if (!std.mem.eql(u8, &value.evidence.sha256, &sha256))
-                        break :blk false;
-                }
-                break :blk value.evidence.size == artifact.size and
-                    std.mem.eql(u8, value.evidence.package, artifact.package) and
-                    std.mem.eql(u8, value.evidence.version, artifact.version) and
-                    std.mem.eql(u8, value.evidence.architecture, artifact.architecture) and
-                    std.mem.eql(u8, value.evidence.acquisition_url, artifact.acquisition_url);
-            },
+            .local_artifact => |value| package_origin.eqlLocalArtifactV2(
+                .{
+                    .artifact_id = package_origin.artifactIdFromIdentity(
+                        artifact.archive_identity,
+                    ),
+                    .archive_identity = artifact.archive_identity,
+                    .size = value.evidence.size,
+                    .package = value.evidence.package,
+                    .version = value.evidence.version,
+                    .architecture = value.evidence.architecture,
+                    .acquisition_url = value.evidence.acquisition_url,
+                    .trust_mode = switch (value.evidence.trust_mode) {
+                        .pinned_sha256 => .pinned_content_digest,
+                        .verified_https => .verified_https,
+                    },
+                },
+                artifact,
+            ) and artifact.archive_identity.digests.sha256 != null and
+                std.mem.eql(
+                    u8,
+                    &value.evidence.sha256,
+                    &artifact.archive_identity.digests.sha256.?,
+                ),
         },
     };
 }
@@ -1266,7 +1370,7 @@ fn verifyExactLockV2LockedPackageEvidence(
             .package = ordered.package,
         };
         const command = journal.commands[command_index];
-        const command_digest = command.artifact_sha256 orelse return .{
+        const command_digest = commandArtifactSha256(command) orelse return .{
             .failure = .locked_origin_evidence_missing,
             .package = ordered.package,
         };
@@ -1383,7 +1487,7 @@ fn verifyExactLockV2LocalEvidence(
                         .package = ordered.package,
                     };
                 const command = journal.commands[command_index];
-                const command_digest = command.artifact_sha256 orelse
+                const command_digest = commandArtifactSha256(command) orelse
                     return .{
                         .failure = .local_origin_evidence_missing,
                         .package = ordered.package,
@@ -1962,6 +2066,20 @@ fn writeRawDigest(writer: anytype, digest: [32]u8) !void {
     try writer.writeAll(&hex);
 }
 
+fn writeArtifactIdentity(
+    writer: anytype,
+    identity: content_digest.Identity,
+) !void {
+    try writer.print("primary:{s}", .{identity.primary.name()});
+    inline for (content_digest.supported_algorithms) |algorithm| {
+        if (identity.digests.get(algorithm)) |digest| {
+            try writer.print(",{s}:", .{algorithm.name()});
+            var encoded: [128]u8 = undefined;
+            try writer.writeAll(digest.hex(&encoded));
+        }
+    }
+}
+
 fn writeHex(writer: anytype, bytes: []const u8) !void {
     const alphabet = "0123456789abcdef";
     for (bytes) |byte| {
@@ -1980,6 +2098,57 @@ fn parseDigest(value: []const u8) ![32]u8 {
 fn optionalDigest(value: []const u8) !?[32]u8 {
     if (std.mem.eql(u8, value, "-")) return null;
     return try parseDigest(value);
+}
+
+fn optionalArtifactIdentity(
+    value: []const u8,
+) !?content_digest.Identity {
+    if (std.mem.eql(u8, value, "-")) return null;
+    var fields = std.mem.splitScalar(u8, value, ',');
+    const primary_field = fields.next() orelse return error.MalformedDigest;
+    if (!std.mem.startsWith(u8, primary_field, "primary:"))
+        return error.MalformedDigest;
+    const primary = content_digest.Algorithm.parse(
+        primary_field["primary:".len..],
+    ) catch return error.MalformedDigest;
+    var digests: content_digest.Set = .{};
+    var previous: ?content_digest.Algorithm = null;
+    while (fields.next()) |field| {
+        const separator = std.mem.indexOfScalar(u8, field, ':') orelse
+            return error.MalformedDigest;
+        const algorithm = content_digest.Algorithm.parse(
+            field[0..separator],
+        ) catch return error.MalformedDigest;
+        if (previous) |prior| {
+            if (@intFromEnum(algorithm) <= @intFromEnum(prior))
+                return error.MalformedDigest;
+        }
+        previous = algorithm;
+        const digest = content_digest.Value.parse(
+            algorithm,
+            field[separator + 1 ..],
+        ) catch return error.MalformedDigest;
+        digests.put(digest) catch return error.MalformedDigest;
+    }
+    return content_digest.Identity.init(digests, primary) catch
+        return error.MalformedDigest;
+}
+
+fn commandArtifactIdentity(
+    command: Command,
+) ?content_digest.Identity {
+    if (command.artifact_identity) |identity| return identity;
+    const sha256 = command.artifact_sha256 orelse return null;
+    return content_digest.Identity.init(
+        .{ .sha256 = sha256 },
+        .sha256,
+    ) catch unreachable;
+}
+
+fn commandArtifactSha256(command: Command) ?[32]u8 {
+    if (command.artifact_identity) |identity|
+        return identity.digests.sha256;
+    return command.artifact_sha256;
 }
 
 fn parseDigestLine(line: ?[]const u8, name: []const u8) ![32]u8 {

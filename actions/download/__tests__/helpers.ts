@@ -78,15 +78,15 @@ export function fingerprint(inputs: Inputs): FingerprintDocument {
   return inputs.transactionBackend === 'native'
     ? {
         ...legacy,
-        schema: 'io.github.cataggar.debz.package-cache-fingerprint.v4',
-        api_version: 4,
-        capability: 'package-cache-v4',
-        lock_schema: 'https://debz.dev/schema/exact-closure-lock-v2',
-        lock_schema_version: 2,
-        archive_format: 'debz-package-cache-archive-v2',
-        origin_mode: 'exact-lock-v2-verified-origins',
-        primary_key: `debz-package-cas-v4-${inputs.architecture}-${policy}-${lock}`,
-        restore_prefix: `debz-package-cas-v4-${inputs.architecture}-${policy}-`,
+        schema: 'io.github.cataggar.debz.package-cache-fingerprint.v5',
+        api_version: 5,
+        capability: 'package-cache-v5',
+        lock_schema: 'https://debz.dev/schema/exact-closure-lock-v3',
+        lock_schema_version: 3,
+        archive_format: 'debz-package-cache-archive-v3',
+        origin_mode: 'exact-lock-v3-content-identities',
+        primary_key: `debz-package-cas-v5-${inputs.architecture}-${policy}-${lock}`,
+        restore_prefix: `debz-package-cas-v5-${inputs.architecture}-${policy}-`,
       }
     : legacy;
 }
@@ -114,9 +114,9 @@ export function preparation(
   return inputs.transactionBackend === 'native'
     ? {
         ...legacy,
-        schema: 'io.github.cataggar.debz.package-cache-result.v4',
-        api_version: 4,
-        capability: 'package-cache-v4',
+        schema: 'io.github.cataggar.debz.package-cache-result.v5',
+        api_version: 5,
+        capability: 'package-cache-v5',
       }
     : legacy;
 }

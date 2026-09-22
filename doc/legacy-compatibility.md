@@ -29,9 +29,10 @@ The normative Zig classifier and capability-evidence encoder are
   Native execution uses native transaction provenance and receipt-bound
   completion instead.
 - transaction journals v1 and v2 are historical implicit-legacy records.
-  Newly written journal v3 records `legacy_dpkg` and the bounded
-  `legacy-dpkg-execution-deprecated-v1` capability. All three versions remain
-  legacy and can never authorize native work.
+  Journal v3 records `legacy_dpkg` and the bounded
+  `legacy-dpkg-execution-deprecated-v1` capability. Journal v4 additionally
+  carries complete package identities for plan-v4/exact-lock-v3 execution.
+  All four versions remain legacy and can never authorize native work.
 - root-operation and completion v1 carry an explicit backend. An active record
   belongs to that backend until it is recovered and cleared by its owner.
 

@@ -1,0 +1,431 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-execution-intent-v2",
+  "title": "debz native execution intent with explicit v2 authority v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "attempt_id",
+    "install_root",
+    "root_identity_sha256",
+    "root_inode",
+    "operation",
+    "architecture",
+    "policy",
+    "triggers",
+    "defer_triggers",
+    "staging_directory_initially_present",
+    "packages",
+    "ordered_actions",
+    "request_sha256",
+    "policy_sha256",
+    "authorization_sha256",
+    "program_sha256",
+    "exact_lock_sha256",
+    "artifact_evidence_sha256",
+    "database_generation_sha256",
+    "initial_trigger_state_sha256",
+    "authorization_schema",
+    "authorization_version",
+    "program_schema",
+    "program_version",
+    "exact_lock_schema",
+    "exact_lock_version",
+    "authorization_path",
+    "program_path",
+    "blobs",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "https://debz.dev/schema/native-execution-intent-v2"
+    },
+    "version": { "const": 2 },
+    "attempt_id": { "$ref": "#/$defs/sha256" },
+    "install_root": { "$ref": "#/$defs/absolutePath" },
+    "root_identity_sha256": { "$ref": "#/$defs/sha256" },
+    "root_inode": { "type": "integer", "minimum": 0 },
+    "operation": {
+      "enum": [
+        "install",
+        "upgrade",
+        "downgrade",
+        "reinstall",
+        "configure",
+        "remove",
+        "purge",
+        "process_triggers"
+      ]
+    },
+    "architecture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "policy": {
+      "enum": ["keep_existing", "use_package_version"]
+    },
+    "triggers": { "type": "boolean" },
+    "defer_triggers": { "type": "boolean" },
+    "staging_directory_initially_present": { "type": "boolean" },
+    "packages": {
+      "type": "array",
+      "maxItems": 200000,
+      "items": { "$ref": "#/$defs/package" }
+    },
+    "ordered_actions": {
+      "type": "array",
+      "maxItems": 200000,
+      "items": { "$ref": "#/$defs/orderedAction" }
+    },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": { "$ref": "#/$defs/sha256" },
+    "authorization_sha256": { "$ref": "#/$defs/sha256" },
+    "program_sha256": { "$ref": "#/$defs/sha256" },
+    "exact_lock_sha256": { "$ref": "#/$defs/sha256" },
+    "artifact_evidence_sha256": { "$ref": "#/$defs/sha256" },
+    "database_generation_sha256": { "$ref": "#/$defs/sha256" },
+    "initial_trigger_state_sha256": { "$ref": "#/$defs/sha256" },
+    "authorization_schema": {
+      "const": "https://debz.dev/schema/native-transaction-authorization-v2"
+    },
+    "authorization_version": { "const": 2 },
+    "program_schema": {
+      "const": "https://debz.dev/schema/native-transaction-program-v2"
+    },
+    "program_version": { "const": 2 },
+    "exact_lock_schema": {
+      "const": "https://debz.dev/schema/exact-closure-lock-v3"
+    },
+    "exact_lock_version": { "const": 3 },
+    "authorization_path": {
+      "const": "native-transaction-authorization-v2.json"
+    },
+    "program_path": {
+      "const": "native-transaction-program-v2.json"
+    },
+    "blobs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200000,
+      "prefixItems": [{ "$ref": "#/$defs/requestBlob" }],
+      "items": { "$ref": "#/$defs/blob" },
+      "contains": { "$ref": "#/$defs/requestBlob" },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "defer_triggers": { "const": true } },
+        "required": ["defer_triggers"]
+      },
+      "then": {
+        "properties": { "triggers": { "const": true } }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sha512": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "sha256Digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "sha512Digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha512" },
+        "digest": { "$ref": "#/$defs/sha512" }
+      }
+    },
+    "digestIdentity": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256Identity" },
+        { "$ref": "#/$defs/sha512Identity" },
+        { "$ref": "#/$defs/mixedSha256Identity" },
+        { "$ref": "#/$defs/mixedSha512Identity" }
+      ]
+    },
+    "sha256Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha256" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/sha256Digest" }],
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    "sha512Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha512" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/sha512Digest" }],
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    "mixedSha256Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha256" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "$ref": "#/$defs/sha512Digest" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "mixedSha512Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha512" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "$ref": "#/$defs/sha512Digest" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "absolutePath": {
+      "type": "string",
+      "maxLength": 4096,
+      "pattern": "^(?:/|/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\\\u0000-\\u001f\\u007f]+)*)$"
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "architecture"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 }
+      }
+    },
+    "orderedAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "kind", "package", "version", "architecture"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "kind": { "type": "string", "minLength": 1 },
+        "package": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 }
+      }
+    },
+    "blobCommon": {
+      "type": "object",
+      "required": [
+        "kind",
+        "key",
+        "logical_path",
+        "storage_path",
+        "size",
+        "mode",
+        "entry_kind"
+      ],
+      "properties": {
+        "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "logical_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "size": { "type": "integer", "minimum": 0 },
+        "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "entry_kind": { "const": "regular" }
+      }
+    },
+    "requestBlob": {
+      "allOf": [
+        { "$ref": "#/$defs/blobCommon" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "logical_path",
+            "storage_path",
+            "size",
+            "sha256",
+            "mode",
+            "entry_kind"
+          ],
+          "properties": {
+            "kind": { "const": "request" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "logical_path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "storage_path": {
+              "type": "string",
+              "pattern": "^var/lib/debz/native-recovery-v1/request/.+\\.json$"
+            },
+            "size": { "type": "integer", "minimum": 0 },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+            "entry_kind": { "const": "regular" }
+          }
+        }
+      ]
+    },
+    "artifactBlob": {
+      "allOf": [
+        { "$ref": "#/$defs/blobCommon" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "logical_path",
+            "storage_path",
+            "size",
+            "archive_identity",
+            "mode",
+            "entry_kind"
+          ],
+          "properties": {
+            "kind": { "const": "artifact" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "logical_path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "storage_path": {
+              "type": "string",
+              "pattern": "^var/lib/debz/native-recovery-v1/artifacts/.+\\.deb$"
+            },
+            "size": { "type": "integer", "minimum": 0 },
+            "archive_identity": { "$ref": "#/$defs/digestIdentity" },
+            "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+            "entry_kind": { "const": "regular" }
+          }
+        }
+      ]
+    },
+    "installedScriptBlob": {
+      "allOf": [
+        { "$ref": "#/$defs/blobCommon" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "logical_path",
+            "storage_path",
+            "size",
+            "sha256",
+            "mode",
+            "entry_kind"
+          ],
+          "properties": {
+            "kind": { "const": "installed_script" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "logical_path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "storage_path": {
+              "type": "string",
+              "pattern": "^var/lib/debz/native-recovery-v1/scripts/.+\\.script$"
+            },
+            "size": { "type": "integer", "minimum": 0 },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+            "entry_kind": { "const": "regular" }
+          }
+        }
+      ]
+    },
+    "databaseBlob": {
+      "allOf": [
+        { "$ref": "#/$defs/blobCommon" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "key",
+            "logical_path",
+            "storage_path",
+            "size",
+            "sha256",
+            "mode",
+            "entry_kind"
+          ],
+          "properties": {
+            "kind": { "const": "database" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+            "logical_path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "storage_path": {
+              "type": "string",
+              "pattern": "^var/lib/debz/native-recovery-v1/database/.+\\.blob$"
+            },
+            "size": { "type": "integer", "minimum": 0 },
+            "sha256": { "$ref": "#/$defs/sha256" },
+            "mode": { "type": "integer", "minimum": 0, "maximum": 4095 },
+            "entry_kind": { "const": "regular" }
+          }
+        }
+      ]
+    },
+    "blob": {
+      "oneOf": [
+        { "$ref": "#/$defs/requestBlob" },
+        { "$ref": "#/$defs/artifactBlob" },
+        { "$ref": "#/$defs/installedScriptBlob" },
+        { "$ref": "#/$defs/databaseBlob" }
+      ]
+    }
+  }
+}

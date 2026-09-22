@@ -21,7 +21,7 @@ only through [`root_fs`](root-filesystem.md):
 | `var/lib/debz/` | shared namespace, provisioned with `createDirectoryPath` |
 | `var/lib/debz/root-operation.lock` | the fixed root mutation lock |
 | `var/lib/debz/root-operation-v1.json` | the versioned active-attempt record |
-| `var/lib/debz/root-operation-completion-v1.json` | the versioned completion provenance statement recovery publishes for an interrupted completion |
+| `var/lib/debz/root-operation-completion-v2.json` | the current all-digest completion provenance statement; historical v1 remains readable |
 
 Every component is resolved one at a time without following a symbolic link.
 A symlinked `var/lib/debz` fails closed with `error.NamespaceUnavailable`
@@ -341,12 +341,16 @@ executor reports a failure that could never discharge anything. Before
 back was deleting the record by hand.
 
 `src/root_operation_completion.zig` owns the durable statement that discharges
-it, published at `var/lib/debz/root-operation-completion-v1.json` through the
+it. New native authority is published at
+`var/lib/debz/root-operation-completion-v2.json`; legacy completion v1 remains
+readable at its original path. Both use the
 same root-anchored, atomic, no-follow, `fsync`ed publication the record uses.
 Republishing an identical statement rewrites nothing, so a recovery that is
 itself interrupted converges on exactly one document.
 
-`schema/root-operation-completion-v1.json` is the canonical schema. The
+`schema/root-operation-completion-v2.json` is the current native schema and
+adds the bound transaction-provenance version. V1 bytes, digest calculation,
+and schema remain unchanged. The
 statement binds:
 
 - the attempt identifier, and the `record_generation` and `record_digest_sha256`
@@ -362,7 +366,7 @@ statement binds:
   `already_present` (found and verified), `recovered` (rebuilt from durable
   evidence before this statement), or `unavailable` (never published, because
   the crash window interrupted publication), with the bound document's schema
-  and digest whenever one exists;
+  version, and digest whenever one exists;
 - `journal`: whether the transaction journal is `archived`, `active`, `absent`,
   or `unreadable`, with the digest of the bytes that were read;
 - `discharge`: the surface, operation, and request digest of the command that
@@ -476,7 +480,7 @@ the transaction backend is selected and before the repository operation lock at
 rank 1. It publishes `preflight` once the target snapshot is validated, enters
 the bridge before the executor block, resolves it from the executor's own
 transaction state, and publishes provenance bound to the
-`transaction-result-v2.json` document digest before clearing the active intent.
+`transaction-result-v3.json` document digest before clearing the active intent.
 The idempotent re-run path, which verifies an already-installed descriptor
 without mutating, ends as `abandoned_before_mutation` and clears normally.
 

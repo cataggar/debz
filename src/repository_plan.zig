@@ -86,8 +86,20 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !solver.Plan {
     const actions = try owned.alloc(solver.PlanAction, action_values.len);
     for (action_values, 0..) |value, index| {
         const action = try object(value);
-        const origin = try parseOrigin(owned, action.get("origin") orelse
-            return error.InvalidDocument);
+        const origin_value = action.get("origin") orelse
+            return error.InvalidDocument;
+        const origin_v2 = if (schema_version == 4)
+            try parseOriginV2(owned, origin_value)
+        else
+            null;
+        const origin: ?solver.PlanOrigin = if (schema_version == 3)
+            try parseOrigin(owned, origin_value)
+        else if (origin_v2) |value_origin| switch (value_origin) {
+            .authenticated_repository => |repository| solver.PlanOrigin{
+                .authenticated_repository = repository,
+            },
+            .local_artifact => null,
+        } else null;
         const identity = if (schema_version == 4)
             try optionalDigestIdentity(action.get("archive_identity") orelse
                 return error.InvalidDocument)
@@ -127,6 +139,7 @@ pub fn decode(allocator: std.mem.Allocator, source: []const u8) !solver.Plan {
             .selected_origin = null,
             .selected_origin_v2 = null,
             .origin = origin,
+            .origin_v2 = origin_v2,
         };
     }
 
@@ -214,6 +227,49 @@ fn parseOrigin(
         ),
     };
     try package_origin.validateLocalArtifact(evidence);
+    return .{ .local_artifact = .{
+        .evidence = evidence,
+        .solver_priority = try signed(i32, origin, "solver_priority"),
+    } };
+}
+
+fn parseOriginV2(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?solver.PlanOriginV2 {
+    if (value == .null) return null;
+    const origin = try object(value);
+    const kind = try string(origin, "type");
+    if (std.mem.eql(u8, kind, "authenticated_repository")) {
+        return .{ .authenticated_repository = .{
+            .id = try lowerHex64(try string(origin, "id")),
+            .priority = try signed(i32, origin, "priority"),
+        } };
+    }
+    if (!std.mem.eql(u8, kind, "local_artifact"))
+        return error.InvalidDocument;
+    const package = try object(origin.get("package") orelse
+        return error.InvalidDocument);
+    const identity = (try optionalDigestIdentity(
+        origin.get("archive_identity") orelse return error.InvalidDocument,
+    )) orelse return error.InvalidDigest;
+    const evidence: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = try parseDigestValue(
+            origin.get("artifact_id") orelse return error.InvalidDocument,
+        ),
+        .archive_identity = identity,
+        .size = try unsigned(u64, origin, "size"),
+        .package = try stringDupe(allocator, package, "name"),
+        .version = try stringDupe(allocator, package, "version"),
+        .architecture = try stringDupe(allocator, package, "architecture"),
+        .acquisition_url = try stringDupe(allocator, origin, "acquisition_url"),
+        .trust_mode = try enumField(
+            package_origin.LocalArtifactTrustModeV2,
+            origin,
+            "trust_mode",
+        ),
+    };
+    try package_origin.validateLocalArtifactV2(evidence);
     return .{ .local_artifact = .{
         .evidence = evidence,
         .solver_priority = try signed(i32, origin, "solver_priority"),
@@ -354,6 +410,17 @@ fn optionalDigestIdentity(value: std.json.Value) !?content_digest.Identity {
     }
     return content_digest.Identity.init(digests, primary) catch
         return error.InvalidDigest;
+}
+
+fn parseDigestValue(value: std.json.Value) !content_digest.Value {
+    const digest = try object(value);
+    const algorithm = content_digest.Algorithm.parse(
+        try string(digest, "algorithm"),
+    ) catch return error.InvalidDigest;
+    return content_digest.Value.parse(
+        algorithm,
+        try string(digest, "digest"),
+    ) catch return error.InvalidDigest;
 }
 
 fn lowerHex64(value: []const u8) ![64]u8 {
@@ -561,6 +628,10 @@ test "repository_plan.test.v4 replays complete mixed archive identities" {
             .id = @splat('1'),
             .priority = 500,
         } },
+        .origin_v2 = .{ .authenticated_repository = .{
+            .id = @splat('1'),
+            .priority = 500,
+        } },
     }};
     var ordered = [_]solver.OrderedAction{.{
         .sequence = 0,
@@ -592,4 +663,92 @@ test "repository_plan.test.v4 replays complete mixed archive identities" {
     const replay = try decoded.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(replay);
     try std.testing.expectEqualStrings(canonical, replay);
+}
+
+test "repository_plan.test.v4 SHA512-only local origin replays without SHA256" {
+    const identity = try content_digest.Identity.init(
+        .{ .sha512 = content_digest.Value.of(
+            .sha512,
+            "repository-plan-sha512",
+        ).sha512 },
+        .sha512,
+    );
+    const evidence: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = package_origin.artifactIdFromIdentity(identity),
+        .archive_identity = identity,
+        .size = 22,
+        .package = "local",
+        .version = "1",
+        .architecture = "all",
+        .acquisition_url = "file:///local.deb",
+        .trust_mode = .pinned_content_digest,
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var actions = [_]solver.PlanAction{.{
+        .kind = .install,
+        .package = evidence.package,
+        .version = evidence.version,
+        .architecture = evidence.architecture,
+        .repository = null,
+        .sha256 = null,
+        .archive_identity = identity,
+        .package_size = evidence.size,
+        .installed_size_delta_bytes = 1,
+        .source_package = evidence.package,
+        .prior_installed = null,
+        .requested = true,
+        .reason = .explicit_request,
+        .selected_origin = null,
+        .selected_origin_v2 = null,
+        .origin = null,
+        .origin_v2 = .{ .local_artifact = .{
+            .evidence = evidence,
+            .solver_priority = 1000,
+        } },
+    }};
+    var ordered = [_]solver.OrderedAction{.{
+        .sequence = 0,
+        .kind = .unpack,
+        .package = evidence.package,
+        .version = evidence.version,
+        .architecture = evidence.architecture,
+    }};
+    const plan: solver.Plan = .{
+        .schema_version = 4,
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &actions,
+        .ordered_actions = &ordered,
+        .summary = .{ .installs = 1, .download_bytes = evidence.size },
+        .download_bytes = evidence.size,
+        .installed_size_delta_bytes = 1,
+        .backing_allocator = std.testing.allocator,
+        .arena = &arena,
+    };
+    const canonical = try plan.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "\"sha256\"") == null);
+
+    var decoded = try decode(std.testing.allocator, canonical);
+    defer decoded.deinit();
+    const decoded_evidence = decoded.actions[0].origin_v2.?.local_artifact.evidence;
+    try std.testing.expect(decoded_evidence.archive_identity.eql(identity));
+    try std.testing.expect(decoded_evidence.archive_identity.digests.sha256 == null);
+    const replay = try decoded.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(replay);
+    try std.testing.expectEqualStrings(canonical, replay);
+
+    const tampered = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        canonical,
+        "\"algorithm\":\"sha512\"",
+        "\"algorithm\":\"sha999\"",
+    );
+    defer std.testing.allocator.free(tampered);
+    try std.testing.expectError(
+        error.InvalidDigest,
+        decode(std.testing.allocator, tampered),
+    );
 }

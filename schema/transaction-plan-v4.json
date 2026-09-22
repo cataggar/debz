@@ -90,15 +90,15 @@
     "localOrigin": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "artifact_id", "sha256", "size", "package", "acquisition_url", "trust_mode", "solver_priority"],
+      "required": ["type", "artifact_id", "archive_identity", "size", "package", "acquisition_url", "trust_mode", "solver_priority"],
       "properties": {
         "type": { "const": "local_artifact" },
-        "artifact_id": { "$ref": "#/$defs/sha256" },
-        "sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_id": { "$ref": "#/$defs/digest" },
+        "archive_identity": { "$ref": "#/$defs/digestIdentity" },
         "size": { "type": "integer", "minimum": 0 },
         "package": { "$ref": "#/$defs/identity" },
         "acquisition_url": { "type": "string", "minLength": 1 },
-        "trust_mode": { "enum": ["pinned_sha256", "verified_https"] },
+        "trust_mode": { "enum": ["pinned_content_digest", "verified_https"] },
         "solver_priority": { "type": "integer" }
       }
     },

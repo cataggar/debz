@@ -15015,6 +15015,7 @@ fn ownedNativeTransportFixture(
         .transaction_provenance = .{
             .status = .already_present,
             .schema = native_provenance.schema_id,
+            .version = native_provenance.schema_version,
             .document_sha256 = receipt_digest,
             .detail = "transport fixture only",
         },

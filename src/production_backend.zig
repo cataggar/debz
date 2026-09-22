@@ -839,6 +839,7 @@ pub const Backend = struct {
                 .transaction_provenance = .{
                     .status = .already_present,
                     .schema = native_provenance.schema_id,
+                    .version = native_provenance.schema_version,
                     .document_sha256 = receipt_digest,
                     .detail = "verified terminal native receipt",
                 },
@@ -1295,6 +1296,10 @@ pub const Backend = struct {
             },
             .exact_lock = legacy_lock,
             .exact_lock_v3 = native_lock,
+            .output_schema_version = switch (self.transaction_backend) {
+                .legacy_dpkg => .v2,
+                .native => .v4,
+            },
         });
         defer switch (planning) {
             .plan => |*value| value.deinit(),
@@ -6799,7 +6804,15 @@ fn backendRootCompletion(
         allocator,
         .limited(root_operation_completion.maximum_document_bytes),
     ) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound => directory.dir.readFileAlloc(
+            std.testing.io,
+            "root/" ++ root_operation_completion.legacy_document_path,
+            allocator,
+            .limited(root_operation_completion.maximum_document_bytes),
+        ) catch |legacy_err| switch (legacy_err) {
+            error.FileNotFound => return null,
+            else => return legacy_err,
+        },
         else => return err,
     };
     defer allocator.free(bytes);
@@ -7960,18 +7973,7 @@ test "production workflow recovery reconciles completion without a second mutati
     });
     try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
     try std.testing.expectEqual(@as(usize, 2), process.calls);
-    const completion_source = try directory.dir.readFileAlloc(
-        std.testing.io,
-        "root/" ++ root_operation_completion.document_path,
-        allocator,
-        .limited(root_operation_completion.maximum_document_bytes),
-    );
-    defer allocator.free(completion_source);
-    var completion = try root_operation_completion.decode(
-        allocator,
-        completion_source,
-        root_operation_completion.maximum_document_bytes,
-    );
+    var completion = (try backendRootCompletion(allocator, &directory)).?;
     defer completion.deinit();
     try std.testing.expectEqual(
         root_operation_completion.TransactionProvenanceStatus.unavailable,
@@ -8262,17 +8264,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             root_operation.maximum_document_bytes,
         );
         defer record.deinit();
-        const completion_source = try directory.dir.readFileAlloc(
-            std.testing.io,
-            "root/" ++ root_operation_completion.document_path,
-            allocator,
-            .limited(root_operation_completion.maximum_document_bytes),
-        );
-        var completion = try root_operation_completion.decode(
-            allocator,
-            completion_source,
-            root_operation_completion.maximum_document_bytes,
-        );
+        var completion = (try backendRootCompletion(allocator, &directory)).?;
         defer completion.deinit();
         try std.testing.expectEqual(
             root_operation.ProvenanceState.published,
@@ -9674,17 +9666,7 @@ test "production workflow successful recovery publishes honest completion eviden
     });
     try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
     try std.testing.expect(process.calls > 1);
-    const completion_source = try directory.dir.readFileAlloc(
-        std.testing.io,
-        "root/" ++ root_operation_completion.document_path,
-        allocator,
-        .limited(root_operation_completion.maximum_document_bytes),
-    );
-    var completion = try root_operation_completion.decode(
-        allocator,
-        completion_source,
-        root_operation_completion.maximum_document_bytes,
-    );
+    var completion = (try backendRootCompletion(allocator, &directory)).?;
     defer completion.deinit();
     try std.testing.expect(
         completion.document.transaction_provenance.status ==

@@ -87,7 +87,7 @@ likewise requires `deinit`.
 
 `repository_backend.prepareNative` is the lower-level preparation boundary,
 not the repository-add executor. It takes the repository request, an already
-held native `repository_bootstrap.add` attempt, the genuine v2 lock and
+held native `repository_bootstrap.add` attempt, the genuine v3 lock and
 executable plan, and already acquired archive bytes. It shares
 `repository_api.validateRequest` with normal dispatch, then requires matching
 root, architecture, complete original request, executor policy, and native
@@ -235,8 +235,10 @@ and outcome; nonterminal or missing evidence refuses.
 
 The returned `NativeRetainedReceipt` owns its logical path and native receipt;
 call `deinit` when finished. Native operation-local receipts use
-`native-transaction-provenance-v1.json`, never the legacy
-`transaction-result-v2.json`. The backend-specific operation-directory
+`native-transaction-provenance-v2.json` for current all-digest authority while
+historical v1 receipts remain readable; they never use the legacy
+`transaction-result-v3.json`. Historical transaction-result v2 bytes remain
+separately readable. The backend-specific operation-directory
 identity and original request determine the destination, including custom
 state paths. Legacy paths and state schemas are unchanged.
 
@@ -292,7 +294,7 @@ joined by scoped repository dispatch.
 
 `persistNativePackageState` consumes the original `NativeReceiptRequest`; it
 accepts no replacement state, plan, lock, archive or cache. It reads the original
-operation-local state, executable plan and v2 lock through stable no-follow
+operation-local state, executable plan and v3 lock through stable no-follow
 file pins. Root, architecture, request/policy, plan digest, lock identity,
 descriptor identity/origin and exact native evidence paths must agree with the
 held caller. Root authority is validated before metadata access and again at
@@ -385,7 +387,8 @@ post-install work is refused. Known package failure stays `phase=failed` with
 First successful completion revalidates the original receipt-bound descriptor
 blob, installed descriptor/source/keyring bytes, and the exact bound live target
 manifest. It durably publishes `phase=complete`, completes the original root
-caller, and retains the existing `root-operation-completion-v1.json` both in the
+caller, and retains the current `root-operation-completion-v2.json` (or the
+historical v1 document for legacy evidence) both in the
 original operation directory and in the shared root-operation namespace.
 Completion records the real native receipt and either `succeeded` or
 `failed_after_mutation`, with no fabricated command journal. Both completion
@@ -443,7 +446,7 @@ download or replacement plan. This adapter joins persisted native recovery,
 package checkpoints, import/refresh and completion without enabling CLI dispatch.
 
 Before recovery can execute package work, the adapter pins and authenticates
-the original repository state, executable plan and genuine v2 lock. Those same
+the original repository state, executable plan and genuine v3 lock. Those same
 pins survive recovery into the checkpoint/import/completion pipeline; missing,
 corrupt or replaced inputs are not silently reloaded. Native package recovery
 uses only its original persisted evidence, even after CAS eviction. The
@@ -484,7 +487,7 @@ adopts, acknowledges, completes or clears either caller.
 
 The operation-local and shared completion must be byte-identical canonical
 documents, as must their native receipts. Original state, executable plan and
-v2 lock are pinned and checked against the historical completion's evidence.
+v3 lock are pinned and checked against the historical completion's evidence.
 The discharge digest uses the **original** attempt ID and terminal state.
 Successful history additionally requires the recorded refresh (unless the
 original request selected no-refresh), exact installed descriptor material,
@@ -513,7 +516,7 @@ arbitrary historical lookup, unchanged-result adapter or CLI activation.
 `completeUnchangedNative` takes a `NativeUnchangedRequest` containing the
 original `NativeRecoveryRequest`, optionally the original acquired descriptor
 bytes, and the usual import/refresh dependencies. Original state, executable
-plan and v2 lock must already exist. The action and ordered-action lists must
+plan and v3 lock must already exist. The action and ordered-action lists must
 be empty, but the lock must still bind the installed descriptor's genuine
 artifact origin, digest and identity. An empty lock or a clean caller alone
 does not establish successful bootstrap.
@@ -575,7 +578,7 @@ acquisition. Native operation state binds the executable plan digest expected by
 the native caller, while legacy state retains its existing canonical-file
 digest. Changed plans use the verified native CAS closure and joined completion
 pipeline, not the command-oriented executor bridge. A genuinely unchanged
-installed descriptor gets an empty action plan and a descriptor-bound v2 lock
+installed descriptor gets an empty action plan and a descriptor-bound v3 lock
 that preserves its installed hold selection; it goes directly to no-execution
 completion, without loading execution archives or fabricating an action.
 
@@ -677,7 +680,8 @@ v1 continues to deny host-root execution for every operation.
 After dpkg, the backend verifies descriptor package identity and exact static
 source/keyring bytes, imports the resulting target APT configuration, writes
 its manifest, refreshes only new or changed descriptor repositories unless
-`no_refresh`, and publishes transaction provenance v2 through the
+`no_refresh`, and publishes transaction provenance v3 with complete package
+and CAS identities through the
 lock-validating execution/recovery constructors. Missing or mismatched executor
 lock digests cannot be replaced by caller-supplied provenance fields.
 
@@ -706,7 +710,7 @@ SHA-256 identity of the descriptor URL, optional expected digest, and
 `no_refresh`, so identical requests under one backend resume the same evidence
 while distinct descriptors or backends have separate histories. Existing
 legacy directory names are unchanged. Exact-lock request and policy validation
-also require the selected backend, even though both use the v2 lock schema.
+also require the selected backend even though both use lock v3.
 Decoding is bounded, canonical, and digest checked. A repository-root advisory lock
 serializes add operations even though their evidence directories are separate.
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
+const content_digest = @import("content_digest.zig");
 const solver = @import("solver.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
@@ -215,6 +216,7 @@ pub const CommandProvenance = struct {
     environment: []const EnvironmentEntry = &.{},
     command_sha256: [32]u8,
     artifact_sha256: ?[32]u8,
+    artifact_identity: ?content_digest.Identity = null,
 };
 
 pub const FailureCode = enum {
@@ -503,9 +505,10 @@ pub fn execute(
         else
             null;
         var artifact_digest: ?[32]u8 = null;
+        var artifact_identity: ?content_digest.Identity = null;
         if (artifact) |item| {
             const action = findPlanAction(request.plan.actions, item.package, item.version, item.architecture).?;
-            artifact_digest = validateArtifact(arena, dependencies.filesystem, item, action, request.policy.validation_limits) catch |err| {
+            const verified = validateArtifact(arena, dependencies.filesystem, item, action, request.policy.validation_limits) catch |err| {
                 state.failure = .{
                     .code = artifactCode(err),
                     .phase = phase,
@@ -515,6 +518,8 @@ pub fn execute(
                 };
                 return finish(allocator, arena_ptr, &state, plan_sha256);
             };
+            artifact_digest = verified.identity.digests.sha256;
+            artifact_identity = verified.identity;
         }
 
         const argv = try buildArgv(
@@ -537,6 +542,7 @@ pub fn execute(
             .environment = &audited_environment,
             .command_sha256 = hashInvocation(argv, &audited_environment),
             .artifact_sha256 = artifact_digest,
+            .artifact_identity = artifact_identity,
         };
         journal.state = .in_progress;
         journal.boundary = .before_command;
@@ -1356,7 +1362,14 @@ fn buildJournalCommands(
             .phase = @tagName(phase),
             .package = try allocator.dupe(u8, ordered.package),
             .command_sha256 = hashInvocation(argv, &audited_environment),
-            .artifact_sha256 = if (phase == .unpack) try parseHexDigest(action.sha256.?) else null,
+            .artifact_sha256 = if (phase == .unpack and action.archive_identity == null)
+                try parseHexDigest(action.sha256.?)
+            else
+                null,
+            .artifact_identity = if (phase == .unpack)
+                action.archive_identity
+            else
+                null,
         });
     }
     if (request.plan.ordered_actions.len != 0) {
@@ -1386,7 +1399,9 @@ fn journalFailure(
 fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem) !void {
     try validateRootLexical(request.install_root, request.policy.risk.allow_host_root);
     filesystem.validateRoot(request.install_root) catch return error.UnsafeInstallRoot;
-    if (request.plan.schema_version != 2 and request.plan.schema_version != 3)
+    if (request.plan.schema_version != 2 and
+        request.plan.schema_version != 3 and
+        request.plan.schema_version != 4)
         return error.UnsupportedPlanVersion;
     if (request.plan.mode != .plan_only) return error.NonExecutablePlanMode;
     // Purge is a native-engine transition. The legacy dpkg program has no
@@ -1405,6 +1420,8 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
     if (request.policy.exact_lock_verification == .locked_packages and
         request.exact_lock_v2 == null and request.exact_lock_v3 == null)
         return error.LockedPackageVerificationRequiresV2Lock;
+    if ((request.plan.schema_version == 4) != (request.exact_lock_v3 != null))
+        return error.PlanLockVersionMismatch;
     if (request.exact_lock) |lock| {
         if (!std.mem.eql(u8, lock.target_architecture, request.plan.target_architecture))
             return error.LockArchitectureMismatch;
@@ -1437,24 +1454,24 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                 locked.declared_size != action.package_size.?)
                 return error.PlanLockEvidenceMismatch;
         }
-        if (request.exact_lock_v3) |lock_v3| {
-            if (!std.mem.eql(u8, lock_v3.target_architecture, request.plan.target_architecture))
-                return error.LockArchitectureMismatch;
-            for (request.plan.actions) |action| {
-                if (solver.isRemoval(action.kind)) continue;
-                const locked = lock_v3.findPackage(
-                    action.package,
-                    action.version,
-                    action.architecture,
-                ) orelse return error.PlanOutsideLockedClosure;
-                const identity = action.archive_identity orelse
-                    return error.MissingAuthenticatedArtifactMetadata;
-                if (action.package_size == null or
-                    !actionMatchesLockV3(action, locked) or
-                    !identity.eql(locked.archive_identity) or
-                    locked.declared_size != action.package_size.?)
-                    return error.PlanLockEvidenceMismatch;
-            }
+    }
+    if (request.exact_lock_v3) |lock_v3| {
+        if (!std.mem.eql(u8, lock_v3.target_architecture, request.plan.target_architecture))
+            return error.LockArchitectureMismatch;
+        for (request.plan.actions) |action| {
+            if (solver.isRemoval(action.kind)) continue;
+            const locked = lock_v3.findPackage(
+                action.package,
+                action.version,
+                action.architecture,
+            ) orelse return error.PlanOutsideLockedClosure;
+            const identity = action.archive_identity orelse
+                return error.MissingAuthenticatedArtifactMetadata;
+            if (action.package_size == null or
+                !actionMatchesLockV3(action, locked) or
+                !identity.eql(locked.archive_identity) or
+                locked.declared_size != action.package_size.?)
+                return error.PlanLockEvidenceMismatch;
         }
     }
     if (request.policy.process_timeout_ms == 0) return error.InvalidProcessTimeout;
@@ -1511,9 +1528,20 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
         } else {
             const expected_bootstrap: usize = if (requiresRootBootstrap(request.plan.actions) and action.prior_installed == null) 1 else 0;
             if (bootstrap_extracts != expected_bootstrap) return error.IncompleteInstallOrdering;
-            if (action.sha256 == null or action.package_size == null)
+            if (action.package_size == null)
                 return error.MissingAuthenticatedArtifactMetadata;
-            _ = parseHexDigest(action.sha256.?) catch return error.InvalidAuthenticatedDigest;
+            if (request.plan.schema_version >= 4) {
+                const identity = action.archive_identity orelse
+                    return error.MissingAuthenticatedArtifactMetadata;
+                _ = content_digest.Identity.init(
+                    identity.digests,
+                    identity.primary,
+                ) catch return error.InvalidAuthenticatedDigest;
+            } else {
+                _ = parseHexDigest(action.sha256 orelse
+                    return error.MissingAuthenticatedArtifactMetadata) catch
+                    return error.InvalidAuthenticatedDigest;
+            }
             try validateActionOrigin(request.plan.schema_version, action);
         }
     }
@@ -1540,14 +1568,44 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             if (sameIdentity(prior.package, prior.version, prior.architecture, artifact.package, artifact.version, artifact.architecture))
                 return error.DuplicateArtifact;
         }
+        _ = try validateArtifact(
+            arena,
+            filesystem,
+            artifact,
+            action,
+            request.policy.validation_limits,
+        );
     }
-
-    _ = arena;
 }
 
 fn validateActionOrigin(schema_version: u32, action: solver.PlanAction) !void {
     if (schema_version == 2) {
         if (action.repository == null) return error.MissingAuthenticatedArtifactMetadata;
+        return;
+    }
+    if (schema_version >= 4) {
+        const origin = action.origin_v2 orelse return error.MissingPackageOrigin;
+        switch (origin) {
+            .authenticated_repository => |repository| {
+                if (action.repository == null or
+                    !std.mem.eql(u8, &action.repository.?.id, &repository.id) or
+                    action.repository.?.priority != repository.priority)
+                    return error.PackageOriginMismatch;
+            },
+            .local_artifact => |local| {
+                if (action.repository != null) return error.PackageOriginMismatch;
+                package_origin.validateLocalArtifactV2(local.evidence) catch
+                    return error.InvalidLocalArtifactOrigin;
+                const identity = action.archive_identity orelse
+                    return error.MissingAuthenticatedDigest;
+                if (!std.mem.eql(u8, action.package, local.evidence.package) or
+                    !std.mem.eql(u8, action.version, local.evidence.version) or
+                    !std.mem.eql(u8, action.architecture, local.evidence.architecture) or
+                    !identity.eql(local.evidence.archive_identity) or
+                    action.package_size != local.evidence.size)
+                    return error.PackageOriginMismatch;
+            },
+        }
         return;
     }
     const origin = action.origin orelse return error.MissingPackageOrigin;
@@ -1562,13 +1620,18 @@ fn validateActionOrigin(schema_version: u32, action: solver.PlanAction) !void {
             if (action.repository != null) return error.PackageOriginMismatch;
             package_origin.validateLocalArtifact(local.evidence) catch
                 return error.InvalidLocalArtifactOrigin;
-            const digest = parseHexDigest(action.sha256 orelse
-                return error.MissingAuthenticatedDigest) catch
-                return error.InvalidAuthenticatedDigest;
+            const expected_sha256 = if (schema_version >= 4)
+                (action.archive_identity orelse
+                    return error.MissingAuthenticatedDigest).digests.sha256
+            else
+                parseHexDigest(action.sha256 orelse
+                    return error.MissingAuthenticatedDigest) catch
+                    return error.InvalidAuthenticatedDigest;
             if (!std.mem.eql(u8, action.package, local.evidence.package) or
                 !std.mem.eql(u8, action.version, local.evidence.version) or
                 !std.mem.eql(u8, action.architecture, local.evidence.architecture) or
-                !std.mem.eql(u8, &digest, &local.evidence.sha256) or
+                expected_sha256 == null or
+                !std.mem.eql(u8, &expected_sha256.?, &local.evidence.sha256) or
                 action.package_size != local.evidence.size)
                 return error.PackageOriginMismatch;
         },
@@ -1596,7 +1659,7 @@ fn actionMatchesLockV3(
     action: solver.PlanAction,
     locked: exact_lock_v3.Package,
 ) bool {
-    const origin = action.origin orelse return false;
+    const origin = action.origin_v2 orelse return false;
     return switch (locked.origin) {
         .authenticated_repository => |expected| switch (origin) {
             .authenticated_repository => |actual| std.mem.eql(
@@ -1608,19 +1671,17 @@ fn actionMatchesLockV3(
         },
         .local_artifact => |expected| switch (origin) {
             .authenticated_repository => false,
-            .local_artifact => |actual| blk: {
-                const sha256 = expected.archive_identity.digests.sha256 orelse
-                    break :blk false;
-                break :blk std.mem.eql(u8, &actual.evidence.sha256, &sha256) and
-                    actual.evidence.size == expected.size and
-                    std.mem.eql(u8, actual.evidence.package, expected.package) and
-                    std.mem.eql(u8, actual.evidence.version, expected.version) and
-                    std.mem.eql(u8, actual.evidence.architecture, expected.architecture) and
-                    std.mem.eql(u8, actual.evidence.acquisition_url, expected.acquisition_url);
-            },
+            .local_artifact => |actual| package_origin.eqlLocalArtifactV2(
+                actual.evidence,
+                expected,
+            ),
         },
     };
 }
+
+const VerifiedArtifact = struct {
+    identity: content_digest.Identity,
+};
 
 fn validateArtifact(
     allocator: std.mem.Allocator,
@@ -1628,7 +1689,7 @@ fn validateArtifact(
     artifact: Artifact,
     action: solver.PlanAction,
     limits: deb_payload.Limits,
-) ![32]u8 {
+) !VerifiedArtifact {
     const expected_size = action.package_size orelse return error.MissingAuthenticatedSize;
     const maximum = std.math.cast(usize, expected_size) orelse return error.ArtifactTooLarge;
     const bytes = try filesystem.readArtifact(allocator, artifact.path, maximum);
@@ -1639,16 +1700,21 @@ fn validateArtifact(
             return error.InvalidAuthenticatedDigest;
     } else null;
     if (action.archive_identity) |identity| {
-        identity.verify(bytes) catch return error.ArchiveDigestMismatch;
+        identity.verify(bytes) catch return error.DigestMismatch;
     } else {
         var observed: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &observed, .{});
         if (!std.mem.eql(u8, &observed, &legacy_digest.?))
-            return error.ArchiveDigestMismatch;
+            return error.DigestMismatch;
     }
     if (bytes.len != expected_size) return error.SizeMismatch;
-    var actual: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+    const verified_identity = if (action.archive_identity) |identity|
+        identity
+    else
+        content_digest.Identity.init(
+            .{ .sha256 = legacy_digest.? },
+            .sha256,
+        ) catch unreachable;
 
     const validation = if (isLocalArtifactAction(action))
         deb_payload.inspectLocal(allocator, bytes, .{
@@ -1691,10 +1757,14 @@ fn validateArtifact(
             owned.deinit();
         },
     }
-    return actual;
+    return .{ .identity = verified_identity };
 }
 
 fn isLocalArtifactAction(action: solver.PlanAction) bool {
+    if (action.origin_v2) |origin| return switch (origin) {
+        .authenticated_repository => false,
+        .local_artifact => true,
+    };
     const origin = action.origin orelse return false;
     return switch (origin) {
         .authenticated_repository => false,
@@ -2056,8 +2126,16 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
         if (action.repository) |repository| hash.update(&repository.id);
         hash.update("\x00");
-        if (plan.schema_version == 3) hashPlanOrigin(&hash, action.origin);
-        if (action.sha256) |digest| hash.update(&digest);
+        if (plan.schema_version >= 4) {
+            hashPlanOriginV2(&hash, action.origin_v2);
+        } else if (plan.schema_version >= 3) {
+            hashPlanOrigin(&hash, action.origin);
+        }
+        if (plan.schema_version >= 4) {
+            hashPlanIdentity(&hash, action.archive_identity);
+        } else if (action.sha256) |digest| {
+            hash.update(&digest);
+        }
         hash.update("\x00");
         std.mem.writeInt(u64, &number, action.package_size orelse 0, .little);
         hash.update(&number);
@@ -2076,6 +2154,28 @@ fn hashPlan(plan: solver.Plan) [32]u8 {
         hash.update("\x00");
     }
     return hash.finalResult();
+}
+
+fn hashPlanIdentity(
+    hash: *std.crypto.hash.sha2.Sha256,
+    identity: ?content_digest.Identity,
+) void {
+    const value = identity orelse {
+        hash.update(&.{0});
+        return;
+    };
+    hash.update(&.{ 1, @intFromEnum(value.primary) });
+    inline for (content_digest.supported_algorithms) |algorithm| {
+        if (value.digests.get(algorithm)) |digest| {
+            hash.update(&.{ 1, @intFromEnum(algorithm) });
+            switch (digest) {
+                .sha256 => |bytes| hash.update(&bytes),
+                .sha512 => |bytes| hash.update(&bytes),
+            }
+        } else {
+            hash.update(&.{ 0, @intFromEnum(algorithm) });
+        }
+    }
 }
 
 fn hashPlanOrigin(
@@ -2100,6 +2200,44 @@ fn hashPlanOrigin(
             hash.update(&.{2});
             hash.update(&evidence.artifact_id);
             hash.update(&evidence.sha256);
+            std.mem.writeInt(u64, &number, evidence.size, .little);
+            hash.update(&number);
+            hashPlanString(hash, evidence.package);
+            hashPlanString(hash, evidence.version);
+            hashPlanString(hash, evidence.architecture);
+            hashPlanString(hash, evidence.acquisition_url);
+            hashPlanString(hash, @tagName(evidence.trust_mode));
+            std.mem.writeInt(i32, &priority, local.solver_priority, .little);
+            hash.update(&priority);
+        },
+    }
+}
+
+fn hashPlanOriginV2(
+    hash: *std.crypto.hash.sha2.Sha256,
+    origin: ?solver.PlanOriginV2,
+) void {
+    const value = origin orelse {
+        hash.update(&.{0});
+        return;
+    };
+    var number: [8]u8 = undefined;
+    var priority: [4]u8 = undefined;
+    switch (value) {
+        .authenticated_repository => |repository| {
+            hash.update(&.{1});
+            hash.update(&repository.id);
+            std.mem.writeInt(i32, &priority, repository.priority, .little);
+            hash.update(&priority);
+        },
+        .local_artifact => |local| {
+            const evidence = local.evidence;
+            hash.update(&.{ 2, @intFromEnum(evidence.artifact_id.algorithm()) });
+            switch (evidence.artifact_id) {
+                .sha256 => |bytes| hash.update(&bytes),
+                .sha512 => |bytes| hash.update(&bytes),
+            }
+            hashPlanIdentity(hash, evidence.archive_identity);
             std.mem.writeInt(u64, &number, evidence.size, .little);
             hash.update(&number);
             hashPlanString(hash, evidence.package);
@@ -2171,8 +2309,10 @@ fn optionalDigestEqual(left: ?[32]u8, right: ?[32]u8) bool {
 fn preflightCode(err: anyerror) FailureCode {
     return switch (err) {
         error.HostRootDenied, error.InvalidAbsolutePath, error.AmbiguousRoot, error.AmbiguousPath, error.UnsafeInstallRoot => .invalid_root,
-        error.MissingArtifact => .artifact_missing,
+        error.MissingArtifact, error.FileNotFound => .artifact_missing,
         error.UnsafeArtifactPath => .invalid_artifact,
+        error.DigestMismatch, error.SizeMismatch => .artifact_digest_mismatch,
+        error.IdentityMismatch => .artifact_identity_mismatch,
         error.DuplicateForceRisk => .unsupported_force_policy,
         error.OutOfMemory => .out_of_memory,
         else => .invalid_plan,
@@ -2905,7 +3045,11 @@ test "transaction_executor.test.local artifact preflight and reread require exac
         action,
         .{},
     );
-    try std.testing.expectEqualSlices(u8, &digest, &reread);
+    try std.testing.expectEqualSlices(
+        u8,
+        &digest,
+        &reread.identity.digests.sha256.?,
+    );
 
     const locked_package: exact_lock_v2.Package = .{
         .name = artifact_evidence.package,
@@ -2961,6 +3105,164 @@ test "transaction_executor.test.local artifact preflight and reread require exac
         },
         harness.dependencies().filesystem,
     ));
+}
+
+test "transaction_executor.test.plan v4 SHA512 authority verifies every digest before mutation" {
+    const bytes = try testDeb(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var sha256: [32]u8 = undefined;
+    var sha512: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &sha256, .{});
+    std.crypto.hash.sha2.Sha512.hash(bytes, &sha512, .{});
+    const sha512_identity = try content_digest.Identity.init(
+        .{ .sha512 = sha512 },
+        .sha512,
+    );
+    const local: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = package_origin.artifactIdFromIdentity(sha512_identity),
+        .archive_identity = sha512_identity,
+        .size = bytes.len,
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .acquisition_url = "file:///cache/demo.deb",
+        .trust_mode = .pinned_content_digest,
+    };
+    var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
+    actions[0].repository = null;
+    actions[0].sha256 = null;
+    actions[0].archive_identity = sha512_identity;
+    actions[0].origin = null;
+    actions[0].origin_v2 = .{ .local_artifact = .{
+        .evidence = local,
+        .solver_priority = 1000,
+    } };
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "demo", .version = "1.0", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "demo", .version = "1.0", .architecture = "amd64" },
+    };
+    var plan = testPlan(&actions, &ordered);
+    plan.schema_version = 4;
+    const locked_package: exact_lock_v3.Package = .{
+        .name = local.package,
+        .version = local.version,
+        .architecture = local.architecture,
+        .origin = .{ .local_artifact = local },
+        .archive_identity = sha512_identity,
+        .declared_size = local.size,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    var lock = try exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{local},
+        .packages = &.{locked_package},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const artifact: Artifact = .{
+        .package = local.package,
+        .version = local.version,
+        .architecture = local.architecture,
+        .path = "/cache/demo.deb",
+    };
+
+    var success_harness: TestHarness = .{ .bytes = bytes };
+    var success = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{artifact},
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v3 = &lock.lock,
+    }, success_harness.dependencies());
+    defer success.deinit();
+    try std.testing.expect(success.succeeded());
+
+    var wrong_sha512 = sha512;
+    wrong_sha512[0] ^= 0xff;
+    const wrong_all_identity = try content_digest.Identity.init(
+        .{ .sha256 = sha256, .sha512 = wrong_sha512 },
+        .sha512,
+    );
+    var wrong_local = local;
+    wrong_local.artifact_id =
+        package_origin.artifactIdFromIdentity(wrong_all_identity);
+    wrong_local.archive_identity = wrong_all_identity;
+    var wrong_actions = actions;
+    wrong_actions[0].archive_identity = wrong_all_identity;
+    wrong_actions[0].origin_v2 = .{ .local_artifact = .{
+        .evidence = wrong_local,
+        .solver_priority = 1000,
+    } };
+    var wrong_plan = plan;
+    wrong_plan.actions = &wrong_actions;
+    var wrong_package = locked_package;
+    wrong_package.origin = .{ .local_artifact = wrong_local };
+    wrong_package.archive_identity = wrong_all_identity;
+    var wrong_lock = try exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{wrong_local},
+        .packages = &.{wrong_package},
+        .verified_origins = true,
+    });
+    defer wrong_lock.deinit();
+    var mismatch_harness: TestHarness = .{ .bytes = bytes };
+    var mismatch = try execute(std.testing.allocator, .{
+        .plan = &wrong_plan,
+        .install_root = "/target",
+        .artifacts = &.{artifact},
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v3 = &wrong_lock.lock,
+    }, mismatch_harness.dependencies());
+    defer mismatch.deinit();
+    try std.testing.expectEqual(
+        FailureCode.artifact_digest_mismatch,
+        mismatch.failure.?.code,
+    );
+    try std.testing.expectEqual(@as(usize, 0), mismatch_harness.lock_acquires);
+    try std.testing.expectEqual(@as(usize, 0), mismatch_harness.invocation_count);
+
+    const sha256_identity = try content_digest.Identity.init(
+        .{ .sha256 = sha256 },
+        .sha256,
+    );
+    var downgraded_actions = wrong_actions;
+    downgraded_actions[0].archive_identity = sha256_identity;
+    var downgraded_plan = wrong_plan;
+    downgraded_plan.actions = &downgraded_actions;
+    var downgrade_harness: TestHarness = .{ .bytes = bytes };
+    var downgrade = try execute(std.testing.allocator, .{
+        .plan = &downgraded_plan,
+        .install_root = "/target",
+        .artifacts = &.{artifact},
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v3 = &wrong_lock.lock,
+    }, downgrade_harness.dependencies());
+    defer downgrade.deinit();
+    try std.testing.expect(!downgrade.succeeded());
+    try std.testing.expectEqual(@as(usize, 0), downgrade_harness.lock_acquires);
+    try std.testing.expectEqual(@as(usize, 0), downgrade_harness.invocation_count);
+
+    var mixed_plan = plan;
+    mixed_plan.schema_version = 3;
+    var mixed_harness: TestHarness = .{ .bytes = bytes };
+    var mixed = try execute(std.testing.allocator, .{
+        .plan = &mixed_plan,
+        .install_root = "/target",
+        .artifacts = &.{artifact},
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v3 = &lock.lock,
+    }, mixed_harness.dependencies());
+    defer mixed.deinit();
+    try std.testing.expect(!mixed.succeeded());
+    try std.testing.expectEqual(@as(usize, 0), mixed_harness.lock_acquires);
+    try std.testing.expectEqual(@as(usize, 0), mixed_harness.invocation_count);
 }
 
 fn testDeb(allocator: std.mem.Allocator) ![]u8 {
@@ -3108,7 +3410,7 @@ test "transaction_executor.test.lock timeout happens before mutation and identif
     try std.testing.expectEqual(@as(usize, 1), harness.lock_releases);
 }
 
-test "transaction_executor.test.digest mismatch is rechecked after locks before dpkg" {
+test "transaction_executor.test.digest mismatch fails before locks and is rechecked before dpkg" {
     const bytes = try testDeb(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     var actions = [_]solver.PlanAction{testInstallAction(bytes, "demo")};
@@ -3126,7 +3428,7 @@ test "transaction_executor.test.digest mismatch is rechecked after locks before 
     }, harness.dependencies());
     defer report.deinit();
     try std.testing.expectEqual(FailureCode.artifact_digest_mismatch, report.failure.?.code);
-    try std.testing.expectEqual(@as(usize, 3), harness.lock_acquires);
+    try std.testing.expectEqual(@as(usize, 0), harness.lock_acquires);
     try std.testing.expectEqual(@as(usize, 0), harness.invocation_count);
 }
 
@@ -3729,7 +4031,9 @@ test "transaction_executor.test.unfinished journal blocks normal retry and binds
     defer first.deinit();
     var decoded = try recovery.decode(std.testing.allocator, harness.journal_bytes[0..harness.journal_len]);
     defer decoded.deinit();
-    try std.testing.expect(decoded.journal.commands[0].artifact_sha256 != null);
+    try std.testing.expect(
+        decoded.journal.commands[0].artifact_identity.?.digests.sha256 != null,
+    );
     try std.testing.expectEqual(recovery.State.interrupted, decoded.journal.state);
 
     harness.cancelled_value = false;

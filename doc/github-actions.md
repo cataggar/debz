@@ -12,8 +12,9 @@ from `PATH`, asks that CLI to produce the deterministic cache fingerprint,
 downloads one opaque cache blob into a private `RUNNER_TEMP` staging directory,
 imports only verified package objects through debz, authenticates the explicit
 repository configuration and keyrings, and prepares every package in the lock.
-It defaults to legacy v1 contracts. Explicit `transaction-backend: native`
-selects native v2 locks, fingerprints, preparation results, and archive keys,
+It defaults to the legacy lock/archive contract with packages-v2 cache
+envelopes. Explicit `transaction-backend: native` selects native v3 locks,
+v5 fingerprints/preparation results, and tagged archive-v3 keys,
 with no version autodetection or fallback. Native empty and local-only
 closures may omit repository inputs; local bytes must already be acquired or
 imported, never fetched from redacted provenance URLs.
@@ -31,7 +32,7 @@ download runtime, and always invokes one normal `debz install --cache-only`
 transaction with the same lock, repository/keyring inputs, architecture,
 solver policy, cache root, and explicit alternate root.
 The install action defaults to legacy. Explicit `transaction-backend: native`
-selects v2 download contracts and receipt-bound native installation, with a
+selects v5/v3 download contracts and receipt-bound native installation, with a
 dedicated CLI capability probe before preparation or mutation. Changed installs
 must match the completing caller's typed receipt/completion identities to a
 read-only native verification summary. Verified unchanged native closures emit

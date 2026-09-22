@@ -122,6 +122,9 @@ pub fn classify(identity: Identity) PolicyError!Classification {
         try requireBackend(identity.backend, .legacy_dpkg);
         return legacy(.transaction_result);
     }
+    if (matches(identity, "https://debz.dev/schema/transaction-result-v3", 3)) {
+        return explicit(.transaction_result, identity.backend);
+    }
     if (matches(identity, "io.github.cataggar.debz.transaction-result-summary.v1", 1)) {
         try requireBackend(identity.backend, .legacy_dpkg);
         return legacy(.transaction_result_summary);
@@ -135,7 +138,7 @@ pub fn classify(identity: Identity) PolicyError!Classification {
         return native(.transaction_result_capability);
     }
     if (std.mem.eql(u8, identity.schema, "debz:transaction-journal") and
-        identity.version >= 1 and identity.version <= 3)
+        identity.version >= 1 and identity.version <= 4)
     {
         try requireBackend(identity.backend, .legacy_dpkg);
         return legacy(.transaction_journal);
@@ -143,7 +146,9 @@ pub fn classify(identity: Identity) PolicyError!Classification {
     if (matches(identity, "https://debz.dev/schema/root-operation-record-v1", 1)) {
         return explicit(.root_operation, identity.backend);
     }
-    if (matches(identity, "https://debz.dev/schema/root-operation-completion-v1", 1)) {
+    if (matches(identity, "https://debz.dev/schema/root-operation-completion-v1", 1) or
+        matches(identity, "https://debz.dev/schema/root-operation-completion-v2", 2))
+    {
         return explicit(.root_operation_completion, identity.backend);
     }
     if (matches(identity, "https://debz.dev/schema/apt-system-operation-state-v1", 1)) {
@@ -211,7 +216,9 @@ pub fn classify(identity: Identity) PolicyError!Classification {
         try requireBackend(identity.backend, .native);
         return native(.package_family_result);
     }
-    if (matches(identity, "https://debz.dev/schema/native-transaction-provenance-v1", 1)) {
+    if (matches(identity, "https://debz.dev/schema/native-transaction-provenance-v1", 1) or
+        matches(identity, "https://debz.dev/schema/native-transaction-provenance-v2", 2))
+    {
         try requireBackend(identity.backend, .native);
         return native(.native_provenance);
     }
@@ -385,12 +392,14 @@ const canonical_schemas = [_][]const u8{
     "https://debz.dev/schema/exact-closure-lock-v3",
     "https://debz.dev/schema/transaction-result-v1",
     "https://debz.dev/schema/transaction-result-v2",
+    "https://debz.dev/schema/transaction-result-v3",
     "io.github.cataggar.debz.transaction-result-summary.v1",
     "io.github.cataggar.debz.transaction-result-summary.v2",
     "io.github.cataggar.debz.transaction-result-capability.v1",
     "debz:transaction-journal",
     "https://debz.dev/schema/root-operation-record-v1",
     "https://debz.dev/schema/root-operation-completion-v1",
+    "https://debz.dev/schema/root-operation-completion-v2",
     "https://debz.dev/schema/apt-system-operation-state-v1",
     "https://debz.dev/schema/apt-system-result-v1",
     "https://debz.dev/schema/apt-system-result-v2",
@@ -411,6 +420,7 @@ const canonical_schemas = [_][]const u8{
     "io.github.cataggar.debz.package-family.result.v1",
     "io.github.cataggar.debz.package-family.result.v2",
     "https://debz.dev/schema/native-transaction-provenance-v1",
+    "https://debz.dev/schema/native-transaction-provenance-v2",
     "io.github.cataggar.debz.native-install-capability.v1",
     "io.github.cataggar.debz.native-install-result.v1",
     "https://debz.dev/schema/native-repository-unchanged-v1",
@@ -684,6 +694,11 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             .backend = .native,
         },
         .{
+            .identity = .{ .schema = "https://debz.dev/schema/exact-closure-lock-v3", .version = 3, .backend = .native },
+            .family = .exact_lock,
+            .backend = .native,
+        },
+        .{
             .identity = .{ .schema = "https://debz.dev/schema/transaction-result-v1", .version = 1 },
             .family = .transaction_result,
             .backend = .legacy_dpkg,
@@ -709,6 +724,11 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
             .backend = .legacy_dpkg,
         },
         .{
+            .identity = .{ .schema = "https://debz.dev/schema/transaction-result-v3", .version = 3, .backend = .native },
+            .family = .transaction_result,
+            .backend = .native,
+        },
+        .{
             .identity = .{ .schema = "debz:transaction-journal", .version = 1 },
             .family = .transaction_journal,
             .backend = .legacy_dpkg,
@@ -720,6 +740,11 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
         },
         .{
             .identity = .{ .schema = "debz:transaction-journal", .version = 3 },
+            .family = .transaction_journal,
+            .backend = .legacy_dpkg,
+        },
+        .{
+            .identity = .{ .schema = "debz:transaction-journal", .version = 4 },
             .family = .transaction_journal,
             .backend = .legacy_dpkg,
         },
@@ -740,6 +765,11 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
         },
         .{
             .identity = .{ .schema = "https://debz.dev/schema/root-operation-completion-v1", .version = 1, .backend = .native },
+            .family = .root_operation_completion,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/root-operation-completion-v2", .version = 2, .backend = .native },
             .family = .root_operation_completion,
             .backend = .native,
         },
@@ -880,6 +910,11 @@ test "legacy_compat.test.exact identities never cross backend boundaries" {
         },
         .{
             .identity = .{ .schema = "https://debz.dev/schema/native-transaction-provenance-v1", .version = 1 },
+            .family = .native_provenance,
+            .backend = .native,
+        },
+        .{
+            .identity = .{ .schema = "https://debz.dev/schema/native-transaction-provenance-v2", .version = 2 },
             .family = .native_provenance,
             .backend = .native,
         },

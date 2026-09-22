@@ -188,7 +188,7 @@ terminal receipts, and acknowledgment with mandatory bundled helper binding.
 It accepts prepared programs and immutable archive bytes rather than fixture
 requests or command-shaped executor inputs, and refuses host or mismatched
 roots. The core CLI now supports explicit `--transaction-backend native` for
-genuine v2 lock planning/replay and verified download, with backend-bound solver
+genuine v3 lock planning/replay and verified download, with backend-bound solver
 policy and no v1 conversion. Experimental core native mutation now captures
 complete production evidence and executes prepared programs under the caller's
 root attempt. Persisted-input recovery and receipt-backed outer completion

@@ -31,8 +31,10 @@ const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
 
-pub const schema_id = "https://debz.dev/schema/root-operation-completion-v1";
-pub const schema_version: u32 = 1;
+pub const legacy_schema_id = "https://debz.dev/schema/root-operation-completion-v1";
+pub const legacy_schema_version: u32 = 1;
+pub const schema_id = "https://debz.dev/schema/root-operation-completion-v2";
+pub const schema_version: u32 = 2;
 
 /// The document is small and fixed-shape. The ceiling exists so a hostile or
 /// damaged root cannot force an unbounded read before validation.
@@ -40,7 +42,9 @@ pub const maximum_document_bytes: usize = 64 * 1024;
 pub const maximum_detail_bytes: usize = 256;
 pub const maximum_schema_bytes: usize = 256;
 
-pub const document_name = "root-operation-completion-v1.json";
+pub const legacy_document_name = "root-operation-completion-v1.json";
+pub const legacy_document_path = root_operation.namespace_path ++ "/" ++ legacy_document_name;
+pub const document_name = "root-operation-completion-v2.json";
 pub const document_path = root_operation.namespace_path ++ "/" ++ document_name;
 
 /// What survived of the detailed transaction provenance for the completed
@@ -70,6 +74,7 @@ pub const TransactionProvenance = struct {
     /// Schema identifier of the bound document. Empty exactly when no document
     /// is bound.
     schema: []const u8 = "",
+    version: ?u32 = null,
     document_sha256: ?[32]u8 = null,
     detail: []const u8,
 };
@@ -90,6 +95,8 @@ pub const Discharge = struct {
 };
 
 pub const Document = struct {
+    schema: []const u8 = schema_id,
+    version: u32 = schema_version,
     attempt_id: [32]u8,
     /// Generation and digest of the active record this statement discharges,
     /// exactly as observed under the root mutation lock.
@@ -256,6 +263,14 @@ pub fn create(
     }
 
     var document: Document = .{
+        .schema = if (input.transaction_provenance.version == null)
+            legacy_schema_id
+        else
+            schema_id,
+        .version = if (input.transaction_provenance.version == null)
+            legacy_schema_version
+        else
+            schema_version,
         .attempt_id = record.attempt_id,
         .record_generation = record.generation,
         .record_digest_sha256 = record.digest_sha256,
@@ -282,6 +297,7 @@ pub fn create(
         .transaction_provenance = .{
             .status = input.transaction_provenance.status,
             .schema = try owned.dupe(u8, input.transaction_provenance.schema),
+            .version = input.transaction_provenance.version,
             .document_sha256 = input.transaction_provenance.document_sha256,
             .detail = try owned.dupe(u8, input.transaction_provenance.detail),
         },
@@ -314,10 +330,13 @@ fn validateTransactionProvenance(value: TransactionProvenance) ValidationError!v
             if (value.schema.len == 0 or value.schema.len > maximum_schema_bytes)
                 return error.InvalidTransactionProvenance;
             if (!printableText(value.schema)) return error.InvalidTransactionProvenance;
+            if (value.version != null and value.version.? == 0)
+                return error.InvalidTransactionProvenance;
         },
         .unavailable => {
             if (value.document_sha256 != null) return error.InvalidTransactionProvenance;
             if (value.schema.len != 0) return error.InvalidTransactionProvenance;
+            if (value.version != null) return error.InvalidTransactionProvenance;
         },
     }
 }
@@ -387,6 +406,8 @@ fn validArchitecture(value: []const u8) bool {
 fn digestPayload(document: Document) [32]u8 {
     var buffer: [1024]u8 = undefined;
     var sink: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    if (document.version == schema_version)
+        sink.writer.writeAll("debz-root-operation-completion-v2\x00") catch unreachable;
     writePayload(document, &sink.writer) catch unreachable;
     sink.writer.flush() catch unreachable;
     return sink.hasher.finalResult();
@@ -402,8 +423,8 @@ fn writeDocument(document: Document, writer: *std.Io.Writer) !void {
 
 fn writePayload(document: Document, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
-    try writeJsonString(writer, schema_id);
-    try writer.print(",\"version\":{},\"attempt_id\":", .{schema_version});
+    try writeJsonString(writer, document.schema);
+    try writer.print(",\"version\":{},\"attempt_id\":", .{document.version});
     try writeHexString(writer, &document.attempt_id);
     try writer.print(",\"record_generation\":{},\"record_digest_sha256\":", .{
         document.record_generation,
@@ -467,6 +488,13 @@ fn writePayload(document: Document, writer: *std.Io.Writer) !void {
         try writer.writeAll("null")
     else
         try writeJsonString(writer, document.transaction_provenance.schema);
+    if (document.version == schema_version) {
+        try writer.writeAll(",\"version\":");
+        if (document.transaction_provenance.version) |version|
+            try writer.print("{}", .{version})
+        else
+            try writer.writeAll("null");
+    }
     try writer.writeAll(",\"document_sha256\":");
     try writeOptionalHex(writer, document.transaction_provenance.document_sha256);
     try writer.writeAll(",\"detail\":");
@@ -548,6 +576,7 @@ const WireLockBinding = struct {
 const WireTransactionProvenance = struct {
     status: TransactionProvenanceStatus,
     schema: ?[]const u8,
+    version: ?u32 = null,
     document_sha256: ?[]const u8,
     detail: []const u8,
 };
@@ -616,7 +645,14 @@ pub fn decode(
     };
     defer parsed.deinit();
     const wire = parsed.value;
-    if (!std.mem.eql(u8, wire.schema, schema_id) or wire.version != schema_version)
+    const legacy = std.mem.eql(u8, wire.schema, legacy_schema_id) and
+        wire.version == legacy_schema_version;
+    const current = std.mem.eql(u8, wire.schema, schema_id) and
+        wire.version == schema_version;
+    if (!legacy and !current)
+        return error.UnsupportedSchema;
+    if ((legacy and wire.transaction_provenance.version != null) or
+        (current and wire.transaction_provenance.version == null))
         return error.UnsupportedSchema;
     const operation = try parseOperation(wire.surface, wire.operation);
     const record: root_operation.Record = .{
@@ -656,6 +692,7 @@ pub fn decode(
         .transaction_provenance = .{
             .status = wire.transaction_provenance.status,
             .schema = wire.transaction_provenance.schema orelse "",
+            .version = wire.transaction_provenance.version,
             .document_sha256 = try parseOptionalHex(wire.transaction_provenance.document_sha256),
             .detail = wire.transaction_provenance.detail,
         },
@@ -696,7 +733,16 @@ pub const Store = struct {
 
     /// Raw bytes of the published statement, or `null` when none exists.
     pub fn readBytes(self: Store, allocator: std.mem.Allocator) !?[]u8 {
-        const path = try root_fs.Path.init(document_path);
+        return (try self.readBytesAt(allocator, document_path)) orelse
+            try self.readBytesAt(allocator, legacy_document_path);
+    }
+
+    fn readBytesAt(
+        self: Store,
+        allocator: std.mem.Allocator,
+        relative_path: []const u8,
+    ) !?[]u8 {
+        const path = try root_fs.Path.init(relative_path);
         return self.root.readFileAlloc(allocator, path, maximum_document_bytes) catch |err|
             switch (err) {
                 error.FileNotFound => null,
@@ -727,7 +773,11 @@ pub const Store = struct {
             defer allocator.free(existing);
             if (std.mem.eql(u8, existing, bytes)) return;
         }
-        try self.root.publishFile(try root_fs.Path.init(document_path), bytes, .{
+        const path = if (document.version == legacy_schema_version)
+            legacy_document_path
+        else
+            document_path;
+        try self.root.publishFile(try root_fs.Path.init(path), bytes, .{
             .permissions = document_permissions,
             .overwrite = .replace,
             .durable = true,
@@ -1163,7 +1213,15 @@ test "root_operation_completion.test.store refuses a symbolic link at the docume
     // Publication never writes through the link: it replaces the name.
     var record = try testRecord(testing.allocator);
     defer record.deinit();
-    var document = try create(testing.allocator, testInput(record.record));
+    var input = testInput(record.record);
+    input.transaction_provenance = .{
+        .status = .already_present,
+        .schema = "https://debz.dev/schema/native-transaction-provenance-v2",
+        .version = 2,
+        .document_sha256 = @splat(0x88),
+        .detail = "native transaction provenance",
+    };
+    var document = try create(testing.allocator, input);
     defer document.deinit();
     try store.publish(testing.allocator, document.document);
     var loaded = (try store.read(testing.allocator)).?;

@@ -1,6 +1,5 @@
 const std = @import("std");
 const exact_lock_v2 = @import("exact_lock_v3.zig");
-const exact_lock_legacy = @import("exact_lock_v2.zig");
 const live_root = @import("live_root.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_execution_request = @import("native_execution_request.zig");
@@ -150,7 +149,8 @@ pub fn describeCompletion(
         !std.mem.eql(u8, outer.install_root, proof.install_root) or
         outer.program_sha256 == null or !std.mem.eql(u8, &outer.program_sha256.?, &program_digest) or
         outer.exact_lock == null or !std.mem.eql(u8, &outer.exact_lock.?.digest_sha256, &lock_digest) or
-        !std.mem.eql(u8, outer.transaction_provenance.schema, native_provenance.schema_id) or
+        !std.mem.eql(u8, outer.transaction_provenance.schema, proof.schema) or
+        outer.transaction_provenance.version != proof.version or
         outer.transaction_provenance.document_sha256 == null or
         !std.mem.eql(u8, &outer.transaction_provenance.document_sha256.?, &receipt_digest))
         return error.InvalidNativeCompletionEvidence;
@@ -690,7 +690,8 @@ fn verifyCompletionEvidence(
     try verifyTerminalOutcome(expected_outcome, proof.outcome, outer.outcome);
     if (outer.backend != .native or !outer.mutation_started or
         outer.transaction_provenance.status == .unavailable or
-        !std.mem.eql(u8, outer.transaction_provenance.schema, native_provenance.schema_id) or
+        !std.mem.eql(u8, outer.transaction_provenance.schema, proof.schema) or
+        outer.transaction_provenance.version != proof.version or
         outer.journal.status != .absent or outer.journal.document_sha256 != null or
         !std.mem.eql(u8, outer.install_root, install_root) or
         !std.mem.eql(u8, proof.install_root, install_root) or proof.root_inode != root_inode or
@@ -767,6 +768,7 @@ fn verifyStateEvidence(
     var request = try native_execution_request.decodePersisted(allocator, request_bytes);
     defer request.deinit();
     try evidenceDigest(proof, .execution_request, request.documentDigest());
+    try request.validateAuthorityDocuments(authorized, program.program);
     const execution = request.execution();
     try native_execution_request.validateProgram(execution, program.program);
     if (execution.root_inode != root_inode or
@@ -794,6 +796,27 @@ fn verifyStateEvidence(
     defer allocator.free(progress_bytes);
     var progress = try native_recovery.decodeProgress(allocator, progress_bytes);
     defer progress.deinit();
+    if (proof.authority) |binding| {
+        const authorization_schema = if (authorized.wire_version == native_authorization.schema_v2_version)
+            native_authorization.schema_v2_id
+        else
+            native_authorization.schema_id;
+        if (!std.mem.eql(u8, binding.execution_request_schema, native_execution_request.authority_schema_id) or
+            binding.execution_request_version != 4 or
+            !std.mem.eql(u8, binding.authorization_schema, authorization_schema) or
+            binding.authorization_version != authorized.wire_version or
+            !std.mem.eql(u8, binding.program_schema, program.program.schema) or
+            binding.program_version != program.program.version or
+            !std.mem.eql(u8, binding.exact_lock_schema, program.program.exact_lock.schema) or
+            binding.exact_lock_version != program.program.exact_lock.version or
+            !std.mem.eql(u8, binding.execution_intent_schema, intent.intent.schema) or
+            binding.execution_intent_version != intent.intent.version or
+            !std.mem.eql(u8, binding.progress_schema, progress.document.schema) or
+            binding.progress_version != progress.document.version)
+            return error.InvalidCompletion;
+    } else if (proof.version != native_provenance.legacy_schema_version) {
+        return error.InvalidCompletion;
+    }
     try native_recovery.validateHelperActions(
         progress.document,
         request.bootstrap(),
@@ -1253,36 +1276,21 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
         const artifact = action.artifact orelse continue;
         const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
             return error.LockEvidenceMismatch;
-        if (locked.archive_identity.digests.sha256) |sha256| {
-            if (!std.mem.eql(u8, &artifact.sha256, &sha256))
-                return error.LockEvidenceMismatch;
-        }
-        if (artifact.size != locked.declared_size or
-            !originMatches(artifact.origin, locked.origin))
+        const identity = artifact.archive_identity orelse
+            return error.LockEvidenceMismatch;
+        if (!identity.eql(locked.archive_identity) or
+            artifact.size != locked.declared_size or
+            artifact.origin_v2 == null or
+            !originMatchesV2(artifact.origin_v2.?, locked.origin))
             return error.LockEvidenceMismatch;
     }
     for (program.artifacts) |artifact| {
         const locked = lock.findPackage(artifact.package.name, artifact.package.version, artifact.package.architecture) orelse
             return error.LockEvidenceMismatch;
-        if (locked.archive_identity.digests.sha256) |sha256|
-            try equalDigest(artifact.sha256, native_recovery.hexDigest(sha256));
-        const origin: exact_lock_legacy.PackageOrigin = switch (artifact.origin) {
-            .authenticated_repository => |value| .{ .authenticated_repository = .{
-                .repository_id = value.repository_id,
-                .repository_snapshot_sha256 = try parseDigest(value.repository_snapshot_sha256),
-            } },
-            .local_artifact => |value| .{ .local_artifact = .{
-                .artifact_id = value.artifact_id,
-                .sha256 = try parseDigest(value.sha256),
-                .size = value.size,
-                .package = value.package.name,
-                .version = value.package.version,
-                .architecture = value.package.architecture,
-                .acquisition_url = value.acquisition_url,
-                .trust_mode = value.trust_mode,
-            } },
-        };
-        if (artifact.size != locked.declared_size or !originMatches(origin, locked.origin))
+        const identity = artifact.identity() orelse return error.LockEvidenceMismatch;
+        if (!identity.eql(locked.archive_identity) or
+            artifact.size != locked.declared_size or artifact.origin_v2 == null or
+            !programOriginMatchesV2(artifact.origin_v2.?, locked.origin))
             return error.LockEvidenceMismatch;
     }
 }
@@ -1324,8 +1332,8 @@ fn verifyFinalClosure(final_state: []const native_authorization.FinalPackage, lo
     if (installed != lock.packages.len) return error.LockEvidenceMismatch;
 }
 
-fn originMatches(
-    left: exact_lock_legacy.PackageOrigin,
+fn originMatchesV2(
+    left: exact_lock_v2.PackageOrigin,
     right: exact_lock_v2.PackageOrigin,
 ) bool {
     return switch (left) {
@@ -1339,20 +1347,36 @@ fn originMatches(
             &value.repository_snapshot_sha256,
             &right.authenticated_repository.repository_snapshot_sha256,
         ),
+        .local_artifact => |value| right == .local_artifact and
+            package_origin.eqlLocalArtifactV2(value, right.local_artifact),
+    };
+}
+
+fn programOriginMatchesV2(
+    left: native_program.OriginV2,
+    right: exact_lock_v2.PackageOrigin,
+) bool {
+    return switch (left) {
+        .authenticated_repository => |value| right == .authenticated_repository and
+            std.mem.eql(
+                u8,
+                &value.repository_id,
+                &right.authenticated_repository.repository_id,
+            ) and std.mem.eql(
+            u8,
+            &(parseDigest(value.repository_snapshot_sha256) catch return false),
+            &right.authenticated_repository.repository_snapshot_sha256,
+        ),
         .local_artifact => |value| if (right == .local_artifact) local: {
-            const tagged = right.local_artifact;
-            if (tagged.archive_identity.digests.sha256) |sha256| {
-                if (!std.mem.eql(u8, &value.sha256, &sha256)) break :local false;
-            }
-            break :local value.size == tagged.size and
-                std.mem.eql(u8, value.package, tagged.package) and
-                std.mem.eql(u8, value.version, tagged.version) and
-                std.mem.eql(u8, value.architecture, tagged.architecture) and
-                std.mem.eql(u8, value.acquisition_url, tagged.acquisition_url) and
-                switch (value.trust_mode) {
-                    .pinned_sha256 => tagged.trust_mode == .pinned_content_digest,
-                    .verified_https => tagged.trust_mode == .verified_https,
-                };
+            const expected = right.local_artifact;
+            break :local value.artifact_id.value.eql(expected.artifact_id) and
+                value.archive_identity.value.eql(expected.archive_identity) and
+                value.size == expected.size and
+                std.mem.eql(u8, value.package.name, expected.package) and
+                std.mem.eql(u8, value.package.version, expected.version) and
+                std.mem.eql(u8, value.package.architecture, expected.architecture) and
+                std.mem.eql(u8, value.acquisition_url, expected.acquisition_url) and
+                value.trust_mode == expected.trust_mode;
         } else false,
     };
 }
@@ -1568,15 +1592,18 @@ test "native_transaction_result.test.empty closures retain only authorized resid
 }
 
 test "native_transaction_result.test.repository locks preserve unlocked packages without weakening full closures" {
-    const artifact: package_origin.LocalArtifactEvidence = .{
-        .artifact_id = @splat('1'),
-        .sha256 = @splat(0x11),
+    const artifact: package_origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = .{ .sha256 = @splat(0x11) },
+        .archive_identity = .{
+            .digests = .{ .sha256 = @splat(0x11) },
+            .primary = .sha256,
+        },
         .size = 1,
         .package = "descriptor",
         .version = "1",
         .architecture = "all",
         .acquisition_url = "file:///descriptor.deb",
-        .trust_mode = .pinned_sha256,
+        .trust_mode = .pinned_content_digest,
     };
     var lock = try exact_lock_v2.create(std.testing.allocator, .{
         .target_architecture = "amd64",
@@ -1590,7 +1617,7 @@ test "native_transaction_result.test.repository locks preserve unlocked packages
             .version = artifact.version,
             .architecture = artifact.architecture,
             .origin = .{ .local_artifact = artifact },
-            .sha256 = artifact.sha256,
+            .archive_identity = artifact.archive_identity,
             .declared_size = artifact.size,
             .retention = .requested,
             .dpkg_selection_hold = false,

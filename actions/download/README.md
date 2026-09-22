@@ -55,7 +55,7 @@ Pinning the download action selects its orchestration code; pinning
 implementation. The download action never upgrades or substitutes that CLI.
 The default `transaction-backend: legacy_dpkg` requires `package-cache-v3`
 (introduced in `debz` 0.3.0). Explicit `transaction-backend: native` requires a
-CLI build/release implementing `package-cache-v4`, with native v2 lock,
+CLI build/release implementing `package-cache-v5`, with native v3 lock,
 fingerprint, preparation, and archive support. An older or incompatible CLI
 fails before cache restore; neither backend is automatically substituted.
 Legacy execution remains available for this compatibility increment, but is
@@ -78,7 +78,7 @@ Required and conditional inputs:
 
 | Input | Meaning |
 | --- | --- |
-| `lock-input` | Canonical exact-closure lock v1 for legacy or v2 for native. Unsupported or mismatched schemas fail instead of being skipped. |
+| `lock-input` | Canonical exact-closure lock v1 for legacy or v3 for native. Unsupported or mismatched schemas fail instead of being skipped. |
 | `architecture` | Native target Debian architecture: `amd64` or `arm64`. This is not inferred from the runner architecture. |
 | `source` or `config` | Required for legacy mode and repository-backed native locks. Repeated paths are newline-delimited. |
 | `keyring` | Required for legacy mode and repository-backed native locks. Every source must use `Signed-By` and name one of these newline-delimited paths. |
@@ -120,10 +120,10 @@ ambient trusted-key directories.
 
 ### Native closures
 
-Native mode accepts the CLI's separately versioned v2 contracts and
-`debz-package-cas-v4-` keys, never legacy responses or restore keys. Empty native
+Native mode accepts the CLI's separately versioned v5 contracts and
+`debz-package-cas-v5-` keys, never legacy responses or restore keys. Empty native
 closures need no source/keyring inputs, return zero downloaded/reused objects,
-and can still be saved and restored as canonical empty v2 archives. Local-only
+and can still be saved and restored as canonical empty v3 archives. Local-only
 closures may also omit repository inputs. The CLI remains responsible for
 deciding which repository evidence the lock requires.
 
@@ -261,7 +261,7 @@ install action.
 
 ## Local integration coverage
 
-With Node 24, locked action dependencies, and a built v2-capable CLI:
+With Node 24, locked action dependencies, and a built v5-capable CLI:
 
 ```sh
 DEBZ_DOWNLOAD_INTEGRATION=1 \

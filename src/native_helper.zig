@@ -1,6 +1,7 @@
 //! Trusted helper deployment never creates or replaces its package-owned target.
 //! Sources are immutable, content-addressed files in debz's private namespace.
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const root_fs = @import("root_fs.zig");
 
@@ -134,7 +135,8 @@ pub const BootstrapOwner = struct {
     architecture: []const u8,
     final_state: []const u8,
     artifact: u32,
-    archive_sha256: [64]u8,
+    archive_sha256: [64]u8 = @splat('0'),
+    archive_identity: ?content_digest.JsonIdentity = null,
     archive_size: u64,
     application_sha256: [64]u8,
     program_step: u32,
@@ -143,13 +145,89 @@ pub const BootstrapOwner = struct {
         if (!std.mem.eql(u8, self.package, owner_package) or
             self.version.len == 0 or
             self.architecture.len == 0 or self.final_state.len == 0 or
-            !validDigest(self.archive_sha256) or
             !validDigest(self.application_sha256) or self.archive_size == 0)
             return error.InvalidNativeHelperBootstrap;
+        if (self.archive_identity) |archive_identity| {
+            _ = content_digest.Identity.init(
+                archive_identity.value.digests,
+                archive_identity.value.primary,
+            ) catch return error.InvalidNativeHelperBootstrap;
+        } else if (!validDigest(self.archive_sha256)) {
+            return error.InvalidNativeHelperBootstrap;
+        }
         if (!std.mem.eql(u8, self.final_state, "installed") and
             !std.mem.eql(u8, self.final_state, "triggers_pending") and
             !std.mem.eql(u8, self.final_state, "triggers_awaited"))
             return error.InvalidNativeHelperBootstrap;
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !BootstrapOwner {
+        const Wire = struct {
+            package: []const u8,
+            version: []const u8,
+            architecture: []const u8,
+            final_state: []const u8,
+            artifact: u32,
+            archive_sha256: ?[64]u8 = null,
+            archive_identity: ?content_digest.JsonIdentity = null,
+            archive_size: u64,
+            application_sha256: [64]u8,
+            program_step: u32,
+        };
+        const wire = try std.json.innerParse(Wire, allocator, source, options);
+        if ((wire.archive_sha256 == null) == (wire.archive_identity == null))
+            return error.UnexpectedToken;
+        return .{
+            .package = wire.package,
+            .version = wire.version,
+            .architecture = wire.architecture,
+            .final_state = wire.final_state,
+            .artifact = wire.artifact,
+            .archive_sha256 = wire.archive_sha256 orelse @splat('0'),
+            .archive_identity = wire.archive_identity,
+            .archive_size = wire.archive_size,
+            .application_sha256 = wire.application_sha256,
+            .program_step = wire.program_step,
+        };
+    }
+
+    pub fn jsonStringify(self: BootstrapOwner, writer: anytype) !void {
+        if (self.archive_identity) |archive_identity| {
+            try writer.write(.{
+                .package = self.package,
+                .version = self.version,
+                .architecture = self.architecture,
+                .final_state = self.final_state,
+                .artifact = self.artifact,
+                .archive_identity = archive_identity,
+                .archive_size = self.archive_size,
+                .application_sha256 = self.application_sha256,
+                .program_step = self.program_step,
+            });
+        } else {
+            try writer.write(.{
+                .package = self.package,
+                .version = self.version,
+                .architecture = self.architecture,
+                .final_state = self.final_state,
+                .artifact = self.artifact,
+                .archive_sha256 = self.archive_sha256,
+                .archive_size = self.archive_size,
+                .application_sha256 = self.application_sha256,
+                .program_step = self.program_step,
+            });
+        }
+    }
+
+    pub fn identity(self: BootstrapOwner) ?content_digest.Identity {
+        if (self.archive_identity) |archive_identity| return archive_identity.value;
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, &self.archive_sha256) catch return null;
+        return content_digest.Identity.init(.{ .sha256 = digest }, .sha256) catch null;
     }
 };
 
@@ -186,7 +264,8 @@ pub const Bootstrap = struct {
             std.mem.eql(u8, self.owner.architecture, other.owner.architecture) and
             std.mem.eql(u8, self.owner.final_state, other.owner.final_state) and
             self.owner.artifact == other.owner.artifact and
-            std.mem.eql(u8, &self.owner.archive_sha256, &other.owner.archive_sha256) and
+            self.owner.identity() != null and other.owner.identity() != null and
+            self.owner.identity().?.eql(other.owner.identity().?) and
             self.owner.archive_size == other.owner.archive_size and
             std.mem.eql(u8, &self.owner.application_sha256, &other.owner.application_sha256) and
             self.owner.program_step == other.owner.program_step and

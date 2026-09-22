@@ -100,7 +100,7 @@ test('invokes debz without a shell and strictly validates both result schemas', 
   assert.ok(calls[2].includes('/runner/export.dbzcache'));
 });
 
-test('native selection binds both commands and accepts only consistent v4 contracts', async () => {
+test('native selection binds both commands and accepts only consistent v5 contracts', async () => {
   const nativeInputs: Inputs = { ...inputs, transactionBackend: 'native' };
   const expected = fingerprint(nativeInputs);
   const prepared = preparation(nativeInputs, expected);
@@ -171,7 +171,7 @@ test('native and legacy schemas cannot be mixed or silently autodetected', async
   ), /unexpected value/);
   await assert.rejects(fingerprintCache('/runner/debz', '0.3.0', nativeInputs, {
     async run() { throw new Error('unsupported native flag'); },
-  }), /required package-cache-v4 fingerprint contract/);
+  }), /required package-cache-v5 fingerprint contract/);
 });
 
 test('zero verified objects are native-only and all counts remain consistent and bounded', () => {

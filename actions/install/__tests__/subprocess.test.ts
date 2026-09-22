@@ -41,7 +41,7 @@ test('nested download handoff accepts only the explicitly selected cache key dom
   const inputs = fixtureInputs('/work');
   const outputs = new Map([
     ['cache-hit', 'true'],
-    ['cache-matched-key', `debz-package-cas-v4-linux-x64-${'a'.repeat(64)}-${'b'.repeat(64)}`],
+    ['cache-matched-key', `debz-package-cas-v5-linux-x64-${'a'.repeat(64)}-${'b'.repeat(64)}`],
     ['cache-path', inputs.cachePath], ['cache-root', inputs.cacheRoot],
     ['lock-digest', 'a'.repeat(64)], ['downloaded-count', '0'], ['reused-count', '4'],
     ['backend-capability', 'legacy-dpkg-execution-deprecated-v1'],
@@ -53,7 +53,7 @@ test('nested download handoff accepts only the explicitly selected cache key dom
   const validated = validateDownloadOutputs(outputs, inputs);
   assert.equal(validated.reusedCount, 4);
   assert.equal(validated.backendCapability, 'native-transaction-execution-v1');
-  outputs.set('cache-matched-key', outputs.get('cache-matched-key')!.replace('-v4-', '-v3-'));
+  outputs.set('cache-matched-key', outputs.get('cache-matched-key')!.replace('-v5-', '-v3-'));
   assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache-hit evidence/u);
 });
 

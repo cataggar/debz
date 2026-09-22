@@ -34,7 +34,7 @@ The native root's script-free helper fixture is reference-installed with
 target. This is scoped to the disposable fixture root, not production native
 admission or the host architecture database.
 
-The core native planning lane resolves a real v2 lock, compares its repository
+The core native planning lane resolves a real v3 lock, compares its repository
 and package evidence with the legacy closure, verifies its independent digest
 and backend-bound policy, and exercises cold download and cache-only replay.
 It rejects v1 input and changed policy. A missing helper target refuses native
