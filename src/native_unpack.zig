@@ -19651,7 +19651,7 @@ fn finishLifecycleAttempt(
             else
                 .already_present,
             .schema = provenance.schema,
-            .version = provenance.version,
+            .version = native_provenance.completionVersion(provenance),
             .document_sha256 = parseHex(
                 32,
                 &provenance.digest_sha256,
@@ -21827,7 +21827,9 @@ fn orphanNativeEvidenceDetail(
         const name = member.name;
         if (std.mem.eql(u8, name, "native-recovery-v1") or
             std.mem.eql(u8, name, native_recovery.authorization_name) or
+            std.mem.eql(u8, name, native_recovery.authorization_v2_name) or
             std.mem.eql(u8, name, native_recovery.program_name) or
+            std.mem.eql(u8, name, native_recovery.program_v2_name) or
             std.mem.eql(u8, name, "native-execution-progress-v1.log") or
             std.mem.eql(u8, name, "native-managed-state-v1.json") or
             std.mem.eql(u8, name, std.fs.path.basename(native_recovery.diversion_cache_path)) or
@@ -22038,7 +22040,9 @@ fn recoverWithoutNativeIntent(
         .detail = "already_completed",
         .program_sha256 = locked_provenance.document.program_sha256,
         .attempt_id = locked_provenance.document.attempt_id,
-        .provenance_path = native_provenance.document_path,
+        .provenance_path = native_provenance.documentPath(
+            locked_provenance.document,
+        ),
     };
 }
 
@@ -22258,7 +22262,9 @@ fn recoverLifecycleProgram(
             .detail = "cleanup_completed",
             .program_sha256 = provenance.document.program_sha256,
             .attempt_id = native_recovery.hexDigest(original_attempt),
-            .provenance_path = native_provenance.document_path,
+            .provenance_path = native_provenance.documentPath(
+                provenance.document,
+            ),
         };
     } else {
         var owned_active = active_record.?;
@@ -23697,7 +23703,7 @@ fn productionCompletionResult(receipt: native_provenance.Document) LifecycleResu
         .detail = "awaiting_caller_acknowledgment",
         .program_sha256 = receipt.program_sha256,
         .attempt_id = receipt.attempt_id,
-        .provenance_path = native_provenance.document_path,
+        .provenance_path = native_provenance.documentPath(receipt),
     };
 }
 
@@ -25851,7 +25857,7 @@ fn attachLifecycleProvenance(
         )) return;
     }
     result.attempt_id = owned.document.attempt_id;
-    result.provenance_path = native_provenance.document_path;
+    result.provenance_path = native_provenance.documentPath(owned.document);
     if (result.program_sha256 == null)
         result.program_sha256 = owned.document.program_sha256;
 }
@@ -27566,7 +27572,10 @@ fn typedRuntimeFixtureResult(report: Runtime.Report) LifecycleResult {
         .detail = report.detail,
         .program_sha256 = report.program_sha256,
         .attempt_id = if (report.receipt) |receipt| receipt.document.attempt_id else null,
-        .provenance_path = if (report.receipt != null) native_provenance.document_path else null,
+        .provenance_path = if (report.receipt) |receipt|
+            native_provenance.documentPath(receipt.document)
+        else
+            null,
     };
 }
 
@@ -27668,8 +27677,10 @@ fn callerOwnedLifecycleFixture(
                 .record = attempt.record(),
                 .transaction_provenance = .{
                     .status = .already_present,
-                    .schema = native_provenance.schema_id,
-                    .version = native_provenance.schema_version,
+                    .schema = receipt.document.schema,
+                    .version = native_provenance.completionVersion(
+                        receipt.document,
+                    ),
                     .document_sha256 = native_recovery.parseDigest(receipt.document.digest_sha256).?,
                     .detail = "caller-acknowledged native fixture",
                 },

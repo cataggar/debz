@@ -42,15 +42,15 @@
       "sha512": "fa94ad6d0a590c03d25d7b4ff373dbc5d944a72eb1ed4ab339ba0059085936b5780384ed8c64bd9224a5cccaa7d9567bcb136e72c9a72a54271b3b2e602834ab"
     },
     "findings": {
-      "count": 20060,
+      "count": 20074,
       "counts": {
         "cas_layout": 190,
         "digest_version": 103,
         "fixed_64_hex": 171,
-        "raw_32_byte": 1050,
-        "sha256_token": 18546
+        "raw_32_byte": 1051,
+        "sha256_token": 18559
       },
-      "sha512": "91665d7c70c1abab2754b897bb1a729d6534a692ed1fa90ed27a4f024f03118c74d0f2476a6b19acd839f34044f6e13f69a74b2ab5c07e2e4996d39f7d6224a8"
+      "sha512": "5ecaba000299774a1c14e69721807244ef779d53ea51069a47cd5aa5d317efa2ce0320909d5ad885ee05d096d61b386a587d9e864187a7b5658bd5a62d8e71a3"
     },
     "classifications": [
       {
@@ -155,15 +155,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes and versioned compatibility readers.",
-        "count": 11814,
+        "count": 11828,
         "counts": {
           "cas_layout": 75,
           "digest_version": 53,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1045,
-          "sha256_token": 10623
+          "raw_32_byte": 1046,
+          "sha256_token": 10636
         },
-        "sha512": "1f6965019ca351e893d131e33c4a1d19700ff4361992e31243c8103a6212b7706dd577767576bbc65228cb24c9c5478e106cb727a1a4454087ca847575d276e1"
+        "sha512": "92ca0d761910112ffee5b87b5d7f5da0414ae9499ad2c07b371d54d208c23c94f93cb68cd869f79eb98c06304d3674bf704c047c31abcea61f2f63397cad8e9e"
       },
       {
         "scope": "test",
@@ -191,7 +191,7 @@
           "raw_32_byte": 0,
           "sha256_token": 5403
         },
-        "sha512": "3990f1dc9fe42f72efb2a94eb90db33dedb31b7f5efac76874c765ce67af1426056ffa0c9555ebb78d02877be7941afb0ba8e959e943fef681cf83d70a678376"
+        "sha512": "b80b013ece2fa70d67001915c5875b13816a5ba8eb60097f82701d904d1b1d8d304363a6e05b5cac6c2f705408dba5529a6910f45f1481ebe16ffc264ea08574"
       }
     ]
   },
@@ -470,8 +470,8 @@
         "src/package_acquisition.zig",
         "tools/test-native-recovery.py"
       ],
-      "count": 19,
-      "sha512": "463eeb64d899a645711394f506822e52ab228382dc12495319321a5f5d14f3c5efad5e42630f24c3cdf1f79a01776860ef770368b16e312e6e58c6d7a1429415"
+      "count": 16,
+      "sha512": "6dc5b91550b4abe7adeac0ce4fb3ad1d68779356326a7ff8520a0f44386d7773cb018c12f894f91baf26547cd3e679f59cc60033248866198ff925ee60a3dd05"
     }
   ]
 }

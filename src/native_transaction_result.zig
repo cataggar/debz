@@ -28,6 +28,7 @@ pub const schema_id = "io.github.cataggar.debz.transaction-result-summary.v2";
 pub const api_version: u32 = 2;
 pub const capability_schema_id = "io.github.cataggar.debz.transaction-result-capability.v1";
 pub const capability = "native-transaction-result-v1";
+const EvidenceVersion = enum { legacy, current };
 
 pub fn capabilitiesJson(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -52,6 +53,8 @@ pub fn capabilitiesJson(allocator: std.mem.Allocator) std.mem.Allocator.Error![]
 }
 
 pub const Summary = struct {
+    transaction_version: EvidenceVersion = .current,
+    completion_version: EvidenceVersion = .current,
     target_architecture: []const u8,
     install_root: []const u8,
     operation: product_api.Operation,
@@ -72,10 +75,22 @@ pub const Summary = struct {
             .schema = schema_id,
             .api_version = api_version,
             .backend = "native",
-            .transaction_schema = native_provenance.schema_id,
-            .transaction_schema_version = native_provenance.schema_version,
-            .completion_schema = root_operation_completion.schema_id,
-            .completion_schema_version = root_operation_completion.schema_version,
+            .transaction_schema = if (self.transaction_version == .legacy)
+                native_provenance.legacy_schema_id
+            else
+                native_provenance.schema_id,
+            .transaction_schema_version = if (self.transaction_version == .legacy)
+                native_provenance.legacy_schema_version
+            else
+                native_provenance.schema_version,
+            .completion_schema = if (self.completion_version == .legacy)
+                root_operation_completion.legacy_schema_id
+            else
+                root_operation_completion.schema_id,
+            .completion_schema_version = if (self.completion_version == .legacy)
+                root_operation_completion.legacy_schema_version
+            else
+                root_operation_completion.schema_version,
             .target_architecture = self.target_architecture,
             .install_root = self.install_root,
             .operation = self.operation.spelling(),
@@ -173,7 +188,7 @@ pub fn describeCompletion(
         outer.program_sha256 == null or !std.mem.eql(u8, &outer.program_sha256.?, &program_digest) or
         outer.exact_lock == null or !std.mem.eql(u8, &outer.exact_lock.?.digest_sha256, &lock_digest) or
         !std.mem.eql(u8, outer.transaction_provenance.schema, proof.schema) or
-        outer.transaction_provenance.version != proof.version or
+        outer.transaction_provenance.version != native_provenance.completionVersion(proof) or
         outer.transaction_provenance.document_sha256 == null or
         !std.mem.eql(u8, &outer.transaction_provenance.document_sha256.?, &receipt_digest))
         return error.InvalidNativeCompletionEvidence;
@@ -259,6 +274,14 @@ fn verifyInternal(
     }
     try held.validate();
     return .{
+        .transaction_version = if (proof.version == native_provenance.legacy_schema_version)
+            .legacy
+        else
+            .current,
+        .completion_version = if (outer.version == root_operation_completion.legacy_schema_version)
+            .legacy
+        else
+            .current,
         .target_architecture = expected_architecture,
         .install_root = install_root,
         .operation = outer.operation.package_transaction,
@@ -761,7 +784,7 @@ fn verifyCompletionEvidence(
     if (outer.backend != .native or !outer.mutation_started or
         outer.transaction_provenance.status == .unavailable or
         !std.mem.eql(u8, outer.transaction_provenance.schema, proof.schema) or
-        outer.transaction_provenance.version != proof.version or
+        outer.transaction_provenance.version != native_provenance.completionVersion(proof) or
         outer.journal.status != .absent or outer.journal.document_sha256 != null or
         !std.mem.eql(u8, outer.install_root, install_root) or
         !std.mem.eql(u8, proof.install_root, install_root) or proof.root_inode != root_inode or
@@ -1249,9 +1272,18 @@ fn verifyPendingEvidence(allocator: std.mem.Allocator, root: root_fs.Root, proof
         }
         if (!matched) return error.UnresolvedNativeEvidence;
     }
+    const current_authority = proof.authority != null;
+    const authorization_path = if (current_authority)
+        root_operation.namespace_path ++ "/" ++ native_recovery.authorization_v2_name
+    else
+        root_operation.namespace_path ++ "/" ++ native_recovery.authorization_name;
+    const program_path = if (current_authority)
+        root_operation.namespace_path ++ "/" ++ native_recovery.program_v2_name
+    else
+        root_operation.namespace_path ++ "/" ++ native_recovery.program_name;
     inline for (.{
-        .{ .authorization, root_operation.namespace_path ++ "/" ++ native_recovery.authorization_name },
-        .{ .program, root_operation.namespace_path ++ "/" ++ native_recovery.program_name },
+        .{ .authorization, authorization_path },
+        .{ .program, program_path },
         .{ .intent, native_recovery.intent_path },
         .{ .progress, native_recovery.progress_path },
         .{ .managed_state, native_recovery.managed_state_path },
@@ -1668,6 +1700,30 @@ fn testSummaries(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("07" ** 32, fields.get("completion_digest_sha256").?.string);
     try std.testing.expectEqual(@as(i64, 0), fields.get("package_count").?.integer);
     try std.testing.expectEqual(@as(?usize, bytes.len - 1), std.mem.indexOfScalar(u8, bytes, '\n'));
+    var historical = summary;
+    historical.transaction_version = .legacy;
+    historical.completion_version = .legacy;
+    const historical_bytes = try historical.canonicalJson(allocator);
+    defer allocator.free(historical_bytes);
+    var historical_parsed = try std.json.parseFromSlice(std.json.Value, allocator, historical_bytes, .{});
+    defer historical_parsed.deinit();
+    const historical_fields = historical_parsed.value.object;
+    try std.testing.expectEqualStrings(
+        native_provenance.legacy_schema_id,
+        historical_fields.get("transaction_schema").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(i64, native_provenance.legacy_schema_version),
+        historical_fields.get("transaction_schema_version").?.integer,
+    );
+    try std.testing.expectEqualStrings(
+        root_operation_completion.legacy_schema_id,
+        historical_fields.get("completion_schema").?.string,
+    );
+    try std.testing.expectEqual(
+        @as(i64, root_operation_completion.legacy_schema_version),
+        historical_fields.get("completion_schema_version").?.integer,
+    );
     const capabilities = try capabilitiesJson(allocator);
     defer allocator.free(capabilities);
     var supported = try std.json.parseFromSlice(std.json.Value, allocator, capabilities, .{});

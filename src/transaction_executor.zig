@@ -1537,9 +1537,19 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
                     identity.primary,
                 ) catch return error.InvalidAuthenticatedDigest;
             } else {
-                _ = parseHexDigest(action.sha256 orelse
+                const sha256 = parseHexDigest(action.sha256 orelse
                     return error.MissingAuthenticatedArtifactMetadata) catch
                     return error.InvalidAuthenticatedDigest;
+                if (action.archive_identity) |identity| {
+                    _ = content_digest.Identity.init(
+                        identity.digests,
+                        identity.primary,
+                    ) catch return error.InvalidAuthenticatedDigest;
+                    const typed_sha256 = identity.digests.sha256 orelse
+                        return error.MissingAuthenticatedDigest;
+                    if (!std.crypto.timing_safe.eql([32]u8, sha256, typed_sha256))
+                        return error.PackageOriginMismatch;
+                }
             }
             try validateActionOrigin(request.plan.schema_version, action);
         }
@@ -1622,18 +1632,13 @@ fn validateActionOrigin(schema_version: u32, action: solver.PlanAction) !void {
             if (action.repository != null) return error.PackageOriginMismatch;
             package_origin.validateLocalArtifact(local.evidence) catch
                 return error.InvalidLocalArtifactOrigin;
-            const expected_sha256 = if (schema_version >= 4)
-                (action.archive_identity orelse
-                    return error.MissingAuthenticatedDigest).digests.sha256
-            else
-                parseHexDigest(action.sha256 orelse
-                    return error.MissingAuthenticatedDigest) catch
-                    return error.InvalidAuthenticatedDigest;
+            const expected_sha256 = parseHexDigest(action.sha256 orelse
+                return error.MissingAuthenticatedDigest) catch
+                return error.InvalidAuthenticatedDigest;
             if (!std.mem.eql(u8, action.package, local.evidence.package) or
                 !std.mem.eql(u8, action.version, local.evidence.version) or
                 !std.mem.eql(u8, action.architecture, local.evidence.architecture) or
-                expected_sha256 == null or
-                !std.mem.eql(u8, &expected_sha256.?, &local.evidence.sha256) or
+                !std.mem.eql(u8, &expected_sha256, &local.evidence.sha256) or
                 action.package_size != local.evidence.size)
                 return error.PackageOriginMismatch;
         },
@@ -3053,6 +3058,39 @@ test "transaction_executor.test.local artifact preflight and reread require exac
         &reread.identity.digests.sha256.?,
     );
 
+    const sha512_only = try content_digest.Identity.init(
+        .{ .sha512 = content_digest.Value.of(.sha512, bytes).sha512 },
+        .sha512,
+    );
+    actions[0].archive_identity = sha512_only;
+    try std.testing.expectError(error.MissingAuthenticatedDigest, preflight(
+        std.testing.allocator,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .artifacts = &.{artifact},
+            .policy = .{ .conffile = .keep_existing },
+        },
+        harness.dependencies().filesystem,
+    ));
+    var wrong_sha256 = digest;
+    wrong_sha256[0] ^= 1;
+    actions[0].archive_identity = try content_digest.Identity.init(
+        .{ .sha256 = wrong_sha256, .sha512 = sha512_only.digests.sha512.? },
+        .sha512,
+    );
+    try std.testing.expectError(error.PackageOriginMismatch, preflight(
+        std.testing.allocator,
+        .{
+            .plan = &plan,
+            .install_root = "/target",
+            .artifacts = &.{artifact},
+            .policy = .{ .conffile = .keep_existing },
+        },
+        harness.dependencies().filesystem,
+    ));
+    actions[0].archive_identity = null;
+
     const locked_package: exact_lock_v2.Package = .{
         .name = artifact_evidence.package,
         .version = artifact_evidence.version,
@@ -3182,6 +3220,73 @@ test "transaction_executor.test.plan v4 SHA512 authority verifies every digest b
     }, success_harness.dependencies());
     defer success.deinit();
     try std.testing.expect(success.succeeded());
+    try std.testing.expect(success.commands[0].artifact_sha256 == null);
+    try std.testing.expect(content_digest.Identity.eql(
+        sha512_identity,
+        success.commands[0].artifact_identity.?,
+    ));
+
+    var replay_harness: TestHarness = .{
+        .bytes = bytes,
+        .crash_point = .after_command_journal,
+    };
+    var interrupted = try execute(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .artifacts = &.{artifact},
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v3 = &lock.lock,
+    }, replay_harness.dependencies());
+    defer interrupted.deinit();
+    try std.testing.expectEqual(FailureCode.interrupted, interrupted.failure.?.code);
+    var journal = try recovery.decode(
+        std.testing.allocator,
+        replay_harness.journal_bytes[0..replay_harness.journal_len],
+    );
+    defer journal.deinit();
+    try std.testing.expect(journal.journal.commands[0].artifact_sha256 == null);
+    try std.testing.expect(content_digest.Identity.eql(
+        sha512_identity,
+        journal.journal.commands[0].artifact_identity.?,
+    ));
+    var mismatched_action = actions[0];
+    mismatched_action.archive_identity = try content_digest.Identity.init(
+        .{ .sha256 = sha256, .sha512 = sha512 },
+        .sha512,
+    );
+    try std.testing.expectError(
+        error.PackageOriginMismatch,
+        validateActionOrigin(4, mismatched_action),
+    );
+    var mismatched_actions = [_]solver.PlanAction{mismatched_action};
+    var mismatched_plan = plan;
+    mismatched_plan.actions = &mismatched_actions;
+    const invocations_before_replay = replay_harness.invocation_count;
+    var rejected_replay = try recover(std.testing.allocator, .{
+        .plan = &mismatched_plan,
+        .install_root = "/target",
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v3 = &lock.lock,
+    }, replay_harness.dependencies());
+    defer rejected_replay.deinit();
+    try std.testing.expectEqual(FailureCode.invalid_plan, rejected_replay.failure.?.code);
+    try std.testing.expectEqualStrings(
+        "PlanLockEvidenceMismatch",
+        rejected_replay.failure.?.diagnostic,
+    );
+    try std.testing.expectEqual(invocations_before_replay, replay_harness.invocation_count);
+    replay_harness.crash_point = null;
+    replay_harness.status_source =
+        "Package: demo\nVersion: 1.0\nArchitecture: amd64\nStatus: install ok installed\n\n";
+    var replayed = try recover(std.testing.allocator, .{
+        .plan = &plan,
+        .install_root = "/target",
+        .policy = .{ .conffile = .keep_existing },
+        .exact_lock_v3 = &lock.lock,
+    }, replay_harness.dependencies());
+    defer replayed.deinit();
+    try std.testing.expect(replayed.succeeded());
+    try std.testing.expect(replay_harness.journal_archived);
 
     var wrong_sha512 = sha512;
     wrong_sha512[0] ^= 0xff;

@@ -1140,9 +1140,11 @@ fn nativeDescriptorBytes(
     if (!std.mem.eql(u8, &intent.intent.digest_sha256, &receipt.execution_intent_sha256))
         return error.NativeReceiptMismatch;
     var found: ?native_recovery.Blob = null;
-    const digest = native_recovery.hexDigest(descriptor.sha256);
     for (intent.intent.blobs) |blob| {
-        if (blob.kind != .artifact or !std.mem.eql(u8, &blob.sha256, &digest)) continue;
+        if (blob.kind != .artifact) continue;
+        const identity = blob.identity() orelse return error.InvalidRecoveryIntent;
+        const archive_sha256 = identity.digests.sha256 orelse continue;
+        if (!std.mem.eql(u8, &archive_sha256, &descriptor.sha256)) continue;
         if (found != null or blob.size != descriptor.size) return error.DescriptorIdentityMismatch;
         found = blob;
     }

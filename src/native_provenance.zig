@@ -554,7 +554,7 @@ pub fn publish(
     const bytes = try document.canonicalJson(allocator);
     defer allocator.free(bytes);
     if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
-    const path = try root_fs.Path.init(pathFor(document));
+    const path = try root_fs.Path.init(documentPath(document));
     const existing_bytes = root.readFileAlloc(
         allocator,
         path,
@@ -566,7 +566,7 @@ pub fn publish(
     if (existing_bytes) |existing| {
         defer allocator.free(existing);
         if (std.mem.eql(u8, existing, bytes)) return;
-        var owned = try readPath(allocator, root, pathFor(document)) orelse
+        var owned = try readPath(allocator, root, documentPath(document)) orelse
             return error.ProvenanceChanged;
         defer owned.deinit();
         if (std.mem.eql(
@@ -683,11 +683,31 @@ fn digest(document: Document) Digest {
     return hexDigest(sink.hasher.finalResult());
 }
 
-fn pathFor(document: Document) []const u8 {
+pub fn documentPath(document: Document) []const u8 {
     return if (document.version == legacy_schema_version)
         legacy_document_path
     else
         document_path;
+}
+
+pub fn completionVersion(document: Document) ?u32 {
+    return if (document.version == legacy_schema_version)
+        null
+    else
+        document.version;
+}
+
+test "native_provenance.test.document path follows the versioned receipt" {
+    var document = testDocument();
+    try std.testing.expectEqualStrings(document_path, documentPath(document));
+    try std.testing.expectEqual(schema_version, completionVersion(document).?);
+    document.schema = legacy_schema_id;
+    document.version = legacy_schema_version;
+    try std.testing.expectEqualStrings(
+        legacy_document_path,
+        documentPath(document),
+    );
+    try std.testing.expect(completionVersion(document) == null);
 }
 
 pub fn testDocument() Document {

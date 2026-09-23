@@ -2823,13 +2823,25 @@ pub fn cleanup(
                 else => return err,
             };
     }
+    var authorization_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const authorization_path = try std.fmt.bufPrint(
+        &authorization_buffer,
+        root_operation.namespace_path ++ "/{s}",
+        .{intent.authorization_path},
+    );
+    var program_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const program_path = try std.fmt.bufPrint(
+        &program_buffer,
+        root_operation.namespace_path ++ "/{s}",
+        .{intent.program_path},
+    );
     for ([_][]const u8{
         progress_path,
         trigger_events_path,
         managed_state_path,
         intent_path,
-        root_operation.namespace_path ++ "/" ++ authorization_name,
-        root_operation.namespace_path ++ "/" ++ program_name,
+        authorization_path,
+        program_path,
     }) |path| {
         root.removeFile(try root_fs.Path.init(path)) catch |err| switch (err) {
             error.FileNotFound => {},

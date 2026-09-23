@@ -838,8 +838,8 @@ pub const Backend = struct {
                 .record = attempt.record(),
                 .transaction_provenance = .{
                     .status = .already_present,
-                    .schema = native_provenance.schema_id,
-                    .version = native_provenance.schema_version,
+                    .schema = receipt.schema,
+                    .version = native_provenance.completionVersion(receipt),
                     .document_sha256 = receipt_digest,
                     .detail = "verified terminal native receipt",
                 },
@@ -854,7 +854,9 @@ pub const Backend = struct {
         }
         const document = completion.?.document;
         if (!document.bindsRecord(attempt.record()) or
-            !std.mem.eql(u8, document.transaction_provenance.schema, native_provenance.schema_id) or
+            !std.mem.eql(u8, document.transaction_provenance.schema, receipt.schema) or
+            document.transaction_provenance.version !=
+                native_provenance.completionVersion(receipt) or
             document.transaction_provenance.document_sha256 == null or
             !std.mem.eql(u8, &document.transaction_provenance.document_sha256.?, &receipt_digest) or
             document.transaction_provenance.status == .unavailable or document.journal.status != .absent)
@@ -7055,7 +7057,9 @@ test "production workflow required_security.native reconciliation refuses orphan
         native_recovery.intent_path,
         native_recovery.workspace_directory,
         root_operation.namespace_path ++ "/" ++ native_recovery.program_name,
+        root_operation.namespace_path ++ "/" ++ native_recovery.program_v2_name,
         root_operation.namespace_path ++ "/" ++ native_recovery.authorization_name,
+        root_operation.namespace_path ++ "/" ++ native_recovery.authorization_v2_name,
         native_recovery.progress_path,
         native_recovery.managed_state_path,
         root_operation.namespace_path ++ "/.debz-native-unresolved",

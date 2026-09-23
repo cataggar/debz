@@ -265,7 +265,7 @@ Native callers explicitly select a separate receipt-backed handoff:
 ```sh
 debz transaction-result capabilities --transaction-backend native --json
 debz transaction-result verify --transaction-backend native \
-  --install-root /explicit/root --lock-input /explicit/closure.v2.json \
+  --install-root /explicit/root --lock-input /explicit/closure.v3.json \
   --architecture amd64 --json
 ```
 
@@ -274,8 +274,11 @@ native summary/receipt/completion/lock contracts before a caller attempts a
 mutation. It requires no root access. Native verification accepts no
 `--state-path`, never autodetects a legacy result, and emits
 [`transaction-result-summary.v2`](../schema/transaction-result-summary-v2.json).
-The underlying native receipt and root-operation completion remain their
-existing v1 schemas; they are not converted into command-oriented provenance.
+Current native receipts and root-operation completions use their v2 schemas;
+the summary reports the versions actually verified. Historical v1 receipts,
+completions, and v2 locks remain readable through explicit legacy verification;
+none are converted into command-oriented provenance or upgraded to current
+transaction authority.
 
 Verification acquires the existing root-operation lock without creating a
 namespace, lock file, or attempt. It requires a physically bound alternate
