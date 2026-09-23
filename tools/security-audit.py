@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import hashlib
 import json
 import subprocess
 import sys
@@ -12,6 +13,128 @@ from datetime import date
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FAILURES: list[str] = []
+
+DIGEST_POLICY_PATH = pathlib.Path("security/digest-cutover-policy.json")
+DIGEST_SCOPE_ROOTS = (
+    ".github",
+    "actions",
+    "build",
+    "doc",
+    "fuzz",
+    "schema",
+    "security",
+    "src",
+    "test",
+    "tools",
+)
+DIGEST_TOP_LEVEL_FILES = {"README.md", "build.zig", "build.zig.zon"}
+DIGEST_FINDING_KINDS = (
+    "cas_layout",
+    "digest_version",
+    "fixed_64_hex",
+    "raw_32_byte",
+    "sha256_token",
+)
+DIGEST_POLICY_EXCLUDED_FINDINGS = {
+    DIGEST_POLICY_PATH.as_posix(),
+    "tools/security-audit.py",
+    "tools/test_security_audit.py",
+}
+
+SHA256_TOKEN = re.compile(
+    r"(?i)(?:sha-256|sha256|[A-Za-z_][A-Za-z0-9_]*(?:sha_256|sha256)[A-Za-z0-9_]*)"
+)
+RAW_32_BYTE = re.compile(r"\[\s*32\s*\](?:const\s+)?u8")
+FIXED_64_HEX = re.compile(
+    r"(?i)(?:\^\[0-9a-f\]\{64\}\$|\{64\}|"
+    r"(?:hex|digest|sha256|artifact_id|cache_key)[^\n]{0,64}"
+    r"(?:==|!=|<=|>=|<|>)\s*64|"
+    r"(?:==|!=|<=|>=|<|>)\s*64[^\n]{0,64}"
+    r"(?:hex|digest|sha256|artifact_id|cache_key)|"
+    r"(?:artifact_id|sha256_hex|cache_key)\s*:\s*\[64\]u8)"
+)
+CAS_LAYOUT = re.compile(
+    r"(?i)(?:packages-v[0-9]+|metadata-v[0-9]+|"
+    r"(?:objects|staging|locks)/<[^>]*(?:digest|identity|sha256)[^>]*>|"
+    r"\b(?:cacheKey|cache_key)\b|sha256-|"
+    r"\bCAS\b.{0,80}\b(?:digest|identity|layout|path|key)\b|"
+    r"\b(?:digest|identity|layout|path|key)\b.{0,80}\bCAS\b)"
+)
+DIGEST_VERSION = re.compile(
+    r"(?i)(?:"
+    r"(?:digest|identity|checksum|hash)[A-Za-z0-9_-]*(?:version|v[0-9]+)|"
+    r"(?:version|v[0-9]+)[A-Za-z0-9_-]*(?:digest|identity|checksum|hash)|"
+    r"(?:schema|format|namespace)[A-Za-z0-9_-]*v[0-9]+)"
+)
+RAW_32_FIELD = re.compile(
+    r"(?m)^\s*(?:pub\s+)?"
+    r"(?P<name>(?:sha256|digest|hash|checksum|identity)|"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:sha256|digest|hash|checksum|identity)"
+    r"[A-Za-z0-9_]*)\s*:\s*\??\[\s*32\s*\]u8\b",
+    re.IGNORECASE,
+)
+FIXED_SHA256_CAS = re.compile(
+    r"(?i)(?:"
+    r"(?:objects|staging|locks)[/\\](?:\{|\$\{|<)?sha256(?:_hex)?|"
+    r"sha256(?:_hex)?\s*\[\s*0\s*\.\.\s*(?:2|64)\s*\]|"
+    r"cache_key\s*:\s*\[(?:64|65|71)\]u8|"
+    r"packages-v1|metadata-v1)"
+)
+AUTHORITY_FIELD = re.compile(
+    r"(?i)(?:package_(?:sha256|digest)|cas_sha256|index_sha256|"
+    r"archive_(?:sha256|digest)|artifact_(?:sha256|digest))"
+)
+
+CURRENT_TYPED_SCHEMA_REQUIREMENTS = {
+    "schema/exact-closure-lock-v3.json": {
+        "archive_identity": 3,
+        "artifact_id": 2,
+        "index_identity": 1,
+    },
+    "schema/native-transaction-authorization-v2.json": {
+        "archive_identity": 2,
+        "artifact_id": 1,
+    },
+    "schema/native-transaction-program-v2.json": {
+        "archive_identity": 3,
+        "artifact_id": 1,
+    },
+    "schema/transaction-plan-v4.json": {
+        "archive_identity": 2,
+        "artifact_id": 1,
+    },
+    "schema/transaction-result-v3.json": {
+        "archive_identity": 1,
+        "artifact_id": 1,
+    },
+}
+
+TYPED_SOURCE_REQUIREMENTS = {
+    "src/content_digest.zig": (
+        "pub const Value = union(Algorithm)",
+        "pub const Set = struct",
+        "pub const Identity = struct",
+        "pub const JsonValue = struct",
+        "pub const JsonIdentity = struct",
+        "pub fn cacheKey(self: Identity",
+    ),
+    "src/exact_lock_v3.zig": (
+        "index_identity: content_digest.Identity",
+        "archive_identity: content_digest.Identity",
+    ),
+    "src/package_acquisition.zig": (
+        'pub const namespace = "packages-v2"',
+        "pub const Digest = content_digest.Identity",
+        "digest.cacheKey(&name_buffer)",
+    ),
+    "src/package_origin.zig": (
+        "artifact_id: content_digest.Value",
+        "archive_identity: content_digest.Identity",
+    ),
+    "src/repository_refresh.zig": (
+        "index_identity: content_digest.Identity",
+    ),
+}
 
 
 def fail(message: str) -> None:
@@ -26,6 +149,512 @@ def tracked_files() -> list[pathlib.Path]:
         stdout=subprocess.PIPE,
     )
     return [ROOT / item.decode() for item in result.stdout.split(b"\0") if item]
+
+
+def untracked_files() -> list[pathlib.Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return [ROOT / item.decode() for item in result.stdout.split(b"\0") if item]
+
+
+def repository_digest_files(files: list[pathlib.Path]) -> list[pathlib.Path]:
+    required_policy = ROOT / DIGEST_POLICY_PATH
+    candidates = [*files, *untracked_files()]
+    if required_policy.is_file():
+        candidates.append(required_policy)
+    return sorted(set(candidates))
+
+
+def digest_relevant_path(relative: str) -> bool:
+    path = pathlib.PurePosixPath(relative)
+    if relative in DIGEST_TOP_LEVEL_FILES:
+        return True
+    if not path.parts or path.parts[0] not in DIGEST_SCOPE_ROOTS:
+        return False
+    if "__pycache__" in path.parts or "node_modules" in path.parts:
+        return False
+    return path.suffix not in {".pyc", ".pyo"}
+
+
+def tracked_digest_texts(files: list[pathlib.Path]) -> dict[str, str]:
+    texts: dict[str, str] = {}
+    for path in repository_digest_files(files):
+        relative = path.relative_to(ROOT).as_posix()
+        if not digest_relevant_path(relative):
+            continue
+        try:
+            texts[relative] = path.read_text(errors="strict")
+        except UnicodeDecodeError:
+            continue
+    return texts
+
+
+def digest_scope(relative: str) -> str:
+    if relative in DIGEST_TOP_LEVEL_FILES:
+        return "build"
+    return pathlib.PurePosixPath(relative).parts[0]
+
+
+def canonical_sha512(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha512(encoded).hexdigest()
+
+
+def normalized_line(text: str, offset: int) -> str:
+    start = text.rfind("\n", 0, offset) + 1
+    end = text.find("\n", offset)
+    if end < 0:
+        end = len(text)
+    return " ".join(text[start:end].strip().split())
+
+
+def digest_findings(texts: dict[str, str]) -> list[dict[str, str]]:
+    patterns = {
+        "cas_layout": CAS_LAYOUT,
+        "digest_version": DIGEST_VERSION,
+        "fixed_64_hex": FIXED_64_HEX,
+        "raw_32_byte": RAW_32_BYTE,
+        "sha256_token": SHA256_TOKEN,
+    }
+    findings: list[dict[str, str]] = []
+    for relative, text in sorted(texts.items()):
+        if relative in DIGEST_POLICY_EXCLUDED_FINDINGS:
+            continue
+        for kind, pattern in patterns.items():
+            for match in pattern.finditer(text):
+                findings.append(
+                    {
+                        "context": normalized_line(text, match.start()),
+                        "kind": kind,
+                        "path": relative,
+                        "token": match.group(),
+                    }
+                )
+    return sorted(
+        findings,
+        key=lambda item: (
+            item["path"],
+            item["kind"],
+            item["context"],
+            item["token"],
+        ),
+    )
+
+
+def schema_sha256_candidates(relative: str, text: str) -> list[dict[str, str]]:
+    if not relative.startswith("schema/") or not relative.endswith(".json"):
+        return []
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    candidates: list[dict[str, str]] = []
+
+    def walk(value: object, pointer: str) -> None:
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                for name, definition in properties.items():
+                    if not isinstance(name, str):
+                        continue
+                    encoded = json.dumps(
+                        definition,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    if "sha256" in name.lower() or "#/$defs/sha256" in encoded:
+                        candidates.append(
+                            {
+                                "context": encoded,
+                                "kind": "schema_sha256_field",
+                                "path": relative,
+                                "selector": f"{pointer}/properties/{name}",
+                            }
+                        )
+            for name, child in value.items():
+                walk(child, f"{pointer}/{name}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                walk(child, f"{pointer}/{index}")
+
+    walk(document, "")
+    return candidates
+
+
+def digest_semantic_candidates(texts: dict[str, str]) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    for relative, text in sorted(texts.items()):
+        if relative in DIGEST_POLICY_EXCLUDED_FINDINGS:
+            continue
+        for match in RAW_32_FIELD.finditer(text):
+            candidates.append(
+                {
+                    "context": normalized_line(text, match.start()),
+                    "kind": "raw_32_byte_field",
+                    "path": relative,
+                    "selector": match.group("name"),
+                }
+            )
+        candidates.extend(schema_sha256_candidates(relative, text))
+        for match in FIXED_64_HEX.finditer(text):
+            candidates.append(
+                {
+                    "context": normalized_line(text, match.start()),
+                    "kind": "fixed_64_hex_assumption",
+                    "path": relative,
+                    "selector": match.group(),
+                }
+            )
+        for match in FIXED_SHA256_CAS.finditer(text):
+            candidates.append(
+                {
+                    "context": normalized_line(text, match.start()),
+                    "kind": "fixed_sha256_cas",
+                    "path": relative,
+                    "selector": match.group(),
+                }
+            )
+    return sorted(
+        candidates,
+        key=lambda item: (
+            item["kind"],
+            item["path"],
+            item["selector"],
+            item["context"],
+        ),
+    )
+
+
+def exact_policy_path(value: object) -> bool:
+    if not isinstance(value, str) or not value or value.startswith("/"):
+        return False
+    if any(character in value for character in "*?[]{}"):
+        return False
+    path = pathlib.PurePosixPath(value)
+    return ".." not in path.parts and path.as_posix() == value
+
+
+def digest_inventory_failures(
+    texts: dict[str, str],
+    policy: dict[str, object],
+) -> list[str]:
+    failures: list[str] = []
+    scoped_paths = sorted(texts)
+    findings = digest_findings(texts)
+    inventory = policy.get("inventory")
+    if not isinstance(inventory, dict):
+        return ["digest policy inventory is missing"]
+    expected_files = inventory.get("tracked_files")
+    if not isinstance(expected_files, dict):
+        failures.append("digest policy tracked-file inventory is missing")
+    elif (
+        expected_files.get("count") != len(scoped_paths)
+        or expected_files.get("sha512") != canonical_sha512(scoped_paths)
+    ):
+        failures.append(
+            "digest policy tracked-file inventory changed "
+            f"(count={len(scoped_paths)}, sha512={canonical_sha512(scoped_paths)})"
+        )
+    expected_findings = inventory.get("findings")
+    actual_counts = {
+        kind: sum(finding["kind"] == kind for finding in findings)
+        for kind in DIGEST_FINDING_KINDS
+    }
+    if not isinstance(expected_findings, dict):
+        failures.append("digest policy finding inventory is missing")
+    elif (
+        expected_findings.get("count") != len(findings)
+        or expected_findings.get("counts") != actual_counts
+        or expected_findings.get("sha512") != canonical_sha512(findings)
+    ):
+        failures.append(
+            "digest policy finding inventory changed "
+            f"(count={len(findings)}, sha512={canonical_sha512(findings)})"
+        )
+
+    classifications = inventory.get("classifications")
+    if not isinstance(classifications, list):
+        failures.append("digest policy classifications are missing")
+        return failures
+    actual_scopes = sorted({digest_scope(path) for path in scoped_paths})
+    seen_scopes: set[str] = set()
+    for entry in classifications:
+        if not isinstance(entry, dict):
+            failures.append("digest policy contains a malformed classification")
+            continue
+        scope = entry.get("scope")
+        classification = entry.get("classification")
+        rationale = entry.get("rationale")
+        if (
+            not isinstance(scope, str)
+            or scope not in actual_scopes
+            or scope in seen_scopes
+            or not isinstance(classification, str)
+            or not classification
+            or not isinstance(rationale, str)
+            or len(rationale.strip()) < 40
+        ):
+            failures.append("digest policy contains an invalid or duplicate classification")
+            continue
+        seen_scopes.add(scope)
+        scoped_findings = [
+            finding for finding in findings if digest_scope(finding["path"]) == scope
+        ]
+        scoped_counts = {
+            kind: sum(finding["kind"] == kind for finding in scoped_findings)
+            for kind in DIGEST_FINDING_KINDS
+        }
+        if (
+            entry.get("count") != len(scoped_findings)
+            or entry.get("counts") != scoped_counts
+            or entry.get("sha512") != canonical_sha512(scoped_findings)
+        ):
+            failures.append(
+                f"digest policy classification changed: {scope} "
+                f"(count={len(scoped_findings)}, "
+                f"sha512={canonical_sha512(scoped_findings)})"
+            )
+    if sorted(seen_scopes) != actual_scopes:
+        failures.append("digest policy does not classify every tracked audit scope")
+    return failures
+
+
+def semantic_allowlist_failures(
+    candidates: list[dict[str, str]],
+    policy: dict[str, object],
+) -> list[str]:
+    failures: list[str] = []
+    entries = policy.get("semantic_allowlist")
+    if not isinstance(entries, list) or not entries:
+        return ["digest semantic allowlist is missing"]
+    candidates_by_kind: dict[str, list[tuple[int, dict[str, str]]]] = {}
+    for index, candidate in enumerate(candidates):
+        candidates_by_kind.setdefault(candidate["kind"], []).append(
+            (index, candidate)
+        )
+    covered: set[int] = set()
+    seen_ids: set[str] = set()
+    allowed_classes = {
+        "fixed_control_and_versioned_compatibility",
+        "fixed_control_protocol",
+        "generated_external_protocol",
+        "historical_versioned_compatibility",
+        "typed_identity_internal",
+    }
+    for entry in entries:
+        if not isinstance(entry, dict):
+            failures.append("digest semantic allowlist contains a malformed entry")
+            continue
+        identifier = entry.get("id")
+        kind = entry.get("kind")
+        classification = entry.get("classification")
+        rationale = entry.get("rationale")
+        paths = entry.get("paths")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in seen_ids
+            or kind not in candidates_by_kind
+            or classification not in allowed_classes
+            or not isinstance(rationale, str)
+            or len(rationale.strip()) < 40
+            or not isinstance(paths, list)
+            or not paths
+            or paths != sorted(set(paths))
+            or not all(exact_policy_path(path) for path in paths)
+        ):
+            failures.append("digest semantic allowlist contains an invalid or overbroad entry")
+            continue
+        seen_ids.add(identifier)
+        selected_pairs = [
+            (index, candidate)
+            for index, candidate in candidates_by_kind[kind]
+            if candidate["path"] in paths
+        ]
+        selected = [candidate for _, candidate in selected_pairs]
+        if (
+            not selected
+            or {candidate["path"] for candidate in selected} != set(paths)
+            or entry.get("count") != len(selected)
+            or entry.get("sha512") != canonical_sha512(selected)
+        ):
+            failures.append(f"digest semantic allowlist changed: {identifier}")
+            continue
+        for index, candidate in selected_pairs:
+            if index in covered:
+                failures.append(
+                    f"digest semantic candidate is multiply classified: "
+                    f"{candidate['path']}:{candidate['selector']}"
+                )
+            covered.add(index)
+        if classification != "historical_versioned_compatibility":
+            for candidate in selected:
+                if (
+                    candidate["kind"] in {"raw_32_byte_field", "schema_sha256_field"}
+                    and AUTHORITY_FIELD.search(candidate["selector"])
+                ):
+                    failures.append(
+                        f"{candidate['path']}:{candidate['selector']}: "
+                        "SHA256-only package/repository/artifact authority is forbidden"
+                    )
+                if candidate["kind"] == "fixed_sha256_cas":
+                    failures.append(
+                        f"{candidate['path']}:{candidate['selector']}: "
+                        "fixed SHA256 CAS layout is forbidden"
+                    )
+    if covered != set(range(len(candidates))):
+        for index, candidate in enumerate(candidates):
+            if index not in covered:
+                failures.append(
+                    f"{candidate['path']}:{candidate['selector']}: "
+                    f"unreviewed {candidate['kind'].replace('_', ' ')}"
+                )
+    return failures
+
+
+def typed_digest_authority_failures(texts: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    for relative, required in TYPED_SOURCE_REQUIREMENTS.items():
+        text = texts.get(relative)
+        if text is None or any(token not in text for token in required):
+            failures.append(
+                f"{relative}: versioned typed digest authority implementation changed"
+            )
+
+    for relative, required_fields in CURRENT_TYPED_SCHEMA_REQUIREMENTS.items():
+        text = texts.get(relative)
+        if text is None:
+            failures.append(f"{relative}: current typed digest schema is missing")
+            continue
+        try:
+            document = json.loads(text)
+        except json.JSONDecodeError:
+            failures.append(f"{relative}: current typed digest schema is invalid JSON")
+            continue
+        observed: dict[str, int] = {}
+
+        def walk(value: object) -> None:
+            if isinstance(value, dict):
+                properties = value.get("properties")
+                if isinstance(properties, dict):
+                    for name, definition in properties.items():
+                        if name not in {"archive_identity", "artifact_id", "index_identity"}:
+                            continue
+                        observed[name] = observed.get(name, 0) + 1
+                        encoded = json.dumps(
+                            definition,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        expected_ref = (
+                            "#/$defs/digest"
+                            if name == "artifact_id"
+                            else "#/$defs/digestIdentity"
+                        )
+                        if expected_ref not in encoded:
+                            failures.append(
+                                f"{relative}:{name}: current authority is not algorithm-tagged"
+                            )
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(document)
+        if observed != required_fields:
+            failures.append(
+                f"{relative}: typed package/repository/artifact authority fields changed"
+            )
+        for forbidden in (
+            "package_sha256",
+            "package_digest",
+            "cas_sha256",
+            "index_sha256",
+            "archive_sha256",
+            "archive_digest",
+        ):
+            if f'"{forbidden}"' in text:
+                failures.append(
+                    f"{relative}:{forbidden}: current schema reintroduced SHA256-only authority"
+                )
+    return failures
+
+
+def digest_cutover_failures(
+    texts: dict[str, str],
+    policy: dict[str, object],
+) -> list[str]:
+    failures = digest_inventory_failures(texts, policy)
+    failures.extend(
+        semantic_allowlist_failures(digest_semantic_candidates(texts), policy)
+    )
+    failures.extend(typed_digest_authority_failures(texts))
+    return failures
+
+
+def audit_digest_cutover(files: list[pathlib.Path]) -> None:
+    policy_path = ROOT / DIGEST_POLICY_PATH
+    if not policy_path.is_file():
+        fail("digest cutover policy is missing")
+        return
+    try:
+        policy = json.loads(policy_path.read_text())
+    except json.JSONDecodeError:
+        fail("digest cutover policy is invalid JSON")
+        return
+    if (
+        policy.get("schema")
+        != "https://debz.dev/security/digest-cutover-policy-v1"
+        or policy.get("version") != 1
+        or policy.get("fingerprint_algorithm") != "sha512"
+    ):
+        fail("digest cutover policy identity changed")
+        return
+    if policy.get("scope") != {
+        "roots": list(DIGEST_SCOPE_ROOTS),
+        "top_level_files": sorted(DIGEST_TOP_LEVEL_FILES),
+        "excluded_finding_paths": sorted(DIGEST_POLICY_EXCLUDED_FINDINGS),
+        "exclusion_rationale": (
+            "The repository manifest includes tracked and non-ignored untracked "
+            "files so pre-commit audit results remain stable after commit. The "
+            "policy and its audit/canary implementation are excluded from token "
+            "findings to avoid recursive self-classification; they do not define "
+            "repository digest authority."
+        ),
+    }:
+        fail("digest cutover policy scope or self-exclusion changed")
+        return
+    if policy.get("authority_policy") != {
+        "current_package_repository_artifact_authority": (
+            "content_digest.Identity, content_digest.Value, content_digest.Set, "
+            "or their versioned algorithm-tagged serialized forms"
+        ),
+        "sha256_only_authority": "forbidden",
+        "raw_32_byte_authority": "forbidden",
+        "fixed_64_hex_authority": "forbidden",
+        "fixed_sha256_cas_layout": "forbidden",
+        "historical_and_control_exception_rule": (
+            "exact-path, exact-fingerprint, version-specific or frozen-control "
+            "classification with a non-empty rationale"
+        ),
+    }:
+        fail("digest cutover authority policy changed")
+        return
+    texts = tracked_digest_texts(files)
+    for message in digest_cutover_failures(texts, policy):
+        fail(message)
 
 
 def dependency_options(build: str, dependency: str) -> dict[str, str] | None:
@@ -1413,6 +2042,8 @@ def audit_secrets_and_artifacts(files: list[pathlib.Path]) -> None:
     synthetic_key_count = 0
     for path in files:
         relative = path.relative_to(ROOT)
+        if "__pycache__" in relative.parts or path.suffix.lower() in {".pyc", ".pyo"}:
+            continue
         if any(part in generated_roots for part in relative.parts):
             fail(f"tracked generated artifact: {relative}")
         if path.suffix.lower() in generated_suffixes:
@@ -1432,6 +2063,7 @@ def audit_secrets_and_artifacts(files: list[pathlib.Path]) -> None:
 
 def main() -> int:
     files = tracked_files()
+    audit_digest_cutover(files)
     audit_production_sources()
     audit_dependencies()
     audit_release_targets()

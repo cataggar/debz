@@ -235,6 +235,21 @@ class ReleaseTests(unittest.TestCase):
         (prefix / "share/doc/debz/LICENSE").write_text("Apache-2.0\n")
         (prefix / "share/doc/debz/THIRD_PARTY_NOTICES").write_text("libsolv BSD-3-Clause\n")
         (prefix / "share/debz").mkdir(parents=True)
+        digest_policy = json.dumps(
+            {
+                "schema": "https://debz.dev/security/digest-cutover-policy-v1",
+                "version": 1,
+            }
+        )
+        legacy_policy = json.dumps(
+            {
+                "schema": "https://debz.dev/schema/legacy-compatibility-policy-v1",
+                "version": 1,
+            }
+        )
+        for directory in (prefix / "share/debz", prefix / "share/doc/debz"):
+            (directory / "digest-cutover-policy.json").write_text(digest_policy)
+            (directory / "legacy-cutover-policy.json").write_text(legacy_policy)
         (prefix / "share/debz/runtime-dependencies.json").write_text(
             json.dumps(self.runtime_manifest())
         )
@@ -286,6 +301,17 @@ class ReleaseTests(unittest.TestCase):
         self.policy.write_text(json.dumps(policy))
         with self.assertRaises(release.ReleaseError):
             release.policy_dependencies(self.policy)
+
+    def test_missing_or_divergent_cutover_policies_are_rejected(self) -> None:
+        missing = self.prefix("missing-policy")
+        (missing / "share/debz/digest-cutover-policy.json").unlink()
+        with self.assertRaisesRegex(release.ReleaseError, "missing required files"):
+            release.binary_entries(missing, "debz-0.1.0-linux-x64")
+
+        divergent = self.prefix("divergent-policy")
+        (divergent / "share/doc/debz/legacy-cutover-policy.json").write_text("{}")
+        with self.assertRaisesRegex(release.ReleaseError, "policy copies differ"):
+            release.binary_entries(divergent, "debz-0.1.0-linux-x64")
 
     def test_static_x64_and_arm64_elfs_are_accepted(self) -> None:
         release.validate_static_elf(self.elf(62), "linux-x64")

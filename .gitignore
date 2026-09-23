@@ -5,6 +5,10 @@
 /actions/download/node_modules/
 /actions/install/lib/
 /actions/install/node_modules/
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.coverage
 /.cache/
 /.tmp/
 /.real-snapshot/

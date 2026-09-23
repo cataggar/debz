@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import copy
 import json
 import os
 import pathlib
@@ -25,6 +26,134 @@ SPEC.loader.exec_module(security_audit)
 
 
 class SecurityAuditTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.digest_texts = security_audit.tracked_digest_texts(
+            security_audit.tracked_files()
+        )
+        cls.digest_policy = json.loads(
+            (ROOT / "security/digest-cutover-policy.json").read_text()
+        )
+
+    def test_digest_cutover_rejects_new_raw_package_authority(self) -> None:
+        candidates = security_audit.digest_semantic_candidates(
+            {
+                "src/new_package_authority.zig": (
+                    "pub const Package = struct {\n"
+                    "    package_sha256: [32]u8,\n"
+                    "};\n"
+                )
+            }
+        )
+        failures = security_audit.semantic_allowlist_failures(
+            candidates, self.digest_policy
+        )
+        self.assertTrue(any("raw 32 byte field" in failure for failure in failures))
+
+    def test_digest_cutover_rejects_new_sha256_only_schema_field(self) -> None:
+        schema = {
+            "$id": "https://debz.dev/schema/example-v3",
+            "type": "object",
+            "properties": {
+                "package_digest": {"$ref": "#/$defs/sha256"},
+            },
+            "$defs": {
+                "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                }
+            },
+        }
+        candidates = security_audit.digest_semantic_candidates(
+            {"schema/example-v3.json": json.dumps(schema)}
+        )
+        failures = security_audit.semantic_allowlist_failures(
+            candidates, self.digest_policy
+        )
+        self.assertTrue(
+            any("schema sha256 field" in failure for failure in failures)
+        )
+
+    def test_digest_cutover_rejects_fixed_sha256_cas_path(self) -> None:
+        candidates = security_audit.digest_semantic_candidates(
+            {
+                "src/new_cache.zig": (
+                    'const object_path = "objects/{sha256}";\n'
+                )
+            }
+        )
+        failures = security_audit.semantic_allowlist_failures(
+            candidates, self.digest_policy
+        )
+        self.assertTrue(any("fixed sha256 cas" in failure for failure in failures))
+
+    def test_digest_cutover_rejects_unreviewed_raw_control_field(self) -> None:
+        candidates = security_audit.digest_semantic_candidates(
+            {
+                "src/new_control.zig": (
+                    "const Control = struct {\n"
+                    "    policy_sha256: [32]u8,\n"
+                    "};\n"
+                )
+            }
+        )
+        failures = security_audit.semantic_allowlist_failures(
+            candidates, self.digest_policy
+        )
+        self.assertTrue(any("raw 32 byte field" in failure for failure in failures))
+
+    def test_digest_cutover_rejects_inventory_drift(self) -> None:
+        changed = dict(self.digest_texts)
+        changed["src/content_digest.zig"] += "\n// sha256 inventory drift canary\n"
+        failures = security_audit.digest_inventory_failures(
+            changed, self.digest_policy
+        )
+        self.assertTrue(any("finding inventory changed" in failure for failure in failures))
+
+    def test_digest_cutover_includes_nonignored_untracked_files(self) -> None:
+        candidate = ROOT / "src/sha512_transaction_e2e_test.zig"
+        with mock.patch.object(
+            security_audit,
+            "untracked_files",
+            return_value=[candidate],
+        ):
+            files = security_audit.repository_digest_files([])
+        self.assertIn(candidate, files)
+        self.assertIn(ROOT / "security/digest-cutover-policy.json", files)
+
+    def test_digest_cutover_rejects_malformed_or_overbroad_allowlist(self) -> None:
+        policy = copy.deepcopy(self.digest_policy)
+        policy["semantic_allowlist"][0]["paths"] = ["src/*"]
+        failures = security_audit.semantic_allowlist_failures(
+            security_audit.digest_semantic_candidates(self.digest_texts),
+            policy,
+        )
+        self.assertIn(
+            "digest semantic allowlist contains an invalid or overbroad entry",
+            failures,
+        )
+
+    def test_digest_cutover_accepts_typed_authority_and_frozen_compatibility(self) -> None:
+        self.assertEqual(
+            [],
+            security_audit.digest_cutover_failures(
+                self.digest_texts,
+                self.digest_policy,
+            ),
+        )
+        allowlist = {
+            entry["id"]: entry
+            for entry in self.digest_policy["semantic_allowlist"]
+        }
+        self.assertEqual(
+            "historical_versioned_compatibility",
+            allowlist["raw-historical-authority-fields"]["classification"],
+        )
+        self.assertIn(
+            "pub const Identity = struct",
+            self.digest_texts["src/content_digest.zig"],
+        )
+
     def test_docs_ignore_disposable_snapshot_payloads_not_repository_docs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="debz-snapshot-docs-") as directory:
             root = pathlib.Path(directory)

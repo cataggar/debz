@@ -22337,6 +22337,20 @@ fn productionLifecycleRequest(
 /// Experimental caller-owned runtime. Product/CLI backend selection remains
 /// separate; this interface never accepts fixture requests or alternate helpers.
 pub const Runtime = struct {
+    /// Injectable external namespace probe mechanics. The authenticated helper
+    /// bytes, target binding, request, authorization, and program remain
+    /// production-validated before this hook is reached.
+    pub const ExternalMechanics = struct {
+        context: ?*anyopaque = null,
+        probe_helper_fn: ?*const fn (
+            context: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            root: root_fs.Root,
+            helper: native_helper.Binding,
+            cancellation: maintainer_script.Cancellation,
+        ) anyerror!void = null,
+    };
+
     pub const PrepareRequest = struct {
         attempt: *root_operation.Attempt,
         plan: *const solver.Plan,
@@ -22352,6 +22366,7 @@ pub const Runtime = struct {
         operation: native_recovery.Operation,
         /// Transient caller budget; never changes persisted program or policy.
         deadline: ?transaction_executor.Deadline = null,
+        external_mechanics: ExternalMechanics = .{},
     };
 
     pub const Outcome = enum { succeeded, failed, recovery_required, refused };
@@ -22597,6 +22612,7 @@ pub const Runtime = struct {
             crash_at,
             native_helper.bundled(),
             &bounds,
+            request.external_mechanics,
         ) catch |err| switch (err) {
             error.DeadlineExceeded => return deadlineReport(allocator, request.attempt),
             else => return err,
@@ -22606,7 +22622,15 @@ pub const Runtime = struct {
 
     /// Recovery consumes only persisted evidence from the original attempt.
     pub fn recover(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !Report {
-        return recoverBounded(allocator, attempt, null, null);
+        return recoverBounded(allocator, attempt, null, null, .{});
+    }
+
+    pub fn recoverWithExternalMechanics(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        external_mechanics: ExternalMechanics,
+    ) !Report {
+        return recoverBounded(allocator, attempt, null, null, external_mechanics);
     }
 
     pub fn recoverWithDeadline(
@@ -22614,7 +22638,7 @@ pub const Runtime = struct {
         attempt: *root_operation.Attempt,
         deadline: transaction_executor.Deadline,
     ) !Report {
-        return recoverBounded(allocator, attempt, deadline, null);
+        return recoverBounded(allocator, attempt, deadline, null, .{});
     }
 
     fn recoverBounded(
@@ -22622,6 +22646,7 @@ pub const Runtime = struct {
         attempt: *root_operation.Attempt,
         deadline: ?transaction_executor.Deadline,
         crash_at: ?native_recovery.CrashPoint,
+        external_mechanics: ExternalMechanics,
     ) !Report {
         const root = try validateAttempt(attempt);
         var bounds: RuntimeBounds = .{ .deadline = deadline };
@@ -22636,6 +22661,7 @@ pub const Runtime = struct {
             crash_at,
             native_helper.bundled(),
             &bounds,
+            external_mechanics,
         ) catch |err| switch (err) {
             error.DeadlineExceeded => return deadlineReport(allocator, attempt),
             else => return err,
@@ -22868,6 +22894,7 @@ fn executePreparedNativeProgram(
         crash_at,
         null,
         null,
+        .{},
     );
 }
 
@@ -22909,6 +22936,7 @@ fn executePreparedNativeProgramWithHelper(
     crash_at: ?native_recovery.CrashPoint,
     helper_source: ?native_helper.Source,
     bounds: ?*RuntimeBounds,
+    external_mechanics: Runtime.ExternalMechanics,
 ) !LifecycleResult {
     try checkRuntimeBounds(bounds);
     const program = compiled.program.program;
@@ -22957,7 +22985,13 @@ fn executePreparedNativeProgramWithHelper(
             );
         } else {
             deployment = try native_helper.stage(allocator, root, source);
-            try probeNativeHelperWithBounds(allocator, root, deployment.?.binding, bounds);
+            try probeNativeHelperWithBounds(
+                allocator,
+                root,
+                deployment.?.binding,
+                bounds,
+                external_mechanics,
+            );
         }
     }
     const bytes = if (program.version == native_program.schema_v2_version)
@@ -23014,14 +23048,17 @@ fn probeNativeHelperWithBounds(
     root: root_fs.Root,
     helper: native_helper.Binding,
     bounds: ?*RuntimeBounds,
+    external_mechanics: Runtime.ExternalMechanics,
 ) !void {
     try checkRuntimeBounds(bounds);
-    native_helper.probeWithCancellation(
-        allocator,
-        root,
-        helper,
-        if (bounds) |value| value.cancellation() else .never(),
-    ) catch |err| {
+    const cancellation: maintainer_script.Cancellation = if (bounds) |value|
+        value.cancellation()
+    else
+        .never();
+    (if (external_mechanics.probe_helper_fn) |probe|
+        probe(external_mechanics.context, allocator, root, helper, cancellation)
+    else
+        native_helper.probeWithCancellation(allocator, root, helper, cancellation)) catch |err| {
         try checkRuntimeBounds(bounds);
         return err;
     };
@@ -23671,7 +23708,16 @@ fn recoverPreparedNativeProgram(
     locks: root_operation.LockBackend,
     crash_at: ?native_recovery.CrashPoint,
 ) !LifecycleResult {
-    return recoverPreparedNativeProgramWithHelper(allocator, root, attempt, locks, crash_at, null, null);
+    return recoverPreparedNativeProgramWithHelper(
+        allocator,
+        root,
+        attempt,
+        locks,
+        crash_at,
+        null,
+        null,
+        .{},
+    );
 }
 
 fn recoverPreparedNativeProgramWithHelper(
@@ -23682,6 +23728,7 @@ fn recoverPreparedNativeProgramWithHelper(
     crash_at: ?native_recovery.CrashPoint,
     helper_source: ?native_helper.Source,
     bounds: ?*RuntimeBounds,
+    external_mechanics: Runtime.ExternalMechanics,
 ) !LifecycleResult {
     try checkRuntimeBounds(bounds);
     if (try readProductionCompletion(allocator, root, attempt)) |value| {
@@ -23734,7 +23781,7 @@ fn recoverPreparedNativeProgramWithHelper(
     try native_execution_request.validateIntent(request.execution(), intent.intent);
     if (request.helper()) |helper| {
         if (request.bootstrap() == null)
-            try probeNativeHelperWithBounds(allocator, root, helper, bounds);
+            try probeNativeHelperWithBounds(allocator, root, helper, bounds, external_mechanics);
     }
     if (!std.mem.eql(u8, &program.program.script_policy_sha256, &native_recovery.hexDigest(
         maintainer_script.policyDigest(lifecycleScriptPolicy()),
@@ -27563,7 +27610,13 @@ fn callerOwnedLifecycleFixture(
         });
         defer attempt.release();
         const result = if (external.isolated_helper) block: {
-            var report = try Runtime.recoverBounded(allocator, &attempt, deadline, external.crash_at);
+            var report = try Runtime.recoverBounded(
+                allocator,
+                &attempt,
+                deadline,
+                external.crash_at,
+                .{},
+            );
             defer report.deinit();
             break :block typedRuntimeFixtureResult(report);
         } else try recoverPreparedNativeProgramWithHelper(
@@ -27574,6 +27627,7 @@ fn callerOwnedLifecycleFixture(
             null,
             null,
             null,
+            .{},
         );
         if (external.acknowledge_native) {
             var receipt = (if (external.isolated_helper)
@@ -27679,6 +27733,7 @@ fn callerOwnedLifecycleFixture(
         external.crash_at,
         null,
         null,
+        .{},
     );
 }
 
@@ -29226,6 +29281,7 @@ fn testPreparedDeadline(
             null,
             null,
             &bounds,
+            .{},
         ) catch |err| switch (err) {
             error.DeadlineExceeded => break :block try Runtime.deadlineReport(testing.allocator, caller),
             else => return err,
@@ -29278,6 +29334,7 @@ fn testPreparedDeadline(
         null,
         null,
         &fresh,
+        .{},
     );
     try testing.expectEqual(LifecycleOutcome.applied, recovered.outcome);
     try testing.expect(!fresh.expired);

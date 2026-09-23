@@ -646,6 +646,7 @@ test {
     _ = exact_lock;
     _ = exact_lock_v2;
     _ = exact_lock_v3;
+    _ = repository_plan;
     _ = native_authorization;
     _ = native_program;
     _ = native_unpack;
@@ -656,6 +657,7 @@ test {
     _ = transaction_provenance;
     _ = transaction_provenance_v2;
     _ = transaction_provenance_v3;
+    _ = native_provenance;
     _ = transaction_result_summary;
     _ = native_transaction_result;
     _ = native_install_result;

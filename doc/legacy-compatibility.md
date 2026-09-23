@@ -68,6 +68,19 @@ preserve canonical bytes, signature inputs, document digests, repository
 snapshot identity, exact package/version/architecture spelling, and recorded
 backend. Historical verification never grants mutation authority.
 
+## Digest compatibility inventory
+
+The tracked repository digest inventory is
+[`security/digest-cutover-policy.json`](../security/digest-cutover-policy.json).
+Current package, repository-index, artifact, and package-CAS authority must use
+`content_digest.Identity`, `Value`, or `Set`, or the equivalent versioned
+algorithm-tagged wire form. SHA256-only fields and raw `[32]u8` widths remain
+allowlisted only for frozen version-specific compatibility or unrelated
+document, policy, signature, state, and transport controls. Each exception has
+an exact-path SHA512 inventory fingerprint and rationale; path globs and
+unreviewed inventory drift fail the security audit. Fixed 64-hex and SHA256 CAS
+layout assumptions cannot authorize current content.
+
 ## Migration
 
 1. Generate a backend-explicit `system-profile-v2`.

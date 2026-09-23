@@ -13,6 +13,8 @@ The install prefix must contain:
 * `bin/debz`
 * `share/doc/debz/LICENSE`
 * `share/doc/debz/THIRD_PARTY_NOTICES`
+* identical `share/debz/` and `share/doc/debz/` copies of
+  `digest-cutover-policy.json` and `legacy-cutover-policy.json`
 * `share/debz/runtime-dependencies.json`
 
 Typical CI usage:

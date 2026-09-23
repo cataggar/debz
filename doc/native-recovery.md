@@ -488,6 +488,13 @@ and cache preparation: it is not reset at a native phase or script boundary.
 recovery; plain `recover` and requests without a deadline keep their existing
 behavior.
 
+`Runtime.ExecuteRequest.external_mechanics` and
+`recoverWithExternalMechanics` narrowly inject the external helper namespace
+probe for hermetic integration. The runtime reaches that hook only after it has
+staged and authenticated the bundled helper binding and validated the persisted
+request, authorization, program, and recovery intent. The hook cannot replace
+those bytes or documents; ordinary callers use the production probe by default.
+
 This is a transient execution constraint, not a changed script policy or
 persisted clock. Program, authorization, invocation-policy and recovery hashes
 remain unchanged. The runtime checks expiry before helper work and execution

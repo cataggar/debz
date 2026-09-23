@@ -19,6 +19,12 @@ mkdir -p "$root"
 
 test -x "$gnu_prefix/bin/debz"
 test ! -e "$gnu_prefix/share/debz/runtime-dependencies.json"
+test -f "$gnu_prefix/share/debz/digest-cutover-policy.json"
+test -f "$gnu_prefix/share/debz/legacy-cutover-policy.json"
+cmp "$gnu_prefix/share/debz/digest-cutover-policy.json" \
+  "$gnu_prefix/share/doc/debz/digest-cutover-policy.json"
+cmp "$gnu_prefix/share/debz/legacy-cutover-policy.json" \
+  "$gnu_prefix/share/doc/debz/legacy-cutover-policy.json"
 if "$zig" build \
   --cache-dir "$root/gnu-cache" \
   -Dtarget=x86_64-linux-gnu \
@@ -39,6 +45,12 @@ fi
 
 test -x "$release_prefix/bin/debz"
 test -f "$release_prefix/share/debz/runtime-dependencies.json"
+test -f "$release_prefix/share/debz/digest-cutover-policy.json"
+test -f "$release_prefix/share/debz/legacy-cutover-policy.json"
+cmp "$release_prefix/share/debz/digest-cutover-policy.json" \
+  "$release_prefix/share/doc/debz/digest-cutover-policy.json"
+cmp "$release_prefix/share/debz/legacy-cutover-policy.json" \
+  "$release_prefix/share/doc/debz/legacy-cutover-policy.json"
 for schema in \
   apt-config-snapshot-v1.json \
   apt-config-snapshot-v2.json \

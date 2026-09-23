@@ -1398,7 +1398,6 @@ fn journalFailure(
 
 fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem) !void {
     try validateRootLexical(request.install_root, request.policy.risk.allow_host_root);
-    filesystem.validateRoot(request.install_root) catch return error.UnsafeInstallRoot;
     if (request.plan.schema_version != 2 and
         request.plan.schema_version != 3 and
         request.plan.schema_version != 4)
@@ -1576,6 +1575,9 @@ fn preflight(arena: std.mem.Allocator, request: Request, filesystem: FileSystem)
             request.policy.validation_limits,
         );
     }
+    // Plan, lock, and cache authority must fail closed before the executor
+    // observes the target root.
+    filesystem.validateRoot(request.install_root) catch return error.UnsafeInstallRoot;
 }
 
 fn validateActionOrigin(schema_version: u32, action: solver.PlanAction) !void {

@@ -760,6 +760,50 @@ pub fn build(b: *std.Build) void {
     }) |module| module.addAnonymousImport("debz_native_trigger_helper", .{
         .root_source_file = native_trigger_helper.getEmittedBin(),
     });
+    const sha512_e2e_module = b.createModule(.{
+        .root_source_file = b.path("src/sha512_transaction_e2e_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sha512_e2e_module.addOptions("debz_build_options", build_options);
+    sha512_e2e_module.addIncludePath(libsolv_dependency.path("src"));
+    sha512_e2e_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    sha512_e2e_module.addIncludePath(zstd_dependency.path("lib"));
+    sha512_e2e_module.addCMacro("LZMA_API_STATIC", "1");
+    sha512_e2e_module.linkLibrary(libsolv);
+    sha512_e2e_module.linkLibrary(liblzma);
+    sha512_e2e_module.linkLibrary(zstd);
+    sha512_e2e_module.link_libc = true;
+    sha512_e2e_module.addAnonymousImport("debz_native_trigger_helper", .{
+        .root_source_file = native_trigger_helper.getEmittedBin(),
+    });
+    const sha512_e2e_tests = b.addTest(.{
+        .root_module = sha512_e2e_module,
+        .filters = &.{
+            "sha512_e2e.test.hermetic signed SHA512-only transaction verifies recovery and fail-closed identities",
+        },
+    });
+    const run_sha512_e2e_tests = b.addRunArtifact(sha512_e2e_tests);
+    const sha512_legacy_compat_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "exact_lock_v2.test.mixed origins canonical roundtrip and tamper rejection",
+            "repository_plan.test.canonical executable plan round trips exactly",
+            "native_authorization.test.canonical document binds program artifacts and final closure",
+            "native_program.test.fresh install compiles a complete deterministic program",
+            "native_execution_request.test.helper wrapper preserves v1 bytes and handles allocation failures",
+            "native_provenance.test.legacy v1 canonical bytes remain frozen",
+            "native_install_result.test.changed installs bind receipts while unchanged installs do not invent them",
+        },
+    });
+    const run_sha512_legacy_compat_tests = b.addRunArtifact(sha512_legacy_compat_tests);
+    const sha512_e2e_step = b.step(
+        "test-sha512-e2e",
+        "Run the hermetic signed SHA512-only transaction recovery proof",
+    );
+    sha512_e2e_step.dependOn(&run_sha512_e2e_tests.step);
+    sha512_e2e_step.dependOn(&run_sha512_legacy_compat_tests.step);
+    test_step.dependOn(&run_sha512_e2e_tests.step);
     const native_trigger_queue_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/native_trigger.zig"),
@@ -1193,6 +1237,8 @@ fn installReleaseFiles(
         .{ .source = "README.md", .destination = "share/doc/debz/README.md" },
         .{ .source = "LICENSE", .destination = "share/doc/debz/LICENSE" },
         .{ .source = "THIRD_PARTY_NOTICES", .destination = "share/doc/debz/THIRD_PARTY_NOTICES" },
+        .{ .source = "security/digest-cutover-policy.json", .destination = "share/debz/digest-cutover-policy.json" },
+        .{ .source = "security/digest-cutover-policy.json", .destination = "share/doc/debz/digest-cutover-policy.json" },
         .{ .source = "security/legacy-cutover-policy.json", .destination = "share/debz/legacy-cutover-policy.json" },
         .{ .source = "security/legacy-cutover-policy.json", .destination = "share/doc/debz/legacy-cutover-policy.json" },
     };
