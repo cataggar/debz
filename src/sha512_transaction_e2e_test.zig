@@ -12,6 +12,7 @@ const native_helper = @import("native_helper.zig");
 const native_program = @import("native_program.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
+const native_transaction_result = @import("native_transaction_result.zig");
 const native_unpack = @import("native_unpack.zig");
 const package_acquisition = @import("package_acquisition.zig");
 const package_database = @import("package_database.zig");
@@ -20,6 +21,7 @@ const repository_plan = @import("repository_plan.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
+const root_operation_completion = @import("root_operation_completion.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const transaction_executor = @import("transaction_executor.zig");
@@ -483,12 +485,7 @@ fn initializeRoot(root: root_fs.Root) !void {
     }
     try root.publishFile(
         try root_fs.Path.init("var/lib/dpkg/status"),
-        "Package: dpkg\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n",
-        .{},
-    );
-    try root.publishFile(
-        try root_fs.Path.init("var/lib/dpkg/info/dpkg.list"),
-        "/.\n/usr\n/usr/bin\n/usr/bin/dpkg-trigger\n",
+        "",
         .{},
     );
     try root.publishFile(
@@ -1024,7 +1021,8 @@ test "sha512_e2e.test.hermetic signed SHA512-only transaction verifies recovery 
         .target_architecture = "amd64",
         .attempt_id = @splat(0x91),
     });
-    defer attempt.release();
+    var attempt_released = false;
+    defer if (!attempt_released) attempt.release();
 
     var preparation = try native_unpack.Runtime.prepare(allocator, .{
         .attempt = &attempt,
@@ -1209,7 +1207,66 @@ test "sha512_e2e.test.hermetic signed SHA512-only transaction verifies recovery 
     defer replayed.deinit();
     try testing.expectEqual(native_unpack.Runtime.Outcome.succeeded, replayed.outcome);
     try testing.expectEqualStrings(receipt.digest_sha256[0..], replayed.receipt.?.document.digest_sha256[0..]);
+
+    switch (attempt.record().state) {
+        .mutating => try attempt.advance(allocator, .{ .state = .verifying, .phase = .verification }),
+        .recovery_required => try attempt.beginRecovery(allocator, attempt.record().phase),
+        .verifying, .recovering => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try attempt.complete(allocator, .succeeded);
+    const receipt_digest = native_recovery.parseDigest(receipt.digest_sha256) orelse
+        return error.TestUnexpectedResult;
+    var completion = try root_operation_completion.create(allocator, .{
+        .record = attempt.record(),
+        .transaction_provenance = .{
+            .status = .already_present,
+            .schema = native_provenance.schema_id,
+            .version = native_provenance.schema_version,
+            .document_sha256 = receipt_digest,
+            .detail = "verified terminal native receipt",
+        },
+        .journal = .{
+            .status = .absent,
+            .detail = "native receipt binds native phase journals; no command journal",
+        },
+        .discharge = .{
+            .surface = .package_transaction,
+            .operation = "install",
+            .request_sha256 = request_sha256,
+        },
+    });
+    defer completion.deinit();
+    const completion_store = root_operation_completion.Store.init(root);
+    try completion_store.publish(allocator, completion.document);
+    try attempt.publishProvenance(allocator, completion.document.digest_sha256);
     try native_unpack.Runtime.acknowledge(allocator, &attempt, receipt.digest_sha256);
     try testing.expect(!try native_unpack.Runtime.hasActiveEvidence(allocator, root));
+    try attempt.clear();
+    attempt.release();
+    attempt_released = true;
+
+    // The in-memory lock adapter models exclusion only; settled verification
+    // also requires the persistent lock-file anchor provided by production.
+    try root.publishFile(try root_fs.Path.init(root_operation.lock_path), "", .{});
+    const result = try native_transaction_result.verify(
+        allocator,
+        root,
+        install_root,
+        lock.lock,
+        "amd64",
+        locks.interface(),
+    );
+    try testing.expectEqualSlices(u8, &lock.lock.digest_sha256, &result.lock_sha256);
+    try testing.expectEqualSlices(u8, &receipt_digest, &result.transaction_digest_sha256);
+    try testing.expectEqualSlices(u8, &completion.document.digest_sha256, &result.completion_digest_sha256);
+    try testing.expectEqual(@as(usize, 1), result.package_count);
+    const result_json = try result.canonicalJson(allocator);
+    defer allocator.free(result_json);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        result_json,
+        "\"final_verification_status\":\"exact_match\"",
+    ) != null);
     try expectLegacySha256RequestBytes(allocator);
 }

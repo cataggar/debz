@@ -503,7 +503,7 @@ jobs:
           test "$EXACT_DOWNLOADED" -eq 0
           test "$EXACT_REUSED" -gt 0
           case "$PARTIAL_KEY:$EXACT_KEY" in
-            debz-package-cas-v4-*:debz-package-cas-v4-*) ;;
+            debz-package-cas-v5-*:debz-package-cas-v5-*) ;;
             *) exit 1 ;;
           esac
       - name: Populate native empty cache

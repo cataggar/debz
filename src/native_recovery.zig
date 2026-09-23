@@ -519,6 +519,7 @@ pub fn validateIntent(intent: Intent) !void {
         }
         if (request_blobs != 1) return error.InvalidBlob;
     }
+    if (request_blobs != 1) return error.InvalidBlob;
     if (total_blob_bytes > 8 * 1024 * 1024 * 1024)
         return error.LimitExceeded;
     var payload = intent;
@@ -3002,6 +3003,11 @@ fn checkIntentBinding() !void {
     };
     sealIntent(&intent);
     try validateIntent(intent);
+    intent.blobs = &.{};
+    sealIntent(&intent);
+    try std.testing.expectError(error.InvalidBlob, validateIntent(intent));
+    intent.blobs = &blobs;
+    sealIntent(&intent);
     intent.defer_triggers = true;
     try std.testing.expectError(error.DigestMismatch, validateIntent(intent));
 }

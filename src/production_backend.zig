@@ -1005,7 +1005,7 @@ pub const Backend = struct {
         if (self.transaction_backend != .native or !usesPackageTransaction(request.operation))
             return self.withRepositoriesGuarded(allocator, request, workflow, null);
         if (request.options.lock_input_path == null)
-            return api.failure(request.operation, .usage, .configuration_required, "native execution requires an explicit v2 exact-lock input");
+            return api.failure(request.operation, .usage, .configuration_required, "native execution requires an explicit v3 exact-lock input");
         if (!request.options.assume_yes or request.options.conffile == .unspecified)
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires confirmation and an explicit conffile policy");
         if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0 or
@@ -4930,100 +4930,6 @@ pub fn planningPolicyDigest(backend: transaction_engine.Kind, options: api.Commo
     };
 }
 
-fn upgradeNativeLockV2(
-    allocator: std.mem.Allocator,
-    lock: exact_lock_v2.Lock,
-) !exact_lock_v3.OwnedLock {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const temporary = arena.allocator();
-    const repositories = try temporary.alloc(exact_lock_v3.Repository, lock.repositories.len);
-    for (lock.repositories, repositories) |legacy, *repository| repository.* = .{
-        .id = legacy.id,
-        .snapshot_sha256 = legacy.snapshot_sha256,
-        .release_sha256 = legacy.release_sha256,
-        .index_identity = try content_digest.Identity.init(
-            .{ .sha256 = legacy.index_sha256 },
-            .sha256,
-        ),
-        .signer_fingerprints = legacy.signer_fingerprints,
-    };
-    const artifacts = try temporary.alloc(
-        @import("package_origin.zig").LocalArtifactEvidenceV2,
-        lock.local_artifacts.len,
-    );
-    for (lock.local_artifacts, artifacts) |legacy, *artifact| {
-        const identity = try content_digest.Identity.init(
-            .{ .sha256 = legacy.sha256 },
-            .sha256,
-        );
-        artifact.* = .{
-            .artifact_id = @import("package_origin.zig").artifactIdFromIdentity(identity),
-            .archive_identity = identity,
-            .size = legacy.size,
-            .package = legacy.package,
-            .version = legacy.version,
-            .architecture = legacy.architecture,
-            .acquisition_url = legacy.acquisition_url,
-            .trust_mode = switch (legacy.trust_mode) {
-                .pinned_sha256 => .pinned_content_digest,
-                .verified_https => .verified_https,
-            },
-        };
-    }
-    const packages = try temporary.alloc(exact_lock_v3.Package, lock.packages.len);
-    for (lock.packages, packages) |legacy, *package| {
-        const identity = try content_digest.Identity.init(
-            .{ .sha256 = legacy.sha256 },
-            .sha256,
-        );
-        package.* = .{
-            .name = legacy.name,
-            .version = legacy.version,
-            .architecture = legacy.architecture,
-            .origin = switch (legacy.origin) {
-                .authenticated_repository => |origin| .{
-                    .authenticated_repository = .{
-                        .repository_id = origin.repository_id,
-                        .repository_snapshot_sha256 = origin.repository_snapshot_sha256,
-                    },
-                },
-                .local_artifact => |origin| local: {
-                    var match: ?@import("package_origin.zig").LocalArtifactEvidenceV2 = null;
-                    for (artifacts) |candidate| {
-                        if (std.mem.eql(u8, candidate.package, origin.package) and
-                            std.mem.eql(u8, candidate.version, origin.version) and
-                            std.mem.eql(u8, candidate.architecture, origin.architecture))
-                        {
-                            match = candidate;
-                            break;
-                        }
-                    }
-                    break :local .{ .local_artifact = match orelse
-                        return error.MissingArtifact };
-                },
-            },
-            .archive_identity = identity,
-            .declared_size = legacy.declared_size,
-            .retention = switch (legacy.retention) {
-                .requested => .requested,
-                .dependency => .dependency,
-                .retained => .retained,
-            },
-            .dpkg_selection_hold = legacy.dpkg_selection_hold,
-        };
-    }
-    return exact_lock_v3.create(allocator, .{
-        .target_architecture = lock.target_architecture,
-        .request_sha256 = lock.request_sha256,
-        .policy_sha256 = lock.policy_sha256,
-        .repositories = repositories,
-        .local_artifacts = artifacts,
-        .packages = packages,
-        .verified_origins = true,
-    });
-}
-
 fn readProductLock(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -5035,24 +4941,11 @@ fn readProductLock(
         .native => {
             const bytes = try readFile(allocator, io, path, exact_lock_v3.maximum_document_bytes);
             defer allocator.free(bytes);
-            if (exact_lock_v3.decode(
+            return .{ .native = try exact_lock_v3.decode(
                 allocator,
                 bytes,
                 exact_lock_v3.maximum_document_bytes,
-            )) |lock| {
-                return .{ .native = lock };
-            } else |err| switch (err) {
-                error.UnsupportedSchema => {
-                    var legacy = try exact_lock_v2.decode(
-                        allocator,
-                        bytes,
-                        exact_lock_v2.maximum_document_bytes,
-                    );
-                    defer legacy.deinit();
-                    return .{ .native = try upgradeNativeLockV2(allocator, legacy.lock) };
-                },
-                else => return err,
-            }
+            ) };
         },
     }
 }
@@ -5634,6 +5527,54 @@ test "production workflow native execution requires a reviewed lock before repos
         result.diagnostics[0].id,
     );
     try std.testing.expect(!result.changed);
+}
+
+test "production native lock input refuses historical v2 without upgrading authority" {
+    const allocator = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var lock = try exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try directory.dir.realPath(std.testing.io, &root_buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        "{s}/lock-v2.json",
+        .{root_buffer[0..root_length]},
+    );
+    try writeLockVersion(exact_lock_v2, allocator, std.testing.io, path, lock.lock);
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        readProductLock(allocator, std.testing.io, path, .native),
+    );
+
+    const bytes = try readFile(
+        allocator,
+        std.testing.io,
+        path,
+        exact_lock_v2.maximum_document_bytes,
+    );
+    defer allocator.free(bytes);
+    var historical = try exact_lock_v2.decode(
+        allocator,
+        bytes,
+        exact_lock_v2.maximum_document_bytes,
+    );
+    defer historical.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &lock.lock.digest_sha256,
+        &historical.lock.digest_sha256,
+    );
 }
 
 test "production workflow external native fixture" {

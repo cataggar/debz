@@ -175,6 +175,33 @@ pub const ValidationError = error{
     ValidationWorkLimitExceeded,
 };
 
+const DigestIndex = struct {
+    sha256: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    sha512: std.AutoHashMapUnmanaged([64]u8, void) = .empty,
+
+    fn deinit(self: *DigestIndex, allocator: std.mem.Allocator) void {
+        self.sha256.deinit(allocator);
+        self.sha512.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn add(
+        self: *DigestIndex,
+        allocator: std.mem.Allocator,
+        identity: content_digest.Identity,
+    ) std.mem.Allocator.Error!bool {
+        if (identity.digests.sha256) |digest| {
+            const entry = try self.sha256.getOrPut(allocator, digest);
+            if (entry.found_existing) return false;
+        }
+        if (identity.digests.sha512) |digest| {
+            const entry = try self.sha512.getOrPut(allocator, digest);
+            if (entry.found_existing) return false;
+        }
+        return true;
+    }
+};
+
 pub fn create(
     allocator: std.mem.Allocator,
     input: Input,
@@ -234,8 +261,12 @@ pub fn create(
         package_origin.LocalArtifactEvidenceV2,
         input.local_artifacts.len,
     );
+    var local_artifact_digests: DigestIndex = .{};
+    defer local_artifact_digests.deinit(allocator);
     for (input.local_artifacts, 0..) |artifact, index| {
         try package_origin.validateLocalArtifactV2(artifact);
+        if (!try local_artifact_digests.add(allocator, artifact.archive_identity))
+            return error.DuplicateArtifact;
         local_artifacts[index] = try dupeLocalArtifact(owned, artifact);
     }
     std.mem.sort(
@@ -256,12 +287,16 @@ pub fn create(
     @memset(referenced_artifacts, false);
 
     const packages = try owned.alloc(Package, input.packages.len);
+    var package_digests: DigestIndex = .{};
+    defer package_digests.deinit(allocator);
     for (input.packages, 0..) |package, index| {
         if (!validIdentity(package.name) or
             !validIdentity(package.version) or
             !validIdentity(package.architecture))
             return error.InvalidIdentity;
         try validateDigestIdentity(package.archive_identity);
+        if (!try package_digests.add(allocator, package.archive_identity))
+            return error.DuplicateArtifact;
         packages[index] = package;
         packages[index].name = try owned.dupe(u8, package.name);
         packages[index].version = try owned.dupe(u8, package.version);
@@ -1136,6 +1171,101 @@ test "exact_lock_v3.test.empty closure is canonical bounded and still evidence c
         .trust_mode = .pinned_content_digest,
     }};
     try std.testing.expectError(error.UnusedArtifact, create(std.testing.allocator, input));
+}
+
+test "exact_lock_v3.test.overlapping digest identities are duplicate archive evidence" {
+    const sha256: [32]u8 = @splat(0x11);
+    const sha512: [64]u8 = @splat(0x22);
+    const sha256_only = try content_digest.Identity.init(
+        .{ .sha256 = sha256 },
+        .sha256,
+    );
+    const complete = try content_digest.Identity.init(
+        .{ .sha256 = sha256, .sha512 = sha512 },
+        .sha512,
+    );
+    const artifacts = [_]package_origin.LocalArtifactEvidenceV2{
+        .{
+            .artifact_id = package_origin.artifactIdFromIdentity(sha256_only),
+            .archive_identity = sha256_only,
+            .size = 1,
+            .package = "first",
+            .version = "1",
+            .architecture = "amd64",
+            .acquisition_url = "file:///first.deb",
+            .trust_mode = .pinned_content_digest,
+        },
+        .{
+            .artifact_id = package_origin.artifactIdFromIdentity(complete),
+            .archive_identity = complete,
+            .size = 1,
+            .package = "second",
+            .version = "1",
+            .architecture = "amd64",
+            .acquisition_url = "file:///second.deb",
+            .trust_mode = .pinned_content_digest,
+        },
+    };
+    try std.testing.expectError(error.DuplicateArtifact, create(
+        std.testing.allocator,
+        .{
+            .target_architecture = "amd64",
+            .request_sha256 = @splat(1),
+            .policy_sha256 = @splat(2),
+            .repositories = &.{},
+            .local_artifacts = &artifacts,
+            .packages = &.{},
+            .verified_origins = true,
+        },
+    ));
+
+    const repository: Repository = .{
+        .id = @splat('a'),
+        .snapshot_sha256 = @splat(3),
+        .release_sha256 = @splat(4),
+        .index_identity = sha256_only,
+        .signer_fingerprints = &.{@splat(5)},
+    };
+    const packages = [_]Package{
+        .{
+            .name = "first",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository.id,
+                .repository_snapshot_sha256 = repository.snapshot_sha256,
+            } },
+            .archive_identity = sha256_only,
+            .declared_size = 1,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "second",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository.id,
+                .repository_snapshot_sha256 = repository.snapshot_sha256,
+            } },
+            .archive_identity = complete,
+            .declared_size = 1,
+            .retention = .dependency,
+            .dpkg_selection_hold = false,
+        },
+    };
+    try std.testing.expectError(error.DuplicateArtifact, create(
+        std.testing.allocator,
+        .{
+            .target_architecture = "amd64",
+            .request_sha256 = @splat(1),
+            .policy_sha256 = @splat(2),
+            .repositories = &.{repository},
+            .local_artifacts = &.{},
+            .packages = &packages,
+            .verified_origins = true,
+        },
+    ));
 }
 
 test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidence" {

@@ -45,10 +45,9 @@ pub const maximum_trigger_activations: u32 = 4096;
 /// it; legacy documents can never be reinterpreted as native authorization.
 pub const Backend = transaction_engine.Kind;
 
-/// Exact closure lock generation authorized for this transaction. Only
-/// exact-closure-lock v2 carries tagged authenticated origins, so older lock
-/// versions remain readable for the legacy backend and are never authorized
-/// here.
+/// Exact closure lock generation authorized for this transaction. V1
+/// authorizations retain exact-lock v2 semantics; v2 authorizations require
+/// exact-lock v3 and its complete tagged content identities.
 pub const LockBinding = struct {
     schema: []const u8,
     version: u32,
@@ -516,7 +515,7 @@ pub fn create(
                         &prior.artifact.?.sha256,
                         &action.artifact.?.sha256,
                     )) return error.DuplicateArtifact;
-                } else if (content_digest.Identity.eql(
+                } else if (content_digest.Identity.overlaps(
                     prior.artifact.?.archive_identity.?,
                     action.artifact.?.archive_identity.?,
                 )) return error.DuplicateArtifact;
@@ -2542,6 +2541,87 @@ test "native_authorization.test.rejects contradictory duplicate and unauthorized
         case.mutate(&input, &actions, &final_state);
         try std.testing.expectError(case.expected, create(std.testing.allocator, input));
     }
+}
+
+test "native_authorization.test.v2 rejects partially overlapping artifact identities" {
+    const complete = try content_digest.Identity.init(.{
+        .sha256 = @splat(0x31),
+        .sha512 = @splat(0x41),
+    }, .sha512);
+    const overlapping = try content_digest.Identity.init(
+        .{ .sha512 = complete.digests.sha512.? },
+        .sha512,
+    );
+    const repository_origin: exact_lock_v3.PackageOrigin = .{
+        .authenticated_repository = .{
+            .repository_id = @splat('a'),
+            .repository_snapshot_sha256 = @splat(0x22),
+        },
+    };
+    const actions = [_]Action{
+        .{
+            .sequence = 0,
+            .kind = .install,
+            .package = "first",
+            .version = "1",
+            .architecture = "amd64",
+            .prior_version = null,
+            .artifact = .{
+                .archive_identity = complete,
+                .size = 1,
+                .origin_v2 = repository_origin,
+            },
+        },
+        .{
+            .sequence = 1,
+            .kind = .install,
+            .package = "second",
+            .version = "1",
+            .architecture = "amd64",
+            .prior_version = null,
+            .artifact = .{
+                .archive_identity = overlapping,
+                .size = 1,
+                .origin_v2 = repository_origin,
+            },
+        },
+    };
+    const final_state = [_]FinalPackage{
+        .{
+            .name = "first",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "second",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+    };
+    try std.testing.expectError(error.DuplicateArtifact, create(
+        std.testing.allocator,
+        .{
+            .backend = .native,
+            .target_architecture = "amd64",
+            .install_root = "/srv/native-root",
+            .request_sha256 = @splat(1),
+            .solver_policy_sha256 = @splat(2),
+            .executor_policy_sha256 = @splat(3),
+            .plan_sha256 = @splat(4),
+            .exact_lock = .{
+                .schema = exact_lock_v3.schema_id,
+                .version = exact_lock_v3.schema_version,
+                .digest_sha256 = @splat(5),
+            },
+            .policy = .{ .conffile = .keep_existing },
+            .actions = &actions,
+            .final_state = &final_state,
+        },
+    ));
 }
 
 test "native_authorization.test.schema and enums stay synchronized with the contract" {

@@ -713,6 +713,62 @@ test "transaction_recovery.test.legacy compatibility rejects unknown and native 
     );
 }
 
+test "transaction_recovery.test.exact lock v3 recovery requires plan v4" {
+    var lock = try exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var plan: solver.Plan = .{
+        .schema_version = 3,
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &.{},
+        .ordered_actions = &.{},
+        .summary = .{},
+        .download_bytes = 0,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = std.testing.allocator,
+        .arena = undefined,
+    };
+    const journal: Journal = .{
+        .version = journal_version,
+        .compatibility = .legacy_execution_deprecated_v1,
+        .state = .complete,
+        .boundary = .verifying,
+        .plan_sha256 = @splat(3),
+        .root_identity = @splat(4),
+        .policy_sha256 = @splat(5),
+        .lock_sha256 = lock.lock.digest_sha256,
+        .next_command = 0,
+        .commands = &.{},
+    };
+    const refused = try verifyExactLockV3Evidence(
+        std.testing.allocator,
+        lock.lock,
+        plan,
+        journal,
+        true,
+    );
+    try std.testing.expectEqual(
+        VerificationFailure.locked_origin_evidence_mismatch,
+        refused.failure.?,
+    );
+    plan.schema_version = 4;
+    try std.testing.expect((try verifyExactLockV3Evidence(
+        std.testing.allocator,
+        lock.lock,
+        plan,
+        journal,
+        true,
+    )).succeeded());
+}
+
 pub fn verify(
     allocator: std.mem.Allocator,
     plan: solver.Plan,
@@ -1074,7 +1130,7 @@ fn verifyExactLockV3Evidence(
     journal: Journal,
     all_packages: bool,
 ) !Verification {
-    if ((plan.schema_version != 3 and plan.schema_version != 4) or
+    if (plan.schema_version != 4 or
         !std.mem.eql(u8, plan.target_architecture, lock.target_architecture) or
         journal.lock_sha256 == null or
         !std.mem.eql(u8, &journal.lock_sha256.?, &lock.digest_sha256) or

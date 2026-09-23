@@ -1,5 +1,6 @@
 const std = @import("std");
-const exact_lock_v2 = @import("exact_lock_v3.zig");
+const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const live_root = @import("live_root.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_execution_request = @import("native_execution_request.zig");
@@ -42,8 +43,8 @@ pub fn capabilitiesJson(allocator: std.mem.Allocator) std.mem.Allocator.Error![]
         .transaction_schema_version = native_provenance.schema_version,
         .completion_schema = root_operation_completion.schema_id,
         .completion_schema_version = root_operation_completion.schema_version,
-        .lock_schema = exact_lock_v2.schema_id,
-        .lock_schema_version = exact_lock_v2.schema_version,
+        .lock_schema = exact_lock_v3.schema_id,
+        .lock_schema_version = exact_lock_v3.schema_version,
         .read_only = true,
     }, .{ .whitespace = .minified }, &output.writer) catch return error.OutOfMemory;
     output.writer.writeByte('\n') catch return error.OutOfMemory;
@@ -104,11 +105,33 @@ pub fn verify(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
+    lock: exact_lock_v3.Lock,
+    expected_architecture: []const u8,
+    locks: root_operation.LockBackend,
+) anyerror!Summary {
+    return verifyInternal(allocator, root, install_root, lock, expected_architecture, null, locks);
+}
+
+/// Explicit historical exact-lock v2 verification route. It preserves the
+/// original SHA256-only evidence semantics without upgrading the lock or
+/// granting current exact-lock v3 authority.
+pub fn verifyLegacyV2(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
     lock: exact_lock_v2.Lock,
     expected_architecture: []const u8,
     locks: root_operation.LockBackend,
-) !Summary {
-    return verifyInternal(allocator, root, install_root, lock, expected_architecture, null, locks);
+) anyerror!Summary {
+    return verifyInternal(
+        allocator,
+        root,
+        install_root,
+        lock,
+        expected_architecture,
+        null,
+        locks,
+    );
 }
 
 /// Read-only identity constraints, not caller ownership or execution authority.
@@ -172,23 +195,43 @@ pub fn verifyForCaller(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
+    lock: exact_lock_v3.Lock,
+    expected_architecture: []const u8,
+    expected: ExpectedCaller,
+    locks: root_operation.LockBackend,
+) anyerror!Summary {
+    return verifyInternal(allocator, root, install_root, lock, expected_architecture, expected, locks);
+}
+
+pub fn verifyForCallerLegacyV2(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
     lock: exact_lock_v2.Lock,
     expected_architecture: []const u8,
     expected: ExpectedCaller,
     locks: root_operation.LockBackend,
-) !Summary {
-    return verifyInternal(allocator, root, install_root, lock, expected_architecture, expected, locks);
+) anyerror!Summary {
+    return verifyInternal(
+        allocator,
+        root,
+        install_root,
+        lock,
+        expected_architecture,
+        expected,
+        locks,
+    );
 }
 
 fn verifyInternal(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     expected_architecture: []const u8,
     expected: ?ExpectedCaller,
     locks: root_operation.LockBackend,
-) !Summary {
+) anyerror!Summary {
     var held = try VerificationLock.acquire(root, install_root, locks, null);
     defer held.deinit();
     if (try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null or
@@ -308,12 +351,33 @@ pub fn validateRepositoryHistoryCaller(allocator: std.mem.Allocator, attempt: *r
 pub fn verifyRepositoryHistory(
     allocator: std.mem.Allocator,
     attempt: *root_operation.Attempt,
+    lock: exact_lock_v3.Lock,
+    policy: transaction_executor.Policy,
+    completion: root_operation_completion.Document,
+    receipt: native_provenance.Document,
+) anyerror!void {
+    return verifyRepositoryHistoryInternal(allocator, attempt, lock, policy, completion, receipt) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+pub fn verifyRepositoryHistoryLegacyV2(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
     lock: exact_lock_v2.Lock,
     policy: transaction_executor.Policy,
     completion: root_operation_completion.Document,
     receipt: native_provenance.Document,
-) !void {
-    return verifyRepositoryHistoryInternal(allocator, attempt, lock, policy, completion, receipt) catch |err| switch (err) {
+) anyerror!void {
+    return verifyRepositoryHistoryInternal(
+        allocator,
+        attempt,
+        lock,
+        policy,
+        completion,
+        receipt,
+    ) catch |err| switch (err) {
         error.WriteFailed => error.OutOfMemory,
         else => err,
     };
@@ -322,11 +386,11 @@ pub fn verifyRepositoryHistory(
 fn verifyRepositoryHistoryInternal(
     allocator: std.mem.Allocator,
     attempt: *root_operation.Attempt,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     policy: transaction_executor.Policy,
     completion: root_operation_completion.Document,
     receipt: native_provenance.Document,
-) !void {
+) anyerror!void {
     try validateRepositoryHistoryCaller(allocator, attempt);
     const caller = attempt.record();
     const bytes = try completion.canonicalJson(allocator);
@@ -390,7 +454,16 @@ fn verifyCaller(
         return if (expected_outcome == .succeeded) error.TransactionNotSuccessful else error.TransactionNotFailed;
     const record = attempt.record();
     const root = attempt.coordinator.root;
-    try verifyStateEvidence(allocator, root, (try root.rootEntry()).inode, null, record, proof, expected_outcome, null);
+    try verifyStateEvidence(
+        allocator,
+        root,
+        (try root.rootEntry()).inode,
+        @as(?exact_lock_v3.Lock, null),
+        record,
+        proof,
+        expected_outcome,
+        null,
+    );
     try verifyPendingEvidence(allocator, root, proof);
     if (!attempt.locked()) return error.LockLost;
     try attempt.coordinator.validateProjection();
@@ -427,11 +500,11 @@ pub fn verifyPendingSuccess(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
-    lock: exact_lock_v2.Lock,
+    lock: exact_lock_v3.Lock,
     expected_architecture: []const u8,
     expected: PendingRequest,
     locks: root_operation.LockBackend,
-) !PendingSuccess {
+) anyerror!PendingSuccess {
     return verifyOwned(allocator, root, install_root, lock, expected_architecture, expected, locks, .pending, .succeeded);
 }
 
@@ -441,11 +514,11 @@ pub fn verifyPendingFailure(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
-    lock: exact_lock_v2.Lock,
+    lock: exact_lock_v3.Lock,
     expected_architecture: []const u8,
     expected: OwnedRequest,
     locks: root_operation.LockBackend,
-) !PendingFailure {
+) anyerror!PendingFailure {
     return verifyOwned(allocator, root, install_root, lock, expected_architecture, expected, locks, .pending, .failed);
 }
 
@@ -455,11 +528,11 @@ pub fn verifyReleasedSuccess(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
-    lock: exact_lock_v2.Lock,
+    lock: exact_lock_v3.Lock,
     expected_architecture: []const u8,
     expected: OwnedRequest,
     locks: root_operation.LockBackend,
-) !OwnedSuccess {
+) anyerror!OwnedSuccess {
     return verifyOwned(allocator, root, install_root, lock, expected_architecture, expected, locks, .released, .succeeded);
 }
 
@@ -467,13 +540,13 @@ fn verifyOwned(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     expected_architecture: []const u8,
     expected: OwnedRequest,
     locks: root_operation.LockBackend,
     state: OwnershipState,
     comptime expected_outcome: TerminalOutcome,
-) !OwnedResult(expected_outcome) {
+) anyerror!OwnedResult(expected_outcome) {
     return verifyOwnedInternal(
         allocator,
         root,
@@ -495,13 +568,13 @@ fn verifyOwnedInternal(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     install_root: []const u8,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     expected_architecture: []const u8,
     expected: OwnedRequest,
     locks: root_operation.LockBackend,
     state: OwnershipState,
     comptime expected_outcome: TerminalOutcome,
-) !OwnedResult(expected_outcome) {
+) anyerror!OwnedResult(expected_outcome) {
     if (expected_outcome == .failed and state != .pending)
         return error.PendingOwnerRequired;
     const owner_bytes = try expected.owner.canonicalJson(allocator);
@@ -655,12 +728,12 @@ fn verifyEvidence(
     root: root_fs.Root,
     install_root: []const u8,
     root_inode: u64,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     expected_architecture: []const u8,
     outer: root_operation_completion.Document,
     proof: native_provenance.Document,
     expected_outcome: TerminalOutcome,
-) !void {
+) anyerror!void {
     if (outer.operation != .package_transaction) return error.InvalidCompletion;
     switch (outer.operation.package_transaction) {
         .install, .remove, .upgrade, .upgrade_all, .reinstall => {},
@@ -674,17 +747,14 @@ fn verifyCompletionEvidence(
     root: root_fs.Root,
     install_root: []const u8,
     root_inode: u64,
-    lock: exact_lock_v2.Lock,
+    lock: anytype,
     expected_architecture: []const u8,
     outer: root_operation_completion.Document,
     proof: native_provenance.Document,
     expected_outcome: TerminalOutcome,
     repository_policy: ?transaction_executor.Policy,
-) !void {
-    const lock_bytes = try lock.canonicalJson(allocator);
-    defer allocator.free(lock_bytes);
-    var validated_lock = try exact_lock_v2.decode(allocator, lock_bytes, exact_lock_v2.maximum_document_bytes);
-    defer validated_lock.deinit();
+) anyerror!void {
+    try validateCanonicalLock(allocator, lock);
     if (!std.mem.eql(u8, lock.target_architecture, expected_architecture))
         return error.ArchitectureMismatch;
     try verifyTerminalOutcome(expected_outcome, proof.outcome, outer.outcome);
@@ -703,7 +773,41 @@ fn verifyCompletionEvidence(
     try equalDigest(proof.policy_sha256, native_recovery.hexDigest(outer.policy_sha256));
     try equalDigest(proof.root_identity_sha256, native_recovery.hexDigest(outer.root_identity_sha256));
     try optionalDigest(outer.transaction_provenance.document_sha256, proof.digest_sha256);
-    try verifyStateEvidence(allocator, root, root_inode, lock, outer, proof, expected_outcome, repository_policy);
+    try verifyStateEvidence(
+        allocator,
+        root,
+        root_inode,
+        @as(?@TypeOf(lock), lock),
+        outer,
+        proof,
+        expected_outcome,
+        repository_policy,
+    );
+}
+
+fn validateCanonicalLock(allocator: std.mem.Allocator, lock: anytype) anyerror!void {
+    const Lock = @TypeOf(lock);
+    const lock_bytes = try lock.canonicalJson(allocator);
+    defer allocator.free(lock_bytes);
+    if (Lock == exact_lock_v2.Lock) {
+        var validated = try exact_lock_v2.decode(
+            allocator,
+            lock_bytes,
+            exact_lock_v2.maximum_document_bytes,
+        );
+        defer validated.deinit();
+        return;
+    }
+    if (Lock == exact_lock_v3.Lock) {
+        var validated = try exact_lock_v3.decode(
+            allocator,
+            lock_bytes,
+            exact_lock_v3.maximum_document_bytes,
+        );
+        defer validated.deinit();
+        return;
+    }
+    @compileError("unsupported exact-lock type");
 }
 
 // Live callers bind the same native evidence through their sticky record;
@@ -712,12 +816,12 @@ fn verifyStateEvidence(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     root_inode: u64,
-    lock: ?exact_lock_v2.Lock,
+    lock: anytype,
     authority: anytype,
     proof: native_provenance.Document,
     expected_outcome: TerminalOutcome,
     repository_policy: ?transaction_executor.Policy,
-) !void {
+) anyerror!void {
     try native_provenance.verifyEvidence(allocator, root, proof);
 
     const authorization_bytes = try readEvidence(allocator, root, proof, .authorization, native_authorization.maximum_document_bytes);
@@ -1258,7 +1362,25 @@ fn verifyRemainingFile(
     try equalDigest(native_recovery.hexDigest(sha256), expected_sha256);
 }
 
-fn verifyLock(authorization: native_authorization.Authorization, program: native_program.Program, lock: exact_lock_v2.Lock, verification: transaction_executor.ExactLockVerification) !void {
+fn verifyLock(
+    authorization: native_authorization.Authorization,
+    program: native_program.Program,
+    lock: anytype,
+    verification: transaction_executor.ExactLockVerification,
+) anyerror!void {
+    if (@TypeOf(lock) == exact_lock_v2.Lock)
+        return verifyLockV2(authorization, program, lock, verification);
+    if (@TypeOf(lock) == exact_lock_v3.Lock)
+        return verifyLockV3(authorization, program, lock, verification);
+    @compileError("unsupported exact-lock type");
+}
+
+fn verifyLockV2(
+    authorization: native_authorization.Authorization,
+    program: native_program.Program,
+    lock: exact_lock_v2.Lock,
+    verification: transaction_executor.ExactLockVerification,
+) !void {
     if (!std.mem.eql(u8, authorization.target_architecture, lock.target_architecture) or
         !std.mem.eql(u8, program.target_architecture, lock.target_architecture))
         return error.ArchitectureMismatch;
@@ -1274,6 +1396,70 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
     try verifyFinalClosure(authorization.final_state, lock, verification);
     for (authorization.actions) |action| {
         const artifact = action.artifact orelse continue;
+        const locked = lock.findPackage(
+            action.package,
+            action.version,
+            action.architecture,
+        ) orelse return error.LockEvidenceMismatch;
+        if (!std.mem.eql(u8, &artifact.sha256, &locked.sha256) or
+            artifact.size != locked.declared_size or
+            artifact.origin == null or
+            !originsEqualV2(artifact.origin.?, locked.origin))
+            return error.LockEvidenceMismatch;
+    }
+    for (program.artifacts) |artifact| {
+        const locked = lock.findPackage(
+            artifact.package.name,
+            artifact.package.version,
+            artifact.package.architecture,
+        ) orelse return error.LockEvidenceMismatch;
+        try equalDigest(artifact.sha256, native_recovery.hexDigest(locked.sha256));
+        const origin = artifact.origin orelse return error.LockEvidenceMismatch;
+        const observed: exact_lock_v2.PackageOrigin = switch (origin) {
+            .authenticated_repository => |value| .{ .authenticated_repository = .{
+                .repository_id = value.repository_id,
+                .repository_snapshot_sha256 = try parseDigest(
+                    value.repository_snapshot_sha256,
+                ),
+            } },
+            .local_artifact => |value| .{ .local_artifact = .{
+                .artifact_id = value.artifact_id,
+                .sha256 = try parseDigest(value.sha256),
+                .size = value.size,
+                .package = value.package.name,
+                .version = value.package.version,
+                .architecture = value.package.architecture,
+                .acquisition_url = value.acquisition_url,
+                .trust_mode = value.trust_mode,
+            } },
+        };
+        if (artifact.size != locked.declared_size or
+            !originsEqualV2(observed, locked.origin))
+            return error.LockEvidenceMismatch;
+    }
+}
+
+fn verifyLockV3(
+    authorization: native_authorization.Authorization,
+    program: native_program.Program,
+    lock: exact_lock_v3.Lock,
+    verification: transaction_executor.ExactLockVerification,
+) !void {
+    if (!std.mem.eql(u8, authorization.target_architecture, lock.target_architecture) or
+        !std.mem.eql(u8, program.target_architecture, lock.target_architecture))
+        return error.ArchitectureMismatch;
+    if (!std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v3.schema_id) or
+        authorization.exact_lock.version != exact_lock_v3.schema_version or
+        !std.mem.eql(u8, program.exact_lock.schema, exact_lock_v3.schema_id) or
+        program.exact_lock.version != exact_lock_v3.schema_version or
+        !std.mem.eql(u8, &authorization.exact_lock.digest_sha256, &lock.digest_sha256) or
+        !std.mem.eql(u8, &authorization.request_sha256, &lock.request_sha256) or
+        !std.mem.eql(u8, &authorization.solver_policy_sha256, &lock.policy_sha256))
+        return error.LockEvidenceMismatch;
+    try verifyProgramPolicy(authorization, program);
+    try verifyFinalClosure(authorization.final_state, lock, verification);
+    for (authorization.actions) |action| {
+        const artifact = action.artifact orelse continue;
         const locked = lock.findPackage(action.package, action.version, action.architecture) orelse
             return error.LockEvidenceMismatch;
         const identity = artifact.archive_identity orelse
@@ -1281,7 +1467,7 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
         if (!identity.eql(locked.archive_identity) or
             artifact.size != locked.declared_size or
             artifact.origin_v2 == null or
-            !originMatchesV2(artifact.origin_v2.?, locked.origin))
+            !originMatchesV3(artifact.origin_v2.?, locked.origin))
             return error.LockEvidenceMismatch;
     }
     for (program.artifacts) |artifact| {
@@ -1290,7 +1476,7 @@ fn verifyLock(authorization: native_authorization.Authorization, program: native
         const identity = artifact.identity() orelse return error.LockEvidenceMismatch;
         if (!identity.eql(locked.archive_identity) or
             artifact.size != locked.declared_size or artifact.origin_v2 == null or
-            !programOriginMatchesV2(artifact.origin_v2.?, locked.origin))
+            !programOriginMatchesV3(artifact.origin_v2.?, locked.origin))
             return error.LockEvidenceMismatch;
     }
 }
@@ -1308,7 +1494,11 @@ fn verifyProgramPolicy(authorization: native_authorization.Authorization, progra
         if (left != right) return error.AuthorizationMismatch;
 }
 
-fn verifyFinalClosure(final_state: []const native_authorization.FinalPackage, lock: exact_lock_v2.Lock, verification: transaction_executor.ExactLockVerification) !void {
+fn verifyFinalClosure(
+    final_state: []const native_authorization.FinalPackage,
+    lock: anytype,
+    verification: transaction_executor.ExactLockVerification,
+) anyerror!void {
     var installed: usize = 0;
     for (final_state) |package| {
         switch (package.state) {
@@ -1332,9 +1522,21 @@ fn verifyFinalClosure(final_state: []const native_authorization.FinalPackage, lo
     if (installed != lock.packages.len) return error.LockEvidenceMismatch;
 }
 
-fn originMatchesV2(
+fn originsEqualV2(
     left: exact_lock_v2.PackageOrigin,
     right: exact_lock_v2.PackageOrigin,
+) bool {
+    return switch (left) {
+        .authenticated_repository => |value| right == .authenticated_repository and
+            std.meta.eql(value, right.authenticated_repository),
+        .local_artifact => |value| right == .local_artifact and
+            package_origin.eqlLocalArtifact(value, right.local_artifact),
+    };
+}
+
+fn originMatchesV3(
+    left: exact_lock_v3.PackageOrigin,
+    right: exact_lock_v3.PackageOrigin,
 ) bool {
     return switch (left) {
         .authenticated_repository => |value| right == .authenticated_repository and
@@ -1352,9 +1554,9 @@ fn originMatchesV2(
     };
 }
 
-fn programOriginMatchesV2(
+fn programOriginMatchesV3(
     left: native_program.OriginV2,
-    right: exact_lock_v2.PackageOrigin,
+    right: exact_lock_v3.PackageOrigin,
 ) bool {
     return switch (left) {
         .authenticated_repository => |value| right == .authenticated_repository and
@@ -1473,7 +1675,7 @@ fn testSummaries(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings(capability_schema_id, supported.value.object.get("schema").?.string);
     try std.testing.expectEqualStrings(capability, supported.value.object.get("capability").?.string);
     try std.testing.expectEqualStrings(schema_id, supported.value.object.get("summary_schema").?.string);
-    try std.testing.expectEqualStrings(exact_lock_v2.schema_id, supported.value.object.get("lock_schema").?.string);
+    try std.testing.expectEqualStrings(exact_lock_v3.schema_id, supported.value.object.get("lock_schema").?.string);
     try std.testing.expect(supported.value.object.get("read_only").?.bool);
 }
 
@@ -1509,7 +1711,7 @@ test "native_transaction_result.test.projected root external fixture" {
                 error.HostRootNotSupported,
                 VerificationLock.acquire(projected, "/", locks, projection),
             );
-            var lock = try exact_lock_v2.create(allocator, .{
+            var lock = try exact_lock_v3.create(allocator, .{
                 .target_architecture = "amd64",
                 .request_sha256 = @splat(1),
                 .policy_sha256 = @splat(2),
@@ -1566,7 +1768,7 @@ test "native_transaction_result.test.summary preserves distinct request domains 
 }
 
 test "native_transaction_result.test.empty closures retain only authorized residual configurations" {
-    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+    var lock = try exact_lock_v3.create(std.testing.allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = @splat(1),
         .policy_sha256 = @splat(2),
@@ -1591,6 +1793,157 @@ test "native_transaction_result.test.empty closures retain only authorized resid
     try std.testing.expectError(error.TransactionNotSuccessful, verifyFinalClosure(&.{residual}, lock.lock, .full_closure));
 }
 
+test "native_transaction_result.test.historical v2 lock evidence stays explicit and cannot become v3 authority" {
+    var legacy_lock = try exact_lock_v2.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer legacy_lock.deinit();
+    const authorization: native_authorization.Authorization = .{
+        .wire_version = native_authorization.schema_version,
+        .backend = .native,
+        .target_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .install_root = "/srv/legacy-root",
+        .root_identity_sha256 = @splat(3),
+        .request_sha256 = legacy_lock.lock.request_sha256,
+        .solver_policy_sha256 = legacy_lock.lock.policy_sha256,
+        .executor_policy_sha256 = @splat(4),
+        .plan_sha256 = @splat(5),
+        .exact_lock = .{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = legacy_lock.lock.digest_sha256,
+        },
+        .policy = .{
+            .conffile = .keep_existing,
+            .force = &.{},
+            .allow_host_root = false,
+        },
+        .actions = &.{},
+        .final_state = &.{},
+        .trigger_authority = null,
+        .final_state_sha256 = @splat(6),
+        .digest_sha256 = @splat(7),
+    };
+    const program: native_program.Program = .{
+        .schema = native_program.schema_id,
+        .version = native_program.schema_version,
+        .backend = .native,
+        .install_root = authorization.install_root,
+        .root_identity_sha256 = native_recovery.hexDigest(
+            authorization.root_identity_sha256,
+        ),
+        .target_architecture = authorization.target_architecture,
+        .foreign_architectures = &.{},
+        .request_sha256 = native_recovery.hexDigest(
+            authorization.request_sha256,
+        ),
+        .solver_policy_sha256 = native_recovery.hexDigest(
+            authorization.solver_policy_sha256,
+        ),
+        .executor_policy_sha256 = native_recovery.hexDigest(
+            authorization.executor_policy_sha256,
+        ),
+        .plan_sha256 = native_recovery.hexDigest(authorization.plan_sha256),
+        .exact_lock = .{
+            .schema = exact_lock_v2.schema_id,
+            .version = exact_lock_v2.schema_version,
+            .digest_sha256 = native_recovery.hexDigest(
+                legacy_lock.lock.digest_sha256,
+            ),
+        },
+        .authorization_sha256 = native_recovery.hexDigest(
+            authorization.digest_sha256,
+        ),
+        .final_state_sha256 = native_recovery.hexDigest(
+            authorization.final_state_sha256,
+        ),
+        .policy = .{
+            .conffile = authorization.policy.conffile,
+            .force = &.{},
+            .allow_host_root = false,
+        },
+        .script_policy_sha256 = @splat('8'),
+        .installed_database = .{
+            .generation_sha256 = @splat('9'),
+            .evidence_sha256 = @splat('a'),
+            .package_count = 0,
+        },
+        .artifacts = &.{},
+        .artifacts_sha256 = @splat('b'),
+        .steps = &.{},
+        .steps_sha256 = @splat('c'),
+        .digest_sha256 = @splat('d'),
+    };
+    try verifyLock(
+        authorization,
+        program,
+        legacy_lock.lock,
+        .full_closure,
+    );
+    try validateCanonicalLock(std.testing.allocator, legacy_lock.lock);
+    var host = try root_fs.openAbsoluteRoot(std.testing.io, "/");
+    defer host.close();
+    var locks: root_operation.TestLockBackend = .{
+        .allocator = std.testing.allocator,
+    };
+    defer locks.deinit();
+    try std.testing.expectError(
+        error.HostRootNotSupported,
+        verifyLegacyV2(
+            std.testing.allocator,
+            host.root,
+            "/",
+            legacy_lock.lock,
+            "amd64",
+            locks.interface(),
+        ),
+    );
+    try std.testing.expectError(
+        error.HostRootNotSupported,
+        verifyForCallerLegacyV2(
+            std.testing.allocator,
+            host.root,
+            "/",
+            legacy_lock.lock,
+            "amd64",
+            .{
+                .operation = .install,
+                .request_sha256 = @splat(0x81),
+                .policy_sha256 = @splat(0x82),
+                .foreign_architectures = &.{},
+            },
+            locks.interface(),
+        ),
+    );
+
+    var current_lock = try exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = legacy_lock.lock.request_sha256,
+        .policy_sha256 = legacy_lock.lock.policy_sha256,
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer current_lock.deinit();
+    try std.testing.expectError(
+        error.LockEvidenceMismatch,
+        verifyLock(
+            authorization,
+            program,
+            current_lock.lock,
+            .full_closure,
+        ),
+    );
+}
+
 test "native_transaction_result.test.repository locks preserve unlocked packages without weakening full closures" {
     const artifact: package_origin.LocalArtifactEvidenceV2 = .{
         .artifact_id = .{ .sha256 = @splat(0x11) },
@@ -1605,7 +1958,7 @@ test "native_transaction_result.test.repository locks preserve unlocked packages
         .acquisition_url = "file:///descriptor.deb",
         .trust_mode = .pinned_content_digest,
     };
-    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+    var lock = try exact_lock_v3.create(std.testing.allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = @splat(1),
         .policy_sha256 = @splat(2),
@@ -1644,7 +1997,7 @@ fn testOwnedRefusal(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     path: []const u8,
-    lock: exact_lock_v2.Lock,
+    lock: exact_lock_v3.Lock,
     expected: PendingRequest,
     locks: root_operation.LockBackend,
     expected_error: anyerror,
@@ -1687,7 +2040,7 @@ fn testOwnedBoundaries(comptime state: OwnershipState) !void {
     const root = root_fs.Root.init(testing.io, temporary.dir);
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = path_buffer[0..try temporary.dir.realPath(testing.io, &path_buffer)];
-    var lock = try exact_lock_v2.create(allocator, .{
+    var lock = try exact_lock_v3.create(allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = @splat(1),
         .policy_sha256 = @splat(2),

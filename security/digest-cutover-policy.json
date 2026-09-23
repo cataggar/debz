@@ -42,15 +42,15 @@
       "sha512": "fa94ad6d0a590c03d25d7b4ff373dbc5d944a72eb1ed4ab339ba0059085936b5780384ed8c64bd9224a5cccaa7d9567bcb136e72c9a72a54271b3b2e602834ab"
     },
     "findings": {
-      "count": 19958,
+      "count": 20060,
       "counts": {
-        "cas_layout": 189,
+        "cas_layout": 190,
         "digest_version": 103,
         "fixed_64_hex": 171,
-        "raw_32_byte": 1048,
-        "sha256_token": 18447
+        "raw_32_byte": 1050,
+        "sha256_token": 18546
       },
-      "sha512": "7d7743b83a9c78a4a2530e06788eba321c753f30ab92aba006ecb067a9b800a24e6c43df06b94256769a79b62a2131169937dcf2b625adbd337cff3017e1ffc8"
+      "sha512": "91665d7c70c1abab2754b897bb1a729d6534a692ed1fa90ed27a4f024f03118c74d0f2476a6b19acd839f34044f6e13f69a74b2ab5c07e2e4996d39f7d6224a8"
     },
     "classifications": [
       {
@@ -127,15 +127,15 @@
         "scope": "schema",
         "classification": "versioned_contracts",
         "rationale": "Schemas mix current typed identity contracts with explicitly versioned historical and control SHA256 fields checked by the semantic allowlist.",
-        "count": 1585,
+        "count": 1596,
         "counts": {
           "cas_layout": 20,
           "digest_version": 0,
           "fixed_64_hex": 110,
           "raw_32_byte": 0,
-          "sha256_token": 1455
+          "sha256_token": 1466
         },
-        "sha512": "b0fb17767ad5822482c61ba2923182960803064b29ab451fc899bcdd48932d26c89d0f29e57909511b7165fe94a7f29b06bd5045662544d4e848508463a60616"
+        "sha512": "1888f8828c3d499ba9147be5c695955616b29429d06766b670c02b425005a17f12d1afdbb901d87196f1db8da7cbe51be4a8f7187cc22bfa0dba04e1760941e9"
       },
       {
         "scope": "security",
@@ -155,15 +155,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes and versioned compatibility readers.",
-        "count": 11723,
+        "count": 11814,
         "counts": {
-          "cas_layout": 74,
+          "cas_layout": 75,
           "digest_version": 53,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1043,
-          "sha256_token": 10535
+          "raw_32_byte": 1045,
+          "sha256_token": 10623
         },
-        "sha512": "14e66d214c6cedaded2c818900f35e6f7766a09aa231c52d4b5898a45c78c42deb65f9aea4c18be7bd959f581f4726683a2e9658631e9cb214a502f4c8a8b41a"
+        "sha512": "1f6965019ca351e893d131e33c4a1d19700ff4361992e31243c8103a6212b7706dd577767576bbc65228cb24c9c5478e106cb727a1a4454087ca847575d276e1"
       },
       {
         "scope": "test",
@@ -348,8 +348,8 @@
         "schema/vendor-state-inventory-v1.json",
         "schema/vendor-state-reference-v1.json"
       ],
-      "count": 436,
-      "sha512": "03b21e334932e2ac10374b574c20d7352d7868a23fe71f92e2b7732ecff899b307cf14084d60e1cc6d5c15befc64e7599364e15cfbbc3880a2d3f0ee7fc02dbe"
+      "count": 442,
+      "sha512": "10c6cd1a01fe16f450a2ab6f1e1b32faaeaf614ced44b9eb97e94ad7144e56a8ad9a6898d6766be4f4cd6c27958fab5f61c1d392b47415ada6ef70ff04826ffd"
     },
     {
       "id": "fixed-64-hex-controls-and-compatibility",
