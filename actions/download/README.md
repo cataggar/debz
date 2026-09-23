@@ -256,8 +256,8 @@ configuration/keyrings, architecture/policy, and `${{ steps.packages.outputs.cac
 Do not infer an installed state from `cache-hit`, `reused-count`, or the
 presence of files in `cache-path`.
 Keep the backend selection consistent: a native download closure must be
-consumed by a native-capable transaction caller, not the currently legacy
-install action.
+consumed by a native-capable transaction caller, such as
+[`actions/install`](../install/README.md) with `transaction-backend: native`.
 
 ## Local integration coverage
 

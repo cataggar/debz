@@ -161,8 +161,10 @@ def inside(root: Path, backend: str) -> None:
         if result.returncode != expected:
             for name in (
                 "transaction.journal", "root-operation-v1.json",
-                "root-operation-completion-v1.json", "root-operation-deferred-ack-v1.json",
-                "native-transaction-provenance-v1.json", "apt/active-operation-v1.json",
+                "root-operation-completion-v1.json", "root-operation-completion-v2.json",
+                "root-operation-deferred-ack-v1.json",
+                "native-transaction-provenance-v1.json", "native-transaction-provenance-v2.json",
+                "apt/active-operation-v1.json",
             ):
                 evidence_file = state_path / name
                 if evidence_file.is_file():
@@ -273,7 +275,11 @@ def inside(root: Path, backend: str) -> None:
     assert len(set(operations_path.glob("*/transaction-result.json")) - previous_results) == 1
     lock_path = root / evidence["exact_lock"]["path"].lstrip("/")
     lock = json.loads(lock_path.read_bytes())
-    assert lock["version"] == (2 if backend == "native" else 1), lock
+    assert lock["version"] == (3 if backend == "native" else 1), lock
+    if backend == "native":
+        assert lock["schema"] == "https://debz.dev/schema/exact-closure-lock-v3"
+        assert all("index_identity" in repository for repository in lock["repositories"])
+        assert all("archive_identity" in package for package in lock["packages"])
     assert {item["name"] for item in lock["packages"]} == closure, lock
     requested = {item["name"] for item in lock["packages"] if item["retention"] == "requested"}
     assert requested == {"base-dep", "alt-a"}
@@ -289,7 +295,7 @@ def inside(root: Path, backend: str) -> None:
     assert completion["request_sha256"] == result["request_sha256"]
     if backend == "native":
         receipt = json.loads((root / evidence["transaction_result"]["path"].lstrip("/")).read_bytes())
-        assert receipt["schema"] == "https://debz.dev/schema/native-transaction-provenance-v1", receipt
+        assert receipt["schema"] == "https://debz.dev/schema/native-transaction-provenance-v2", receipt
         assert receipt["outcome"] == "succeeded", receipt
         assert receipt["exact_lock_sha256"] == evidence["exact_lock"]["digest_sha256"]
         assert receipt["digest_sha256"] == evidence["transaction_result"]["digest_sha256"]
@@ -321,7 +327,7 @@ def inside(root: Path, backend: str) -> None:
     assert upgraded["changed"] is True
     assert (root / "usr/share/debz-fixtures/fixture-upgrade").read_text().startswith("fixture-upgrade=2.0-1:")
     if backend == "native":
-        lower_completion = json.loads((state_path / "root-operation-completion-v1.json").read_bytes())
+        lower_completion = json.loads((state_path / "root-operation-completion-v2.json").read_bytes())
         assert lower_completion["operation"] == "upgrade_all", lower_completion
         assert lower_completion["discharge"]["operation"] == "upgrade_all", lower_completion
         assert lower_completion["discharge"]["request_sha256"] == lower_completion["request_sha256"]

@@ -5622,8 +5622,8 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         owned_verification: ?struct {
             lock_path: []const u8,
             lock_sha256: ?[32]u8 = null,
-            lock_schema: []const u8 = exact_lock_v2.schema_id,
-            lock_version: u32 = exact_lock_v2.schema_version,
+            lock_schema: []const u8 = exact_lock_v3.schema_id,
+            lock_version: u32 = exact_lock_v3.schema_version,
             backend: transaction_engine.Kind = .native,
             expected_error: ?[]const u8 = null,
             state: enum { pending, released } = .pending,
@@ -6089,9 +6089,9 @@ fn prepareExternalNativeReviewFixture(
                 try store.clearRecoveryReviewClaim(allocator, try root_operation.decodeRecoveryReviewClaim(allocator, claim_source));
                 return 0;
             }
-            const lock_source = try readFile(allocator, std.testing.io, self.lock_path, 8 * 1024 * 1024);
+            const lock_source = try readFile(allocator, std.testing.io, self.lock_path, exact_lock_v3.maximum_document_bytes);
             defer allocator.free(lock_source);
-            var lock = try exact_lock_v2.decode(allocator, lock_source, 8 * 1024 * 1024);
+            var lock = try exact_lock_v3.decode(allocator, lock_source, exact_lock_v3.maximum_document_bytes);
             defer lock.deinit();
             if (!std.mem.eql(u8, &lock.lock.digest_sha256, &self.lock_digest))
                 return error.InvalidExternalWorkflowRequest;

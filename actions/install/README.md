@@ -190,6 +190,9 @@ CLI `--json` remains command.v1. A changed install returns typed receipt,
 completion, program, caller, lock, and closure identities. The action invokes
 the read-only native verifier through the same verified CLI and privilege
 boundary, then matches its v2 summary to this invocation's exact identities.
+The summary must report matching provenance/completion schema pairs: current
+v2/v2 or explicitly verified historical v1/v1. Mixed schema versions and
+unverified receipt or lock identities fail closed.
 It does not parse human summary text or try to read private root-owned evidence
 with unprivileged Node. An older or concurrently replaced receipt cannot
 satisfy this binding.
@@ -213,7 +216,7 @@ diagnostics/stderr, and all protected input/executable/directory identity guards
 | `package-cache-root` | Parent passed unchanged to final `--cache-path`. |
 | `lock-digest` | Canonical exact-lock digest verified by download and transaction-result validation. |
 | `downloaded-count`, `reused-count` | Package preparation counts, not installed-state claims. |
-| `transaction-result` | Legacy `STATE/transaction-result.json` or native `INSTALL_ROOT/var/lib/debz/native-transaction-provenance-v2.json` (with v1 retained for historical reads); empty for unchanged native installs. Native evidence may require privilege to read. |
+| `transaction-result` | Legacy `STATE/transaction-result.json` or native `INSTALL_ROOT/var/lib/debz/native-transaction-provenance-v2.json` (v1 path for explicitly verified historical v1 evidence); empty for unchanged native installs. Native evidence may require privilege to read. |
 | `provenance` | Alias of `transaction-result`; unchanged native installs claim no receipt. |
 | `installed-count` | Package count in the final exact closure, not the number newly changed. |
 | `changed` | The CLI's changed flag; false for a verified unchanged native closure. |

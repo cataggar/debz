@@ -249,7 +249,7 @@ for selector, filename, backend in (
   assert.equal(cold.get('changed'), 'true');
   assert.equal(cold.get('installed-count'), '4');
   assert.ok(Number(cold.get('downloaded-count')) > 0);
-  assert.equal(cold.get('transaction-result'), path.join(coldInputs.installRoot, 'var/lib/debz/native-transaction-provenance-v1.json'));
+  assert.equal(cold.get('transaction-result'), path.join(coldInputs.installRoot, 'var/lib/debz/native-transaction-provenance-v2.json'));
   if (process.getuid?.() !== 0) {
     await assert.rejects(readFile(cold.get('transaction-result')!), /EACCES/u);
   }

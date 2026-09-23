@@ -42,44 +42,44 @@
       "sha512": "fa94ad6d0a590c03d25d7b4ff373dbc5d944a72eb1ed4ab339ba0059085936b5780384ed8c64bd9224a5cccaa7d9567bcb136e72c9a72a54271b3b2e602834ab"
     },
     "findings": {
-      "count": 20074,
+      "count": 20077,
       "counts": {
         "cas_layout": 190,
         "digest_version": 103,
         "fixed_64_hex": 171,
         "raw_32_byte": 1051,
-        "sha256_token": 18559
+        "sha256_token": 18562
       },
-      "sha512": "5ecaba000299774a1c14e69721807244ef779d53ea51069a47cd5aa5d317efa2ce0320909d5ad885ee05d096d61b386a587d9e864187a7b5658bd5a62d8e71a3"
+      "sha512": "b531635bec31c79b0eff94d17ea2145d7d9130d1f10a2b89956be07a5ad1ed091186492f415a2d3c9eae8cf7f3410544d586bb7b2affca0535a8f4e3f950f7f9"
     },
     "classifications": [
       {
         "scope": ".github",
         "classification": "external_integrity_protocol",
         "rationale": "Workflow SHA256 values are frozen installer and CI compatibility inputs; package authorities are independently rejected by semantic checks.",
-        "count": 9,
+        "count": 13,
         "counts": {
           "cas_layout": 1,
           "digest_version": 0,
           "fixed_64_hex": 0,
           "raw_32_byte": 0,
-          "sha256_token": 8
+          "sha256_token": 12
         },
-        "sha512": "5e583a0e873b9d56ce8bdff2bde0201b589bb5bf319b4d7f2a085cbe0f2f3a6d5d9c87a78db7a100a57fa08d0d4a617c4fba4e17328f705b374d5eab594210e2"
+        "sha512": "cad35f0ace1e41936b439087a5508d26bc612ef3a3c986aec44e289402a4f8e4d84a97f4e3dc6053fed0b2b2980d89b2c56c2a6db0fcfc8ea0988e8ee1191adc"
       },
       {
         "scope": "actions",
         "classification": "external_and_generated_protocol",
         "rationale": "Action source, tests, and checked-in bundles retain external integrity and compatibility tokens; they cannot authorize raw package identities.",
-        "count": 609,
+        "count": 611,
         "counts": {
           "cas_layout": 50,
           "digest_version": 32,
           "fixed_64_hex": 39,
           "raw_32_byte": 0,
-          "sha256_token": 488
+          "sha256_token": 490
         },
-        "sha512": "67a446f798cc49fbab1c6001c6ea54623173e6fb7aa8ad30dc79bcf1e0c072aedbf02a1161ff9a8f96460c3ea1a5942d10565e0febb02a32508ccf984ca6f087"
+        "sha512": "51fab9ca61649364d070a7bc39ec35ad7d745f04b7615b0832002e41fa14b54716f1161c5f2e6cd9a30f186086cb3efbe42ead1e17e07bd2e6ca24cdbac22cff"
       },
       {
         "scope": "build",
@@ -155,15 +155,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes and versioned compatibility readers.",
-        "count": 11828,
+        "count": 11825,
         "counts": {
           "cas_layout": 75,
           "digest_version": 53,
           "fixed_64_hex": 18,
           "raw_32_byte": 1046,
-          "sha256_token": 10636
+          "sha256_token": 10633
         },
-        "sha512": "92ca0d761910112ffee5b87b5d7f5da0414ae9499ad2c07b371d54d208c23c94f93cb68cd869f79eb98c06304d3674bf704c047c31abcea61f2f63397cad8e9e"
+        "sha512": "26df74d0d26d3a5d6e4d427b6da31e1971f1c2c3760a26a37af913e835df5ee2b0649de16035fc3de4c51f4c162edf1cdaac1a8b68e56042100437bad8221a8e"
       },
       {
         "scope": "test",
@@ -452,7 +452,7 @@
         "tools/test_vendor_state_capture.py"
       ],
       "count": 171,
-      "sha512": "084eef15d9110d5c112fe761d330a7beda60ce0c2bda9148950f2d89382fdecf06446599d1050e6a14f3caa268d63a22190c87f51d73d9943701dade6053e43b"
+      "sha512": "2ee070574df77a39f636cc545bd5d07fa90f647c3a4687262193d9ca277042bb43467d8b6549d748577c21c53733338fafe26514b18c07ba65182f0dc2d56b3b"
     },
     {
       "id": "historical-fixed-cas-layouts",

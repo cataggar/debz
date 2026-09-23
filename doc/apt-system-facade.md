@@ -1075,6 +1075,9 @@ deliberately distinct from the recovery-only
 authority (with historical v1 still readable). Apt/system success is
 published only after the exact lock, verified transaction result, completed
 root-operation status, and final state all agree.
+Recovered legacy v1 and current v2 discharge statements retain their own
+schema/version in the outer binding; rereads reject a binding that mislabels
+the canonical completion document.
 
 `prepareRecovery` reloads the same profile, retained canonical request, active
 state, and exact lock. Profile, request, selector, attempt, state, or evidence

@@ -8,7 +8,7 @@ branding:
 
 inputs:
   transaction-backend:
-    description: Explicit package-cache backend (legacy_dpkg uses v1; native requires v2 CLI contracts)
+    description: Explicit package-cache backend (legacy_dpkg uses v1 locks/v3 cache contracts; native requires v3 locks/v5 cache contracts)
     required: false
     default: legacy_dpkg
   lock-input:

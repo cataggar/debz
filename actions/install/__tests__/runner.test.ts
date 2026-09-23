@@ -8,6 +8,7 @@ import {
   validateInstallCommandResult,
   validateTransactionSummary,
   validateNativeInstallResult,
+  transactionResultPath,
 } from '../src/runner.js';
 import {
   commandResult,
@@ -46,6 +47,8 @@ test('native result formats are explicit, bounded, and distinct from legacy evid
   assert.ok(buildInstallArguments(inputs).includes('--native-result'));
   assert.ok(buildTransactionResultArguments(inputs).includes('--install-root'));
   assert.equal(buildTransactionResultArguments(inputs).includes('--state-path'), false);
+  assert.equal(transactionResultPath(inputs), '/work/runner/root/var/lib/debz/native-transaction-provenance-v2.json');
+  assert.equal(transactionResultPath(inputs, 1), '/work/runner/root/var/lib/debz/native-transaction-provenance-v1.json');
   assert.throws(() => validateNativeInstallResult(commandResult(), inputs, 'a'.repeat(64)));
   const result = validateNativeInstallResult(nativeInstallResult(inputs), inputs, 'a'.repeat(64));
   assert.throws(() => validateTransactionSummary(transactionSummary(), inputs, 'a'.repeat(64), result));
@@ -61,6 +64,35 @@ test('native result formats are explicit, bounded, and distinct from legacy evid
   stale.command.changed = true;
   stale.evidence.receipt = null;
   assert.throws(() => validateNativeInstallResult(`${JSON.stringify(stale)}\n`, inputs, 'a'.repeat(64)), /not an object/u);
+});
+
+test('native summaries accept verified v1 and v2 evidence only as matching schema pairs', () => {
+  const inputs = fixtureInputs('/work');
+  inputs.transactionBackend = 'native';
+  const lockDigest = 'a'.repeat(64);
+  const result = validateNativeInstallResult(nativeInstallResult(inputs), inputs, lockDigest);
+  for (const version of [1, 2] as const) {
+    const summary = nativeTransactionSummary(inputs, 4, version);
+    const verified = validateTransactionSummary(summary, inputs, lockDigest, result);
+    assert.equal(verified.installedCount, 4);
+    assert.equal(verified.nativeEvidenceVersion, version);
+
+    const other = version === 1 ? 2 : 1;
+    for (const field of [
+      'transaction_schema', 'transaction_schema_version',
+      'completion_schema', 'completion_schema_version',
+    ] as const) {
+      const mixed = JSON.parse(summary);
+      mixed[field] = field.endsWith('_version')
+        ? other
+        : `https://debz.dev/schema/${field === 'transaction_schema'
+          ? 'native-transaction-provenance' : 'root-operation-completion'}-v${other}`;
+      assert.throws(
+        () => validateTransactionSummary(`${JSON.stringify(mixed)}\n`, inputs, lockDigest, result),
+        /unsupported provenance\/completion schema pair/u,
+      );
+    }
+  }
 });
 
 test('accepts only canonical successful command and transaction summaries', () => {

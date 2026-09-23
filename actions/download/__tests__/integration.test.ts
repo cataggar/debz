@@ -125,11 +125,14 @@ test('native repository and empty closures use real CLI cold, partial, and exact
     values.DEBZ_DOWNLOAD_KEYRING = path.join(fixture, 'repository/fixture-keyring.gpg');
     const base: unknown = JSON.parse(await readFile(path.join(fixture, 'base.native.lock.json'), 'utf8'));
     assert.ok(typeof base === 'object' && base !== null && 'target_architecture' in base);
+    assert.ok('schema' in base && base.schema === 'https://debz.dev/schema/exact-closure-lock-v3');
+    assert.ok('version' in base && base.version === 3);
     const architecture = base.target_architecture;
     assert.ok(architecture === 'amd64' || architecture === 'arm64');
     assert.ok('digest_sha256' in base);
     const { digest_sha256, ...closure } = base;
     assert.equal(typeof digest_sha256, 'string');
+    assert.equal(digest_sha256, createHash('sha256').update(JSON.stringify(closure)).digest('hex'));
     const emptyBody = {
       ...closure,
       request_sha256: '1'.repeat(64),

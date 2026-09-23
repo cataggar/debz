@@ -250,9 +250,13 @@ export async function runAction(
           'the canonical transaction result could not be verified',
         );
       }
-      installedCount = validateTransactionSummary(
+      const summary = validateTransactionSummary(
         summaryExecution.stdout, inputs, download.lockDigest, nativeResult,
-      ).installedCount;
+      );
+      installedCount = summary.installedCount;
+      if (summary.nativeEvidenceVersion !== undefined) {
+        resultPath = transactionResultPath(inputs, summary.nativeEvidenceVersion);
+      }
     }
     if (
       installedCount !==
