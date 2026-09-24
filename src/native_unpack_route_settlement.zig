@@ -355,6 +355,8 @@ fn canonicalPath(
     buffer: *[root_fs.maximum_path_bytes]u8,
 ) !CanonicalPath {
     const first = std.mem.sliceTo(path, '/');
+    if (first.len == path.len)
+        return .{ .text = path, .rewritten = false };
     for (aliases) |alias| {
         if (!std.mem.eql(u8, alias.from, first))
             continue;
@@ -370,6 +372,17 @@ fn canonicalPath(
         };
     }
     return .{ .text = path, .rewritten = false };
+}
+
+test "native_unpack.test.route canonicalization keeps alias symlink distinct from descendants" {
+    const aliases = [_]Alias{.{ .from = "bin", .to = "usr/bin" }};
+    var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const own = try canonicalPath(&aliases, "bin", &buffer);
+    try std.testing.expectEqualStrings("bin", own.text);
+    try std.testing.expect(!own.rewritten);
+    const descendant = try canonicalPath(&aliases, "bin/tool", &buffer);
+    try std.testing.expectEqualStrings("usr/bin/tool", descendant.text);
+    try std.testing.expect(descendant.rewritten);
 }
 
 fn claimRoutePath(

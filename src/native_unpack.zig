@@ -551,6 +551,7 @@ fn routeSettlementCanonicalPath(
     buffer: *[root_fs.maximum_path_bytes]u8,
 ) ![]const u8 {
     const first = std.mem.sliceTo(path, '/');
+    if (first.len == path.len) return path;
     for (aliases) |alias| {
         if (!std.mem.eql(u8, alias.from, first)) continue;
         return std.fmt.bufPrint(buffer, "{s}{s}", .{
@@ -1927,9 +1928,9 @@ pub const OwnershipError = error{ OutOfMemory, AliasCollision, InvalidDiversion 
 /// exact published spelling is retained beside the canonical one. `/.` is the
 /// root itself, which no mutation ever targets, so it is not indexed.
 ///
-/// Two spellings of one package that normalize onto the same canonical path
-/// are a collision the caller must fail on: the database would claim one file
-/// twice and its checksums could not both be true.
+/// The alias symlink itself is a separate inode from its target directory;
+/// only descendants are rewritten. Two spellings of one package that still
+/// normalize onto the same path are a collision the caller must fail on.
 pub fn indexOwnership(
     allocator: std.mem.Allocator,
     model: package_database.Model,
@@ -2027,6 +2028,7 @@ fn canonicalOwnedPath(
     rewritten: *std.ArrayList([]u8),
 ) std.mem.Allocator.Error![]const u8 {
     const first = std.mem.sliceTo(relative, '/');
+    if (first.len == relative.len) return relative;
     const alias = aliases.find(first) orelse return relative;
     const owned = try std.fmt.allocPrint(allocator, "{s}{s}", .{
         alias.to,
@@ -2043,6 +2045,7 @@ fn canonicalAliasPath(
     buffer: []u8,
 ) ?[]const u8 {
     const first = std.mem.sliceTo(relative, '/');
+    if (first.len == relative.len) return relative;
     const alias = aliases.find(first) orelse return relative;
     return std.fmt.bufPrint(buffer, "{s}{s}", .{
         alias.to,
@@ -3972,7 +3975,11 @@ fn normalizePath(builder: *Builder, archive_path: []const u8) PlanError!Claim {
         .code = .alias_escape,
         .path = archive_path,
     });
-    const alias = builder.aliases.find(first) orelse return .{
+    const alias = if (first.len == archive_path.len)
+        null
+    else
+        builder.aliases.find(first);
+    const observed_alias = alias orelse return .{
         .path = archive_path,
         .archive_path = archive_path,
         .kind = undefined,
@@ -3981,7 +3988,7 @@ fn normalizePath(builder: *Builder, archive_path: []const u8) PlanError!Claim {
     };
     const rest = archive_path[first.len..];
     return .{
-        .path = try std.fmt.allocPrint(builder.arena, "{s}{s}", .{ alias.to, rest }),
+        .path = try std.fmt.allocPrint(builder.arena, "{s}{s}", .{ observed_alias.to, rest }),
         .archive_path = archive_path,
         .kind = undefined,
         .file = 0,
@@ -4375,7 +4382,13 @@ fn preparePackageClaims(
                 .package = item.identity.name,
             });
         }
-        if (package_database.reservedPayloadPath(claim.path)) return builder.fail(.{
+        // Exact structural directory claims may be recorded as ownership;
+        // they cannot create the directory or publish archive metadata.
+        const database_directory_claim = claim.kind == .directory and
+            databasePayloadStructuralDirectory(claim.path) and
+            std.mem.eql(u8, claim.archive_path, claim.path);
+        if (package_database.reservedPayloadPath(claim.path) and
+            !database_directory_claim) return builder.fail(.{
             .surface = .archive,
             .code = .reserved_path,
             .path = claim.path,
@@ -4744,6 +4757,14 @@ fn planClaim(
                 model,
             ),
     );
+    if (databasePayloadStructuralDirectory(claim.path) and
+        (previous == null or previous.?.kind != .directory))
+        return builder.fail(.{
+            .surface = .archive,
+            .code = .reserved_path,
+            .path = claim.path,
+            .package = item.identity.name,
+        });
     var link_source_previous: ?PreviousState = null;
     const decision = try resolveOwnership(
         builder,
@@ -8406,6 +8427,7 @@ const MaterializationRequest = struct {
 
 const CapturedDatabase = struct {
     snapshot: package_database.Snapshot,
+    absent: bool = false,
     arena: *std.heap.ArenaAllocator,
     budget: *ModelAllocator,
     backing_allocator: std.mem.Allocator,
@@ -8475,7 +8497,14 @@ fn captureDatabaseSnapshot(
     root: root_fs.Root,
     options: package_database.Options,
 ) !CapturedDatabase {
-    return captureDatabaseSnapshotBounded(allocator, root, options, 256 * 1024 * 1024);
+    return captureDatabaseSnapshotBounded(allocator, root, options, 256 * 1024 * 1024, false);
+}
+
+fn captureInitialDatabaseSnapshot(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !CapturedDatabase {
+    return captureDatabaseSnapshotBounded(allocator, root, .{}, 256 * 1024 * 1024, true);
 }
 
 fn captureDatabaseSnapshotBounded(
@@ -8483,6 +8512,7 @@ fn captureDatabaseSnapshotBounded(
     root: root_fs.Root,
     options: package_database.Options,
     maximum_bytes: u64,
+    allow_absent: bool,
 ) !CapturedDatabase {
     const budget = try allocator.create(ModelAllocator);
     errdefer allocator.destroy(budget);
@@ -8491,7 +8521,19 @@ fn captureDatabaseSnapshotBounded(
     errdefer allocator.destroy(arena);
     arena.* = .init(budget.allocator());
     errdefer arena.deinit();
-    const snapshot = captureDatabaseSnapshotInto(
+    const absent = allow_absent and
+        (try root.entryIfExists(try root_fs.Path.init(package_database.database_directory))) == null;
+    const snapshot = if (absent) blk: {
+        const info = try arena.allocator().alloc(package_database.InfoEntry, 1);
+        info[0] = .{
+            .name = package_database.info_format_name,
+            .bytes = package_database.supported_info_format ++ "\n",
+        };
+        break :blk package_database.Snapshot{
+            .status = package_database.regularFile(""),
+            .info = info,
+        };
+    } else captureDatabaseSnapshotInto(
         arena.allocator(),
         root,
         options,
@@ -8504,6 +8546,7 @@ fn captureDatabaseSnapshotBounded(
     };
     return .{
         .snapshot = snapshot,
+        .absent = absent,
         .arena = arena,
         .budget = budget,
         .backing_allocator = allocator,
@@ -8706,6 +8749,75 @@ fn captureDatabaseSnapshotInto(
     }.less);
     snapshot.updates = try owned.dupe(package_database.UpdateEntry, updates.items);
     return snapshot;
+}
+
+test "native_unpack.test.absent database is distinct from partial foreign and healthy roots" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: root_fs.Root = .init(testing.io, tmp.dir);
+    try root.createDirectoryPath(
+        try root_fs.Path.init(root_operation.namespace_path),
+        .fromMode(0o755),
+    );
+    var absent = try captureInitialDatabaseSnapshot(testing.allocator, root);
+    defer absent.deinit();
+    try testing.expect(absent.absent);
+    try testing.expectEqualStrings("", absent.snapshot.status.bytes);
+    try testing.expectEqualStrings("1\n", absent.snapshot.info[0].bytes);
+    const imported = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = absent.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    var empty_database = imported;
+    defer empty_database.deinit();
+    try testing.expectEqual(@as(usize, 0), empty_database.model.packages.len);
+    try testing.expect(!std.mem.eql(
+        u8,
+        &empty_database.generation.sha256,
+        &native_program.absentDatabaseGeneration(),
+    ));
+    try root.createDirectoryPath(
+        try root_fs.Path.init(package_database.database_directory),
+        .fromMode(0o755),
+    );
+    try testing.expectError(
+        error.DatabaseStatusMissing,
+        captureInitialDatabaseSnapshot(testing.allocator, root),
+    );
+    try root.publishFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/foreign"),
+        "foreign dpkg state",
+        .{},
+    );
+    try testing.expectError(
+        error.DatabaseStatusMissing,
+        captureInitialDatabaseSnapshot(testing.allocator, root),
+    );
+    for ([_][]const u8{ "info", "updates", "triggers" }) |directory| {
+        const path = try std.fmt.allocPrint(
+            testing.allocator,
+            "{s}/{s}",
+            .{ package_database.database_directory, directory },
+        );
+        defer testing.allocator.free(path);
+        try root.ensureDirectory(
+            try root_fs.Path.init(path),
+            root_fs.default_directory_permissions,
+        );
+    }
+    try root.publishFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/status"),
+        "",
+        .{},
+    );
+    var present = try captureInitialDatabaseSnapshot(testing.allocator, root);
+    defer present.deinit();
+    try testing.expect(!present.absent);
+    try testing.expectEqualStrings("", present.snapshot.status.bytes);
 }
 
 const BoundArchive = struct {
@@ -21323,6 +21435,7 @@ fn recoverNativeRootMutation(
         try attempt.requireRecovery(allocator, .mutation);
         return false;
     };
+    try validateDatabaseBootstrapJournal(root, program, action, opened.journal());
     try validateRouteSettlementRecoveryJournal(
         allocator,
         root,
@@ -21391,6 +21504,8 @@ fn recoverNativeRootMutation(
     if (bounds) |value| value.observeMutation(report);
     switch (report.outcome) {
         .applied => {
+            if (std.meta.eql(action, databaseBootstrapAction()))
+                try validateDatabaseBootstrapDirectories(allocator, root, true);
             const checkpoint_sha256 = try checkpointManagedPaths(
                 allocator,
                 runtime,
@@ -22474,8 +22589,10 @@ pub const Runtime = struct {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        var captured = try captureDatabaseSnapshot(allocator, root, .{});
+        var captured = try captureInitialDatabaseSnapshot(allocator, root);
         defer captured.deinit();
+        if (captured.absent and request.plan.actions.len == 0)
+            return error.DatabaseStatusMissing;
         normalizeCapturedNativeArchitecture(&captured.snapshot, request.plan.target_architecture);
         var database = switch (try package_database.importSnapshot(allocator, .{
             .native_architecture = request.plan.target_architecture,
@@ -22565,10 +22682,14 @@ pub const Runtime = struct {
             .script_policy = scriptPolicy(),
             .foreign_architectures = database.model.foreign_architectures,
             .installed = .{
-                .generation_sha256 = database.generation.sha256,
+                .generation_sha256 = if (captured.absent)
+                    native_program.absentDatabaseGeneration()
+                else
+                    database.generation.sha256,
                 .packages = installed,
                 .trigger_state_sha256 = native_trigger.stateDigest(database.model),
                 .updates_pending = database.model.pending_updates.len != 0,
+                .bootstrap_absent = captured.absent,
             },
             .archives = archives,
             .trigger_authority = authority,
@@ -22958,8 +23079,10 @@ fn executePreparedNativeProgramWithHelper(
     const scratch = arena.allocator();
     const document = try native_execution_request.create(root, attempt, program, operation);
     const archives = try productionArchives(scratch, program.artifacts, archive_bytes);
-    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    var captured = try captureInitialDatabaseSnapshot(allocator, root);
     defer captured.deinit();
+    if (captured.absent != requiresDatabaseInitialization(program))
+        return error.DatabasePresenceChanged;
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
     var database = switch (try package_database.importSnapshot(allocator, .{
         .native_architecture = program.target_architecture,
@@ -22969,6 +23092,8 @@ fn executePreparedNativeProgramWithHelper(
         .diagnostic => return error.InvalidExternalDatabase,
     };
     defer database.deinit();
+    if (captured.absent)
+        database.generation.sha256 = native_program.absentDatabaseGeneration();
     if (helper_source != null)
         try validateNativeHelperTargetPlan(compiled.authorization.authorization, archives.models, database.model);
     var deployment: ?native_helper.Deployment = null;
@@ -23047,6 +23172,320 @@ fn executePreparedNativeProgramWithHelper(
         helper_source,
         bounds,
     ) catch |err| return lifecycleExecutionError(err);
+}
+
+fn requiresDatabaseInitialization(program: native_program.Program) bool {
+    const absent = native_recovery.hexDigest(native_program.absentDatabaseGeneration());
+    return std.mem.eql(u8, &program.installed_database.generation_sha256, &absent);
+}
+
+const database_bootstrap_directories = [_][]const u8{
+    package_database.database_directory,
+    package_database.database_directory ++ "/info",
+    package_database.database_directory ++ "/updates",
+    package_database.database_directory ++ "/triggers",
+    package_database.database_directory ++ "/alternatives",
+    package_database.database_directory ++ "/parts",
+};
+
+const database_bootstrap_paths = database_bootstrap_directories ++ [_][]const u8{
+    package_database.database_directory ++ "/status",
+    package_database.database_directory ++ "/info/format",
+};
+
+fn databasePayloadStructuralDirectory(path: []const u8) bool {
+    // `triggers/` has no package claim in the supported archive profile.
+    // Everything below these exact roots remains reserved to native database
+    // and alternatives operations, never to archive payload publication.
+    for ([_][]const u8{
+        database_bootstrap_directories[0],
+        database_bootstrap_directories[1],
+        database_bootstrap_directories[2],
+        database_bootstrap_directories[4],
+        database_bootstrap_directories[5],
+    }) |directory| {
+        if (std.mem.eql(u8, path, directory)) return true;
+    }
+    return false;
+}
+
+fn databaseBootstrapAction() native_recovery.Action {
+    return nativeAction(.database, 2, 0, std.math.maxInt(u32));
+}
+
+fn databaseBootstrapDigest(program: native_program.Program) ![32]u8 {
+    const program_digest = native_recovery.parseDigest(program.digest_sha256) orelse
+        return error.InvalidLifecycleProgram;
+    var hash = Sha256.init(.{});
+    hash.update("debz-native-database-bootstrap-plan-v2\x00");
+    hash.update(&program_digest);
+    hash.update(&native_program.absentDatabaseGeneration());
+    for (database_bootstrap_paths, 0..) |path, index| {
+        hashText(&hash, path);
+        hashText(&hash, if (index < database_bootstrap_directories.len) "directory" else "regular");
+    }
+    hashText(&hash, package_database.supported_info_format ++ "\n");
+    return hash.finalResult();
+}
+
+fn databaseBootstrapIntents(root: root_fs.Root) ![database_bootstrap_paths.len]root_mutation.Intent {
+    const owner = (try root.entryIfExists(
+        try root_fs.Path.init(root_operation.namespace_path),
+    )) orelse return error.NativeNamespaceMissing;
+    var empty_sha256: [32]u8 = undefined;
+    var format_sha256: [32]u8 = undefined;
+    Sha256.hash("", &empty_sha256, .{});
+    Sha256.hash(package_database.supported_info_format ++ "\n", &format_sha256, .{});
+    var intents: [database_bootstrap_paths.len]root_mutation.Intent = undefined;
+    for (database_bootstrap_directories, 0..) |path, index| {
+        intents[index] = .{ .directory = .{
+            .path = path,
+            .uid = owner.uid,
+            .gid = owner.gid,
+            .overwrite = .require_absent,
+        } };
+    }
+    intents[database_bootstrap_directories.len] = .{ .file = .{
+        .path = database_bootstrap_paths[database_bootstrap_directories.len],
+        .bytes = "",
+        .uid = owner.uid,
+        .gid = owner.gid,
+        .overwrite = .require_absent,
+        .expected_sha256 = empty_sha256,
+    } };
+    intents[database_bootstrap_directories.len + 1] = .{ .file = .{
+        .path = database_bootstrap_paths[database_bootstrap_directories.len + 1],
+        .bytes = package_database.supported_info_format ++ "\n",
+        .uid = owner.uid,
+        .gid = owner.gid,
+        .overwrite = .require_absent,
+        .expected_sha256 = format_sha256,
+    } };
+    return intents;
+}
+
+fn validateDatabaseBootstrapJournal(
+    root: root_fs.Root,
+    program: native_program.Program,
+    action: native_recovery.Action,
+    journal: root_mutation.Journal,
+) !void {
+    if (!std.meta.eql(action, databaseBootstrapAction())) {
+        if (journal.steps.len != 0 and
+            std.mem.eql(u8, journal.steps[0].path, database_bootstrap_paths[0]))
+            return error.InvalidDatabaseBootstrapJournal;
+        return;
+    }
+    const program_digest = native_recovery.parseDigest(program.digest_sha256) orelse
+        return error.InvalidDatabaseBootstrapJournal;
+    const authorization_digest = native_recovery.parseDigest(program.authorization_sha256) orelse
+        return error.InvalidDatabaseBootstrapJournal;
+    if (!requiresDatabaseInitialization(program) or
+        journal.steps.len != database_bootstrap_paths.len or
+        journal.evidence.program_sha256 == null or
+        !std.mem.eql(u8, &journal.evidence.program_sha256.?, &program_digest) or
+        journal.evidence.authorization_sha256 == null or
+        !std.mem.eql(u8, &journal.evidence.authorization_sha256.?, &authorization_digest) or
+        journal.evidence.database_generation_sha256 == null or
+        !std.mem.eql(
+            u8,
+            &journal.evidence.database_generation_sha256.?,
+            &native_program.absentDatabaseGeneration(),
+        ) or
+        journal.evidence.database_plan_sha256 == null or
+        !std.mem.eql(
+            u8,
+            &journal.evidence.database_plan_sha256.?,
+            &try databaseBootstrapDigest(program),
+        ))
+        return error.InvalidDatabaseBootstrapJournal;
+    const owner = (try root.entryIfExists(
+        try root_fs.Path.init(root_operation.namespace_path),
+    )) orelse return error.NativeNamespaceMissing;
+    var empty_sha256: [32]u8 = undefined;
+    var format_sha256: [32]u8 = undefined;
+    Sha256.hash("", &empty_sha256, .{});
+    Sha256.hash(package_database.supported_info_format ++ "\n", &format_sha256, .{});
+    for (journal.steps, 0..) |step, index| {
+        const expected_kind: root_mutation.StepKind =
+            if (index < database_bootstrap_directories.len) .create_directory else .publish_file;
+        if (step.index != index or step.kind != expected_kind or
+            !std.mem.eql(u8, step.path, database_bootstrap_paths[index]) or
+            step.overwrite != .require_absent or step.expected != .absent or
+            step.desired != .present or step.source != null or
+            step.artifact != null or step.source_sha256 != null or
+            step.desired.present.kind !=
+                @as(root_mutation.Kind, if (index < database_bootstrap_directories.len) .directory else .regular) or
+            step.desired.present.metadata.uid != owner.uid or
+            step.desired.present.metadata.gid != owner.gid or
+            step.desired.present.metadata.mode !=
+                @as(u32, if (index < database_bootstrap_directories.len) 0o755 else 0o644) or
+            step.desired.present.metadata.modified_nanoseconds != 0 or
+            (index >= database_bootstrap_directories.len and
+                (step.desired.present.size != (if (index == database_bootstrap_directories.len) @as(u64, 0) else package_database.supported_info_format.len + 1) or
+                    step.desired.present.content_sha256 == null or
+                    !std.mem.eql(
+                        u8,
+                        &step.desired.present.content_sha256.?,
+                        if (index == database_bootstrap_directories.len) &empty_sha256 else &format_sha256,
+                    ))))
+            return error.InvalidDatabaseBootstrapJournal;
+    }
+}
+
+fn validateDatabaseBootstrapDirectories(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    require_empty: bool,
+) !void {
+    const owner = (try root.entryIfExists(
+        try root_fs.Path.init(root_operation.namespace_path),
+    )) orelse return error.InvalidDatabaseBootstrapState;
+    for (database_bootstrap_directories[4..]) |path| {
+        var pinned = root.pinDirectory(try root_fs.Path.init(path)) catch
+            return error.InvalidDatabaseBootstrapState;
+        defer pinned.close();
+        const entry = if (require_empty) block: {
+            var observed = pinned.observeAlloc(allocator, 0, 0) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidDatabaseBootstrapState,
+            };
+            defer observed.deinit();
+            break :block observed.entry;
+        } else (pinned.metadata() catch return error.InvalidDatabaseBootstrapState).entry;
+        if (!entry.modeled or !entry.isDirectory() or entry.mode != 0o755 or
+            entry.uid != owner.uid or entry.gid != owner.gid)
+            return error.InvalidDatabaseBootstrapState;
+    }
+}
+
+fn initializeNativeDatabase(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    attempt: *root_operation.Attempt,
+    runtime: *native_recovery.Runtime,
+    program: native_program.Program,
+    bounds: ?*RuntimeBounds,
+) !?LifecycleResult {
+    const action = databaseBootstrapAction();
+    var intent = try native_recovery.readIntent(allocator, root);
+    defer intent.deinit();
+    const marker = native_program.absentDatabaseGeneration();
+    const program_digest = native_recovery.parseDigest(program.digest_sha256) orelse
+        return error.InvalidDatabaseBootstrapAuthority;
+    const record = attempt.record();
+    if (!requiresDatabaseInitialization(program) or
+        !std.mem.eql(u8, &intent.intent.digest_sha256, &runtime.intent_sha256) or
+        !std.mem.eql(u8, &intent.intent.program_sha256, &program.digest_sha256) or
+        !std.mem.eql(u8, &intent.intent.attempt_id, &native_recovery.hexDigest(attempt.attemptId())) or
+        !std.mem.eql(u8, &intent.intent.database_generation_sha256, &native_recovery.hexDigest(marker)) or
+        record.program_sha256 == null or
+        !std.mem.eql(u8, &record.program_sha256.?, &program_digest) or
+        record.database_generation_sha256 == null or
+        !std.mem.eql(u8, &record.database_generation_sha256.?, &marker))
+        return error.InvalidDatabaseBootstrapAuthority;
+    const prior = try runtime.latest(action);
+    if (prior) |progress_record| {
+        if (progress_record.stage == .completed and
+            (progress_record.result == .applied or progress_record.result == .recovered))
+        {
+            const checkpoint = try native_recovery.managedCheckpointDigestForAction(
+                allocator,
+                root,
+                runtime.intent_sha256,
+                action,
+            ) orelse return error.InvalidDatabaseBootstrapProgress;
+            if (progress_record.evidence_sha256 == null or
+                !std.mem.eql(u8, &progress_record.evidence_sha256.?, &checkpoint))
+                return error.InvalidDatabaseBootstrapProgress;
+            try validateDatabaseBootstrapDirectories(allocator, root, false);
+            var captured = try captureDatabaseSnapshot(allocator, root, .{});
+            defer captured.deinit();
+            normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+            var database = switch (try package_database.importSnapshot(
+                allocator,
+                .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+                .{},
+            )) {
+                .database => |value| value,
+                .diagnostic => return error.InvalidDatabaseBootstrapState,
+            };
+            database.deinit();
+            return null;
+        }
+        if (progress_record.stage != .prepared and
+            !(progress_record.stage == .completed and progress_record.result == .rolled_back))
+            return error.InvalidDatabaseBootstrapProgress;
+    }
+    if (try root.entryIfExists(try root_fs.Path.init(package_database.database_directory)) != null)
+        return error.DatabasePresenceChanged;
+    const intents = try databaseBootstrapIntents(root);
+    const preflight = try root_mutation.preflight(allocator, root, .{ .intents = &intents });
+    var bootstrap_plan = switch (preflight) {
+        .plan => |value| value,
+        .diagnostic => return error.DatabaseBootstrapRejected,
+    };
+    defer bootstrap_plan.deinit();
+    if (prior == null or prior.?.stage == .completed)
+        try runtime.append(action, .prepared, .none, null);
+    var crash = runtime.crash;
+    var engine = try root_mutation.prepare(
+        allocator,
+        root,
+        attempt,
+        &bootstrap_plan,
+        .{
+            .authorization_sha256 = record.authorization_sha256,
+            .program_sha256 = record.program_sha256,
+            .plan_sha256 = record.plan_sha256,
+            .exact_lock = record.exact_lock,
+            .database_generation_sha256 = record.database_generation_sha256,
+            .database_plan_sha256 = try databaseBootstrapDigest(program),
+            .artifact_evidence_sha256 = record.artifact_evidence_sha256,
+        },
+        .{ .hooks = .{ .context = &crash, .beforeFn = struct {
+            fn before(context: ?*anyopaque, boundary: root_mutation.Boundary, index: u32) root_mutation.HookError!void {
+                if (boundary == .parent_sync and index == database_bootstrap_directories.len) {
+                    const controller: *native_recovery.CrashController = @ptrCast(@alignCast(context.?));
+                    controller.hit(.during_database_publication);
+                }
+            }
+        }.before }, .allow_recovery_continuation = runtime.recovering, .deadline = if (bounds) |value| value.deadline else null },
+    );
+    defer engine.deinit();
+    try validateDatabaseBootstrapJournal(root, program, action, engine.journal());
+    const applied = try root_mutation.apply(&engine, .fromPlan(&bootstrap_plan));
+    if (bounds) |value| value.observeMutation(applied);
+    if (applied.outcome == .recovery_required)
+        return .{ .outcome = .recovery_required, .detail = "database_bootstrap_recovery_required" };
+    if (applied.outcome == .rolled_back) {
+        try runtime.append(action, .completed, .rolled_back, null);
+        try root_mutation.clear(&engine);
+        return .{ .outcome = .recovery_required, .detail = "database_bootstrap_rolled_back" };
+    }
+    try validateDatabaseBootstrapDirectories(allocator, root, true);
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    const expected = try package_database.generation(allocator, .{
+        .status = package_database.regularFile(""),
+        .info = &.{.{ .name = "format", .bytes = "1\n" }},
+    });
+    const actual = try package_database.generation(allocator, captured.snapshot);
+    if (!expected.eql(actual)) {
+        try attempt.requireRecovery(allocator, .verification);
+        return .{ .outcome = .recovery_required, .detail = "database_bootstrap_changed" };
+    }
+    const checkpoint = try checkpointManagedPaths(
+        allocator,
+        runtime,
+        action,
+        engine.journal().steps,
+        &.{},
+        false,
+    );
+    try runtime.append(action, .completed, .applied, checkpoint);
+    try root_mutation.clear(&engine);
+    return null;
 }
 
 fn probeNativeHelperWithBounds(
@@ -23803,6 +24242,8 @@ fn recoverPreparedNativeProgramWithHelper(
         .diagnostic => return error.InvalidExternalDatabase,
     };
     defer database.deinit();
+    if (requiresDatabaseInitialization(program.program))
+        database.generation.sha256 = native_program.absentDatabaseGeneration();
     if (!lifecycleDatabaseMatchesProgram(program.program, database.generation, database.model.packages.len) or
         !std.mem.eql(u8, &native_recovery.hexDigest(native_trigger.stateDigest(database.model)), &intent.intent.initial_trigger_state_sha256))
         return error.RecoveryDatabaseBindingMismatch;
@@ -24114,20 +24555,26 @@ fn executeLifecycleProgramWithRequest(
         }
     }
 
-    var locked_capture = captureDatabaseSnapshot(allocator, root, .{}) catch |err| {
-        if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
-        return err;
-    };
-    defer locked_capture.deinit();
-    normalizeCapturedNativeArchitecture(
-        &locked_capture.snapshot,
-        program.target_architecture,
-    );
+    var locked_capture: ?CapturedDatabase = if (recovery_intent != null and
+        requiresDatabaseInitialization(program.*))
+        null
+    else
+        captureInitialDatabaseSnapshot(allocator, root) catch |err| {
+            if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
+            return err;
+        };
+    defer if (locked_capture) |*value| value.deinit();
+    if (locked_capture) |*value|
+        normalizeCapturedNativeArchitecture(&value.snapshot, program.target_architecture);
+    if (recovery_intent == null and
+        locked_capture.?.absent != requiresDatabaseInitialization(program.*))
+        return error.DatabasePresenceChanged;
+    const locked_snapshot = if (locked_capture) |value| value.snapshot else initial_snapshot;
     var locked_database = switch (try package_database.importSnapshot(
         allocator,
         .{
             .native_architecture = program.target_architecture,
-            .snapshot = locked_capture.snapshot,
+            .snapshot = locked_snapshot,
         },
         .{},
     )) {
@@ -24142,6 +24589,9 @@ fn executeLifecycleProgramWithRequest(
         },
     };
     defer locked_database.deinit();
+    if (recovery_intent != null and requiresDatabaseInitialization(program.*) or
+        (locked_capture != null and locked_capture.?.absent))
+        locked_database.generation.sha256 = native_program.absentDatabaseGeneration();
     if (recovery_intent == null and !lifecycleDatabaseMatchesProgram(
         program.*,
         locked_database.generation,
@@ -24192,7 +24642,7 @@ fn executeLifecycleProgramWithRequest(
     defer if (diversion_session) |*session| session.deinit();
     if (recovery_intent == null) {
         diversion_session = try native_diversion.Session.open(allocator, root);
-        const captured_diversions: ?[]const u8 = if (locked_capture.snapshot.diversions) |entry| entry.bytes else null;
+        const captured_diversions: ?[]const u8 = if (locked_snapshot.diversions) |entry| entry.bytes else null;
         const cached_diversions = diversion_session.?.cache.bytes;
         if ((captured_diversions == null) != (cached_diversions == null) or
             (captured_diversions != null and !std.mem.eql(u8, captured_diversions.?, cached_diversions.?)))
@@ -24403,6 +24853,17 @@ fn executeLifecycleProgramWithRequest(
             };
         }
     }
+    if (requiresDatabaseInitialization(program.*)) {
+        const runtime = execution.recovery orelse return error.NativeRecoveryRequired;
+        if (try initializeNativeDatabase(
+            allocator,
+            root,
+            attempt,
+            runtime,
+            program.*,
+            bounds,
+        )) |failure| return failure;
+    }
     try execution.checkDeadline();
     const trigger_authority_bytes = try publishTriggerAuthority(
         allocator,
@@ -24429,7 +24890,7 @@ fn executeLifecycleProgramWithRequest(
         if (recovery_intent != null)
             initial_snapshot.status.bytes
         else
-            locked_capture.snapshot.status.bytes,
+            locked_snapshot.status.bytes,
     );
 
     for (program.steps) |step| switch (try beginNativeProgramStep(execution, step)) {
@@ -29045,6 +29506,390 @@ test "native_unpack.test.public runtime preparation preserves unlocked repositor
     try testPreparedMixedLifecycle(true, .repository_scoped_preparation);
 }
 
+fn testFreshDatabaseInstall(crash_at: ?native_recovery.CrashPoint) !void {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: root_fs.Root = .init(testing.io, tmp.dir);
+    var root_buffer: [4096]u8 = undefined;
+    const root_length = try tmp.dir.realPath(testing.io, &root_buffer);
+    const install_root = root_buffer[0..root_length];
+    var files = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/bin", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/app", .content = "new payload\n", .mode = 0o644 },
+        .{ .path = "bin", .kind = '2', .link = "usr/bin" },
+        .{ .path = "var/lib/dpkg", .kind = '5', .mode = 0o700 },
+        .{ .path = "var/lib/dpkg/info", .kind = '5', .mode = 0o700 },
+        .{ .path = "var/lib/dpkg/updates", .kind = '5', .mode = 0o700 },
+        .{ .path = "var/lib/dpkg/alternatives", .kind = '5', .mode = 0o700 },
+        .{ .path = "var/lib/dpkg/parts", .kind = '5', .mode = 0o700 },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "app", .version = "1.2" }, &files);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot_id: [32]u8 = @splat(0x22);
+    var lock = try exact_lock_v3.create(testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot_id,
+            .release_sha256 = @splat(3),
+            .index_identity = .{ .digests = .{ .sha256 = @splat(4) }, .primary = .sha256 },
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "app",
+            .version = "1.2",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot_id,
+            } },
+            .archive_identity = .{
+                .digests = .{ .sha256 = model.provenance().sha256 },
+                .primary = .sha256,
+            },
+            .declared_size = bytes.len,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var action: solver.PlanAction = .{
+        .kind = .install,
+        .package = "app",
+        .version = "1.2",
+        .architecture = "amd64",
+        .repository = .{ .id = repository_id, .priority = 500 },
+        .sha256 = hex(32, model.provenance().sha256),
+        .archive_identity = .{
+            .digests = .{ .sha256 = model.provenance().sha256 },
+            .primary = .sha256,
+        },
+        .package_size = bytes.len,
+        .installed_size_delta_bytes = 0,
+        .source_package = "app",
+        .prior_installed = null,
+        .requested = true,
+        .reason = .explicit_request,
+        .selected_origin = null,
+    };
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "app", .version = "1.2", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "app", .version = "1.2", .architecture = "amd64" },
+    };
+    const solver_plan: solver.Plan = .{
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = (&action)[0..1],
+        .ordered_actions = &ordered,
+        .summary = .{},
+        .download_bytes = bytes.len,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = testing.allocator,
+        .arena = undefined,
+    };
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(
+        testing.io,
+        root,
+        install_root,
+        locks.interface(),
+    );
+    var attempt = try coordinator.acquire(testing.allocator, .{
+        .backend = .native,
+        .operation = .{ .repository_bootstrap = .add },
+        .request_sha256 = @splat(0x71),
+        .policy_sha256 = @splat(0x72),
+        .target_architecture = "amd64",
+        .evidence = .{ .plan_sha256 = transaction_executor.planDigest(solver_plan) },
+    });
+    defer attempt.release();
+    try root.createDirectoryPath(
+        try root_fs.Path.init(package_database.database_directory),
+        .fromMode(0o755),
+    );
+    try root.publishFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/diversions"),
+        "foreign database evidence\n",
+        .{},
+    );
+    try testing.expectError(
+        error.DatabaseStatusMissing,
+        Runtime.prepare(testing.allocator, .{
+            .attempt = &attempt,
+            .plan = &solver_plan,
+            .exact_lock = &lock.lock,
+            .archives = &.{bytes},
+            .policy = .{ .conffile = .keep_existing },
+        }),
+    );
+    try testing.expect(!attempt.record().mutation_started);
+    try testing.expect(try root.entryIfExists(
+        try root_fs.Path.init(native_recovery.intent_path),
+    ) == null);
+    try root.removeFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/diversions"),
+    );
+    try root.removeDirectory(
+        try root_fs.Path.init(package_database.database_directory),
+    );
+    var prepared = try Runtime.prepare(testing.allocator, .{
+        .attempt = &attempt,
+        .plan = &solver_plan,
+        .exact_lock = &lock.lock,
+        .archives = &.{bytes},
+        .policy = .{ .conffile = .keep_existing },
+    });
+    defer prepared.deinit();
+    if (prepared != .prepared) return error.TestUnexpectedResult;
+    const program = prepared.prepared.program.program;
+    try testing.expect(requiresDatabaseInitialization(program));
+    try testing.expect(!attempt.record().mutation_started);
+    try testing.expect(try root.entryIfExists(
+        try root_fs.Path.init(package_database.database_directory),
+    ) == null);
+    var compiled: CompiledLifecycle = .{
+        .authorization = prepared.prepared.authorization,
+        .program = prepared.prepared.program,
+    };
+    for ([_][]const u8{
+        package_database.database_directory,
+        package_database.database_directory ++ "/info",
+        package_database.database_directory ++ "/updates",
+        package_database.database_directory ++ "/triggers",
+    }) |path| try root.ensureDirectory(
+        try root_fs.Path.init(path),
+        root_fs.default_directory_permissions,
+    );
+    try root.publishFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/status"),
+        "",
+        .{},
+    );
+    try root.publishFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/info/format"),
+        "1\n",
+        .{},
+    );
+    try testing.expectError(
+        error.DatabasePresenceChanged,
+        executePreparedNativeProgramWithHelper(
+            testing.allocator,
+            root,
+            &compiled,
+            &.{bytes},
+            &attempt,
+            locks.interface(),
+            .install,
+            null,
+            null,
+            null,
+            .{},
+        ),
+    );
+    try testing.expect(try root.entryIfExists(
+        try root_fs.Path.init(native_recovery.intent_path),
+    ) == null);
+    try root.removeFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/info/format"),
+    );
+    try root.removeFile(
+        try root_fs.Path.init(package_database.database_directory ++ "/status"),
+    );
+    for ([_][]const u8{
+        package_database.database_directory ++ "/triggers",
+        package_database.database_directory ++ "/updates",
+        package_database.database_directory ++ "/info",
+        package_database.database_directory,
+    }) |path| try root.removeDirectory(try root_fs.Path.init(path));
+    const applied = if (crash_at) |point| block: {
+        if (builtin.os.tag != .linux) return error.SkipZigTest;
+        const linux = std.os.linux;
+        const child = linux.fork();
+        if (linux.errno(child) != .SUCCESS) return error.ForkFailed;
+        if (child == 0) {
+            _ = executePreparedNativeProgramWithHelper(
+                testing.allocator,
+                root,
+                &compiled,
+                &.{bytes},
+                &attempt,
+                locks.interface(),
+                .install,
+                point,
+                null,
+                null,
+                .{},
+            ) catch std.process.exit(87);
+            std.process.exit(88);
+        }
+        var status: u32 = 0;
+        const waited = linux.waitpid(@intCast(child), &status, 0);
+        try testing.expectEqual(child, waited);
+        try testing.expectEqual(@as(u32, native_recovery.crash_exit_code), status >> 8);
+        try testing.expect(try root.entryIfExists(
+            try root_fs.Path.init(native_recovery.intent_path),
+        ) != null);
+        try testing.expect(
+            (try root.entryIfExists(try root_fs.Path.init(root_mutation.journal_path)) != null) ==
+                (point == .during_database_publication),
+        );
+        if (point == .during_database_publication) {
+            const bytes_journal = try root.readFileAlloc(
+                testing.allocator,
+                try root_fs.Path.init(root_mutation.journal_path),
+                root_mutation.maximum_document_bytes,
+            );
+            defer testing.allocator.free(bytes_journal);
+            var journal = try root_mutation.decode(
+                testing.allocator,
+                bytes_journal,
+                root_mutation.maximum_document_bytes,
+            );
+            defer journal.deinit();
+            try testing.expectEqual(
+                @as(usize, database_bootstrap_paths.len),
+                journal.journal.steps.len,
+            );
+            try validateDatabaseBootstrapJournal(
+                root,
+                program,
+                databaseBootstrapAction(),
+                journal.journal,
+            );
+            try validateDatabaseBootstrapDirectories(testing.allocator, root, true);
+
+            var legacy = Sha256.init(.{});
+            legacy.update("debz-native-database-bootstrap-plan-v1\x00");
+            const program_digest = native_recovery.parseDigest(program.digest_sha256) orelse
+                return error.TestUnexpectedResult;
+            legacy.update(&program_digest);
+            legacy.update(&native_program.absentDatabaseGeneration());
+            var wrong_digest = journal.journal;
+            wrong_digest.evidence.database_plan_sha256 = legacy.finalResult();
+            try testing.expectError(
+                error.InvalidDatabaseBootstrapJournal,
+                validateDatabaseBootstrapJournal(
+                    root,
+                    program,
+                    databaseBootstrapAction(),
+                    wrong_digest,
+                ),
+            );
+            var legacy_shape = journal.journal;
+            legacy_shape.steps = journal.journal.steps[0..6];
+            try testing.expectError(
+                error.InvalidDatabaseBootstrapJournal,
+                validateDatabaseBootstrapJournal(
+                    root,
+                    program,
+                    databaseBootstrapAction(),
+                    legacy_shape,
+                ),
+            );
+            const steps = try testing.allocator.dupe(root_mutation.Step, journal.journal.steps);
+            defer testing.allocator.free(steps);
+            steps[4].path = package_database.database_directory ++ "/other";
+            var wrong_path = journal.journal;
+            wrong_path.steps = steps;
+            try testing.expectError(
+                error.InvalidDatabaseBootstrapJournal,
+                validateDatabaseBootstrapJournal(
+                    root,
+                    program,
+                    databaseBootstrapAction(),
+                    wrong_path,
+                ),
+            );
+        }
+        if (point == .after_execution_intent) {
+            for (database_bootstrap_directories[4..]) |path|
+                try testing.expect(try root.entryIfExists(try root_fs.Path.init(path)) == null);
+        }
+        attempt.release();
+        var previous = (try coordinator.inspect(testing.allocator)).?;
+        defer previous.deinit();
+        const record = previous.record;
+        attempt = try coordinator.acquire(testing.allocator, .{
+            .intent = .recovery,
+            .backend = .native,
+            .operation = record.operation,
+            .request_sha256 = record.request_sha256,
+            .policy_sha256 = record.policy_sha256,
+            .target_architecture = record.target_architecture,
+            .foreign_architectures = record.foreign_architectures,
+            .evidence = record.evidence(),
+        });
+        break :block try recoverPreparedNativeProgramWithHelper(
+            testing.allocator,
+            root,
+            &attempt,
+            locks.interface(),
+            null,
+            null,
+            null,
+            .{},
+        );
+    } else try executePreparedNativeProgramWithHelper(
+        testing.allocator,
+        root,
+        &compiled,
+        &.{bytes},
+        &attempt,
+        locks.interface(),
+        .install,
+        null,
+        null,
+        null,
+        .{},
+    );
+    try testing.expectEqual(LifecycleOutcome.applied, applied.outcome);
+    const payload = try root.readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("usr/share/app"),
+        1024,
+    );
+    defer testing.allocator.free(payload);
+    try testing.expectEqualStrings("new payload\n", payload);
+    var captured = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer captured.deinit();
+    try testing.expect(std.mem.indexOf(u8, captured.snapshot.status.bytes, "Package: app") != null);
+    const info_list = for (captured.snapshot.info) |entry| {
+        if (std.mem.eql(u8, entry.name, "app.list")) break entry.bytes;
+    } else return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, info_list, "/var/lib/dpkg\n") != null);
+    for (database_bootstrap_directories[1..]) |path| {
+        if (!databasePayloadStructuralDirectory(path)) continue;
+        const listed = try std.fmt.allocPrint(testing.allocator, "/{s}\n", .{path});
+        defer testing.allocator.free(listed);
+        try testing.expect(std.mem.indexOf(u8, info_list, listed) != null);
+    }
+    try validateDatabaseBootstrapDirectories(testing.allocator, root, true);
+    try testing.expect(std.mem.indexOf(u8, info_list, "/bin\n") != null);
+    try testing.expect(std.mem.indexOf(u8, info_list, "/usr/bin\n") != null);
+    try testing.expectEqual(@as(u32, 0o755), (try root.entry(
+        try root_fs.Path.init(package_database.database_directory),
+    )).mode);
+}
+
+test "native_unpack.test.caller-owned install initializes an absent database" {
+    try testFreshDatabaseInstall(null);
+}
+
+test "native_unpack.test.caller-owned database bootstrap survives a process crash" {
+    try testFreshDatabaseInstall(.after_execution_intent);
+    try testFreshDatabaseInstall(.during_database_publication);
+}
+
 test "native_unpack.test.public runtime requires a held native attempt and its physical named root" {
     var fixture: Fixture = undefined;
     try fixture.init(empty_status, &.{});
@@ -30603,7 +31448,7 @@ test "native_unpack.test.materialization database capture has an aggregate bound
     defer fixture.deinit();
     try testing.expectError(
         error.DatabaseCaptureLimit,
-        captureDatabaseSnapshotBounded(testing.allocator, fixture.root(), .{}, 1),
+        captureDatabaseSnapshotBounded(testing.allocator, fixture.root(), .{}, 1, false),
     );
     var captured = try captureDatabaseSnapshot(testing.allocator, fixture.root(), .{});
     defer captured.deinit();
@@ -30974,6 +31819,114 @@ test "native_unpack.test.merged usr is normalized and dpkg namespace is reserved
         &reserved_program,
         &.{.{ .artifact = 0, .bytes = reserved_bytes }},
     ), .reserved_path);
+}
+
+test "native_unpack.test.merged usr alias owns its symlink separately from target directory" {
+    const status =
+        \\Package: base-files
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: base
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "base-files.list", .bytes = "/.\n/bin\n/usr/bin\n" },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("usr"),
+        root_fs.default_directory_permissions,
+    );
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("usr/bin"),
+        root_fs.default_directory_permissions,
+    );
+    try fixture.root().createSymbolicLink(try root_fs.Path.init("bin"), "usr/bin");
+    const aliases = try detectAliases(testing.allocator, fixture.root());
+    defer deinitAliasEvidence(testing.allocator, aliases);
+    var database = try fixture.database();
+    defer database.deinit();
+    var ownership = try indexOwnership(testing.allocator, database.model, aliases);
+    defer ownership.deinit();
+    try testing.expectEqual(@as(usize, 1), ownership.ownersOf("bin").len);
+    try testing.expectEqualStrings("/bin", ownership.ownersOf("bin")[0].listed);
+    try testing.expectEqual(@as(usize, 1), ownership.ownersOf("usr/bin").len);
+    try testing.expectEqualStrings("/usr/bin", ownership.ownersOf("usr/bin")[0].listed);
+
+    var data = [_]Entry{
+        .{ .path = "bin", .kind = '2', .link = "usr/bin" },
+        .{ .path = "usr/bin", .kind = '5' },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "base-files", .version = "2" }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{unpackStep(0, &model, 0, "1", false)};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    var planned = try expectPlan(try planFor(
+        &fixture,
+        &program,
+        &.{.{ .artifact = 0, .bytes = bytes }},
+    ));
+    defer planned.deinit();
+    try testing.expectEqualStrings("bin", planned.packages[0].paths[0].path);
+    try testing.expect(!planned.packages[0].paths[0].aliased);
+    try testing.expectEqual(Kind.symlink, planned.packages[0].paths[0].kind);
+    try testing.expectEqualStrings("usr/bin", planned.packages[0].paths[1].path);
+    try testing.expectEqual(Kind.directory, planned.packages[0].paths[1].kind);
+
+    const duplicate = [_][]const u8{ "/bin", "/usr/bin", "/bin/tool", "/usr/bin/tool" };
+    var conflicting = database.model.packages[0];
+    conflicting.paths = &duplicate;
+    const records = [_]package_database.PackageRecord{conflicting};
+    var invalid = database.model;
+    invalid.packages = &records;
+    try testing.expectError(error.AliasCollision, indexOwnership(
+        testing.allocator,
+        invalid,
+        aliases,
+    ));
+}
+
+test "native_unpack.test.merged usr alias descendants still reject duplicate and conflicting claims" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("usr"),
+        root_fs.default_directory_permissions,
+    );
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("usr/bin"),
+        root_fs.default_directory_permissions,
+    );
+    try fixture.root().createSymbolicLink(try root_fs.Path.init("bin"), "usr/bin");
+    for ([_]bool{ false, true }) |conflicting_kind| {
+        var data = [_]Entry{
+            .{ .path = "bin/tool", .content = "a\n" },
+            if (conflicting_kind)
+                .{ .path = "usr/bin/tool", .kind = '5' }
+            else
+                .{ .path = "usr/bin/tool", .content = "b\n" },
+        };
+        const bytes = try buildOwnedArchive(.{ .package = "bad" }, &data);
+        defer testing.allocator.free(bytes);
+        var model = try modelOf(bytes);
+        defer model.deinit();
+        const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+        var artifacts: [1]native_program.ProgramArtifact = undefined;
+        const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+        try expectRefusal(try planFor(
+            &fixture,
+            &program,
+            &.{.{ .artifact = 0, .bytes = bytes }},
+        ), if (conflicting_kind) .alias_kind_conflict else .duplicate_archive_path);
+    }
 }
 
 test "native_unpack.test.deferred lifecycle features are explicit handoffs" {
@@ -31799,6 +32752,192 @@ test "native_unpack.test.existing directory metadata is never described as a wri
         @as(u32, 0o700),
         (try fixture.root().entry(try root_fs.Path.init("usr/share/admin"))).mode,
     );
+}
+
+test "native_unpack.test.database directory is an existing non-mutating archive claim" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var data = [_]Entry{
+        .{ .path = "var", .kind = '5', .mode = 0o755 },
+        .{ .path = "var/lib", .kind = '5', .mode = 0o755 },
+        .{ .path = "var/lib/dpkg", .kind = '5', .mode = 0o700 },
+        .{ .path = "etc/issue", .content = "base\n" },
+    };
+    const bytes = try buildOwnedArchive(.{
+        .package = "base-files",
+        .version = "14.2ubuntu1",
+        .data_root = true,
+    }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    var planned = try expectPlan(try planFor(
+        &fixture,
+        &program,
+        &.{.{ .artifact = 0, .bytes = bytes }},
+    ));
+    defer planned.deinit();
+    const directory = for (planned.packages[0].paths) |path| {
+        if (std.mem.eql(u8, path.path, package_database.database_directory)) break path;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(Kind.directory, directory.kind);
+    try testing.expectEqual(Kind.directory, directory.previous.?.kind);
+    try testing.expect(!directory.publish);
+    const info_list = planned.database.find("info/base-files.list") orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, info_list.bytes, "/var/lib/dpkg\n") != null);
+    for (planned.filesystem) |change| {
+        const path = switch (change) {
+            inline else => |entry| entry.path,
+        };
+        try testing.expect(!std.mem.eql(u8, path, package_database.database_directory));
+    }
+    try testing.expectEqual(@as(u32, 0o755), (try fixture.root().entry(
+        try root_fs.Path.init(package_database.database_directory),
+    )).mode);
+
+    try fixture.tmp.dir.deleteTree(testing.io, package_database.database_directory);
+    try expectRefusal(try planFor(
+        &fixture,
+        &program,
+        &.{.{ .artifact = 0, .bytes = bytes }},
+    ), .reserved_path);
+}
+
+test "native_unpack.test.dpkg structural directory claims require exact existing directories" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var captured = try captureInitialDatabaseSnapshot(testing.allocator, fixture.root());
+    defer captured.deinit();
+    try testing.expect(!captured.absent);
+    var data = [_]Entry{
+        .{ .path = "var/lib/dpkg", .kind = '5', .mode = 0o700 },
+        .{ .path = "var/lib/dpkg/alternatives", .kind = '5', .mode = 0o755 },
+        .{ .path = "var/lib/dpkg/info", .kind = '5', .mode = 0o700 },
+        .{ .path = "var/lib/dpkg/parts", .kind = '5', .mode = 0o755 },
+        .{ .path = "var/lib/dpkg/updates", .kind = '5', .mode = 0o700 },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "dpkg", .version = "1" }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    const archives = [_]ArchiveInput{.{ .artifact = 0, .bytes = bytes }};
+
+    try expectRefusal(try planFor(&fixture, &program, &archives), .reserved_path);
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("var/lib/dpkg/alternatives"),
+        root_fs.default_directory_permissions,
+    );
+    try expectRefusal(try planFor(&fixture, &program, &archives), .reserved_path);
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("var/lib/dpkg/parts"),
+        root_fs.default_directory_permissions,
+    );
+    try fixture.root().applyMetadata(
+        try root_fs.Path.init("var/lib/dpkg/alternatives"),
+        .{ .mode = 0o700 },
+    );
+    var planned = try expectPlan(try planFor(&fixture, &program, &archives));
+    defer planned.deinit();
+    try testing.expectEqual(@as(usize, data.len), planned.packages[0].paths.len);
+    const info_list = planned.database.find("info/dpkg.list") orelse
+        return error.TestUnexpectedResult;
+    for (data) |file| {
+        const path = for (planned.packages[0].paths) |entry| {
+            if (std.mem.eql(u8, entry.path, file.path)) break entry;
+        } else return error.TestUnexpectedResult;
+        try testing.expectEqual(Kind.directory, path.previous.?.kind);
+        try testing.expect(!path.publish);
+        const listed = try std.fmt.allocPrint(testing.allocator, "/{s}\n", .{file.path});
+        defer testing.allocator.free(listed);
+        try testing.expect(std.mem.indexOf(u8, info_list.bytes, listed) != null);
+    }
+    for (planned.filesystem) |change| {
+        const path = switch (change) {
+            inline else => |entry| entry.path,
+        };
+        try testing.expect(!package_database.reservedPayloadPath(path));
+    }
+    try testing.expectEqual(@as(u32, 0o700), (try fixture.root().entry(
+        try root_fs.Path.init("var/lib/dpkg/alternatives"),
+    )).mode);
+    try fixture.root().removeDirectory(try root_fs.Path.init("var/lib/dpkg/alternatives"));
+    try fixture.root().publishFile(
+        try root_fs.Path.init("var/lib/dpkg/alternatives"),
+        "foreign\n",
+        .{},
+    );
+    try expectRefusal(try planFor(&fixture, &program, &archives), .reserved_path);
+}
+
+test "native_unpack.test.bootstrap extension refuses foreign directory occupants before checkpoint" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init(root_operation.namespace_path),
+        root_fs.default_directory_permissions,
+    );
+    for (database_bootstrap_directories[4..]) |path| try fixture.root().ensureDirectory(
+        try root_fs.Path.init(path),
+        root_fs.default_directory_permissions,
+    );
+    try validateDatabaseBootstrapDirectories(testing.allocator, fixture.root(), true);
+    try seedFile(fixture.root(), "var/lib/dpkg/parts/foreign", "keep\n");
+    try testing.expectError(
+        error.InvalidDatabaseBootstrapState,
+        validateDatabaseBootstrapDirectories(testing.allocator, fixture.root(), true),
+    );
+}
+
+test "native_unpack.test.database directory exception refuses other kinds, spellings and children" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    for (database_bootstrap_directories[4..]) |path| try fixture.root().ensureDirectory(
+        try root_fs.Path.init(path),
+        root_fs.default_directory_permissions,
+    );
+    const cases = [_]Entry{
+        .{ .path = "var/lib/dpkg", .content = "not a directory\n" },
+        .{ .path = "var/lib/dpkg", .kind = '2', .link = "other" },
+        .{ .path = "VAR/LIB/DPKG", .kind = '5' },
+        .{ .path = "var/lib/dpkg/status", .content = "foreign status\n" },
+        .{ .path = "var/lib/dpkg/updates", .content = "not a directory\n" },
+        .{ .path = "var/lib/dpkg/alternatives", .content = "foreign\n" },
+        .{ .path = "var/lib/dpkg/parts", .kind = '2', .link = "other" },
+        .{ .path = "VAR/LIB/DPKG/parts", .kind = '5' },
+        .{ .path = "var/lib/dpkg/alternatives/foreign", .content = "foreign\n" },
+        .{ .path = "var/lib/dpkg/parts/foreign", .kind = '5' },
+        .{ .path = "var/lib/dpkg/info/foreign", .content = "foreign\n" },
+        .{ .path = "var/lib/dpkg/triggers", .kind = '5' },
+    };
+    for (cases) |entry| {
+        var data = [_]Entry{entry};
+        const bytes = try buildOwnedArchive(
+            .{ .package = "bad", .version = "1" },
+            &data,
+        );
+        defer testing.allocator.free(bytes);
+        var model = try modelOf(bytes);
+        defer model.deinit();
+        const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+        var artifacts: [1]native_program.ProgramArtifact = undefined;
+        const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+        try expectRefusal(try planFor(
+            &fixture,
+            &program,
+            &.{.{ .artifact = 0, .bytes = bytes }},
+        ), .reserved_path);
+    }
 }
 
 test "native_unpack.test.all planner limits fail before evidence is dropped" {

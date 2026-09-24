@@ -2,8 +2,8 @@
 set -euo pipefail
 umask 077
 
-readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20260816T000000Z
-readonly pinned_suite=resolute
+readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z
+readonly pinned_suite=stonking
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 readonly max_download_bytes=$((1536 * 1024 * 1024))
 readonly max_package_bytes=$((512 * 1024 * 1024))
@@ -127,49 +127,79 @@ common=(
 native_common=("${common[@]}" --transaction-backend native)
 mutating=(--assume-yes --noninteractive --conffile keep-existing)
 
-run() {
-  local name=$1
-  local status
-  shift
+run_candidate() {
+  local name=$1 duration=$2
+  local status=0
+  local audit_status=0
+  shift 2
   if [[ ${DEBZ_REAL_SNAPSHOT_TRACE:-0} == 1 ]]; then
-    set +e
-    timeout --signal=TERM --kill-after=30s 30m \
-      strace -f -qq -e trace=execve -o "$evidence/$name.execve" \
-      "$debz" "$@" >"$evidence/$name.json" 2>"$evidence/$name.stderr"
-    status=$?
-    set -e
-    if grep -Eq 'execve\\("(/usr)?/(s?bin/)?dpkg(-deb)?"' "$evidence/$name.execve"; then
+    timeout --signal=TERM --kill-after=30s "$duration" \
+      strace -f -qq -yy -e trace=execve,execveat -o "$evidence/$name.execve" \
+      "$@" >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
+    [[ -s "$evidence/$name.execve" ]] || {
+      echo "candidate execution trace missing for $name" >&2
+      exit 91
+    }
+    grep -Eq 'execve\("([^"]*/)?dpkg(-deb)?"|execveat\([^,]+, "([^"]*/)?dpkg(-deb)?"|execveat\([^,]*</[^>]+/dpkg(-deb)?>, ""' "$evidence/$name.execve" ||
+      audit_status=$?
+    if (( audit_status > 1 )); then
+      echo "candidate execution trace unreadable for $name" >&2
+      exit 91
+    fi
+    if (( audit_status == 0 )); then
       echo "native candidate invoked dpkg or dpkg-deb during $name" >&2
       printf 'operation=%s\nexit_status=%s\nforbidden_dpkg_exec=true\n' \
         "$name" "$status" >>"$evidence/native-exec-audit.txt"
-      return 90
+      exit 90
     fi
     printf 'operation=%s\nexit_status=%s\nforbidden_dpkg_exec=false\n' \
       "$name" "$status" >>"$evidence/native-exec-audit.txt"
-    (( status == 0 )) || return "$status"
   else
-    timeout --signal=TERM --kill-after=30s 30m "$debz" "$@" \
-      >"$evidence/$name.json" 2>"$evidence/$name.stderr"
+    timeout --signal=TERM --kill-after=30s "$duration" "$@" \
+      >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
   fi
-  [[ ! -s "$evidence/$name.stderr" ]]
+  return "$status"
+}
+
+run() {
+  local name=$1
+  shift
+  run_candidate "$name" 30m "$debz" "$@"
+  if [[ -s "$evidence/$name.stderr" ]]; then
+    local retry_check=0
+    local stderr_bytes
+    stderr_bytes=$(stat -c '%s' "$evidence/$name.stderr")
+    if [[ "$name" == refresh || "$name" == download || "$name" == create ]] &&
+      (( stderr_bytes <= 4096 )); then
+      grep -Evq '^debz acquisition retry failed_attempt=[1-6]/6 delay_ms=[1-9][0-9]{0,5} http_status=(429|500|502|503|504)$' \
+        "$evidence/$name.stderr" || retry_check=$?
+    fi
+    if (( retry_check != 1 )); then
+      echo "unexpected candidate stderr during $name" >&2
+      return 1
+    fi
+  fi
   grep -q '"exit_status":0' "$evidence/$name.json"
 }
 
 verify_result() {
   local name=$1 lock_input=$2
-  timeout --signal=TERM --kill-after=30s 10m "$debz" transaction-result verify \
+  run_candidate "$name-summary" 10m "$debz" transaction-result verify \
     --transaction-backend native --install-root "$root" --state-path "$state" \
-    --lock-input "$lock_input" --architecture "$architecture" --json \
-    >"$evidence/$name-summary.json" 2>"$evidence/$name-summary.stderr"
+    --lock-input "$lock_input" --architecture "$architecture" --json
   [[ ! -s "$evidence/$name-summary.stderr" ]]
   jq -e '.outcome == "succeeded"' "$evidence/$name-summary.json" >/dev/null
 }
 
 review_lock() {
   jq -e --arg arch "$architecture" '
+    .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
+    .version == 3 and
     .target_architecture == $arch and
     ([.packages[] | select(.name == "ubuntu-minimal")] | length) == 1 and
+    all(.packages[]; .archive_identity.primary == "sha512") and
     (.repositories | length) == 1 and
+    all(.repositories[]; .index_identity.primary == "sha512") and
     ([.repositories[].signer_fingerprints[]] | unique) ==
       ["f6ecb3762474eda9d21b7022871920d1991bc93c"]
   ' "$1" >/dev/null
@@ -197,10 +227,10 @@ printf 'download_bytes=%s\nlargest_package_bytes=%s\npackage_count=%s\nmetadata_
 run download download "${native_common[@]}" --lock-input "$lock" ubuntu-minimal
 run create install "${native_common[@]}" "${mutating[@]}" --lock-input "$lock" ubuntu-minimal
 verify_result create "$lock"
-cp "$root/var/lib/debz/native-transaction-provenance-v1.json" \
-  "$evidence/create-native-transaction-provenance-v1.json"
-cp "$root/var/lib/debz/root-operation-completion-v1.json" \
-  "$evidence/create-root-operation-completion-v1.json"
+cp "$root/var/lib/debz/native-transaction-provenance-v2.json" \
+  "$evidence/create-native-transaction-provenance-v2.json"
+cp "$root/var/lib/debz/root-operation-completion-v2.json" \
+  "$evidence/create-root-operation-completion-v2.json"
 cp "$root/var/lib/dpkg/status" "$evidence/status-after-create"
 
 awk '
@@ -219,12 +249,12 @@ printf 'lock_file_sha256=%s\nlock_document_digest=%s\n' \
   "$(sha256sum "$update_lock" | cut -d' ' -f1)" \
   "$(jq -r '.digest_sha256' "$update_lock")" >"$evidence/update-lock-identity.txt"
 before_update_provenance=$(sha256sum \
-  "$root/var/lib/debz/native-transaction-provenance-v1.json" | cut -d' ' -f1)
+  "$root/var/lib/debz/native-transaction-provenance-v2.json" | cut -d' ' -f1)
 run update upgrade-all "${native_common[@]}" "${mutating[@]}" --lock-input "$update_lock"
 jq -e '.changed == false' "$evidence/update.json" >/dev/null
 [[ "$before_update_status" == "$(sha256sum "$root/var/lib/dpkg/status" | cut -d' ' -f1)" ]]
 [[ "$before_update_provenance" == "$(sha256sum \
-  "$root/var/lib/debz/native-transaction-provenance-v1.json" | cut -d' ' -f1)" ]]
+  "$root/var/lib/debz/native-transaction-provenance-v2.json" | cut -d' ' -f1)" ]]
 printf 'changed=false\nstatus_unchanged=true\nprovenance_unchanged=true\n' \
   >"$evidence/update-zero-actions.txt"
 
@@ -238,9 +268,8 @@ value["digest_sha256"] = ("0" if value["digest_sha256"][0] != "0" else "1") + va
 path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
 PY
 set +e
-timeout --signal=TERM --kill-after=30s 10m "$debz" plan "${native_common[@]}" \
-  --lock-input "$evidence/injected-invalid.lock.json" ubuntu-minimal \
-  >"$evidence/injected-failure.json" 2>"$evidence/injected-failure.stderr"
+run_candidate injected-failure 10m "$debz" plan "${native_common[@]}" \
+  --lock-input "$evidence/injected-invalid.lock.json" ubuntu-minimal
 failure_status=$?
 set -e
 (( failure_status != 0 ))

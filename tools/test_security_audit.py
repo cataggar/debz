@@ -287,6 +287,7 @@ class SecurityAuditTests(unittest.TestCase):
                 "src/apt_system_orchestrator.zig",
                 "src/live_root.zig",
                 "src/maintainer_script.zig",
+                "src/native_unpack.zig",
                 "src/production_backend.zig",
             ],
             owners,
@@ -302,6 +303,22 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertGreater(
             apt_system_command.index("linux.fork()"),
             apt_system_command.index('\ntest "'),
+        )
+        native_unpack = sources["src/native_unpack.zig"]
+        self.assertEqual(native_unpack.count("linux.fork()"), 1)
+        self.assertGreater(
+            native_unpack.index("linux.fork()"),
+            native_unpack.index('\ntest "'),
+        )
+        self.assertLess(
+            native_unpack.index("fn testFreshDatabaseInstall("),
+            native_unpack.index("linux.fork()"),
+        )
+        self.assertLess(
+            native_unpack.index("linux.fork()"),
+            native_unpack.index(
+                '\ntest "native_unpack.test.caller-owned install initializes an absent database"'
+            ),
         )
         apt_system_orchestrator = sources["src/apt_system_orchestrator.zig"]
         self.assertEqual(apt_system_orchestrator.count("linux.fork()"), 1)

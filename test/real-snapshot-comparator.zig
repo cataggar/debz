@@ -128,16 +128,20 @@ fn validateSnapshot(value: std.json.Value) !Counts {
         !integerEquals(root.get("version"), 1))
         return error.InvalidSnapshot;
     const filesystem = try arrayLength(root.get("filesystem"));
+    if (filesystem == 0) return error.InvalidSnapshot;
     const dpkg = switch (root.get("dpkg") orelse return error.InvalidSnapshot) {
         .object => |object| object,
         else => return error.InvalidSnapshot,
     };
     if (dpkg.count() != 10 or
-        !isBool(dpkg.get("present")))
+        !isBool(dpkg.get("present")) or
+        !dpkg.get("present").?.bool)
         return error.InvalidSnapshot;
+    const status = try arrayLength(dpkg.get("status"));
+    if (status == 0) return error.InvalidSnapshot;
     return .{
         .filesystem = filesystem,
-        .status = try arrayLength(dpkg.get("status")),
+        .status = status,
         .status_old = try arrayLength(dpkg.get("status_old")),
         .info = try arrayLength(dpkg.get("info")),
         .triggers = try arrayLength(dpkg.get("triggers")),
@@ -213,7 +217,7 @@ fn equalValue(left: std.json.Value, right: std.json.Value) bool {
 
 fn fixture(comptime status: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        \\{{"schema":"{s}","version":1,"filesystem":[],"dpkg":{{"present":true,"status":[{{"package":"{s}"}}],"status_old":[],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr"}}],"dpkg":{{"present":true,"status":[{{"package":"{s}"}}],"status_old":[],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
     ,
         .{ schema, status },
     );
@@ -255,4 +259,20 @@ test "real snapshot comparator rejects one semantic difference" {
     );
     defer right.deinit();
     try std.testing.expect(!equalValue(left.value, right.value));
+}
+
+test "real snapshot comparator rejects empty and absent databases" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        fixture("installed"),
+        .{},
+    );
+    defer parsed.deinit();
+    const dpkg = parsed.value.object.getPtr("dpkg").?;
+    dpkg.object.getPtr("present").?.* = .{ .bool = false };
+    try std.testing.expectError(error.InvalidSnapshot, validateSnapshot(parsed.value));
+    dpkg.object.getPtr("present").?.* = .{ .bool = true };
+    dpkg.object.getPtr("status").?.array.items.len = 0;
+    try std.testing.expectError(error.InvalidSnapshot, validateSnapshot(parsed.value));
 }

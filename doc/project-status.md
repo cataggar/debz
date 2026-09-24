@@ -138,10 +138,11 @@ native/reference equality; shell and existing Python tooling are restricted to
 privileged execution and pinned oracle artifact preparation. The gate's
 repository-specific config explicitly binds the finite 31-day missing-expiry
 policy. The frozen Ubuntu `resolute` InRelease is dated 2026-04-23 and therefore
-returns `ReleaseExpired` before mutation. Current update pockets are incomplete
-for a fresh `ubuntu-minimal` closure, while the current complete development
-suite publishes SHA512-only Release and package identities that exact-lock v2
-does not accept. No clock override or historical replay is used.
+returns `ReleaseExpired` before mutation. The gate now pins the currently
+valid `stonking` 2026-09-23 snapshot, whose complete development suite
+publishes SHA512-only Release and package identities supported by exact-lock
+v3. No clock override, fabricated SHA256, or historical replay is used; both
+architecture parity runs remain necessary before any cutover claim.
 
 Item 14 adds private native-step journaling, persisted execution inputs, and
 recovery/provenance orchestration. Recovery consumes the original compiled

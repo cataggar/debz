@@ -11,12 +11,12 @@ on:
         description: "Pinned immutable Ubuntu snapshot URI"
         required: true
         type: string
-        default: "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z"
+        default: "https://snapshot.ubuntu.com/ubuntu/20260923T000000Z"
       ubuntu_snapshot_suite:
         description: "Pinned snapshot suite/codename"
         required: true
         type: string
-        default: "resolute"
+        default: "stonking"
       run_arm64_dpkg_oracles:
         description: "Capture pinned dpkg 1.22.22 ARM64 oracle evidence"
         required: true
@@ -1083,9 +1083,9 @@ jobs:
       - name: Test real acceptance input validation
         run: |
           tools/real-snapshot-acceptance.sh --validate-values \
-            https://snapshot.ubuntu.com/ubuntu/20260816T000000Z resolute amd64
+            https://snapshot.ubuntu.com/ubuntu/20260923T000000Z stonking amd64
           ! tools/real-snapshot-acceptance.sh --validate-values \
-            https://example.invalid resolute amd64
+            https://example.invalid stonking amd64
       - name: Run static security audit
         run: zig build security-audit
 
@@ -1391,6 +1391,16 @@ jobs:
             tools/real-snapshot-acceptance.sh "$PWD/zig-out/bin/debz" \
             "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "$ARCHITECTURE" \
             "$PWD/.real-snapshot/$ARCHITECTURE"
+      - name: Install exact closure with pinned dpkg reference
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+          REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
+        run: |
+          sudo --preserve-env=ARCHITECTURE,REFERENCE_DPKG \
+            tools/real-snapshot-reference.sh "$REFERENCE_DPKG" \
+            "$PWD/.real-snapshot/$ARCHITECTURE/evidence/ubuntu-minimal.lock.json" \
+            "$PWD/.real-snapshot/$ARCHITECTURE/cache" "$ARCHITECTURE" \
+            "$PWD/.real-snapshot/$ARCHITECTURE"
       - name: Collect diagnostics and clean staged payloads
         if: always()
         env:
@@ -1440,6 +1450,7 @@ jobs:
               "$PWD/$evidence/comparison-summary-v1.json" \
               || differential_status=$?
           else
+            differential_status=1
             printf 'compared=false\nreference_snapshot_present=%s\nnative_snapshot_present=%s\n' \
               "$([ -f "$evidence/reference.snapshot.json" ] && echo true || echo false)" \
               "$([ -f "$evidence/native.snapshot.json" ] && echo true || echo false)" |
@@ -1457,7 +1468,7 @@ jobs:
           fi
           sudo chown -R "$USER:$USER" "$evidence"
           forbidden_exec_status=0
-          if grep -Eh 'execve\("(/usr)?/(s?bin/)?dpkg(-deb)?"' \
+          if grep -Eh 'execve\("([^"]*/)?dpkg(-deb)?"|execveat\([^,]+, "([^"]*/)?dpkg(-deb)?"|execveat\([^,]*</[^>]+/dpkg(-deb)?>, ""' \
             "$evidence"/*.execve >"$evidence/forbidden-exec.txt" 2>/dev/null; then
             forbidden_exec_status=1
           else

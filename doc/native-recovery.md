@@ -401,6 +401,44 @@ overwritten. Plans that remove the target's owning package, omit the target
 from its replacement archive, or replace it with a non-regular entry are also
 refused.
 
+### Absent dpkg database bootstrap
+
+For a caller-owned native install into a selected root with **no**
+`var/lib/dpkg` entry, read-only preparation models an empty `status` and an
+`info/format` marker without writing either. Its compiled database-generation
+assertion uses a domain-separated **absent-database digest**, distinct from
+every initialized empty status generation. That digest is bound by the native
+program, execution request, caller's root-operation record, and durable native
+execution intent. An existing dpkg directory with missing status, missing
+required directories, or unimportable contents is never classified as absent;
+it is refused instead of repaired.
+
+Only after the bound execution intent and progress exist does a typed
+root-mutation plan create `var/lib/dpkg`, `info`, `updates`, `triggers`, empty
+`alternatives` and `parts` directories, empty `status`, and `info/format`
+(`1\n`). Every target has a require-absent precondition. The version-2
+bootstrap-plan digest binds the ordered path and kind of all eight targets as
+well as the program, absent generation, and format marker; recovery requires
+the matching eight-step journal and checks exact paths, modes, ownership,
+file digests, and the new directories' initial emptiness before replay
+completion. An older six-step bootstrap journal is not silently reinterpreted
+or replayed as the new plan. Foreign occupants before the bootstrap
+checkpoint, or contradictory journal evidence, block recovery rather than
+being overwritten.
+
+Once published, ordinary database capture and import take over. Archives may
+list only the **exact, already-existing** structural directories
+`var/lib/dpkg`, `info`, `updates`, `alternatives`, and `parts`: these directory
+claims record ownership but never create or change database paths or metadata.
+Other database children, alternate spellings, and non-directory claims remain
+reserved. Existing healthy roots never use the absent-database digest or
+initialization plan; roots missing either new optional directory are not
+repaired by ordinary import, and an archive claim of a missing directory is
+refused.
+
+This database initializer is separate from the package-owned trigger-helper
+bootstrap below. Neither the runner nor a shell gate seeds the dpkg database.
+
 ### Authenticated fresh-root helper bootstrap
 
 Legacy [`native-execution-request-v3`](../schema/native-execution-request-v3.json)

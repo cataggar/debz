@@ -108,9 +108,9 @@ The real-snapshot candidate is selected explicitly with
 through the default legacy executor. The opt-in `ubuntu-real-snapshot` job in
 the existing manual `.github/workflows/ci.yml` dispatch runs on
 `ubuntu-24.04` amd64 and `ubuntu-24.04-arm` arm64 against
-`https://snapshot.ubuntu.com/ubuntu/20260816T000000Z`, suite `resolute`,
-component `main`, and the explicit Ubuntu archive keyring. Inputs remain
-fixed to that reviewed snapshot.
+`https://snapshot.ubuntu.com/ubuntu/20260923T000000Z`, suite `stonking`,
+component `main`, and the explicit Ubuntu archive keyring. Inputs remain fixed to that reviewed snapshot until its signed validity
+window requires a fresh reviewed pin.
 Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
 regular, non-symlink Ubuntu archive keyring instead of installing trust material
 on the host. The authenticated lock must identify the reviewed Ubuntu 2018
@@ -120,39 +120,39 @@ an existing root is never reused or reset by this script.
 The native side begins with only an existing empty directory: no dpkg
 database, helper placeholder, package state, merged-/usr links, or private
 debz namespace is pre-created. It authenticates metadata, resolves a genuine
-v2 lock, and can bootstrap the private trigger helper only from the exact
+v3 lock, and can bootstrap the private trigger helper only from the exact
 authenticated `dpkg` archive and final owner evidence. Candidate commands are
 optionally exec-traced and fail if they launch `dpkg` or `dpkg-deb`.
 The isolated oracle is the architecture-pinned dpkg 1.22.22 payload prepared
 under `.cache`; Python is transport for that reference artifact, not the
-comparison authority. When both bounded captures exist,
-`test/real-snapshot-comparator.zig` is the canonical equality authority for the
+comparison authority. The reference step independently verifies each
+authenticated lock archive against its SHA512 CAS identity, initializes only
+the separate oracle's dpkg database, stages exact-lock interpreter/tool
+payloads for the chroot, attempts to install the closure with the pinned dpkg,
+and captures its root only on success. The candidate root is never seeded from
+the reference. A local amd64 rehearsal showed that feeding the lock's
+alphabetical package order directly to dpkg fails on `Pre-Depends`; the
+reference driver must become dependency ordered before this gate can pass.
+`test/real-snapshot-comparator.zig` is the equality authority for the bounded
 filesystem and normalized dpkg
-status/info/trigger/diversion/statoverride/alternatives sections. A missing
-reference capture is recorded as unavailable and cannot be reported as a
-successful comparison.
+status/info/trigger/diversion/statoverride/alternatives sections. Missing
+either capture or any mismatch fails the manual job; the always-run cleanup
+retains available diagnostics even after earlier failure.
 
-This gate is currently fail-closed rather than a completed parity claim.
-`resolute` is the frozen 26.04 release pocket: later snapshot timestamps retain
-the unchanged signed InRelease dated 2026-04-23 instead of re-signing it. The
-repository config now explicitly selects
+This gate is not a completed parity claim until both architecture captures
+compare successfully. The previously pinned `resolute` release is frozen with
+an InRelease dated 2026-04-23 and expired under the finite policy. The newly
+pinned `stonking` release advertises Date 2026-09-22 and Valid-Until
+2026-10-06; repository authentication must verify those signed fields
+before planning. The repository config explicitly selects
 `allow_missing_valid_until_with_max_age_seconds` with the unchanged 31-day
 maximum. That policy is part of normalized repository identity, authenticated
-snapshot provenance, and exact-lock identity. The reviewed pin therefore
-returns `ReleaseExpired` before lock resolution or root mutation.
-
-No current replacement supplies the same complete closure to the current
-architecture. The current `resolute-updates` snapshot authenticates under the
-finite policy but is only a pocket: `ubuntu-minimal` planning lacks base
-packages, beginning with `libcrypt1`. The current complete `stonking` suite has
-a signed Date and `Valid-Until`, but Canonical publishes its Release and
-Packages transport identities only as SHA512; exact-lock v2 requires the
-repository-published SHA256 package digest and refuses the index before
-planning. There is no authorized historical verification-time replay artifact.
-Full install/reinstall/upgrade/remove/purge, crash/restart, archive-evicted
-recovery, and final native/reference comparison require either a current
-complete Ubuntu snapshot retaining SHA256 package identities or a separately
-reviewed SHA512 exact-lock/acquisition version across both architectures.
+snapshot provenance, and exact-lock identity. Current exact-lock v3 and
+acquisition contracts support the SHA512-only Release, Packages, and archive
+identities published by `stonking`; no fabricated SHA256 or historical-time
+replay is allowed. Full install/reinstall/upgrade/remove/purge, crash/restart,
+archive-evicted recovery, and passing native/reference comparisons still
+require executed evidence from both architectures.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

@@ -888,6 +888,7 @@ pub const InstalledDatabase = struct {
     generation_sha256: [32]u8,
     packages: []const InstalledPackage = &.{},
     trigger_state_sha256: [32]u8 = @splat(0),
+    bootstrap_absent: bool = false,
     /// Nonempty `var/lib/dpkg/updates` is interrupted publication and requires
     /// explicit recovery before another mutation.
     updates_pending: bool = false,
@@ -1379,6 +1380,14 @@ fn sameOrigin(left: exact_lock_v2.PackageOrigin, right: exact_lock_v2.PackageOri
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+/// Domain-separated generation for a root with no dpkg directory. It cannot
+/// be confused with the digest of an initialized but empty status database.
+pub fn absentDatabaseGeneration() [32]u8 {
+    var result: [32]u8 = undefined;
+    Sha256.hash("debz-native-absent-dpkg-database-v1\x00", &result, .{});
+    return result;
+}
+
 fn updateString(hasher: *Sha256, value: []const u8) void {
     var length: [8]u8 = undefined;
     std.mem.writeInt(u64, &length, value.len, .little);
@@ -1628,6 +1637,15 @@ fn validateBinding(self: *Compiler) CompileError!void {
             .detail = self.input.unsupported_features[0],
         });
     if (self.input.installed.updates_pending)
+        return self.reject(.{ .code = .database_not_quiescent });
+    const absent = absentDatabaseGeneration();
+    if (self.input.installed.bootstrap_absent !=
+        std.mem.eql(u8, &self.input.installed.generation_sha256, &absent) or
+        (self.input.installed.bootstrap_absent and
+            (self.input.installed.packages.len != 0 or
+                authorization.foreign_architectures.len != 0 or
+                authorization.actions.len == 0 or
+                authorization.wire_version != native_authorization.schema_v2_version)))
         return self.reject(.{ .code = .database_not_quiescent });
     if (self.input.installed.packages.len > self.limits.installed_packages)
         return self.reject(.{ .code = .limit_exceeded, .detail = "installed packages" });
@@ -4234,6 +4252,17 @@ pub fn validateDocument(program: Program) DecodeError!void {
         &hex(32, transaction_recovery.rootIdentity(program.install_root)),
     )) return error.InvalidProgram;
     if (!validIdentity(program.target_architecture)) return error.InvalidIdentity;
+    const absent = hex(32, absentDatabaseGeneration());
+    if (std.mem.eql(u8, &program.installed_database.generation_sha256, &absent) and
+        (!is_v2 or program.installed_database.package_count != 0 or
+            program.foreign_architectures.len != 0 or program.steps.len < 3 or
+            program.steps[2].operation != .assert_database_generation or
+            !std.mem.eql(
+                u8,
+                &program.steps[2].operation.assert_database_generation.generation_sha256,
+                &absent,
+            )))
+        return error.InvalidProgram;
     for (program.foreign_architectures) |architecture| {
         if (!validIdentity(architecture)) return error.InvalidIdentity;
     }

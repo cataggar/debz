@@ -15,7 +15,8 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tools/real-snapshot-acceptance.sh"
-URI = "https://snapshot.ubuntu.com/ubuntu/20260816T000000Z"
+REFERENCE = ROOT / "tools/real-snapshot-reference.sh"
+URI = "https://snapshot.ubuntu.com/ubuntu/20260923T000000Z"
 SIGNER = "f6ecb3762474eda9d21b7022871920d1991bc93c"
 
 
@@ -32,6 +33,12 @@ def fixture_cli() -> int:
     with pathlib.Path(os.environ["SNAPSHOT_TEST_CALLS"]).open("a") as log:
         log.write(json.dumps(args) + "\n")
     scenario = os.environ.get("SNAPSHOT_TEST_SCENARIO", "")
+    if scenario in ("retry-log", "unexpected-stderr") and operation in ("refresh", "download"):
+        print(
+            "debz acquisition retry failed_attempt=1/6 delay_ms=2000 http_status=503"
+            if scenario == "retry-log" else "unexpected acquisition warning",
+            file=sys.stderr,
+        )
     if operation == "refresh" and scenario == "freshness-failure":
         print(json.dumps({
             "operation": "refresh",
@@ -54,9 +61,13 @@ def fixture_cli() -> int:
     if operation == "plan":
         intent = "install" if args[-1] == "ubuntu-minimal" else "upgrade-all"
         lock = lock_input or {
+            "schema": "https://debz.dev/schema/exact-closure-lock-v3",
+            "version": 3,
             "target_architecture": str(option("--architecture")),
-            "packages": [{"name": "ubuntu-minimal", "declared_size": 1}],
-            "repositories": [{"signer_fingerprints": [
+            "packages": [{"name": "ubuntu-minimal", "declared_size": 1,
+                          "archive_identity": {"primary": "sha512"}}],
+            "repositories": [{"index_identity": {"primary": "sha512"},
+                              "signer_fingerprints": [
                 "unreviewed" if scenario == "unreviewed-signer"
                 or (scenario == "unreviewed-update-signer" and intent == "upgrade-all")
                 else SIGNER
@@ -85,11 +96,11 @@ def fixture_cli() -> int:
         namespace = option("--install-root") / "var/lib/debz"
         namespace.mkdir(parents=True, exist_ok=True)
         if operation == "install":
-            write(namespace / "native-transaction-provenance-v1.json", {
+            write(namespace / "native-transaction-provenance-v2.json", {
                 "outcome": "succeeded",
                 "fixture_lock_digest": lock_input["digest_sha256"],
             })
-            write(namespace / "root-operation-completion-v1.json", {
+            write(namespace / "root-operation-completion-v2.json", {
                 "outcome": "succeeded",
                 "fixture_lock_digest": lock_input["digest_sha256"],
             })
@@ -129,12 +140,19 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         self.strace = self.directory / "strace"
         self.strace.write_text(
             "#!" + sys.executable + "\n"
-            "import pathlib, subprocess, sys\n"
+            "import os, pathlib, subprocess, sys\n"
             "args = sys.argv[1:]\n"
-            "assert args[:5] == ['-f', '-qq', '-e', 'trace=execve', '-o']\n"
-            "output = pathlib.Path(args[5])\n"
-            "command = args[6:]\n"
-            "output.write_text(f'execve(\"{command[0]}\", [...], [...]) = 0\\n')\n"
+            "assert args[:6] == ['-f', '-qq', '-yy', '-e', 'trace=execve,execveat', '-o']\n"
+            "output = pathlib.Path(args[6])\n"
+            "command = args[7:]\n"
+            "traced = os.environ.get('SNAPSHOT_TEST_EXECVE', command[0])\n"
+            "if 'injected-invalid.lock.json' in ' '.join(command):\n"
+            "    traced = os.environ.get('SNAPSHOT_TEST_INJECTED_EXECVE', traced)\n"
+            "if os.environ.get('SNAPSHOT_TEST_NO_TRACE') != '1':\n"
+            "    event = (f'execveat(3<{traced}>, \"\", [], [], AT_EMPTY_PATH) = 0\\n'\n"
+            "             if os.environ.get('SNAPSHOT_TEST_EXECVEAT') == '1'\n"
+            "             else f'execve(\"{traced}\", [...], [...]) = 0\\n')\n"
+            "    output.write_text(event)\n"
             "raise SystemExit(subprocess.run(command).returncode)\n"
         )
         self.strace.chmod(0o700)
@@ -153,7 +171,7 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         )
 
     def run_acceptance(self) -> subprocess.CompletedProcess[str]:
-        return self.run_driver(str(self.cli), URI, "resolute", self.architecture,
+        return self.run_driver(str(self.cli), URI, "stonking", self.architecture,
                                str(self.workspace))
 
     def test_explicit_keyring_requires_an_absolute_regular_non_symlink_file(self) -> None:
@@ -163,11 +181,11 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
                         pathlib.Path(self.keyring.name)):
             with self.subTest(keyring=keyring):
                 self.env["DEBZ_REAL_SNAPSHOT_KEYRING"] = str(keyring)
-                result = self.run_driver("--validate", URI, "resolute", self.architecture)
+                result = self.run_driver("--validate", URI, "stonking", self.architecture)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("explicit regular Ubuntu archive keyring", result.stderr)
         self.env["DEBZ_REAL_SNAPSHOT_KEYRING"] = str(self.keyring)
-        result = self.run_driver("--validate", URI, "resolute", self.architecture)
+        result = self.run_driver("--validate", URI, "stonking", self.architecture)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_existing_workspace_refuses_before_cli_or_mutation(self) -> None:
@@ -185,7 +203,7 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         evidence = self.workspace / "evidence"
         create = json.loads(
-            (evidence / "create-native-transaction-provenance-v1.json").read_text()
+            (evidence / "create-native-transaction-provenance-v2.json").read_text()
         )
         self.assertEqual(create["outcome"], "succeeded")
         self.assertFalse(json.loads((evidence / "update.json").read_text())["changed"])
@@ -254,10 +272,82 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(list((self.workspace / "root").iterdir()), [])
 
+    def test_traced_candidate_rejects_a_dpkg_exec_even_on_failure(self) -> None:
+        self.env["SNAPSHOT_TEST_SCENARIO"] = "freshness-failure"
+        self.env["SNAPSHOT_TEST_EXECVE"] = "/usr/bin/dpkg"
+        self.env["DEBZ_REAL_SNAPSHOT_TRACE"] = "1"
+        self.env["PATH"] = str(self.directory) + os.pathsep + self.env["PATH"]
+        result = self.run_acceptance()
+        self.assertEqual(result.returncode, 90, result.stderr)
+        evidence = self.workspace / "evidence"
+        self.assertEqual(
+            (evidence / "native-exec-audit.txt").read_text(),
+            "operation=refresh\nexit_status=4\nforbidden_dpkg_exec=true\n",
+        )
+        self.assertEqual(
+            [json.loads(line)[0] for line in self.calls.read_text().splitlines()],
+            ["refresh"],
+        )
+
+    def test_missing_candidate_trace_refuses_even_when_command_failed(self) -> None:
+        self.env["SNAPSHOT_TEST_SCENARIO"] = "freshness-failure"
+        self.env["SNAPSHOT_TEST_NO_TRACE"] = "1"
+        self.env["DEBZ_REAL_SNAPSHOT_TRACE"] = "1"
+        self.env["PATH"] = str(self.directory) + os.pathsep + self.env["PATH"]
+        result = self.run_acceptance()
+        self.assertEqual(result.returncode, 91, result.stderr)
+        self.assertIn("candidate execution trace missing", result.stderr)
+
+    def test_invalid_lock_probe_still_audits_forbidden_exec(self) -> None:
+        self.env["SNAPSHOT_TEST_INJECTED_EXECVE"] = "/opt/pinned/bin/dpkg-deb"
+        self.env["DEBZ_REAL_SNAPSHOT_TRACE"] = "1"
+        self.env["PATH"] = str(self.directory) + os.pathsep + self.env["PATH"]
+        result = self.run_acceptance()
+        self.assertEqual(result.returncode, 90, result.stderr)
+        evidence = self.workspace / "evidence"
+        self.assertIn(
+            "operation=injected-failure\nexit_status=5\nforbidden_dpkg_exec=true\n",
+            (evidence / "native-exec-audit.txt").read_text(),
+        )
+        self.assertFalse((evidence / "injected-failure.txt").exists())
+
+    def test_traced_candidate_rejects_dpkg_execveat_by_descriptor(self) -> None:
+        self.env["SNAPSHOT_TEST_SCENARIO"] = "freshness-failure"
+        self.env["SNAPSHOT_TEST_EXECVE"] = "/usr/local/bin/dpkg-deb"
+        self.env["SNAPSHOT_TEST_EXECVEAT"] = "1"
+        self.env["DEBZ_REAL_SNAPSHOT_TRACE"] = "1"
+        self.env["PATH"] = str(self.directory) + os.pathsep + self.env["PATH"]
+        result = self.run_acceptance()
+        self.assertEqual(result.returncode, 90, result.stderr)
+        self.assertIn(
+            "forbidden_dpkg_exec=true",
+            (self.workspace / "evidence/native-exec-audit.txt").read_text(),
+        )
+
     def test_failed_receipt_verification_refuses(self) -> None:
         self.env["SNAPSHOT_TEST_SCENARIO"] = "failed-verification"
         self.assertNotEqual(self.run_acceptance().returncode, 0)
         self.assertFalse((self.workspace / "evidence/create-transaction-result.json").exists())
+
+    def test_bounded_transient_retry_logs_remain_visible(self) -> None:
+        self.env["SNAPSHOT_TEST_SCENARIO"] = "retry-log"
+        result = self.run_acceptance()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for operation in ("refresh", "download"):
+            self.assertEqual(
+                (self.workspace / f"evidence/{operation}.stderr").read_text(),
+                "debz acquisition retry failed_attempt=1/6 delay_ms=2000 http_status=503\n",
+            )
+
+    def test_unexpected_stderr_refuses_after_successful_refresh(self) -> None:
+        self.env["SNAPSHOT_TEST_SCENARIO"] = "unexpected-stderr"
+        result = self.run_acceptance()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected candidate stderr during refresh", result.stderr)
+        self.assertEqual(
+            [json.loads(line)[0] for line in self.calls.read_text().splitlines()],
+            ["refresh"],
+        )
 
     def test_unreviewed_update_signer_refuses_before_update(self) -> None:
         self.env["SNAPSHOT_TEST_SCENARIO"] = "unreviewed-update-signer"
@@ -270,6 +360,38 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         self.env["SNAPSHOT_TEST_SCENARIO"] = "changed-status"
         self.assertNotEqual(self.run_acceptance().returncode, 0)
         self.assertFalse((self.workspace / "evidence/update-zero-actions.txt").exists())
+
+    def test_reference_rejects_corrupt_cached_archive_before_creating_root(self) -> None:
+        self.assertEqual(self.run_acceptance().returncode, 0)
+        lock = self.workspace / "evidence/ubuntu-minimal.lock.json"
+        document = json.loads(lock.read_text())
+        document["packages"] = [
+            {
+                "name": name,
+                "version": "1",
+                "architecture": self.architecture,
+                "declared_size": 1,
+                "archive_identity": {
+                    "primary": "sha512",
+                    "digests": [{"algorithm": "sha512", "digest": "0" * 128}],
+                },
+            }
+            for name in ("libc6", "dash", "coreutils", "dpkg")
+        ]
+        lock.write_text(json.dumps(document))
+        objects = self.workspace / "cache/packages-v2/objects"
+        objects.mkdir(parents=True)
+        (objects / ("sha512-" + "0" * 128)).write_bytes(b"x")
+        result = subprocess.run(
+            [
+                "bash", str(REFERENCE), str(self.cli), str(lock),
+                str(self.workspace / "cache"), self.architecture, str(self.workspace),
+            ],
+            cwd=self.directory, env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.workspace / "reference-root").exists())
+        self.assertFalse((self.workspace / "evidence/reference.snapshot.json").exists())
 
 
 if __name__ == "__main__":
