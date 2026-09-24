@@ -12877,7 +12877,7 @@ fn materializeRemoval(
         try collectRemovalTriggerEvents(sink, database.model, ownership, diversions, intents.items);
         try persistRuntimeTriggerEvents(
             request.execution orelse return error.InvalidLifecycleProgram,
-            sink.allocator,
+            allocator,
             request.root,
             sink.events.items,
         );
@@ -15097,13 +15097,17 @@ fn restoreRuntimeTriggerEvents(
 }
 
 fn collectArchiveTriggerEvents(
-    allocator: std.mem.Allocator,
+    temporary_allocator: std.mem.Allocator,
+    event_allocator: std.mem.Allocator,
     root: root_fs.Root,
     architecture: []const u8,
     model: *const archive_application.Model,
     events: *std.ArrayList(RuntimeTriggerEvent),
     diversion_records: ?[]const package_database.DiversionRecord,
 ) !void {
+    var arena = std.heap.ArenaAllocator.init(temporary_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
@@ -15124,7 +15128,7 @@ fn collectArchiveTriggerEvents(
     for (model.triggers) |declaration| {
         if (declaration.kind != .activate) continue;
         try appendRuntimeTriggerEvent(
-            allocator,
+            event_allocator,
             events,
             source,
             declaration.target,
@@ -15150,7 +15154,7 @@ fn collectArchiveTriggerEvents(
         if ((try seen_file.getOrPut(allocator, interest.trigger)).found_existing)
             continue;
         try appendRuntimeTriggerEvent(
-            allocator,
+            event_allocator,
             events,
             source,
             interest.trigger,
@@ -16720,7 +16724,7 @@ fn lifecycleIncorporateTriggerQueue(
     if (activation_log) |log|
         try persistRuntimeTriggerEvents(
             execution,
-            activation_allocator orelse return error.InvalidLifecycleProgram,
+            allocator,
             root,
             log.items,
         );
@@ -20556,6 +20560,7 @@ fn frozenStatOverrides(
 
 fn prepareNativeRecovery(
     allocator: std.mem.Allocator,
+    runtime_allocator: std.mem.Allocator,
     root: root_fs.Root,
     external: ExternalLifecycleRequest,
     compiled: *const CompiledLifecycle,
@@ -20977,7 +20982,7 @@ fn prepareNativeRecovery(
         false,
     );
     return .{
-        .allocator = allocator,
+        .allocator = runtime_allocator,
         .root = root,
         .intent_sha256 = intent.digest_sha256,
         .crash = .{ .selected = external.crash_at },
@@ -25090,7 +25095,7 @@ fn executeLifecycleProgramWithRequest(
     const execution = &execution_state;
     if (recovery_intent) |intent| {
         recovery_runtime = .{
-            .allocator = scratch,
+            .allocator = allocator,
             .root = root,
             .intent_sha256 = intent.digest_sha256,
             .crash = .{ .selected = external.crash_at },
@@ -25219,6 +25224,7 @@ fn executeLifecycleProgramWithRequest(
         try execution.checkDeadline();
         recovery_runtime = try prepareNativeRecovery(
             scratch,
+            allocator,
             root,
             external,
             compiled,
@@ -25657,6 +25663,7 @@ fn executeLifecycleProgramWithRequest(
                         const model_index = lifecycleArchiveIndex(models, intent.package) orelse
                             return error.InvalidLifecycleProgram;
                         try collectArchiveTriggerEvents(
+                            allocator,
                             scratch,
                             root,
                             program.target_architecture,
@@ -25664,7 +25671,7 @@ fn executeLifecycleProgramWithRequest(
                             &trigger_events,
                             if (publication_diversions) |cache| cache.records else null,
                         );
-                        try persistRuntimeTriggerEvents(execution, scratch, root, trigger_events.items);
+                        try persistRuntimeTriggerEvents(execution, allocator, root, trigger_events.items);
                         const trigger_step = for (program.steps) |candidate| {
                             if (candidate.operation == .process_deferred_triggers) break candidate;
                         } else return error.InvalidLifecycleProgram;
@@ -25778,6 +25785,7 @@ fn executeLifecycleProgramWithRequest(
                     &models[model_index].digest,
                 )) return error.InvalidLifecycleProgram;
                 try collectArchiveTriggerEvents(
+                    allocator,
                     scratch,
                     root,
                     program.target_architecture,
@@ -25785,8 +25793,10 @@ fn executeLifecycleProgramWithRequest(
                     &trigger_events,
                     if (publication_diversions) |cache| cache.records else null,
                 );
+                var route_arena = std.heap.ArenaAllocator.init(allocator);
+                defer route_arena.deinit();
                 if (try activeRouteSettlement(
-                    scratch,
+                    route_arena.allocator(),
                     root,
                     execution,
                     program,
@@ -25802,7 +25812,7 @@ fn executeLifecycleProgramWithRequest(
                     );
                 try persistRuntimeTriggerEvents(
                     execution,
-                    scratch,
+                    allocator,
                     root,
                     trigger_events.items,
                 );
@@ -31412,8 +31422,9 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             try native_execution_request.encode(arena.allocator(), document);
         var diversion_cache = try native_diversion.Session.open(testing.allocator, root);
         defer diversion_cache.deinit();
-        _ = try prepareNativeRecovery(
+        const prepared = try prepareNativeRecovery(
             arena.allocator(),
+            testing.allocator,
             root,
             productionLifecycleRequest(document, null),
             &compiled,
@@ -31428,6 +31439,13 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             null,
             null,
         );
+        try testing.expect(prepared.allocator.ptr == testing.allocator.ptr);
+        try testing.expect(prepared.allocator.vtable == testing.allocator.vtable);
+        const capacity_before = arena.queryCapacity();
+        for (0..64) |_| {
+            _ = try prepared.latest(nativeAction(.verification, 0, 0, 0));
+        }
+        try testing.expectEqual(capacity_before, arena.queryCapacity());
         try testing.expect(try root.entryIfExists(try root_fs.Path.init("usr/share/app")) == null);
         var refused = try Runtime.report(testing.allocator, &caller, .{
             .outcome = .handoff,
@@ -33986,6 +34004,77 @@ test "native_unpack.test.removal triggers preserve every interested identity" {
         snapshot,
         .{ .max_deferred = 1 },
     ), .deferred_limit);
+}
+
+test "native_unpack.test.trigger discovery releases database snapshots between packages" {
+    const status =
+        \\Package: consumer
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: consumer
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "consumer.list", .bytes = "/.\n" },
+        .{ .name = "consumer.triggers", .bytes = "interest repaint\n" },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    try seedFile(fixture.root(), "var/lib/dpkg/triggers/repaint", "consumer\n");
+    var model: archive_application.Model = undefined;
+    model.facts = .{
+        .package = "emitter",
+        .version = "1",
+        .architecture = "amd64",
+        .essential = false,
+        .protected = false,
+        .important = false,
+        .multi_arch = .no,
+        .priority = null,
+        .installed_size = null,
+    };
+    model.triggers = &.{};
+    model.files = &.{};
+    var retained = std.heap.ArenaAllocator.init(testing.allocator);
+    defer retained.deinit();
+    var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    defer events.deinit(retained.allocator());
+    for (0..16) |_| {
+        try collectArchiveTriggerEvents(
+            testing.allocator,
+            retained.allocator(),
+            fixture.root(),
+            "amd64",
+            &model,
+            &events,
+            null,
+        );
+    }
+    try testing.expectEqual(@as(usize, 0), retained.queryCapacity());
+    try testing.expectEqual(@as(usize, 0), events.items.len);
+    var triggers = [_]archive_application.Trigger{.{
+        .directive = .activate,
+        .kind = .activate,
+        .await_policy = .awaited,
+        .target_kind = .name,
+        .target = "repaint",
+    }};
+    model.triggers = &triggers;
+    try collectArchiveTriggerEvents(
+        testing.allocator,
+        retained.allocator(),
+        fixture.root(),
+        "amd64",
+        &model,
+        &events,
+        null,
+    );
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqualStrings("repaint", events.items[0].trigger);
+    try testing.expectEqualStrings("consumer", events.items[0].listeners[0].package.name);
 }
 
 test "native_unpack.test.Config-Version is preserved for an unpacked upgrade" {

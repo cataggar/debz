@@ -183,6 +183,24 @@ This interrupted root is retained, not reused. Neither an amd64 completed
 closure nor an arm64 native/reference comparison has passed yet; the manual
 parity gate remains fail-closed.
 
+A subsequent fresh-root replay was stopped at step 566 when the installer
+reached over 31 GiB resident memory. Progress journal reads and appends were
+using a lifecycle-long scratch arena, accumulating whole-history temporary
+allocations across steps. An initial progress-allocator-only rerun still grew
+past 14 GiB by step 530; unpack trigger discovery also retained temporary
+whole-database snapshots and route-settlement allocations across packages.
+A second rerun with scoped trigger snapshots also reached 14 GiB: the CLI
+still passed its process-lifetime argument arena to the native backend, so
+deferred frees could not return memory. Native CLI execution now uses the
+deallocating process allocator for native runtime phases, retaining the
+command arena for API results; transient progress and trigger work is scoped
+separately. A fresh-root replay then passed step 665: the
+`init-system-helpers` postinst exited successfully. Its sampled peak resident
+memory stayed below 566 MiB through step 708, where `mawk`'s postinst stopped
+before launch with `InvalidAlternativesTool`. That interrupted root is
+retained, not reused; neither completed closure nor native/reference parity
+has been established.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
