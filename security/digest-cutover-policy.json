@@ -42,15 +42,15 @@
       "sha512": "79c6bcf196509e66add2d7b4ba5914d0743c9c30d90da3a9ec2aaec771ed986da2035f13e44647b8fe3f18bab456b81b78ee9298dd7e893209d11616532c8134"
     },
     "findings": {
-      "count": 20276,
+      "count": 20287,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
         "fixed_64_hex": 171,
-        "raw_32_byte": 1065,
-        "sha256_token": 18741
+        "raw_32_byte": 1066,
+        "sha256_token": 18751
       },
-      "sha512": "ac60ffb6bccd480c4052bd6b9602ef88e48f3384c174c2dcf6544f8c3558069f5f02e08ae53e43cdee2d245247761303ed99e867cc64ff1022941cd6627f9bcc"
+      "sha512": "239d2eaee6c28c4f6f2c497bd89ddb1a161eb3e19185efc1cd004f13d273deb89f9090c51529d0e6ab1b34ced33b3178d21af065c7319679cee93814b487b68b"
     },
     "classifications": [
       {
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 153,
+        "count": 155,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 122
+          "sha256_token": 124
         },
-        "sha512": "ee2f1d4daa373475e469f59928a691394a8f48b14d0064cb21fc4d5ccb902e64f621436e91c22e9d817b9c5da362c44c35f8bff12603045e3f2a090530926045"
+        "sha512": "7708af5e49c00f5545bffd0db403131026e19d49e096d93061e8a24903bcae4dbe460b56b7fdea2e2cf0eade466ea90bc48088559df0b6128c5708a15ec7c1c8"
       },
       {
         "scope": "fuzz",
@@ -155,15 +155,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes and versioned compatibility readers.",
-        "count": 11978,
+        "count": 11987,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1059,
-          "sha256_token": 10772
+          "raw_32_byte": 1060,
+          "sha256_token": 10780
         },
-        "sha512": "623b0f206abcc5de1356718ddf8cb9bc8b1863003b45ae394081671aeaf3f1c3094115e07455502bfad0a88197280056ed01d373e3fecf00d6408d1d62f99680"
+        "sha512": "bff1c3e228da6409be2af39d65b534870dbd11366df2f617024470bb25bad5826640a24b261d6be8ffb2ce5a95f54662dd135aaa1981f34d6c43bd9dd93b9a85"
       },
       {
         "scope": "test",

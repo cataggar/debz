@@ -201,6 +201,29 @@ before launch with `InvalidAlternativesTool`. That interrupted root is
 retained, not reused; neither completed closure nor native/reference parity
 has been established.
 
+A subsequent authenticated fresh-root replay with the exact amd64
+`dpkg` 1.23.7ubuntu2 `update-alternatives` pin and staged
+`README.dpkg-new` guard passed step 708: `mawk`'s postinst exited
+successfully. It reached step 822, where `base-files`' preinst also
+exited successfully, then refused its unpack with
+`recovery_required: ownership_conflict`. The incoming archive claims
+`/lib -> usr/lib`, but the already-installed `ubuntu-pro-client` lists
+`/lib` as an owned directory on the same merged-/usr root. The
+sampled peak resident memory was 872.4 MiB. This interrupted root is
+retained, not reused. An exact, journal-guarded sharing rule for a
+byte-identical structural alias claim addresses that refusal, but it
+still requires a new replay on the rebased combined code.
+
+That new authenticated replay passed the former step-823 ownership
+refusal: `base-files` unpack published its exact archive payload, and
+configuration proceeded to step 852. Its postinst then exited 1 with
+`chown: invalid user: 'root:root'`. The fresh root has no
+`etc/passwd` or `etc/group` yet; this transaction schedules
+`base-passwd`'s unpack after this configuration barrier. Sampled peak
+resident memory stayed below 883 MiB. This interrupted root is
+retained, not reused. A completed closure and native/reference parity
+still require a correctly ordered fresh-root replay.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

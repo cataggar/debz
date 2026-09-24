@@ -428,7 +428,8 @@ For each claimed path, the planner records one disposition:
   `Replaces` authorizes the current owner;
 - `replace_retired` when every current owner drops the path in the same
   authorized transaction;
-- `share_directory` for legitimate directory co-ownership; or
+- `share_directory` for legitimate directory co-ownership or a byte-identical
+  merged-/usr alias symlink claim with an existing canonical directory; or
 - `share_multi_arch` for a `Multi-Arch: same` sibling with byte-identical
   effective content and metadata.
 

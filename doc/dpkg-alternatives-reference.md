@@ -7,6 +7,22 @@ limited to the pinned architectures, tool digests, bounded literal script
 commands, typed canonical records, and authenticated root topology described
 below; all state outside that boundary remains fail-closed.
 
+The 2026-09-23 Ubuntu `stonking` amd64 snapshot has a separate executable
+pin for `dpkg` 1.23.7ubuntu2. Its authenticated exact lock names the archive
+SHA-512
+`e2de124c6741eddc498badd81b0bf0fee0845e617d81e90ca8cb28dba16946cd23a193cc5e67dbc3dc50f3f9b0b6eab31318a9172b69282586d8bdc20fc9f19c`;
+the archive's `usr/bin/update-alternatives` has SHA-256
+`3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d`.
+The installed file must still be root-owned, mode 0755, single-linked, and
+exactly match that digest. This additional identity does not change the
+dpkg 1.22.22 reference observations below or admit an arm64 snapshot tool.
+Before `dpkg` is configured on a fresh root, its authenticated alternatives
+README conffile can be staged as `etc/alternatives/README.dpkg-new`. Native
+capture admits only this spelling and the existing `README` spelling with the
+reviewed 100-byte SHA-256, root ownership, mode 0644, and one link. Both
+paths remain in the managed script checkpoint; other staged names, unexpected
+content, and metadata changes still fail closed.
+
 The canonical result is
 `tools/fixtures/vendor-state/dpkg-alternatives-reference-v1.json`, validated by
 `schema/dpkg-alternatives-reference-v1.json`. It binds:
