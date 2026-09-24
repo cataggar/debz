@@ -31,8 +31,9 @@ before the next phase or script launch.
 Unpack trigger discovery similarly frees each database snapshot after copying
 only the trigger events needed for later phases; route-settlement reconciliation
 and trigger-event publication use temporary allocation scopes.
-The CLI supplies its deallocating process allocator for native execution;
-its argument-parsing arena cannot reclaim phase-local allocations.
+The CLI supplies its deallocating process allocator to native preparation,
+execution and recovery while keeping API result ownership in its
+argument-parsing arena. The latter cannot reclaim phase-local allocations.
 
 Filesystem and database repair delegates to the existing
 [root mutation layer](root-mutation.md). Missing, corrupt, mismatched, or

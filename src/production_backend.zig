@@ -221,6 +221,8 @@ const RepositoryOptions = struct {
 pub const Backend = struct {
     io: std.Io,
     transaction_backend: transaction_engine.Kind = .legacy_dpkg,
+    /// Native phase work can outlive the caller's result-allocation arena.
+    native_runtime_allocator: ?std.mem.Allocator = null,
     legacy_execution_capable: bool = true,
     root_projection: ?*const live_root.Projection = null,
     executor: Executor = .legacy_dpkg,
@@ -249,6 +251,10 @@ pub const Backend = struct {
     pub fn execute(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
         return self.route(allocator, request) catch |err|
             mapRuntimeError(request.operation, err);
+    }
+
+    fn nativeRuntimeAllocator(self: *const Backend, allocator: std.mem.Allocator) std.mem.Allocator {
+        return self.native_runtime_allocator orelse allocator;
     }
 
     /// Executes the internal semantic-operation/mode contract. Planning and
@@ -766,11 +772,11 @@ pub const Backend = struct {
                     !std.mem.eql(u8, &attempt.record().request_sha256, &productRequestDigest(original_request))))
                 return blockedRecovery(.recover, "native workflow recovery does not match the original operation, selectors, and request policy");
         }
-        if (try native_runtime.canAbandon(allocator, attempt)) {
+        if (try native_runtime.canAbandon(self.nativeRuntimeAllocator(allocator), attempt)) {
             try guard.abandonNativeIfSafe();
             return success(.recover, false, "no native execution requires recovery", &.{});
         }
-        var report = native_runtime.recover(allocator, attempt) catch |err|
+        var report = native_runtime.recover(self.nativeRuntimeAllocator(allocator), attempt) catch |err|
             return nativeFailure(.recover, err, attempt.record().mutation_started);
         defer report.deinit();
         return self.finishNative(allocator, request, &guard, report, null) catch |err|
@@ -785,7 +791,6 @@ pub const Backend = struct {
         report: native_runtime.Report,
         install_evidence: ?api.NativeInstallEvidence,
     ) !api.Result {
-        _ = self;
         const attempt = guard.active().?;
         if (report.outcome == .refused or report.outcome == .recovery_required) {
             var failure = api.failure(
@@ -886,7 +891,7 @@ pub const Backend = struct {
             guard.preserve_settled = true;
             try guard.crash(.before_deferred_recovery_return);
         } else {
-            try native_runtime.acknowledge(allocator, attempt, receipt.digest_sha256);
+            try native_runtime.acknowledge(self.nativeRuntimeAllocator(allocator), attempt, receipt.digest_sha256);
             try guard.crash(.after_native_acknowledged);
             if (guard.orchestration_id == null) {
                 try attempt.clear();
@@ -1490,7 +1495,7 @@ pub const Backend = struct {
             const archives = try allocator.alloc([]const u8, verified.items.len);
             defer allocator.free(archives);
             for (verified.items, archives) |package, *bytes| bytes.* = package.bytes;
-            var preparation = try native_runtime.prepare(allocator, .{
+            var preparation = try native_runtime.prepare(self.nativeRuntimeAllocator(allocator), .{
                 .attempt = guard.active().?,
                 .plan = plan,
                 .exact_lock = native_lock orelse return error.NativeExactLockRequired,
@@ -1515,7 +1520,7 @@ pub const Backend = struct {
                 ),
             };
             const planned = try planResult(allocator, request.operation, plan.*);
-            var report = try native_runtime.execute(allocator, .{
+            var report = try native_runtime.execute(self.nativeRuntimeAllocator(allocator), .{
                 .attempt = guard.active().?,
                 .prepared = prepared,
                 .archives = archives,
@@ -2738,7 +2743,7 @@ pub const Backend = struct {
             .adopted = true,
             .bridge = .none,
         };
-        var receipt = try native_runtime.readCompletion(allocator, &borrowed) orelse
+        var receipt = try native_runtime.readCompletion(self.nativeRuntimeAllocator(allocator), &borrowed) orelse
             return error.NativeReceiptRequired;
         defer receipt.deinit();
         const digest = native_recovery.parseDigest(receipt.document.digest_sha256) orelse
@@ -2749,7 +2754,7 @@ pub const Backend = struct {
             !std.mem.eql(u8, &digest, &completion.transaction_provenance.document_sha256.?) or
             completion.outcome != expected_outcome)
             return error.InvalidNativeCompletion;
-        try native_runtime.acknowledge(allocator, &borrowed, receipt.document.digest_sha256);
+        try native_runtime.acknowledge(self.nativeRuntimeAllocator(allocator), &borrowed, receipt.document.digest_sha256);
         if (self.completion_crash) |crash| try crash.hit(.after_native_acknowledged);
     }
 

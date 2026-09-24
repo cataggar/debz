@@ -192,8 +192,9 @@ whole-database snapshots and route-settlement allocations across packages.
 A second rerun with scoped trigger snapshots also reached 14 GiB: the CLI
 still passed its process-lifetime argument arena to the native backend, so
 deferred frees could not return memory. Native CLI execution now uses the
-deallocating process allocator, and transient progress and trigger work is
-scoped separately. A fresh-root replay then passed step 665: the
+deallocating process allocator for native runtime phases, retaining the
+command arena for API results; transient progress and trigger work is scoped
+separately. A fresh-root replay then passed step 665: the
 `init-system-helpers` postinst exited successfully. Its sampled peak resident
 memory stayed below 566 MiB through step 708, where `mawk`'s postinst stopped
 before launch with `InvalidAlternativesTool`. That interrupted root is

@@ -390,12 +390,9 @@ pub fn main(init: std.process.Init) !void {
     var backend_context: debz.ProductionBackend = .{
         .io = init.io,
         .transaction_backend = parsed.transaction_backend,
+        .native_runtime_allocator = if (parsed.transaction_backend == .native) init.gpa else null,
     };
-    const execution_allocator = if (parsed.transaction_backend == .native)
-        init.gpa
-    else
-        init.arena.allocator();
-    const result = api.execute(execution_allocator, request, .{
+    const result = api.execute(init.arena.allocator(), request, .{
         .context = &backend_context,
         .executeFn = debz.ProductionBackend.executeOpaque,
     }) catch {
