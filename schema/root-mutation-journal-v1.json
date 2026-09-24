@@ -150,6 +150,7 @@
             "publish_hard_link",
             "create_directory",
             "set_metadata",
+            "assert_case_sensitive",
             "remove_path",
             "remove_directory"
           ]

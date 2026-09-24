@@ -168,13 +168,20 @@ replay is allowed. Full install/reinstall/upgrade/remove/purge, crash/restart,
 archive-evicted recovery, and passing native/reference comparisons still
 require executed evidence from both architectures.
 
-The current native offline replay remains fail-closed at `libpam-runtime`:
-its authenticated archive owns both `PAM.7.gz` and the `pam.7.gz` symlink in
-the same directory. Pinned dpkg installs both on a case-sensitive root, while
-a casefold ext4 probe cannot unpack them. Native cannot merely waive its
-case-alias check: crash recovery must first bind a case-sensitive directory
-proof and both publications to the journal, with no-replace semantics. This
-blocker must be resolved before publishing the real-snapshot parity gate.
+The authenticated amd64 offline replay now publishes `libpam-runtime`'s
+`PAM.7.gz` file and `pam.7.gz` symlink as two distinct entries in their
+existing case-sensitive directory. Each publication has a journal-bound,
+read-only exact-parent witness and atomic no-replace semantics. A real
+casefold-ext4 Zig regression refuses the same pair before mutation; Zig
+crash tests restore both spellings across the two publications. Later
+packages may retain the installed pair only when its one untouched owner
+and two distinct on-disk inodes are observed again. The replay proceeded
+past the remaining unpack steps but stopped during configuration step 665:
+the `init-system-helpers` postinst launcher recorded `setup_failed` at
+`fork` (`ENOMEM`), followed by `recovery_required: invalid_transition`.
+This interrupted root is retained, not reused. Neither an amd64 completed
+closure nor an arm64 native/reference comparison has passed yet; the manual
+parity gate remains fail-closed.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

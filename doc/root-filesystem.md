@@ -92,6 +92,9 @@ Replacing an existing path is possible only through atomic publication:
   `OverwritePolicy.fail_if_exists` requires a non-replacing rename; when the
   filesystem cannot perform one, publication fails with
   `error.AtomicPublicationUnsupported` instead of falling back to a racy check.
+  A guarded `renameWithParent` checks the opened destination directory's
+  device and inode against the journal-bound parent before the same atomic
+  rename; a replaced parent fails with `error.ParentChanged`.
 
 Permissions are applied explicitly after creation so that the published mode
 does not depend on the process umask.

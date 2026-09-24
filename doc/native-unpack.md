@@ -529,13 +529,22 @@ SHA-256, and MD5 are resolved once, and every hard link reuses that effective
 record. Chain/cycle/depth checks remain explicit even though the current
 archive validator permits only an earlier regular target.
 
-Item 10a has no authenticated casefold capability, so it indexes every prefix
-of every final claim, synthesized ancestor, installed ownership path,
-conffile, merged alias, and reserved database path. Distinct ASCII-folded
-spellings, all non-ASCII payload/ownership spellings, and case-insensitive
-variants of `var/lib/dpkg` are refused. Typed prefix requirements also reject
-an exact non-directory where another final path requires a directory. Host
-lookup behavior is never used as proof of target-root case semantics.
+The planner indexes every prefix of every final claim, synthesized ancestor,
+installed ownership path, conffile, merged alias, and reserved database path.
+Only two fresh leaf names from the same authenticated package, both regular
+files or symlinks in the same exact directory, may share an ASCII-folded
+spelling. Native materialization then requires a journaled, read-only
+case-sensitivity guard for that directory immediately before **each** member
+is published. It selects an existing, unchanged regular-file witness in the
+directory and requires a differently cased lookup of that witness to be
+absent; if no bounded witness exists, it refuses instead of creating an
+untracked probe. An already installed pair may remain for an unrelated
+package only when both exact spellings have the same untouched database
+owner and still resolve to distinct inodes; it never authorizes a new claim
+or an upgrade of either member. Cross-package, ancestor, third-spelling,
+non-ASCII, and database-namespace aliases remain refused. Typed prefix
+requirements also reject an exact non-directory where another final path
+requires a directory.
 Folded keys are produced in bounded scratch storage, looked up before
 allocation, and retained only once in planner-owned temporary memory. Repeated
 shared prefixes therefore consume fixed case-index memory rather than growing

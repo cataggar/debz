@@ -1299,10 +1299,28 @@ pub const Root = struct {
 
     /// Renames within the same root. Neither final component is followed.
     pub fn rename(self: Root, old: Path, new: Path, policy: OverwritePolicy) !void {
+        return self.renameWithParent(old, new, policy, null);
+    }
+
+    /// Pins the destination directory at the rename syscall and refuses a
+    /// replacement since the caller's journal-bound observation.
+    pub fn renameWithParent(
+        self: Root,
+        old: Path,
+        new: Path,
+        policy: OverwritePolicy,
+        expected_parent: ?struct { device: u64, inode: u64 },
+    ) !void {
         var old_parent = try self.openParent(old);
         defer old_parent.close(self.io);
         var new_parent = try self.openParent(new);
         defer new_parent.close(self.io);
+        if (expected_parent) |expected| {
+            const observed = try entryAt(self.io, new_parent.dir, "");
+            if (!observed.modeled or observed.device != expected.device or
+                observed.inode != expected.inode)
+                return error.ParentChanged;
+        }
         switch (policy) {
             .replace => try old_parent.dir.rename(
                 old_parent.leaf,
@@ -2091,6 +2109,38 @@ test "root_fs.test.removal and rename operate on links, not their targets" {
     const bytes = try root.readFileAlloc(testing.allocator, try testPath("renamed"), 4096);
     defer testing.allocator.free(bytes);
     try testing.expectEqualStrings("other", bytes);
+}
+
+test "root_fs.test.guarded rename pins the exact destination parent" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+    const parent = try testPath("destination");
+    try root.createDirectory(parent, default_directory_permissions);
+    const original = try root.entry(parent);
+    const staged = try testPath("staged");
+    try root.publishFile(staged, "payload\n", .{});
+    try root.rename(parent, try testPath("old-destination"), .fail_if_exists);
+    try root.createDirectory(parent, default_directory_permissions);
+    const target = try testPath("destination/file");
+    try testing.expectError(error.ParentChanged, root.renameWithParent(
+        staged,
+        target,
+        .fail_if_exists,
+        .{ .device = original.device, .inode = original.inode },
+    ));
+    try testing.expect(try root.entryIfExists(staged) != null);
+    try testing.expect(try root.entryIfExists(target) == null);
+    const replacement = try root.entry(parent);
+    try root.renameWithParent(
+        staged,
+        target,
+        .fail_if_exists,
+        .{ .device = replacement.device, .inode = replacement.inode },
+    );
+    const bytes = try root.readFileAlloc(testing.allocator, target, 64);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("payload\n", bytes);
 }
 
 test "root_fs.test.pinned read observations reject substituted names" {
