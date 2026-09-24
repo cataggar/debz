@@ -1440,6 +1440,7 @@ jobs:
           differential_status=0
           sudo python3 tools/native-differential.py capture \
             --root "$PWD/$work/root" \
+            --exclude dev/null \
             --output "$PWD/$evidence/native.snapshot.json" \
             || differential_status=$?
           if [ -f "$evidence/reference.snapshot.json" ] &&

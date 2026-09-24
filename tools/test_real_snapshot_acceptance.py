@@ -86,6 +86,11 @@ def fixture_cli() -> int:
                 f"Architecture: {option('--architecture')}\nVersion: 1.0\n"
                 "Description: offline driver fixture\n\n"
             )
+            info = status.parent / "info"
+            info.mkdir(exist_ok=True)
+            (info / "ubuntu-minimal.list").write_text(
+                "/.\n/usr\n" + ("/dev/null\n" if scenario == "owned-excluded-device" else "")
+            )
         elif scenario == "changed-status":
             status.write_text(status.read_text().replace("Version: 1.0", "Version: 2.0"))
         write(option("--state-path") / "transaction-result.json", {
@@ -360,6 +365,13 @@ class RealSnapshotAcceptanceTests(unittest.TestCase):
         self.env["SNAPSHOT_TEST_SCENARIO"] = "changed-status"
         self.assertNotEqual(self.run_acceptance().returncode, 0)
         self.assertFalse((self.workspace / "evidence/update-zero-actions.txt").exists())
+
+    def test_candidate_rejects_package_owned_excluded_device(self) -> None:
+        self.env["SNAPSHOT_TEST_SCENARIO"] = "owned-excluded-device"
+        result = self.run_acceptance()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("candidate package claims excluded chroot device", result.stderr)
+        self.assertFalse((self.workspace / "evidence/update.json").exists())
 
     def test_reference_rejects_corrupt_cached_archive_before_creating_root(self) -> None:
         self.assertEqual(self.run_acceptance().returncode, 0)

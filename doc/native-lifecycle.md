@@ -46,6 +46,18 @@ restored on upgrade unwind, and removed before purge postrm. Native execution
 never calls it or invokes apt, debconf, or frontend behavior. No other
 active/unknown metadata support is implied.
 
+Bootstrap extraction can publish several packages' control files before any
+configure callback. Its single dpkg staging slot is serialized: each package's
+authenticated config is staged, published unchanged to its installed `info/`
+member with that package's payload, then removed with `tmp.ci/` through a
+separate authorized, journaled native phase before the next bootstrap package
+stages its config. Later postinst callbacks use the installed member, not the
+shared staging slot. Recovery does not stage a completed package again:
+completed publication and cleanup progress must be present and the installed
+member must still match the authenticated bytes and metadata. An occupied slot
+without the expected owner, or missing/changed control evidence, is refused;
+the same rules for ordinary healthy-root unpack remain in force.
+
 The separate [amd64 and arm64 direct-dpkg config reference](integration-roots.md)
 closes the dpkg side of that boundary for the seven pinned vendor `*.config`
 identities on both admitted architectures. Pinned dpkg 1.22.22 never invokes

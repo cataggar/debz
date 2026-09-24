@@ -708,6 +708,21 @@ mode, ownership, or deletion drift without changing package state or the
 helper. Unknown preinst outcomes retain exact `tmp.ci/config`; unknown postinst
 outcomes retain the published info member and no staged config.
 
+In a bootstrap closure with multiple config-bearing archives, `tmp.ci/config`
+is owned by only one package at a time. Each bootstrap program step records
+staging as its native database substep 0, payload/control publication as
+filesystem substep 1, and exact-slot removal as database substep 2. Removal
+uses the caller's existing authorized root-operation intent and its own typed
+root-mutation journal; the next package cannot stage until that phase completes.
+After a crash during staging, publication, or removal, mutation recovery
+settles the active journal first. Replaying an already-cleared step requires
+completed publication and removal progress and verifies its installed config
+against the authenticated archive; it neither restages nor removes a later
+package's slot. A not-yet-cleared step still requires its own exact staged
+config; missing, foreign or changed bytes/mode/ownership remain refusals.
+This serialization does not move or invoke config scripts or change configure
+callback ordering.
+
 Caller-owned core cases also cover conffile purge and fresh/upgraded
 configuration retry, including partial database publication, prepared/recorded
 postrm and postinst outcomes, failed purge and its subsequent trigger work,

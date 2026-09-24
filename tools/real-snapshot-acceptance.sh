@@ -232,6 +232,12 @@ cp "$root/var/lib/debz/native-transaction-provenance-v2.json" \
 cp "$root/var/lib/debz/root-operation-completion-v2.json" \
   "$evidence/create-root-operation-completion-v2.json"
 cp "$root/var/lib/dpkg/status" "$evidence/status-after-create"
+device_claim=0
+grep -Fqx '/dev/null' "$root/var/lib/dpkg/info/"*.list || device_claim=$?
+if (( device_claim != 1 )); then
+  echo "candidate package claims excluded chroot device" >&2
+  exit 1
+fi
 
 awk '
   /^Package: / { package=$2 }

@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
     const candidate_counts = try validateSnapshot(candidate.value);
     if (!std.meta.eql(reference_counts, candidate_counts))
         return error.SnapshotCountMismatch;
-    if (!equalValue(reference.value, candidate.value))
+    if (!try equalSnapshots(allocator, reference.value, candidate.value))
         return error.SnapshotMismatch;
 
     const summary: Summary = .{
@@ -215,12 +215,208 @@ fn equalValue(left: std.json.Value, right: std.json.Value) bool {
     };
 }
 
+const volatile_unowned_files = [_][]const u8{
+    "etc/machine-id",
+    "var/cache/ldconfig/aux-cache",
+    "var/log/alternatives.log",
+};
+
+fn equalSnapshots(
+    allocator: std.mem.Allocator,
+    reference: std.json.Value,
+    candidate: std.json.Value,
+) !bool {
+    const left = reference.object;
+    const right = candidate.object;
+    const left_dpkg = left.get("dpkg").?;
+    if (!equalValue(left_dpkg, right.get("dpkg").?) or
+        !equalValue(left.get("trace").?, right.get("trace").?))
+        return false;
+
+    var owned = std.StringHashMap(void).init(allocator);
+    defer owned.deinit();
+    for (left_dpkg.object.get("info").?.array.items) |item| {
+        if (item != .object) return error.InvalidSnapshot;
+        const record = item.object;
+        const path = record.get("path") orelse return error.InvalidSnapshot;
+        if (path != .string) return error.InvalidSnapshot;
+        if (!std.mem.endsWith(u8, path.string, ".list")) continue;
+        const kind = record.get("kind") orelse return error.InvalidSnapshot;
+        const lines = record.get("lines") orelse return error.InvalidSnapshot;
+        if (!stringEquals(kind, "path-list") or lines != .array)
+            return error.InvalidSnapshot;
+        for (lines.array.items) |line| {
+            if (line != .string or line.string.len < 2 or line.string[0] != '/')
+                return error.InvalidSnapshot;
+            try owned.put(line.string[1..], {});
+        }
+    }
+    for (volatile_unowned_files) |path| {
+        if (owned.contains(path)) return error.VolatileFilePackageOwned;
+    }
+
+    const left_files = left.get("filesystem").?.array.items;
+    const right_files = right.get("filesystem").?.array.items;
+    if (left_files.len != right_files.len) return false;
+    for (left_files, right_files) |left_file, right_file| {
+        if (!equalFilesystemEntry(left_file, right_file, &owned)) return false;
+    }
+    return true;
+}
+
+fn equalFilesystemEntry(
+    left: std.json.Value,
+    right: std.json.Value,
+    owned: *const std.StringHashMap(void),
+) bool {
+    if (left != .object or right != .object or left.object.count() != right.object.count())
+        return false;
+    const path = left.object.get("path") orelse return false;
+    const kind = left.object.get("kind") orelse return false;
+    if (path != .string or kind != .string or
+        !equalValue(path, right.object.get("path") orelse return false) or
+        !equalValue(kind, right.object.get("kind") orelse return false))
+        return false;
+    const ignore_mtime = std.mem.eql(u8, kind.string, "symlink") or
+        !owned.contains(path.string);
+    const ignore_hash = std.mem.eql(u8, kind.string, "regular") and
+        !owned.contains(path.string) and isVolatileUnownedFile(path.string);
+    if (ignore_mtime and !std.mem.eql(u8, kind.string, "directory")) {
+        const before = left.object.get("mtime_ns") orelse return false;
+        const after = right.object.get("mtime_ns") orelse return false;
+        if (before != .integer or after != .integer) return false;
+    }
+    if (ignore_hash) {
+        if (!validDigest(left.object.get("sha256") orelse return false) or
+            !validDigest(right.object.get("sha256") orelse return false))
+            return false;
+    }
+
+    var fields = left.object.iterator();
+    while (fields.next()) |field| {
+        const other = right.object.get(field.key_ptr.*) orelse return false;
+        if (std.mem.eql(u8, field.key_ptr.*, "mtime_ns") and ignore_mtime) {
+            if (field.value_ptr.* != .integer or other != .integer) return false;
+        } else if (std.mem.eql(u8, field.key_ptr.*, "sha256") and ignore_hash) {
+            if (!validDigest(field.value_ptr.*) or !validDigest(other)) return false;
+        } else if (!equalValue(field.value_ptr.*, other)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn isVolatileUnownedFile(path: []const u8) bool {
+    for (volatile_unowned_files) |volatile_path| {
+        if (std.mem.eql(u8, path, volatile_path)) return true;
+    }
+    return false;
+}
+
+fn validDigest(value: std.json.Value) bool {
+    if (value != .string or value.string.len != 64) return false;
+    for (value.string) |digit| {
+        if (!std.ascii.isHex(digit)) return false;
+    }
+    return true;
+}
+
 fn fixture(comptime status: []const u8) []const u8 {
     return std.fmt.comptimePrint(
         \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr"}}],"dpkg":{{"present":true,"status":[{{"package":"{s}"}}],"status_old":[],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
     ,
         .{ schema, status },
     );
+}
+
+fn regularFixture(comptime info: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"etc/machine-id","kind":"regular","mode":"0444","mtime_ns":1,"size":33,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],"dpkg":{{"present":true,"status":[{{"package":"installed"}}],"status_old":[],"info":[{s}],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+    , .{ schema, info });
+}
+
+fn testFile(value: *std.json.Value) *std.json.ObjectMap {
+    return &value.object.getPtr("filesystem").?.array.items[0].object;
+}
+
+test "real snapshot comparison normalizes only unowned clock and known volatile content" {
+    var left = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        regularFixture(""),
+        .{},
+    );
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        regularFixture(""),
+        .{},
+    );
+    defer right.deinit();
+    testFile(&right.value).getPtr("mtime_ns").?.* = .{ .integer = 2 };
+    testFile(&right.value).getPtr("sha256").?.* = .{
+        .string = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    };
+    try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
+
+    testFile(&left.value).getPtr("path").?.* = .{ .string = "usr/bin/payload" };
+    testFile(&right.value).getPtr("path").?.* = .{ .string = "usr/bin/payload" };
+    try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
+    testFile(&right.value).getPtr("sha256").?.* = testFile(&left.value).get("sha256").?;
+    try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
+
+    testFile(&right.value).getPtr("mode").?.* = .{ .string = "0644" };
+    try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
+}
+
+test "real snapshot comparison refuses to normalize package-owned files" {
+    const owner =
+        \\{"path":"var/lib/dpkg/info/demo.list","kind":"path-list","lines":["/usr/bin/payload"]}
+    ;
+    var left = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        regularFixture(owner),
+        .{},
+    );
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        regularFixture(owner),
+        .{},
+    );
+    defer right.deinit();
+    testFile(&left.value).getPtr("path").?.* = .{ .string = "usr/bin/payload" };
+    testFile(&right.value).getPtr("path").?.* = .{ .string = "usr/bin/payload" };
+    testFile(&right.value).getPtr("mtime_ns").?.* = .{ .integer = 2 };
+    try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
+
+    testFile(&left.value).getPtr("path").?.* = .{ .string = "etc/machine-id" };
+    testFile(&right.value).getPtr("path").?.* = .{ .string = "etc/machine-id" };
+    left.value.object.getPtr("dpkg").?.object.getPtr("info").?.array.items[0]
+        .object.getPtr("lines").?.array.items[0] = .{ .string = "/etc/machine-id" };
+    right.value.object.getPtr("dpkg").?.object.getPtr("info").?.array.items[0]
+        .object.getPtr("lines").?.array.items[0] = .{ .string = "/etc/machine-id" };
+    try std.testing.expectError(
+        error.VolatileFilePackageOwned,
+        equalSnapshots(std.testing.allocator, left.value, right.value),
+    );
+}
+
+test "real snapshot comparison ignores symlink timestamps, not symlink targets" {
+    const image = std.fmt.comptimePrint(
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr/bin/link","kind":"symlink","target":"payload","mtime_ns":1}}],"dpkg":{{"present":true,"status":[{{"package":"installed"}}],"status_old":[],"info":[{{"path":"var/lib/dpkg/info/demo.list","kind":"path-list","lines":["/usr/bin/link"]}}],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+    , .{schema});
+    var left = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, image, .{});
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, image, .{});
+    defer right.deinit();
+    testFile(&right.value).getPtr("mtime_ns").?.* = .{ .integer = 2 };
+    try std.testing.expect(try equalSnapshots(std.testing.allocator, left.value, right.value));
+    testFile(&right.value).getPtr("target").?.* = .{ .string = "other" };
+    try std.testing.expect(!try equalSnapshots(std.testing.allocator, left.value, right.value));
 }
 
 test "real snapshot comparator accepts identical typed snapshots" {

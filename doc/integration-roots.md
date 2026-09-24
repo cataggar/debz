@@ -124,18 +124,32 @@ v3 lock, and can bootstrap the private trigger helper only from the exact
 authenticated `dpkg` archive and final owner evidence. Candidate commands are
 optionally exec-traced and fail if they launch `dpkg` or `dpkg-deb`.
 The isolated oracle is the architecture-pinned dpkg 1.22.22 payload prepared
-under `.cache`; Python is transport for that reference artifact, not the
+under `.cache`; its executable and receipt are reverified before reference
+execution. Python is transport for that reference artifact, not the
 comparison authority. The reference step independently verifies each
 authenticated lock archive against its SHA512 CAS identity, initializes only
 the separate oracle's dpkg database, stages exact-lock interpreter/tool
 payloads for the chroot, attempts to install the closure with the pinned dpkg,
 and captures its root only on success. The candidate root is never seeded from
-the reference. A local amd64 rehearsal showed that feeding the lock's
-alphabetical package order directly to dpkg fails on `Pre-Depends`; the
-reference driver must become dependency ordered before this gate can pass.
+the reference. The pinned dpkg reference probes prerequisite and configuration
+readiness before each package phase, without `--force-depends`; at a stall,
+it lets dpkg configure a dependency cycle together, accepting only deferred
+dependency failures and checking the resulting database state. Maintainer
+scripts see `/proc` mounted only in a private mount namespace, which is gone
+before capture. A fresh amd64 rehearsal configured all 175 packages, processed
+pending triggers, and captured the healthy reference root. The reference-only
+`dev/null` chroot device is excluded from both bounded captures only when no
+package claims it; no package payload path is excluded.
 `test/real-snapshot-comparator.zig` is the equality authority for the bounded
 filesystem and normalized dpkg
-status/info/trigger/diversion/statoverride/alternatives sections. Missing
+status/info/trigger/diversion/statoverride/alternatives sections. It compares
+package-owned regular-file timestamps and every payload digest. It ignores
+clock-derived timestamps on unowned files and symlinks and the contents of
+three explicitly unowned runtime products (`etc/machine-id`,
+`var/cache/ldconfig/aux-cache`, `var/log/alternatives.log`); their presence,
+size, mode, ownership, and captured hashes remain recorded, and a package
+claim on any of those three paths fails comparison. Two independent healthy
+amd64 dpkg roots compared successfully under these rules. Missing
 either capture or any mismatch fails the manual job; the always-run cleanup
 retains available diagnostics even after earlier failure.
 
@@ -153,6 +167,14 @@ identities published by `stonking`; no fabricated SHA256 or historical-time
 replay is allowed. Full install/reinstall/upgrade/remove/purge, crash/restart,
 archive-evicted recovery, and passing native/reference comparisons still
 require executed evidence from both architectures.
+
+The current native offline replay remains fail-closed at `libpam-runtime`:
+its authenticated archive owns both `PAM.7.gz` and the `pam.7.gz` symlink in
+the same directory. Pinned dpkg installs both on a case-sensitive root, while
+a casefold ext4 probe cannot unpack them. Native cannot merely waive its
+case-alias check: crash recovery must first bind a case-sensitive directory
+proof and both publications to the journal, with no-replace semantics. This
+blocker must be resolved before publishing the real-snapshot parity gate.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

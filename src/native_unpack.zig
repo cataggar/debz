@@ -1369,11 +1369,14 @@ const CombinedMutationHooks = struct {
         const matches = if (self.publication_crash_point) |point| selected == point else switch (selected) {
             .during_filesystem_publication => action.kind == .filesystem,
             .during_database_publication => action.kind == .database,
+            .during_bootstrap_config_staging => action.kind == .database and action.substep == 0 and action.ordinal == 0,
+            .during_bootstrap_config_cleanup => action.kind == .database and action.substep == 2,
             else => false,
         };
         if (matches and
             (boundary == .publish_rename or boundary == .publish_create or
-                (selected == .during_unpack_backup_cleanup and boundary == .target_remove)))
+                ((selected == .during_unpack_backup_cleanup or
+                    selected == .during_bootstrap_config_cleanup) and boundary == .target_remove)))
             std.process.exit(native_recovery.crash_exit_code);
     }
 };
@@ -17335,6 +17338,14 @@ fn clearLifecycleConfig(
         return .{ .outcome = .applied, .detail = "no_config" };
     const key = try lifecyclePackageKey(allocator, package);
     defer allocator.free(key);
+    if (program.steps[execution.program_step].operation == .materialize_bootstrap_payload and
+        try consumeRecoveredDatabasePhase(execution))
+    {
+        if (!(installedConfigMatches(allocator, root, package, config.*) catch
+            return .{ .outcome = .refused, .detail = "installed_config_changed" }))
+            return .{ .outcome = .refused, .detail = "installed_config_missing" };
+        return .{ .outcome = .applied, .detail = "recovered_config_cleanup" };
+    }
     if (!(stagedConfigMatches(allocator, root, config.*) catch
         return .{ .outcome = .refused, .detail = "staged_config_changed" }))
     {
@@ -17362,8 +17373,15 @@ fn clearLifecycleConfig(
         } } },
         "publish-config",
     );
-    if (result.outcome == .applied)
+    if (result.outcome == .applied) {
         _ = staging.config_packages.remove(key);
+        for (staging.paths.items, 0..) |path, index| {
+            if (std.mem.eql(u8, path, dpkg_config_staging_path)) {
+                _ = staging.paths.orderedRemove(index);
+                break;
+            }
+        }
+    }
     return result;
 }
 
@@ -17412,6 +17430,29 @@ fn stageLifecycleScripts(
 
     var intents: std.ArrayList(root_mutation.Intent) = .empty;
     defer intents.deinit(allocator);
+    var config_already_cleared = false;
+    if (stage_config and execution.recovery != null and
+        program.steps[execution.program_step].operation == .materialize_bootstrap_payload)
+    {
+        const runtime = execution.recovery.?;
+        const cleanup = try runtime.latest(nativeAction(.database, execution.program_step, 2, 0));
+        if (cleanup != null and cleanup.?.stage == .completed and
+            (cleanup.?.result == .applied or cleanup.?.result == .recovered))
+        {
+            const publication = try runtime.latest(nativeAction(.filesystem, execution.program_step, 1, 0));
+            if (publication == null or publication.?.stage != .completed or
+                (publication.?.result != .applied and publication.?.result != .recovered))
+                return .{ .outcome = .refused, .detail = "config_cleanup_without_publication" };
+            const model_index = lifecycleArchiveIndex(models, package) orelse
+                return error.InvalidLifecycleProgram;
+            const config = models[model_index].script(.config) orelse
+                return error.InvalidLifecycleProgram;
+            if (!(installedConfigMatches(allocator, root, package, config.*) catch
+                return .{ .outcome = .refused, .detail = "installed_config_changed" }))
+                return .{ .outcome = .refused, .detail = "installed_config_missing" };
+            config_already_cleared = true;
+        }
+    }
     const directory = try root.entryIfExists(try root_fs.Path.init(lifecycle_tmp_ci));
     if (directory) |entry| {
         if (entry.kind != .directory)
@@ -17432,7 +17473,7 @@ fn stageLifecycleScripts(
 
     if (lifecycleArchiveIndex(models, package)) |model_index| {
         const model = &models[model_index];
-        if (stage_config) if (model.script(.config)) |config| {
+        if (stage_config and !config_already_cleared) if (model.script(.config)) |config| {
             const directory_present = validateConfigStagingDirectory(root) catch
                 return .{ .outcome = .refused, .detail = "config_staging_collision" };
             const already_staged = stagedConfigMatches(allocator, root, config.*) catch
@@ -17556,7 +17597,7 @@ fn stageLifecycleScripts(
     );
     if (result.outcome == .applied) {
         try staging.packages.put(allocator, key, {});
-        if (stage_config) if (lifecycleArchiveIndex(models, package)) |model_index| {
+        if (stage_config and !config_already_cleared) if (lifecycleArchiveIndex(models, package)) |model_index| {
             if (models[model_index].script(.config)) |config| {
                 if (stagedConfigMatches(allocator, root, config.*) catch
                     return .{ .outcome = .refused, .detail = "staged_config_changed" })
@@ -24906,8 +24947,10 @@ fn executeLifecycleProgramWithRequest(
         .publish_provenance,
         => {},
         .materialize_bootstrap_payload => |intent| {
+            var has_config = false;
             if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
                 if (models[model_index].script(.config) != null) {
+                    has_config = true;
                     const staged = try stageLifecycleScripts(
                         execution,
                         allocator,
@@ -24928,6 +24971,12 @@ fn executeLifecycleProgramWithRequest(
                     );
                     if (lifecycleMaterializationFailure(staged)) |failure|
                         return failure;
+                    if (execution.recovery) |runtime| {
+                        runtime.crash.hit(if (staging.packages.count() > 1)
+                            .after_subsequent_bootstrap_config_stage
+                        else
+                            .after_bootstrap_config_stage);
+                    }
                 }
             }
             const result = try lifecycleDataStep(
@@ -24983,6 +25032,29 @@ fn executeLifecycleProgramWithRequest(
                             .program_sha256 = program.digest_sha256,
                         };
                     };
+            if (has_config) {
+                if (execution.recovery) |runtime|
+                    runtime.crash.hit(.after_bootstrap_payload_before_config_cleanup);
+                const cleared_config = try clearLifecycleConfig(
+                    execution,
+                    allocator,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    models,
+                    locks,
+                    attempt,
+                    operation,
+                    conffile_policy,
+                    intent.package,
+                    &staging,
+                );
+                if (lifecycleMaterializationFailure(cleared_config)) |failure|
+                    return failure;
+                if (execution.recovery) |runtime|
+                    runtime.crash.hit(.after_bootstrap_config_cleanup);
+            }
         },
         .unpack_package => |intent| {
             if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
@@ -29712,30 +29784,14 @@ fn testFreshDatabaseInstall(crash_at: ?native_recovery.CrashPoint) !void {
         package_database.database_directory,
     }) |path| try root.removeDirectory(try root_fs.Path.init(path));
     const applied = if (crash_at) |point| block: {
-        if (builtin.os.tag != .linux) return error.SkipZigTest;
-        const linux = std.os.linux;
-        const child = linux.fork();
-        if (linux.errno(child) != .SUCCESS) return error.ForkFailed;
-        if (child == 0) {
-            _ = executePreparedNativeProgramWithHelper(
-                testing.allocator,
-                root,
-                &compiled,
-                &.{bytes},
-                &attempt,
-                locks.interface(),
-                .install,
-                point,
-                null,
-                null,
-                .{},
-            ) catch std.process.exit(87);
-            std.process.exit(88);
-        }
-        var status: u32 = 0;
-        const waited = linux.waitpid(@intCast(child), &status, 0);
-        try testing.expectEqual(child, waited);
-        try testing.expectEqual(@as(u32, native_recovery.crash_exit_code), status >> 8);
+        try expectPreparedNativeProgramCrash(
+            root,
+            &compiled,
+            &.{bytes},
+            &attempt,
+            locks.interface(),
+            point,
+        );
         try testing.expect(try root.entryIfExists(
             try root_fs.Path.init(native_recovery.intent_path),
         ) != null);
@@ -29881,6 +29937,40 @@ fn testFreshDatabaseInstall(crash_at: ?native_recovery.CrashPoint) !void {
     )).mode);
 }
 
+fn expectPreparedNativeProgramCrash(
+    root: root_fs.Root,
+    compiled: *CompiledLifecycle,
+    archives: []const []const u8,
+    attempt: *root_operation.Attempt,
+    locks: root_operation.LockBackend,
+    point: native_recovery.CrashPoint,
+) !void {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const child = linux.fork();
+    if (linux.errno(child) != .SUCCESS) return error.ForkFailed;
+    if (child == 0) {
+        _ = executePreparedNativeProgramWithHelper(
+            testing.allocator,
+            root,
+            compiled,
+            archives,
+            attempt,
+            locks,
+            .install,
+            point,
+            null,
+            null,
+            .{},
+        ) catch std.process.exit(87);
+        std.process.exit(88);
+    }
+    var status: u32 = 0;
+    const waited = linux.waitpid(@intCast(child), &status, 0);
+    try testing.expectEqual(child, waited);
+    try testing.expectEqual(@as(u32, native_recovery.crash_exit_code), status >> 8);
+}
+
 test "native_unpack.test.caller-owned install initializes an absent database" {
     try testFreshDatabaseInstall(null);
 }
@@ -29888,6 +29978,372 @@ test "native_unpack.test.caller-owned install initializes an absent database" {
 test "native_unpack.test.caller-owned database bootstrap survives a process crash" {
     try testFreshDatabaseInstall(.after_execution_intent);
     try testFreshDatabaseInstall(.during_database_publication);
+}
+
+fn testMultiConfigInstall(
+    healthy_root: bool,
+    crash_at: ?native_recovery.CrashPoint,
+    drift_after_crash: bool,
+    foreign_staging: bool,
+) !void {
+    if (builtin.os.tag != .linux or std.os.linux.getuid() != 0)
+        return error.SkipZigTest;
+    var absent = testing.tmpDir(.{ .iterate = true });
+    defer absent.cleanup();
+    var existing: Fixture = undefined;
+    if (healthy_root) try existing.init(empty_status, &.{});
+    defer if (healthy_root) existing.deinit();
+    const directory = if (healthy_root) existing.tmp.dir else absent.dir;
+    const root: root_fs.Root = .init(testing.io, directory);
+    var root_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const root_length = try directory.realPath(testing.io, &root_buffer);
+    const install_root = root_buffer[0..root_length];
+    if (foreign_staging) {
+        try testing.expect(healthy_root);
+        try seedFile(root, dpkg_config_staging_path, "foreign config\n");
+    }
+
+    var first_files = [_]Entry{.{ .path = "first-file", .content = "first payload\n" }};
+    var second_files = [_]Entry{.{ .path = "second-file", .content = "second payload\n" }};
+    const first_config = "#!/bin/sh\nprintf first > /config-was-executed\n";
+    const second_config = "#!/bin/sh\nprintf second > /config-was-executed\n";
+    const first_bytes = try buildOwnedArchive(.{
+        .package = "first",
+        .version = "1",
+        .control = &.{.{ .path = "config", .mode = 0o755, .content = first_config }},
+    }, &first_files);
+    defer testing.allocator.free(first_bytes);
+    const second_bytes = try buildOwnedArchive(.{
+        .package = "second",
+        .version = "1",
+        .control = &.{.{ .path = "config", .mode = 0o755, .content = second_config }},
+    }, &second_files);
+    defer testing.allocator.free(second_bytes);
+    var first_model = try modelOf(first_bytes);
+    defer first_model.deinit();
+    var second_model = try modelOf(second_bytes);
+    defer second_model.deinit();
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot_id: [32]u8 = @splat(0x22);
+    var lock = try exact_lock_v3.create(testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot_id,
+            .release_sha256 = @splat(3),
+            .index_identity = .{ .digests = .{ .sha256 = @splat(4) }, .primary = .sha256 },
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{
+            .{
+                .name = "first",
+                .version = "1",
+                .architecture = "amd64",
+                .origin = .{ .authenticated_repository = .{
+                    .repository_id = repository_id,
+                    .repository_snapshot_sha256 = snapshot_id,
+                } },
+                .archive_identity = .{
+                    .digests = .{ .sha256 = first_model.provenance().sha256 },
+                    .primary = .sha256,
+                },
+                .declared_size = first_bytes.len,
+                .retention = .requested,
+                .dpkg_selection_hold = false,
+            },
+            .{
+                .name = "second",
+                .version = "1",
+                .architecture = "amd64",
+                .origin = .{ .authenticated_repository = .{
+                    .repository_id = repository_id,
+                    .repository_snapshot_sha256 = snapshot_id,
+                } },
+                .archive_identity = .{
+                    .digests = .{ .sha256 = second_model.provenance().sha256 },
+                    .primary = .sha256,
+                },
+                .declared_size = second_bytes.len,
+                .retention = .requested,
+                .dpkg_selection_hold = false,
+            },
+        },
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var actions = [_]solver.PlanAction{
+        .{
+            .kind = .install,
+            .package = "first",
+            .version = "1",
+            .architecture = "amd64",
+            .repository = .{ .id = repository_id, .priority = 500 },
+            .sha256 = hex(32, first_model.provenance().sha256),
+            .archive_identity = .{
+                .digests = .{ .sha256 = first_model.provenance().sha256 },
+                .primary = .sha256,
+            },
+            .package_size = first_bytes.len,
+            .installed_size_delta_bytes = 0,
+            .source_package = "first",
+            .prior_installed = null,
+            .requested = true,
+            .reason = .explicit_request,
+            .selected_origin = null,
+        },
+        .{
+            .kind = .install,
+            .package = "second",
+            .version = "1",
+            .architecture = "amd64",
+            .repository = .{ .id = repository_id, .priority = 500 },
+            .sha256 = hex(32, second_model.provenance().sha256),
+            .archive_identity = .{
+                .digests = .{ .sha256 = second_model.provenance().sha256 },
+                .primary = .sha256,
+            },
+            .package_size = second_bytes.len,
+            .installed_size_delta_bytes = 0,
+            .source_package = "second",
+            .prior_installed = null,
+            .requested = true,
+            .reason = .explicit_request,
+            .selected_origin = null,
+        },
+    };
+    var ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .bootstrap_extract, .package = "first", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .bootstrap_extract, .package = "second", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = .unpack, .package = "first", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 3, .kind = .configure_pending, .package = "first", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 4, .kind = .unpack, .package = "second", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 5, .kind = .configure_pending, .package = "second", .version = "1", .architecture = "amd64" },
+    };
+    var healthy_ordered = [_]solver.OrderedAction{
+        .{ .sequence = 0, .kind = .unpack, .package = "first", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = .configure_pending, .package = "first", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = .unpack, .package = "second", .version = "1", .architecture = "amd64" },
+        .{ .sequence = 3, .kind = .configure_pending, .package = "second", .version = "1", .architecture = "amd64" },
+    };
+    const solver_plan: solver.Plan = .{
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &actions,
+        .ordered_actions = if (healthy_root) &healthy_ordered else &ordered,
+        .summary = .{},
+        .download_bytes = first_bytes.len + second_bytes.len,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = testing.allocator,
+        .arena = undefined,
+    };
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(
+        testing.io,
+        root,
+        install_root,
+        locks.interface(),
+    );
+    var attempt = try coordinator.acquire(testing.allocator, .{
+        .backend = .native,
+        .operation = .{ .repository_bootstrap = .add },
+        .request_sha256 = @splat(0x71),
+        .policy_sha256 = @splat(0x72),
+        .target_architecture = "amd64",
+        .evidence = .{ .plan_sha256 = transaction_executor.planDigest(solver_plan) },
+    });
+    defer attempt.release();
+    var prepared = try Runtime.prepare(testing.allocator, .{
+        .attempt = &attempt,
+        .plan = &solver_plan,
+        .exact_lock = &lock.lock,
+        .archives = &.{ first_bytes, second_bytes },
+        .policy = .{ .conffile = .keep_existing },
+    });
+    defer prepared.deinit();
+    if (prepared != .prepared) return error.TestUnexpectedResult;
+    var compiled: CompiledLifecycle = .{
+        .authorization = prepared.prepared.authorization,
+        .program = prepared.prepared.program,
+    };
+    const program = compiled.program.program;
+    var bootstrap_count: usize = 0;
+    for (program.steps) |step| {
+        if (step.operation == .materialize_bootstrap_payload) bootstrap_count += 1;
+    }
+    try testing.expectEqual(if (healthy_root) @as(usize, 0) else 2, bootstrap_count);
+
+    const result = if (crash_at) |point| block: {
+        try expectPreparedNativeProgramCrash(
+            root,
+            &compiled,
+            &.{ first_bytes, second_bytes },
+            &attempt,
+            locks.interface(),
+            point,
+        );
+        try testing.expect(try root.entryIfExists(
+            try root_fs.Path.init(native_recovery.intent_path),
+        ) != null);
+        if (point == .during_bootstrap_config_staging or
+            point == .during_bootstrap_config_cleanup)
+        {
+            const journal_bytes = try root.readFileAlloc(
+                testing.allocator,
+                try root_fs.Path.init(root_mutation.journal_path),
+                root_mutation.maximum_document_bytes,
+            );
+            defer testing.allocator.free(journal_bytes);
+            var journal = try root_mutation.decode(
+                testing.allocator,
+                journal_bytes,
+                root_mutation.maximum_document_bytes,
+            );
+            defer journal.deinit();
+            const digest = native_recovery.parseDigest(program.digest_sha256) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectEqual(
+                digest,
+                journal.journal.evidence.program_sha256 orelse return error.TestUnexpectedResult,
+            );
+            var owns_config_path = false;
+            for (journal.journal.steps) |mutation| {
+                if (std.mem.eql(u8, mutation.path, dpkg_config_staging_path))
+                    owns_config_path = true;
+            }
+            try testing.expect(owns_config_path);
+        }
+        if (drift_after_crash)
+            try root.publishFile(
+                try root_fs.Path.init(dpkg_config_staging_path),
+                "changed\n",
+                .{},
+            );
+        attempt.release();
+        var previous = (try coordinator.inspect(testing.allocator)).?;
+        defer previous.deinit();
+        const record = previous.record;
+        attempt = try coordinator.acquire(testing.allocator, .{
+            .intent = .recovery,
+            .backend = .native,
+            .operation = record.operation,
+            .request_sha256 = record.request_sha256,
+            .policy_sha256 = record.policy_sha256,
+            .target_architecture = record.target_architecture,
+            .foreign_architectures = record.foreign_architectures,
+            .evidence = record.evidence(),
+        });
+        break :block try recoverPreparedNativeProgramWithHelper(
+            testing.allocator,
+            root,
+            &attempt,
+            locks.interface(),
+            null,
+            null,
+            null,
+            .{},
+        );
+    } else try executePreparedNativeProgramWithHelper(
+        testing.allocator,
+        root,
+        &compiled,
+        &.{ first_bytes, second_bytes },
+        &attempt,
+        locks.interface(),
+        .install,
+        null,
+        null,
+        null,
+        .{},
+    );
+    if (foreign_staging) {
+        try testing.expectEqual(LifecycleOutcome.refused, result.outcome);
+        try testing.expectEqualStrings("config_staging_collision", result.detail);
+        const occupant = try root.readFileAlloc(
+            testing.allocator,
+            try root_fs.Path.init(dpkg_config_staging_path),
+            1024,
+        );
+        defer testing.allocator.free(occupant);
+        try testing.expectEqualStrings("foreign config\n", occupant);
+        try testing.expect(try root.entryIfExists(
+            try root_fs.Path.init("first-file"),
+        ) == null);
+        return;
+    }
+    if (drift_after_crash) {
+        try testing.expectEqual(LifecycleOutcome.recovery_required, result.outcome);
+        const changed = try root.readFileAlloc(
+            testing.allocator,
+            try root_fs.Path.init(dpkg_config_staging_path),
+            1024,
+        );
+        defer testing.allocator.free(changed);
+        try testing.expectEqualStrings("changed\n", changed);
+        try testing.expect(try root.entryIfExists(
+            try root_fs.Path.init("second-file"),
+        ) == null);
+        return;
+    }
+    try testing.expectEqual(LifecycleOutcome.applied, result.outcome);
+    for ([_]struct { package: []const u8, config: []const u8, payload: []const u8 }{
+        .{ .package = "first", .config = first_config, .payload = "first-file" },
+        .{ .package = "second", .config = second_config, .payload = "second-file" },
+    }) |expected| {
+        const info_path = try std.fmt.allocPrint(
+            testing.allocator,
+            "var/lib/dpkg/info/{s}.config",
+            .{expected.package},
+        );
+        defer testing.allocator.free(info_path);
+        const installed = try root.readFileAlloc(
+            testing.allocator,
+            try root_fs.Path.init(info_path),
+            1024,
+        );
+        defer testing.allocator.free(installed);
+        try testing.expectEqualStrings(expected.config, installed);
+        const entry = try root.entry(try root_fs.Path.init(info_path));
+        try testing.expectEqual(@as(u32, 0o755), entry.mode);
+        try testing.expectEqual(@as(u32, 0), entry.uid);
+        try testing.expectEqual(@as(u32, 0), entry.gid);
+        try testing.expect(try root.entryIfExists(
+            try root_fs.Path.init(expected.payload),
+        ) != null);
+    }
+    try testing.expect(try root.entryIfExists(
+        try root_fs.Path.init(dpkg_control_staging_directory),
+    ) == null);
+    try testing.expect(try root.entryIfExists(
+        try root_fs.Path.init("config-was-executed"),
+    ) == null);
+    var captured = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer captured.deinit();
+    try testing.expect(std.mem.indexOf(u8, captured.snapshot.status.bytes, "Package: first") != null);
+    try testing.expect(std.mem.indexOf(u8, captured.snapshot.status.bytes, "Package: second") != null);
+}
+
+test "native_unpack.test.two config members serialize through the bootstrap staging slot" {
+    try testMultiConfigInstall(false, null, false, false);
+    try testMultiConfigInstall(true, null, false, false);
+    try testMultiConfigInstall(true, null, false, true);
+}
+
+test "native_unpack.test.bootstrap config staging publication and cleanup recover independently" {
+    for ([_]native_recovery.CrashPoint{
+        .during_bootstrap_config_staging,
+        .after_bootstrap_config_stage,
+        .after_subsequent_bootstrap_config_stage,
+        .during_filesystem_publication,
+        .after_bootstrap_payload_before_config_cleanup,
+        .during_bootstrap_config_cleanup,
+        .after_bootstrap_config_cleanup,
+    }) |point| try testMultiConfigInstall(false, point, false, false);
+    try testMultiConfigInstall(false, .after_bootstrap_config_stage, true, false);
+    try testMultiConfigInstall(false, .after_subsequent_bootstrap_config_stage, true, false);
 }
 
 test "native_unpack.test.public runtime requires a held native attempt and its physical named root" {
