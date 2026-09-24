@@ -58,6 +58,26 @@ requirements, moving repository failure, retained-closure GC, hostile
 tar-shaped cache blobs, relocation, executable-replacement attempts,
 maintainer-script failure, and explicit recovery.
 
+The manual `ubuntu-real-snapshot` CI job is an opt-in two-row amd64/arm64
+gate selected by the `run_native_real_snapshot` dispatch input. It builds the
+production candidate and Zig comparator, prepares the hash-pinned dpkg oracle
+outside the candidate path, verifies the lock's cached archives, installs
+them into a separate oracle root only if dpkg's dependency checks permit it,
+and requires both captures to compare. Direct alphabetical lock order
+currently fails the reference's `Pre-Depends` checks; this gate is not yet
+passing real-package parity.
+Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
+dpkg/helper/package state, selects `native` explicitly, and exec-traces
+candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.
+Evidence members are capped at 128 MiB and the artifact at 512 MiB before
+upload. Bounded, recognized acquisition retry diagnostics remain in the
+evidence; unexpected candidate stderr still fails the gate. Repository
+freshness remains authoritative and repository-specific: the acceptance
+config explicitly binds the unchanged 31-day maximum for a
+missing `Valid-Until`. The gate pins a currently valid signed `stonking`
+snapshot instead of overriding the clock for frozen `resolute`; no CI clock
+exception, hostname inference, or unbounded immutable exemption exists.
+
 `zig build security-audit` is network-free and rejects:
 
 - ambient APT/GnuPG/proxy/environment access and shell construction;

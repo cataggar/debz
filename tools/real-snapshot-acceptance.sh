@@ -2,12 +2,13 @@
 set -euo pipefail
 umask 077
 
-readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20260816T000000Z
-readonly pinned_suite=resolute
+readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z
+readonly pinned_suite=stonking
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 readonly max_download_bytes=$((1536 * 1024 * 1024))
 readonly max_package_bytes=$((512 * 1024 * 1024))
 readonly max_cache_bytes=$((2 * 1024 * 1024 * 1024))
+readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
 
 validate_values() {
   local uri=$1 suite=$2 architecture=$3
@@ -64,18 +65,14 @@ source_file=$workspace/ubuntu.sources
 config_file=$workspace/ubuntu.json
 lock=$evidence/ubuntu-minimal.lock.json
 update_lock=$evidence/ubuntu-minimal.update.lock.json
-mkdir -p "$root/var/lib/debz" "$root/var/lib/dpkg/"{info,updates,triggers} "$cache" "$state" "$evidence"
-mkdir -p "$root/usr/"{bin,sbin,lib,lib64}
-mkdir -p "$root/etc"
-ln -s usr/bin "$root/bin"
-ln -s usr/sbin "$root/sbin"
-ln -s usr/lib "$root/lib"
-ln -s usr/lib64 "$root/lib64"
-: >"$root/var/lib/dpkg/status"
-: >"$root/var/lib/dpkg/available"
+mkdir -p "$root" "$cache" "$state" "$evidence"
+[[ -z $(find "$root" -mindepth 1 -print -quit) ]]
+printf 'install_root_exists=true\ndpkg_database_present=false\nhelper_placeholder_present=false\npackage_state_present=false\n' \
+  >"$evidence/fresh-root-before.txt"
 capture_root_layout() {
   {
-    for path in bin sbin lib lib64 bin/sh usr/bin/sh usr/bin/dpkg-divert; do
+    for path in bin sbin lib lib64 bin/sh usr/bin/sh usr/bin/dpkg usr/bin/dpkg-deb \
+      usr/bin/dpkg-trigger; do
       target=$(readlink "$root/$path" 2>/dev/null || true)
       printf '%s target=%s exists=%s executable=%s\n' "$path" "${target:-none}" \
         "$([[ -e "$root/$path" ]] && echo true || echo false)" \
@@ -92,8 +89,29 @@ Components: main
 Architectures: $architecture
 Signed-By: $keyring
 EOF
-printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true}\n' \
-  "$source_file" "$suite" >"$config_file"
+printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
+  "$source_file" "$suite" "$maximum_release_age_seconds" >"$config_file"
+source_commit=${GITHUB_SHA:-}
+if [[ -z "$source_commit" ]]; then
+  source_commit=$(git -C "$(dirname "$0")/.." rev-parse HEAD)
+fi
+{
+  printf 'source_commit=%s\n' "$source_commit"
+  printf 'architecture=%s\nsnapshot_uri=%s\nsnapshot_suite=%s\n' \
+    "$architecture" "$uri" "$suite"
+  printf 'invocation_unix=%s\nworkflow=%s\nrun_id=%s\nrun_attempt=%s\njob=%s\n' \
+    "$(date -u +%s)" "${GITHUB_WORKFLOW:-local}" "${GITHUB_RUN_ID:-local}" \
+    "${GITHUB_RUN_ATTEMPT:-local}" "${GITHUB_JOB:-local}"
+  printf 'candidate_backend=native\nreference_backend=pinned-dpkg-oracle\n'
+  printf 'repository_freshness=allow_missing_valid_until_with_max_age_seconds:%s\n' \
+    "$maximum_release_age_seconds"
+  printf 'program_sha256=%s\nkeyring_sha256=%s\n' \
+    "$(sha256sum "$debz" | cut -d' ' -f1)" \
+    "$(sha256sum "$keyring" | cut -d' ' -f1)"
+  printf 'source_profile_sha256=%s\nrepository_profile_sha256=%s\n' \
+    "$(sha256sum "$source_file" | cut -d' ' -f1)" \
+    "$(sha256sum "$config_file" | cut -d' ' -f1)"
+} >"$evidence/invocation-identity.txt"
 
 common=(
   --install-root "$root"
@@ -106,31 +124,82 @@ common=(
   --lock-wait-ms 30000
   --json
 )
+native_common=("${common[@]}" --transaction-backend native)
 mutating=(--assume-yes --noninteractive --conffile keep-existing)
+
+run_candidate() {
+  local name=$1 duration=$2
+  local status=0
+  local audit_status=0
+  shift 2
+  if [[ ${DEBZ_REAL_SNAPSHOT_TRACE:-0} == 1 ]]; then
+    timeout --signal=TERM --kill-after=30s "$duration" \
+      strace -f -qq -yy -e trace=execve,execveat -o "$evidence/$name.execve" \
+      "$@" >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
+    [[ -s "$evidence/$name.execve" ]] || {
+      echo "candidate execution trace missing for $name" >&2
+      exit 91
+    }
+    grep -Eq 'execve\("([^"]*/)?dpkg(-deb)?"|execveat\([^,]+, "([^"]*/)?dpkg(-deb)?"|execveat\([^,]*</[^>]+/dpkg(-deb)?>, ""' "$evidence/$name.execve" ||
+      audit_status=$?
+    if (( audit_status > 1 )); then
+      echo "candidate execution trace unreadable for $name" >&2
+      exit 91
+    fi
+    if (( audit_status == 0 )); then
+      echo "native candidate invoked dpkg or dpkg-deb during $name" >&2
+      printf 'operation=%s\nexit_status=%s\nforbidden_dpkg_exec=true\n' \
+        "$name" "$status" >>"$evidence/native-exec-audit.txt"
+      exit 90
+    fi
+    printf 'operation=%s\nexit_status=%s\nforbidden_dpkg_exec=false\n' \
+      "$name" "$status" >>"$evidence/native-exec-audit.txt"
+  else
+    timeout --signal=TERM --kill-after=30s "$duration" "$@" \
+      >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
+  fi
+  return "$status"
+}
 
 run() {
   local name=$1
   shift
-  timeout --signal=TERM --kill-after=30s 30m "$debz" "$@" \
-    >"$evidence/$name.json" 2>"$evidence/$name.stderr"
-  [[ ! -s "$evidence/$name.stderr" ]]
+  run_candidate "$name" 30m "$debz" "$@"
+  if [[ -s "$evidence/$name.stderr" ]]; then
+    local retry_check=0
+    local stderr_bytes
+    stderr_bytes=$(stat -c '%s' "$evidence/$name.stderr")
+    if [[ "$name" == refresh || "$name" == download || "$name" == create ]] &&
+      (( stderr_bytes <= 4096 )); then
+      grep -Evq '^debz acquisition retry failed_attempt=[1-6]/6 delay_ms=[1-9][0-9]{0,5} http_status=(429|500|502|503|504)$' \
+        "$evidence/$name.stderr" || retry_check=$?
+    fi
+    if (( retry_check != 1 )); then
+      echo "unexpected candidate stderr during $name" >&2
+      return 1
+    fi
+  fi
   grep -q '"exit_status":0' "$evidence/$name.json"
 }
 
 verify_result() {
   local name=$1 lock_input=$2
-  timeout --signal=TERM --kill-after=30s 10m "$debz" transaction-result verify \
-    --state-path "$state" --lock-input "$lock_input" --architecture "$architecture" --json \
-    >"$evidence/$name-summary.json" 2>"$evidence/$name-summary.stderr"
+  run_candidate "$name-summary" 10m "$debz" transaction-result verify \
+    --transaction-backend native --install-root "$root" --state-path "$state" \
+    --lock-input "$lock_input" --architecture "$architecture" --json
   [[ ! -s "$evidence/$name-summary.stderr" ]]
   jq -e '.outcome == "succeeded"' "$evidence/$name-summary.json" >/dev/null
 }
 
 review_lock() {
   jq -e --arg arch "$architecture" '
+    .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
+    .version == 3 and
     .target_architecture == $arch and
     ([.packages[] | select(.name == "ubuntu-minimal")] | length) == 1 and
+    all(.packages[]; .archive_identity.primary == "sha512") and
     (.repositories | length) == 1 and
+    all(.repositories[]; .index_identity.primary == "sha512") and
     ([.repositories[].signer_fingerprints[]] | unique) ==
       ["f6ecb3762474eda9d21b7022871920d1991bc93c"]
   ' "$1" >/dev/null
@@ -140,8 +209,11 @@ run refresh refresh "${common[@]}" --assume-yes
 metadata_bytes=$(du -sb "$cache" | cut -f1)
 (( metadata_bytes <= max_cache_bytes ))
 
-run resolve-lock plan "${common[@]}" --lock-output "$lock" ubuntu-minimal
+run resolve-lock plan "${native_common[@]}" --lock-output "$lock" ubuntu-minimal
 review_lock "$lock"
+printf 'lock_file_sha256=%s\nlock_document_digest=%s\n' \
+  "$(sha256sum "$lock" | cut -d' ' -f1)" \
+  "$(jq -r '.digest_sha256' "$lock")" >"$evidence/install-lock-identity.txt"
 download_bytes=$(jq '[.packages[].declared_size] | add' "$lock")
 largest_package=$(jq '[.packages[].declared_size] | max' "$lock")
 package_count=$(jq '.packages | length' "$lock")
@@ -152,32 +224,45 @@ printf 'download_bytes=%s\nlargest_package_bytes=%s\npackage_count=%s\nmetadata_
   "$download_bytes" "$largest_package" "$package_count" "$metadata_bytes" \
   >"$evidence/bounds.txt"
 
-run download download "${common[@]}" --lock-input "$lock" ubuntu-minimal
-run create install "${common[@]}" "${mutating[@]}" --lock-input "$lock" ubuntu-minimal
+run download download "${native_common[@]}" --lock-input "$lock" ubuntu-minimal
+run create install "${native_common[@]}" "${mutating[@]}" --lock-input "$lock" ubuntu-minimal
 verify_result create "$lock"
-cp "$state/transaction-result.json" "$evidence/create-transaction-result.json"
+cp "$root/var/lib/debz/native-transaction-provenance-v2.json" \
+  "$evidence/create-native-transaction-provenance-v2.json"
+cp "$root/var/lib/debz/root-operation-completion-v2.json" \
+  "$evidence/create-root-operation-completion-v2.json"
 cp "$root/var/lib/dpkg/status" "$evidence/status-after-create"
-
-dpkg-query --admindir="$root/var/lib/dpkg" -W -f='${db:Status-Abbrev} ${binary:Package} ${Version}\n' \
-  >"$evidence/installed.txt"
-grep -Eq '^ii  ubuntu-minimal(:[^ ]+)? ' "$evidence/installed.txt"
-if grep -Eq '^[^i][^i]|^.R|^..[A-Z]' "$evidence/installed.txt"; then
-  echo "unhealthy dpkg package state" >&2
+device_claim=0
+grep -Fqx '/dev/null' "$root/var/lib/dpkg/info/"*.list || device_claim=$?
+if (( device_claim != 1 )); then
+  echo "candidate package claims excluded chroot device" >&2
   exit 1
 fi
 
-run reproduce-lock plan "${common[@]}" --lock-input "$lock" \
+awk '
+  /^Package: / { package=$2 }
+  /^Status: / && package == "ubuntu-minimal" && $0 == "Status: install ok installed" { found=1 }
+  END { exit !found }
+' "$root/var/lib/dpkg/status"
+
+run reproduce-lock plan "${native_common[@]}" --lock-input "$lock" \
   --lock-output "$evidence/reproduced.lock.json" ubuntu-minimal
 cmp "$lock" "$evidence/reproduced.lock.json"
 before_update_status=$(sha256sum "$root/var/lib/dpkg/status" | cut -d' ' -f1)
-run resolve-update-lock plan "${common[@]}" --lock-output "$update_lock"
+run resolve-update-lock plan "${native_common[@]}" --lock-output "$update_lock"
 review_lock "$update_lock"
-run update upgrade-all "${common[@]}" "${mutating[@]}" --lock-input "$update_lock"
-verify_result update "$update_lock"
-jq -e '.commands == []' "$state/transaction-result.json" >/dev/null
+printf 'lock_file_sha256=%s\nlock_document_digest=%s\n' \
+  "$(sha256sum "$update_lock" | cut -d' ' -f1)" \
+  "$(jq -r '.digest_sha256' "$update_lock")" >"$evidence/update-lock-identity.txt"
+before_update_provenance=$(sha256sum \
+  "$root/var/lib/debz/native-transaction-provenance-v2.json" | cut -d' ' -f1)
+run update upgrade-all "${native_common[@]}" "${mutating[@]}" --lock-input "$update_lock"
+jq -e '.changed == false' "$evidence/update.json" >/dev/null
 [[ "$before_update_status" == "$(sha256sum "$root/var/lib/dpkg/status" | cut -d' ' -f1)" ]]
-cp "$state/transaction-result.json" "$evidence/update-transaction-result.json"
-printf 'command_count=0\nstatus_unchanged=true\n' >"$evidence/update-zero-actions.txt"
+[[ "$before_update_provenance" == "$(sha256sum \
+  "$root/var/lib/debz/native-transaction-provenance-v2.json" | cut -d' ' -f1)" ]]
+printf 'changed=false\nstatus_unchanged=true\nprovenance_unchanged=true\n' \
+  >"$evidence/update-zero-actions.txt"
 
 status_digest=$(sha256sum "$root/var/lib/dpkg/status" | cut -d' ' -f1)
 cp "$lock" "$evidence/injected-invalid.lock.json"
@@ -189,9 +274,8 @@ value["digest_sha256"] = ("0" if value["digest_sha256"][0] != "0" else "1") + va
 path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
 PY
 set +e
-timeout --signal=TERM --kill-after=30s 10m "$debz" plan "${common[@]}" \
-  --lock-input "$evidence/injected-invalid.lock.json" ubuntu-minimal \
-  >"$evidence/injected-failure.json" 2>"$evidence/injected-failure.stderr"
+run_candidate injected-failure 10m "$debz" plan "${native_common[@]}" \
+  --lock-input "$evidence/injected-invalid.lock.json" ubuntu-minimal
 failure_status=$?
 set -e
 (( failure_status != 0 ))

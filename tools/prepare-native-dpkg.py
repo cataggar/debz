@@ -282,6 +282,7 @@ def prepare(architecture: str) -> Path:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--architecture", choices=sorted(PINS))
+    parser.add_argument("--verify-only", type=Path, metavar="DPKG")
     arguments = parser.parse_args()
     architecture = arguments.architecture or {
         "x86_64": "amd64",
@@ -289,6 +290,10 @@ def main() -> int:
     }.get(platform.machine())
     if architecture is None:
         raise RuntimeError(f"unsupported reference machine: {platform.machine()}")
+    if arguments.verify_only is not None:
+        select(arguments.verify_only, architecture, root_accounts=True)
+        verify_receipt(arguments.verify_only.parents[2] / RECEIPT, architecture)
+        return 0
     print(prepare(architecture))
     return 0
 

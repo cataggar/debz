@@ -817,6 +817,18 @@ def audit_production_sources() -> None:
         for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(r"\blinux\.(?:fork|execve|chroot)\s*\(", text):
+            if relative == "src/native_unpack.zig" and match.group() == "linux.fork(":
+                helper_start = text.find("fn testFreshDatabaseInstall(")
+                helper_end = text.find(
+                    '\ntest "native_unpack.test.caller-owned install initializes an absent database"',
+                    helper_start,
+                )
+                if (
+                    helper_start >= 0
+                    and helper_start < match.start() < helper_end
+                    and text.count("linux.fork(") == 1
+                ):
+                    continue
             if (
                 relative in (
                     "src/apt_system_command.zig",

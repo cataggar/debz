@@ -131,6 +131,19 @@ a placeholder or invoking dpkg tools. Other script tools, including
 `update-alternatives`, remain independently fail-closed on their authenticated
 root payload and pinned architecture digest.
 
+The manual real-snapshot gate now selects the production native backend
+explicitly on amd64 and arm64 and starts from an empty directory with no dpkg
+database or helper placeholder. A Zig comparator owns canonical
+native/reference equality; shell and existing Python tooling are restricted to
+privileged execution and pinned oracle artifact preparation. The gate's
+repository-specific config explicitly binds the finite 31-day missing-expiry
+policy. The frozen Ubuntu `resolute` InRelease is dated 2026-04-23 and therefore
+returns `ReleaseExpired` before mutation. The gate now pins the currently
+valid `stonking` 2026-09-23 snapshot, whose complete development suite
+publishes SHA512-only Release and package identities supported by exact-lock
+v3. No clock override, fabricated SHA256, or historical replay is used; both
+architecture parity runs remain necessary before any cutover claim.
+
 Item 14 adds private native-step journaling, persisted execution inputs, and
 recovery/provenance orchestration. Recovery consumes the original compiled
 authority without caller archives or recompilation, delegates primitive repair
@@ -409,8 +422,10 @@ CAS publication.
 boundary. Its non-mutating `resolve_lock` operation may create an initial exact
 lock from authenticated metadata and a deterministic plan. Create, customize,
 update, and recovery continue to require that reviewed lock as input. The
-manual native-architecture real-snapshot matrix exercises this sequence for
-Ubuntu 26.04 `ubuntu-minimal`; see
+manual native-architecture real-snapshot matrix is intended to exercise this
+sequence for Ubuntu 26.04 `ubuntu-minimal`, but its current reviewed snapshot
+is refused by the explicit finite repository freshness policy before lock
+resolution or mutation; see
 [zvmi Debian-family backend](zvmi-package-family.md).
 
 ## Dependency solver

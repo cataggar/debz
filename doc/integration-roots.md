@@ -103,37 +103,80 @@ members produce identical repository and provenance digests. The Release
 validity window is fixed from 2024 through 2037. CI retains full-lane root,
 cache, state, and provenance artifacts for seven days.
 
-The mandatory release-acceptance command is the manual `workflow_dispatch`
-real-snapshot matrix in `.github/workflows/ci.yml`. It runs natively on
+The real-snapshot candidate is selected explicitly with
+`--transaction-backend native`; omission can never route this acceptance
+through the default legacy executor. The opt-in `ubuntu-real-snapshot` job in
+the existing manual `.github/workflows/ci.yml` dispatch runs on
 `ubuntu-24.04` amd64 and `ubuntu-24.04-arm` arm64 against
-`https://snapshot.ubuntu.com/ubuntu/20260816T000000Z`, suite `resolute`,
-component `main`, and the explicit Ubuntu archive keyring. Inputs remain
-visible but validation rejects any value other than that reviewed snapshot.
-Here "natively" describes the runner architecture: this snapshot lane still
-uses the default legacy transaction backend, not native transaction execution.
+`https://snapshot.ubuntu.com/ubuntu/20260923T000000Z`, suite `stonking`,
+component `main`, and the explicit Ubuntu archive keyring. Inputs remain fixed to that reviewed snapshot until its signed validity
+window requires a fresh reviewed pin.
 Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
 regular, non-symlink Ubuntu archive keyring instead of installing trust material
 on the host. The authenticated lock must identify the reviewed Ubuntu 2018
 archive signer `F6ECB3762474EDA9D21B7022871920D1991BC93C`. Workspaces must be new;
 an existing root is never reused or reset by this script.
 
-Each row uses the production CLI to authenticate metadata, resolve and review
-an exact `ubuntu-minimal` closure lock without mutating a root, download and
-validate every payload, create the dpkg root under that exact lock, reproduce
-the install lock, and resolve a separate operation-bound lock for `upgrade-all`.
-The pinned update must execute zero dpkg commands and preserve package status.
-Its genuine legacy receipt is verified against the update lock, separately
-from the verified install receipt; it is not a copy of earlier provenance.
-Unlike a native unchanged result, this legacy replay can report `changed: true`
-and publish a new receipt despite executing zero commands.
-It verifies dpkg health,
-provenance, native architecture, failure-before-mutation for a tampered lock,
-and the absence of apt processes in the root. Metadata, package, total
-download, disk, retry, command, and workflow limits are bounded. Evidence is
-retained even on failure while package cache and staged root payloads are
-cleaned.
+The native side begins with only an existing empty directory: no dpkg
+database, helper placeholder, package state, merged-/usr links, or private
+debz namespace is pre-created. It authenticates metadata, resolves a genuine
+v3 lock, and can bootstrap the private trigger helper only from the exact
+authenticated `dpkg` archive and final owner evidence. Candidate commands are
+optionally exec-traced and fail if they launch `dpkg` or `dpkg-deb`.
+The isolated oracle is the architecture-pinned dpkg 1.22.22 payload prepared
+under `.cache`; its executable and receipt are reverified before reference
+execution. Python is transport for that reference artifact, not the
+comparison authority. The reference step independently verifies each
+authenticated lock archive against its SHA512 CAS identity, initializes only
+the separate oracle's dpkg database, stages exact-lock interpreter/tool
+payloads for the chroot, attempts to install the closure with the pinned dpkg,
+and captures its root only on success. The candidate root is never seeded from
+the reference. The pinned dpkg reference probes prerequisite and configuration
+readiness before each package phase, without `--force-depends`; at a stall,
+it lets dpkg configure a dependency cycle together, accepting only deferred
+dependency failures and checking the resulting database state. Maintainer
+scripts see `/proc` mounted only in a private mount namespace, which is gone
+before capture. A fresh amd64 rehearsal configured all 175 packages, processed
+pending triggers, and captured the healthy reference root. The reference-only
+`dev/null` chroot device is excluded from both bounded captures only when no
+package claims it; no package payload path is excluded.
+`test/real-snapshot-comparator.zig` is the equality authority for the bounded
+filesystem and normalized dpkg
+status/info/trigger/diversion/statoverride/alternatives sections. It compares
+package-owned regular-file timestamps and every payload digest. It ignores
+clock-derived timestamps on unowned files and symlinks and the contents of
+three explicitly unowned runtime products (`etc/machine-id`,
+`var/cache/ldconfig/aux-cache`, `var/log/alternatives.log`); their presence,
+size, mode, ownership, and captured hashes remain recorded, and a package
+claim on any of those three paths fails comparison. Two independent healthy
+amd64 dpkg roots compared successfully under these rules. Missing
+either capture or any mismatch fails the manual job; the always-run cleanup
+retains available diagnostics even after earlier failure.
 
-Immediately before that cleanup, the workflow runs
+This gate is not a completed parity claim until both architecture captures
+compare successfully. The previously pinned `resolute` release is frozen with
+an InRelease dated 2026-04-23 and expired under the finite policy. The newly
+pinned `stonking` release advertises Date 2026-09-22 and Valid-Until
+2026-10-06; repository authentication must verify those signed fields
+before planning. The repository config explicitly selects
+`allow_missing_valid_until_with_max_age_seconds` with the unchanged 31-day
+maximum. That policy is part of normalized repository identity, authenticated
+snapshot provenance, and exact-lock identity. Current exact-lock v3 and
+acquisition contracts support the SHA512-only Release, Packages, and archive
+identities published by `stonking`; no fabricated SHA256 or historical-time
+replay is allowed. Full install/reinstall/upgrade/remove/purge, crash/restart,
+archive-evicted recovery, and passing native/reference comparisons still
+require executed evidence from both architectures.
+
+The current native offline replay remains fail-closed at `libpam-runtime`:
+its authenticated archive owns both `PAM.7.gz` and the `pam.7.gz` symlink in
+the same directory. Pinned dpkg installs both on a case-sensitive root, while
+a casefold ext4 probe cannot unpack them. Native cannot merely waive its
+case-alias check: crash recovery must first bind a case-sensitive directory
+proof and both publications to the journal, with no-replace semantics. This
+blocker must be resolved before publishing the real-snapshot parity gate.
+
+The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
 schema](../schema/vendor-state-inventory-v1.json) inventories every

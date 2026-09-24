@@ -38,34 +38,34 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 423,
-      "sha512": "fa94ad6d0a590c03d25d7b4ff373dbc5d944a72eb1ed4ab339ba0059085936b5780384ed8c64bd9224a5cccaa7d9567bcb136e72c9a72a54271b3b2e602834ab"
+      "count": 426,
+      "sha512": "79c6bcf196509e66add2d7b4ba5914d0743c9c30d90da3a9ec2aaec771ed986da2035f13e44647b8fe3f18bab456b81b78ee9298dd7e893209d11616532c8134"
     },
     "findings": {
-      "count": 20077,
+      "count": 20261,
       "counts": {
-        "cas_layout": 190,
-        "digest_version": 103,
+        "cas_layout": 195,
+        "digest_version": 104,
         "fixed_64_hex": 171,
-        "raw_32_byte": 1051,
-        "sha256_token": 18562
+        "raw_32_byte": 1061,
+        "sha256_token": 18730
       },
-      "sha512": "b531635bec31c79b0eff94d17ea2145d7d9130d1f10a2b89956be07a5ad1ed091186492f415a2d3c9eae8cf7f3410544d586bb7b2affca0535a8f4e3f950f7f9"
+      "sha512": "789ea4fbd3e05c0a4106acebe3cc721f715ff7ee1468ab6a79d5f0551d6741c684bd0e145330da6fdfad7c065a25cc220c67b78ea647c5897ee25120436d863b"
     },
     "classifications": [
       {
         "scope": ".github",
         "classification": "external_integrity_protocol",
         "rationale": "Workflow SHA256 values are frozen installer and CI compatibility inputs; package authorities are independently rejected by semantic checks.",
-        "count": 13,
+        "count": 16,
         "counts": {
           "cas_layout": 1,
           "digest_version": 0,
           "fixed_64_hex": 0,
           "raw_32_byte": 0,
-          "sha256_token": 12
+          "sha256_token": 15
         },
-        "sha512": "cad35f0ace1e41936b439087a5508d26bc612ef3a3c986aec44e289402a4f8e4d84a97f4e3dc6053fed0b2b2980d89b2c56c2a6db0fcfc8ea0988e8ee1191adc"
+        "sha512": "221642ebc38b36c5a373b2a7981c741c1b41999b0b82f5286f9842d34e018bfbc2d7faee3494ed83bd6674a9124e5e52fa25638ec85667879f3728ed0c0ca70d"
       },
       {
         "scope": "actions",
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 149,
+        "count": 152,
         "counts": {
-          "cas_layout": 22,
+          "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 119
+          "sha256_token": 121
         },
-        "sha512": "f10eff3fe9094f8c36d2a2300388fab146cbdc0616a4a29f037019b6f5b30d9f6c5bdf91e5af6165de6e5fd610e3d6e3203205215a6247ab68959133c6069077"
+        "sha512": "4be45f9e9dfb6a1ffa1879b0cd1b2f92e5ec0cd1923c9edc9c9b04d4d9a3390a550e52edbb30410898378d803fa4fc9bdee87827cc772ae7d108f241b323dee3"
       },
       {
         "scope": "fuzz",
@@ -155,43 +155,43 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes and versioned compatibility readers.",
-        "count": 11825,
+        "count": 11964,
         "counts": {
           "cas_layout": 75,
-          "digest_version": 53,
+          "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1046,
-          "sha256_token": 10633
+          "raw_32_byte": 1055,
+          "sha256_token": 10762
         },
-        "sha512": "26df74d0d26d3a5d6e4d427b6da31e1971f1c2c3760a26a37af913e835df5ee2b0649de16035fc3de4c51f4c162edf1cdaac1a8b68e56042100437bad8221a8e"
+        "sha512": "10bc74d7e5a22812b2f59bff096fd05395e5235f1128d61a75912db63063309c062e88b67b630303287f4961a0b6cb47c2e8db6ffebcfb8b5c4f2a11c620f923"
       },
       {
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 0,
+        "count": 13,
         "counts": {
           "cas_layout": 0,
           "digest_version": 0,
           "fixed_64_hex": 0,
-          "raw_32_byte": 0,
-          "sha256_token": 0
+          "raw_32_byte": 1,
+          "sha256_token": 12
         },
-        "sha512": "b25b294cb4deb69ea00a4c3cf3113904801b6015e5956bd019a8570b1fe1d6040e944ef3cdee16d0a46503ca6e659a25f21cf9ceddc13f352a3c98138c15d6af"
+        "sha512": "2fb708576e46953eaa708fb2695af3d841cb1c91180bada66a2347c505eaeb4a77b66a6e4da106fd853cdc5926264eacdc51bd1ee0641d9f15f836bdf1fa57bf"
       },
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
         "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes; production authorities remain typed and versioned.",
-        "count": 5430,
+        "count": 5456,
         "counts": {
-          "cas_layout": 21,
+          "cas_layout": 25,
           "digest_version": 2,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5403
+          "sha256_token": 5425
         },
-        "sha512": "b80b013ece2fa70d67001915c5875b13816a5ba8eb60097f82701d904d1b1d8d304363a6e05b5cac6c2f705408dba5529a6910f45f1481ebe16ffc264ea08574"
+        "sha512": "e6bc44495dc1ccc46b8cecf5f6e1f8b55ecd085933aa23d3843dcb752065072d65f8a6fd37517d459b7fd6a9f26151864a453ccfc5a2647e08f46049e00b5d24"
       }
     ]
   },
