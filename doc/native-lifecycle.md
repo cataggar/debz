@@ -117,6 +117,12 @@ that spelling resolves through a merged-/usr alias. Each unpack retains its own
 effective cache for that matching, including across recovery after later script
 updates. See
 [diversion routing](native-unpack.md#diversion-routing).
+An exact archive directory claim at a proven merged-/usr alias can share an
+installed owner's alias path without replacing the symlink or publishing
+directory metadata, provided its canonical target is an existing directory.
+The symlink's identity and target are checked against a non-mutating filesystem
+journal step before publication and during recovery; foreign links and actual
+symlink claims do not receive this directory-sharing exception.
 
 Old postrm now observes journalled `.dpkg-tmp` backups of replaced ordinary
 files: regular backups retain original inodes and hard-link groups, while
