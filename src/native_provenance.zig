@@ -18,9 +18,12 @@ fn validDigest(value: Digest) bool {
     return true;
 }
 
-pub const schema_id = "https://debz.dev/schema/native-transaction-provenance-v1";
-pub const schema_version: u32 = 1;
-pub const document_path = "var/lib/debz/native-transaction-provenance-v1.json";
+pub const legacy_schema_id = "https://debz.dev/schema/native-transaction-provenance-v1";
+pub const legacy_schema_version: u32 = 1;
+pub const legacy_document_path = "var/lib/debz/native-transaction-provenance-v1.json";
+pub const schema_id = "https://debz.dev/schema/native-transaction-provenance-v2";
+pub const schema_version: u32 = 2;
+pub const document_path = "var/lib/debz/native-transaction-provenance-v2.json";
 pub const maximum_document_bytes: usize = 16 * 1024 * 1024;
 pub const receipts_directory = "var/lib/debz/native-receipts-v1";
 pub const maximum_evidence_files: usize = 1024;
@@ -114,9 +117,25 @@ pub const FinalStateKind = enum {
     package_database_closure_v1,
 };
 
+pub const Authority = struct {
+    execution_request_schema: []const u8,
+    execution_request_version: u32,
+    authorization_schema: []const u8,
+    authorization_version: u32,
+    program_schema: []const u8,
+    program_version: u32,
+    exact_lock_schema: []const u8,
+    exact_lock_version: u32,
+    execution_intent_schema: []const u8,
+    execution_intent_version: u32,
+    progress_schema: []const u8,
+    progress_version: u32,
+};
+
 pub const Document = struct {
     schema: []const u8 = schema_id,
     version: u32 = schema_version,
+    authority: ?Authority = null,
     attempt_id: Digest,
     backend: root_operation.Backend = .native,
     install_root: []const u8,
@@ -152,6 +171,77 @@ pub const Document = struct {
         std.json.Stringify.value(self, .{ .whitespace = .minified }, &output.writer) catch return error.OutOfMemory;
         output.writer.writeByte('\n') catch return error.OutOfMemory;
         return output.toOwnedSlice();
+    }
+
+    pub fn jsonStringify(self: Document, writer: anytype) !void {
+        if (self.version == legacy_schema_version) {
+            try writer.write(.{
+                .schema = self.schema,
+                .version = self.version,
+                .attempt_id = self.attempt_id,
+                .backend = self.backend,
+                .install_root = self.install_root,
+                .root_identity_sha256 = self.root_identity_sha256,
+                .root_inode = self.root_inode,
+                .operation = self.operation,
+                .request_sha256 = self.request_sha256,
+                .policy_sha256 = self.policy_sha256,
+                .authorization_sha256 = self.authorization_sha256,
+                .program_sha256 = self.program_sha256,
+                .exact_lock_sha256 = self.exact_lock_sha256,
+                .artifact_evidence_sha256 = self.artifact_evidence_sha256,
+                .initial_database_generation_sha256 = self.initial_database_generation_sha256,
+                .execution_intent_sha256 = self.execution_intent_sha256,
+                .progress_head_sha256 = self.progress_head_sha256,
+                .progress_record_count = self.progress_record_count,
+                .script_outcomes_sha256 = self.script_outcomes_sha256,
+                .trigger_evidence_sha256 = self.trigger_evidence_sha256,
+                .final_database_generation_sha256 = self.final_database_generation_sha256,
+                .final_state_sha256 = self.final_state_sha256,
+                .recovered_phase_count = self.recovered_phase_count,
+                .evidence_root = self.evidence_root,
+                .evidence_files = self.evidence_files,
+                .evidence_files_sha256 = self.evidence_files_sha256,
+                .final_state_kind = self.final_state_kind,
+                .outcome = self.outcome,
+                .detail = self.detail,
+                .digest_sha256 = self.digest_sha256,
+            });
+            return;
+        }
+        try writer.write(.{
+            .schema = self.schema,
+            .version = self.version,
+            .authority = self.authority.?,
+            .attempt_id = self.attempt_id,
+            .backend = self.backend,
+            .install_root = self.install_root,
+            .root_identity_sha256 = self.root_identity_sha256,
+            .root_inode = self.root_inode,
+            .operation = self.operation,
+            .request_sha256 = self.request_sha256,
+            .policy_sha256 = self.policy_sha256,
+            .authorization_sha256 = self.authorization_sha256,
+            .program_sha256 = self.program_sha256,
+            .exact_lock_sha256 = self.exact_lock_sha256,
+            .artifact_evidence_sha256 = self.artifact_evidence_sha256,
+            .initial_database_generation_sha256 = self.initial_database_generation_sha256,
+            .execution_intent_sha256 = self.execution_intent_sha256,
+            .progress_head_sha256 = self.progress_head_sha256,
+            .progress_record_count = self.progress_record_count,
+            .script_outcomes_sha256 = self.script_outcomes_sha256,
+            .trigger_evidence_sha256 = self.trigger_evidence_sha256,
+            .final_database_generation_sha256 = self.final_database_generation_sha256,
+            .final_state_sha256 = self.final_state_sha256,
+            .recovered_phase_count = self.recovered_phase_count,
+            .evidence_root = self.evidence_root,
+            .evidence_files = self.evidence_files,
+            .evidence_files_sha256 = self.evidence_files_sha256,
+            .final_state_kind = self.final_state_kind,
+            .outcome = self.outcome,
+            .detail = self.detail,
+            .digest_sha256 = self.digest_sha256,
+        });
     }
 };
 
@@ -303,14 +393,39 @@ pub fn seal(document: *Document) void {
 }
 
 pub fn validate(document: Document) !void {
-    if (!std.mem.eql(u8, document.schema, schema_id) or
-        document.version != schema_version or
+    const legacy = std.mem.eql(u8, document.schema, legacy_schema_id) and
+        document.version == legacy_schema_version;
+    const current = std.mem.eql(u8, document.schema, schema_id) and
+        document.version == schema_version;
+    if ((!legacy and !current) or
         document.backend != .native or
         !absolute_path.root(document.install_root) or
         document.install_root.len > 4096 or
         document.detail.len > 4096 or
         document.evidence_files.len > maximum_evidence_files)
         return error.InvalidDocument;
+    if (legacy) {
+        if (document.authority != null) return error.InvalidDocument;
+    } else {
+        const authority = document.authority orelse return error.InvalidDocument;
+        inline for (.{
+            authority.execution_request_schema,
+            authority.authorization_schema,
+            authority.program_schema,
+            authority.exact_lock_schema,
+            authority.execution_intent_schema,
+            authority.progress_schema,
+        }) |value| if (value.len == 0 or value.len > 256)
+            return error.InvalidDocument;
+        inline for (.{
+            authority.execution_request_version,
+            authority.authorization_version,
+            authority.program_version,
+            authority.exact_lock_version,
+            authority.execution_intent_version,
+            authority.progress_version,
+        }) |value| if (value == 0) return error.InvalidDocument;
+    }
     const root_identity = hexDigest(
         transaction_recovery.rootIdentity(document.install_root),
     );
@@ -439,7 +554,7 @@ pub fn publish(
     const bytes = try document.canonicalJson(allocator);
     defer allocator.free(bytes);
     if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
-    const path = try root_fs.Path.init(document_path);
+    const path = try root_fs.Path.init(documentPath(document));
     const existing_bytes = root.readFileAlloc(
         allocator,
         path,
@@ -451,7 +566,7 @@ pub fn publish(
     if (existing_bytes) |existing| {
         defer allocator.free(existing);
         if (std.mem.eql(u8, existing, bytes)) return;
-        var owned = try read(allocator, root) orelse
+        var owned = try readPath(allocator, root, documentPath(document)) orelse
             return error.ProvenanceChanged;
         defer owned.deinit();
         if (std.mem.eql(
@@ -474,7 +589,16 @@ pub fn read(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
 ) !?OwnedDocument {
-    const path = try root_fs.Path.init(document_path);
+    if (try readPath(allocator, root, document_path)) |document| return document;
+    return try readPath(allocator, root, legacy_document_path);
+}
+
+fn readPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    relative_path: []const u8,
+) !?OwnedDocument {
+    const path = try root_fs.Path.init(relative_path);
     const bytes = root.readFileAlloc(
         allocator,
         path,
@@ -545,7 +669,10 @@ pub fn verifyEvidence(
 fn digest(document: Document) Digest {
     var buffer: [4096]u8 = undefined;
     var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
-    sink.writer.writeAll("debz-native-transaction-provenance-v1\x00") catch
+    sink.writer.writeAll(if (document.version == legacy_schema_version)
+        "debz-native-transaction-provenance-v1\x00"
+    else
+        "debz-native-transaction-provenance-v2\x00") catch
         unreachable;
     std.json.Stringify.value(
         document,
@@ -554,6 +681,33 @@ fn digest(document: Document) Digest {
     ) catch unreachable;
     sink.writer.flush() catch unreachable;
     return hexDigest(sink.hasher.finalResult());
+}
+
+pub fn documentPath(document: Document) []const u8 {
+    return if (document.version == legacy_schema_version)
+        legacy_document_path
+    else
+        document_path;
+}
+
+pub fn completionVersion(document: Document) ?u32 {
+    return if (document.version == legacy_schema_version)
+        null
+    else
+        document.version;
+}
+
+test "native_provenance.test.document path follows the versioned receipt" {
+    var document = testDocument();
+    try std.testing.expectEqualStrings(document_path, documentPath(document));
+    try std.testing.expectEqual(schema_version, completionVersion(document).?);
+    document.schema = legacy_schema_id;
+    document.version = legacy_schema_version;
+    try std.testing.expectEqualStrings(
+        legacy_document_path,
+        documentPath(document),
+    );
+    try std.testing.expect(completionVersion(document) == null);
 }
 
 pub fn testDocument() Document {
@@ -606,6 +760,20 @@ pub fn testDocument() Document {
         },
     };
     var document: Document = .{
+        .authority = .{
+            .execution_request_schema = "https://debz.dev/schema/native-execution-request-v4",
+            .execution_request_version = 4,
+            .authorization_schema = "https://debz.dev/schema/native-transaction-authorization-v2",
+            .authorization_version = 2,
+            .program_schema = "https://debz.dev/schema/native-transaction-program-v2",
+            .program_version = 2,
+            .exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v3",
+            .exact_lock_version = 3,
+            .execution_intent_schema = "https://debz.dev/schema/native-execution-intent-v2",
+            .execution_intent_version = 2,
+            .progress_schema = "https://debz.dev/schema/native-execution-progress-v3",
+            .progress_version = 3,
+        },
         .attempt_id = attempt_id,
         .install_root = "/srv/root",
         .root_identity_sha256 = hexDigest(
@@ -649,6 +817,32 @@ pub fn testContract() !void {
 
 test "native_provenance.test.digest binds terminal evidence" {
     try testContract();
+}
+
+test "native_provenance.test.legacy v1 canonical bytes remain frozen" {
+    var document = testDocument();
+    document.schema = legacy_schema_id;
+    document.version = legacy_schema_version;
+    document.authority = null;
+    seal(&document);
+    const source = try document.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    var canonical_sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &canonical_sha256, .{});
+    var expected_sha256: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(
+        &expected_sha256,
+        "c4de2d5af3929c6eabebb67e86ce763bdc3c16cfc0fbce9614b0727594c44a38",
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &expected_sha256,
+        &canonical_sha256,
+    );
+    var decoded = try decode(std.testing.allocator, source);
+    defer decoded.deinit();
+    try std.testing.expectEqual(legacy_schema_version, decoded.document.version);
+    try std.testing.expect(decoded.document.authority == null);
 }
 
 fn testDecodeAllocation(allocator: std.mem.Allocator, source: []const u8) !void {

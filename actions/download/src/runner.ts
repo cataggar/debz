@@ -13,39 +13,39 @@ const hex64 = /^[0-9a-f]{64}$/;
 const contracts = {
   legacy_dpkg: {
     fingerprint: {
-      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v1',
-      api_version: 1,
-      capability: 'package-cache-v1',
+      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v3',
+      api_version: 3,
+      capability: 'package-cache-v3',
       lock_schema: 'https://debz.dev/schema/exact-closure-lock-v1',
       lock_schema_version: 1,
       archive_format: 'debz-package-cache-archive-v1',
       origin_mode: 'exact-lock-v1-authenticated-repository',
     },
     prepare: {
-      schema: 'io.github.cataggar.debz.package-cache-result.v1',
-      api_version: 1,
-      capability: 'package-cache-v1',
+      schema: 'io.github.cataggar.debz.package-cache-result.v3',
+      api_version: 3,
+      capability: 'package-cache-v3',
     },
-    cacheKey: /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
-    restorePrefix: /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
+    cacheKey: /^debz-package-cas-v3-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
+    restorePrefix: /^debz-package-cas-v3-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
   },
   native: {
     fingerprint: {
-      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v2',
-      api_version: 2,
-      capability: 'package-cache-v2',
-      lock_schema: 'https://debz.dev/schema/exact-closure-lock-v2',
-      lock_schema_version: 2,
-      archive_format: 'debz-package-cache-archive-v2',
-      origin_mode: 'exact-lock-v2-verified-origins',
+      schema: 'io.github.cataggar.debz.package-cache-fingerprint.v5',
+      api_version: 5,
+      capability: 'package-cache-v5',
+      lock_schema: 'https://debz.dev/schema/exact-closure-lock-v3',
+      lock_schema_version: 3,
+      archive_format: 'debz-package-cache-archive-v3',
+      origin_mode: 'exact-lock-v3-content-identities',
     },
     prepare: {
-      schema: 'io.github.cataggar.debz.package-cache-result.v2',
-      api_version: 2,
-      capability: 'package-cache-v2',
+      schema: 'io.github.cataggar.debz.package-cache-result.v5',
+      api_version: 5,
+      capability: 'package-cache-v5',
     },
-    cacheKey: /^debz-package-cas-v2-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
-    restorePrefix: /^debz-package-cas-v2-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
+    cacheKey: /^debz-package-cas-v5-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/,
+    restorePrefix: /^debz-package-cas-v5-[A-Za-z0-9-]+-[0-9a-f]{64}-$/,
   },
 } as const;
 
@@ -101,7 +101,7 @@ export type FingerprintDocument = CacheContract['fingerprint'] & {
   target_architecture: string;
   abi: 'debian-package-archive-v1';
   debz_version: string;
-  cas_layout: 'packages-v1';
+  cas_layout: 'packages-v2';
   payload_policy: 'deb-payload-default-limits-v1';
   acceptance_policy_digest: string;
   fingerprint: string;
@@ -116,7 +116,7 @@ export type PrepareDocument = CacheContract['prepare'] & {
   lock_digest: string;
   fingerprint: string;
   target_architecture: string;
-  cas_layout: 'packages-v1';
+  cas_layout: 'packages-v2';
   cache_root: string;
   cache_path: string;
   downloaded_count: number;
@@ -386,7 +386,7 @@ export function validateFingerprint(
   literal(document.target_architecture, inputs.architecture, 'target_architecture');
   literal(document.abi, 'debian-package-archive-v1', 'abi');
   literal(document.debz_version, version, 'debz_version');
-  literal(document.cas_layout, 'packages-v1', 'cas_layout');
+  literal(document.cas_layout, 'packages-v2', 'cas_layout');
   literal(document.payload_policy, 'deb-payload-default-limits-v1', 'payload_policy');
   literal(document.cache_root, inputs.cacheRoot, 'cache_root');
   literal(document.cache_path, inputs.cachePath, 'cache_path');
@@ -455,7 +455,7 @@ export function validatePrepare(
   literal(document.lock_digest, expected.lock_digest, 'lock_digest');
   literal(document.fingerprint, expected.fingerprint, 'fingerprint');
   literal(document.target_architecture, inputs.architecture, 'target_architecture');
-  literal(document.cas_layout, 'packages-v1', 'cas_layout');
+  literal(document.cas_layout, 'packages-v2', 'cas_layout');
   literal(document.cache_root, inputs.cacheRoot, 'cache_root');
   literal(document.cache_path, inputs.cachePath, 'cache_path');
   const downloaded = count(document.downloaded_count, 'downloaded_count');

@@ -49,6 +49,9 @@ SCRIPT = NAMESPACE / "native-lifecycle-script-v1.json"
 PROGRESS = NAMESPACE / "native-execution-progress-v1.log"
 RECOVERY_ARTIFACTS = NAMESPACE / "native-recovery-v1/artifacts"
 PROVENANCE_SCHEMA = "native-transaction-provenance-v1"
+CURRENT_PROVENANCE_SCHEMA = "native-transaction-provenance-v2"
+CURRENT_PROVENANCE = NAMESPACE / "native-transaction-provenance-v2.json"
+CURRENT_COMPLETION = NAMESPACE / "root-operation-completion-v2.json"
 BINDING_FIELDS = (
     "attempt_id", "program_sha256", "authorization_sha256",
     "root_identity_sha256", "install_root", "root_inode", "operation",
@@ -67,6 +70,13 @@ EVIDENCE_SCHEMAS = {
     "unpack_diversion_cache": "native-unpack-diversion-v1",
     "trigger_events": "native-trigger-events-v1",
     "script_outcome": "native-script-outcome-v1",
+}
+VERSIONED_EVIDENCE_SCHEMAS = {
+    "execution_request": ("native-execution-request", {1, 2, 3, 4}),
+    "authorization": ("native-transaction-authorization", {1, 2}),
+    "program": ("native-transaction-program", {1, 2}),
+    "intent": ("native-execution-intent", {1, 2}),
+    "progress": ("native-execution-progress", {1, 2, 3}),
 }
 
 
@@ -245,9 +255,16 @@ def digest(domain: str, value: object) -> str:
 def assert_digest(value: dict, schema: str) -> None:
     payload = dict(value)
     expected = payload["digest_sha256"]
-    if schema == "native-transaction-authorization-v1":
+    if schema in {
+        "native-transaction-authorization-v1",
+        "native-transaction-authorization-v2",
+        "root-operation-completion-v1",
+    }:
         del payload["digest_sha256"]
         found = digest("", payload)
+    elif schema == "root-operation-completion-v2":
+        del payload["digest_sha256"]
+        found = digest("debz-root-operation-completion-v2\0", payload)
     else:
         payload["digest_sha256"] = "0" * 64
         found = digest(f"debz-{schema}\0", payload)
@@ -256,16 +273,32 @@ def assert_digest(value: dict, schema: str) -> None:
 
 
 @cache
+def schema_resources() -> tuple[dict[str, dict], object | None]:
+    definitions = {}
+    registry = Registry() if Registry is not None and Resource is not None else None
+    for path in (ROOT / "schema").glob("*.json"):
+        definition = document(path)
+        identifier = definition.get("$id")
+        if not isinstance(identifier, str):
+            continue
+        definitions[identifier] = definition
+        if registry is not None:
+            registry = registry.with_resource(identifier, Resource.from_contents(definition))
+    return definitions, registry
+
+
+@cache
 def validator(schema: str) -> jsonschema.Draft202012Validator:
     definition = document(ROOT / "schema" / f"{schema}.json")
-    execution = document(ROOT / "schema/native-execution-request-v1.json")
+    definitions, registry = schema_resources()
     if Registry is not None and Resource is not None:
-        registry = Registry().with_resource(execution["$id"], Resource.from_contents(execution))
+        assert registry is not None
         return jsonschema.Draft202012Validator(definition, registry=registry)
     return jsonschema.Draft202012Validator(
         definition,
         resolver=jsonschema.RefResolver.from_schema(
-            definition, store={execution["$id"]: execution},
+            definition,
+            store=definitions,
         ),
     )
 
@@ -406,10 +439,13 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
             continue
         value = json.loads(raw)
         schema = EVIDENCE_SCHEMAS[kind]
-        if kind == "execution_request" and value.get("version") in (2, 3):
-            schema = f"native-execution-request-v{value['version']}"
-        if kind == "progress" and value.get("version") == 2:
-            schema = "native-execution-progress-v2"
+        versioned = VERSIONED_EVIDENCE_SCHEMAS.get(kind)
+        if versioned is not None:
+            prefix, versions = versioned
+            version = value.get("version")
+            if version not in versions:
+                raise AssertionError(f"unsupported retained {kind} version")
+            schema = f"{prefix}-v{version}"
         validator(schema).validate(value)
         assert_digest(value, schema)
         if value["digest_sha256"] != entry["document_sha256"]:
@@ -500,6 +536,7 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
         "request/native-execution-request-v1.json",
         "request/native-execution-request-v2.json",
         "request/native-execution-request-v3.json",
+        "request/native-execution-request-v4.json",
     ):
         requests = documents.get("execution_request", [])
         if len(requests) != 1:
@@ -507,12 +544,10 @@ def retained_documents(root: Path, proof: dict) -> dict[str, list[dict]]:
         request_bytes = canonical(requests[0]) + b"\n"
         if hashlib.sha256(request_bytes).hexdigest() != request_blobs[0]["sha256"]:
             raise AssertionError("retained production request differs from the execution intent")
-        if requests[0]["version"] in (2, 3):
-            helper = (
-                requests[0]["helper"]
-                if requests[0]["version"] == 2
-                else requests[0]["bootstrap"]["helper"]
-            )
+        if requests[0]["version"] in (2, 3, 4):
+            helper = requests[0].get("helper")
+            if helper is None:
+                helper = requests[0]["bootstrap"]["helper"]
             binaries = [entry for entry in proof["evidence_files"] if entry["kind"] == "helper_binary"]
             if len(binaries) != 1 or binaries[0]["sha256"] != helper["sha256"] or binaries[0]["size"] != helper["size"]:
                 raise AssertionError("retained helper differs from the original request")
@@ -2638,7 +2673,7 @@ def exercise_consumer_parity(
             assert plan["succeeded"] and not plan["changed"], plan
             assert core_lock.read_bytes() == family_lock.read_bytes(), "consumer plans differ for identical installed inputs"
             lock = document(core_lock)
-            validator("exact-closure-lock-v2").validate(lock)
+            validator("exact-closure-lock-v3").validate(lock)
             for root in roots:
                 assert not m.oracle.differences(initial[root], triggers.snapshot(root)), "planning changed installed state"
             operation = "upgrade-all" if case.get("update") else "install"
@@ -2675,12 +2710,12 @@ def exercise_consumer_parity(
             for root in (core, current.candidate):
                 assert not (root / OPERATION).exists() and not (root / INTENT).exists()
                 if not case["archives"]:
-                    assert not (root / NAMESPACE / "native-transaction-provenance-v1.json").exists()
+                    assert not (root / CURRENT_PROVENANCE).exists()
                     continue
-                receipt = document(root / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
-                completion = document(root / NAMESPACE / "root-operation-completion-v1.json")
-                validator(PROVENANCE_SCHEMA).validate(receipt)
-                assert_digest(receipt, PROVENANCE_SCHEMA)
+                receipt = document(root / CURRENT_PROVENANCE, 16 * 1024 * 1024)
+                completion = document(root / CURRENT_COMPLETION)
+                validator(CURRENT_PROVENANCE_SCHEMA).validate(receipt)
+                assert_digest(receipt, CURRENT_PROVENANCE_SCHEMA)
                 retained_documents(root, receipt)
                 assert_final_database(root, architecture, receipt)
                 assert receipt["outcome"] == ("failed" if expected_status else "succeeded")
@@ -2783,7 +2818,7 @@ def exercise_workflows(
             assert result["succeeded"] == (status == "success"), result
         assert not (current.directory / "state/transaction-result.json").exists()
         if result["provenance_path"] is not None:
-            assert result["provenance_path"] == str(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json")
+            assert result["provenance_path"] == str(current.candidate / CURRENT_PROVENANCE)
             assert Path(result["provenance_path"]).is_file()
         return result
 
@@ -2808,11 +2843,11 @@ def exercise_workflows(
         return observed
 
     def assert_completion(current: lifecycle.Scenario, lock: dict) -> None:
-        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
-        validator(PROVENANCE_SCHEMA).validate(receipt)
-        assert_digest(receipt, PROVENANCE_SCHEMA)
+        receipt = document(current.candidate / CURRENT_PROVENANCE, 16 * 1024 * 1024)
+        validator(CURRENT_PROVENANCE_SCHEMA).validate(receipt)
+        assert_digest(receipt, CURRENT_PROVENANCE_SCHEMA)
         retained_documents(current.candidate, receipt)
-        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        completion = document(current.candidate / CURRENT_COMPLETION)
         assert receipt["exact_lock_sha256"] == lock["digest_sha256"]
         assert completion["attempt_id"] == receipt["attempt_id"]
         assert completion["transaction_provenance"]["document_sha256"] == receipt["digest_sha256"]
@@ -2864,8 +2899,8 @@ def exercise_workflows(
         assert summary["request_sha256"] == lock["request_sha256"]
         assert summary["solver_policy_sha256"] == lock["policy_sha256"]
         assert summary["package_count"] == len(lock["packages"])
-        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
-        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        receipt = document(current.candidate / CURRENT_PROVENANCE, 16 * 1024 * 1024)
+        completion = document(current.candidate / CURRENT_COMPLETION)
         assert summary["transaction_digest_sha256"] == receipt["digest_sha256"]
         assert summary["completion_digest_sha256"] == completion["digest_sha256"]
         assert summary["caller_request_sha256"] == completion["request_sha256"]
@@ -2887,8 +2922,8 @@ def exercise_workflows(
     def completion_evidence(current: lifecycle.Scenario, label: str, outcome: str, settlement: str) -> dict:
         captured = document(current.directory / label / "native-evidence.json")
         returned = captured["native_completion"]
-        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
-        completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+        receipt = document(current.candidate / CURRENT_PROVENANCE, 16 * 1024 * 1024)
+        completion = document(current.candidate / CURRENT_COMPLETION)
         assert completion["surface"] == "package_transaction"
         assert returned["operation"] == completion["operation"]
         assert returned["outcome"] == outcome == receipt["outcome"]
@@ -2928,8 +2963,8 @@ def exercise_workflows(
         if succeeds:
             validator("transaction-result-summary-v2").validate(result)
             lock = document(Path(original["lock_input"]))
-            receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
-            completion = document(current.candidate / NAMESPACE / "root-operation-completion-v1.json")
+            receipt = document(current.candidate / CURRENT_PROVENANCE, 16 * 1024 * 1024)
+            completion = document(current.candidate / CURRENT_COMPLETION)
             expected_operation = (
                 ("upgrade" if original.get("package") is not None else "upgrade-all")
                 if original["operation"] == "update" else "install"
@@ -2976,8 +3011,8 @@ def exercise_workflows(
         result = verify_family(f"mismatch-{field}", {**original_family, field: value}, False)
         assert result["error"] == "NativeFamilyRequestMismatch", result
     for name, path in (
-        ("receipt", current.candidate / NAMESPACE / "native-transaction-provenance-v1.json"),
-        ("completion", current.candidate / NAMESPACE / "root-operation-completion-v1.json"),
+        ("receipt", current.candidate / CURRENT_PROVENANCE),
+        ("completion", current.candidate / CURRENT_COMPLETION),
         ("database", current.candidate / "var/lib/dpkg/status"),
         ("lock", Path(original_family["lock_input"])),
     ):
@@ -3059,7 +3094,7 @@ def exercise_workflows(
     assert {package["name"] for package in initial["packages"]} == {"essential-core", "native-helper-target"}
     planned = run_family(current, "family-plan", family_request(current, "resolve_lock", "scenario-main"))
     assert not planned["changed"] and planned["provenance_path"] is None
-    assert document(Path(planned["lock_path"]))["version"] == 2
+    assert document(Path(planned["lock_path"]))["version"] == 3
     create_request = family_request(current, "create", "scenario-main")
     created = run_family(current, "family-create", create_request)
     assert created["changed"]
@@ -3129,7 +3164,7 @@ def exercise_workflows(
         planned = run_family(current, "update-plan", plan_request, update_planning=True)
         assert not planned["changed"] and planned["provenance_path"] is None
         lock = document(Path(planned["lock_path"]))
-        validator("exact-closure-lock-v2").validate(lock)
+        validator("exact-closure-lock-v3").validate(lock)
         assert lock["request_sha256"] != install_lock["request_sha256"]
         assert document(current.directory / "update-plan/native-evidence.json") == {
             "native_install": None, "native_completion": None,
@@ -3214,7 +3249,7 @@ def exercise_workflows(
     planned = run(current, "plan-install", request(current, "install", "plan_only", names))
     assert {item["package"] for item in planned["items"]} == {*names, "base-dep"}
     lock = document(current.directory / "workflow.lock.json")
-    assert lock["version"] == 2
+    assert lock["version"] == 3
     installed = run(current, "install", request(current, "install", "execute", list(reversed(names))))
     assert installed["changed"]
     reference_dir = current.directory / "reference-install"
@@ -3250,14 +3285,14 @@ def exercise_workflows(
             verify_result(current, lock, False)
         finally:
             (current.candidate / OPERATION).unlink()
-        receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+        receipt = document(current.candidate / CURRENT_PROVENANCE, 16 * 1024 * 1024)
         program_path = current.candidate / next(
             entry["path"] for entry in receipt["evidence_files"] if entry["kind"] == "program"
         )
         for path in (
             program_path,
-            current.candidate / NAMESPACE / "native-transaction-provenance-v1.json",
-            current.candidate / NAMESPACE / "root-operation-completion-v1.json",
+            current.candidate / CURRENT_PROVENANCE,
+            current.candidate / CURRENT_COMPLETION,
             current.candidate / "var/lib/dpkg/status",
         ):
             original = path.read_bytes()
@@ -3267,12 +3302,12 @@ def exercise_workflows(
             finally:
                 path.write_bytes(original)
         verify_result(current, lock)
-    receipt_before = (current.candidate / NAMESPACE / "native-transaction-provenance-v1.json").read_bytes()
+    receipt_before = (current.candidate / CURRENT_PROVENANCE).read_bytes()
     run(current, "plan-unchanged", request(current, "upgrade_all", "plan_only", []))
     unchanged = run(current, "unchanged", request(current, "upgrade_all", "execute", []), capture_evidence=True)
     assert not unchanged["changed"]
     assert document(current.directory / "unchanged/native-evidence.json")["native_completion"] is None
-    assert receipt_before == (current.candidate / NAMESPACE / "native-transaction-provenance-v1.json").read_bytes()
+    assert receipt_before == (current.candidate / CURRENT_PROVENANCE).read_bytes()
     run(current, "plan-remove", request(current, "remove", "plan_only", names))
     removal_lock = document(current.directory / "workflow.lock.json")
     removed = run(current, "remove", request(current, "remove", "execute", names))
@@ -3296,7 +3331,7 @@ def exercise_workflows(
     )
     assert failed["changed"]
     assert_completion(current, failure_lock)
-    receipt = document(current.candidate / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+    receipt = document(current.candidate / CURRENT_PROVENANCE, 16 * 1024 * 1024)
     assert receipt["outcome"] == "failed"
     completed = run(current, "recover", request(current, "install", "recover", failed_names))
     assert not completed["changed"]
@@ -3448,12 +3483,12 @@ def exercise_workflows(
         m.write(active, b"{}\n")
         verify_released(current, f"verify-released-active-{name}", released, expected_error="OperationNotSettled")
         active.unlink()
-    completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+    completion_path = current.candidate / CURRENT_COMPLETION
     original_completion = completion_path.read_bytes()
     m.write(completion_path, b"{}\n")
     verify_released(current, "verify-released-damaged-completion", released, expected_error="NonCanonicalDocument")
     m.write(completion_path, original_completion)
-    receipt_path = current.candidate / NAMESPACE / "native-transaction-provenance-v1.json"
+    receipt_path = current.candidate / CURRENT_PROVENANCE
     original_receipt = receipt_path.read_bytes()
     m.write(receipt_path, b"{}\n")
     verify_released(current, "verify-released-damaged-receipt", released, expected_error="MissingField")
@@ -3481,7 +3516,7 @@ def exercise_workflows(
         finalization = owned_request(current, "install", "recover", names)
         before = triggers.snapshot(current.candidate)
         if boundary == "after_provenance_published":
-            completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+            completion_path = current.candidate / CURRENT_COMPLETION
             original_completion = completion_path.read_bytes()
             m.write(completion_path, b"{}\n")
             run(current, "damaged-completion", finalization, owner_evidence=retained,
@@ -3589,8 +3624,8 @@ def exercise_workflows(
             for name, relative, failure in (
                 ("intent", INTENT, "EvidenceChanged"),
                 ("progress", PROGRESS, "EvidenceChanged"),
-                ("authorization", NAMESPACE / "native-transaction-authorization-v1.json", "EvidenceChanged"),
-                ("program", NAMESPACE / "native-transaction-program-v1.json", "EvidenceChanged"),
+                ("authorization", NAMESPACE / "native-transaction-authorization-v2.json", "EvidenceChanged"),
+                ("program", NAMESPACE / "native-transaction-program-v2.json", "EvidenceChanged"),
                 ("triggers", NAMESPACE / "native-trigger-events-v1.json", "EvidenceChanged"),
                 ("managed", NAMESPACE / "native-managed-state-v1.json", "EvidenceChanged"),
             ):
@@ -3604,7 +3639,7 @@ def exercise_workflows(
             active_progress.unlink()
             verify_pending(current, "verify-partial-acknowledgment", pending)
             m.write(active_progress, original_progress)
-            completion_path = current.candidate / NAMESPACE / "root-operation-completion-v1.json"
+            completion_path = current.candidate / CURRENT_COMPLETION
             original_completion = completion_path.read_bytes()
             m.write(completion_path, b"{}\n")
             verify_pending(current, "verify-damaged-completion", pending, expected_error="NonCanonicalDocument")
@@ -3623,7 +3658,7 @@ def exercise_workflows(
                 active.unlink()
             run(current, "wrong-operation-acknowledgment", {**recovery, "operation": "remove"},
                 owner_evidence=pending, acknowledgment="recovery", exit_status=8)
-            receipt_path = current.candidate / NAMESPACE / "native-transaction-provenance-v1.json"
+            receipt_path = current.candidate / CURRENT_PROVENANCE
             original_receipt = receipt_path.read_bytes()
             m.write(receipt_path, b"{}\n")
             verify_pending(current, "verify-damaged-receipt", pending, expected_error="MissingField")
@@ -3735,8 +3770,7 @@ def exercise_workflows(
             run(current, "finalize", recovery, owner_evidence=proof, acknowledgment="ownership")
             run(current, "finalize-again", recovery, owner_evidence=proof, acknowledgment="ownership")
             assert not m.oracle.differences(before, triggers.snapshot(current.candidate))
-            for path in (OPERATION, INTENT, owner_path, NAMESPACE / "root-operation-completion-v1.json",
-                         NAMESPACE / "native-transaction-provenance-v1.json"):
+            for path in (OPERATION, INTENT, owner_path, CURRENT_COMPLETION, CURRENT_PROVENANCE):
                 assert not (current.candidate / path).exists(), path
             assert not (current.directory / "unused-cache").exists()
             assert not (current.directory / "unused-state").exists()
@@ -3834,11 +3868,11 @@ def exercise_workflows(
             projected_run("recover", facade_recover=True, owner_evidence="/fixture/owner.json",
                           expected_exit=7 if outcome == "failed" else 0)
             projected_owner()
-            completion = document(root / NAMESPACE / "root-operation-completion-v1.json")
+            completion = document(root / CURRENT_COMPLETION)
             assert completion["discharge"]["operation"] == "recover", completion
             projected_run("recover", facade_recover=True, owner_evidence="/fixture/owner.json",
                           expected_exit=7 if outcome == "failed" else 0)
-        proof = document(root / NAMESPACE / "native-transaction-provenance-v1.json", 16 * 1024 * 1024)
+        proof = document(root / CURRENT_PROVENANCE, 16 * 1024 * 1024)
         assert proof["install_root"] == "/run/debz/system-root"
         assert proof["outcome"] == ("failed" if outcome == "failed" else "succeeded")
         retained_documents(root, proof)
@@ -3888,7 +3922,7 @@ def exercise_workflows(
                           owned_verification={**verification, "expected_error": "OperationalVerificationFailure"})
         for damaged in (
             fixture / "lock.json",
-            root / NAMESPACE / "native-transaction-provenance-v1.json",
+            root / CURRENT_PROVENANCE,
             root / "var/lib/dpkg/status",
         ):
             original = damaged.read_bytes()
@@ -4003,9 +4037,9 @@ def exercise_workflows(
                           **review_arguments)
         for path in (OPERATION, INTENT, owner_path):
             assert not (root / path).exists(), path
-        shared_receipt = root / NAMESPACE / "native-transaction-provenance-v1.json"
+        shared_receipt = root / CURRENT_PROVENANCE
         shared_receipt.write_bytes(b"{}\n")
-        completion_path = root / NAMESPACE / "root-operation-completion-v1.json"
+        completion_path = root / CURRENT_COMPLETION
         completion_bytes = completion_path.read_bytes()
         if outcome != "success":
             completion_path.unlink()
@@ -4370,8 +4404,8 @@ def repository_cli_cases(
                 assert not (root / "repository-trace").exists()
             else:
                 proof = document(evidence, 16 * 1024 * 1024)
-                validator(PROVENANCE_SCHEMA).validate(proof)
-                assert_digest(proof, PROVENANCE_SCHEMA)
+                validator(CURRENT_PROVENANCE_SCHEMA).validate(proof)
+                assert_digest(proof, CURRENT_PROVENANCE_SCHEMA)
                 assert (root / "repository-trace").read_text() == "preinst\npostinst\n"
         mountpoint = root / "run/debz/system-root"
         assert not mountpoint.exists() or not list(mountpoint.iterdir()), "public native projection leaked"
@@ -4446,19 +4480,19 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         assert result.returncode == 0, (name, result.returncode, result.stdout, result.stderr)
         assert (root / "fixture/repository-execution-complete").read_text() == case
         assert not list((root / "run/debz/system-root").iterdir()), "repository execution projection leaked"
-        assert not list((root / "fixture/package-cache/packages-v1/objects").iterdir()), "repository recovery reused CAS inputs"
+        assert not list((root / "fixture/package-cache/packages-v2/objects").iterdir()), "repository recovery reused CAS inputs"
         assert not (root / OPERATION).exists(), "repository completion did not clear its caller"
         if terminal:
             caller = document(root / "fixture/repository-pending-caller.json")
             assert caller["outcome"] == "pending"
             assert caller["surface"] == "repository_bootstrap" and caller["operation"] == "add"
             proof = document(root / "fixture/repository-native-receipt.json", 16 * 1024 * 1024)
-            validator(PROVENANCE_SCHEMA).validate(proof)
-            assert_digest(proof, PROVENANCE_SCHEMA)
+            validator(CURRENT_PROVENANCE_SCHEMA).validate(proof)
+            assert_digest(proof, CURRENT_PROVENANCE_SCHEMA)
             retained_logical = (root / "fixture/repository-retained-receipt-path").read_text()
             assert retained_logical.startswith("/var/lib/debz/repository/operations/")
             retained_path = root / retained_logical.lstrip("/")
-            assert retained_path.name == "native-transaction-provenance-v1.json"
+            assert retained_path.name == CURRENT_PROVENANCE.name
             assert retained_path.parent.parent == root / NAMESPACE / "repository/operations"
             assert len(retained_path.parent.name) == 64 and all(value in "0123456789abcdef" for value in retained_path.parent.name)
             assert retained_path.read_bytes() == (root / "fixture/repository-native-receipt.json").read_bytes()
@@ -4503,16 +4537,15 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
                     assert not checkpoint["no_refresh"]
                     assert (root / "var/cache/debz/metadata-v1").is_dir()
             assert stat.S_IMODE(checkpoint_path.stat().st_mode) == 0o600
-            completion_path = root / NAMESPACE / "root-operation-completion-v1.json"
+            completion_path = root / CURRENT_COMPLETION
             local_completion = retained_path.parent / completion_path.name
             assert completion_path.read_bytes() == local_completion.read_bytes()
             assert stat.S_IMODE(completion_path.stat().st_mode) == 0o600
             assert stat.S_IMODE(local_completion.stat().st_mode) == 0o600
             completion = document(completion_path)
-            validator("root-operation-completion-v1").validate(completion)
-            completion_payload = dict(completion)
-            completion_digest = completion_payload.pop("digest_sha256")
-            assert hashlib.sha256(json.dumps(completion_payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest() == completion_digest
+            validator("root-operation-completion-v2").validate(completion)
+            assert_digest(completion, "root-operation-completion-v2")
+            completion_digest = completion["digest_sha256"]
             completed_caller = document(root / "fixture/repository-completed-caller.json")
             assert completed_caller["state"] == "completed" and completed_caller["provenance"] == "published"
             assert completed_caller["provenance_sha256"] == completion_digest
@@ -4578,7 +4611,7 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             assert not helper_target.exists() and not (root / NAMESPACE / "native-helper-cache-v1").exists()
             assert not (root / "fixture/repository-native-receipt.json").exists()
             assert not (root / "fixture/repository-retained-receipt-path").exists()
-            assert not (root / NAMESPACE / "root-operation-completion-v1.json").exists()
+            assert not (root / CURRENT_COMPLETION).exists()
             assert not (root / NAMESPACE / "repository").exists()
             assert not (root / "repository-trace").exists()
             assert not (root / "usr/share/doc/debz-native-repository/README").exists()
@@ -4600,12 +4633,12 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         assert (root / "fixture/repository-execution-complete").read_text() == "unchanged"
         assert not list((root / "run/debz/system-root").iterdir())
         assert not (root / "fixture/unchanged-descriptor.deb").exists()
-        assert not list((root / "fixture/package-cache/packages-v1/objects").iterdir())
+        assert not list((root / "fixture/package-cache/packages-v2/objects").iterdir())
         assert (root / "var/lib/dpkg/status").read_bytes() == (root / "fixture/unchanged-original-status").read_bytes()
         assert not (root / "repository-trace").exists()
         for path in (OPERATION, INTENT, PROGRESS, triggers.HELPER,
-                     NAMESPACE / "native-transaction-provenance-v1.json",
-                     NAMESPACE / "root-operation-completion-v1.json",
+                     CURRENT_PROVENANCE,
+                     CURRENT_COMPLETION,
                      NAMESPACE / "native-helper-cache-v1"):
             assert not (root / path).exists(), path
         callers = document(root / "fixture/repository-unchanged-caller.json")
@@ -4644,8 +4677,8 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         for expected in state["managed_files"]:
             path = root / expected["logical_path"].lstrip("/")
             assert hashlib.sha256(path.read_bytes()).hexdigest() == expected["sha256"]
-        assert not (operation / "native-transaction-provenance-v1.json").exists()
-        assert not (operation / "root-operation-completion-v1.json").exists()
+        assert not (operation / CURRENT_PROVENANCE.name).exists()
+        assert not (operation / CURRENT_COMPLETION.name).exists()
         assert (root / "usr/share/held").read_bytes() == b"untouched\n"
         print(f"native-repository-unchanged-{no_refresh}: genuine no-receipt completion passed", flush=True)
 
@@ -4694,7 +4727,7 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
         assert not (root / OPERATION).exists()
         assert not (root / INTENT).exists() and not (root / PROGRESS).exists()
         assert not list((root / "run/debz/system-root").iterdir())
-        assert not list((root / "var/cache/debz/packages-v1/objects").iterdir())
+        assert not list((root / "var/cache/debz/packages-v2/objects").iterdir())
         assert (root / "usr/share/held").read_bytes() == b"untouched\n"
         state_path = root / repeated["paths"]["operation_state"].lstrip("/")
         state = document(state_path)
@@ -4708,14 +4741,14 @@ def exercise_repository_execution(executable: Path, workspace: Path, architectur
             assert (root / "var/lib/dpkg/status").read_bytes() == (root / "fixture/dispatch-original-status").read_bytes()
             assert not (root / "repository-trace").exists()
             assert not (root / triggers.HELPER).exists()
-            assert not (root / NAMESPACE / "root-operation-completion-v1.json").exists()
+            assert not (root / CURRENT_COMPLETION).exists()
             validator("native-repository-unchanged-v1").validate(evidence)
             assert evidence["receipt"] is None and evidence["action_count"] == 0
             lock = document(root / state["exact_lock_path"].lstrip("/"))
             assert len(lock["packages"]) == 1 and lock["packages"][0]["dpkg_selection_hold"]
         else:
-            validator(PROVENANCE_SCHEMA).validate(evidence)
-            assert_digest(evidence, PROVENANCE_SCHEMA)
+            validator(CURRENT_PROVENANCE_SCHEMA).validate(evidence)
+            assert_digest(evidence, CURRENT_PROVENANCE_SCHEMA)
             assert evidence["outcome"] == ("failed" if case == "known_failure" else "succeeded")
             assert (root / "repository-trace").read_text() == "preinst\npostinst\n"
             assert (root / triggers.HELPER).read_bytes() == helper_bytes

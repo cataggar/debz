@@ -42,10 +42,11 @@ commands likewise use dedicated versioned schemas rather than changing product
 API v1. They expose `debz.package_cache_workflow` as a lock-oriented,
 non-installing API: fingerprinting performs no repository or package I/O, and
 preparation authenticates and verifies the complete lock closure. The default
-`legacy_dpkg` backend retains the v1 lock, fingerprint, result, and archive
-contracts. Explicit `--transaction-backend native` selects genuine v2 locks
-using the core native solver-policy domain, v2 fingerprint/result schemas,
-and the distinct v2 archive stream. Neither mode auto-detects the other.
+`legacy_dpkg` backend retains lock v1 and archive v1 while using the
+packages-v2 CAS fingerprint/result v3 envelopes. Explicit
+`--transaction-backend native` selects genuine v3 locks using the core native
+solver-policy domain, fingerprint/result v5, and the tagged v3 archive stream.
+Neither mode auto-detects another lock or archive version.
 The library provides corresponding typed `createNativeFingerprint`,
 `preflightNative`, and `prepareNative` entry points and writer-held variants.
 
@@ -74,12 +75,12 @@ Missing local artifacts require separate explicit acquisition; corrupt local
 artifacts refuse even with online repair enabled. Redacted provenance URLs
 are never treated as acquisition inputs or promoted to repository authority.
 Closures without repository origins require no source or keyring inputs.
-Empty closures produce zero verified objects and a canonical empty v2 archive.
+Empty closures produce zero verified objects and a canonical empty v3 archive.
 Repository/bootstrap workflows with other solver-policy scopes remain gated
 until their own native integration.
 
-Native keys use a separate `debz-package-cas-v2-` prefix and fingerprint
-domain while retaining the shared `packages-v1/objects` layout. The download
+Native keys use a separate `debz-package-cas-v5-` prefix and fingerprint
+domain while retaining the shared `packages-v2/objects` layout. The download
 and install actions support matching explicit native selection. Other native
 consumer integrations remain separately gated.
 
@@ -127,18 +128,18 @@ commands additionally require `--conffile keep-existing` or
 retains `legacy_dpkg`. Embedders select the same backend with
 `ProductionBackend.transaction_backend`, without changing product API v1
 request or result encoding. Experimental core native execution requires an
-explicit reviewed v2 lock, confirmation, conffile policy, authenticated
+explicit reviewed v3 lock, confirmation, conffile policy, authenticated
 repositories, and a supported non-host Linux root. The existing package-owned
 `usr/bin/dpkg-trigger` target and private mount-namespace privileges are required;
 missing targets refuse without placeholders. Native execution never calls the
 command-shaped executor, including injected executors. There is no fallback.
 
-Native `plan`/`download` resolve and replay exact-lock v2 from authenticated
+Native `plan`/`download` resolve and replay exact-lock v3 from authenticated
 repository evidence. They do not convert v1 locks or invent local-artifact
 origins. Native solver policy uses a distinct digest domain, so locks cannot
 cross backend policy boundaries. V1 remains the legacy core format; neither
 backend silently accepts the other's format. Native package downloads bind
-identity, repository/snapshot, SHA-256, and size before cache or transport
+identity, repository/snapshot, the complete supported digest set, and size before cache or transport
 access, including cache-only replay. The separate `package-cache` commands
 also support explicit native selection as described above; other consumer
 contracts remain gated where documented.
@@ -171,7 +172,7 @@ Recovered transactions report whether the original attempt reached mutation;
 recovery with no outstanding execution reports `changed: false`.
 The internal `ProductionBackend.executeWorkflow` seam also supports native
 batch install/remove and upgrade-all, including explicit outer ownership.
-Planning and execution share the same canonical selectors and genuine v2
+Planning and execution share the same canonical selectors and genuine v3
 authority. Workflow recovery supplies the original semantic operation,
 selectors, and request policy (recommends, repository priority, conffile, and
 downgrade settings), which must match the held original attempt; it accepts
@@ -192,7 +193,7 @@ pending owner marker until the outer caller durably accepts the exact token.
 Owned known failures use this same handoff while retaining exit 7 and their
 failure outcome; they are not relabeled as successes. Acknowledgment verifies
 the original operation, request policy, completion, native receipt, and exact
-reviewed v2 owner where present. It acknowledges native evidence before clearing
+reviewed v3 owner where present. It acknowledges native evidence before clearing
 the root record or owner marker, and retries do not replay package work.
 Callbacks refuse physical host roots and orphan native intents, including
 otherwise idempotent cleanup requests. Unresolved native programs, workspaces,
@@ -234,8 +235,9 @@ is already `completed` and only owes provenance — a crash between the terminal
 record and its published provenance — `recover` discharges that obligation
 without running dpkg again: it verifies any `transaction-result.json` that
 survived, publishes
-`INSTALL_ROOT/var/lib/debz/root-operation-completion-v1.json`
-([`schema/root-operation-completion-v1.json`](../schema/root-operation-completion-v1.json)),
+`INSTALL_ROOT/var/lib/debz/root-operation-completion-v2.json`
+([`schema/root-operation-completion-v2.json`](../schema/root-operation-completion-v2.json));
+historical v1 completion remains readable at its original path,
 binds the record to it, clears the active intent, and reports success with
 `changed` true, because it published durable provenance and unblocked the root
 even though no package state changed. The result item names the outcome, the
@@ -263,7 +265,7 @@ Native callers explicitly select a separate receipt-backed handoff:
 ```sh
 debz transaction-result capabilities --transaction-backend native --json
 debz transaction-result verify --transaction-backend native \
-  --install-root /explicit/root --lock-input /explicit/closure.v2.json \
+  --install-root /explicit/root --lock-input /explicit/closure.v3.json \
   --architecture amd64 --json
 ```
 
@@ -272,14 +274,17 @@ native summary/receipt/completion/lock contracts before a caller attempts a
 mutation. It requires no root access. Native verification accepts no
 `--state-path`, never autodetects a legacy result, and emits
 [`transaction-result-summary.v2`](../schema/transaction-result-summary-v2.json).
-The underlying native receipt and root-operation completion remain their
-existing v1 schemas; they are not converted into command-oriented provenance.
+Current native receipts and root-operation completions use their v2 schemas;
+the summary reports the versions actually verified. Historical v1 receipts,
+completions, and v2 locks remain readable through explicit legacy verification;
+none are converted into command-oriented provenance or upgraded to current
+transaction authority.
 
 Verification acquires the existing root-operation lock without creating a
 namespace, lock file, or attempt. It requires a physically bound alternate
 root with no active native evidence, root attempt, or outstanding owner
 marker. It checks canonical completion and receipt digests, retained evidence
-bytes, original caller/program/authorization bindings, the exact v2 closure
+bytes, original caller/program/authorization bindings, the exact v3 closure
 and origin evidence, terminal success, and the current package-database
 generation and final state. The summary preserves the lock's request/solver
 policy domains separately from the original caller's request/policy domains.
@@ -337,13 +342,19 @@ Package-cache JSON schemas are:
 
 - [`package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
 - [`package-cache-fingerprint-v2.json`](../schema/package-cache-fingerprint-v2.json)
+- [`package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
+- [`package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
+- [`package-cache-fingerprint-v5.json`](../schema/package-cache-fingerprint-v5.json)
 - [`package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
 - [`package-cache-result-v2.json`](../schema/package-cache-result-v2.json)
+- [`package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
+- [`package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
+- [`package-cache-result-v5.json`](../schema/package-cache-result-v5.json)
 - [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 
 Their successful outputs include the canonical lock digest, CLI-owned
 fingerprint, exact/compatible cache keys or verified preparation counts, and
-the exact `packages-v1/objects` path. Fingerprint output also supplies the
+the exact `packages-v2/objects` path. Fingerprint output also supplies the
 maximum opaque archive byte count for a bounded pre-import download. Error
 documents contain no cache key or success-shaped path. The error v1 envelope
 is backend-neutral and remains shared by both modes.

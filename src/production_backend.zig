@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const api = @import("product_api.zig");
 const deb_payload = @import("deb_payload.zig");
 const dpkg_status = @import("dpkg_status.zig");
@@ -21,6 +22,7 @@ const transaction_recovery = @import("transaction_recovery.zig");
 const transaction_provenance = @import("transaction_provenance.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const legacy_compat = @import("legacy_compat.zig");
 const native_runtime = @import("native_unpack.zig").Runtime;
 const native_recovery = @import("native_recovery.zig");
@@ -432,7 +434,7 @@ pub const Backend = struct {
         return switch (lock) {
             inline else => |owned, kind| {
                 const createFingerprint = if (kind == .native)
-                    package_cache_workflow.createNativeFingerprint
+                    package_cache_workflow.createTaggedFingerprint
                 else
                     package_cache_workflow.createFingerprint;
                 return createFingerprint(
@@ -476,23 +478,23 @@ pub const Backend = struct {
         if (kind == .native and lock.repositories.len != 0)
             try package_cache_workflow.validateRequest(request, true);
         const createFingerprint = if (kind == .native)
-            package_cache_workflow.createNativeFingerprint
+            package_cache_workflow.createTaggedFingerprint
         else
             package_cache_workflow.createFingerprint;
         const importArchive = if (kind == .native)
-            package_cache_archive.importNativeFile
+            package_cache_archive.importTaggedFile
         else
             package_cache_archive.importFile;
         const exportArchive = if (kind == .native)
-            package_cache_archive.exportNativeFile
+            package_cache_archive.exportTaggedFile
         else
             package_cache_archive.exportFile;
         const preflight = if (kind == .native)
-            package_cache_workflow.preflightNative
+            package_cache_workflow.preflightTagged
         else
             package_cache_workflow.preflight;
         const prepareAfterCleanup = if (kind == .native)
-            package_cache_workflow.prepareNativeWithWriterLockAfterCleanup
+            package_cache_workflow.prepareTaggedWithWriterLockAfterCleanup
         else
             package_cache_workflow.prepareWithWriterLockAfterCleanup;
         var validated_fingerprint = try createFingerprint(
@@ -639,11 +641,16 @@ pub const Backend = struct {
                 refreshed.states,
                 repository.repository_id,
             ) orelse return error.MissingRepository;
+            const snapshot = findSnapshot(
+                refreshed.snapshots,
+                repository.repository_id.bytes,
+            ) orelse return error.MissingRepository;
             views[index] = .{
                 .input = repository,
                 .base_uri = try repository_acquisition.Uri.parse(normalized_repository.uri),
                 .release_sha256 = state.release_digest.bytes,
                 .index_sha256 = state.index_digest.bytes,
+                .index_identity = snapshot.snapshot.provenance.index_identity,
                 .signer_fingerprint = state.signer_fingerprint,
             };
         }
@@ -831,7 +838,8 @@ pub const Backend = struct {
                 .record = attempt.record(),
                 .transaction_provenance = .{
                     .status = .already_present,
-                    .schema = native_provenance.schema_id,
+                    .schema = receipt.schema,
+                    .version = native_provenance.completionVersion(receipt),
                     .document_sha256 = receipt_digest,
                     .detail = "verified terminal native receipt",
                 },
@@ -846,7 +854,9 @@ pub const Backend = struct {
         }
         const document = completion.?.document;
         if (!document.bindsRecord(attempt.record()) or
-            !std.mem.eql(u8, document.transaction_provenance.schema, native_provenance.schema_id) or
+            !std.mem.eql(u8, document.transaction_provenance.schema, receipt.schema) or
+            document.transaction_provenance.version !=
+                native_provenance.completionVersion(receipt) or
             document.transaction_provenance.document_sha256 == null or
             !std.mem.eql(u8, &document.transaction_provenance.document_sha256.?, &receipt_digest) or
             document.transaction_provenance.status == .unavailable or document.journal.status != .absent)
@@ -997,7 +1007,7 @@ pub const Backend = struct {
         if (self.transaction_backend != .native or !usesPackageTransaction(request.operation))
             return self.withRepositoriesGuarded(allocator, request, workflow, null);
         if (request.options.lock_input_path == null)
-            return api.failure(request.operation, .usage, .configuration_required, "native execution requires an explicit v2 exact-lock input");
+            return api.failure(request.operation, .usage, .configuration_required, "native execution requires an explicit v3 exact-lock input");
         if (!request.options.assume_yes or request.options.conffile == .unspecified)
             return api.failure(request.operation, .usage, .configuration_required, "native execution requires confirmation and an explicit conffile policy");
         if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0 or
@@ -1287,7 +1297,11 @@ pub const Backend = struct {
                 .strict_repository_priority = effective_request.options.repository_policy == .strict_priority,
             },
             .exact_lock = legacy_lock,
-            .exact_lock_v2 = native_lock,
+            .exact_lock_v3 = native_lock,
+            .output_schema_version = switch (self.transaction_backend) {
+                .legacy_dpkg => .v2,
+                .native => .v4,
+            },
         });
         defer switch (planning) {
             .plan => |*value| value.deinit(),
@@ -1343,8 +1357,8 @@ pub const Backend = struct {
                 .version = exact_lock.schema_version,
                 .digest_sha256 = value.digest_sha256,
             } else if (native_lock) |value| .{
-                .schema = exact_lock_v2.schema_id,
-                .version = exact_lock_v2.schema_version,
+                .schema = exact_lock_v3.schema_id,
+                .version = exact_lock_v3.schema_version,
                 .digest_sha256 = value.digest_sha256,
             } else null,
         })) |failure| return failure;
@@ -1393,7 +1407,7 @@ pub const Backend = struct {
                         value.findPackage(action.package, action.version, action.architecture)
                     else
                         null,
-                    .exact_lock_v2_package = if (native_lock orelse
+                    .exact_lock_v3_package = if (native_lock orelse
                         if (generated_lock) |*value| value.nativeLock() else null) |value|
                         value.findPackage(action.package, action.version, action.architecture) orelse
                             return error.PlanOutsideLockedClosure
@@ -1421,7 +1435,8 @@ pub const Backend = struct {
                 .requested_architecture = action.architecture,
                 .filename = selected.record.transport.filename.value,
                 .size = package.provenance.declared_size,
-                .sha256 = package.provenance.expected_sha256.bytes,
+                .sha256 = package.provenance.expected_sha256,
+                .archive_identity = package.provenance.expected_identity,
             }, .{});
             switch (validation_result) {
                 .diagnostic => |diagnostic| {
@@ -1450,8 +1465,8 @@ pub const Backend = struct {
             }
             const path = try std.fmt.allocPrint(
                 allocator,
-                "{s}/packages-v1/objects/{s}",
-                .{ request.options.cache_path, &package.provenance.cache_key },
+                "{s}/packages-v2/objects/{s}",
+                .{ request.options.cache_path, package.provenance.cache_key },
             );
             try artifacts.append(allocator, .{
                 .package = action.package,
@@ -4842,7 +4857,7 @@ fn openRegularFileAbsoluteNoFollow(io: std.Io, path: []const u8) !std.Io.File {
 
 const ProductLock = union(transaction_engine.Kind) {
     legacy_dpkg: exact_lock.OwnedLock,
-    native: exact_lock_v2.OwnedLock,
+    native: exact_lock_v3.OwnedLock,
 
     fn deinit(self: *ProductLock) void {
         switch (self.*) {
@@ -4858,7 +4873,7 @@ const ProductLock = union(transaction_engine.Kind) {
         };
     }
 
-    fn nativeLock(self: *const ProductLock) ?*const exact_lock_v2.Lock {
+    fn nativeLock(self: *const ProductLock) ?*const exact_lock_v3.Lock {
         return switch (self.*) {
             .native => |*owned| &owned.lock,
             .legacy_dpkg => null,
@@ -4893,7 +4908,7 @@ const ProductLock = union(transaction_engine.Kind) {
                     .{},
                 );
             },
-            .native => |owned| try writeLockVersion(exact_lock_v2, allocator, io, path, owned.lock),
+            .native => |owned| try writeLockVersion(exact_lock_v3, allocator, io, path, owned.lock),
         }
     }
 };
@@ -4926,9 +4941,13 @@ fn readProductLock(
     switch (backend) {
         .legacy_dpkg => return .{ .legacy_dpkg = try readLock(allocator, io, path) },
         .native => {
-            const bytes = try readFile(allocator, io, path, exact_lock_v2.maximum_document_bytes);
+            const bytes = try readFile(allocator, io, path, exact_lock_v3.maximum_document_bytes);
             defer allocator.free(bytes);
-            return .{ .native = try exact_lock_v2.decode(allocator, bytes, exact_lock_v2.maximum_document_bytes) };
+            return .{ .native = try exact_lock_v3.decode(
+                allocator,
+                bytes,
+                exact_lock_v3.maximum_document_bytes,
+            ) };
         },
     }
 }
@@ -4975,7 +4994,7 @@ fn resolveProductLock(
 ) !ProductLock {
     switch (backend) {
         inline else => |kind| {
-            const Lock = if (kind == .native) exact_lock_v2 else exact_lock;
+            const Lock = if (kind == .native) exact_lock_v3 else exact_lock;
             return @unionInit(ProductLock, @tagName(kind), try lockFromPlan(
                 Lock,
                 allocator,
@@ -5000,7 +5019,18 @@ fn lockFromPlan(
     semantic_request_digest: [32]u8,
     solver_policy_digest: [32]u8,
 ) !Lock.OwnedLock {
-    var packages: std.ArrayList(exact_lock.Package) = .empty;
+    const ResolvedPackage = struct {
+        name: []const u8,
+        version: []const u8,
+        architecture: []const u8,
+        repository_id: [64]u8,
+        repository_snapshot_sha256: [32]u8,
+        archive_identity: content_digest.Identity,
+        declared_size: u64,
+        retention: exact_lock.Retention,
+        dpkg_selection_hold: bool,
+    };
+    var packages: std.ArrayList(ResolvedPackage) = .empty;
     defer packages.deinit(allocator);
     var repository_ids: std.ArrayList([64]u8) = .empty;
     defer repository_ids.deinit(allocator);
@@ -5027,7 +5057,7 @@ fn lockFromPlan(
             .repository_id = repository_id,
             .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
                 return error.MissingRepository,
-            .sha256 = record.transport.sha256.bytes,
+            .archive_identity = record.transport.identity,
             .declared_size = record.transport.size.value,
             .retention = if (action.requested) .requested else .dependency,
             .dpkg_selection_hold = false,
@@ -5063,7 +5093,7 @@ fn lockFromPlan(
             .repository_id = repository_id,
             .repository_snapshot_sha256 = repository.authenticated_snapshot_sha256 orelse
                 return error.MissingRepository,
-            .sha256 = record.transport.sha256.bytes,
+            .archive_identity = record.transport.identity,
             .declared_size = record.transport.size.value,
             .retention = .retained,
             .dpkg_selection_hold = package.status.want == .hold,
@@ -5100,19 +5130,29 @@ fn lockFromPlan(
             return error.MissingRepository;
         }
         try signer_storage.append(allocator, signers);
-        try repositories.append(allocator, .{
-            .id = repository_id,
-            .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
-            .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
-            .index_sha256 = snapshot.snapshot.provenance.index_digest.bytes,
-            .signer_fingerprints = signers[0..signer_count],
-        });
+        if (Lock == exact_lock_v3) {
+            try repositories.append(allocator, .{
+                .id = repository_id,
+                .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
+                .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
+                .index_identity = snapshot.snapshot.provenance.index_identity,
+                .signer_fingerprints = signers[0..signer_count],
+            });
+        } else {
+            try repositories.append(allocator, .{
+                .id = repository_id,
+                .snapshot_sha256 = repository_refresh.snapshotDigest(snapshot),
+                .release_sha256 = snapshot.snapshot.provenance.release_digest.bytes,
+                .index_sha256 = snapshot.snapshot.provenance.index_digest.bytes,
+                .signer_fingerprints = signers[0..signer_count],
+            });
+        }
     }
 
-    if (Lock == exact_lock_v2) {
+    if (Lock == exact_lock_v3) {
         // These entries came directly from authenticated resolution above,
         // never from decoding or reinterpreting a legacy lock.
-        const native_packages = try allocator.alloc(exact_lock_v2.Package, packages.items.len);
+        const native_packages = try allocator.alloc(exact_lock_v3.Package, packages.items.len);
         defer allocator.free(native_packages);
         for (packages.items, native_packages) |package, *native| native.* = .{
             .name = package.name,
@@ -5122,7 +5162,7 @@ fn lockFromPlan(
                 .repository_id = package.repository_id,
                 .repository_snapshot_sha256 = package.repository_snapshot_sha256,
             } },
-            .sha256 = package.sha256,
+            .archive_identity = package.archive_identity,
             .declared_size = package.declared_size,
             .retention = switch (package.retention) {
                 .requested => .requested,
@@ -5131,7 +5171,7 @@ fn lockFromPlan(
             },
             .dpkg_selection_hold = package.dpkg_selection_hold,
         };
-        return exact_lock_v2.create(allocator, .{
+        return exact_lock_v3.create(allocator, .{
             .target_architecture = request.options.architecture,
             .request_sha256 = semantic_request_digest,
             .policy_sha256 = solver_policy_digest,
@@ -5141,12 +5181,26 @@ fn lockFromPlan(
             .verified_origins = true,
         });
     }
+    const legacy_packages = try allocator.alloc(exact_lock.Package, packages.items.len);
+    defer allocator.free(legacy_packages);
+    for (packages.items, legacy_packages) |package, *legacy| legacy.* = .{
+        .name = package.name,
+        .version = package.version,
+        .architecture = package.architecture,
+        .repository_id = package.repository_id,
+        .repository_snapshot_sha256 = package.repository_snapshot_sha256,
+        .sha256 = package.archive_identity.digests.sha256 orelse
+            return error.MissingPackageDigest,
+        .declared_size = package.declared_size,
+        .retention = package.retention,
+        .dpkg_selection_hold = package.dpkg_selection_hold,
+    };
     return exact_lock.create(allocator, .{
         .target_architecture = request.options.architecture,
         .request_sha256 = semantic_request_digest,
         .policy_sha256 = solver_policy_digest,
         .repositories = repositories.items,
-        .packages = packages.items,
+        .packages = legacy_packages,
         .authenticated_metadata = true,
     });
 }
@@ -5477,6 +5531,54 @@ test "production workflow native execution requires a reviewed lock before repos
     try std.testing.expect(!result.changed);
 }
 
+test "production native lock input refuses historical v2 without upgrading authority" {
+    const allocator = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var lock = try exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try directory.dir.realPath(std.testing.io, &root_buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buffer,
+        "{s}/lock-v2.json",
+        .{root_buffer[0..root_length]},
+    );
+    try writeLockVersion(exact_lock_v2, allocator, std.testing.io, path, lock.lock);
+    try std.testing.expectError(
+        error.UnsupportedSchema,
+        readProductLock(allocator, std.testing.io, path, .native),
+    );
+
+    const bytes = try readFile(
+        allocator,
+        std.testing.io,
+        path,
+        exact_lock_v2.maximum_document_bytes,
+    );
+    defer allocator.free(bytes);
+    var historical = try exact_lock_v2.decode(
+        allocator,
+        bytes,
+        exact_lock_v2.maximum_document_bytes,
+    );
+    defer historical.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &lock.lock.digest_sha256,
+        &historical.lock.digest_sha256,
+    );
+}
+
 test "production workflow external native fixture" {
     const raw_path = std.c.getenv("DEBZ_NATIVE_WORKFLOW_REQUEST") orelse return error.SkipZigTest;
     try runExternalNativeWorkflow(std.mem.span(raw_path), null);
@@ -5520,8 +5622,8 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         owned_verification: ?struct {
             lock_path: []const u8,
             lock_sha256: ?[32]u8 = null,
-            lock_schema: []const u8 = exact_lock_v2.schema_id,
-            lock_version: u32 = exact_lock_v2.schema_version,
+            lock_schema: []const u8 = exact_lock_v3.schema_id,
+            lock_version: u32 = exact_lock_v3.schema_version,
             backend: transaction_engine.Kind = .native,
             expected_error: ?[]const u8 = null,
             state: enum { pending, released } = .pending,
@@ -5764,10 +5866,10 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             external.reconciliation_owner_output != null)
             return error.InvalidExternalWorkflowRequest;
         const verifier = @import("native_transaction_result.zig");
-        var lock = try exact_lock_v2.decode(
+        var lock = try exact_lock_v3.decode(
             allocator,
-            try readFile(allocator, std.testing.io, check.lock_path, exact_lock_v2.maximum_document_bytes),
-            exact_lock_v2.maximum_document_bytes,
+            try readFile(allocator, std.testing.io, check.lock_path, exact_lock_v3.maximum_document_bytes),
+            exact_lock_v3.maximum_document_bytes,
         );
         defer lock.deinit();
         var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
@@ -5987,9 +6089,9 @@ fn prepareExternalNativeReviewFixture(
                 try store.clearRecoveryReviewClaim(allocator, try root_operation.decodeRecoveryReviewClaim(allocator, claim_source));
                 return 0;
             }
-            const lock_source = try readFile(allocator, std.testing.io, self.lock_path, 8 * 1024 * 1024);
+            const lock_source = try readFile(allocator, std.testing.io, self.lock_path, exact_lock_v3.maximum_document_bytes);
             defer allocator.free(lock_source);
-            var lock = try exact_lock_v2.decode(allocator, lock_source, 8 * 1024 * 1024);
+            var lock = try exact_lock_v3.decode(allocator, lock_source, exact_lock_v3.maximum_document_bytes);
             defer lock.deinit();
             if (!std.mem.eql(u8, &lock.lock.digest_sha256, &self.lock_digest))
                 return error.InvalidExternalWorkflowRequest;
@@ -6645,7 +6747,15 @@ fn backendRootCompletion(
         allocator,
         .limited(root_operation_completion.maximum_document_bytes),
     ) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound => directory.dir.readFileAlloc(
+            std.testing.io,
+            "root/" ++ root_operation_completion.legacy_document_path,
+            allocator,
+            .limited(root_operation_completion.maximum_document_bytes),
+        ) catch |legacy_err| switch (legacy_err) {
+            error.FileNotFound => return null,
+            else => return legacy_err,
+        },
         else => return err,
     };
     defer allocator.free(bytes);
@@ -6947,7 +7057,9 @@ test "production workflow required_security.native reconciliation refuses orphan
         native_recovery.intent_path,
         native_recovery.workspace_directory,
         root_operation.namespace_path ++ "/" ++ native_recovery.program_name,
+        root_operation.namespace_path ++ "/" ++ native_recovery.program_v2_name,
         root_operation.namespace_path ++ "/" ++ native_recovery.authorization_name,
+        root_operation.namespace_path ++ "/" ++ native_recovery.authorization_v2_name,
         native_recovery.progress_path,
         native_recovery.managed_state_path,
         root_operation.namespace_path ++ "/.debz-native-unresolved",
@@ -7066,7 +7178,7 @@ test "production workflow required_security.native reconciliation retains exact 
     }
 }
 
-test "production package family native resolution emits genuine v2 locks and reuses authenticated cache" {
+test "production package family native resolution emits genuine v3 locks and reuses authenticated cache" {
     const family = @import("package_family_backend.zig");
     const allocator = std.testing.allocator;
     var directory = std.testing.tmpDir(.{});
@@ -7106,9 +7218,9 @@ test "production package family native resolution emits genuine v2 locks and reu
     try std.testing.expectEqualStrings(fixture.lock_path, planned.result.lock_path.?);
     try std.testing.expect(planned.result.lock_path.?.ptr != fixture.lock_path.ptr);
 
-    const bytes = try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock_v2.maximum_document_bytes);
+    const bytes = try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock_v3.maximum_document_bytes);
     defer allocator.free(bytes);
-    var lock = try exact_lock_v2.decode(allocator, bytes, exact_lock_v2.maximum_document_bytes);
+    var lock = try exact_lock_v3.decode(allocator, bytes, exact_lock_v3.maximum_document_bytes);
     defer lock.deinit();
     try std.testing.expectEqualStrings("amd64", lock.lock.target_architecture);
     try std.testing.expectEqual(@as(usize, 2), lock.lock.packages.len);
@@ -7125,7 +7237,7 @@ test "production package family native resolution emits genuine v2 locks and reu
     var cached = try backend.execute(allocator, request);
     defer cached.deinit();
     try std.testing.expectEqual(api.ExitStatus.success, cached.result.exit_status);
-    const cached_bytes = try readFile(allocator, std.testing.io, fixture.second_lock_path, exact_lock_v2.maximum_document_bytes);
+    const cached_bytes = try readFile(allocator, std.testing.io, fixture.second_lock_path, exact_lock_v3.maximum_document_bytes);
     defer allocator.free(cached_bytes);
     try std.testing.expectEqualSlices(u8, bytes, cached_bytes);
     const status = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(1024));
@@ -7806,18 +7918,7 @@ test "production workflow recovery reconciles completion without a second mutati
     });
     try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
     try std.testing.expectEqual(@as(usize, 2), process.calls);
-    const completion_source = try directory.dir.readFileAlloc(
-        std.testing.io,
-        "root/" ++ root_operation_completion.document_path,
-        allocator,
-        .limited(root_operation_completion.maximum_document_bytes),
-    );
-    defer allocator.free(completion_source);
-    var completion = try root_operation_completion.decode(
-        allocator,
-        completion_source,
-        root_operation_completion.maximum_document_bytes,
-    );
+    var completion = (try backendRootCompletion(allocator, &directory)).?;
     defer completion.deinit();
     try std.testing.expectEqual(
         root_operation_completion.TransactionProvenanceStatus.unavailable,
@@ -8108,17 +8209,7 @@ test "production workflow deferred recovery completion survives every handoff cr
             root_operation.maximum_document_bytes,
         );
         defer record.deinit();
-        const completion_source = try directory.dir.readFileAlloc(
-            std.testing.io,
-            "root/" ++ root_operation_completion.document_path,
-            allocator,
-            .limited(root_operation_completion.maximum_document_bytes),
-        );
-        var completion = try root_operation_completion.decode(
-            allocator,
-            completion_source,
-            root_operation_completion.maximum_document_bytes,
-        );
+        var completion = (try backendRootCompletion(allocator, &directory)).?;
         defer completion.deinit();
         try std.testing.expectEqual(
             root_operation.ProvenanceState.published,
@@ -9520,17 +9611,7 @@ test "production workflow successful recovery publishes honest completion eviden
     });
     try std.testing.expectEqual(api.ExitStatus.success, recovered.exit_status);
     try std.testing.expect(process.calls > 1);
-    const completion_source = try directory.dir.readFileAlloc(
-        std.testing.io,
-        "root/" ++ root_operation_completion.document_path,
-        allocator,
-        .limited(root_operation_completion.maximum_document_bytes),
-    );
-    var completion = try root_operation_completion.decode(
-        allocator,
-        completion_source,
-        root_operation_completion.maximum_document_bytes,
-    );
+    var completion = (try backendRootCompletion(allocator, &directory)).?;
     defer completion.deinit();
     try std.testing.expect(
         completion.document.transaction_provenance.status ==

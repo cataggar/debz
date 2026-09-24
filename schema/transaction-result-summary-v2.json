@@ -1,9 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/cataggar/debz/schema/transaction-result-summary-v2.json",
-  "title": "debz verified native transaction-result summary",
+  "title": "debz verified versioned native transaction-result summary",
   "type": "object",
   "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "transaction_schema": { "const": "https://debz.dev/schema/native-transaction-provenance-v1" },
+        "transaction_schema_version": { "const": 1 },
+        "completion_schema": { "const": "https://debz.dev/schema/root-operation-completion-v1" },
+        "completion_schema_version": { "const": 1 }
+      }
+    },
+    {
+      "properties": {
+        "transaction_schema": { "const": "https://debz.dev/schema/native-transaction-provenance-v2" },
+        "transaction_schema_version": { "const": 2 },
+        "completion_schema": { "const": "https://debz.dev/schema/root-operation-completion-v2" },
+        "completion_schema_version": { "const": 2 }
+      }
+    }
+  ],
   "required": [
     "schema", "api_version", "backend", "transaction_schema", "transaction_schema_version",
     "completion_schema", "completion_schema_version", "target_architecture", "install_root",
@@ -16,10 +34,10 @@
     "schema": { "const": "io.github.cataggar.debz.transaction-result-summary.v2" },
     "api_version": { "const": 2 },
     "backend": { "const": "native" },
-    "transaction_schema": { "const": "https://debz.dev/schema/native-transaction-provenance-v1" },
-    "transaction_schema_version": { "const": 1 },
-    "completion_schema": { "const": "https://debz.dev/schema/root-operation-completion-v1" },
-    "completion_schema_version": { "const": 1 },
+    "transaction_schema": { "type": "string" },
+    "transaction_schema_version": { "type": "integer" },
+    "completion_schema": { "type": "string" },
+    "completion_schema_version": { "type": "integer" },
     "target_architecture": { "type": "string", "minLength": 1, "maxLength": 256 },
     "install_root": { "type": "string", "minLength": 2, "maxLength": 4096, "pattern": "^/" },
     "operation": { "enum": ["install", "remove", "upgrade", "upgrade-all", "reinstall"] },

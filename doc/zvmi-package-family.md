@@ -70,7 +70,7 @@ architecture and reviewed output location remain explicit.
 
 Resolution uses authenticated repository metadata and the supplied root's
 installed-state snapshot through the existing native planner, producing a
-genuine canonical `exact-closure-lock-v2` with authenticated origin, signer,
+genuine canonical `exact-closure-lock-v3` with authenticated origin, signer,
 snapshot, semantic-request and policy bindings. An empty staged root yields
 the initial image closure. Offline resolution uses only already-authenticated
 cached metadata and never fetches missing packages or repository files.
@@ -82,14 +82,14 @@ owned result after use.
 ### Update planning and execution
 
 `NativePackageFamilyBackend.resolveUpdateLock(allocator, request)` accepts the
-same explicit native v2 `resolve_lock` request shape, with a lock output and
+same explicit native `resolve_lock` request shape, with a v3 lock output and
 no lock input. A `package` selects a named upgrade (including qualified
 architecture/version selectors); omitting it selects upgrade-all. The method
 does not accept mutation or recovery requests. Ordinary `execute` with
 `resolve_lock` still requires a package and retains install planning semantics.
 No new request version or planning-target field is introduced.
 
-Review the emitted v2 lock, then call `execute` with `operation = .update`,
+Review the emitted v3 lock, then call `execute` with `operation = .update`,
 the same package selector (or no package for upgrade-all), the same planning
 policy, and that lock as `lock_input`. Install, named-upgrade and upgrade-all
 locks have distinct semantic bindings; changing operation, selector or policy
@@ -143,10 +143,10 @@ recovery returns no new provenance and does not turn a prior failed install
 into success. Unknown script outcomes remain unresolved without replay;
 another outer owner's marker cannot be finalized through this adapter.
 
-Native capability discovery advertises all six operations, exact-lock v2,
+Native capability discovery advertises all six operations, exact-lock v3,
 native transaction provenance and disposable-or-recoverable roots, with no
 apt/dpkg invocation. Selecting native never falls back to the legacy family
-adapter, and the ordinary v1 adapter rejects v2 requests.
+adapter, and the ordinary v1 adapter rejects v3 requests.
 
 ### Diagnostic inspection
 
@@ -201,7 +201,7 @@ share the product install operation; their family labels are not independently
 attested.
 
 The verifier shares the adapter's product-request mapping and validation,
-reads the reviewed v2 lock without following symlinks, and uses the existing
+reads the reviewed v3 lock without following symlinks, and uses the existing
 native transaction verifier under its fail-fast, non-creating root lock.
 Before releasing that lock it compares the mapped operation, semantic caller
 request, native solver policy and foreign architectures with the verified

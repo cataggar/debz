@@ -108,7 +108,7 @@ export function fixtureInputs(root: string): Inputs {
     },
     packageCacheEnabled: true,
     cacheRoot: path.join(root, 'runner', 'cache'),
-    cachePath: path.join(root, 'runner', 'cache', 'packages-v1', 'objects'),
+    cachePath: path.join(root, 'runner', 'cache', 'packages-v2', 'objects'),
     offline: false,
     repairCorruptCache: false,
     debzVersion: 'v0.3.0',
@@ -187,15 +187,15 @@ export function nativeInstallResult(inputs: Inputs, changed = true, count = 4): 
   })}\n`;
 }
 
-export function nativeTransactionSummary(inputs: Inputs, count = 4): string {
+export function nativeTransactionSummary(inputs: Inputs, count = 4, evidenceVersion: 1 | 2 = 2): string {
   return `${JSON.stringify({
     schema: 'io.github.cataggar.debz.transaction-result-summary.v2',
     api_version: 2,
     backend: 'native',
-    transaction_schema: 'https://debz.dev/schema/native-transaction-provenance-v1',
-    transaction_schema_version: 1,
-    completion_schema: 'https://debz.dev/schema/root-operation-completion-v1',
-    completion_schema_version: 1,
+    transaction_schema: `https://debz.dev/schema/native-transaction-provenance-v${evidenceVersion}`,
+    transaction_schema_version: evidenceVersion,
+    completion_schema: `https://debz.dev/schema/root-operation-completion-v${evidenceVersion}`,
+    completion_schema_version: evidenceVersion,
     target_architecture: inputs.architecture,
     install_root: inputs.installRoot,
     operation: 'install',

@@ -33,10 +33,12 @@
 //! the bindings this module validates.
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
+const content_digest = @import("content_digest.zig");
 const package_path = @import("package_path.zig");
 const debian_version = @import("debian_version.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const package_origin = @import("package_origin.zig");
@@ -46,6 +48,8 @@ const transaction_recovery = @import("transaction_recovery.zig");
 
 pub const schema_id = "https://debz.dev/schema/native-transaction-program-v1";
 pub const schema_version: u32 = 1;
+pub const schema_v2_id = "https://debz.dev/schema/native-transaction-program-v2";
+pub const schema_v2_version: u32 = 2;
 
 /// Absolute resource ceilings. `Limits` may tighten them; nothing may raise
 /// them, so a hostile or defective caller cannot enlarge the compiler's
@@ -334,9 +338,62 @@ pub const OwnershipAssertion = struct {
 pub const ArtifactAssertion = struct {
     artifact: u32,
     package: PackageIdentity,
-    sha256: Digest,
+    sha256: Digest = @splat('0'),
+    archive_identity: ?content_digest.JsonIdentity = null,
     size: u64,
     application_sha256: Digest,
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !ArtifactAssertion {
+        const Wire = struct {
+            artifact: u32,
+            package: PackageIdentity,
+            sha256: ?Digest = null,
+            archive_identity: ?content_digest.JsonIdentity = null,
+            size: u64,
+            application_sha256: Digest,
+        };
+        const wire = try std.json.innerParse(Wire, allocator, source, options);
+        if ((wire.sha256 == null) == (wire.archive_identity == null))
+            return error.UnexpectedToken;
+        return .{
+            .artifact = wire.artifact,
+            .package = wire.package,
+            .sha256 = wire.sha256 orelse @splat('0'),
+            .archive_identity = wire.archive_identity,
+            .size = wire.size,
+            .application_sha256 = wire.application_sha256,
+        };
+    }
+
+    pub fn jsonStringify(self: ArtifactAssertion, writer: anytype) !void {
+        if (self.archive_identity) |archive_identity| {
+            try writer.write(.{
+                .artifact = self.artifact,
+                .package = self.package,
+                .archive_identity = archive_identity,
+                .size = self.size,
+                .application_sha256 = self.application_sha256,
+            });
+        } else {
+            try writer.write(.{
+                .artifact = self.artifact,
+                .package = self.package,
+                .sha256 = self.sha256,
+                .size = self.size,
+                .application_sha256 = self.application_sha256,
+            });
+        }
+    }
+
+    pub fn identity(self: ArtifactAssertion) ?content_digest.Identity {
+        if (self.archive_identity) |archive_identity| return archive_identity.value;
+        const bytes = parseDigest(&self.sha256) orelse return null;
+        return content_digest.Identity.init(.{ .sha256 = bytes }, .sha256) catch null;
+    }
 };
 
 pub const MaterializeIntent = struct {
@@ -543,15 +600,158 @@ pub const Origin = union(enum) {
     local_artifact: LocalArtifactOrigin,
 };
 
+pub const LocalArtifactOriginV2 = struct {
+    artifact_id: content_digest.JsonValue,
+    archive_identity: content_digest.JsonIdentity,
+    size: u64,
+    package: PackageIdentity,
+    acquisition_url: []const u8,
+    trust_mode: package_origin.LocalArtifactTrustModeV2,
+};
+
+pub const OriginV2 = union(enum) {
+    authenticated_repository: RepositoryOrigin,
+    local_artifact: LocalArtifactOriginV2,
+};
+
+const WireLocalArtifactOrigin = struct {
+    artifact_id: std.json.Value,
+    sha256: ?Digest = null,
+    archive_identity: ?content_digest.JsonIdentity = null,
+    size: u64,
+    package: PackageIdentity,
+    acquisition_url: []const u8,
+    trust_mode: []const u8,
+};
+
+const WireOrigin = union(enum) {
+    authenticated_repository: RepositoryOrigin,
+    local_artifact: WireLocalArtifactOrigin,
+};
+
 pub const ProgramArtifact = struct {
     index: u32,
     package: PackageIdentity,
-    sha256: Digest,
+    sha256: Digest = @splat('0'),
+    archive_identity: ?content_digest.JsonIdentity = null,
     size: u64,
     /// Digest of the validated application inventory the unpack engine must
     /// reproduce from the revalidated archive.
     application_sha256: Digest,
-    origin: Origin,
+    origin: ?Origin = null,
+    origin_v2: ?OriginV2 = null,
+
+    pub fn identity(self: ProgramArtifact) ?content_digest.Identity {
+        if (self.archive_identity) |archive_identity| return archive_identity.value;
+        const bytes = parseDigest(&self.sha256) orelse return null;
+        return content_digest.Identity.init(.{ .sha256 = bytes }, .sha256) catch null;
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !ProgramArtifact {
+        const Wire = struct {
+            index: u32,
+            package: PackageIdentity,
+            sha256: ?Digest = null,
+            archive_identity: ?content_digest.JsonIdentity = null,
+            size: u64,
+            application_sha256: Digest,
+            origin: WireOrigin,
+        };
+        const wire = try std.json.innerParse(Wire, allocator, source, options);
+        if ((wire.sha256 == null) == (wire.archive_identity == null))
+            return error.UnexpectedToken;
+
+        var artifact: ProgramArtifact = .{
+            .index = wire.index,
+            .package = wire.package,
+            .sha256 = wire.sha256 orelse @splat('0'),
+            .archive_identity = wire.archive_identity,
+            .size = wire.size,
+            .application_sha256 = wire.application_sha256,
+        };
+        if (wire.archive_identity) |_| {
+            artifact.origin_v2 = switch (wire.origin) {
+                .authenticated_repository => |repository| .{
+                    .authenticated_repository = repository,
+                },
+                .local_artifact => |local| blk: {
+                    if (local.sha256 != null or local.archive_identity == null)
+                        return error.UnexpectedToken;
+                    const artifact_id = content_digest.valueFromJson(local.artifact_id) catch
+                        return error.UnexpectedToken;
+                    const trust_mode = std.meta.stringToEnum(
+                        package_origin.LocalArtifactTrustModeV2,
+                        local.trust_mode,
+                    ) orelse return error.UnexpectedToken;
+                    break :blk .{ .local_artifact = .{
+                        .artifact_id = .{ .value = artifact_id },
+                        .archive_identity = local.archive_identity.?,
+                        .size = local.size,
+                        .package = local.package,
+                        .acquisition_url = local.acquisition_url,
+                        .trust_mode = trust_mode,
+                    } };
+                },
+            };
+        } else {
+            artifact.origin = switch (wire.origin) {
+                .authenticated_repository => |repository| .{
+                    .authenticated_repository = repository,
+                },
+                .local_artifact => |local| blk: {
+                    if (local.sha256 == null or local.archive_identity != null)
+                        return error.UnexpectedToken;
+                    const artifact_id_text = switch (local.artifact_id) {
+                        .string => |text| text,
+                        else => return error.UnexpectedToken,
+                    };
+                    if (artifact_id_text.len != 64 or !validLowerHex(artifact_id_text))
+                        return error.UnexpectedToken;
+                    var artifact_id: Digest = undefined;
+                    @memcpy(&artifact_id, artifact_id_text);
+                    const trust_mode = std.meta.stringToEnum(
+                        package_origin.LocalArtifactTrustMode,
+                        local.trust_mode,
+                    ) orelse return error.UnexpectedToken;
+                    break :blk .{ .local_artifact = .{
+                        .artifact_id = artifact_id,
+                        .sha256 = local.sha256.?,
+                        .size = local.size,
+                        .package = local.package,
+                        .acquisition_url = local.acquisition_url,
+                        .trust_mode = trust_mode,
+                    } };
+                },
+            };
+        }
+        return artifact;
+    }
+
+    pub fn jsonStringify(self: ProgramArtifact, writer: anytype) !void {
+        if (self.archive_identity) |archive_identity| {
+            try writer.write(.{
+                .index = self.index,
+                .package = self.package,
+                .archive_identity = archive_identity,
+                .size = self.size,
+                .application_sha256 = self.application_sha256,
+                .origin = self.origin_v2.?,
+            });
+        } else {
+            try writer.write(.{
+                .index = self.index,
+                .package = self.package,
+                .sha256 = self.sha256,
+                .size = self.size,
+                .application_sha256 = self.application_sha256,
+                .origin = self.origin.?,
+            });
+        }
+    }
 };
 
 /// Canonical program document. Field order is the canonical serialization
@@ -599,7 +799,15 @@ pub const Program = struct {
         self: Program,
         authorization: native_authorization.Authorization,
     ) bool {
-        return self.backend == authorization.backend and
+        const expected_schema = if (authorization.wire_version ==
+            native_authorization.schema_v2_version)
+            schema_v2_id
+        else
+            schema_id;
+        const expected_version = authorization.wire_version;
+        return std.mem.eql(u8, self.schema, expected_schema) and
+            self.version == expected_version and
+            self.backend == authorization.backend and
             std.mem.eql(u8, &self.authorization_sha256, &hex(32, authorization.digest_sha256)) and
             std.mem.eql(u8, &self.final_state_sha256, &hex(32, authorization.final_state_sha256)) and
             std.mem.eql(u8, &self.plan_sha256, &hex(32, authorization.plan_sha256)) and
@@ -708,9 +916,11 @@ pub const Archive = struct {
     package: []const u8,
     version: []const u8,
     architecture: []const u8,
-    sha256: [32]u8,
+    sha256: [32]u8 = @splat(0),
+    archive_identity: ?content_digest.Identity = null,
     size: u64,
-    origin: exact_lock_v2.PackageOrigin,
+    origin: ?exact_lock_v2.PackageOrigin = null,
+    origin_v2: ?exact_lock_v3.PackageOrigin = null,
     application_sha256: [32]u8,
     scripts: []const ArchiveScript = &.{},
     conffiles: []const ArchiveConffile = &.{},
@@ -1384,8 +1594,10 @@ fn validateBinding(self: *Compiler) CompileError!void {
         .native => {},
         .legacy_dpkg => return self.reject(.{ .code = .unsupported_backend }),
     }
-    if (!std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v2.schema_id) or
-        authorization.exact_lock.version != exact_lock_v2.schema_version)
+    if (!((std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v2.schema_id) and
+        authorization.exact_lock.version == exact_lock_v2.schema_version) or
+        (std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v3.schema_id) and
+            authorization.exact_lock.version == exact_lock_v3.schema_version)))
         return self.reject(.{ .code = .unsupported_lock_generation });
     if (authorization.actions.len == 0 and
         (authorization.trigger_authority == null or
@@ -1755,30 +1967,98 @@ fn buildArtifacts(self: *Compiler) CompileError!void {
                 .package = action.package,
                 .architecture = action.architecture,
             });
-        if (!std.mem.eql(u8, &archive.sha256, &evidence.sha256) or archive.size != evidence.size)
-            return self.reject(.{
-                .code = .archive_evidence_mismatch,
-                .package = action.package,
-                .architecture = action.architecture,
-            });
-        if (!sameOrigin(archive.origin, evidence.origin))
-            return self.reject(.{
-                .code = .archive_origin_mismatch,
-                .package = action.package,
-                .architecture = action.architecture,
-            });
+        if (authorization.wire_version == native_authorization.schema_version) {
+            if (!std.mem.eql(u8, &archive.sha256, &evidence.sha256) or
+                archive.size != evidence.size)
+                return self.reject(.{
+                    .code = .archive_evidence_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                });
+            if (!sameOrigin(
+                archive.origin orelse return self.reject(.{
+                    .code = .archive_origin_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                }),
+                evidence.origin orelse return self.reject(.{
+                    .code = .archive_origin_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                }),
+            ))
+                return self.reject(.{
+                    .code = .archive_origin_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                });
+        } else {
+            const archive_identity = archive.archive_identity orelse
+                return self.reject(.{
+                    .code = .archive_evidence_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                });
+            const evidence_identity = evidence.archive_identity orelse
+                return self.reject(.{
+                    .code = .archive_evidence_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                });
+            if (!archive_identity.eql(evidence_identity) or archive.size != evidence.size)
+                return self.reject(.{
+                    .code = .archive_evidence_mismatch,
+                    .detail = if (!archive_identity.eql(evidence_identity))
+                        "identity"
+                    else
+                        "size",
+                    .package = action.package,
+                    .architecture = action.architecture,
+                });
+            if (!sameOriginV2(
+                archive.origin_v2 orelse return self.reject(.{
+                    .code = .archive_origin_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                }),
+                evidence.origin_v2 orelse return self.reject(.{
+                    .code = .archive_origin_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                }),
+            ))
+                return self.reject(.{
+                    .code = .archive_origin_mismatch,
+                    .package = action.package,
+                    .architecture = action.architecture,
+                });
+        }
         const index: u32 = @intCast(self.artifacts.items.len);
         if (index >= self.limits.artifacts)
             return self.reject(.{ .code = .limit_exceeded, .detail = "artifacts" });
         self.artifact_of_action[action_index] = index;
-        try self.artifacts.append(self.arena, .{
+        var program_artifact: ProgramArtifact = .{
             .index = index,
             .package = try self.identity(archive.package, archive.version, archive.architecture),
             .sha256 = hex(32, archive.sha256),
             .size = archive.size,
             .application_sha256 = hex(32, archive.application_sha256),
-            .origin = try ownedOrigin(self, archive.origin),
-        });
+        };
+        if (authorization.wire_version == native_authorization.schema_version) {
+            program_artifact.origin = try ownedOrigin(
+                self,
+                archive.origin orelse unreachable,
+            );
+        } else {
+            program_artifact.archive_identity = .{
+                .value = archive.archive_identity orelse unreachable,
+            };
+            program_artifact.origin_v2 = try ownedOriginV2(
+                self,
+                archive.origin_v2 orelse unreachable,
+            );
+        }
+        try self.artifacts.append(self.arena, program_artifact);
     }
     for (used, 0..) |consumed, index| {
         if (consumed) continue;
@@ -1799,6 +2079,44 @@ fn ownedOrigin(self: *Compiler, origin: exact_lock_v2.PackageOrigin) CompileErro
         .local_artifact => |value| .{ .local_artifact = .{
             .artifact_id = value.artifact_id,
             .sha256 = hex(32, value.sha256),
+            .size = value.size,
+            .package = try self.identity(value.package, value.version, value.architecture),
+            .acquisition_url = try self.arena.dupe(u8, value.acquisition_url),
+            .trust_mode = value.trust_mode,
+        } },
+    };
+}
+
+fn sameOriginV2(left: exact_lock_v3.PackageOrigin, right: exact_lock_v3.PackageOrigin) bool {
+    return switch (left) {
+        .authenticated_repository => |value| switch (right) {
+            .authenticated_repository => |other| std.mem.eql(
+                u8,
+                &value.repository_id,
+                &other.repository_id,
+            ) and std.mem.eql(
+                u8,
+                &value.repository_snapshot_sha256,
+                &other.repository_snapshot_sha256,
+            ),
+            .local_artifact => false,
+        },
+        .local_artifact => |value| switch (right) {
+            .authenticated_repository => false,
+            .local_artifact => |other| package_origin.eqlLocalArtifactV2(value, other),
+        },
+    };
+}
+
+fn ownedOriginV2(self: *Compiler, origin: exact_lock_v3.PackageOrigin) CompileError!OriginV2 {
+    return switch (origin) {
+        .authenticated_repository => |value| .{ .authenticated_repository = .{
+            .repository_id = value.repository_id,
+            .repository_snapshot_sha256 = hex(32, value.repository_snapshot_sha256),
+        } },
+        .local_artifact => |value| .{ .local_artifact = .{
+            .artifact_id = .{ .value = value.artifact_id },
+            .archive_identity = .{ .value = value.archive_identity },
             .size = value.size,
             .package = try self.identity(value.package, value.version, value.architecture),
             .acquisition_url = try self.arena.dupe(u8, value.acquisition_url),
@@ -2246,6 +2564,7 @@ fn emitPreflight(self: *Compiler) CompileError!void {
                 .artifact = artifact.index,
                 .package = artifact.package,
                 .sha256 = artifact.sha256,
+                .archive_identity = artifact.archive_identity,
                 .size = artifact.size,
                 .application_sha256 = artifact.application_sha256,
             } },
@@ -3590,9 +3909,10 @@ fn assemble(self: *Compiler) CompileError!Program {
     const foreign = try self.arena.alloc([]const u8, authorization.foreign_architectures.len);
     for (authorization.foreign_architectures, 0..) |architecture, index|
         foreign[index] = try self.arena.dupe(u8, architecture);
+    const is_v2 = authorization.wire_version == native_authorization.schema_v2_version;
     var program: Program = .{
-        .schema = schema_id,
-        .version = schema_version,
+        .schema = if (is_v2) schema_v2_id else schema_id,
+        .version = if (is_v2) schema_v2_version else schema_version,
         .backend = authorization.backend,
         .install_root = try self.arena.dupe(u8, authorization.install_root),
         .root_identity_sha256 = hex(32, authorization.root_identity_sha256),
@@ -3634,14 +3954,14 @@ fn assemble(self: *Compiler) CompileError!Program {
         .steps_sha256 = @splat('0'),
         .digest_sha256 = @splat('0'),
     };
-    program.artifacts_sha256 = hex(32, hashValue(
-        "debz-native-transaction-program-artifacts-v1\x00",
-        program.artifacts,
-    ));
-    program.steps_sha256 = hex(32, hashValue(
-        "debz-native-transaction-program-steps-v1\x00",
-        program.steps,
-    ));
+    program.artifacts_sha256 = hex(32, hashValue(if (is_v2)
+        "debz-native-transaction-program-artifacts-v2\x00"
+    else
+        "debz-native-transaction-program-artifacts-v1\x00", program.artifacts));
+    program.steps_sha256 = hex(32, hashValue(if (is_v2)
+        "debz-native-transaction-program-steps-v2\x00"
+    else
+        "debz-native-transaction-program-steps-v1\x00", program.steps));
     program.digest_sha256 = hex(32, documentDigest(program));
     return program;
 }
@@ -3660,7 +3980,10 @@ fn hashValue(domain: []const u8, value: anytype) [32]u8 {
 fn documentDigest(program: Program) [32]u8 {
     var payload = program;
     payload.digest_sha256 = @splat('0');
-    return hashValue("debz-native-transaction-program-v1\x00", payload);
+    return hashValue(if (program.version == schema_v2_version)
+        "debz-native-transaction-program-v2\x00"
+    else
+        "debz-native-transaction-program-v1\x00", payload);
 }
 
 fn writeDocument(program: Program, writer: *std.Io.Writer) !void {
@@ -3680,6 +4003,14 @@ fn validLowerHex(value: []const u8) bool {
 /// be lowercase hexadecimal and every package identity must be well formed.
 /// Reflection keeps the walk exhaustive as the model grows.
 fn validateModel(comptime T: type, value: T) bool {
+    if (T == content_digest.JsonValue) return true;
+    if (T == content_digest.JsonIdentity) {
+        _ = content_digest.Identity.init(
+            value.value.digests,
+            value.value.primary,
+        ) catch return false;
+        return true;
+    }
     if (T == PackageIdentity) {
         return validIdentity(value.name) and validVersion(value.version) and
             validIdentity(value.architecture);
@@ -3867,7 +4198,11 @@ fn lessTriggerCallerBinding(
 /// Revalidates a decoded document exactly as strictly as compilation validated
 /// the program it published.
 pub fn validateDocument(program: Program) DecodeError!void {
-    if (!std.mem.eql(u8, program.schema, schema_id) or program.version != schema_version)
+    const is_v1 = std.mem.eql(u8, program.schema, schema_id) and
+        program.version == schema_version;
+    const is_v2 = std.mem.eql(u8, program.schema, schema_v2_id) and
+        program.version == schema_v2_version;
+    if (!is_v1 and !is_v2)
         return error.UnsupportedSchema;
     switch (program.backend) {
         .native => {},
@@ -3883,8 +4218,10 @@ pub fn validateDocument(program: Program) DecodeError!void {
             ))
             return error.InvalidProgram;
     }
-    if (!std.mem.eql(u8, program.exact_lock.schema, exact_lock_v2.schema_id) or
-        program.exact_lock.version != exact_lock_v2.schema_version)
+    if ((is_v1 and (!std.mem.eql(u8, program.exact_lock.schema, exact_lock_v2.schema_id) or
+        program.exact_lock.version != exact_lock_v2.schema_version)) or
+        (is_v2 and (!std.mem.eql(u8, program.exact_lock.schema, exact_lock_v3.schema_id) or
+            program.exact_lock.version != exact_lock_v3.schema_version)))
         return error.UnsupportedLockVersion;
     if (program.steps.len == 0 or program.steps.len > maximum_steps)
         return error.TooManySteps;
@@ -3903,6 +4240,26 @@ pub fn validateDocument(program: Program) DecodeError!void {
     for (program.artifacts, 0..) |artifact, index| {
         if (artifact.index != index) return error.NonCanonicalSequence;
         if (!validateModel(ProgramArtifact, artifact)) return error.InvalidDigest;
+        if ((is_v1 and (artifact.archive_identity != null or artifact.origin == null or
+            artifact.origin_v2 != null)) or
+            (is_v2 and (artifact.archive_identity == null or artifact.origin != null or
+                artifact.origin_v2 == null)))
+            return error.InvalidProgram;
+        if (is_v2) switch (artifact.origin_v2.?) {
+            .authenticated_repository => {},
+            .local_artifact => |local| {
+                if (!local.archive_identity.value.eql(artifact.archive_identity.?.value) or
+                    local.size != artifact.size or
+                    !std.mem.eql(u8, local.package.name, artifact.package.name) or
+                    !std.mem.eql(u8, local.package.version, artifact.package.version) or
+                    !std.mem.eql(
+                        u8,
+                        local.package.architecture,
+                        artifact.package.architecture,
+                    ))
+                    return error.InvalidProgram;
+            },
+        };
     }
     var seen_lifecycle = false;
     var seen_verify = false;
@@ -3922,8 +4279,26 @@ pub fn validateDocument(program: Program) DecodeError!void {
             },
         }
         switch (step.operation) {
-            .revalidate_artifact => |assertion| if (assertion.artifact >= program.artifacts.len)
-                return error.InvalidProgram,
+            .revalidate_artifact => |assertion| {
+                if (assertion.artifact >= program.artifacts.len)
+                    return error.InvalidProgram;
+                const artifact = program.artifacts[assertion.artifact];
+                if ((is_v1 and assertion.archive_identity != null) or
+                    (is_v2 and assertion.archive_identity == null))
+                    return error.InvalidProgram;
+                const assertion_identity = assertion.identity() orelse
+                    return error.InvalidProgram;
+                const artifact_identity = artifact.identity() orelse
+                    return error.InvalidProgram;
+                if (!assertion_identity.eql(artifact_identity) or
+                    assertion.size != artifact.size or
+                    !std.mem.eql(
+                        u8,
+                        &assertion.application_sha256,
+                        &artifact.application_sha256,
+                    ))
+                    return error.InvalidProgram;
+            },
             .materialize_bootstrap_payload => |intent| if (intent.artifact >= program.artifacts.len)
                 return error.InvalidProgram,
             .unpack_package => |intent| if (intent.artifact >= program.artifacts.len)
@@ -3982,14 +4357,16 @@ pub fn validateDocument(program: Program) DecodeError!void {
     if (program.steps[0].operation != .assert_authorization) return error.InvalidStepGraph;
     if (program.steps[program.steps.len - 1].operation != .publish_provenance)
         return error.InvalidStepGraph;
-    if (!std.mem.eql(u8, &program.artifacts_sha256, &hex(32, hashValue(
-        "debz-native-transaction-program-artifacts-v1\x00",
-        program.artifacts,
-    )))) return error.ArtifactsDigestMismatch;
-    if (!std.mem.eql(u8, &program.steps_sha256, &hex(32, hashValue(
-        "debz-native-transaction-program-steps-v1\x00",
-        program.steps,
-    )))) return error.StepsDigestMismatch;
+    if (!std.mem.eql(u8, &program.artifacts_sha256, &hex(32, hashValue(if (is_v2)
+        "debz-native-transaction-program-artifacts-v2\x00"
+    else
+        "debz-native-transaction-program-artifacts-v1\x00", program.artifacts))))
+        return error.ArtifactsDigestMismatch;
+    if (!std.mem.eql(u8, &program.steps_sha256, &hex(32, hashValue(if (is_v2)
+        "debz-native-transaction-program-steps-v2\x00"
+    else
+        "debz-native-transaction-program-steps-v1\x00", program.steps))))
+        return error.StepsDigestMismatch;
     if (!validLowerHex(&program.digest_sha256)) return error.InvalidDigest;
     if (!std.mem.eql(u8, &program.digest_sha256, &hex(32, documentDigest(program))))
         return error.DigestMismatch;
@@ -7346,14 +7723,14 @@ test "native_program.test.schema stays synchronized with the compiled contract" 
         definitions.get("packagePath").?.object.get("pattern").?.string,
     );
     const lock_binding = definitions.get("lockBinding").?.object.get("properties").?.object;
-    try testing.expectEqualStrings(
-        exact_lock_v2.schema_id,
-        lock_binding.get("schema").?.object.get("const").?.string,
-    );
-    try testing.expectEqual(
-        @as(i64, exact_lock_v2.schema_version),
-        lock_binding.get("version").?.object.get("const").?.integer,
-    );
+    const lock_schemas = lock_binding.get("schema").?.object.get("enum").?.array.items;
+    try testing.expectEqual(@as(usize, 2), lock_schemas.len);
+    try testing.expectEqualStrings(exact_lock_v2.schema_id, lock_schemas[0].string);
+    try testing.expectEqualStrings(exact_lock_v3.schema_id, lock_schemas[1].string);
+    const lock_versions = lock_binding.get("version").?.object.get("enum").?.array.items;
+    try testing.expectEqual(@as(usize, 2), lock_versions.len);
+    try testing.expectEqual(@as(i64, exact_lock_v2.schema_version), lock_versions[0].integer);
+    try testing.expectEqual(@as(i64, exact_lock_v3.schema_version), lock_versions[1].integer);
 
     var authorization = try testAuthorization(testing.allocator, &wide_actions, &wide_final);
     defer authorization.deinit();

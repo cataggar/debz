@@ -11,9 +11,11 @@
 //! the contract, its canonical bytes, and its validation.
 const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
+const content_digest = @import("content_digest.zig");
 const package_path = @import("package_path.zig");
 const debian_version = @import("debian_version.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const package_origin = @import("package_origin.zig");
 const solver = @import("solver.zig");
@@ -23,6 +25,8 @@ const transaction_recovery = @import("transaction_recovery.zig");
 
 pub const schema_id = "https://debz.dev/schema/native-transaction-authorization-v1";
 pub const schema_version: u32 = 1;
+pub const schema_v2_id = "https://debz.dev/schema/native-transaction-authorization-v2";
+pub const schema_v2_version: u32 = 2;
 pub const maximum_document_bytes: usize = 16 * 1024 * 1024;
 pub const maximum_actions: usize = 100_000;
 pub const maximum_final_packages: usize = 200_000;
@@ -41,10 +45,9 @@ pub const maximum_trigger_activations: u32 = 4096;
 /// it; legacy documents can never be reinterpreted as native authorization.
 pub const Backend = transaction_engine.Kind;
 
-/// Exact closure lock generation authorized for this transaction. Only
-/// exact-closure-lock v2 carries tagged authenticated origins, so older lock
-/// versions remain readable for the legacy backend and are never authorized
-/// here.
+/// Exact closure lock generation authorized for this transaction. V1
+/// authorizations retain exact-lock v2 semantics; v2 authorizations require
+/// exact-lock v3 and its complete tagged content identities.
 pub const LockBinding = struct {
     schema: []const u8,
     version: u32,
@@ -60,9 +63,11 @@ pub const PolicyBinding = struct {
 
 /// Authenticated archive bound to one archive-producing action.
 pub const Artifact = struct {
-    sha256: [32]u8,
+    sha256: [32]u8 = @splat(0),
+    archive_identity: ?content_digest.Identity = null,
     size: u64,
-    origin: exact_lock_v2.PackageOrigin,
+    origin: ?exact_lock_v2.PackageOrigin = null,
+    origin_v2: ?exact_lock_v3.PackageOrigin = null,
 };
 
 /// One authorized package mutation. `sequence` is the dense canonical program
@@ -152,6 +157,7 @@ pub const Input = struct {
 };
 
 pub const Authorization = struct {
+    wire_version: u32 = schema_version,
     backend: Backend,
     target_architecture: []const u8,
     foreign_architectures: []const []const u8,
@@ -271,9 +277,15 @@ pub fn create(
         .native => {},
         .legacy_dpkg => return error.UnsupportedBackend,
     }
-    if (!std.mem.eql(u8, input.exact_lock.schema, exact_lock_v2.schema_id) or
-        input.exact_lock.version != exact_lock_v2.schema_version)
-        return error.UnsupportedLockVersion;
+    const wire_version: u32 =
+        if (std.mem.eql(u8, input.exact_lock.schema, exact_lock_v2.schema_id) and
+        input.exact_lock.version == exact_lock_v2.schema_version)
+            schema_version
+        else if (std.mem.eql(u8, input.exact_lock.schema, exact_lock_v3.schema_id) and
+        input.exact_lock.version == exact_lock_v3.schema_version)
+            schema_v2_version
+        else
+            return error.UnsupportedLockVersion;
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
     if (!validIdentity(input.target_architecture)) return error.InvalidIdentity;
     if (input.actions.len == 0 and
@@ -434,22 +446,54 @@ pub fn create(
         }
         if (action.artifact) |artifact| {
             var copied = artifact;
-            switch (artifact.origin) {
-                .authenticated_repository => |origin| {
-                    if (!validLowerHex(&origin.repository_id)) return error.InvalidIdentity;
-                },
-                .local_artifact => |origin| {
-                    try package_origin.validateLocalArtifact(origin);
-                    if (!std.mem.eql(u8, origin.package, action.package) or
-                        !std.mem.eql(u8, origin.version, action.version) or
-                        !std.mem.eql(u8, origin.architecture, action.architecture) or
-                        !std.mem.eql(u8, &origin.sha256, &artifact.sha256) or
-                        origin.size != artifact.size)
-                        return error.ArtifactEvidenceMismatch;
-                    copied.origin = .{
-                        .local_artifact = try dupeLocalArtifact(owned, origin),
-                    };
-                },
+            if (wire_version == schema_version) {
+                if (artifact.archive_identity != null or artifact.origin_v2 != null)
+                    return error.ArtifactEvidenceMismatch;
+                switch (artifact.origin orelse return error.ArtifactEvidenceMismatch) {
+                    .authenticated_repository => |origin| {
+                        if (!validLowerHex(&origin.repository_id)) return error.InvalidIdentity;
+                    },
+                    .local_artifact => |origin| {
+                        try package_origin.validateLocalArtifact(origin);
+                        if (!std.mem.eql(u8, origin.package, action.package) or
+                            !std.mem.eql(u8, origin.version, action.version) or
+                            !std.mem.eql(u8, origin.architecture, action.architecture) or
+                            !std.mem.eql(u8, &origin.sha256, &artifact.sha256) or
+                            origin.size != artifact.size)
+                            return error.ArtifactEvidenceMismatch;
+                        copied.origin = .{
+                            .local_artifact = try dupeLocalArtifact(owned, origin),
+                        };
+                    },
+                }
+            } else {
+                if (artifact.origin != null) return error.ArtifactEvidenceMismatch;
+                const identity_value = artifact.archive_identity orelse
+                    return error.ArtifactEvidenceMismatch;
+                _ = content_digest.Identity.init(
+                    identity_value.digests,
+                    identity_value.primary,
+                ) catch return error.ArtifactEvidenceMismatch;
+                switch (artifact.origin_v2 orelse return error.ArtifactEvidenceMismatch) {
+                    .authenticated_repository => |origin| {
+                        if (!validLowerHex(&origin.repository_id))
+                            return error.InvalidIdentity;
+                    },
+                    .local_artifact => |origin| {
+                        try package_origin.validateLocalArtifactV2(origin);
+                        if (!std.mem.eql(u8, origin.package, action.package) or
+                            !std.mem.eql(u8, origin.version, action.version) or
+                            !std.mem.eql(u8, origin.architecture, action.architecture) or
+                            !content_digest.Identity.eql(
+                                origin.archive_identity,
+                                identity_value,
+                            ) or origin.size != artifact.size)
+                            return error.ArtifactEvidenceMismatch;
+                        copied.origin_v2 = .{
+                            .local_artifact = try dupeLocalArtifactV2(owned, origin),
+                        };
+                    },
+                }
             }
             actions[index].artifact = copied;
         }
@@ -464,12 +508,18 @@ pub fn create(
                 action.package,
                 action.architecture,
             )) return error.DuplicateAction;
-            if (prior.artifact != null and action.artifact != null and
-                std.mem.eql(
-                    u8,
-                    &prior.artifact.?.sha256,
-                    &action.artifact.?.sha256,
+            if (prior.artifact != null and action.artifact != null) {
+                if (wire_version == schema_version) {
+                    if (std.mem.eql(
+                        u8,
+                        &prior.artifact.?.sha256,
+                        &action.artifact.?.sha256,
+                    )) return error.DuplicateArtifact;
+                } else if (content_digest.Identity.overlaps(
+                    prior.artifact.?.archive_identity.?,
+                    action.artifact.?.archive_identity.?,
                 )) return error.DuplicateArtifact;
+            }
         }
         try validateActionSemantics(action, target_architecture, foreign_architectures);
         try validateActionFinalState(action, final_state);
@@ -569,6 +619,7 @@ pub fn create(
     }
 
     var authorization: Authorization = .{
+        .wire_version = wire_version,
         .backend = input.backend,
         .target_architecture = target_architecture,
         .foreign_architectures = foreign_architectures,
@@ -784,6 +835,53 @@ const WireAuthorization = struct {
     digest_sha256: []const u8,
 };
 
+const WireOriginV2 = struct {
+    type: OriginType,
+    repository_id: ?[]const u8 = null,
+    repository_snapshot_sha256: ?[]const u8 = null,
+    artifact_id: ?content_digest.JsonValue = null,
+    archive_identity: ?content_digest.JsonIdentity = null,
+    size: ?u64 = null,
+    package: ?WireIdentity = null,
+    acquisition_url: ?[]const u8 = null,
+    trust_mode: ?package_origin.LocalArtifactTrustModeV2 = null,
+};
+
+const WireArtifactV2 = struct {
+    archive_identity: content_digest.JsonIdentity,
+    size: u64,
+    origin: WireOriginV2,
+};
+
+const WireActionV2 = struct {
+    sequence: usize,
+    kind: solver.ActionKind,
+    package: WireIdentity,
+    prior_version: ?[]const u8,
+    artifact: ?WireArtifactV2,
+};
+
+const WireAuthorizationV2 = struct {
+    schema: []const u8,
+    version: u32,
+    backend: Backend,
+    target_architecture: []const u8,
+    foreign_architectures: []const []const u8,
+    install_root: []const u8,
+    root_identity_sha256: []const u8,
+    request_sha256: []const u8,
+    solver_policy_sha256: []const u8,
+    executor_policy_sha256: []const u8,
+    plan_sha256: []const u8,
+    exact_lock: WireLockBinding,
+    policy: WirePolicy,
+    actions: []const WireActionV2,
+    final_state: []const WireFinalPackage,
+    trigger_authority: ?WireTriggerAuthority = null,
+    final_state_sha256: []const u8,
+    digest_sha256: []const u8,
+};
+
 pub fn decode(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -791,6 +889,15 @@ pub fn decode(
 ) !OwnedAuthorization {
     if (source.len > maximum_bytes or source.len > maximum_document_bytes)
         return error.DocumentTooLarge;
+    const Header = struct { schema: []const u8, version: u32 };
+    var header = try std.json.parseFromSlice(Header, allocator, source, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer header.deinit();
+    if (std.mem.eql(u8, header.value.schema, schema_v2_id) and
+        header.value.version == schema_v2_version)
+        return decodeV2(allocator, source);
     var parsed = try std.json.parseFromSlice(WireAuthorization, allocator, source, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
@@ -932,6 +1039,155 @@ pub fn decode(
     return result;
 }
 
+fn decodeV2(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) !OwnedAuthorization {
+    var parsed = try std.json.parseFromSlice(
+        WireAuthorizationV2,
+        allocator,
+        source,
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+    );
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.schema, schema_v2_id) or
+        parsed.value.version != schema_v2_version)
+        return error.UnsupportedSchema;
+    if (parsed.value.actions.len > maximum_actions) return error.TooManyActions;
+    if (parsed.value.final_state.len > maximum_final_packages)
+        return error.TooManyFinalPackages;
+    if (parsed.value.foreign_architectures.len > maximum_foreign_architectures)
+        return error.TooManyArchitectures;
+    if (parsed.value.trigger_authority) |trigger| {
+        if (trigger.handlers.len > maximum_trigger_handlers)
+            return error.TooManyTriggerHandlers;
+        if (trigger.callers.len > maximum_trigger_callers)
+            return error.TooManyTriggerCallers;
+        if (trigger.allowed_triggers.len > maximum_authorized_triggers)
+            return error.TooManyAuthorizedTriggers;
+    }
+
+    const actions = try allocator.alloc(Action, parsed.value.actions.len);
+    defer allocator.free(actions);
+    for (parsed.value.actions, 0..) |action, index| {
+        actions[index] = .{
+            .sequence = action.sequence,
+            .kind = action.kind,
+            .package = action.package.name,
+            .version = action.package.version,
+            .architecture = action.package.architecture,
+            .prior_version = action.prior_version,
+            .artifact = if (action.artifact) |artifact| .{
+                .archive_identity = artifact.archive_identity.value,
+                .size = artifact.size,
+                .origin_v2 = try parseOriginV2(artifact.origin),
+            } else null,
+        };
+    }
+
+    const final_state = try allocator.alloc(FinalPackage, parsed.value.final_state.len);
+    defer allocator.free(final_state);
+    for (parsed.value.final_state, 0..) |package, index| {
+        final_state[index] = .{
+            .name = package.name,
+            .version = package.version,
+            .architecture = package.architecture,
+            .state = package.state,
+            .dpkg_selection_hold = package.dpkg_selection_hold,
+            .triggers_pending = package.triggers_pending,
+            .triggers_awaited = package.triggers_awaited,
+        };
+    }
+
+    var trigger_authority: ?TriggerAuthority = null;
+    var trigger_handlers: []TriggerHandler = &.{};
+    defer if (trigger_handlers.len != 0) allocator.free(trigger_handlers);
+    var trigger_callers: []TriggerCaller = &.{};
+    defer if (trigger_callers.len != 0) allocator.free(trigger_callers);
+    if (parsed.value.trigger_authority) |trigger| {
+        trigger_handlers = try allocator.alloc(TriggerHandler, trigger.handlers.len);
+        for (trigger.handlers, 0..) |handler, index| {
+            trigger_handlers[index] = .{
+                .package = handler.package.name,
+                .version = handler.package.version,
+                .architecture = handler.package.architecture,
+                .source = handler.source,
+                .postinst_sha256 = if (handler.postinst_sha256) |value|
+                    try parseHex(32, value)
+                else
+                    null,
+                .declarations_sha256 = try parseHex(32, handler.declarations_sha256),
+            };
+        }
+        trigger_callers = try allocator.alloc(TriggerCaller, trigger.callers.len);
+        for (trigger.callers, 0..) |caller, index| {
+            trigger_callers[index] = .{
+                .package = caller.package.name,
+                .version = caller.package.version,
+                .architecture = caller.package.architecture,
+                .source = caller.source,
+                .kind = caller.kind,
+                .script_sha256 = try parseHex(32, caller.script_sha256),
+            };
+        }
+        trigger_authority = .{
+            .mode = trigger.mode,
+            .defer_triggers = trigger.defer_triggers,
+            .initial_state_sha256 = try parseHex(32, trigger.initial_state_sha256),
+            .handlers = trigger_handlers,
+            .callers = trigger_callers,
+            .allowed_triggers = trigger.allowed_triggers,
+            .maximum_invocations = trigger.maximum_invocations,
+            .final_mode = trigger.final_mode,
+            .base_final_state_sha256 = if (trigger.base_final_state_sha256) |value|
+                try parseHex(32, value)
+            else
+                null,
+            .maximum_activations = trigger.maximum_activations,
+        };
+    }
+
+    var result = try create(allocator, .{
+        .backend = parsed.value.backend,
+        .target_architecture = parsed.value.target_architecture,
+        .foreign_architectures = parsed.value.foreign_architectures,
+        .install_root = parsed.value.install_root,
+        .request_sha256 = try parseHex(32, parsed.value.request_sha256),
+        .solver_policy_sha256 = try parseHex(32, parsed.value.solver_policy_sha256),
+        .executor_policy_sha256 = try parseHex(32, parsed.value.executor_policy_sha256),
+        .plan_sha256 = try parseHex(32, parsed.value.plan_sha256),
+        .exact_lock = .{
+            .schema = parsed.value.exact_lock.schema,
+            .version = parsed.value.exact_lock.version,
+            .digest_sha256 = try parseHex(32, parsed.value.exact_lock.digest_sha256),
+        },
+        .policy = .{
+            .conffile = parsed.value.policy.conffile,
+            .force = parsed.value.policy.force,
+            .allow_host_root = parsed.value.policy.allow_host_root,
+        },
+        .actions = actions,
+        .final_state = final_state,
+        .trigger_authority = trigger_authority,
+    });
+    errdefer result.deinit();
+    if (result.authorization.wire_version != schema_v2_version)
+        return error.UnsupportedSchema;
+    const root_identity = try parseHex(32, parsed.value.root_identity_sha256);
+    if (!std.mem.eql(u8, &root_identity, &result.authorization.root_identity_sha256))
+        return error.DigestMismatch;
+    const final_digest = try parseHex(32, parsed.value.final_state_sha256);
+    if (!std.mem.eql(u8, &final_digest, &result.authorization.final_state_sha256))
+        return error.FinalStateDigestMismatch;
+    const expected = try parseHex(32, parsed.value.digest_sha256);
+    if (!std.mem.eql(u8, &expected, &result.authorization.digest_sha256))
+        return error.DigestMismatch;
+    const canonical = try result.authorization.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    if (!std.mem.eql(u8, canonical, source)) return error.NonCanonicalDocument;
+    return result;
+}
+
 /// No-follow authorization publication bound to one directory entry.
 pub const Store = struct {
     io: std.Io,
@@ -1042,10 +1298,67 @@ fn parseOrigin(origin: WireOrigin) ValidationError!exact_lock_v2.PackageOrigin {
     };
 }
 
+fn parseOriginV2(origin: WireOriginV2) ValidationError!exact_lock_v3.PackageOrigin {
+    return switch (origin.type) {
+        .authenticated_repository => blk: {
+            if (origin.repository_id == null or
+                origin.repository_snapshot_sha256 == null or
+                origin.artifact_id != null or
+                origin.archive_identity != null or
+                origin.size != null or
+                origin.package != null or
+                origin.acquisition_url != null or
+                origin.trust_mode != null)
+                return error.InvalidIdentity;
+            break :blk .{ .authenticated_repository = .{
+                .repository_id = try parseId(origin.repository_id.?),
+                .repository_snapshot_sha256 = try parseHex(
+                    32,
+                    origin.repository_snapshot_sha256.?,
+                ),
+            } };
+        },
+        .local_artifact => blk: {
+            if (origin.repository_id != null or
+                origin.repository_snapshot_sha256 != null or
+                origin.artifact_id == null or
+                origin.archive_identity == null or
+                origin.size == null or
+                origin.package == null or
+                origin.acquisition_url == null or
+                origin.trust_mode == null)
+                return error.InvalidIdentity;
+            const identity = origin.package.?;
+            break :blk .{ .local_artifact = .{
+                .artifact_id = origin.artifact_id.?.value,
+                .archive_identity = origin.archive_identity.?.value,
+                .size = origin.size.?,
+                .package = identity.name,
+                .version = identity.version,
+                .architecture = identity.architecture,
+                .acquisition_url = origin.acquisition_url.?,
+                .trust_mode = origin.trust_mode.?,
+            } };
+        },
+    };
+}
+
 fn dupeLocalArtifact(
     allocator: std.mem.Allocator,
     artifact: package_origin.LocalArtifactEvidence,
 ) !package_origin.LocalArtifactEvidence {
+    var result = artifact;
+    result.package = try allocator.dupe(u8, artifact.package);
+    result.version = try allocator.dupe(u8, artifact.version);
+    result.architecture = try allocator.dupe(u8, artifact.architecture);
+    result.acquisition_url = try allocator.dupe(u8, artifact.acquisition_url);
+    return result;
+}
+
+fn dupeLocalArtifactV2(
+    allocator: std.mem.Allocator,
+    artifact: package_origin.LocalArtifactEvidenceV2,
+) !package_origin.LocalArtifactEvidenceV2 {
     var result = artifact;
     result.package = try allocator.dupe(u8, artifact.package);
     result.version = try allocator.dupe(u8, artifact.version);
@@ -1085,8 +1398,12 @@ fn writeDocument(authorization: Authorization, writer: *std.Io.Writer) !void {
 
 fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
-    try writeJsonString(writer, schema_id);
-    try writer.print(",\"version\":{},\"backend\":", .{schema_version});
+    const versioned_schema = if (authorization.wire_version == schema_v2_version)
+        schema_v2_id
+    else
+        schema_id;
+    try writeJsonString(writer, versioned_schema);
+    try writer.print(",\"version\":{},\"backend\":", .{authorization.wire_version});
     try writeJsonString(writer, @tagName(authorization.backend));
     try writer.writeAll(",\"target_architecture\":");
     try writeJsonString(writer, authorization.target_architecture);
@@ -1138,10 +1455,28 @@ fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
             try writer.writeAll("null");
         try writer.writeAll(",\"artifact\":");
         if (action.artifact) |artifact| {
-            try writer.writeAll("{\"sha256\":");
-            try writeHexString(writer, &artifact.sha256);
+            if (authorization.wire_version == schema_v2_version) {
+                try writer.writeAll("{\"archive_identity\":");
+                try writeDigestIdentity(
+                    writer,
+                    artifact.archive_identity orelse
+                        return error.InvalidArtifactIdentity,
+                );
+            } else {
+                try writer.writeAll("{\"sha256\":");
+                try writeHexString(writer, &artifact.sha256);
+            }
             try writer.print(",\"size\":{},\"origin\":", .{artifact.size});
-            try writeOrigin(writer, artifact.origin);
+            if (authorization.wire_version == schema_v2_version)
+                try writeOriginV2(
+                    writer,
+                    artifact.origin_v2 orelse return error.InvalidArtifactIdentity,
+                )
+            else
+                try writeOrigin(
+                    writer,
+                    artifact.origin orelse return error.InvalidArtifactIdentity,
+                );
             try writer.writeByte('}');
         } else try writer.writeAll("null");
         try writer.writeByte('}');
@@ -1264,6 +1599,61 @@ fn writeOrigin(writer: *std.Io.Writer, origin: exact_lock_v2.PackageOrigin) !voi
             try writeJsonString(writer, &artifact.artifact_id);
             try writer.writeAll(",\"sha256\":");
             try writeHexString(writer, &artifact.sha256);
+            try writer.print(",\"size\":{},\"package\":", .{artifact.size});
+            try writeIdentity(
+                writer,
+                artifact.package,
+                artifact.version,
+                artifact.architecture,
+            );
+            try writer.writeAll(",\"acquisition_url\":");
+            try writeJsonString(writer, artifact.acquisition_url);
+            try writer.writeAll(",\"trust_mode\":");
+            try writeJsonString(writer, @tagName(artifact.trust_mode));
+            try writer.writeByte('}');
+        },
+    }
+}
+
+fn writeDigestIdentity(
+    writer: *std.Io.Writer,
+    identity: content_digest.Identity,
+) !void {
+    try std.json.Stringify.value(
+        content_digest.JsonIdentity.init(identity),
+        .{ .whitespace = .minified },
+        writer,
+    );
+}
+
+fn writeDigestValue(
+    writer: *std.Io.Writer,
+    value: content_digest.Value,
+) !void {
+    try std.json.Stringify.value(
+        content_digest.JsonValue.init(value),
+        .{ .whitespace = .minified },
+        writer,
+    );
+}
+
+fn writeOriginV2(
+    writer: *std.Io.Writer,
+    origin: exact_lock_v3.PackageOrigin,
+) !void {
+    switch (origin) {
+        .authenticated_repository => |repository| {
+            try writer.writeAll("{\"type\":\"authenticated_repository\",\"repository_id\":");
+            try writeJsonString(writer, &repository.repository_id);
+            try writer.writeAll(",\"repository_snapshot_sha256\":");
+            try writeHexString(writer, &repository.repository_snapshot_sha256);
+            try writer.writeByte('}');
+        },
+        .local_artifact => |artifact| {
+            try writer.writeAll("{\"type\":\"local_artifact\",\"artifact_id\":");
+            try writeDigestValue(writer, artifact.artifact_id);
+            try writer.writeAll(",\"archive_identity\":");
+            try writeDigestIdentity(writer, artifact.archive_identity);
             try writer.print(",\"size\":{},\"package\":", .{artifact.size});
             try writeIdentity(
                 writer,
@@ -2153,6 +2543,87 @@ test "native_authorization.test.rejects contradictory duplicate and unauthorized
     }
 }
 
+test "native_authorization.test.v2 rejects partially overlapping artifact identities" {
+    const complete = try content_digest.Identity.init(.{
+        .sha256 = @splat(0x31),
+        .sha512 = @splat(0x41),
+    }, .sha512);
+    const overlapping = try content_digest.Identity.init(
+        .{ .sha512 = complete.digests.sha512.? },
+        .sha512,
+    );
+    const repository_origin: exact_lock_v3.PackageOrigin = .{
+        .authenticated_repository = .{
+            .repository_id = @splat('a'),
+            .repository_snapshot_sha256 = @splat(0x22),
+        },
+    };
+    const actions = [_]Action{
+        .{
+            .sequence = 0,
+            .kind = .install,
+            .package = "first",
+            .version = "1",
+            .architecture = "amd64",
+            .prior_version = null,
+            .artifact = .{
+                .archive_identity = complete,
+                .size = 1,
+                .origin_v2 = repository_origin,
+            },
+        },
+        .{
+            .sequence = 1,
+            .kind = .install,
+            .package = "second",
+            .version = "1",
+            .architecture = "amd64",
+            .prior_version = null,
+            .artifact = .{
+                .archive_identity = overlapping,
+                .size = 1,
+                .origin_v2 = repository_origin,
+            },
+        },
+    };
+    const final_state = [_]FinalPackage{
+        .{
+            .name = "first",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+        .{
+            .name = "second",
+            .version = "1",
+            .architecture = "amd64",
+            .state = .installed,
+            .dpkg_selection_hold = false,
+        },
+    };
+    try std.testing.expectError(error.DuplicateArtifact, create(
+        std.testing.allocator,
+        .{
+            .backend = .native,
+            .target_architecture = "amd64",
+            .install_root = "/srv/native-root",
+            .request_sha256 = @splat(1),
+            .solver_policy_sha256 = @splat(2),
+            .executor_policy_sha256 = @splat(3),
+            .plan_sha256 = @splat(4),
+            .exact_lock = .{
+                .schema = exact_lock_v3.schema_id,
+                .version = exact_lock_v3.schema_version,
+                .digest_sha256 = @splat(5),
+            },
+            .policy = .{ .conffile = .keep_existing },
+            .actions = &actions,
+            .final_state = &final_state,
+        },
+    ));
+}
+
 test "native_authorization.test.schema and enums stay synchronized with the contract" {
     const source = try std.Io.Dir.cwd().readFileAlloc(
         std.testing.io,
@@ -2188,14 +2659,14 @@ test "native_authorization.test.schema and enums stay synchronized with the cont
         definitions.get("absolutePath").?.object.get("pattern").?.string,
     );
     const lock_binding = definitions.get("lockBinding").?.object.get("properties").?.object;
-    try std.testing.expectEqualStrings(
-        exact_lock_v2.schema_id,
-        lock_binding.get("schema").?.object.get("const").?.string,
-    );
-    try std.testing.expectEqual(
-        @as(i64, exact_lock_v2.schema_version),
-        lock_binding.get("version").?.object.get("const").?.integer,
-    );
+    const lock_schemas = lock_binding.get("schema").?.object.get("enum").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), lock_schemas.len);
+    try std.testing.expectEqualStrings(exact_lock_v2.schema_id, lock_schemas[0].string);
+    try std.testing.expectEqualStrings(exact_lock_v3.schema_id, lock_schemas[1].string);
+    const lock_versions = lock_binding.get("version").?.object.get("enum").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), lock_versions.len);
+    try std.testing.expectEqual(@as(i64, exact_lock_v2.schema_version), lock_versions[0].integer);
+    try std.testing.expectEqual(@as(i64, exact_lock_v3.schema_version), lock_versions[1].integer);
 
     var owned = try create(std.testing.allocator, testInput());
     defer owned.deinit();

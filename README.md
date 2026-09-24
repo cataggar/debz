@@ -45,7 +45,7 @@ installing it:
 ```
 
 The download action caches only a path-free opaque serialization of verified
-`packages-v1/objects`. Restores are staged outside the workspace/CAS and
+`packages-v2/objects`. Restores are staged outside the workspace/CAS and
 imported by `debz`; exact and compatible-prefix objects are always revalidated.
 Repository metadata, credentials, keyrings, roots, dpkg state, and transaction
 journals are excluded. A cache hit is not installed state. See

@@ -25,12 +25,15 @@
 //! adapters remain private and unsupported work never falls back to dpkg.
 
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const builtin = @import("builtin");
 const absolute_path = @import("absolute_path.zig");
 const archive_application = @import("archive_application.zig");
 const control_record = @import("control_record.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
+const package_origin = @import("package_origin.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_alternatives = @import("native_alternatives.zig");
@@ -3125,8 +3128,10 @@ fn lessPackageWork(_: void, left: PackageWork, right: PackageWork) bool {
 
 fn validateProgram(builder: *Builder) PlanError!void {
     const program = builder.request.program;
-    if (!std.mem.eql(u8, program.schema, native_program.schema_id) or
-        program.version != native_program.schema_version)
+    if (!((std.mem.eql(u8, program.schema, native_program.schema_id) and
+        program.version == native_program.schema_version) or
+        (std.mem.eql(u8, program.schema, native_program.schema_v2_id) and
+            program.version == native_program.schema_v2_version)))
         return builder.fail(.{ .surface = .program, .code = .schema_unsupported });
     if (program.backend != .native)
         return builder.fail(.{ .surface = .program, .code = .backend_unsupported });
@@ -3545,7 +3550,7 @@ fn rebuildArchive(
             .package = identity.name,
             .architecture = identity.architecture,
         });
-    const expected_archive = parseHex(32, &record.sha256) orelse
+    const expected_archive = record.identity() orelse
         return builder.fail(.{
             .surface = .artifact,
             .code = .artifact_mismatch,
@@ -3553,6 +3558,12 @@ fn rebuildArchive(
             .architecture = identity.architecture,
         });
     const bytes = builder.request.archives[archive].bytes;
+    expected_archive.verify(bytes) catch return builder.fail(.{
+        .surface = .archive,
+        .code = .archive_binding_mismatch,
+        .package = identity.name,
+        .architecture = identity.architecture,
+    });
     const diagnostic: Diagnostic = .{
         .surface = .archive,
         .code = .path_limit,
@@ -3563,7 +3574,7 @@ fn rebuildArchive(
         bytes,
         .{ .local = .{
             .size = record.size,
-            .sha256 = expected_archive,
+            .sha256 = expected_archive.digests.sha256,
             .identity = .{
                 .package = identity.name,
                 .version = identity.version,
@@ -3653,13 +3664,13 @@ fn rebindArchive(
             .package = identity.name,
             .architecture = identity.architecture,
         });
-        const declared_sha = parseHex(32, &entry.sha256) orelse return builder.fail(.{
+        const declared = entry.identity() orelse return builder.fail(.{
             .surface = .artifact,
             .code = .artifact_mismatch,
             .package = identity.name,
             .architecture = identity.architecture,
         });
-        if (!std.crypto.timing_safe.eql([32]u8, declared_sha, model.provenance().sha256))
+        declared.verify(input.bytes) catch
             return builder.fail(.{
                 .surface = .artifact,
                 .code = .artifact_mismatch,
@@ -8741,40 +8752,54 @@ fn bindMaterializationArchives(
         const input = for (request.archives) |candidate| {
             if (candidate.artifact == artifact.index) break candidate;
         } else {
-            if (lifecycle) continue;
+            if (lifecycle) {
+                continue;
+            }
             return null;
         };
-        const archive_sha256 = parseHex(32, &artifact.sha256) orelse return null;
+        const archive_identity = artifact.identity() orelse {
+            return null;
+        };
+        archive_identity.verify(input.bytes) catch {
+            return null;
+        };
         const application_sha256 = parseHex(
             32,
             &artifact.application_sha256,
-        ) orelse return null;
-        var model = switch (archive_application.revalidate(
+        ) orelse {
+            return null;
+        };
+        if (input.bytes.len != artifact.size) {
+            return null;
+        }
+        var model = switch (archive_application.prepare(
             allocator,
             input.bytes,
-            .{ .local = .{
-                .size = artifact.size,
-                .sha256 = archive_sha256,
-                .identity = .{
-                    .package = artifact.package.name,
-                    .version = artifact.package.version,
-                    .architecture = artifact.package.architecture,
-                },
-            } },
+            .{ .local = .{} },
             request.limits.archive,
-            application_sha256,
         )) {
             .model => |value| value,
-            .diagnostic => return null,
+            .diagnostic => {
+                return null;
+            },
         };
         var model_transferred = false;
         defer if (!model_transferred) model.deinit();
+        if (!std.mem.eql(u8, model.facts.package, artifact.package.name) or
+            !std.mem.eql(u8, model.facts.version, artifact.package.version) or
+            !std.mem.eql(u8, model.facts.architecture, artifact.package.architecture) or
+            !std.mem.eql(u8, &model.digest, &application_sha256))
+        {
+            return null;
+        }
         const binding = root_mutation.bindArchive(
             &model,
             input.bytes,
             artifact.index,
             application_sha256,
-        ) catch return null;
+        ) catch {
+            return null;
+        };
         items[initialized] = .{
             .artifact = artifact.index,
             .bytes = input.bytes,
@@ -8784,7 +8809,9 @@ fn bindMaterializationArchives(
         initialized += 1;
         model_transferred = true;
     }
-    if (initialized != items.len) return null;
+    if (initialized != items.len) {
+        return null;
+    }
     transferred = true;
     return .{ .items = items, .allocator = allocator };
 }
@@ -10433,7 +10460,10 @@ fn materializationProgramDigest(program: native_program.Program) [32]u8 {
     var payload = program;
     payload.digest_sha256 = @splat('0');
     return materializationHashValue(
-        "debz-native-transaction-program-v1\x00",
+        if (program.version == native_program.schema_v2_version)
+            "debz-native-transaction-program-v2\x00"
+        else
+            "debz-native-transaction-program-v1\x00",
         payload,
     );
 }
@@ -10446,8 +10476,10 @@ fn phasePreflight(
     const program = request.planning.program;
     if (request.planning.interoperability != .isolated_root)
         return .{ .outcome = .handoff, .detail = "shared_root" };
-    if (!std.mem.eql(u8, program.schema, native_program.schema_id) or
-        program.version != native_program.schema_version or
+    if (!((std.mem.eql(u8, program.schema, native_program.schema_id) and
+        program.version == native_program.schema_version) or
+        (std.mem.eql(u8, program.schema, native_program.schema_v2_id) and
+            program.version == native_program.schema_v2_version)) or
         program.backend != .native or
         !std.mem.eql(u8, program.install_root, request.install_root))
         return .{ .outcome = .refused, .detail = "program_mismatch" };
@@ -14091,8 +14123,113 @@ fn programArchiveEvidence(
             .version = model.facts.version,
             .architecture = model.facts.architecture,
             .sha256 = model.provenance().sha256,
+            .archive_identity = .{
+                .digests = .{ .sha256 = model.provenance().sha256 },
+                .primary = .sha256,
+            },
             .size = bytes.len,
             .origin = origin,
+            .origin_v2 = taggedOrigin(origin),
+            .application_sha256 = model.digest,
+            .scripts = scripts[0..script_count],
+            .conffiles = conffiles,
+            .triggers = triggers,
+            .essential = model.facts.essential,
+        };
+    }
+    return result;
+}
+
+fn taggedOrigin(origin: exact_lock_v2.PackageOrigin) exact_lock_v3.PackageOrigin {
+    return switch (origin) {
+        .authenticated_repository => |repository| .{
+            .authenticated_repository = .{
+                .repository_id = repository.repository_id,
+                .repository_snapshot_sha256 = repository.repository_snapshot_sha256,
+            },
+        },
+        .local_artifact => |artifact| .{ .local_artifact = .{
+            .artifact_id = .{ .sha256 = artifact.sha256 },
+            .archive_identity = .{
+                .digests = .{ .sha256 = artifact.sha256 },
+                .primary = .sha256,
+            },
+            .size = artifact.size,
+            .package = artifact.package,
+            .version = artifact.version,
+            .architecture = artifact.architecture,
+            .acquisition_url = artifact.acquisition_url,
+            .trust_mode = switch (artifact.trust_mode) {
+                .pinned_sha256 => .pinned_content_digest,
+                .verified_https => .verified_https,
+            },
+        } },
+    };
+}
+
+fn programArchiveEvidenceV2(
+    allocator: std.mem.Allocator,
+    models: []archive_application.Model,
+    archive_bytes: []const []const u8,
+    identities: []const content_digest.Identity,
+    origins: []const exact_lock_v3.PackageOrigin,
+) ![]const native_program.Archive {
+    if (models.len != archive_bytes.len or models.len != identities.len or
+        models.len != origins.len)
+        return error.ArchiveEvidenceMismatch;
+    const result = try allocator.alloc(native_program.Archive, models.len);
+    for (models, archive_bytes, identities, origins, 0..) |*model, bytes, identity, origin, index| {
+        try model.verifyArtifactBinding(bytes);
+        identity.verify(bytes) catch return error.ArchiveEvidenceMismatch;
+        const scripts = try allocator.alloc(
+            native_program.ArchiveScript,
+            model.scripts.len,
+        );
+        var script_count: usize = 0;
+        for (model.scripts) |script| {
+            const kind = lifecycleArchiveScriptKind(script.kind) orelse continue;
+            scripts[script_count] = .{
+                .kind = kind,
+                .sha256 = script.sha256,
+                .size = script.size,
+            };
+            script_count += 1;
+        }
+        const conffiles = try allocator.alloc(
+            native_program.ArchiveConffile,
+            model.conffiles.len,
+        );
+        for (model.conffiles, 0..) |conffile, conffile_index| {
+            const path = try std.fmt.allocPrint(allocator, "/{s}", .{conffile.path});
+            const file = model.findFile(conffile.path);
+            conffiles[conffile_index] = .{
+                .path = path,
+                .md5 = if (conffile.remove_on_upgrade)
+                    null
+                else if (file) |entry|
+                    entry.md5 orelse digestMd5(try model.fileBytes(entry.*))
+                else
+                    return error.UnsupportedLifecycleConffile,
+                .remove_on_upgrade = conffile.remove_on_upgrade,
+            };
+        }
+        const triggers = try allocator.alloc(
+            native_program.TriggerDeclaration,
+            model.triggers.len,
+        );
+        for (model.triggers, 0..) |trigger, trigger_index| {
+            triggers[trigger_index] = .{
+                .kind = lifecycleArchiveTriggerKind(trigger.directive),
+                .name = trigger.target,
+            };
+        }
+        result[index] = .{
+            .package = model.facts.package,
+            .version = model.facts.version,
+            .architecture = model.facts.architecture,
+            .archive_identity = identity,
+            .size = bytes.len,
+            .origin_v2 = origin,
             .application_sha256 = model.digest,
             .scripts = scripts[0..script_count],
             .conffiles = conffiles,
@@ -17717,8 +17854,11 @@ fn retainNativeEvidence(
     const record = attempt.record();
     try sources.append(scratch, .{
         .kind = .authorization,
-        .source_path = root_operation.namespace_path ++ "/" ++
-            native_recovery.authorization_name,
+        .source_path = try std.fmt.allocPrint(
+            scratch,
+            "{s}/{s}",
+            .{ root_operation.namespace_path, intent.authorization_path },
+        ),
         .receipt_name = "authorization.json",
         .document_sha256 = native_recovery.hexDigest(
             record.authorization_sha256 orelse
@@ -17727,8 +17867,11 @@ fn retainNativeEvidence(
     });
     try sources.append(scratch, .{
         .kind = .program,
-        .source_path = root_operation.namespace_path ++ "/" ++
-            native_recovery.program_name,
+        .source_path = try std.fmt.allocPrint(
+            scratch,
+            "{s}/{s}",
+            .{ root_operation.namespace_path, intent.program_path },
+        ),
         .receipt_name = "program.json",
         .document_sha256 = native_recovery.hexDigest(
             record.program_sha256 orelse return error.InvalidRecoveryIntent,
@@ -17744,7 +17887,8 @@ fn retainNativeEvidence(
         if (blob.kind != .request or
             (!std.mem.eql(u8, blob.logical_path, native_execution_request.logical_path) and
                 !std.mem.eql(u8, blob.logical_path, native_execution_request.helper_logical_path) and
-                !std.mem.eql(u8, blob.logical_path, native_execution_request.bootstrap_logical_path)))
+                !std.mem.eql(u8, blob.logical_path, native_execution_request.bootstrap_logical_path) and
+                !std.mem.eql(u8, blob.logical_path, native_execution_request.authority_logical_path)))
             continue;
         const bytes = try native_recovery.verifyBlob(scratch, root, blob);
         var request = try native_execution_request.decodePersisted(scratch, bytes);
@@ -18029,6 +18173,28 @@ fn publishNativeRecoveryRequiredProvenance(
     defer retained.deinit();
     const record = attempt.record();
     var provenance: native_provenance.Document = .{
+        .authority = if (intent.intent.version == 2) .{
+            .execution_request_schema = native_execution_request.authority_schema_id,
+            .execution_request_version = 4,
+            .authorization_schema = intent.intent.authorization_schema.?,
+            .authorization_version = intent.intent.authorization_version.?,
+            .program_schema = intent.intent.program_schema.?,
+            .program_version = intent.intent.program_version.?,
+            .exact_lock_schema = intent.intent.exact_lock_schema.?,
+            .exact_lock_version = intent.intent.exact_lock_version.?,
+            .execution_intent_schema = intent.intent.schema,
+            .execution_intent_version = intent.intent.version,
+            .progress_schema = progress.document.schema,
+            .progress_version = progress.document.version,
+        } else null,
+        .schema = if (intent.intent.version == 2)
+            native_provenance.schema_id
+        else
+            native_provenance.legacy_schema_id,
+        .version = if (intent.intent.version == 2)
+            native_provenance.schema_version
+        else
+            native_provenance.legacy_schema_version,
         .attempt_id = native_provenance.hexDigest(record.attempt_id),
         .install_root = record.install_root,
         .root_identity_sha256 = native_provenance.hexDigest(
@@ -19381,6 +19547,28 @@ fn finishLifecycleAttempt(
     );
     defer retained.deinit();
     var provenance: native_provenance.Document = .{
+        .authority = if (owned_intent.intent.version == 2) .{
+            .execution_request_schema = native_execution_request.authority_schema_id,
+            .execution_request_version = 4,
+            .authorization_schema = owned_intent.intent.authorization_schema.?,
+            .authorization_version = owned_intent.intent.authorization_version.?,
+            .program_schema = owned_intent.intent.program_schema.?,
+            .program_version = owned_intent.intent.program_version.?,
+            .exact_lock_schema = owned_intent.intent.exact_lock_schema.?,
+            .exact_lock_version = owned_intent.intent.exact_lock_version.?,
+            .execution_intent_schema = owned_intent.intent.schema,
+            .execution_intent_version = owned_intent.intent.version,
+            .progress_schema = progress.document.schema,
+            .progress_version = progress.document.version,
+        } else null,
+        .schema = if (owned_intent.intent.version == 2)
+            native_provenance.schema_id
+        else
+            native_provenance.legacy_schema_id,
+        .version = if (owned_intent.intent.version == 2)
+            native_provenance.schema_version
+        else
+            native_provenance.legacy_schema_version,
         .attempt_id = native_provenance.hexDigest(record.attempt_id),
         .install_root = record.install_root,
         .root_identity_sha256 = native_provenance.hexDigest(
@@ -19462,7 +19650,8 @@ fn finishLifecycleAttempt(
                 .recovered
             else
                 .already_present,
-            .schema = native_provenance.schema_id,
+            .schema = provenance.schema,
+            .version = native_provenance.completionVersion(provenance),
             .document_sha256 = parseHex(
                 32,
                 &provenance.digest_sha256,
@@ -19518,15 +19707,22 @@ fn cleanupNativeExecutionEvidence(
         try root.entryIfExists(try root_fs.Path.init(native_recovery.intent_path)) != null;
     for (intent.blobs) |blob| {
         if (blob.kind != .request or
-            !std.mem.eql(u8, blob.logical_path, native_execution_request.bootstrap_logical_path))
+            (!std.mem.eql(u8, blob.logical_path, native_execution_request.bootstrap_logical_path) and
+                !std.mem.eql(u8, blob.logical_path, native_execution_request.authority_logical_path)))
             continue;
         if (!active_evidence) continue;
         const bytes = try native_recovery.verifyBlob(allocator, root, blob);
         defer allocator.free(bytes);
         var request = try native_execution_request.decodePersisted(allocator, bytes);
         defer request.deinit();
-        const bootstrap = request.bootstrap() orelse
+        const bootstrap = request.bootstrap() orelse {
+            if (std.mem.eql(
+                u8,
+                blob.logical_path,
+                native_execution_request.authority_logical_path,
+            )) continue;
             return error.NativeHelperBootstrapBindingMismatch;
+        };
         if (native_helper.prepareBootstrapCleanup(
             allocator,
             root,
@@ -19855,10 +20051,16 @@ fn prepareNativeRecovery(
     helper_bootstrap: ?native_helper.Bootstrap,
     helper_source: ?native_helper.Source,
 ) !native_recovery.Runtime {
+    const authority_v2 = compiled.program.program.version ==
+        native_program.schema_v2_version;
     if (production_request) |request| {
         try native_execution_request.validateBinding(request, root, attempt, compiled.program.program);
         var decoded = try native_execution_request.decodePersisted(allocator, raw_request);
         defer decoded.deinit();
+        try decoded.validateAuthorityDocuments(
+            compiled.authorization.authorization,
+            compiled.program.program,
+        );
         if (!std.mem.eql(u8, &decoded.execution().digest_sha256, &request.digest_sha256))
             return error.RecoveryRequestBindingMismatch;
         try matchNativeHelperBinding(decoded.helper(), helper_binding);
@@ -19892,7 +20094,10 @@ fn prepareNativeRecovery(
     var authorization_store = try native_authorization.Store.init(
         root.io,
         namespace,
-        native_recovery.authorization_name,
+        if (authority_v2)
+            native_recovery.authorization_v2_name
+        else
+            native_recovery.authorization_name,
     );
     try authorization_store.writeAtomic(
         allocator,
@@ -19901,7 +20106,10 @@ fn prepareNativeRecovery(
     var program_store = try native_program.Store.init(
         root.io,
         namespace,
-        native_recovery.program_name,
+        if (authority_v2)
+            native_recovery.program_v2_name
+        else
+            native_recovery.program_name,
     );
     try program_store.writeAtomic(
         allocator,
@@ -19915,7 +20123,9 @@ fn prepareNativeRecovery(
         &blobs,
         .request,
         "request",
-        if (helper_bootstrap != null)
+        if (authority_v2)
+            native_execution_request.authority_logical_path
+        else if (helper_bootstrap != null)
             native_execution_request.bootstrap_logical_path
         else if (helper_binding != null)
             native_execution_request.helper_logical_path
@@ -19941,6 +20151,13 @@ fn prepareNativeRecovery(
             .regular,
             0o600,
         );
+        if (authority_v2) {
+            const identity = compiled.program.program.artifacts[index].archive_identity orelse
+                return error.InvalidLifecycleProgram;
+            identity.value.verify(bytes) catch return error.ArchiveEvidenceMismatch;
+            blobs.items[blobs.items.len - 1].sha256 = @splat('0');
+            blobs.items[blobs.items.len - 1].archive_identity = identity;
+        }
     }
     try appendRecoveryBlob(
         allocator,
@@ -20099,6 +20316,11 @@ fn prepareNativeRecovery(
         try root.entryIfExists(try root_fs.Path.init(lifecycle_tmp_ci)) != null;
     const root_metadata = try root.metadataOfRoot();
     var intent: native_recovery.Intent = .{
+        .schema = if (authority_v2)
+            "https://debz.dev/schema/native-execution-intent-v2"
+        else
+            "https://debz.dev/schema/native-execution-intent-v1",
+        .version = if (authority_v2) 2 else 1,
         .attempt_id = native_recovery.hexDigest(attempt.attemptId()),
         .install_root = external.root,
         .root_identity_sha256 = native_recovery.hexDigest(
@@ -20134,10 +20356,25 @@ fn prepareNativeRecovery(
         .artifact_evidence_sha256 = native_recovery.hexDigest(artifact_sha256),
         .database_generation_sha256 = native_recovery.hexDigest(database_sha256),
         .initial_trigger_state_sha256 = native_recovery.hexDigest(trigger_sha256),
+        .authorization_schema = if (authority_v2)
+            native_authorization.schema_v2_id
+        else
+            null,
+        .authorization_version = if (authority_v2) authorization.wire_version else null,
+        .program_schema = if (authority_v2) program.schema else null,
+        .program_version = if (authority_v2) program.version else null,
+        .exact_lock_schema = if (authority_v2) program.exact_lock.schema else null,
+        .exact_lock_version = if (authority_v2) program.exact_lock.version else null,
         .packages = packages.items,
         .ordered_actions = ordered.items,
-        .authorization_path = native_recovery.authorization_name,
-        .program_path = native_recovery.program_name,
+        .authorization_path = if (authority_v2)
+            native_recovery.authorization_v2_name
+        else
+            native_recovery.authorization_name,
+        .program_path = if (authority_v2)
+            native_recovery.program_v2_name
+        else
+            native_recovery.program_name,
         .blobs = blobs.items,
         .digest_sha256 = @splat('0'),
     };
@@ -20145,7 +20382,20 @@ fn prepareNativeRecovery(
     if (production_request) |request| try native_execution_request.validateIntent(request, intent);
     try native_recovery.publishIntent(allocator, root, intent);
     if (helper_bootstrap != null)
-        try native_recovery.initializeBootstrapProgress(
+        if (authority_v2)
+            try native_recovery.initializeAuthorityBootstrapProgress(
+                allocator,
+                root,
+                intent.digest_sha256,
+            )
+        else
+            try native_recovery.initializeBootstrapProgress(
+                allocator,
+                root,
+                intent.digest_sha256,
+            )
+    else if (authority_v2)
+        try native_recovery.initializeAuthorityProgress(
             allocator,
             root,
             intent.digest_sha256,
@@ -21228,41 +21478,48 @@ fn productionArchives(
     bytes: []const []const u8,
 ) !ProductionArchives {
     if (bytes.len != artifacts.len) return error.RecoveryArtifactBindingMismatch;
-    var by_digest: std.AutoHashMapUnmanaged([32]u8, []const u8) = .empty;
-    defer by_digest.deinit(allocator);
-    for (bytes) |archive| {
-        var sha256: [32]u8 = undefined;
-        Sha256.hash(archive, &sha256, .{});
-        const entry = try by_digest.getOrPut(allocator, sha256);
-        if (entry.found_existing) return error.RecoveryArtifactBindingMismatch;
-        entry.value_ptr.* = archive;
-    }
     const models = try allocator.alloc(archive_application.Model, bytes.len);
     const ordered = try allocator.alloc([]const u8, bytes.len);
+    const used = try allocator.alloc(bool, bytes.len);
+    @memset(used, false);
     for (artifacts, 0..) |artifact, index| {
         if (artifact.index != index) return error.RecoveryArtifactBindingMismatch;
-        const sha256 = native_recovery.parseDigest(artifact.sha256) orelse
+        const identity = artifact.identity() orelse
             return error.RecoveryArtifactBindingMismatch;
-        ordered[index] = by_digest.get(sha256) orelse return error.RecoveryArtifactBindingMismatch;
-        models[index] = switch (archive_application.revalidate(
+        var matched: ?usize = null;
+        for (bytes, 0..) |archive, candidate| {
+            if (used[candidate] or archive.len != artifact.size) continue;
+            identity.verify(archive) catch continue;
+            if (matched != null) return error.RecoveryArtifactBindingMismatch;
+            matched = candidate;
+        }
+        const candidate = matched orelse return error.RecoveryArtifactBindingMismatch;
+        used[candidate] = true;
+        ordered[index] = bytes[candidate];
+        models[index] = switch (archive_application.prepare(
             allocator,
             ordered[index],
-            .{ .local = .{
-                .size = artifact.size,
-                .sha256 = sha256,
-                .identity = .{
-                    .package = artifact.package.name,
-                    .version = artifact.package.version,
-                    .architecture = artifact.package.architecture,
-                },
-            } },
+            .{ .local = .{} },
             .{},
-            native_recovery.parseDigest(artifact.application_sha256) orelse
-                return error.RecoveryArtifactBindingMismatch,
         )) {
             .model => |value| value,
             .diagnostic => return error.RecoveryArtifactBindingMismatch,
         };
+        const application_digest = native_recovery.parseDigest(
+            artifact.application_sha256,
+        ) orelse return error.RecoveryArtifactBindingMismatch;
+        if (!std.mem.eql(u8, models[index].facts.package, artifact.package.name) or
+            !std.mem.eql(u8, models[index].facts.version, artifact.package.version) or
+            !std.mem.eql(
+                u8,
+                models[index].facts.architecture,
+                artifact.package.architecture,
+            ) or !std.mem.eql(
+            u8,
+            &models[index].digest,
+            &application_digest,
+        ))
+            return error.RecoveryArtifactBindingMismatch;
         if (!supportedArchiveMetadata(&models[index]))
             return error.InvalidExternalArchive;
     }
@@ -21570,7 +21827,9 @@ fn orphanNativeEvidenceDetail(
         const name = member.name;
         if (std.mem.eql(u8, name, "native-recovery-v1") or
             std.mem.eql(u8, name, native_recovery.authorization_name) or
+            std.mem.eql(u8, name, native_recovery.authorization_v2_name) or
             std.mem.eql(u8, name, native_recovery.program_name) or
+            std.mem.eql(u8, name, native_recovery.program_v2_name) or
             std.mem.eql(u8, name, "native-execution-progress-v1.log") or
             std.mem.eql(u8, name, "native-managed-state-v1.json") or
             std.mem.eql(u8, name, std.fs.path.basename(native_recovery.diversion_cache_path)) or
@@ -21781,7 +22040,9 @@ fn recoverWithoutNativeIntent(
         .detail = "already_completed",
         .program_sha256 = locked_provenance.document.program_sha256,
         .attempt_id = locked_provenance.document.attempt_id,
-        .provenance_path = native_provenance.document_path,
+        .provenance_path = native_provenance.documentPath(
+            locked_provenance.document,
+        ),
     };
 }
 
@@ -21804,17 +22065,7 @@ fn recoverLifecycleProgram(
     if ((try root.metadataOfRoot()).inode != intent.intent.root_inode)
         return error.RecoveryRootIdentityMismatch;
     if (!std.mem.eql(u8, intent.intent.install_root, request.root) or
-        !std.mem.eql(u8, intent.intent.architecture, request.architecture) or
-        !std.mem.eql(
-            u8,
-            intent.intent.authorization_path,
-            native_recovery.authorization_name,
-        ) or
-        !std.mem.eql(
-            u8,
-            intent.intent.program_path,
-            native_recovery.program_name,
-        ))
+        !std.mem.eql(u8, intent.intent.architecture, request.architecture))
         return error.InvalidRecoveryIntent;
     var namespace = try root.openDirectory(
         try root_fs.Path.init(root_operation.namespace_path),
@@ -21823,12 +22074,12 @@ fn recoverLifecycleProgram(
     const authorization_store = try native_authorization.Store.init(
         root.io,
         namespace,
-        native_recovery.authorization_name,
+        intent.intent.authorization_path,
     );
     const program_store = try native_program.Store.init(
         root.io,
         namespace,
-        native_recovery.program_name,
+        intent.intent.program_path,
     );
     var compiled: CompiledLifecycle = .{
         .authorization = try authorization_store.read(
@@ -21854,6 +22105,29 @@ fn recoverLifecycleProgram(
     ) or !compiled.program.program.matchesAuthorization(
         compiled.authorization.authorization,
     )) return error.RecoveryProgramBindingMismatch;
+    if (intent.intent.version == 2 and
+        (!std.mem.eql(
+            u8,
+            intent.intent.authorization_schema.?,
+            if (compiled.authorization.authorization.wire_version ==
+                native_authorization.schema_v2_version)
+                native_authorization.schema_v2_id
+            else
+                native_authorization.schema_id,
+        ) or intent.intent.authorization_version.? !=
+            compiled.authorization.authorization.wire_version or
+            !std.mem.eql(
+                u8,
+                intent.intent.program_schema.?,
+                compiled.program.program.schema,
+            ) or intent.intent.program_version.? != compiled.program.program.version or
+            !std.mem.eql(
+                u8,
+                intent.intent.exact_lock_schema.?,
+                compiled.program.program.exact_lock.schema,
+            ) or intent.intent.exact_lock_version.? !=
+            compiled.program.program.exact_lock.version))
+        return error.RecoveryProgramBindingMismatch;
     const persisted_program = compiled.program.program;
     if (!std.mem.eql(
         u8,
@@ -21988,7 +22262,9 @@ fn recoverLifecycleProgram(
             .detail = "cleanup_completed",
             .program_sha256 = provenance.document.program_sha256,
             .attempt_id = native_recovery.hexDigest(original_attempt),
-            .provenance_path = native_provenance.document_path,
+            .provenance_path = native_provenance.documentPath(
+                provenance.document,
+            ),
         };
     } else {
         var owned_active = active_record.?;
@@ -22067,10 +22343,24 @@ fn productionLifecycleRequest(
 /// Experimental caller-owned runtime. Product/CLI backend selection remains
 /// separate; this interface never accepts fixture requests or alternate helpers.
 pub const Runtime = struct {
+    /// Injectable external namespace probe mechanics. The authenticated helper
+    /// bytes, target binding, request, authorization, and program remain
+    /// production-validated before this hook is reached.
+    pub const ExternalMechanics = struct {
+        context: ?*anyopaque = null,
+        probe_helper_fn: ?*const fn (
+            context: ?*anyopaque,
+            allocator: std.mem.Allocator,
+            root: root_fs.Root,
+            helper: native_helper.Binding,
+            cancellation: maintainer_script.Cancellation,
+        ) anyerror!void = null,
+    };
+
     pub const PrepareRequest = struct {
         attempt: *root_operation.Attempt,
         plan: *const solver.Plan,
-        exact_lock: *const exact_lock_v2.Lock,
+        exact_lock: *const exact_lock_v3.Lock,
         archives: []const []const u8,
         policy: transaction_executor.Policy,
     };
@@ -22082,6 +22372,7 @@ pub const Runtime = struct {
         operation: native_recovery.Operation,
         /// Transient caller budget; never changes persisted program or policy.
         deadline: ?transaction_executor.Deadline = null,
+        external_mechanics: ExternalMechanics = .{},
     };
 
     pub const Outcome = enum { succeeded, failed, recovery_required, refused };
@@ -22214,7 +22505,11 @@ pub const Runtime = struct {
         _ = try native_statoverride.read(temporary, root, database.model.stat_overrides);
         const installed = try lifecycleInstalledEvidence(temporary, root, database.model);
         const models = try temporary.alloc(archive_application.Model, request.archives.len);
-        const origins = try temporary.alloc(exact_lock_v2.PackageOrigin, request.archives.len);
+        const origins = try temporary.alloc(exact_lock_v3.PackageOrigin, request.archives.len);
+        const identities = try temporary.alloc(
+            content_digest.Identity,
+            request.archives.len,
+        );
         var total_bytes: u64 = 0;
         for (request.archives, 0..) |bytes, index| {
             total_bytes = std.math.add(u64, total_bytes, bytes.len) catch
@@ -22231,14 +22526,22 @@ pub const Runtime = struct {
                 model.facts.version,
                 model.facts.architecture,
             ) orelse return error.ArchiveEvidenceMismatch;
-            if (locked.declared_size != bytes.len or
-                !std.mem.eql(u8, &locked.sha256, &model.provenance().sha256))
+            if (locked.declared_size != bytes.len)
+                return error.ArchiveEvidenceMismatch;
+            locked.archive_identity.verify(bytes) catch
                 return error.ArchiveEvidenceMismatch;
             if (!supportedArchiveMetadata(model))
                 return error.UnsupportedNativeArchive;
             origins[index] = locked.origin;
+            identities[index] = locked.archive_identity;
         }
-        const archives = try programArchiveEvidence(temporary, models, request.archives, origins);
+        const archives = try programArchiveEvidenceV2(
+            temporary,
+            models,
+            request.archives,
+            identities,
+            origins,
+        );
         var triggers = database.model.triggers.interests.len != 0 or
             database.model.triggers.pending.len != 0;
         for (installed) |package| {
@@ -22315,6 +22618,7 @@ pub const Runtime = struct {
             crash_at,
             native_helper.bundled(),
             &bounds,
+            request.external_mechanics,
         ) catch |err| switch (err) {
             error.DeadlineExceeded => return deadlineReport(allocator, request.attempt),
             else => return err,
@@ -22324,7 +22628,15 @@ pub const Runtime = struct {
 
     /// Recovery consumes only persisted evidence from the original attempt.
     pub fn recover(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !Report {
-        return recoverBounded(allocator, attempt, null, null);
+        return recoverBounded(allocator, attempt, null, null, .{});
+    }
+
+    pub fn recoverWithExternalMechanics(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        external_mechanics: ExternalMechanics,
+    ) !Report {
+        return recoverBounded(allocator, attempt, null, null, external_mechanics);
     }
 
     pub fn recoverWithDeadline(
@@ -22332,7 +22644,7 @@ pub const Runtime = struct {
         attempt: *root_operation.Attempt,
         deadline: transaction_executor.Deadline,
     ) !Report {
-        return recoverBounded(allocator, attempt, deadline, null);
+        return recoverBounded(allocator, attempt, deadline, null, .{});
     }
 
     fn recoverBounded(
@@ -22340,6 +22652,7 @@ pub const Runtime = struct {
         attempt: *root_operation.Attempt,
         deadline: ?transaction_executor.Deadline,
         crash_at: ?native_recovery.CrashPoint,
+        external_mechanics: ExternalMechanics,
     ) !Report {
         const root = try validateAttempt(attempt);
         var bounds: RuntimeBounds = .{ .deadline = deadline };
@@ -22354,6 +22667,7 @@ pub const Runtime = struct {
             crash_at,
             native_helper.bundled(),
             &bounds,
+            external_mechanics,
         ) catch |err| switch (err) {
             error.DeadlineExceeded => return deadlineReport(allocator, attempt),
             else => return err,
@@ -22586,6 +22900,7 @@ fn executePreparedNativeProgram(
         crash_at,
         null,
         null,
+        .{},
     );
 }
 
@@ -22627,6 +22942,7 @@ fn executePreparedNativeProgramWithHelper(
     crash_at: ?native_recovery.CrashPoint,
     helper_source: ?native_helper.Source,
     bounds: ?*RuntimeBounds,
+    external_mechanics: Runtime.ExternalMechanics,
 ) !LifecycleResult {
     try checkRuntimeBounds(bounds);
     const program = compiled.program.program;
@@ -22675,10 +22991,26 @@ fn executePreparedNativeProgramWithHelper(
             );
         } else {
             deployment = try native_helper.stage(allocator, root, source);
-            try probeNativeHelperWithBounds(allocator, root, deployment.?.binding, bounds);
+            try probeNativeHelperWithBounds(
+                allocator,
+                root,
+                deployment.?.binding,
+                bounds,
+                external_mechanics,
+            );
         }
     }
-    const bytes = if (bootstrap) |value|
+    const bytes = if (program.version == native_program.schema_v2_version)
+        try native_execution_request.encodeWithAuthority(
+            scratch,
+            try native_execution_request.withAuthority(
+                document,
+                program,
+                if (deployment) |value| value.binding else null,
+                bootstrap,
+            ),
+        )
+    else if (bootstrap) |value|
         try native_execution_request.encodeWithBootstrap(
             scratch,
             try native_execution_request.withBootstrap(document, value),
@@ -22692,6 +23024,10 @@ fn executePreparedNativeProgramWithHelper(
         try native_execution_request.encode(scratch, document);
     var request = try native_execution_request.decodePersisted(scratch, bytes);
     defer request.deinit();
+    try request.validateAuthorityDocuments(
+        compiled.authorization.authorization,
+        program,
+    );
     return executeLifecycleProgramWithRequest(
         allocator,
         root,
@@ -22718,14 +23054,17 @@ fn probeNativeHelperWithBounds(
     root: root_fs.Root,
     helper: native_helper.Binding,
     bounds: ?*RuntimeBounds,
+    external_mechanics: Runtime.ExternalMechanics,
 ) !void {
     try checkRuntimeBounds(bounds);
-    native_helper.probeWithCancellation(
-        allocator,
-        root,
-        helper,
-        if (bounds) |value| value.cancellation() else .never(),
-    ) catch |err| {
+    const cancellation: maintainer_script.Cancellation = if (bounds) |value|
+        value.cancellation()
+    else
+        .never();
+    (if (external_mechanics.probe_helper_fn) |probe|
+        probe(external_mechanics.context, allocator, root, helper, cancellation)
+    else
+        native_helper.probeWithCancellation(allocator, root, helper, cancellation)) catch |err| {
         try checkRuntimeBounds(bounds);
         return err;
     };
@@ -23128,11 +23467,22 @@ fn authorizeNativeHelperBootstrap(
             model.facts.architecture,
         )) break candidate;
     } else return error.NativeHelperBootstrapOwnerUnauthorized;
-    const archive_sha256 = std.fmt.bytesToHex(action_artifact.sha256, .lower);
+    const action_identity = action_artifact.archive_identity orelse
+        content_digest.Identity.init(
+            .{ .sha256 = action_artifact.sha256 },
+            .sha256,
+        ) catch return error.NativeHelperBootstrapArchiveMismatch;
+    const program_identity = artifact.identity() orelse
+        return error.NativeHelperBootstrapArchiveMismatch;
     if (artifact.size != action_artifact.size or
-        !std.mem.eql(u8, &artifact.sha256, &archive_sha256) or
+        !program_identity.eql(action_identity) or
         !std.mem.eql(u8, &artifact.application_sha256, &std.fmt.bytesToHex(model.digest, .lower)) or
-        !std.mem.eql(u8, &artifact.sha256, &std.fmt.bytesToHex(model.provenance().sha256, .lower)))
+        (program_identity.digests.sha256 != null and
+            !std.mem.eql(
+                u8,
+                &program_identity.digests.sha256.?,
+                &model.provenance().sha256,
+            )))
         return error.NativeHelperBootstrapArchiveMismatch;
 
     var owner_step: ?u32 = null;
@@ -23198,6 +23548,7 @@ fn authorizeNativeHelperBootstrap(
             .final_state = @tagName(final_owner.state),
             .artifact = artifact.index,
             .archive_sha256 = artifact.sha256,
+            .archive_identity = artifact.archive_identity,
             .archive_size = artifact.size,
             .application_sha256 = artifact.application_sha256,
             .program_step = bootstrap_step,
@@ -23303,6 +23654,23 @@ fn readProductionCompletion(
     defer allocator.free(program_bytes);
     var program = try native_program.decode(allocator, program_bytes, native_program.maximum_document_bytes);
     defer program.deinit();
+    const authorization_bytes = try retainedNativeBytes(
+        allocator,
+        root,
+        receipt.document,
+        .authorization,
+    );
+    defer allocator.free(authorization_bytes);
+    var authorization = try native_authorization.decode(
+        allocator,
+        authorization_bytes,
+        native_authorization.maximum_document_bytes,
+    );
+    defer authorization.deinit();
+    try request.validateAuthorityDocuments(
+        authorization.authorization,
+        program.program,
+    );
     try native_execution_request.validateBinding(execution, root, attempt, program.program);
     const document = receipt.document;
     if (!std.mem.eql(u8, &document.program_sha256, &execution.program.program_sha256) or
@@ -23335,7 +23703,7 @@ fn productionCompletionResult(receipt: native_provenance.Document) LifecycleResu
         .detail = "awaiting_caller_acknowledgment",
         .program_sha256 = receipt.program_sha256,
         .attempt_id = receipt.attempt_id,
-        .provenance_path = native_provenance.document_path,
+        .provenance_path = native_provenance.documentPath(receipt),
     };
 }
 
@@ -23346,7 +23714,16 @@ fn recoverPreparedNativeProgram(
     locks: root_operation.LockBackend,
     crash_at: ?native_recovery.CrashPoint,
 ) !LifecycleResult {
-    return recoverPreparedNativeProgramWithHelper(allocator, root, attempt, locks, crash_at, null, null);
+    return recoverPreparedNativeProgramWithHelper(
+        allocator,
+        root,
+        attempt,
+        locks,
+        crash_at,
+        null,
+        null,
+        .{},
+    );
 }
 
 fn recoverPreparedNativeProgramWithHelper(
@@ -23357,6 +23734,7 @@ fn recoverPreparedNativeProgramWithHelper(
     crash_at: ?native_recovery.CrashPoint,
     helper_source: ?native_helper.Source,
     bounds: ?*RuntimeBounds,
+    external_mechanics: Runtime.ExternalMechanics,
 ) !LifecycleResult {
     try checkRuntimeBounds(bounds);
     if (try readProductionCompletion(allocator, root, attempt)) |value| {
@@ -23371,7 +23749,8 @@ fn recoverPreparedNativeProgramWithHelper(
     } else return error.RecoveryEvidenceMissing;
     if (!std.mem.eql(u8, request_blob.logical_path, native_execution_request.logical_path) and
         !std.mem.eql(u8, request_blob.logical_path, native_execution_request.helper_logical_path) and
-        !std.mem.eql(u8, request_blob.logical_path, native_execution_request.bootstrap_logical_path))
+        !std.mem.eql(u8, request_blob.logical_path, native_execution_request.bootstrap_logical_path) and
+        !std.mem.eql(u8, request_blob.logical_path, native_execution_request.authority_logical_path))
         return error.ProductionRecoveryRequestRequired;
     const request_bytes = try native_recovery.verifyBlob(allocator, root, request_blob);
     defer allocator.free(request_bytes);
@@ -23385,18 +23764,30 @@ fn recoverPreparedNativeProgramWithHelper(
     } else if (request.helper() != null) return error.NativeHelperBindingRequired;
     var namespace = try root.openDirectory(try root_fs.Path.init(root_operation.namespace_path));
     defer namespace.close(root.io);
-    const authorization_store = try native_authorization.Store.init(root.io, namespace, native_recovery.authorization_name);
-    const program_store = try native_program.Store.init(root.io, namespace, native_recovery.program_name);
+    const authorization_store = try native_authorization.Store.init(
+        root.io,
+        namespace,
+        intent.intent.authorization_path,
+    );
+    const program_store = try native_program.Store.init(
+        root.io,
+        namespace,
+        intent.intent.program_path,
+    );
     var authorization = try authorization_store.read(allocator, native_recovery.maximum_intent_bytes);
     defer authorization.deinit();
     var program = try program_store.read(allocator, native_recovery.maximum_intent_bytes);
     defer program.deinit();
+    try request.validateAuthorityDocuments(
+        authorization.authorization,
+        program.program,
+    );
     var compiled: CompiledLifecycle = .{ .authorization = authorization, .program = program };
     try native_execution_request.validateBinding(request.execution(), root, attempt, program.program);
     try native_execution_request.validateIntent(request.execution(), intent.intent);
     if (request.helper()) |helper| {
         if (request.bootstrap() == null)
-            try probeNativeHelperWithBounds(allocator, root, helper, bounds);
+            try probeNativeHelperWithBounds(allocator, root, helper, bounds, external_mechanics);
     }
     if (!std.mem.eql(u8, &program.program.script_policy_sha256, &native_recovery.hexDigest(
         maintainer_script.policyDigest(lifecycleScriptPolicy()),
@@ -25466,7 +25857,7 @@ fn attachLifecycleProvenance(
         )) return;
     }
     result.attempt_id = owned.document.attempt_id;
-    result.provenance_path = native_provenance.document_path;
+    result.provenance_path = native_provenance.documentPath(owned.document);
     if (result.program_sha256 == null)
         result.program_sha256 = owned.document.program_sha256;
 }
@@ -27181,7 +27572,10 @@ fn typedRuntimeFixtureResult(report: Runtime.Report) LifecycleResult {
         .detail = report.detail,
         .program_sha256 = report.program_sha256,
         .attempt_id = if (report.receipt) |receipt| receipt.document.attempt_id else null,
-        .provenance_path = if (report.receipt != null) native_provenance.document_path else null,
+        .provenance_path = if (report.receipt) |receipt|
+            native_provenance.documentPath(receipt.document)
+        else
+            null,
     };
 }
 
@@ -27225,7 +27619,13 @@ fn callerOwnedLifecycleFixture(
         });
         defer attempt.release();
         const result = if (external.isolated_helper) block: {
-            var report = try Runtime.recoverBounded(allocator, &attempt, deadline, external.crash_at);
+            var report = try Runtime.recoverBounded(
+                allocator,
+                &attempt,
+                deadline,
+                external.crash_at,
+                .{},
+            );
             defer report.deinit();
             break :block typedRuntimeFixtureResult(report);
         } else try recoverPreparedNativeProgramWithHelper(
@@ -27236,6 +27636,7 @@ fn callerOwnedLifecycleFixture(
             null,
             null,
             null,
+            .{},
         );
         if (external.acknowledge_native) {
             var receipt = (if (external.isolated_helper)
@@ -27276,7 +27677,10 @@ fn callerOwnedLifecycleFixture(
                 .record = attempt.record(),
                 .transaction_provenance = .{
                     .status = .already_present,
-                    .schema = native_provenance.schema_id,
+                    .schema = receipt.document.schema,
+                    .version = native_provenance.completionVersion(
+                        receipt.document,
+                    ),
                     .document_sha256 = native_recovery.parseDigest(receipt.document.digest_sha256).?,
                     .detail = "caller-acknowledged native fixture",
                 },
@@ -27340,6 +27744,7 @@ fn callerOwnedLifecycleFixture(
         external.crash_at,
         null,
         null,
+        .{},
     );
 }
 
@@ -28887,6 +29292,7 @@ fn testPreparedDeadline(
             null,
             null,
             &bounds,
+            .{},
         ) catch |err| switch (err) {
             error.DeadlineExceeded => break :block try Runtime.deadlineReport(testing.allocator, caller),
             else => return err,
@@ -28939,6 +29345,7 @@ fn testPreparedDeadline(
         null,
         null,
         &fresh,
+        .{},
     );
     try testing.expectEqual(LifecycleOutcome.applied, recovered.outcome);
     try testing.expect(!fresh.expired);
@@ -29019,7 +29426,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         &.{}
     else
         try programArchiveEvidence(arena.allocator(), &models, &.{bytes}, &.{origin});
-    var lock = try exact_lock_v2.create(testing.allocator, .{
+    var lock = try exact_lock_v3.create(testing.allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = @splat(7),
         .policy_sha256 = @splat(8),
@@ -29027,7 +29434,10 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .id = repository_id,
             .snapshot_sha256 = snapshot,
             .release_sha256 = @splat(3),
-            .index_sha256 = @splat(4),
+            .index_identity = .{
+                .digests = .{ .sha256 = @splat(4) },
+                .primary = .sha256,
+            },
             .signer_fingerprints = &.{@splat(5)},
         }},
         .local_artifacts = &.{},
@@ -29035,8 +29445,14 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .name = "app",
             .version = "1.2",
             .architecture = "amd64",
-            .origin = origin,
-            .sha256 = models[0].provenance().sha256,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } },
+            .archive_identity = .{
+                .digests = .{ .sha256 = models[0].provenance().sha256 },
+                .primary = .sha256,
+            },
             .declared_size = bytes.len,
             .retention = .requested,
             .dpkg_selection_hold = false,
@@ -29052,6 +29468,10 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .architecture = "amd64",
             .repository = .{ .id = repository_id, .priority = 500 },
             .sha256 = hex(32, models[0].provenance().sha256),
+            .archive_identity = .{
+                .digests = .{ .sha256 = models[0].provenance().sha256 },
+                .primary = .sha256,
+            },
             .package_size = bytes.len,
             .installed_size_delta_bytes = 0,
             .source_package = "app",
@@ -29208,7 +29628,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         try testing.expectEqual(.missing_archive, refused.diagnostic.diagnostic.code);
         var changed_lock = lock.lock;
         var changed_package = lock.lock.packages[0];
-        changed_package.sha256[0] ^= 1;
+        changed_package.archive_identity.digests.sha256.?[0] ^= 1;
         changed_lock.packages = &.{changed_package};
         var changed_request = request;
         changed_request.exact_lock = &changed_lock;
@@ -29294,7 +29714,19 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
     if (case == .production_resume) {
         try native_operation.bind(testing.allocator, root, &caller, compiled.program.program);
         const document = try native_execution_request.create(root, &caller, compiled.program.program, .install);
-        const request_bytes = try native_execution_request.encode(arena.allocator(), document);
+        const request_bytes = if (compiled.program.program.version ==
+            native_program.schema_v2_version)
+            try native_execution_request.encodeWithAuthority(
+                arena.allocator(),
+                try native_execution_request.withAuthority(
+                    document,
+                    compiled.program.program,
+                    null,
+                    null,
+                ),
+            )
+        else
+            try native_execution_request.encode(arena.allocator(), document);
         var diversion_cache = try native_diversion.Session.open(testing.allocator, root);
         defer diversion_cache.deinit();
         _ = try prepareNativeRecovery(
@@ -29383,21 +29815,35 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             defer intent.deinit();
             const blob = intent.intent.blobs[0];
             try testing.expectEqual(native_recovery.BlobKind.request, blob.kind);
-            try testing.expectEqualStrings(native_execution_request.logical_path, blob.logical_path);
+            try testing.expectEqualStrings(
+                native_execution_request.authority_logical_path,
+                blob.logical_path,
+            );
             try testing.expect(!std.mem.eql(u8, &blob.sha256, &intent.intent.request_sha256));
             const request_bytes = try native_recovery.verifyBlob(testing.allocator, root, blob);
             defer testing.allocator.free(request_bytes);
-            var request = try native_execution_request.decode(testing.allocator, request_bytes);
+            var request = try native_execution_request.decodePersisted(
+                testing.allocator,
+                request_bytes,
+            );
             defer request.deinit();
-            try native_execution_request.validateBinding(request.document, root, &caller, compiled.program.program);
+            try native_execution_request.validateBinding(
+                request.execution(),
+                root,
+                &caller,
+                compiled.program.program,
+            );
             try testing.expectError(error.InvalidRecoveryIntent, validatePersistedLifecycleRequest(testing.allocator, root, intent.intent));
-            var changed_request = request.document;
+            var changed_request = request.execution();
             changed_request.caller.policy_sha256 = @splat('3');
             native_execution_request.seal(&changed_request);
             try testing.expectError(error.RecoveryRequestBindingMismatch, native_execution_request.validateBinding(changed_request, root, &caller, compiled.program.program));
             const noncanonical = try std.mem.concat(testing.allocator, u8, &.{ request_bytes, "\n" });
             defer testing.allocator.free(noncanonical);
-            try testing.expectError(error.NonCanonicalDocument, native_execution_request.decode(testing.allocator, noncanonical));
+            try testing.expectError(
+                error.NonCanonicalDocument,
+                native_execution_request.decodePersisted(testing.allocator, noncanonical),
+            );
             var receipt = try readProductionCompletion(testing.allocator, root, &caller) orelse
                 return error.TestUnexpectedResult;
             defer receipt.deinit();
@@ -29409,8 +29855,8 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
                 receipt.document.digest_sha256,
             ));
             try testing.expectEqual(native_provenance.Outcome.succeeded, receipt.document.outcome);
-            try testing.expectEqual(request.document.caller.request_sha256, receipt.document.request_sha256);
-            try testing.expectEqual(request.document.caller.policy_sha256, receipt.document.policy_sha256);
+            try testing.expectEqual(request.execution().caller.request_sha256, receipt.document.request_sha256);
+            try testing.expectEqual(request.execution().caller.policy_sha256, receipt.document.policy_sha256);
             try testing.expectError(error.NativeRecoveryRequired, executePreparedNativeProgram(
                 testing.allocator,
                 root,

@@ -454,6 +454,11 @@
       "cutover": "retain_guard"
     },
     {
+      "path": "src/exact_lock_v3.zig",
+      "role": "tagged_digest_lock_decoder_rejects_legacy_schemas",
+      "cutover": "retain_guard"
+    },
+    {
       "path": "src/native_transaction_result.zig",
       "role": "native_result_verifier_rejects_legacy_schema",
       "cutover": "retain_guard"

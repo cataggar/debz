@@ -1,6 +1,8 @@
 const std = @import("std");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
+const content_digest = @import("content_digest.zig");
 const package_acquisition = @import("package_acquisition.zig");
 
 const File = std.Io.File;
@@ -9,8 +11,11 @@ pub const format_id = "debz-package-cache-archive-v1";
 pub const magic = format_id ++ "\n";
 pub const native_format_id = "debz-package-cache-archive-v2";
 pub const native_magic = native_format_id ++ "\n";
+pub const tagged_format_id = "debz-package-cache-archive-v3";
+pub const tagged_magic = tagged_format_id ++ "\n";
 pub const entry_header_bytes: u64 = 32 + 8;
 pub const trailer_bytes: u64 = 32;
+pub const maximum_tagged_entry_header_bytes: u64 = 2 + 1 + 32 + 1 + 64 + 8;
 
 const Version = enum { v1, v2 };
 
@@ -55,6 +60,7 @@ pub const Error = error{
     LockObjectMismatch,
     CorruptObject,
     InvalidConfiguration,
+    UnknownAlgorithm,
 };
 
 pub fn maximumArchiveBytes(limits: Limits) Error!u64 {
@@ -63,6 +69,26 @@ pub fn maximumArchiveBytes(limits: Limits) Error!u64 {
 
 pub fn maximumNativeArchiveBytes(limits: Limits) Error!u64 {
     return maximumBytes(.v2, limits);
+}
+
+pub fn maximumTaggedArchiveBytes(limits: Limits) Error!u64 {
+    if (limits.maximum_objects == 0 or
+        limits.maximum_object_bytes == 0 or
+        limits.maximum_total_object_bytes == 0)
+        return error.InvalidConfiguration;
+    const headers = std.math.mul(
+        u64,
+        @intCast(limits.maximum_objects),
+        maximum_tagged_entry_header_bytes,
+    ) catch return error.ArchiveTooLarge;
+    var total = std.math.add(
+        u64,
+        @intCast(tagged_magic.len + @sizeOf(u32)),
+        headers,
+    ) catch return error.ArchiveTooLarge;
+    total = std.math.add(u64, total, limits.maximum_total_object_bytes) catch
+        return error.ArchiveTooLarge;
+    return std.math.add(u64, total, trailer_bytes) catch error.ArchiveTooLarge;
 }
 
 fn maximumBytes(comptime version: Version, limits: Limits) Error!u64 {
@@ -193,7 +219,7 @@ fn importVersion(
         defer allocator.free(bytes);
         try readHashed(archive, io, bytes, &offset, &hasher);
         const actual_digest = package_acquisition.Digest.of(bytes);
-        if (!std.mem.eql(u8, &actual_digest.bytes, &digest))
+        if (!std.mem.eql(u8, &actual_digest.digests.sha256.?, &digest))
             return error.ObjectDigestMismatch;
 
         const lock_index = lock_by_digest.get(digest) orelse {
@@ -230,9 +256,12 @@ fn importVersion(
         var payload_offset = match.payload_offset;
         try readExact(archive, io, bytes, &payload_offset);
         const actual_digest = package_acquisition.Digest.of(bytes);
-        if (!std.mem.eql(u8, &actual_digest.bytes, &match.digest))
+        if (!std.mem.eql(u8, &actual_digest.digests.sha256.?, &match.digest))
             return error.ObjectDigestMismatch;
-        const object_digest: package_acquisition.Digest = .{ .bytes = match.digest };
+        const object_digest = try @import("content_digest.zig").Identity.init(
+            .{ .sha256 = match.digest },
+            .sha256,
+        );
         if (cache.lookup(allocator, object_digest, match.size, .verify_sha256)) |existing| {
             allocator.free(existing);
             result.reused += 1;
@@ -345,7 +374,10 @@ fn exportVersion(
         var size_buffer: [8]u8 = undefined;
         std.mem.writeInt(u64, &size_buffer, package.declared_size, .big);
         try writeHashed(output, io, &size_buffer, &offset, &hasher);
-        const digest: package_acquisition.Digest = .{ .bytes = package.sha256 };
+        const digest = try @import("content_digest.zig").Identity.init(
+            .{ .sha256 = package.sha256 },
+            .sha256,
+        );
         const bytes = try cache.lookup(
             allocator,
             digest,
@@ -355,17 +387,391 @@ fn exportVersion(
         defer allocator.free(bytes);
         try writeHashed(output, io, bytes, &offset, &hasher);
     }
-    const content_digest = hasher.finalResult();
-    try output.writePositionalAll(io, &content_digest, offset);
-    offset += content_digest.len;
+    const archive_digest = hasher.finalResult();
+    try output.writePositionalAll(io, &archive_digest, offset);
+    offset += archive_digest.len;
     if (offset != expected_size) return error.ArchiveTooLarge;
     try output.sync(io);
     return .{
         .objects = lock.packages.len,
         .bytes = total_bytes,
         .archive_bytes = offset,
-        .content_sha256 = content_digest,
+        .content_sha256 = archive_digest,
     };
+}
+
+pub fn importTaggedFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    archive: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v3.Lock,
+    limits: Limits,
+    policy: ImportPolicy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !ImportResult {
+    if (writer_lock.cache != cache or writer_lock.file == null or
+        cache.limits.maximum_object_bytes != limits.maximum_object_bytes)
+        return error.InvalidConfiguration;
+    const stat = archive.stat(io) catch return error.InvalidArchiveFile;
+    if (stat.kind != .file) return error.InvalidArchiveFile;
+    const maximum = try maximumTaggedArchiveBytes(limits);
+    const minimum: u64 = tagged_magic.len + @sizeOf(u32) + trailer_bytes;
+    if (stat.size < minimum) return error.TruncatedArchive;
+    if (stat.size > maximum) return error.ArchiveTooLarge;
+
+    var lock_sha256 = std.AutoHashMap([32]u8, usize).init(allocator);
+    defer lock_sha256.deinit();
+    var lock_sha512 = std.AutoHashMap([64]u8, usize).init(allocator);
+    defer lock_sha512.deinit();
+    for (lock.packages, 0..) |package, index| {
+        _ = content_digest.Identity.init(
+            package.archive_identity.digests,
+            package.archive_identity.primary,
+        ) catch return error.LockObjectMismatch;
+        if (package.archive_identity.digests.sha256) |digest| {
+            const entry = try lock_sha256.getOrPut(digest);
+            if (entry.found_existing) return error.DuplicateObject;
+            entry.value_ptr.* = index;
+        }
+        if (package.archive_identity.digests.sha512) |digest| {
+            const entry = try lock_sha512.getOrPut(digest);
+            if (entry.found_existing) return error.DuplicateObject;
+            entry.value_ptr.* = index;
+        }
+    }
+
+    var offset: u64 = 0;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var magic_buffer: [tagged_magic.len]u8 = undefined;
+    try readHashed(archive, io, &magic_buffer, &offset, &hasher);
+    if (!std.mem.eql(u8, &magic_buffer, tagged_magic)) return error.InvalidArchive;
+    var count_buffer: [4]u8 = undefined;
+    try readHashed(archive, io, &count_buffer, &offset, &hasher);
+    const count = std.mem.readInt(u32, &count_buffer, .big);
+    if (count > limits.maximum_objects) return error.TooManyObjects;
+
+    const Match = struct {
+        identity: content_digest.Identity,
+        size: u64,
+        payload_offset: u64,
+    };
+    const matches = try allocator.alloc(?Match, lock.packages.len);
+    defer allocator.free(matches);
+    @memset(matches, null);
+    var seen_sha256 = std.AutoHashMap([32]u8, void).init(allocator);
+    defer seen_sha256.deinit();
+    var seen_sha512 = std.AutoHashMap([64]u8, void).init(allocator);
+    defer seen_sha512.deinit();
+    var previous_identity: ?content_digest.Identity = null;
+    var total_bytes: u64 = 0;
+    var result: ImportResult = .{
+        .imported = 0,
+        .reused = 0,
+        .skipped = 0,
+        .bytes = 0,
+    };
+
+    var entry_index: u32 = 0;
+    while (entry_index < count) : (entry_index += 1) {
+        const identity = try readTaggedIdentity(
+            archive,
+            io,
+            &offset,
+            &hasher,
+        );
+        if (previous_identity) |previous| {
+            const order = content_digest.Identity.order(previous, identity);
+            if (order == .eq) return error.DuplicateObject;
+            if (order != .lt) return error.NonCanonicalOrder;
+        }
+        previous_identity = identity;
+        if (identity.digests.sha256) |digest| {
+            const entry = try seen_sha256.getOrPut(digest);
+            if (entry.found_existing) return error.DuplicateObject;
+        }
+        if (identity.digests.sha512) |digest| {
+            const entry = try seen_sha512.getOrPut(digest);
+            if (entry.found_existing) return error.DuplicateObject;
+        }
+
+        var size_buffer: [8]u8 = undefined;
+        try readHashed(archive, io, &size_buffer, &offset, &hasher);
+        const size = std.mem.readInt(u64, &size_buffer, .big);
+        if (size == 0 or size > limits.maximum_object_bytes) return error.ObjectTooLarge;
+        total_bytes = std.math.add(u64, total_bytes, size) catch
+            return error.TotalObjectBytesExceeded;
+        if (total_bytes > limits.maximum_total_object_bytes)
+            return error.TotalObjectBytesExceeded;
+        const size_usize = std.math.cast(usize, size) orelse return error.ObjectTooLarge;
+        const payload_offset = offset;
+        const bytes = try allocator.alloc(u8, size_usize);
+        defer allocator.free(bytes);
+        try readHashed(archive, io, bytes, &offset, &hasher);
+        identity.verify(bytes) catch return error.ObjectDigestMismatch;
+
+        const lock_index = switch (identity.primaryValue()) {
+            .sha256 => |digest| lock_sha256.get(digest),
+            .sha512 => |digest| lock_sha512.get(digest),
+        } orelse {
+            result.skipped += 1;
+            continue;
+        };
+        const locked = lock.packages[lock_index];
+        if (!content_digest.Identity.eql(identity, locked.archive_identity) or
+            locked.declared_size != size or matches[lock_index] != null)
+            return error.LockObjectMismatch;
+        matches[lock_index] = .{
+            .identity = identity,
+            .size = size,
+            .payload_offset = payload_offset,
+        };
+    }
+    result.bytes = total_bytes;
+
+    var expected_digest: [32]u8 = undefined;
+    try readExact(archive, io, &expected_digest, &offset);
+    const actual_archive_digest = hasher.finalResult();
+    if (!std.mem.eql(u8, &actual_archive_digest, &expected_digest))
+        return error.ArchiveDigestMismatch;
+    if (offset != stat.size) return error.TrailingArchiveData;
+    if (policy.require_exact_closure) {
+        if (result.skipped != 0 or count != lock.packages.len)
+            return error.LockObjectMismatch;
+        for (matches) |match| if (match == null) return error.LockObjectMismatch;
+    }
+
+    for (matches) |maybe_match| {
+        const match = maybe_match orelse continue;
+        const size_usize = std.math.cast(usize, match.size) orelse
+            return error.ObjectTooLarge;
+        const bytes = try allocator.alloc(u8, size_usize);
+        defer allocator.free(bytes);
+        var payload_offset = match.payload_offset;
+        try readExact(archive, io, bytes, &payload_offset);
+        match.identity.verify(bytes) catch return error.ObjectDigestMismatch;
+        if (cache.lookup(
+            allocator,
+            match.identity,
+            match.size,
+            .verify_all_supported,
+        )) |existing| {
+            allocator.free(existing);
+            result.reused += 1;
+        } else |err| switch (err) {
+            error.CacheMiss => {
+                try cache.publish(
+                    allocator,
+                    match.identity,
+                    match.size,
+                    bytes,
+                    .{ .held = writer_lock },
+                    .{},
+                );
+                result.imported += 1;
+            },
+            error.CorruptObject => {
+                if (!policy.repair_corrupt) return error.CorruptObject;
+                result.skipped += 1;
+            },
+            else => |other| return other,
+        }
+    }
+    return result;
+}
+
+pub fn exportTaggedFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v3.Lock,
+    limits: Limits,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+) !ExportResult {
+    if (writer_lock.cache != cache or writer_lock.file == null or
+        cache.limits.maximum_object_bytes != limits.maximum_object_bytes or
+        lock.packages.len > limits.maximum_objects)
+        return error.InvalidConfiguration;
+    const output_stat = output.stat(io) catch return error.InvalidArchiveFile;
+    if (output_stat.kind != .file or output_stat.size != 0)
+        return error.InvalidArchiveFile;
+
+    var seen_sha256 = std.AutoHashMap([32]u8, void).init(allocator);
+    defer seen_sha256.deinit();
+    var seen_sha512 = std.AutoHashMap([64]u8, void).init(allocator);
+    defer seen_sha512.deinit();
+    const order = try allocator.alloc(usize, lock.packages.len);
+    defer allocator.free(order);
+    for (lock.packages, 0..) |package, index| {
+        _ = content_digest.Identity.init(
+            package.archive_identity.digests,
+            package.archive_identity.primary,
+        ) catch return error.LockObjectMismatch;
+        if (package.archive_identity.digests.sha256) |digest| {
+            const entry = try seen_sha256.getOrPut(digest);
+            if (entry.found_existing) return error.DuplicateObject;
+        }
+        if (package.archive_identity.digests.sha512) |digest| {
+            const entry = try seen_sha512.getOrPut(digest);
+            if (entry.found_existing) return error.DuplicateObject;
+        }
+        order[index] = index;
+    }
+    std.mem.sort(usize, order, lock, struct {
+        fn less(context: exact_lock_v3.Lock, left: usize, right: usize) bool {
+            return content_digest.Identity.order(
+                context.packages[left].archive_identity,
+                context.packages[right].archive_identity,
+            ) == .lt;
+        }
+    }.less);
+
+    var expected_size: u64 = tagged_magic.len + @sizeOf(u32) + trailer_bytes;
+    var total_bytes: u64 = 0;
+    for (lock.packages) |package| {
+        if (package.declared_size == 0 or package.declared_size > limits.maximum_object_bytes)
+            return error.ObjectTooLarge;
+        total_bytes = std.math.add(u64, total_bytes, package.declared_size) catch
+            return error.TotalObjectBytesExceeded;
+        if (total_bytes > limits.maximum_total_object_bytes)
+            return error.TotalObjectBytesExceeded;
+        expected_size = std.math.add(
+            u64,
+            expected_size,
+            taggedIdentityBytes(package.archive_identity) + 8 + package.declared_size,
+        ) catch return error.ArchiveTooLarge;
+    }
+    if (expected_size > try maximumTaggedArchiveBytes(limits))
+        return error.ArchiveTooLarge;
+
+    var offset: u64 = 0;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    try writeHashed(output, io, tagged_magic, &offset, &hasher);
+    var count_buffer: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count_buffer, @intCast(lock.packages.len), .big);
+    try writeHashed(output, io, &count_buffer, &offset, &hasher);
+    for (order) |package_index| {
+        const package = lock.packages[package_index];
+        try writeTaggedIdentity(
+            output,
+            io,
+            package.archive_identity,
+            &offset,
+            &hasher,
+        );
+        var size_buffer: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size_buffer, package.declared_size, .big);
+        try writeHashed(output, io, &size_buffer, &offset, &hasher);
+        const bytes = try cache.lookup(
+            allocator,
+            package.archive_identity,
+            package.declared_size,
+            .verify_all_supported,
+        );
+        defer allocator.free(bytes);
+        try writeHashed(output, io, bytes, &offset, &hasher);
+    }
+    const archive_digest = hasher.finalResult();
+    try output.writePositionalAll(io, &archive_digest, offset);
+    offset += archive_digest.len;
+    if (offset != expected_size) return error.ArchiveTooLarge;
+    try output.sync(io);
+    return .{
+        .objects = lock.packages.len,
+        .bytes = total_bytes,
+        .archive_bytes = offset,
+        .content_sha256 = archive_digest,
+    };
+}
+
+fn taggedIdentityBytes(identity: content_digest.Identity) u64 {
+    var result: u64 = 2;
+    inline for (content_digest.supported_algorithms) |algorithm| {
+        if (identity.digests.get(algorithm) != null)
+            result += 1 + algorithm.byteLength();
+    }
+    return result;
+}
+
+fn readTaggedIdentity(
+    file: File,
+    io: std.Io,
+    offset: *u64,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) !content_digest.Identity {
+    var header: [2]u8 = undefined;
+    try readHashed(file, io, &header, offset, hasher);
+    const primary = algorithmFromTag(header[0]) orelse
+        return error.UnknownAlgorithm;
+    const count = header[1];
+    if (count == 0 or count > content_digest.supported_algorithms.len)
+        return error.InvalidArchive;
+    var set: content_digest.Set = .{};
+    var previous_algorithm: ?content_digest.Algorithm = null;
+    for (0..count) |_| {
+        var tag: [1]u8 = undefined;
+        try readHashed(file, io, &tag, offset, hasher);
+        const algorithm = algorithmFromTag(tag[0]) orelse
+            return error.UnknownAlgorithm;
+        if (previous_algorithm) |previous| {
+            if (@intFromEnum(algorithm) <= @intFromEnum(previous))
+                return error.NonCanonicalOrder;
+        }
+        previous_algorithm = algorithm;
+        const value: content_digest.Value = switch (algorithm) {
+            .sha256 => blk: {
+                var digest: [32]u8 = undefined;
+                try readHashed(file, io, &digest, offset, hasher);
+                break :blk .{ .sha256 = digest };
+            },
+            .sha512 => blk: {
+                var digest: [64]u8 = undefined;
+                try readHashed(file, io, &digest, offset, hasher);
+                break :blk .{ .sha512 = digest };
+            },
+        };
+        set.put(value) catch return error.DuplicateObject;
+    }
+    return content_digest.Identity.init(set, primary) catch
+        error.InvalidArchive;
+}
+
+fn algorithmFromTag(tag: u8) ?content_digest.Algorithm {
+    return switch (tag) {
+        @intFromEnum(content_digest.Algorithm.sha256) => .sha256,
+        @intFromEnum(content_digest.Algorithm.sha512) => .sha512,
+        else => null,
+    };
+}
+
+fn writeTaggedIdentity(
+    file: File,
+    io: std.Io,
+    identity: content_digest.Identity,
+    offset: *u64,
+    hasher: *std.crypto.hash.sha2.Sha256,
+) !void {
+    const header = [_]u8{
+        @intFromEnum(identity.primary),
+        identity.digests.count(),
+    };
+    try writeHashed(file, io, &header, offset, hasher);
+    inline for (content_digest.supported_algorithms) |algorithm| {
+        if (identity.digests.get(algorithm)) |digest| {
+            const tag = [_]u8{@intFromEnum(algorithm)};
+            try writeHashed(file, io, &tag, offset, hasher);
+            switch (digest) {
+                inline else => |bytes| try writeHashed(
+                    file,
+                    io,
+                    &bytes,
+                    offset,
+                    hasher,
+                ),
+            }
+        }
+    }
 }
 
 fn readHashed(
@@ -416,7 +822,7 @@ fn testLock(
             .architecture = "amd64",
             .repository_id = repository_id,
             .repository_snapshot_sha256 = snapshot,
-            .sha256 = package_acquisition.Digest.of(bytes).bytes,
+            .sha256 = package_acquisition.Digest.of(bytes).digests.sha256.?,
             .declared_size = bytes.len,
             .retention = if (index == 0) .requested else .dependency,
             .dpkg_selection_hold = false,
@@ -453,7 +859,7 @@ fn testNativeLock(
     var artifacts: std.ArrayList(package_origin.LocalArtifactEvidence) = .empty;
     for (objects, 0..) |bytes, index| {
         const name = try std.fmt.allocPrint(temporary, "package-{d}", .{index});
-        const digest = package_acquisition.Digest.of(bytes).bytes;
+        const digest = package_acquisition.Digest.of(bytes).digests.sha256.?;
         const origin: exact_lock_v2.PackageOrigin = if (index % 2 == 0)
             .{ .authenticated_repository = .{
                 .repository_id = repository_id,
@@ -499,6 +905,420 @@ fn testNativeLock(
         .packages = packages,
         .verified_origins = true,
     });
+}
+
+fn testTaggedLock(
+    allocator: std.mem.Allocator,
+    objects: []const []const u8,
+) !exact_lock_v3.OwnedLock {
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(1);
+    const packages = try allocator.alloc(exact_lock_v3.Package, objects.len);
+    defer allocator.free(packages);
+    for (objects, 0..) |bytes, index| {
+        const identity = if (index == 0)
+            try content_digest.Identity.init(
+                .{ .sha512 = content_digest.Value.of(.sha512, bytes).sha512 },
+                .sha512,
+            )
+        else
+            content_digest.Identity.ofSupported(bytes);
+        packages[index] = .{
+            .name = try std.fmt.allocPrint(allocator, "package-{d}", .{index}),
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } },
+            .archive_identity = identity,
+            .declared_size = bytes.len,
+            .retention = if (index == 0) .requested else .dependency,
+            .dpkg_selection_hold = false,
+        };
+    }
+    defer for (packages) |package| allocator.free(package.name);
+    return exact_lock_v3.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(2),
+        .policy_sha256 = @splat(3),
+        .repositories = if (objects.len == 0) &.{} else &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(4),
+            .index_identity = content_digest.Identity.ofSupported("index"),
+            .signer_fingerprints = &.{@splat(6)},
+        }},
+        .local_artifacts = &.{},
+        .packages = packages,
+        .verified_origins = true,
+    });
+}
+
+fn writeTaggedTestArchive(
+    file: File,
+    identities: []const content_digest.Identity,
+    payloads: []const []const u8,
+) !void {
+    if (identities.len != payloads.len) return error.InvalidArchive;
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try output.writer.writeAll(tagged_magic);
+    var count: [4]u8 = undefined;
+    std.mem.writeInt(u32, &count, @intCast(identities.len), .big);
+    try output.writer.writeAll(&count);
+    for (identities, payloads) |identity, payload| {
+        try output.writer.writeByte(@intFromEnum(identity.primary));
+        try output.writer.writeByte(identity.digests.count());
+        inline for (content_digest.supported_algorithms) |algorithm| {
+            if (identity.digests.get(algorithm)) |digest| {
+                try output.writer.writeByte(@intFromEnum(algorithm));
+                switch (digest) {
+                    inline else => |bytes| try output.writer.writeAll(&bytes),
+                }
+            }
+        }
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, payload.len, .big);
+        try output.writer.writeAll(&size);
+        try output.writer.writeAll(payload);
+    }
+    var trailer: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(output.written(), &trailer, .{});
+    try output.writer.writeAll(&trailer);
+    try file.writeStreamingAll(std.testing.io, output.written());
+    try file.sync(std.testing.io);
+}
+
+test "package_cache_archive.test.legacy v1 and v2 archive bytes remain exact" {
+    const object = "legacy archive bytes";
+    const limits: Limits = .{
+        .maximum_objects = 4,
+        .maximum_object_bytes = 1024,
+        .maximum_total_object_bytes = 4096,
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try package_acquisition.Cache.initFromDir(
+        std.testing.io,
+        tmp.dir,
+        .{ .maximum_object_bytes = limits.maximum_object_bytes },
+    );
+    defer cache.deinit();
+    const identity = content_digest.Identity.ofSha256(object);
+    try cache.publish(
+        std.testing.allocator,
+        identity,
+        object.len,
+        object,
+        .fail_fast,
+        .{},
+    );
+    var writer = try cache.acquireWriter(10);
+    defer writer.release();
+    var v1_lock = try testLock(std.testing.allocator, &.{object});
+    defer v1_lock.deinit();
+    var v2_lock = try testNativeLock(std.testing.allocator, &.{object});
+    defer v2_lock.deinit();
+
+    inline for (.{
+        .{ magic, "legacy-v1.archive", v1_lock.lock },
+        .{ native_magic, "legacy-v2.archive", v2_lock.lock },
+    }) |case| {
+        var archive = try tmp.dir.createFile(std.testing.io, case[1], .{
+            .exclusive = true,
+            .read = true,
+        });
+        defer archive.close(std.testing.io);
+        if (@TypeOf(case[2]) == exact_lock.Lock) {
+            _ = try exportFile(
+                std.testing.allocator,
+                std.testing.io,
+                archive,
+                &cache,
+                case[2],
+                limits,
+                &writer,
+            );
+        } else {
+            _ = try exportNativeFile(
+                std.testing.allocator,
+                std.testing.io,
+                archive,
+                &cache,
+                case[2],
+                limits,
+                &writer,
+            );
+        }
+        const actual = try tmp.dir.readFileAlloc(
+            std.testing.io,
+            case[1],
+            std.testing.allocator,
+            .limited(4096),
+        );
+        defer std.testing.allocator.free(actual);
+        const prefix_len = case[0].len + 4 + 32 + 8 + object.len;
+        const expected = try std.testing.allocator.alloc(u8, prefix_len + 32);
+        defer std.testing.allocator.free(expected);
+        @memcpy(expected[0..case[0].len], case[0]);
+        std.mem.writeInt(u32, expected[case[0].len..][0..4], 1, .big);
+        @memcpy(expected[case[0].len + 4 ..][0..32], &identity.digests.sha256.?);
+        std.mem.writeInt(
+            u64,
+            expected[case[0].len + 4 + 32 ..][0..8],
+            object.len,
+            .big,
+        );
+        @memcpy(expected[case[0].len + 4 + 32 + 8 ..][0..object.len], object);
+        std.crypto.hash.sha2.Sha256.hash(
+            expected[0..prefix_len],
+            expected[prefix_len..][0..32],
+            .{},
+        );
+        try std.testing.expectEqualSlices(u8, expected, actual);
+    }
+}
+
+test "package_cache_archive.test.tagged v3 rejects duplicates and digest-set substitution" {
+    const objects = [_][]const u8{ "first-object", "second-object" };
+    const limits: Limits = .{
+        .maximum_objects = 4,
+        .maximum_object_bytes = 1024,
+        .maximum_total_object_bytes = 4096,
+    };
+    var lock = try testTaggedLock(std.testing.allocator, &objects);
+    defer lock.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try package_acquisition.Cache.initFromDir(
+        std.testing.io,
+        tmp.dir,
+        .{ .maximum_object_bytes = limits.maximum_object_bytes },
+    );
+    defer cache.deinit();
+    var writer = try cache.acquireWriter(10);
+    defer writer.release();
+
+    var duplicate = try tmp.dir.createFile(std.testing.io, "duplicate.archive", .{
+        .exclusive = true,
+        .read = true,
+    });
+    defer duplicate.close(std.testing.io);
+    const repeated_identities = [_]content_digest.Identity{
+        lock.lock.packages[0].archive_identity,
+        lock.lock.packages[0].archive_identity,
+    };
+    const repeated_payloads = [_][]const u8{ objects[0], objects[0] };
+    try writeTaggedTestArchive(duplicate, &repeated_identities, &repeated_payloads);
+    try std.testing.expectError(error.DuplicateObject, importTaggedFile(
+        std.testing.allocator,
+        std.testing.io,
+        duplicate,
+        &cache,
+        lock.lock,
+        limits,
+        .{},
+        &writer,
+    ));
+
+    var substituted_identity = lock.lock.packages[1].archive_identity;
+    substituted_identity.digests.sha256.?[0] ^= 1;
+    var substituted = try tmp.dir.createFile(std.testing.io, "substituted.archive", .{
+        .exclusive = true,
+        .read = true,
+    });
+    defer substituted.close(std.testing.io);
+    try writeTaggedTestArchive(
+        substituted,
+        &.{substituted_identity},
+        &.{objects[1]},
+    );
+    try std.testing.expectError(error.ObjectDigestMismatch, importTaggedFile(
+        std.testing.allocator,
+        std.testing.io,
+        substituted,
+        &cache,
+        lock.lock,
+        limits,
+        .{},
+        &writer,
+    ));
+    for (lock.lock.packages) |package| try std.testing.expectEqual(
+        @as(?u64, null),
+        try cache.objectSize(package.archive_identity),
+    );
+}
+
+test "package_cache_archive.test.tagged v3 export import replay preserves full identities" {
+    const objects = [_][]const u8{ "sha512-only object", "mixed digest object" };
+    const limits: Limits = .{
+        .maximum_objects = 10,
+        .maximum_object_bytes = 1024,
+        .maximum_total_object_bytes = 4096,
+    };
+    var lock = try testTaggedLock(std.testing.allocator, &objects);
+    defer lock.deinit();
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var source_cache = try package_acquisition.Cache.initFromDir(
+        std.testing.io,
+        source_tmp.dir,
+        .{ .maximum_object_bytes = limits.maximum_object_bytes },
+    );
+    defer source_cache.deinit();
+    for (lock.lock.packages, objects) |package, bytes| try source_cache.publish(
+        std.testing.allocator,
+        package.archive_identity,
+        bytes.len,
+        bytes,
+        .fail_fast,
+        .{},
+    );
+    var source_writer = try source_cache.acquireWriter(10);
+    defer source_writer.release();
+    var archive = try source_tmp.dir.createFile(std.testing.io, "tagged.archive", .{
+        .exclusive = true,
+        .read = true,
+    });
+    defer archive.close(std.testing.io);
+    const exported = try exportTaggedFile(
+        std.testing.allocator,
+        std.testing.io,
+        archive,
+        &source_cache,
+        lock.lock,
+        limits,
+        &source_writer,
+    );
+    try std.testing.expectEqual(@as(usize, 2), exported.objects);
+    const encoded = try source_tmp.dir.readFileAlloc(
+        std.testing.io,
+        "tagged.archive",
+        std.testing.allocator,
+        .limited(4096),
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.startsWith(u8, encoded, tagged_magic));
+    try std.testing.expect(exported.archive_bytes <= try maximumTaggedArchiveBytes(limits));
+
+    var target_tmp = std.testing.tmpDir(.{});
+    defer target_tmp.cleanup();
+    var target_cache = try package_acquisition.Cache.initFromDir(
+        std.testing.io,
+        target_tmp.dir,
+        .{ .maximum_object_bytes = limits.maximum_object_bytes },
+    );
+    defer target_cache.deinit();
+    var target_writer = try target_cache.acquireWriter(10);
+    defer target_writer.release();
+    const imported = try importTaggedFile(
+        std.testing.allocator,
+        std.testing.io,
+        archive,
+        &target_cache,
+        lock.lock,
+        limits,
+        .{ .require_exact_closure = true },
+        &target_writer,
+    );
+    try std.testing.expectEqual(@as(usize, 2), imported.imported);
+    const replayed = try importTaggedFile(
+        std.testing.allocator,
+        std.testing.io,
+        archive,
+        &target_cache,
+        lock.lock,
+        limits,
+        .{ .require_exact_closure = true },
+        &target_writer,
+    );
+    try std.testing.expectEqual(@as(usize, 2), replayed.reused);
+    for (lock.lock.packages, objects) |package, expected| {
+        const actual = try target_cache.lookup(
+            std.testing.allocator,
+            package.archive_identity,
+            expected.len,
+            .verify_all_supported,
+        );
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expect(lock.lock.packages[0].archive_identity.digests.sha256 == null);
+    try std.testing.expect(lock.lock.packages[1].archive_identity.digests.sha256 != null);
+    try std.testing.expect(lock.lock.packages[1].archive_identity.digests.sha512 != null);
+}
+
+test "package_cache_archive.test.tagged v3 rejects unknown algorithms before publication" {
+    const objects = [_][]const u8{"object"};
+    const limits: Limits = .{
+        .maximum_objects = 10,
+        .maximum_object_bytes = 1024,
+        .maximum_total_object_bytes = 4096,
+    };
+    var lock = try testTaggedLock(std.testing.allocator, &objects);
+    defer lock.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try package_acquisition.Cache.initFromDir(
+        std.testing.io,
+        tmp.dir,
+        .{ .maximum_object_bytes = limits.maximum_object_bytes },
+    );
+    defer cache.deinit();
+    try cache.publish(
+        std.testing.allocator,
+        lock.lock.packages[0].archive_identity,
+        objects[0].len,
+        objects[0],
+        .fail_fast,
+        .{},
+    );
+    var writer = try cache.acquireWriter(10);
+    defer writer.release();
+    var archive = try tmp.dir.createFile(std.testing.io, "tagged.archive", .{
+        .exclusive = true,
+        .read = true,
+    });
+    defer archive.close(std.testing.io);
+    _ = try exportTaggedFile(
+        std.testing.allocator,
+        std.testing.io,
+        archive,
+        &cache,
+        lock.lock,
+        limits,
+        &writer,
+    );
+    try archive.writePositionalAll(
+        std.testing.io,
+        &[_]u8{0xff},
+        tagged_magic.len + @sizeOf(u32),
+    );
+    var target_tmp = std.testing.tmpDir(.{});
+    defer target_tmp.cleanup();
+    var target_cache = try package_acquisition.Cache.initFromDir(
+        std.testing.io,
+        target_tmp.dir,
+        .{ .maximum_object_bytes = limits.maximum_object_bytes },
+    );
+    defer target_cache.deinit();
+    var target_writer = try target_cache.acquireWriter(10);
+    defer target_writer.release();
+    try std.testing.expectError(error.UnknownAlgorithm, importTaggedFile(
+        std.testing.allocator,
+        std.testing.io,
+        archive,
+        &target_cache,
+        lock.lock,
+        limits,
+        .{},
+        &target_writer,
+    ));
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try target_cache.objectSize(lock.lock.packages[0].archive_identity),
+    );
 }
 
 test "package_cache_archive.test.native roundtrip preserves mixed and empty v2 closures" {
@@ -558,8 +1378,16 @@ test "package_cache_archive.test.native roundtrip preserves mixed and empty v2 c
         try std.testing.expectEqual(@as(u32, @intCast(count)), std.mem.readInt(u32, encoded[native_magic.len..][0..4], .big));
         try std.testing.expectEqual(exported.archive_bytes, encoded.len);
         const digest = package_acquisition.Digest.of(encoded[0 .. encoded.len - trailer_bytes]);
-        try std.testing.expectEqualSlices(u8, &digest.bytes, &exported.content_sha256);
-        try std.testing.expectEqualSlices(u8, &digest.bytes, encoded[encoded.len - trailer_bytes ..]);
+        try std.testing.expectEqualSlices(
+            u8,
+            &digest.digests.sha256.?,
+            &exported.content_sha256,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            &digest.digests.sha256.?,
+            encoded[encoded.len - trailer_bytes ..],
+        );
         try std.testing.expect(exported.archive_bytes <= try maximumNativeArchiveBytes(limits));
         if (count == 0) {
             try std.testing.expectEqual(@as(u64, native_magic.len + 4 + trailer_bytes), exported.archive_bytes);
@@ -680,7 +1508,10 @@ test "package_cache_archive.test.native import does not autodetect legacy archiv
     var archive = try tmp.dir.createFile(std.testing.io, "legacy.archive", .{ .exclusive = true, .read = true });
     defer archive.close(std.testing.io);
     const digest = package_acquisition.Digest.of("object");
-    try writeTestArchive(archive, &.{.{ .digest = digest.bytes, .bytes = "object" }});
+    try writeTestArchive(archive, &.{.{
+        .digest = digest.digests.sha256.?,
+        .bytes = "object",
+    }});
     const limits: Limits = .{ .maximum_objects = 10, .maximum_object_bytes = 1024, .maximum_total_object_bytes = 4096 };
     try std.testing.expectError(error.InvalidArchive, importNativeFile(
         std.testing.allocator,
@@ -747,9 +1578,9 @@ test "package_cache_archive.test.native invalid closures publish no objects" {
         var archive = try tmp.dir.createFile(std.testing.io, "native.archive", .{ .exclusive = true, .read = true });
         defer archive.close(std.testing.io);
         var entries = [_]TestArchiveEntry{
-            .{ .digest = package_acquisition.Digest.of(objects[0]).bytes, .bytes = objects[0] },
-            .{ .digest = package_acquisition.Digest.of(objects[1]).bytes, .bytes = objects[1] },
-            .{ .digest = package_acquisition.Digest.of("extra").bytes, .bytes = "extra" },
+            .{ .digest = package_acquisition.Digest.of(objects[0]).digests.sha256.?, .bytes = objects[0] },
+            .{ .digest = package_acquisition.Digest.of(objects[1]).digests.sha256.?, .bytes = objects[1] },
+            .{ .digest = package_acquisition.Digest.of("extra").digests.sha256.?, .bytes = "extra" },
         };
         const length: usize = switch (fault) {
             .empty => 0,
@@ -1030,8 +1861,8 @@ const TestArchiveEntry = struct {
 test "package_cache_archive.test.duplicate and noncanonical objects are rejected" {
     var lock = try testLock(std.testing.allocator, &.{ "a", "b" });
     defer lock.deinit();
-    const digest_a = package_acquisition.Digest.of("a").bytes;
-    const digest_b = package_acquisition.Digest.of("b").bytes;
+    const digest_a = package_acquisition.Digest.of("a").digests.sha256.?;
+    const digest_b = package_acquisition.Digest.of("b").digests.sha256.?;
     const cases = [_]struct {
         entries: [2]TestArchiveEntry,
         expected: anyerror,
@@ -1178,7 +2009,7 @@ test "package_cache_archive.test.exact restore requires the complete lock and im
     });
     defer archive.close(std.testing.io);
     const entry = TestArchiveEntry{
-        .digest = package_acquisition.Digest.of("a").bytes,
+        .digest = package_acquisition.Digest.of("a").digests.sha256.?,
         .bytes = "a",
     };
     try writeTestArchive(archive, &.{entry});

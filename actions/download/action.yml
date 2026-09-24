@@ -8,7 +8,7 @@ branding:
 
 inputs:
   transaction-backend:
-    description: Explicit package-cache backend (legacy_dpkg uses v1; native requires v2 CLI contracts)
+    description: Explicit package-cache backend (legacy_dpkg uses v1 locks/v3 cache contracts; native requires v3 locks/v5 cache contracts)
     required: false
     default: legacy_dpkg
   lock-input:
@@ -128,7 +128,7 @@ outputs:
   cache-matched-key:
     description: Exact or compatible-prefix key restored, or empty when no cache was restored
   cache-path:
-    description: Absolute verified packages-v1/objects path used by later debz operations
+    description: Absolute verified packages-v2/objects path used by later debz operations
   cache-root:
     description: Absolute parent cache root accepted by debz --cache-path
   lock-digest:

@@ -378,7 +378,7 @@ binds the completion document digest directly. A native completion can retain
 the exact original operation discharge when recovery resumes after publication,
 or an exact recovery discharge when recovery first creates the completion.
 The classifier binds both to the original caller, native policy, architecture,
-v2 lock, and available native receipt. Cross-backend evidence, mixed discharge
+v3 lock, and available native receipt. Cross-backend evidence, mixed discharge
 name/digest pairs, legacy journals, and non-success outcomes cannot prove
 successful recovery. Discharge names use the canonical stored operation
 spelling, including `upgrade_all`, rather than the CLI spelling `upgrade-all`.
@@ -415,7 +415,7 @@ Committed native history has a separate verifier. Its request carries the
 expected durable final-state snapshot and complete operation-local owner.
 All evidence paths must be derived from the same state directory and outer
 attempt. The verifier reads the canonical retained final state, outer execution
-completion, retained acknowledgment, v2 exact lock, and native receipt through
+completion, retained acknowledgment, v3 exact lock, and native receipt through
 the trusted-file boundary. It binds the final generation/digest, profile and
 request, completion and receipt identity, exact v1/v2 owner, original native
 caller/policy, lock, architecture, and successful outcome. An outer completion
@@ -599,7 +599,7 @@ outer active slot remains occupied at this durable history boundary.
 
 Committed failure has its own request and historical result type. Verification
 requires the exact durable final generation/digest, retained pending owner,
-genuine v2 lock, canonical failed native receipt and original failed lower
+genuine v3 lock, canonical failed native receipt and original failed lower
 completion in the same operation directory. It binds the original caller,
 policy, architecture, lock, attempt, owner review identity and matching original
 or recovery discharge pair. Missing/corrupt anchors, foreign review ownership,
@@ -755,7 +755,7 @@ process-runner, clock, and fault-injection configuration is preserved. Backend
 errors propagate directly without retrying through another engine. Explicit
 profile selection does not relax standalone host-root restrictions.
 
-Operation paths select `exact-lock-v1.json` for legacy and `exact-lock-v2.json`
+Operation paths select `exact-lock-v1.json` for legacy and `exact-lock-v3.json`
 for native from the trusted profile backend during preparation, recovery, and
 active-state reconciliation. Within a state path, both backends retain the same
 `apt/active-operation-v1.json` slot and `active-operation-v1.lock`; selecting
@@ -1071,9 +1071,13 @@ exact lock and validates `transaction-result.json` through
 does the store retain the transaction document and publish
 `apt-system-execution-completion-v1`. This ordinary completion schema is
 deliberately distinct from the recovery-only
-`root-operation-completion-v1.json` discharge statement. Apt/system success is
+`root-operation-completion-v2.json` discharge statement for current native
+authority (with historical v1 still readable). Apt/system success is
 published only after the exact lock, verified transaction result, completed
 root-operation status, and final state all agree.
+Recovered legacy v1 and current v2 discharge statements retain their own
+schema/version in the outer binding; rereads reject a binding that mislabels
+the canonical completion document.
 
 `prepareRecovery` reloads the same profile, retained canonical request, active
 state, and exact lock. Profile, request, selector, attempt, state, or evidence
@@ -1149,7 +1153,7 @@ created by the orchestrated path and fails closed, while documented ordinary
 product legacy recovery remains separate.
 
 After a real lower recovery, the engine strictly decodes and retains the
-operation-local `root-operation-completion-v1.json`, checks the observed lower
+operation-local `root-operation-completion-v2.json`, checks the observed lower
 attempt ID, semantic request, architecture, exact-lock schema/version/digest,
 operation, outcome, and recovery discharge, then CAS-publishes that exact
 binding together with the immutable final outcome before explicitly

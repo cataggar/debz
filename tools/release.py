@@ -497,12 +497,26 @@ def binary_entries(prefix: pathlib.Path, root_name: str) -> tuple[list[tuple[str
         pathlib.PurePosixPath("bin/debz"),
         pathlib.PurePosixPath("share/doc/debz/LICENSE"),
         pathlib.PurePosixPath("share/doc/debz/THIRD_PARTY_NOTICES"),
+        pathlib.PurePosixPath("share/debz/digest-cutover-policy.json"),
+        pathlib.PurePosixPath("share/debz/legacy-cutover-policy.json"),
+        pathlib.PurePosixPath("share/doc/debz/digest-cutover-policy.json"),
+        pathlib.PurePosixPath("share/doc/debz/legacy-cutover-policy.json"),
         pathlib.PurePosixPath("share/debz/runtime-dependencies.json"),
     }
     present = {pathlib.PurePosixPath(name).relative_to(root_name) for name, _, _ in entries}
     missing = required - present
     if missing:
         raise ReleaseError("install prefix is missing required files: " + ", ".join(map(str, sorted(missing))))
+    installed = {
+        pathlib.PurePosixPath(name).relative_to(root_name): data
+        for name, data, _ in entries
+    }
+    validate_installed_policies(
+        installed[pathlib.PurePosixPath("share/debz/digest-cutover-policy.json")],
+        installed[pathlib.PurePosixPath("share/doc/debz/digest-cutover-policy.json")],
+        installed[pathlib.PurePosixPath("share/debz/legacy-cutover-policy.json")],
+        installed[pathlib.PurePosixPath("share/doc/debz/legacy-cutover-policy.json")],
+    )
     assert binary is not None
     return entries, binary
 
@@ -513,6 +527,36 @@ def expected_asset_names(version: str) -> list[str]:
         for platform in PLATFORMS
         for archive_format in FORMATS
     )
+
+
+def validate_installed_policies(
+    digest_policy: bytes,
+    digest_policy_documentation: bytes,
+    legacy_policy: bytes,
+    legacy_policy_documentation: bytes,
+) -> None:
+    if digest_policy != digest_policy_documentation:
+        raise ReleaseError("installed digest cutover policy copies differ")
+    if legacy_policy != legacy_policy_documentation:
+        raise ReleaseError("installed legacy cutover policy copies differ")
+    for name, data, schema in (
+        (
+            "digest cutover",
+            digest_policy,
+            "https://debz.dev/security/digest-cutover-policy-v1",
+        ),
+        (
+            "legacy cutover",
+            legacy_policy,
+            "https://debz.dev/schema/legacy-compatibility-policy-v1",
+        ),
+    ):
+        try:
+            document = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReleaseError(f"installed {name} policy is invalid JSON") from error
+        if document.get("schema") != schema or document.get("version") != 1:
+            raise ReleaseError(f"installed {name} policy identity is invalid")
 
 
 def release_plan(tag: str) -> dict[str, object]:
@@ -541,6 +585,10 @@ def audit_archive(
         f"{root}/bin/debz",
         f"{root}/share/doc/debz/LICENSE",
         f"{root}/share/doc/debz/THIRD_PARTY_NOTICES",
+        f"{root}/share/debz/digest-cutover-policy.json",
+        f"{root}/share/debz/legacy-cutover-policy.json",
+        f"{root}/share/doc/debz/digest-cutover-policy.json",
+        f"{root}/share/doc/debz/legacy-cutover-policy.json",
         f"{root}/share/debz/runtime-dependencies.json",
     }
     missing = required - names
@@ -574,6 +622,12 @@ def validate_archived_binary(
     }
     binary = files[f"{root}/bin/debz"]
     runtime = files[f"{root}/share/debz/runtime-dependencies.json"]
+    validate_installed_policies(
+        files[f"{root}/share/debz/digest-cutover-policy.json"],
+        files[f"{root}/share/doc/debz/digest-cutover-policy.json"],
+        files[f"{root}/share/debz/legacy-cutover-policy.json"],
+        files[f"{root}/share/doc/debz/legacy-cutover-policy.json"],
+    )
     validate_static_elf(binary, platform)
     validate_runtime_manifest(runtime, dependencies)
 

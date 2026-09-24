@@ -167,9 +167,9 @@ tools, malformed or partial topology, unsupported vendor metadata and external
 drift remain fail-closed.
 
 Item 15b's `debz.native_preparation` foundation binds actual solver plans and
-exact-lock v2 documents to native authorization and compiled programs without
+new exact-lock v3 documents to native authorization and compiled programs without
 fixture request hashes or command-shaped reports. It preserves authenticated
-origins and the complete installed/residual closure, and the private interpreter
+origins, complete SHA256/SHA512 package identities, and the installed/residual closure, and the private interpreter
 accepts its mixed install/remove and install/purge programs. Its caller-owned
 operation boundary preserves the outer request/policy/plan hashes and leaves
 the caller's lock, mutation state, completion, and cleanup under caller control.
@@ -188,7 +188,7 @@ terminal receipts, and acknowledgment with mandatory bundled helper binding.
 It accepts prepared programs and immutable archive bytes rather than fixture
 requests or command-shaped executor inputs, and refuses host or mismatched
 roots. The core CLI now supports explicit `--transaction-backend native` for
-genuine v2 lock planning/replay and verified download, with backend-bound solver
+genuine v3 lock planning/replay and verified download, with backend-bound solver
 policy and no v1 conversion. Experimental core native mutation now captures
 complete production evidence and executes prepared programs under the caller's
 root attempt. Persisted-input recovery and receipt-backed outer completion

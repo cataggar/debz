@@ -87,9 +87,9 @@ test('rejects symlinked and overlapping mutable roots before setup', async () =>
   const cacheLinked = await createInputEnvironment('cache-linked');
   const cacheRoot = cacheLinked.environment.DEBZ_INSTALL_CACHE_ROOT as string;
   const realObjects = path.join(cacheLinked.runner, 'real-objects');
-  await mkdir(path.join(cacheRoot, 'packages-v1'), { recursive: true });
+  await mkdir(path.join(cacheRoot, 'packages-v2'), { recursive: true });
   await mkdir(realObjects);
-  await symlink(realObjects, path.join(cacheRoot, 'packages-v1', 'objects'));
+  await symlink(realObjects, path.join(cacheRoot, 'packages-v2', 'objects'));
   await assert.rejects(readInputs(cacheLinked.environment), /symbolic link/u);
 
   const overlap = await createInputEnvironment('overlap');

@@ -176,7 +176,7 @@ const package_cache_help =
     \\Options:
     \\  -h, --help                   Show this help
     \\
-    \\The cache contract is versioned and CLI-owned. Only packages-v1/objects
+    \\The cache contract is versioned and CLI-owned. Only packages-v2/objects
     \\is suitable for an external cache; metadata, locks, and staging are not.
     \\
 ;
@@ -837,8 +837,8 @@ fn verifyNativeTransactionResult(
     const lock_parent = std.fs.path.dirname(lock_path) orelse return error.InvalidAbsolutePath;
     var lock_dir = try openAbsoluteDirectoryNoFollow(io, lock_parent);
     defer lock_dir.close(io);
-    const lock_store = try debz.ExactClosureLockV2Store.init(io, lock_dir, std.fs.path.basename(lock_path));
-    var lock = try lock_store.read(allocator, debz.exact_lock_v2.maximum_document_bytes);
+    const lock_store = try debz.ExactClosureLockV3Store.init(io, lock_dir, std.fs.path.basename(lock_path));
+    var lock = try lock_store.read(allocator, debz.exact_lock_v3.maximum_document_bytes);
     defer lock.deinit();
     var root = try debz.openAbsoluteRootFilesystem(io, install_root);
     defer root.close();

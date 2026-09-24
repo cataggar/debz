@@ -13,7 +13,8 @@ const operation_state = @import("apt_system_state.zig");
 const lower_ownership_token =
     @import("apt_system_lower_ownership_token.zig");
 const exact_lock = @import("exact_lock.zig");
-const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v2 = @import("exact_lock_v3.zig");
+const exact_lock_legacy_v2 = @import("exact_lock_v2.zig");
 const legacy_compat = @import("legacy_compat.zig");
 const live_root = @import("live_root.zig");
 const native_provenance = @import("native_provenance.zig");
@@ -33,7 +34,7 @@ pub const operation_directory_name = "operations";
 pub const request_document_name = "request-v1.json";
 pub const retained_state_name = "state-v1.json";
 pub const exact_lock_name = "exact-lock-v1.json";
-pub const native_exact_lock_name = "exact-lock-v2.json";
+pub const native_exact_lock_name = "exact-lock-v3.json";
 pub const transaction_result_name = "transaction-result.json";
 pub const recovery_completion_name = "root-operation-recovery-completion-v1.json";
 pub const completion_document_name = "execution-completion-v1.json";
@@ -4079,8 +4080,11 @@ pub const SystemStateStore = struct {
         );
         return .{
             .path = paths.recovery_completion,
-            .schema = root_operation_completion.schema_id,
-            .version = root_operation_completion.schema_version,
+            .schema = if (validated.document.version == root_operation_completion.legacy_schema_version)
+                root_operation_completion.legacy_schema_id
+            else
+                root_operation_completion.schema_id,
+            .version = validated.document.version,
             .digest_sha256 = digest,
         };
     }
@@ -4093,12 +4097,7 @@ pub const SystemStateStore = struct {
     ) !root_operation_completion.OwnedDocument {
         const self: *SystemStateStore = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, binding.path, paths.recovery_completion) or
-            !std.mem.eql(
-                u8,
-                binding.schema,
-                root_operation_completion.schema_id,
-            ) or
-            binding.version != root_operation_completion.schema_version)
+            !recoveryCompletionSchemaMatches(binding))
             return error.RecoveryCompletionMismatch;
         const bytes = try readTrustedOperationFile(
             self.io,
@@ -4113,11 +4112,8 @@ pub const SystemStateStore = struct {
             root_operation_completion.maximum_document_bytes,
         );
         errdefer document.deinit();
-        if (!std.mem.eql(
-            u8,
-            &document.document.digest_sha256,
-            &binding.digest_sha256,
-        )) return error.RecoveryCompletionMismatch;
+        if (!recoveryCompletionIdentityMatches(binding, document.document))
+            return error.RecoveryCompletionMismatch;
         return document;
     }
 
@@ -4650,30 +4646,85 @@ pub const SystemResultVerifier = struct {
         architecture: []const u8,
         expected_request_sha256: [32]u8,
     ) !VerifiedLock {
-        switch (backend) {
-            inline else => |kind| {
-                const Lock = if (kind == .native) exact_lock_v2 else exact_lock;
-                var decoded = Lock.decode(allocator, source, Lock.maximum_document_bytes) catch |err| switch (err) {
-                    // Canonical re-encoding uses only an allocating writer.
-                    error.WriteFailed => return error.OutOfMemory,
-                    else => return err,
-                };
-                defer decoded.deinit();
-                if (!std.mem.eql(u8, decoded.lock.target_architecture, architecture))
-                    return error.ArchitectureMismatch;
-                if (!std.mem.eql(u8, &decoded.lock.request_sha256, &expected_request_sha256))
-                    return error.RequestDigestMismatch;
-                return .{
-                    .binding = .{
-                        .path = path,
-                        .schema = Lock.schema_id,
-                        .version = Lock.schema_version,
-                        .digest_sha256 = decoded.lock.digest_sha256,
-                    },
-                    .semantic_request_sha256 = decoded.lock.request_sha256,
-                };
-            },
+        if (backend == .legacy_dpkg) {
+            var decoded = exact_lock.decode(
+                allocator,
+                source,
+                exact_lock.maximum_document_bytes,
+            ) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            };
+            defer decoded.deinit();
+            return verifiedLockBinding(
+                path,
+                architecture,
+                expected_request_sha256,
+                exact_lock.schema_id,
+                exact_lock.schema_version,
+                decoded.lock,
+            );
         }
+        if (exact_lock_v2.decode(
+            allocator,
+            source,
+            exact_lock_v2.maximum_document_bytes,
+        )) |decoded_value| {
+            var decoded = decoded_value;
+            defer decoded.deinit();
+            return verifiedLockBinding(
+                path,
+                architecture,
+                expected_request_sha256,
+                exact_lock_v2.schema_id,
+                exact_lock_v2.schema_version,
+                decoded.lock,
+            );
+        } else |err| switch (err) {
+            error.UnsupportedSchema => {},
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        }
+        var legacy = exact_lock_legacy_v2.decode(
+            allocator,
+            source,
+            exact_lock_legacy_v2.maximum_document_bytes,
+        ) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => return err,
+        };
+        defer legacy.deinit();
+        return verifiedLockBinding(
+            path,
+            architecture,
+            expected_request_sha256,
+            exact_lock_legacy_v2.schema_id,
+            exact_lock_legacy_v2.schema_version,
+            legacy.lock,
+        );
+    }
+
+    fn verifiedLockBinding(
+        path: []const u8,
+        architecture: []const u8,
+        expected_request_sha256: [32]u8,
+        schema: []const u8,
+        version: u32,
+        lock: anytype,
+    ) !VerifiedLock {
+        if (!std.mem.eql(u8, lock.target_architecture, architecture))
+            return error.ArchitectureMismatch;
+        if (!std.mem.eql(u8, &lock.request_sha256, &expected_request_sha256))
+            return error.RequestDigestMismatch;
+        return .{
+            .binding = .{
+                .path = path,
+                .schema = schema,
+                .version = version,
+                .digest_sha256 = lock.digest_sha256,
+            },
+            .semantic_request_sha256 = lock.request_sha256,
+        };
     }
 
     fn verifyTransaction(
@@ -9412,11 +9463,7 @@ pub const Engine = struct {
             }
             const retained_lower_recovery =
                 if (current.state.transaction_result) |binding|
-                    std.mem.eql(
-                        u8,
-                        binding.schema,
-                        root_operation_completion.schema_id,
-                    ) and std.mem.eql(
+                    recoveryCompletionSchemaMatches(binding) and std.mem.eql(
                         u8,
                         binding.path,
                         recovery.prepared.paths.recovery_completion,
@@ -10836,6 +10883,17 @@ pub const Engine = struct {
                     "verified recovery completion evidence could not be retained",
                 ),
             };
+            if (!documentEqual(retained, .{
+                .path = prepared.paths.recovery_completion,
+                .schema = document.schema,
+                .version = document.version,
+                .digest_sha256 = document.digest_sha256,
+            })) return self.markRecoveryRequired(
+                allocator,
+                prepared,
+                current,
+                "retained recovery completion binding is inconsistent",
+            );
         } else {
             const existing_retained = if (current.state.transaction_result) |binding|
                 std.mem.eql(
@@ -11339,12 +11397,7 @@ pub const Engine = struct {
                         binding.path,
                         prepared.paths.recovery_completion,
                     ) or
-                    !std.mem.eql(
-                        u8,
-                        binding.schema,
-                        root_operation_completion.schema_id,
-                    ) or
-                    binding.version != root_operation_completion.schema_version)
+                    !recoveryCompletionSchemaMatches(binding))
                     return error.InvalidRetainedEvidence;
                 var completion = try self.store.readRecoveryCompletionFn(
                     self.store.context,
@@ -11353,11 +11406,7 @@ pub const Engine = struct {
                     binding,
                 );
                 defer completion.deinit();
-                if (!std.mem.eql(
-                    u8,
-                    &completion.document.digest_sha256,
-                    &binding.digest_sha256,
-                ) or
+                if (!recoveryCompletionIdentityMatches(binding, completion.document) or
                     !std.mem.eql(
                         u8,
                         &completion.document.digest_sha256,
@@ -12321,6 +12370,23 @@ fn documentEqual(
         std.mem.eql(u8, &left.digest_sha256, &right.digest_sha256);
 }
 
+fn recoveryCompletionSchemaMatches(binding: api.DocumentBinding) bool {
+    return (std.mem.eql(u8, binding.schema, root_operation_completion.schema_id) and
+        binding.version == root_operation_completion.schema_version) or
+        (std.mem.eql(u8, binding.schema, root_operation_completion.legacy_schema_id) and
+            binding.version == root_operation_completion.legacy_schema_version);
+}
+
+fn recoveryCompletionIdentityMatches(
+    binding: api.DocumentBinding,
+    document: root_operation_completion.Document,
+) bool {
+    return recoveryCompletionSchemaMatches(binding) and
+        std.mem.eql(u8, binding.schema, document.schema) and
+        binding.version == document.version and
+        std.mem.eql(u8, &binding.digest_sha256, &document.digest_sha256);
+}
+
 fn completionEqual(
     left: api.CompletionBinding,
     right: api.CompletionBinding,
@@ -13078,17 +13144,8 @@ fn classifyRecoveryMutationStatus(
         if (completion) |document| {
             const binding = outer_state.transaction_result orelse
                 return .unknown;
-            if (!std.mem.eql(
-                u8,
-                binding.schema,
-                root_operation_completion.schema_id,
-            ) or
-                binding.version != root_operation_completion.schema_version or
-                !std.mem.eql(
-                    u8,
-                    &binding.digest_sha256,
-                    &document.digest_sha256,
-                ) or
+            if (!std.mem.eql(u8, binding.path, prepared.paths.recovery_completion) or
+                !recoveryCompletionIdentityMatches(binding, document) or
                 !try recoveryCompletionMatches(
                     allocator,
                     document,
@@ -14796,15 +14853,18 @@ test "apt_system_orchestrator.test.backend-bound locks preserve schema identity 
 
 test "apt_system_orchestrator.test.native lock verification retains mixed origin authority" {
     const origin = @import("package_origin.zig");
-    const artifact: origin.LocalArtifactEvidence = .{
-        .artifact_id = origin.artifactIdFromSha256(@splat(0xab)),
-        .sha256 = @splat(0xab),
+    const artifact: origin.LocalArtifactEvidenceV2 = .{
+        .artifact_id = .{ .sha256 = @splat(0xab) },
+        .archive_identity = .{
+            .digests = .{ .sha256 = @splat(0xab) },
+            .primary = .sha256,
+        },
         .size = 12,
         .package = "local",
         .version = "1",
         .architecture = "amd64",
         .acquisition_url = "https://example.test/local.deb?REDACTED",
-        .trust_mode = .pinned_sha256,
+        .trust_mode = .pinned_content_digest,
     };
     var lock = try exact_lock_v2.create(std.testing.allocator, .{
         .target_architecture = "amd64",
@@ -14814,7 +14874,10 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
             .id = @splat('a'),
             .snapshot_sha256 = @splat(1),
             .release_sha256 = @splat(2),
-            .index_sha256 = @splat(3),
+            .index_identity = .{
+                .digests = .{ .sha256 = @splat(3) },
+                .primary = .sha256,
+            },
             .signer_fingerprints = &.{@splat(4)},
         }},
         .local_artifacts = &.{artifact},
@@ -14824,7 +14887,7 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
                 .version = artifact.version,
                 .architecture = artifact.architecture,
                 .origin = .{ .local_artifact = artifact },
-                .sha256 = artifact.sha256,
+                .archive_identity = artifact.archive_identity,
                 .declared_size = artifact.size,
                 .retention = .requested,
                 .dpkg_selection_hold = false,
@@ -14837,7 +14900,10 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
                     .repository_id = @splat('a'),
                     .repository_snapshot_sha256 = @splat(1),
                 } },
-                .sha256 = @splat(9),
+                .archive_identity = .{
+                    .digests = .{ .sha256 = @splat(9) },
+                    .primary = .sha256,
+                },
                 .declared_size = 34,
                 .retention = .dependency,
                 .dpkg_selection_hold = false,
@@ -14950,6 +15016,7 @@ fn ownedNativeTransportFixture(
         .transaction_provenance = .{
             .status = .already_present,
             .schema = native_provenance.schema_id,
+            .version = native_provenance.schema_version,
             .document_sha256 = receipt_digest,
             .detail = "transport fixture only",
         },
@@ -18965,17 +19032,14 @@ const FakeStateStore = struct {
             root_operation_completion.maximum_document_bytes,
         );
         errdefer document.deinit();
-        if (!std.mem.eql(
-            u8,
-            &document.document.digest_sha256,
-            &binding.digest_sha256,
-        )) return error.RecoveryCompletionMismatch;
+        if (!recoveryCompletionIdentityMatches(binding, document.document))
+            return error.RecoveryCompletionMismatch;
         return document;
     }
 
     fn retainRecoveryCompletion(
         context: *anyopaque,
-        _: std.mem.Allocator,
+        allocator: std.mem.Allocator,
         paths: OperationPaths,
         source: []const u8,
         digest: [32]u8,
@@ -18985,6 +19049,14 @@ const FakeStateStore = struct {
             self.fail_recovery_retain_once = false;
             return error.InjectedRecoveryRetainFailure;
         }
+        var validated = try root_operation_completion.decode(
+            allocator,
+            source,
+            root_operation_completion.maximum_document_bytes,
+        );
+        defer validated.deinit();
+        if (!std.mem.eql(u8, &validated.document.digest_sha256, &digest))
+            return error.DigestMismatch;
         self.retained_transaction = true;
         if (self.recovery_completion_bytes) |previous| {
             if (!std.mem.eql(u8, previous, source)) return error.PublicationConflict;
@@ -18993,8 +19065,11 @@ const FakeStateStore = struct {
         }
         return .{
             .path = paths.recovery_completion,
-            .schema = root_operation_completion.schema_id,
-            .version = root_operation_completion.schema_version,
+            .schema = if (validated.document.version == root_operation_completion.legacy_schema_version)
+                root_operation_completion.legacy_schema_id
+            else
+                root_operation_completion.schema_id,
+            .version = validated.document.version,
             .digest_sha256 = digest,
         };
     }
@@ -19879,6 +19954,7 @@ fn cleanupProductionRootArtifacts() void {
         "/" ++ root_operation.record_path,
         "/" ++ root_operation.deferred_ack_path,
         "/" ++ root_operation_completion.document_path,
+        "/" ++ root_operation_completion.legacy_document_path,
     }) |path|
         std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
 }
@@ -23164,6 +23240,44 @@ test "apt_system_orchestrator.test.required_privileged.production recovery commi
             std.testing.allocator,
             fixture.state_path,
         )) == null);
+        var final = (try store.interface().readRetained(
+            std.testing.allocator,
+            prepared.paths,
+        )) orelse return error.MissingRetainedState;
+        defer final.deinit();
+        const binding = final.state.transaction_result orelse
+            return error.MissingRecoveryCompletion;
+        try std.testing.expectEqualStrings(
+            root_operation_completion.legacy_schema_id,
+            binding.schema,
+        );
+        try std.testing.expectEqual(
+            root_operation_completion.legacy_schema_version,
+            binding.version,
+        );
+        const state_store = store.interface();
+        var document = try state_store.readRecoveryCompletionFn(
+            state_store.context,
+            std.testing.allocator,
+            prepared.paths,
+            binding,
+        );
+        defer document.deinit();
+        try std.testing.expect(
+            recoveryCompletionIdentityMatches(binding, document.document),
+        );
+        var mislabeled = binding;
+        mislabeled.schema = root_operation_completion.schema_id;
+        mislabeled.version = root_operation_completion.schema_version;
+        try std.testing.expectError(
+            error.RecoveryCompletionMismatch,
+            state_store.readRecoveryCompletionFn(
+                state_store.context,
+                std.testing.allocator,
+                prepared.paths,
+                mislabeled,
+            ),
+        );
         var clean = try runner.interface().inspect(std.testing.allocator);
         defer clean.deinit();
         try std.testing.expectEqual(RootStatus.clean, clean.status);

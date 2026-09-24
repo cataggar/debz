@@ -39,6 +39,7 @@ function harness(
   cacheHit = true,
   backend: Inputs['transactionBackend'] = 'legacy_dpkg',
   changed = true,
+  nativeEvidenceVersion: 1 | 2 = 2,
 ): Harness {
   const inputs = fixtureInputs('/work');
   inputs.transactionBackend = backend;
@@ -103,7 +104,7 @@ function harness(
       ? [
           { code: 0, stdout: nativeCapability(), stderr: '' },
           { code: 0, stdout: nativeInstallResult(inputs, changed), stderr: '' },
-          ...(changed ? [{ code: 0, stdout: nativeTransactionSummary(inputs), stderr: '' }] : []),
+          ...(changed ? [{ code: 0, stdout: nativeTransactionSummary(inputs, 4, nativeEvidenceVersion), stderr: '' }] : []),
         ]
       : [
           { code: 0, stdout: commandResult(), stderr: '' },
@@ -264,7 +265,7 @@ test('native installs probe before preparation and bind the actual receipt under
   assert.ok(verify?.includes('--install-root'));
   assert.equal(verify?.includes('--state-path'), false);
   assert.equal(value.outputs.get('changed'), 'true');
-  assert.match(value.outputs.get('transaction-result') ?? '', /root\/var\/lib\/debz\/native-transaction-provenance-v1.json$/u);
+  assert.match(value.outputs.get('transaction-result') ?? '', /root\/var\/lib\/debz\/native-transaction-provenance-v2.json$/u);
   assert.equal(value.outputs.get('installed-count'), '4');
 });
 
@@ -281,6 +282,13 @@ test('unchanged native installs publish no historical or fabricated receipt', as
     'native-transaction-execution-v1',
   );
   assert.equal(value.infos.length, 0);
+});
+
+test('verified historical native summaries publish their v1 receipt path', async () => {
+  const value = harness(true, 'native', true, 1);
+  await runAction(value.inputs, ioFor(value), value.services);
+  assert.match(value.outputs.get('transaction-result') ?? '', /root\/var\/lib\/debz\/native-transaction-provenance-v1.json$/u);
+  assert.equal(value.outputs.get('transaction-result'), value.outputs.get('provenance'));
 });
 
 test('unsupported native capability refuses before package preparation or installation', async () => {
@@ -326,4 +334,23 @@ test('native receipt, completion, caller, program, root, and closure mismatches 
     assert.equal(value.saved, false);
     assert.equal(value.cleanup, true);
   }
+});
+
+test('mixed native provenance and completion summaries publish no outputs', async () => {
+  const value = harness(true, 'native');
+  const original = value.services.runDebz;
+  value.services.runDebz = async (executable, args, sudo, maximum) => {
+    const result = await original(executable, args, sudo, maximum);
+    if (args[1] === 'verify') {
+      const document = JSON.parse(result.stdout);
+      document.completion_schema = 'https://debz.dev/schema/root-operation-completion-v1';
+      document.completion_schema_version = 1;
+      return { ...result, stdout: `${JSON.stringify(document)}\n` };
+    }
+    return result;
+  };
+  await assert.rejects(runAction(value.inputs, ioFor(value), value.services), /unsupported provenance\/completion schema pair/u);
+  assert.equal(value.outputs.size, 0);
+  assert.equal(value.saved, false);
+  assert.equal(value.cleanup, true);
 });

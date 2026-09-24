@@ -18,8 +18,10 @@ The normative Zig classifier and capability-evidence encoder are
 - `system-profile-v2` is backend-explicit. The selected backend must match the
   lock, result, active record, package-family surface, repository surface, and
   Actions input before mutation.
-- exact-lock v1 is legacy. Exact-lock v2 is native for product/package-cache
-  execution, while repository operations use v2 for both backends and must
+- exact-lock v1 is legacy. Exact-lock v2 remains a version-specific historical
+  read format. New native product, package-cache, package-family, apt-system,
+  and repository operations use exact-lock v3 with complete tagged package
+  identities. Historical repository v2 operations must
   supply the separately authenticated backend context. A v2 repository lock
   without that context is refused. There is no conversion, format detection,
   or cross-backend replay.
@@ -27,9 +29,10 @@ The normative Zig classifier and capability-evidence encoder are
   Native execution uses native transaction provenance and receipt-bound
   completion instead.
 - transaction journals v1 and v2 are historical implicit-legacy records.
-  Newly written journal v3 records `legacy_dpkg` and the bounded
-  `legacy-dpkg-execution-deprecated-v1` capability. All three versions remain
-  legacy and can never authorize native work.
+  Journal v3 records `legacy_dpkg` and the bounded
+  `legacy-dpkg-execution-deprecated-v1` capability. Journal v4 additionally
+  carries complete package identities for plan-v4/exact-lock-v3 execution.
+  All four versions remain legacy and can never authorize native work.
 - root-operation and completion v1 carry an explicit backend. An active record
   belongs to that backend until it is recovered and cleared by its owner.
 
@@ -65,10 +68,23 @@ preserve canonical bytes, signature inputs, document digests, repository
 snapshot identity, exact package/version/architecture spelling, and recorded
 backend. Historical verification never grants mutation authority.
 
+## Digest compatibility inventory
+
+The tracked repository digest inventory is
+[`security/digest-cutover-policy.json`](../security/digest-cutover-policy.json).
+Current package, repository-index, artifact, and package-CAS authority must use
+`content_digest.Identity`, `Value`, or `Set`, or the equivalent versioned
+algorithm-tagged wire form. SHA256-only fields and raw `[32]u8` widths remain
+allowlisted only for frozen version-specific compatibility or unrelated
+document, policy, signature, state, and transport controls. Each exception has
+an exact-path SHA512 inventory fingerprint and rationale; path globs and
+unreviewed inventory drift fail the security audit. Fixed 64-hex and SHA256 CAS
+layout assumptions cannot authorize current content.
+
 ## Migration
 
 1. Generate a backend-explicit `system-profile-v2`.
-2. Generate and review a native exact-lock v2. Do not translate or resign v1.
+2. Generate and review a native exact-lock v3. Do not translate or resign v1/v2.
 3. Run native preparation and execution with matching repository, package
    family, profile, Actions, and backend selection.
 4. Retain old profiles, locks, results, and signatures unchanged where audit

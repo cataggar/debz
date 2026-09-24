@@ -1,6 +1,7 @@
 # Dpkg transaction executor
 
-`debz.executeTransaction` executes an owned schema-v2 or schema-v3 solver plan against one
+`debz.executeTransaction` executes an owned schema-v2, schema-v3, or
+schema-v4 solver plan against one
 explicit absolute install root. Host root (`/`) is denied unless
 `RiskPolicy.allow_host_root` is explicitly enabled. The production filesystem
 adapter rejects symlinks in every root and artifact-path component.
@@ -22,13 +23,15 @@ retains its transaction lock and the frontend lock, with
 `DPKG_FRONTEND_LOCKED=true`, across the transaction.
 
 Each cached archive is reread immediately before its bootstrap-extract or unpack command. Size,
-SHA-256, outer archive, payload paths, control identity, requested identity,
+the exact-lock v3 content identity, outer archive, payload paths, control identity, requested identity,
 scripts, and conffiles are revalidated with `deb_payload.validate` for
 repository packages or `deb_payload.inspectLocal` for tagged local artifacts.
-Every install-like action requires an exact SHA-256 and size. Origin checks
+Every install-like action requires an exact content identity and size. Native
+application evidence retains an independently computed SHA-256 for executor
+and recovery integrity without replacing or downgrading the package identity. Origin checks
 branch explicitly between authenticated repository identity and local artifact
 ID, acquisition URL, trust mode, digest, size, and control identity.
-An exact-lock-v2 local package is always replayed from its locked artifact when
+An exact-lock-v3 local package is always replayed from its locked artifact when
 dpkg status alone is the only installed-state evidence. Final execution and
 recovery verification require a completed unpack journal entry with that
 artifact digest and an exact plan-origin/size match; matching dpkg identity
@@ -46,10 +49,19 @@ recovery journal and transaction provenance binding.
 
 Schema-v2 recovery journals retain the released plan-digest algorithm so
 interrupted repository-only transactions remain recoverable after an upgrade.
-For schema-v3 plans, the recovery journal's plan digest additionally binds the
-complete tagged origin of every archive-producing action, including the union
-tag, artifact ID, SHA-256, size, package identity, acquisition URL, trust mode,
-and solver priority.
+For schema-v4 plans, the recovery journal's plan digest additionally binds the
+complete tagged origin and canonical supported digest set of every
+archive-producing action. Unknown algorithms, missing required algorithms,
+digest downgrade, cache substitution, and identity mismatch are rejected by
+the immediate pre-lock reread before a lock, process, dpkg, or filesystem
+mutation can occur. Schema-v2/v3 plan bytes and replay semantics remain
+unchanged.
+
+Executor journal versions 1 through 3 remain readable with their original
+bytes and SHA256 command/artifact fields. Journal v4 is selected for plan-v4
+authority and records each package command's complete canonical artifact
+identity. Recovery compares the whole digest set against exact-lock v3 and
+never synthesizes SHA256 for a SHA512-only package.
 
 For a new root, the authenticated closure containing absent Essential packages
 receives a deterministic `/usr/bin/dpkg-deb --extract` bootstrap phase before

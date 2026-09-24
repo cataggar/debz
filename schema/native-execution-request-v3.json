@@ -38,9 +38,12 @@
         "authorization_sha256": {"$ref": "#/$defs/digest"},
         "program_sha256": {"$ref": "#/$defs/digest"},
         "exact_lock_schema": {
-          "const": "https://debz.dev/schema/exact-closure-lock-v2"
+          "enum": [
+            "https://debz.dev/schema/exact-closure-lock-v2",
+            "https://debz.dev/schema/exact-closure-lock-v3"
+          ]
         },
-        "exact_lock_version": {"const": 2},
+        "exact_lock_version": {"enum": [2, 3]},
         "exact_lock_sha256": {"$ref": "#/$defs/digest"},
         "helper": {
           "type": "object",

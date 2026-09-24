@@ -8,10 +8,10 @@ The document digest covers canonical JSON without its final digest member.
 V1 is permanently `legacy_dpkg` authority; it is never inferred or translated
 as native. Newly generated v1 locks receive a separate capability sidecar that
 binds the exact canonical lock bytes without changing their digest or any
-historical signature. Product/package-cache v2 locks are native. Repository
-operations use v2 for both `legacy_dpkg` and native execution, with backend
-authority supplied by the separately authenticated request and policy digests;
-missing or mismatched backend context is refused. See
+historical signature. Current product/package-cache native locks are v3.
+Repository operations use v3 for both backends, with backend authority
+supplied by the separately authenticated request and policy digests; missing
+or mismatched backend context is refused. See
 [Legacy compatibility](legacy-compatibility.md).
 
 `debz.exact_lock_v2` adds a tagged package origin. Authenticated repository
@@ -42,6 +42,27 @@ that `config-files` state belongs in the separate native final-state authority,
 not the lock's installed-package closure. Purge must remove the residual state.
 V1 creation, decoding, and schema are unchanged.
 
+`debz.exact_lock_v3` versions repository and package content identity without
+changing any v1/v2 bytes. Repository indexes and package archives carry an
+explicit primary algorithm plus the complete supported digest set. Supported
+algorithms are exactly lowercase `sha256` and `sha512`; encodings have exact
+lengths and canonical order is SHA256 then SHA512. If both are published, both
+are retained and verified. SHA512-only repository packages remain valid
+without a fabricated SHA256. Unknown algorithms, duplicate/conflicting
+entries, a missing primary, wrong case/length, and digest-set substitution are
+rejected. Transaction-plan schema v4 serializes the same tagged archive
+identity. Local origins bind a typed artifact ID plus the complete archive and
+pinned content identities; v2/v3 plan serialization remains byte-for-byte
+unchanged.
+
+Native execution carries that identity without truncation through explicit
+successor documents: authorization v2, program v2, execution request v4,
+recovery intent v2, progress v3/v4, transaction result v3, native provenance
+v2, and root completion v2. Each successor binds the exact schemas and
+versions it consumed. Legacy authorization/program/provenance/completion v1,
+request v1-v3, intent v1, progress v1/v2, and transaction-result v1/v2 bytes
+and canonical hashes remain readable and unchanged.
+
 Exact-lock v2 keeps its complete-closure meaning by default. The transaction
 executor also exposes a separately policy-digested `locked_packages` mode for
 repository-add operations whose lock intentionally contains only non-remove
@@ -68,10 +89,12 @@ and total-work limits; sorted indexed matching and reference accounting avoid
 quadratic artifact/package validation. `ExactClosureLockStore` publishes with
 write/fsync/rename/fsync.
 
-Authenticated snapshot digest version 2 additionally binds the configured
+Authenticated snapshot digest version 3 additionally binds the configured
 freshness policy and maximum missing-expiry age, signed Release date,
 `Valid-Until` grace, bounded future-skew decision, and whether the
-missing-`Valid-Until` exception was exercised. Observation time and observed
+missing-`Valid-Until` exception was exercised, plus the complete
+algorithm-tagged index digest set and explicit primary selection. Observation
+time and observed
 age remain validated cache evidence but are excluded from lock identity, so
 independent authenticated refreshes of the same still-valid signed snapshot
 under the same policy produce the same digest. Repository and configuration
@@ -87,27 +110,28 @@ The production CLI permits initial lock resolution only on non-mutating
 `plan` and `download` operations. The package-family API exposes that path as
 `resolve_lock`; all image mutations continue to require the reviewed lock.
 
-The core CLI selects genuine v2 planning and download with
+The core CLI selects genuine v3 planning and download with
 `--transaction-backend native`; embedders set
 `ProductionBackend.transaction_backend = .native`. Native resolution builds
 the tagged closure directly from authenticated repository snapshots, while
 native replay refuses v1 input. Its solver-policy digest is SHA-256 of
 `debz.product-native-solver-policy-v1\0` followed by the existing 32-byte solver
 policy digest. Legacy core resolution/replay keeps its original v1 format and
-policy bytes. Core native mutation consumes an explicit reviewed v2 lock and
+policy bytes. Core native mutation consumes an explicit reviewed v3 lock and
 publishes a native receipt rather than legacy command provenance. Core recovery
 consumes persisted inputs without re-resolution or replacement locks, binds outer
 completion to that receipt, and acknowledges native evidence before clearing the
 caller record. Other consumers remain independently gated.
 
-The separate `debz package-cache` interface supports canonical v1 locks only.
+The separate `debz package-cache` interface supports canonical v1, v2, and v3
+locks through explicit version-specific paths.
 `fingerprint` rejects unsupported schema versions, noncanonical/tampered
 documents, target or solver-policy drift, duplicate object digests, and
 resource-limit violations before cache restore. `prepare` reauthenticates all
 repository evidence and verifies the complete lock closure independent of
-installed state. V2/local-artifact origins are rejected explicitly rather than
-being omitted; they can be added only with an end-to-end reviewed acquisition
-path.
+installed state. Exact-lock v3 carries SHA512-only and mixed package identities
+through tagged CAS and archive v3; every supported digest is verified before
+publication or replay.
 
 The package-cache fingerprint is domain-separated and covers the lock digest,
 schema, target and foreign architectures, exact runtime version, package-CAS
@@ -142,16 +166,15 @@ package-origin digest exactly equal to the bound lock digest. Package,
 repository, and signer verification is count-bounded and uses sorted/indexed
 matching rather than nested scans.
 
-`debz.native_authorization` defines native transaction authorization schema
-version 1: the complete contract the native engine must hold before it mutates
-a root. One document binds the selected backend, the exact closure lock
-generation and digest, the request, solver-policy, executor-policy, and plan
-digests, the selected install root plus its derived root identity, the target
-and foreign architectures, the conffile and force policy including explicit
-host-root authorization, every ordered install/remove/purge/reinstall/upgrade/
-downgrade action with its prior installed version, the authenticated origin,
-digest, and size of every archive-producing action, and the exact intended
-final closure with its own digest.
+`debz.native_authorization` defines the complete contract the native engine
+must hold before it mutates a root. Historical schema v1 retains SHA256 package
+evidence. Current schema v2 binds exact-lock v3 and the complete canonical
+content identity for every archive-producing action without changing v1
+bytes. Both versions bind the selected backend, lock generation and digest,
+request, solver-policy, executor-policy and plan digests, selected install root
+and derived root identity, target and foreign architectures, conffile and force
+policy, ordered lifecycle actions, authenticated origins, sizes, and the exact
+intended final closure.
 
 For removal, that closure may contain a residual `config-files` record or
 omit the package when no residual conffiles or `postrm` remain. The program
@@ -159,7 +182,7 @@ compiler checks the authorized choice against installed evidence; authorizing
 absence does not permit it to discard conffiles that removal must retain.
 
 Authorization is native-only. Creating one for `legacy_dpkg` is rejected, and
-only exact-closure-lock v2 may be bound, so previously serialized v1 locks stay
+new authorization binds exact-closure-lock v3, so previously serialized v1/v2 locks stay
 readable for the legacy backend and can never be silently reinterpreted as
 native authorization. `transaction_engine.authorize` requires an authorization
 for native execution, rejects an authorization supplied to the legacy backend,
@@ -181,18 +204,18 @@ persisted through the no-follow `NativeTransactionAuthorizationStore`.
 
 `debz.native_program` compiles one authorization, the reviewed ordered
 lifecycle, the consumed installed-database generation, and the validated
-archives into native transaction program schema version 1: the deterministic
-low-level transaction the engine executes and a later recovery replays or
-refuses. The program binds the authorization digest and every binding the
-authorization carries, the database generation plus an evidence digest over the
-complete installed state, every artifact's identity, origin, digest, size, and
-application digest, the maintainer-script environment-policy identity, and the
-intended final closure digest. Its steps are dense, phased, typed, and
-dependency-ordered, and its digest covers the whole document.
+archives into the deterministic low-level transaction the engine executes and
+recovery replays or refuses. Historical schema v1 remains byte-compatible;
+schema v2 carries every artifact's complete supported digest set and binds
+authorization v2 plus exact-lock v3. Both versions bind the authorization
+digest, database generation and complete installed-state evidence, artifact
+origin, size and application digest, maintainer-script environment-policy
+identity, intended final closure, and the dense typed dependency-ordered step
+graph.
 `transaction_engine.authorizeProgram` and `executeAuthorizedProgram` require a
 matching program before native execution, and can require an independently
 recorded program digest. See
-[native transaction program v1](native-transaction-program.md).
+[native transaction programs](native-transaction-program.md).
 
 Credentials in URI user-info, common token/query/header assignments, proxy
 variables, and auth paths are redacted before serialization. Persisted
@@ -204,13 +227,25 @@ Schemas:
 
 - [`schema/exact-closure-lock-v1.json`](../schema/exact-closure-lock-v1.json)
 - [`schema/exact-closure-lock-v2.json`](../schema/exact-closure-lock-v2.json)
+- [`schema/exact-closure-lock-v3.json`](../schema/exact-closure-lock-v3.json)
 - [`schema/package-cache-fingerprint-v1.json`](../schema/package-cache-fingerprint-v1.json)
+- [`schema/package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
+- [`schema/package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
+- [`schema/package-cache-fingerprint-v5.json`](../schema/package-cache-fingerprint-v5.json)
 - [`schema/package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
+- [`schema/package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
+- [`schema/package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
+- [`schema/package-cache-result-v5.json`](../schema/package-cache-result-v5.json)
 - [`schema/package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 - [`schema/transaction-result-v1.json`](../schema/transaction-result-v1.json)
 - [`schema/transaction-result-v2.json`](../schema/transaction-result-v2.json)
+- [`schema/transaction-result-v3.json`](../schema/transaction-result-v3.json)
 - [`schema/transaction-result-summary-v1.json`](../schema/transaction-result-summary-v1.json)
 - [`schema/native-transaction-authorization-v1.json`](../schema/native-transaction-authorization-v1.json)
+- [`schema/native-transaction-authorization-v2.json`](../schema/native-transaction-authorization-v2.json)
+- [`schema/native-transaction-program-v1.json`](../schema/native-transaction-program-v1.json)
+- [`schema/native-transaction-program-v2.json`](../schema/native-transaction-program-v2.json)
+- [`schema/native-transaction-provenance-v2.json`](../schema/native-transaction-provenance-v2.json)
 
 `debz transaction-result verify` is the no-follow read boundary used after an
 Actions installation, including when the mutating process ran under explicit

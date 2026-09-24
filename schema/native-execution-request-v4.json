@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-execution-request-v4",
+  "title": "debz native execution request with explicit v2 authority v4",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "execution",
+    "authority",
+    "helper",
+    "bootstrap",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/native-execution-request-v4" },
+    "version": { "const": 4 },
+    "execution": {
+      "$ref": "https://debz.dev/schema/native-execution-request-v1"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorization_schema",
+        "authorization_version",
+        "program_schema",
+        "program_version",
+        "exact_lock_schema",
+        "exact_lock_version"
+      ],
+      "properties": {
+        "authorization_schema": {
+          "const": "https://debz.dev/schema/native-transaction-authorization-v2"
+        },
+        "authorization_version": { "const": 2 },
+        "program_schema": {
+          "const": "https://debz.dev/schema/native-transaction-program-v2"
+        },
+        "program_version": { "const": 2 },
+        "exact_lock_schema": {
+          "const": "https://debz.dev/schema/exact-closure-lock-v3"
+        },
+        "exact_lock_version": { "const": 3 }
+      }
+    },
+    "helper": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "$ref": "https://debz.dev/schema/native-execution-request-v2#/properties/helper"
+        }
+      ]
+    },
+    "bootstrap": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "allOf": [
+            {
+              "$ref": "https://debz.dev/schema/native-execution-request-v3#/properties/bootstrap"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "exact_lock_schema": {
+                  "const": "https://debz.dev/schema/exact-closure-lock-v3"
+                },
+                "exact_lock_version": { "const": 3 }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "digest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "not": {
+    "type": "object",
+    "required": ["helper", "bootstrap"],
+    "properties": {
+      "helper": { "not": { "type": "null" } },
+      "bootstrap": { "not": { "type": "null" } }
+    }
+  }
+}

@@ -39,6 +39,18 @@ const nativeSummaryKeys = [
   'program_sha256', 'package_count', 'outcome', 'final_verification_status',
   'lock_evidence', 'receipt_evidence', 'root_operation_status',
 ];
+const nativeEvidenceSchemaPairs = [
+  {
+    transactionSchema: 'https://debz.dev/schema/native-transaction-provenance-v2',
+    completionSchema: 'https://debz.dev/schema/root-operation-completion-v2',
+    version: 2,
+  },
+  {
+    transactionSchema: 'https://debz.dev/schema/native-transaction-provenance-v1',
+    completionSchema: 'https://debz.dev/schema/root-operation-completion-v1',
+    version: 1,
+  },
+] as const;
 
 export interface NativeInstallResult {
   changed: boolean;
@@ -56,6 +68,7 @@ export interface TransactionSummary {
   lockDigest: string;
   transactionDigest: string;
   installedCount: number;
+  nativeEvidenceVersion?: 1 | 2;
 }
 
 export function buildInstallArguments(inputs: Inputs): string[] {
@@ -285,10 +298,6 @@ export function validateTransactionSummary(
       schema: 'io.github.cataggar.debz.transaction-result-summary.v2',
       api_version: 2,
       backend: 'native',
-      transaction_schema: 'https://debz.dev/schema/native-transaction-provenance-v1',
-      transaction_schema_version: 1,
-      completion_schema: 'https://debz.dev/schema/root-operation-completion-v1',
-      completion_schema_version: 1,
       target_architecture: inputs.architecture,
       install_root: inputs.installRoot,
       operation: 'install',
@@ -306,12 +315,22 @@ export function validateTransactionSummary(
       root_operation_status: 'cleared',
     };
     for (const [name, value] of Object.entries(expected)) literal(document[name], value, name);
+    const schemaPair = nativeEvidenceSchemaPairs.find((pair) =>
+      document.transaction_schema === pair.transactionSchema &&
+      document.transaction_schema_version === pair.version &&
+      document.completion_schema === pair.completionSchema &&
+      document.completion_schema_version === pair.version
+    );
+    if (schemaPair === undefined) {
+      throw new InstallActionError('native transaction-result summary has an unsupported provenance/completion schema pair');
+    }
     digest(document.request_sha256, 'request_sha256');
     digest(document.solver_policy_sha256, 'solver_policy_sha256');
     return {
       lockDigest: expectedLockDigest,
       transactionDigest: nativeResult.receipt.transactionDigest,
       installedCount: nativePackageCount(document.package_count, inputs),
+      nativeEvidenceVersion: schemaPair.version,
     };
   }
   exactKeys(document, summaryKeys, 'transaction-result summary');
@@ -358,9 +377,9 @@ export function validateTransactionSummary(
   };
 }
 
-export function transactionResultPath(inputs: Inputs): string {
+export function transactionResultPath(inputs: Inputs, nativeEvidenceVersion: 1 | 2 = 2): string {
   if (inputs.transactionBackend === 'native') {
-    return path.join(inputs.installRoot, 'var/lib/debz/native-transaction-provenance-v1.json');
+    return path.join(inputs.installRoot, `var/lib/debz/native-transaction-provenance-v${nativeEvidenceVersion}.json`);
   }
   return path.join(inputs.statePath, 'transaction-result.json');
 }

@@ -335,7 +335,7 @@ export async function readInputs(
       'cache-root must be an absolute child of RUNNER_TEMP',
     );
   }
-  const cachePath = path.join(cacheRoot, 'packages-v1', 'objects');
+  const cachePath = path.join(cacheRoot, 'packages-v2', 'objects');
   await assertNoSymlinkComponents(cachePath, 'package cache path');
 
   const mutablePaths = [

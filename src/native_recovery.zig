@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_helper = @import("native_helper.zig");
 const absolute_path = @import("absolute_path.zig");
@@ -22,8 +23,12 @@ pub const intent_path = root_operation.native_intent_path;
 pub const progress_path = "var/lib/debz/native-execution-progress-v1.log";
 pub const progress_schema_id = "https://debz.dev/schema/native-execution-progress-v1";
 pub const bootstrap_progress_schema_id = "https://debz.dev/schema/native-execution-progress-v2";
+pub const authority_progress_schema_id = "https://debz.dev/schema/native-execution-progress-v3";
+pub const authority_bootstrap_progress_schema_id = "https://debz.dev/schema/native-execution-progress-v4";
 pub const authorization_name = "native-transaction-authorization-v1.json";
 pub const program_name = "native-transaction-program-v1.json";
+pub const authorization_v2_name = "native-transaction-authorization-v2.json";
+pub const program_v2_name = "native-transaction-program-v2.json";
 pub const blob_prefix = "native-recovery-v1-blob-";
 pub const workspace_directory = native_helper.bootstrap_directory;
 pub const artifact_directory = workspace_directory ++ "/artifacts";
@@ -206,9 +211,74 @@ pub const Blob = struct {
     logical_path: []const u8,
     storage_path: []const u8,
     size: u64,
-    sha256: Digest,
+    sha256: Digest = @splat('0'),
+    archive_identity: ?content_digest.JsonIdentity = null,
     mode: u32,
     entry_kind: EntryKind,
+
+    pub fn identity(self: Blob) ?content_digest.Identity {
+        if (self.archive_identity) |archive_identity| return archive_identity.value;
+        const digest = parseDigest(self.sha256) orelse return null;
+        return content_digest.Identity.init(.{ .sha256 = digest }, .sha256) catch null;
+    }
+
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !Blob {
+        const Wire = struct {
+            kind: BlobKind,
+            key: []const u8,
+            logical_path: []const u8,
+            storage_path: []const u8,
+            size: u64,
+            sha256: ?Digest = null,
+            archive_identity: ?content_digest.JsonIdentity = null,
+            mode: u32,
+            entry_kind: EntryKind,
+        };
+        const wire = try std.json.innerParse(Wire, allocator, source, options);
+        if ((wire.sha256 == null) == (wire.archive_identity == null))
+            return error.UnexpectedToken;
+        return .{
+            .kind = wire.kind,
+            .key = wire.key,
+            .logical_path = wire.logical_path,
+            .storage_path = wire.storage_path,
+            .size = wire.size,
+            .sha256 = wire.sha256 orelse @splat('0'),
+            .archive_identity = wire.archive_identity,
+            .mode = wire.mode,
+            .entry_kind = wire.entry_kind,
+        };
+    }
+
+    pub fn jsonStringify(self: Blob, writer: anytype) !void {
+        if (self.archive_identity) |archive_identity| {
+            try writer.write(.{
+                .kind = self.kind,
+                .key = self.key,
+                .logical_path = self.logical_path,
+                .storage_path = self.storage_path,
+                .size = self.size,
+                .archive_identity = archive_identity,
+                .mode = self.mode,
+                .entry_kind = self.entry_kind,
+            });
+        } else {
+            try writer.write(.{
+                .kind = self.kind,
+                .key = self.key,
+                .logical_path = self.logical_path,
+                .storage_path = self.storage_path,
+                .size = self.size,
+                .sha256 = self.sha256,
+                .mode = self.mode,
+                .entry_kind = self.entry_kind,
+            });
+        }
+    }
 };
 
 pub const Intent = struct {
@@ -234,10 +304,84 @@ pub const Intent = struct {
     artifact_evidence_sha256: Digest,
     database_generation_sha256: Digest,
     initial_trigger_state_sha256: Digest,
+    authorization_schema: ?[]const u8 = null,
+    authorization_version: ?u32 = null,
+    program_schema: ?[]const u8 = null,
+    program_version: ?u32 = null,
+    exact_lock_schema: ?[]const u8 = null,
+    exact_lock_version: ?u32 = null,
     authorization_path: []const u8,
     program_path: []const u8,
     blobs: []const Blob,
     digest_sha256: Digest,
+
+    pub fn jsonStringify(self: Intent, writer: anytype) !void {
+        if (self.version == 1) {
+            try writer.write(.{
+                .schema = self.schema,
+                .version = self.version,
+                .attempt_id = self.attempt_id,
+                .install_root = self.install_root,
+                .root_identity_sha256 = self.root_identity_sha256,
+                .root_inode = self.root_inode,
+                .operation = self.operation,
+                .architecture = self.architecture,
+                .policy = self.policy,
+                .triggers = self.triggers,
+                .defer_triggers = self.defer_triggers,
+                .staging_directory_initially_present = self.staging_directory_initially_present,
+                .packages = self.packages,
+                .ordered_actions = self.ordered_actions,
+                .request_sha256 = self.request_sha256,
+                .policy_sha256 = self.policy_sha256,
+                .authorization_sha256 = self.authorization_sha256,
+                .program_sha256 = self.program_sha256,
+                .exact_lock_sha256 = self.exact_lock_sha256,
+                .artifact_evidence_sha256 = self.artifact_evidence_sha256,
+                .database_generation_sha256 = self.database_generation_sha256,
+                .initial_trigger_state_sha256 = self.initial_trigger_state_sha256,
+                .authorization_path = self.authorization_path,
+                .program_path = self.program_path,
+                .blobs = self.blobs,
+                .digest_sha256 = self.digest_sha256,
+            });
+        } else {
+            try writer.write(.{
+                .schema = self.schema,
+                .version = self.version,
+                .attempt_id = self.attempt_id,
+                .install_root = self.install_root,
+                .root_identity_sha256 = self.root_identity_sha256,
+                .root_inode = self.root_inode,
+                .operation = self.operation,
+                .architecture = self.architecture,
+                .policy = self.policy,
+                .triggers = self.triggers,
+                .defer_triggers = self.defer_triggers,
+                .staging_directory_initially_present = self.staging_directory_initially_present,
+                .packages = self.packages,
+                .ordered_actions = self.ordered_actions,
+                .request_sha256 = self.request_sha256,
+                .policy_sha256 = self.policy_sha256,
+                .authorization_sha256 = self.authorization_sha256,
+                .program_sha256 = self.program_sha256,
+                .exact_lock_sha256 = self.exact_lock_sha256,
+                .artifact_evidence_sha256 = self.artifact_evidence_sha256,
+                .database_generation_sha256 = self.database_generation_sha256,
+                .initial_trigger_state_sha256 = self.initial_trigger_state_sha256,
+                .authorization_schema = self.authorization_schema.?,
+                .authorization_version = self.authorization_version.?,
+                .program_schema = self.program_schema.?,
+                .program_version = self.program_version.?,
+                .exact_lock_schema = self.exact_lock_schema.?,
+                .exact_lock_version = self.exact_lock_version.?,
+                .authorization_path = self.authorization_path,
+                .program_path = self.program_path,
+                .blobs = self.blobs,
+                .digest_sha256 = self.digest_sha256,
+            });
+        }
+    }
 };
 
 pub const OwnedIntent = struct {
@@ -253,24 +397,50 @@ pub const OwnedIntent = struct {
 pub fn sealIntent(intent: *Intent) void {
     intent.digest_sha256 = @splat('0');
     intent.digest_sha256 = digestValue(
-        "debz-native-execution-intent-v1\x00",
+        if (intent.version == 2)
+            "debz-native-execution-intent-v2\x00"
+        else
+            "debz-native-execution-intent-v1\x00",
         intent.*,
     );
 }
 
 pub fn validateIntent(intent: Intent) !void {
-    if (!std.mem.eql(
+    const is_v1 = std.mem.eql(
         u8,
         intent.schema,
         "https://debz.dev/schema/native-execution-intent-v1",
-    ) or intent.version != 1)
+    ) and intent.version == 1;
+    const is_v2 = std.mem.eql(
+        u8,
+        intent.schema,
+        "https://debz.dev/schema/native-execution-intent-v2",
+    ) and intent.version == 2;
+    if (!is_v1 and !is_v2)
         return error.UnsupportedSchema;
     if (!absolute_path.root(intent.install_root) or
         intent.install_root.len > 4096 or
-        !std.mem.eql(u8, intent.authorization_path, authorization_name) or
-        !std.mem.eql(u8, intent.program_path, program_name) or
+        !std.mem.eql(
+            u8,
+            intent.authorization_path,
+            if (is_v2) authorization_v2_name else authorization_name,
+        ) or
+        !std.mem.eql(
+            u8,
+            intent.program_path,
+            if (is_v2) program_v2_name else program_name,
+        ) or
         intent.packages.len > maximum_records or
         intent.ordered_actions.len > maximum_records)
+        return error.InvalidIntent;
+    if ((is_v1 and (intent.authorization_schema != null or
+        intent.authorization_version != null or intent.program_schema != null or
+        intent.program_version != null or intent.exact_lock_schema != null or
+        intent.exact_lock_version != null)) or
+        (is_v2 and (intent.authorization_schema == null or
+            intent.authorization_version == null or intent.program_schema == null or
+            intent.program_version == null or intent.exact_lock_schema == null or
+            intent.exact_lock_version == null)))
         return error.InvalidIntent;
     const root_identity = hexDigest(
         @import("transaction_recovery.zig").rootIdentity(intent.install_root),
@@ -307,10 +477,14 @@ pub fn validateIntent(intent: Intent) !void {
         if (blob.storage_path.len == 0 or
             !std.mem.startsWith(u8, blob.storage_path, "var/lib/debz/") or
             blob.size > std.math.maxInt(usize) or
-            parseDigest(blob.sha256) == null or
+            blob.identity() == null or
             blob.entry_kind != .regular or
             blob.key.len == 0 or blob.key.len > 4096 or
             blob.logical_path.len == 0 or blob.logical_path.len > 4096)
+            return error.InvalidBlob;
+        if ((is_v1 and blob.archive_identity != null) or
+            (is_v2 and blob.kind == .artifact and blob.archive_identity == null) or
+            (is_v2 and blob.kind != .artifact and blob.archive_identity != null))
             return error.InvalidBlob;
         _ = root_fs.Path.init(blob.storage_path) catch return error.InvalidBlob;
         _ = root_fs.Path.initPackage(blob.logical_path) catch return error.InvalidBlob;
@@ -345,6 +519,7 @@ pub fn validateIntent(intent: Intent) !void {
         }
         if (request_blobs != 1) return error.InvalidBlob;
     }
+    if (request_blobs != 1) return error.InvalidBlob;
     if (total_blob_bytes > 8 * 1024 * 1024 * 1024)
         return error.LimitExceeded;
     var payload = intent;
@@ -353,7 +528,10 @@ pub fn validateIntent(intent: Intent) !void {
     if (!std.mem.eql(
         u8,
         &expected,
-        &digestValue("debz-native-execution-intent-v1\x00", payload),
+        &digestValue(if (is_v2)
+            "debz-native-execution-intent-v2\x00"
+        else
+            "debz-native-execution-intent-v1\x00", payload),
     )) return error.DigestMismatch;
 }
 
@@ -429,11 +607,15 @@ pub fn validateHelperActions(
     progress: ProgressDocument,
     bootstrap: ?native_helper.Bootstrap,
 ) !void {
-    const bootstrap_progress = std.mem.eql(
+    const bootstrap_progress = (std.mem.eql(
         u8,
         progress.schema,
         bootstrap_progress_schema_id,
-    ) and progress.version == 2;
+    ) and progress.version == 2) or (std.mem.eql(
+        u8,
+        progress.schema,
+        authority_bootstrap_progress_schema_id,
+    ) and progress.version == 4);
     if (bootstrap_progress != (bootstrap != null))
         return error.InvalidNativeHelperBootstrapState;
     for (progress.records) |record| {
@@ -530,15 +712,29 @@ pub const OwnedProgress = struct {
     }
 };
 
-fn sealRecord(record: *Record, bootstrap: bool) void {
+fn progressRecordDomain(version: u32) []const u8 {
+    return switch (version) {
+        1 => "debz-native-execution-progress-record-v1\x00",
+        2 => "debz-native-execution-progress-record-v2\x00",
+        3 => "debz-native-execution-progress-record-v3\x00",
+        4 => "debz-native-execution-progress-record-v4\x00",
+        else => unreachable,
+    };
+}
+
+fn progressDocumentDomain(version: u32) []const u8 {
+    return switch (version) {
+        1 => "debz-native-execution-progress-v1\x00",
+        2 => "debz-native-execution-progress-v2\x00",
+        3 => "debz-native-execution-progress-v3\x00",
+        4 => "debz-native-execution-progress-v4\x00",
+        else => unreachable,
+    };
+}
+
+fn sealRecord(record: *Record, version: u32) void {
     record.digest_sha256 = @splat('0');
-    record.digest_sha256 = digestValue(
-        if (bootstrap)
-            "debz-native-execution-progress-record-v2\x00"
-        else
-            "debz-native-execution-progress-record-v1\x00",
-        record.*,
-    );
+    record.digest_sha256 = digestValue(progressRecordDomain(version), record.*);
 }
 
 fn validateProgress(document: ProgressDocument) !void {
@@ -547,6 +743,15 @@ fn validateProgress(document: ProgressDocument) !void {
         false
     else if (std.mem.eql(u8, document.schema, bootstrap_progress_schema_id) and
         document.version == 2)
+        true
+    else if (std.mem.eql(u8, document.schema, authority_progress_schema_id) and
+        document.version == 3)
+        false
+    else if (std.mem.eql(
+        u8,
+        document.schema,
+        authority_bootstrap_progress_schema_id,
+    ) and document.version == 4)
         true
     else
         return error.InvalidProgress;
@@ -642,13 +847,7 @@ fn validateProgress(document: ProgressDocument) !void {
         if (!std.mem.eql(
             u8,
             &digest,
-            &digestValue(
-                if (bootstrap)
-                    "debz-native-execution-progress-record-v2\x00"
-                else
-                    "debz-native-execution-progress-record-v1\x00",
-                payload,
-            ),
+            &digestValue(progressRecordDomain(document.version), payload),
         )) return error.InvalidProgress;
         previous = digest;
     }
@@ -664,13 +863,7 @@ fn validateProgress(document: ProgressDocument) !void {
     if (!std.mem.eql(
         u8,
         &digest,
-        &digestValue(
-            if (bootstrap)
-                "debz-native-execution-progress-v2\x00"
-            else
-                "debz-native-execution-progress-v1\x00",
-            payload,
-        ),
+        &digestValue(progressDocumentDomain(document.version), payload),
     )) return error.DigestMismatch;
 }
 
@@ -679,7 +872,7 @@ pub fn initializeProgress(
     root: root_fs.Root,
     intent_sha256: Digest,
 ) !void {
-    return initializeProgressVersion(allocator, root, intent_sha256, false);
+    return initializeProgressVersion(allocator, root, intent_sha256, false, false);
 }
 
 pub fn initializeBootstrapProgress(
@@ -687,7 +880,23 @@ pub fn initializeBootstrapProgress(
     root: root_fs.Root,
     intent_sha256: Digest,
 ) !void {
-    return initializeProgressVersion(allocator, root, intent_sha256, true);
+    return initializeProgressVersion(allocator, root, intent_sha256, true, false);
+}
+
+pub fn initializeAuthorityProgress(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+) !void {
+    return initializeProgressVersion(allocator, root, intent_sha256, false, true);
+}
+
+pub fn initializeAuthorityBootstrapProgress(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: Digest,
+) !void {
+    return initializeProgressVersion(allocator, root, intent_sha256, true, true);
 }
 
 fn initializeProgressVersion(
@@ -695,22 +904,29 @@ fn initializeProgressVersion(
     root: root_fs.Root,
     intent_sha256: Digest,
     bootstrap: bool,
+    authority: bool,
 ) !void {
+    const version: u32 = if (authority)
+        if (bootstrap) 4 else 3
+    else if (bootstrap)
+        2
+    else
+        1;
     var document: ProgressDocument = .{
-        .schema = if (bootstrap) bootstrap_progress_schema_id else progress_schema_id,
-        .version = if (bootstrap) 2 else 1,
+        .schema = switch (version) {
+            1 => progress_schema_id,
+            2 => bootstrap_progress_schema_id,
+            3 => authority_progress_schema_id,
+            4 => authority_bootstrap_progress_schema_id,
+            else => unreachable,
+        },
+        .version = version,
         .intent_sha256 = intent_sha256,
         .records = &.{},
         .head_sha256 = @splat('0'),
         .digest_sha256 = @splat('0'),
     };
-    document.digest_sha256 = digestValue(
-        if (bootstrap)
-            "debz-native-execution-progress-v2\x00"
-        else
-            "debz-native-execution-progress-v1\x00",
-        document,
-    );
+    document.digest_sha256 = digestValue(progressDocumentDomain(version), document);
     try validateProgress(document);
     const bytes = try canonicalJson(allocator, document);
     defer allocator.free(bytes);
@@ -787,22 +1003,24 @@ pub fn appendProgress(
         u8,
         current.document.schema,
         bootstrap_progress_schema_id,
+    ) or std.mem.eql(
+        u8,
+        current.document.schema,
+        authority_bootstrap_progress_schema_id,
     );
-    sealRecord(&record, bootstrap);
+    sealRecord(&record, current.document.version);
     records[records.len - 1] = record;
     var document: ProgressDocument = .{
-        .schema = if (bootstrap) bootstrap_progress_schema_id else progress_schema_id,
-        .version = if (bootstrap) 2 else 1,
+        .schema = current.document.schema,
+        .version = current.document.version,
         .intent_sha256 = intent_sha256,
         .records = records,
         .head_sha256 = record.digest_sha256,
         .digest_sha256 = @splat('0'),
     };
+    _ = bootstrap;
     document.digest_sha256 = digestValue(
-        if (bootstrap)
-            "debz-native-execution-progress-v2\x00"
-        else
-            "debz-native-execution-progress-v1\x00",
+        progressDocumentDomain(document.version),
         document,
     );
     try validateProgress(document);
@@ -2522,10 +2740,8 @@ pub fn verifyBlob(
     );
     errdefer allocator.free(bytes);
     if (bytes.len != blob.size) return error.BlobDigestMismatch;
-    var digest: [32]u8 = undefined;
-    Sha256.hash(bytes, &digest, .{});
-    if (!std.mem.eql(u8, &hexDigest(digest), &blob.sha256))
-        return error.BlobDigestMismatch;
+    const identity = blob.identity() orelse return error.BlobDigestMismatch;
+    identity.verify(bytes) catch return error.BlobDigestMismatch;
     return bytes;
 }
 
@@ -2607,13 +2823,25 @@ pub fn cleanup(
                 else => return err,
             };
     }
+    var authorization_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const authorization_path = try std.fmt.bufPrint(
+        &authorization_buffer,
+        root_operation.namespace_path ++ "/{s}",
+        .{intent.authorization_path},
+    );
+    var program_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const program_path = try std.fmt.bufPrint(
+        &program_buffer,
+        root_operation.namespace_path ++ "/{s}",
+        .{intent.program_path},
+    );
     for ([_][]const u8{
         progress_path,
         trigger_events_path,
         managed_state_path,
         intent_path,
-        root_operation.namespace_path ++ "/" ++ authorization_name,
-        root_operation.namespace_path ++ "/" ++ program_name,
+        authorization_path,
+        program_path,
     }) |path| {
         root.removeFile(try root_fs.Path.init(path)) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -2717,7 +2945,7 @@ fn checkProgressChain() !void {
         .previous_sha256 = @splat('0'),
         .digest_sha256 = @splat('0'),
     };
-    sealRecord(&first, false);
+    sealRecord(&first, 1);
     var second: Record = .{
         .sequence = 1,
         .action = first.action,
@@ -2726,7 +2954,7 @@ fn checkProgressChain() !void {
         .previous_sha256 = first.digest_sha256,
         .digest_sha256 = @splat('0'),
     };
-    sealRecord(&second, false);
+    sealRecord(&second, 1);
     var records = [_]Record{ first, second };
     var progress: ProgressDocument = .{
         .intent_sha256 = @splat('1'),
@@ -2787,6 +3015,11 @@ fn checkIntentBinding() !void {
     };
     sealIntent(&intent);
     try validateIntent(intent);
+    intent.blobs = &.{};
+    sealIntent(&intent);
+    try std.testing.expectError(error.InvalidBlob, validateIntent(intent));
+    intent.blobs = &blobs;
+    sealIntent(&intent);
     intent.defer_triggers = true;
     try std.testing.expectError(error.DigestMismatch, validateIntent(intent));
 }

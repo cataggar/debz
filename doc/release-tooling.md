@@ -13,6 +13,8 @@ The install prefix must contain:
 * `bin/debz`
 * `share/doc/debz/LICENSE`
 * `share/doc/debz/THIRD_PARTY_NOTICES`
+* identical `share/debz/` and `share/doc/debz/` copies of
+  `digest-cutover-policy.json` and `legacy-cutover-policy.json`
 * `share/debz/runtime-dependencies.json`
 
 Typical CI usage:
@@ -55,5 +57,5 @@ architectures after attestations and publication complete.
 The same post-publication matrix then creates a hermetic signed repository and
 exact lock and runs [`actions/download`](../actions/download/README.md) with
 caching disabled. This proves the just-published CLI implements the
-`package-cache-v1` contract and prepares the complete closure on both native
+`package-cache-v3` legacy contract and prepares the complete closure on both native
 architectures without treating setup or package cache state as installation.

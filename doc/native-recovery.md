@@ -401,16 +401,20 @@ overwritten. Plans that remove the target's owning package, omit the target
 from its replacement archive, or replace it with a non-regular entry are also
 refused.
 
-### Authenticated fresh-root helper bootstrap v3
+### Authenticated fresh-root helper bootstrap
 
-[`native-execution-request-v3`](../schema/native-execution-request-v3.json)
-is the only missing-target exception. It is available only for an empty,
+Legacy [`native-execution-request-v3`](../schema/native-execution-request-v3.json)
+and the authority-bound
+[`native-execution-request-v4`](../schema/native-execution-request-v4.json)
+are the only missing-target exception. V4 envelopes the unchanged execution
+mapping and binds authorization v2, program v2, and exact-lock v3. It is
+available only for an empty,
 settled dpkg database and an exact transaction whose authenticated `dpkg`
 archive contains one regular `usr/bin/dpkg-trigger`. No differently named
 package may inherit this authority. The bootstrap binding records the caller
 attempt and root identity/inode, fixed private uid/gid, plan, authorization,
-program and exact v2 lock, owner package/version/architecture and final state,
-archive digest, size, artifact index and application digest, and the target's
+program and exact lock, owner package/version/architecture and final state,
+complete archive identity, size, artifact index and application digest, and the target's
 exact payload digest, size, mode, uid and gid. Wrong, absent, ambiguous,
 non-regular or misordered owners fail before payload mutation. Final
 verification requires that the bound `dpkg` generation is the target's sole
@@ -434,9 +438,11 @@ maintainer script therefore cannot execute or copy the staged helper by its
 attempt-derived name.
 
 Source publication and the namespace probe have separate durable progress
-actions in `native-execution-progress-v2`. Legacy request v1/v2 executions keep
+actions in `native-execution-progress-v2` for legacy authority and
+`native-execution-progress-v4` for all-digest authority. Non-bootstrap
+all-digest execution uses progress v3. Legacy request v1/v2 executions keep
 their original progress-v1 schema and action vocabulary; helper actions are
-accepted only when the retained request is the exact bound v3 bootstrap. A
+accepted only when the retained request is the exact bound bootstrap. A
 crash before source publication may publish it once; an exact
 already-published source may be adopted. A crash before probe launch may
 launch it once, and a recorded successful outcome may be completed without
@@ -482,6 +488,13 @@ and cache preparation: it is not reset at a native phase or script boundary.
 recovery; plain `recover` and requests without a deadline keep their existing
 behavior.
 
+`Runtime.ExecuteRequest.external_mechanics` and
+`recoverWithExternalMechanics` narrowly inject the external helper namespace
+probe for hermetic integration. The runtime reaches that hook only after it has
+staged and authenticated the bundled helper binding and validated the persisted
+request, authorization, program, and recovery intent. The hook cannot replace
+those bytes or documents; ordinary callers use the production probe by default.
+
 This is a transient execution constraint, not a changed script policy or
 persisted clock. Program, authorization, invocation-policy and recovery hashes
 remain unchanged. The runtime checks expiry before helper work and execution
@@ -507,7 +520,8 @@ Prepare with `native_runtime.scriptPolicy()` and supply the owned preparation
 plus immutable archive byte slices to `execute`. Inputs are borrowed for the
 call and must not be changed concurrently. Authorization/program integrity,
 caller binding, archive bytes, and locked database state are revalidated.
-The runtime always uses the bundled trusted helper and persists a v2 request.
+The runtime always uses the bundled trusted helper and persists a v4 request
+binding authorization v2, program v2, and exact-lock v3.
 It accepts neither caller helper bytes nor helper-free execution.
 
 ```zig
@@ -559,15 +573,16 @@ evidence, and mutation journals. Completed retained provenance is not active
 execution evidence.
 
 Core product/CLI planning, download, execution, and recovery use these typed
-contracts. Native mutation requires a reviewed v2 lock and a supported non-host
+contracts. Native mutation requires a reviewed v3 lock and a supported non-host
 root. Native recovery accepts no new repository or lock inputs and reads only
 the original persisted execution evidence. Terminal success and known failure
-bind `root-operation-completion-v1.json` to the exact native receipt, publish
+bind `root-operation-completion-v2.json` to the exact native provenance-v2
+receipt (while legacy execution remains readable through v1), publish
 the outer provenance transition, acknowledge native evidence, and finally clear
 the caller's active record. Every boundary is restartable. Generic acquisition
 cannot reclaim a native program-bound attempt in either the pre-intent or
 pending-acknowledgment window, and an orphan native intent blocks other engines.
-Empty v2 closures now represent last-package removal or purge,
+Empty v3 closures represent last-package removal or purge,
 with explicit action authorization and retained configuration modeled separately.
 Remaining consumer integration and full pinned parity remain roadmap work.
 Legacy stays default, and there is no fallback.
@@ -607,7 +622,7 @@ Owned known failures also use pending acknowledgment while preserving their
 terminal failure outcome and exit 7. Unknown outcomes remain blocked.
 
 Acknowledgment uses the caller's existing rank-0 lock, validates receipt-backed
-completion against the original request, and preserves authenticated exact v2
+completion against the original request, and preserves authenticated exact v3
 review ownership. Native cleanup precedes marker acknowledgment and root-record
 clearing. Independently retained owner evidence supports retries after native
 cleanup, marker acknowledgment, record clearing, and marker clearing; none of
@@ -621,7 +636,7 @@ exact owner token, an absent root record/marker, and no active native evidence
 under the same root lock. Pre-mutation claims bind the outer state, profile,
 lock digest, and semantic request; post-mutation claims bind the original
 execute request and the outer caller's lock/evidence digests. Both preserve
-reviewed v2 ownership and require explicit exact-owner finalization. A claim
+reviewed v3 ownership and require explicit exact-owner finalization. A claim
 does not verify package closure or manufacture a native completion receipt.
 It accepts no replacement recovery inputs or cache/state access. Actual-process
 coverage interrupts claim publication and finalization while retaining the
@@ -730,7 +745,7 @@ without replay, acknowledgment or ownership changes. Existing settled and
 owner-bound verification remains covered by the core recovery family.
 
 Repository package checkpoints reuse the original persisted locked state, plan
-and v2 lock after package execution or fresh recovery with no CAS inputs. Real
+and v3 lock after package execution or fresh recovery with no CAS inputs. Real
 cases bind successful/failed native outcomes to durable generic repository state,
 refuse changed or missing inputs and leaf symlinks, expire before rename, detect
 input replacement during publication, converge after interrupted rename and
@@ -800,7 +815,7 @@ new caller has no execution program or mutation evidence. Operation-scoped lock
 units preserve strict full-closure behavior for other native consumers.
 
 Two additional private-root cases start with an already-installed descriptor
-and genuine descriptor-bound v2 lock, then complete bootstrap with and without
+and genuine descriptor-bound v3 lock, then complete bootstrap with and without
 refresh. They require actual no-execution preparation, retain the original
 archive and dedicated no-execution evidence, and exercise interruptions through
 import/refresh, terminal state, caller abandonment and root clear. Same-held

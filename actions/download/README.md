@@ -53,9 +53,9 @@ older runners are rejected rather than given a shell/Python fallback.
 Pinning the download action selects its orchestration code; pinning
 `debz-version` in the setup step separately selects the CLI and fingerprint
 implementation. The download action never upgrades or substitutes that CLI.
-The default `transaction-backend: legacy_dpkg` requires `package-cache-v1`
+The default `transaction-backend: legacy_dpkg` requires `package-cache-v3`
 (introduced in `debz` 0.3.0). Explicit `transaction-backend: native` requires a
-CLI build/release implementing `package-cache-v2`, with native v2 lock,
+CLI build/release implementing `package-cache-v5`, with native v3 lock,
 fingerprint, preparation, and archive support. An older or incompatible CLI
 fails before cache restore; neither backend is automatically substituted.
 Legacy execution remains available for this compatibility increment, but is
@@ -78,7 +78,7 @@ Required and conditional inputs:
 
 | Input | Meaning |
 | --- | --- |
-| `lock-input` | Canonical exact-closure lock v1 for legacy or v2 for native. Unsupported or mismatched schemas fail instead of being skipped. |
+| `lock-input` | Canonical exact-closure lock v1 for legacy or v3 for native. Unsupported or mismatched schemas fail instead of being skipped. |
 | `architecture` | Native target Debian architecture: `amd64` or `arm64`. This is not inferred from the runner architecture. |
 | `source` or `config` | Required for legacy mode and repository-backed native locks. Repeated paths are newline-delimited. |
 | `keyring` | Required for legacy mode and repository-backed native locks. Every source must use `Signed-By` and name one of these newline-delimited paths. |
@@ -120,10 +120,10 @@ ambient trusted-key directories.
 
 ### Native closures
 
-Native mode accepts the CLI's separately versioned v2 contracts and
-`debz-package-cas-v2-` keys, never v1 responses or restore keys. Empty native
+Native mode accepts the CLI's separately versioned v5 contracts and
+`debz-package-cas-v5-` keys, never legacy responses or restore keys. Empty native
 closures need no source/keyring inputs, return zero downloaded/reused objects,
-and can still be saved and restored as canonical empty v2 archives. Local-only
+and can still be saved and restored as canonical empty v3 archives. Local-only
 closures may also omit repository inputs. The CLI remains responsible for
 deciding which repository evidence the lock requires.
 
@@ -145,7 +145,7 @@ receipt-backed completion integration.
 | --- | --- |
 | `cache-hit` | `true` only when the Actions cache service restored the exact primary key. Preparation and verification still ran. |
 | `cache-matched-key` | Exact key, compatible prefix key, or empty when no cache was restored. |
-| `cache-path` | Absolute verified `packages-v1/objects` directory used by later debz operations. |
+| `cache-path` | Absolute verified `packages-v2/objects` directory used by later debz operations. |
 | `cache-root` | Parent cache root accepted by `debz --cache-path`, for a later cache-only transaction. |
 | `lock-digest` | Canonical exact-lock digest verified and reported by `debz`. |
 | `downloaded-count` | Current-lock objects acquired from package transport. |
@@ -172,7 +172,8 @@ primary key and bounded restore prefix. The fingerprint covers:
 The exact key adds the lock digest. The compatible prefix stops at the safe
 sharing boundary, so an older lock may contribute candidate objects. Neither
 an exact hit nor a prefix hit is trusted: `debz` reopens every current-lock
-object, verifies its regular-file shape, declared size, SHA-256, the lock's
+object, verifies its regular-file shape, declared size, every supported
+repository digest, the lock's
 repository or local-artifact evidence, and Debian payload identity before
 reporting reuse.
 The action passes the restore classification back to the CLI. A missing object
@@ -196,7 +197,7 @@ entry can be restored into a different safe cache root. Restore keys come only
 from the CLI result; JavaScript does not append repository paths, secrets, or
 ad hoc policy fragments.
 
-Only objects from `packages-v1/objects` are serialized into the opaque cache
+Only objects from `packages-v2/objects` are serialized into the opaque cache
 blob. The action never caches:
 
 - repository metadata or freshness state;
@@ -255,12 +256,12 @@ configuration/keyrings, architecture/policy, and `${{ steps.packages.outputs.cac
 Do not infer an installed state from `cache-hit`, `reused-count`, or the
 presence of files in `cache-path`.
 Keep the backend selection consistent: a native download closure must be
-consumed by a native-capable transaction caller, not the currently legacy
-install action.
+consumed by a native-capable transaction caller, such as
+[`actions/install`](../install/README.md) with `transaction-backend: native`.
 
 ## Local integration coverage
 
-With Node 24, locked action dependencies, and a built v2-capable CLI:
+With Node 24, locked action dependencies, and a built v5-capable CLI:
 
 ```sh
 DEBZ_DOWNLOAD_INTEGRATION=1 \

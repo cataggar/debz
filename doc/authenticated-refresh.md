@@ -1,7 +1,8 @@
 # Authenticated repository refresh
 
 `repository_refresh.refresh` preserves the plain `Release` path and returns an
-untrusted `Result`. It verifies Release-to-index SHA-256 integrity but cannot be
+untrusted `Result`. It verifies every supported Release-to-index digest
+(SHA256 and SHA512) but cannot be
 passed to `SolverRepositoryInput.fromRefresh`.
 
 `repository_refresh.refreshAuthenticated` returns `AuthenticatedResult` only
@@ -46,9 +47,10 @@ future-skew policy, and index objects. Cache-only loading rechecks object
 integrity, reruns authentication, rejects any changed freshness policy,
 revalidates the original decision, and evaluates the signed metadata at the
 current time. Changed policy evidence, historically invalid decisions, stale
-metadata, or incompatible evidence fails closed. Repository snapshot v3 uses a
-new cache namespace, so older v2 cache objects are not reinterpreted under the
-exception.
+metadata, or incompatible evidence fails closed. Repository snapshot v4 stores
+the algorithm-tagged index digest set and explicit primary selection in
+canonical SHA256-then-SHA512 order. It uses a new cache namespace, so older
+snapshots are never reinterpreted as tagged identities.
 
 The supported algorithms are exactly those documented in
 [`openpgp-verifier.md`](openpgp-verifier.md): OpenPGP v4 RSA (algorithms 1 and

@@ -52,12 +52,29 @@ pub const Sha256Digest = struct {
     bytes: [32]u8,
 
     pub fn eql(left: Sha256Digest, right: Sha256Digest) bool {
-        return std.mem.eql(u8, &left.bytes, &right.bytes);
+        return std.crypto.timing_safe.eql([32]u8, left.bytes, right.bytes);
     }
 };
 
 pub const Sha256Entry = struct {
     digest: Sha256Digest,
+    size: u64,
+    path: LocatedString,
+    digest_span: Span,
+    size_span: Span,
+    span: Span,
+};
+
+pub const Sha512Digest = struct {
+    bytes: [64]u8,
+
+    pub fn eql(left: Sha512Digest, right: Sha512Digest) bool {
+        return std.crypto.timing_safe.eql([64]u8, left.bytes, right.bytes);
+    }
+};
+
+pub const Sha512Entry = struct {
+    digest: Sha512Digest,
     size: u64,
     path: LocatedString,
     digest_span: Span,
@@ -78,14 +95,16 @@ pub const ReleaseMetadata = struct {
     architectures: []LocatedString,
     components: []LocatedString,
     acquire_by_hash: ?LocatedBool,
-    /// The only checksum records exposed as trusted index metadata.
+    /// Supported checksum records exposed as trusted index metadata.
     sha256_entries: []Sha256Entry,
+    sha512_entries: []Sha512Entry,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ReleaseMetadata) void {
         self.allocator.free(self.architectures);
         self.allocator.free(self.components);
         self.allocator.free(self.sha256_entries);
+        self.allocator.free(self.sha512_entries);
         self.* = undefined;
     }
 };
@@ -115,6 +134,7 @@ pub const DiagnosticCode = enum {
     too_many_checksum_rows,
     malformed_checksum_row,
     invalid_sha256_digest,
+    invalid_sha512_digest,
     invalid_checksum_size,
     invalid_checksum_path,
     duplicate_checksum_path,
@@ -140,13 +160,14 @@ pub const Diagnostic = struct {
             .invalid_boolean => "Acquire-By-Hash must be exactly 'yes' or 'no'",
             .invalid_timestamp => "timestamp must use an RFC-style date, time, and UTC offset",
             .invalid_timestamp_weekday => "timestamp weekday does not match its calendar date",
-            .too_many_checksum_rows => "SHA256 exceeds the configured row limit",
+            .too_many_checksum_rows => "checksum section exceeds the configured row limit",
             .malformed_checksum_row => "checksum row must contain digest, decimal size, and relative path",
-            .invalid_sha256_digest => "SHA256 digest must contain exactly 64 hexadecimal digits",
+            .invalid_sha256_digest => "SHA256 digest must contain exactly 64 lowercase hexadecimal digits",
+            .invalid_sha512_digest => "SHA512 digest must contain exactly 128 lowercase hexadecimal digits",
             .invalid_checksum_size => "checksum size must be an unsigned 64-bit decimal integer",
             .invalid_checksum_path => "checksum path must be a normalized relative path",
-            .duplicate_checksum_path => "SHA256 repeats an identical path record",
-            .conflicting_checksum_path => "SHA256 contains conflicting records for one path",
+            .duplicate_checksum_path => "checksum section repeats an identical path record",
+            .conflicting_checksum_path => "supported checksum sections conflict for one path",
         };
     }
 };
@@ -209,6 +230,10 @@ pub fn parse(
     defer checksums.deinit(allocator);
     var checksum_paths = std.StringHashMap(usize).init(allocator);
     defer checksum_paths.deinit();
+    var sha512_checksums: std.ArrayList(Sha512Entry) = .empty;
+    defer sha512_checksums.deinit(allocator);
+    var sha512_paths = std.StringHashMap(usize).init(allocator);
+    defer sha512_paths.deinit();
 
     var origin: ?LocatedString = null;
     var label: ?LocatedString = null;
@@ -287,9 +312,30 @@ pub fn parse(
             )) |diagnostic| {
                 return .{ .diagnostic = diagnostic };
             }
+        } else if (std.ascii.eqlIgnoreCase(field.name, "SHA512")) {
+            if (try parseSha512(
+                allocator,
+                &sha512_checksums,
+                &sha512_paths,
+                field,
+                limits.max_checksum_rows,
+            )) |diagnostic| {
+                return .{ .diagnostic = diagnostic };
+            }
         }
         // MD5Sum, SHA1, and unknown fields are intentionally not promoted into
         // trusted metadata. The DEB822 bounds still apply to their input.
+    }
+
+    for (sha512_checksums.items) |entry| {
+        if (checksum_paths.get(entry.path.value)) |sha256_index| {
+            if (checksums.items[sha256_index].size != entry.size) {
+                return .{ .diagnostic = .{
+                    .code = .conflicting_checksum_path,
+                    .span = entry.path.span,
+                } };
+            }
+        }
     }
 
     const owned_architectures = try architectures.toOwnedSlice(allocator);
@@ -298,6 +344,8 @@ pub fn parse(
     errdefer allocator.free(owned_components);
     const owned_checksums = try checksums.toOwnedSlice(allocator);
     errdefer allocator.free(owned_checksums);
+    const owned_sha512_checksums = try sha512_checksums.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_sha512_checksums);
 
     return .{ .metadata = .{
         .source = source,
@@ -312,6 +360,7 @@ pub fn parse(
         .components = owned_components,
         .acquire_by_hash = acquire_by_hash,
         .sha256_entries = owned_checksums,
+        .sha512_entries = owned_sha512_checksums,
         .allocator = allocator,
     } };
 }
@@ -477,18 +526,91 @@ fn parseDigest(text: []const u8) ?Sha256Digest {
     if (text.len != 64) return null;
     var result: Sha256Digest = undefined;
     for (0..32) |index| {
-        const high = hexValue(text[index * 2]) orelse return null;
-        const low = hexValue(text[index * 2 + 1]) orelse return null;
+        const high = lowerHexValue(text[index * 2]) orelse return null;
+        const low = lowerHexValue(text[index * 2 + 1]) orelse return null;
         result.bytes[index] = (high << 4) | low;
     }
     return result;
 }
 
-fn hexValue(byte: u8) ?u8 {
+fn parseSha512(
+    allocator: std.mem.Allocator,
+    entries: *std.ArrayList(Sha512Entry),
+    paths: *std.StringHashMap(usize),
+    field: deb822.Field,
+    limit: usize,
+) std.mem.Allocator.Error!?Diagnostic {
+    for (field.value_lines) |line| {
+        var token_index: usize = 0;
+        const digest_token = nextToken(line.text, &token_index) orelse continue;
+        const size_token = nextToken(line.text, &token_index) orelse
+            return .{ .code = .malformed_checksum_row, .span = fromDeb822Span(line.span) };
+        const path_token = nextToken(line.text, &token_index) orelse
+            return .{ .code = .malformed_checksum_row, .span = fromDeb822Span(line.span) };
+        if (nextToken(line.text, &token_index) != null) {
+            return .{ .code = .malformed_checksum_row, .span = fromDeb822Span(line.span) };
+        }
+        if (entries.items.len >= limit) {
+            return .{ .code = .too_many_checksum_rows, .span = fromDeb822Span(line.span) };
+        }
+
+        const digest_span = tokenSpan(line, digest_token);
+        const digest = parseSha512Digest(digest_token.text) orelse
+            return .{ .code = .invalid_sha512_digest, .span = digest_span };
+        const size_span = tokenSpan(line, size_token);
+        if (!allDecimal(size_token.text)) {
+            return .{ .code = .invalid_checksum_size, .span = size_span };
+        }
+        const size = std.fmt.parseUnsigned(u64, size_token.text, 10) catch
+            return .{ .code = .invalid_checksum_size, .span = size_span };
+        const path = LocatedString{
+            .value = path_token.text,
+            .span = tokenSpan(line, path_token),
+        };
+        if (!validRelativePath(path.value)) {
+            return .{ .code = .invalid_checksum_path, .span = path.span };
+        }
+
+        if (paths.get(path.value)) |existing_index| {
+            const existing = entries.items[existing_index];
+            return .{
+                .code = if (existing.size == size and existing.digest.eql(digest))
+                    .duplicate_checksum_path
+                else
+                    .conflicting_checksum_path,
+                .span = path.span,
+            };
+        }
+
+        try entries.append(allocator, .{
+            .digest = digest,
+            .size = size,
+            .path = path,
+            .digest_span = digest_span,
+            .size_span = size_span,
+            .span = fromDeb822Span(line.span),
+        });
+        errdefer _ = entries.pop();
+        try paths.put(path.value, entries.items.len - 1);
+    }
+    return null;
+}
+
+fn parseSha512Digest(text: []const u8) ?Sha512Digest {
+    if (text.len != 128) return null;
+    var result: Sha512Digest = undefined;
+    for (0..64) |index| {
+        const high = lowerHexValue(text[index * 2]) orelse return null;
+        const low = lowerHexValue(text[index * 2 + 1]) orelse return null;
+        result.bytes[index] = (high << 4) | low;
+    }
+    return result;
+}
+
+fn lowerHexValue(byte: u8) ?u8 {
     return switch (byte) {
         '0'...'9' => byte - '0',
         'a'...'f' => byte - 'a' + 10,
-        'A'...'F' => byte - 'A' + 10,
         else => null,
     };
 }
@@ -720,7 +842,7 @@ fn expectDiagnostic(input: []const u8, limits: Limits, code: DiagnosticCode) !Di
     };
 }
 
-test "parses typed Release metadata and SHA256 indexes" {
+test "parses typed Release metadata and supported index digests" {
     const input =
         "Origin: Debian\n" ++
         "Label: Debian\n" ++
@@ -736,7 +858,9 @@ test "parses typed Release metadata and SHA256 indexes" {
         " bad compatibility data is ignored\n" ++
         "SHA256:\n" ++
         " 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 42 main/binary-amd64/Packages.xz\n" ++
-        " FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF 0 InRelease\n";
+        " ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff 0 InRelease\n" ++
+        "SHA512:\n" ++
+        " 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 42 main/binary-amd64/Packages.xz\n";
     const result = try parse(std.testing.allocator, input, .{});
     var metadata = switch (result) {
         .metadata => |value| value,
@@ -760,6 +884,8 @@ test "parses typed Release metadata and SHA256 indexes" {
     );
     try std.testing.expectEqual(@as(u8, 0x01), metadata.sha256_entries[0].digest.bytes[0]);
     try std.testing.expectEqual(@as(u8, 0xff), metadata.sha256_entries[1].digest.bytes[31]);
+    try std.testing.expectEqual(@as(usize, 1), metadata.sha512_entries.len);
+    try std.testing.expectEqual(@as(u8, 0xef), metadata.sha512_entries[0].digest.bytes[63]);
 }
 
 test "timestamp parser is typed but performs no clock policy" {
@@ -804,6 +930,23 @@ test "validates checksum digest size and row shape" {
         "SHA256:\n 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 1 path extra\n",
         .{},
         .malformed_checksum_row,
+    );
+}
+
+test "SHA512 is strict and cross-section sizes cannot disagree" {
+    _ = try expectDiagnostic(
+        "SHA512:\n" ++
+            " A123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 1 main/binary-amd64/Packages\n",
+        .{},
+        .invalid_sha512_digest,
+    );
+    _ = try expectDiagnostic(
+        "SHA256:\n" ++
+            " 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 1 main/binary-amd64/Packages\n" ++
+            "SHA512:\n" ++
+            " 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 2 main/binary-amd64/Packages\n",
+        .{},
+        .conflicting_checksum_path,
     );
 }
 

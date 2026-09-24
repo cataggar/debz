@@ -327,14 +327,22 @@ jobs:
           import sys
 
           value = json.loads(Path(sys.argv[1]).read_bytes())
-          assert value["version"] == 2
-          value.pop("digest_sha256")
+          assert value["schema"] == "https://debz.dev/schema/exact-closure-lock-v3"
+          assert value["version"] == 3
+          assert list(value) == [
+              "schema", "version", "target_architecture", "request_sha256",
+              "policy_sha256", "repositories", "local_artifacts", "packages",
+              "digest_sha256",
+          ]
+          canonical = lambda document: json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode()
+          digest = value.pop("digest_sha256")
+          assert digest == sha256(canonical(value)).hexdigest()
           value["request_sha256"] = sha256(b"native-action-empty-cache").hexdigest()
           value["repositories"] = []
           value["local_artifacts"] = []
           value["packages"] = []
-          value["digest_sha256"] = sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
-          Path(sys.argv[2]).write_bytes(json.dumps(value, separators=(",", ":")).encode())
+          value["digest_sha256"] = sha256(canonical(value)).hexdigest()
+          Path(sys.argv[2]).write_bytes(canonical(value))
           PY
           printf 'workspace=%s\nsource=%s\nkeyring=%s\nbase_lock=%s\nscenario_lock=%s\n' \
             "$workspace" "$workspace/fixture.sources" \
@@ -407,7 +415,7 @@ jobs:
           test "$REUSED" -gt 0
       - name: Corrupt one exact-restored object
         run: |
-          object=$(find "$RUNNER_TEMP/debz-download-exact/packages-v1/objects" \
+          object=$(find "$RUNNER_TEMP/debz-download-exact/packages-v2/objects" \
             -maxdepth 1 -type f -print -quit)
           test -n "$object"
           printf 'corrupt\n' >"$object"
@@ -503,7 +511,7 @@ jobs:
           test "$EXACT_DOWNLOADED" -eq 0
           test "$EXACT_REUSED" -gt 0
           case "$PARTIAL_KEY:$EXACT_KEY" in
-            debz-package-cas-v2-*:debz-package-cas-v2-*) ;;
+            debz-package-cas-v5-*:debz-package-cas-v5-*) ;;
             *) exit 1 ;;
           esac
       - name: Populate native empty cache

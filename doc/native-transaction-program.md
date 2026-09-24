@@ -1,4 +1,4 @@
-# Native transaction program v1
+# Native transaction programs v1 and v2
 
 The native transaction program is the complete low-level transaction the native
 engine executes against one root. It is compiled once, before any mutation,
@@ -15,7 +15,7 @@ Compilation consumes exactly four kinds of evidence plus explicit policy:
 
 | Input | Meaning |
 |---|---|
-| `authorization` | The reviewed [native transaction authorization](exact-locks-and-provenance.md), which binds the backend, exact closure lock v2 generation, request/solver-policy/executor-policy/plan digests, install root and root identity, target and foreign architectures, mutation policy, every ordered action, and the exact intended final closure. |
+| `authorization` | The reviewed [native transaction authorization](exact-locks-and-provenance.md), which binds the backend, exact closure lock v3 generation, request/solver-policy/executor-policy/plan digests, install root and root identity, target and foreign architectures, mutation policy, every ordered action, complete archive identities, and the exact intended final closure. |
 | `ordered_actions` | The reviewed plan's ordered lifecycle: bootstrap extraction, removals, purges, unpacks, and configure barriers. |
 | `installed` | The consumed installed-database generation: its digest plus, per package, the recorded version, last configured version, state, hold, essential flag, owned-path set digest, maintainer-script digests, conffile records with their recorded and observed digests, and trigger declarations. |
 | `archives` | One validated archive per archive-producing action: identity, digest, size, authenticated origin, application-inventory digest, maintainer-script digests, packaged conffiles with the digest each shipped file carries (absent exactly for `remove-on-upgrade`), trigger declarations, and `Replaces` names. |
@@ -32,7 +32,7 @@ relationship between the four inputs independently.
 ### Production preparation
 
 `debz.native_preparation.prepare` derives an owned native authorization and
-compiled program from a real solver plan, an exact-closure-lock v2, validated
+compiled program from a real solver plan, an exact-closure-lock v3, validated
 installed/archive evidence, and explicit executor/script policy. It verifies
 the lock's contents against its digest, preserves repository snapshot and local
 artifact origins, and binds the actual request, solver-policy, executor-policy,
@@ -85,8 +85,10 @@ identity, target and foreign architectures, exact-lock generation and digest,
 request/solver-policy/executor-policy/plan digests, mutation policy,
 maintainer-script environment-policy identity, the consumed database generation
 and an evidence digest over the complete installed state, every artifact with
-its identity, origin, digest, size, and application digest, the intended final
-closure digest, and the ordered steps with their own digest.
+its identity, origin, complete canonical supported digest set, size, and
+application digest, the intended final closure digest, and the ordered steps
+with their own digest. Schema v2 carries all-digest package authority;
+historical schema v1 bytes and SHA256 semantics remain unchanged.
 
 Every step carries a dense sequence, an explicit phase (`preflight`,
 `bootstrap`, `remove`, `unpack`, `configure`, `trigger`, `verify`), an explicit
@@ -238,7 +240,7 @@ core native execution derives this authority from full captured evidence; see
 Compilation returns either a complete program or exactly one typed diagnostic;
 there is no partial program. It rejects, among others:
 
-- a non-native backend or a lock generation other than exact closure lock v2;
+- a non-native backend or a lock generation other than exact closure lock v3;
 - a maintainer-script policy that disagrees with the authorized host-root
   policy;
 - an unsupported root feature or a non-quiescent database;

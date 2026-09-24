@@ -1,0 +1,343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-transaction-program-v2",
+  "title": "debz native transaction program v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "version",
+    "backend",
+    "install_root",
+    "root_identity_sha256",
+    "target_architecture",
+    "foreign_architectures",
+    "request_sha256",
+    "solver_policy_sha256",
+    "executor_policy_sha256",
+    "plan_sha256",
+    "exact_lock",
+    "authorization_sha256",
+    "final_state_sha256",
+    "policy",
+    "script_policy_sha256",
+    "trigger_authority",
+    "installed_database",
+    "artifacts",
+    "artifacts_sha256",
+    "steps",
+    "steps_sha256",
+    "digest_sha256"
+  ],
+  "properties": {
+    "schema": { "const": "https://debz.dev/schema/native-transaction-program-v2" },
+    "version": { "const": 2 },
+    "backend": { "const": "native" },
+    "install_root": {
+      "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/absolutePath"
+    },
+    "root_identity_sha256": { "$ref": "#/$defs/sha256" },
+    "target_architecture": { "type": "string", "minLength": 1 },
+    "foreign_architectures": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "request_sha256": { "$ref": "#/$defs/sha256" },
+    "solver_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "executor_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "plan_sha256": { "$ref": "#/$defs/sha256" },
+    "exact_lock": { "$ref": "#/$defs/lockBinding" },
+    "authorization_sha256": { "$ref": "#/$defs/sha256" },
+    "final_state_sha256": { "$ref": "#/$defs/sha256" },
+    "policy": {
+      "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/policy"
+    },
+    "script_policy_sha256": { "$ref": "#/$defs/sha256" },
+    "trigger_authority": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/triggerAuthority"
+        }
+      ]
+    },
+    "installed_database": {
+      "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/databaseBinding"
+    },
+    "artifacts": {
+      "type": "array",
+      "maxItems": 100000,
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "artifacts_sha256": { "$ref": "#/$defs/sha256" },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2000000,
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "steps_sha256": { "$ref": "#/$defs/sha256" },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sha512": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$"
+    },
+    "digest": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256Digest" },
+        { "$ref": "#/$defs/sha512Digest" }
+      ]
+    },
+    "sha256Digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "sha512Digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "const": "sha512" },
+        "digest": { "$ref": "#/$defs/sha512" }
+      }
+    },
+    "digestIdentity": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256Identity" },
+        { "$ref": "#/$defs/sha512Identity" },
+        { "$ref": "#/$defs/mixedSha256Identity" },
+        { "$ref": "#/$defs/mixedSha512Identity" }
+      ]
+    },
+    "sha256Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha256" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/sha256Digest" }],
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    "sha512Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha512" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [{ "$ref": "#/$defs/sha512Digest" }],
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
+    },
+    "mixedSha256Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha256" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "$ref": "#/$defs/sha512Digest" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "mixedSha512Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary", "digests"],
+      "properties": {
+        "primary": { "const": "sha512" },
+        "digests": {
+          "type": "array",
+          "prefixItems": [
+            { "$ref": "#/$defs/sha256Digest" },
+            { "$ref": "#/$defs/sha512Digest" }
+          ],
+          "minItems": 2,
+          "maxItems": 2
+        }
+      }
+    },
+    "lockBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "digest_sha256"],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/exact-closure-lock-v3" },
+        "version": { "const": 3 },
+        "digest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "repositoryOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_id", "repository_snapshot_sha256"],
+      "properties": {
+        "repository_id": { "$ref": "#/$defs/sha256" },
+        "repository_snapshot_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "localOrigin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "archive_identity",
+        "size",
+        "package",
+        "acquisition_url",
+        "trust_mode"
+      ],
+      "properties": {
+        "artifact_id": { "$ref": "#/$defs/digest" },
+        "archive_identity": { "$ref": "#/$defs/digestIdentity" },
+        "size": { "type": "integer", "minimum": 0 },
+        "package": {
+          "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/identity"
+        },
+        "acquisition_url": { "type": "string", "minLength": 1 },
+        "trust_mode": {
+          "enum": ["pinned_content_digest", "verified_https"]
+        }
+      }
+    },
+    "origin": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["authenticated_repository"],
+          "properties": {
+            "authenticated_repository": { "$ref": "#/$defs/repositoryOrigin" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["local_artifact"],
+          "properties": {
+            "local_artifact": { "$ref": "#/$defs/localOrigin" }
+          }
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "package",
+        "archive_identity",
+        "size",
+        "application_sha256",
+        "origin"
+      ],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "package": {
+          "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/identity"
+        },
+        "archive_identity": { "$ref": "#/$defs/digestIdentity" },
+        "size": { "type": "integer", "minimum": 0 },
+        "application_sha256": { "$ref": "#/$defs/sha256" },
+        "origin": { "$ref": "#/$defs/origin" }
+      }
+    },
+    "artifactAssertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact",
+        "package",
+        "archive_identity",
+        "size",
+        "application_sha256"
+      ],
+      "properties": {
+        "artifact": { "type": "integer", "minimum": 0 },
+        "package": {
+          "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/identity"
+        },
+        "archive_identity": { "$ref": "#/$defs/digestIdentity" },
+        "size": { "type": "integer", "minimum": 0 },
+        "application_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "operation": {
+      "oneOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "https://debz.dev/schema/native-transaction-program-v1#/$defs/operation"
+            },
+            {
+              "not": {
+                "type": "object",
+                "required": ["revalidate_artifact"]
+              }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["revalidate_artifact"],
+          "properties": {
+            "revalidate_artifact": { "$ref": "#/$defs/artifactAssertion" }
+          }
+        }
+      ]
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "phase", "requires", "operation"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "phase": {
+          "enum": [
+            "preflight",
+            "bootstrap",
+            "remove",
+            "unpack",
+            "configure",
+            "trigger",
+            "verify"
+          ]
+        },
+        "requires": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "operation": { "$ref": "#/$defs/operation" }
+      }
+    }
+  }
+}

@@ -1,18 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const acquisition = @import("repository_acquisition.zig");
-const metadata_cache = @import("metadata_cache.zig");
+const content_digest = @import("content_digest.zig");
 const packages_index = @import("packages_index.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 
 const Dir = std.Io.Dir;
 const File = std.Io.File;
 
-pub const namespace = "packages-v1";
-pub const Digest = metadata_cache.Digest;
+pub const namespace = "packages-v2";
+pub const legacy_namespace = "packages-v1";
+pub const Digest = content_digest.Identity;
 
 pub const SelectedPackage = struct {
     repository_id: source.RepositoryId,
@@ -112,14 +114,14 @@ pub const TaggedSelectionError = SelectionError || error{
 pub const Mode = enum { online, cache_only };
 pub const Workflow = enum { transaction, download_only };
 pub const Outcome = enum { cache_hit, downloaded };
-pub const CacheIntegrityPolicy = enum { verify_sha256 };
+pub const CacheIntegrityPolicy = enum { verify_all_supported, verify_sha256 };
 pub const CorruptCachePolicy = enum { fail, repair_online };
 
 pub const Policy = struct {
     mode: Mode,
     workflow: Workflow = .transaction,
     maximum_package_bytes: usize,
-    cache_integrity: CacheIntegrityPolicy = .verify_sha256,
+    cache_integrity: CacheIntegrityPolicy = .verify_all_supported,
     corrupt_cache: CorruptCachePolicy = .fail,
     proxy: acquisition.ProxyPolicy = .direct,
     deadlines: acquisition.Deadlines,
@@ -134,6 +136,7 @@ pub const Request = struct {
     policy: Policy,
     exact_lock_package: ?exact_lock.Package = null,
     exact_lock_v2_package: ?exact_lock_v2.Package = null,
+    exact_lock_v3_package: ?exact_lock_v3.Package = null,
 };
 
 pub const Provenance = struct {
@@ -143,9 +146,10 @@ pub const Provenance = struct {
     version: []const u8,
     architecture: []const u8,
     resolved_uri: []u8,
-    expected_sha256: Digest,
+    expected_identity: Digest,
+    expected_sha256: ?[32]u8,
     declared_size: u64,
-    cache_key: [64]u8,
+    cache_key: []u8,
     outcome: Outcome,
     workflow: Workflow,
     attempts: u16,
@@ -155,6 +159,7 @@ pub const Provenance = struct {
         allocator.free(self.version);
         allocator.free(self.architecture);
         allocator.free(self.resolved_uri);
+        allocator.free(self.cache_key);
         self.* = undefined;
     }
 };
@@ -329,9 +334,9 @@ pub const Cache = struct {
     ) ![]u8 {
         _ = integrity;
         if (expected_size > self.limits.maximum_object_bytes) return error.PackageTooLarge;
-        var name: [64]u8 = undefined;
-        digest.formatHex(&name);
-        var file = openRegularFileNoFollow(self.objects, self.io, &name) catch |err| switch (err) {
+        var name_buffer: [135]u8 = undefined;
+        const name = digest.cacheKey(&name_buffer);
+        var file = openRegularFileNoFollow(self.objects, self.io, name) catch |err| switch (err) {
             error.FileNotFound => return error.CacheMiss,
             error.IsDir,
             error.SymLinkLoop,
@@ -359,14 +364,15 @@ pub const Cache = struct {
             else => |e| return e,
         };
         errdefer allocator.free(bytes);
-        if (bytes.len != expected_size or !Digest.of(bytes).eql(digest)) return error.CorruptObject;
+        if (bytes.len != expected_size) return error.CorruptObject;
+        digest.verify(bytes) catch return error.CorruptObject;
         return bytes;
     }
 
     pub fn objectSize(self: *Cache, digest: Digest) !?u64 {
-        var name: [64]u8 = undefined;
-        digest.formatHex(&name);
-        var file = openRegularFileNoFollow(self.objects, self.io, &name) catch |err| switch (err) {
+        var name_buffer: [135]u8 = undefined;
+        const name = digest.cacheKey(&name_buffer);
+        var file = openRegularFileNoFollow(self.objects, self.io, name) catch |err| switch (err) {
             error.FileNotFound => return null,
             error.IsDir,
             error.SymLinkLoop,
@@ -399,19 +405,19 @@ pub const Cache = struct {
         if (expected_size > self.limits.maximum_object_bytes or bytes.len > self.limits.maximum_object_bytes)
             return error.PackageTooLarge;
         if (bytes.len != expected_size) return error.SizeMismatch;
-        if (!Digest.of(bytes).eql(digest)) return error.DigestMismatch;
+        digest.verify(bytes) catch return error.DigestMismatch;
 
         var held = try self.acquire(lock);
         defer held.release(self);
-        var name: [64]u8 = undefined;
-        digest.formatHex(&name);
+        var name_buffer: [135]u8 = undefined;
+        const name = digest.cacheKey(&name_buffer);
 
-        if (self.lookup(allocator, digest, expected_size, .verify_sha256)) |existing| {
+        if (self.lookup(allocator, digest, expected_size, .verify_all_supported)) |existing| {
             allocator.free(existing);
             return;
         } else |err| switch (err) {
             error.CacheMiss => {},
-            error.CorruptObject => try self.removeCorruptObject(&name),
+            error.CorruptObject => try self.removeCorruptObject(name),
             else => |e| return e,
         }
 
@@ -428,7 +434,7 @@ pub const Cache = struct {
             try file.sync(self.io);
         }
         try hooks.staged();
-        try self.staging.rename(&stage, self.objects, &name, self.io);
+        try self.staging.rename(&stage, self.objects, name, self.io);
         try syncDirectory(self.io, self.objects);
     }
 
@@ -497,10 +503,10 @@ pub const Cache = struct {
                 break;
             }
             result.scanned += 1;
-            const digest = Digest.parseHex(name) catch {
+            if (!validCacheKey(name)) {
                 result.complete = false;
                 continue;
-            };
+            }
             var file = openRegularFileNoFollow(self.objects, self.io, name) catch {
                 result.complete = false;
                 continue;
@@ -515,7 +521,7 @@ pub const Cache = struct {
                 result.complete = false;
                 continue;
             }
-            if (containsDigest(retained, digest)) continue;
+            if (containsDigest(retained, name)) continue;
             if (result.deleted == options.maximum_objects_deleted) {
                 result.complete = false;
                 continue;
@@ -593,7 +599,25 @@ fn verifyLockPackage(
         !std.mem.eql(u8, &origin.repository_id, selected.repository_id.slice()) or
         selected.authenticated_snapshot_sha256 == null or
         !std.mem.eql(u8, &origin.repository_snapshot_sha256, &selected.authenticated_snapshot_sha256.?) or
-        !std.mem.eql(u8, &locked.sha256, &record.transport.sha256.bytes) or
+        record.transport.sha256 == null or
+        !std.mem.eql(u8, &locked.sha256, &record.transport.sha256.?.bytes) or
+        locked.declared_size != record.transport.size.value)
+        return error.LockPackageMismatch;
+}
+
+fn verifyLockPackageV3(
+    locked: exact_lock_v3.Package,
+    selected: SelectedPackage,
+    origin: exact_lock_v3.AuthenticatedRepositoryOrigin,
+) !void {
+    const record = selected.record;
+    if (!std.mem.eql(u8, locked.name, record.control.package.text) or
+        !std.mem.eql(u8, locked.version, record.control.version.value.original) or
+        !std.mem.eql(u8, locked.architecture, record.control.architecture.text) or
+        !std.mem.eql(u8, &origin.repository_id, selected.repository_id.slice()) or
+        selected.authenticated_snapshot_sha256 == null or
+        !std.mem.eql(u8, &origin.repository_snapshot_sha256, &selected.authenticated_snapshot_sha256.?) or
+        !content_digest.Identity.eql(locked.archive_identity, record.transport.identity) or
         locked.declared_size != record.transport.size.value)
         return error.LockPackageMismatch;
 }
@@ -606,7 +630,10 @@ pub fn acquirePackage(
 ) !VerifiedPackage {
     const record = request.selected.record;
     const declared_size = record.transport.size.value;
-    if (request.exact_lock_package != null and request.exact_lock_v2_package != null)
+    const lock_count = @as(u8, @intFromBool(request.exact_lock_package != null)) +
+        @as(u8, @intFromBool(request.exact_lock_v2_package != null)) +
+        @as(u8, @intFromBool(request.exact_lock_v3_package != null));
+    if (lock_count > 1)
         return error.MultipleExactLocks;
     if (request.exact_lock_package) |locked| {
         try verifyLockPackage(locked, request.selected, .{
@@ -621,13 +648,20 @@ pub fn acquirePackage(
         };
         try verifyLockPackage(locked, request.selected, origin);
     }
+    if (request.exact_lock_v3_package) |locked| {
+        const origin = switch (locked.origin) {
+            .authenticated_repository => |value| value,
+            .local_artifact => return error.LockPackageMismatch,
+        };
+        try verifyLockPackageV3(locked, request.selected, origin);
+    }
     if (request.policy.maximum_package_bytes == 0 or
         declared_size > request.policy.maximum_package_bytes or
         declared_size > cache.limits.maximum_object_bytes)
         return error.PackageTooLarge;
-    const digest: Digest = .{ .bytes = record.transport.sha256.bytes };
-    var cache_key: [64]u8 = undefined;
-    digest.formatHex(&cache_key);
+    const digest: Digest = record.transport.identity;
+    var cache_key_buffer: [135]u8 = undefined;
+    const cache_key = digest.cacheKey(&cache_key_buffer);
     const resolved = try resolvePackageUri(allocator, request.selected.repository_base_uri, record.transport.filename.value);
     defer allocator.free(resolved.text);
 
@@ -657,7 +691,7 @@ pub fn acquirePackage(
     }, dependencies);
     defer downloaded.deinit(allocator);
     if (downloaded.bytes.len != declared_size) return error.SizeMismatch;
-    if (!Digest.of(downloaded.bytes).eql(digest)) return error.DigestMismatch;
+    digest.verify(downloaded.bytes) catch return error.DigestMismatch;
     try cache.publish(
         allocator,
         digest,
@@ -686,7 +720,7 @@ fn makeResult(
     bytes: []u8,
     effective_uri: acquisition.Uri,
     digest: Digest,
-    cache_key: [64]u8,
+    cache_key: []const u8,
     outcome: Outcome,
     attempts: u16,
 ) !VerifiedPackage {
@@ -699,6 +733,8 @@ fn makeResult(
     errdefer allocator.free(architecture);
     const resolved_uri = try acquisition.redactUri(allocator, effective_uri);
     errdefer allocator.free(resolved_uri);
+    const owned_cache_key = try allocator.dupe(u8, cache_key);
+    errdefer allocator.free(owned_cache_key);
     return .{
         .bytes = bytes,
         .allocator = allocator,
@@ -709,9 +745,10 @@ fn makeResult(
             .version = version,
             .architecture = architecture,
             .resolved_uri = resolved_uri,
-            .expected_sha256 = digest,
+            .expected_identity = digest,
+            .expected_sha256 = digest.digests.sha256,
             .declared_size = request.selected.record.transport.size.value,
-            .cache_key = cache_key,
+            .cache_key = owned_cache_key,
             .outcome = outcome,
             .workflow = request.policy.workflow,
             .attempts = attempts,
@@ -751,12 +788,14 @@ fn resolvePackageUri(
     return .{ .text = text, .uri = acquisition.Uri.parse(text) catch return error.InvalidBaseUri };
 }
 
-fn containsDigest(values: []const Digest, wanted: Digest) bool {
+fn containsDigest(values: []const Digest, wanted_key: []const u8) bool {
     var lower: usize = 0;
     var upper = values.len;
     while (lower < upper) {
         const middle = lower + (upper - lower) / 2;
-        switch (std.mem.order(u8, &values[middle].bytes, &wanted.bytes)) {
+        var key_buffer: [135]u8 = undefined;
+        const key = values[middle].cacheKey(&key_buffer);
+        switch (std.mem.order(u8, key, wanted_key)) {
             .lt => lower = middle + 1,
             .gt => upper = middle,
             .eq => return true,
@@ -766,7 +805,27 @@ fn containsDigest(values: []const Digest, wanted: Digest) bool {
 }
 
 fn lessDigest(_: void, left: Digest, right: Digest) bool {
-    return std.mem.order(u8, &left.bytes, &right.bytes) == .lt;
+    var left_buffer: [135]u8 = undefined;
+    var right_buffer: [135]u8 = undefined;
+    return std.mem.order(
+        u8,
+        left.cacheKey(&left_buffer),
+        right.cacheKey(&right_buffer),
+    ) == .lt;
+}
+
+fn validCacheKey(value: []const u8) bool {
+    const algorithm: content_digest.Algorithm = if (std.mem.startsWith(u8, value, "sha256-"))
+        .sha256
+    else if (std.mem.startsWith(u8, value, "sha512-"))
+        .sha512
+    else
+        return false;
+    const prefix_length = algorithm.name().len + 1;
+    if (value.len != prefix_length + algorithm.hexLength()) return false;
+    _ = content_digest.Value.parse(algorithm, value[prefix_length..]) catch
+        return false;
+    return true;
 }
 
 fn sortNames(names: [][]u8) void {
@@ -780,11 +839,11 @@ fn sortNames(names: [][]u8) void {
 var stage_counter: std.atomic.Value(u64) = .init(0);
 
 fn stageName(digest: Digest) ![96]u8 {
-    var digest_hex: [64]u8 = undefined;
-    digest.formatHex(&digest_hex);
+    var key_buffer: [135]u8 = undefined;
+    const key = digest.cacheKey(&key_buffer);
     var result: [96]u8 = undefined;
     const written = try std.fmt.bufPrint(&result, "package-{s}-{x:0>16}.tmp", .{
-        digest_hex[0..8],
+        key[0..@min(key.len, 15)],
         stage_counter.fetchAdd(1, .monotonic),
     });
     @memset(result[written.len..], '_');
@@ -964,9 +1023,33 @@ const TestSelection = struct {
 };
 
 fn testSelection(allocator: std.mem.Allocator, payload: []const u8) !TestSelection {
-    const digest = Digest.of(payload);
-    var digest_hex: [64]u8 = undefined;
-    digest.formatHex(&digest_hex);
+    const digest = content_digest.Value.of(.sha256, payload);
+    var digest_buffer: [128]u8 = undefined;
+    return testSelectionDigest(
+        allocator,
+        payload,
+        "SHA256",
+        digest.hex(&digest_buffer),
+    );
+}
+
+fn testSelectionSha512(allocator: std.mem.Allocator, payload: []const u8) !TestSelection {
+    const digest = content_digest.Value.of(.sha512, payload);
+    var digest_buffer: [128]u8 = undefined;
+    return testSelectionDigest(
+        allocator,
+        payload,
+        "SHA512",
+        digest.hex(&digest_buffer),
+    );
+}
+
+fn testSelectionDigest(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    checksum_field: []const u8,
+    digest_hex: []const u8,
+) !TestSelection {
     const bytes = try std.fmt.allocPrint(
         allocator,
         \\Package: demo
@@ -975,10 +1058,10 @@ fn testSelection(allocator: std.mem.Allocator, payload: []const u8) !TestSelecti
         \\Description: test package
         \\Filename: pool/main/d/demo_1.2.3-1_amd64.deb
         \\Size: {d}
-        \\SHA256: {s}
+        \\{s}: {s}
         \\
     ,
-        .{ payload.len, &digest_hex },
+        .{ payload.len, checksum_field, digest_hex },
     );
     errdefer allocator.free(bytes);
     const repository_id: source.RepositoryId = .{ .bytes = @splat('a') };
@@ -1057,7 +1140,7 @@ test "authenticated solver selection rejects untrusted and conflicting provenanc
     const local: solver.TaggedPackageOrigin = .{ .local_artifact = .{
         .evidence = .{
             .artifact_id = selection.repository.repository_id.bytes,
-            .sha256 = record.transport.sha256.bytes,
+            .sha256 = record.transport.sha256.?.bytes,
             .size = record.transport.size.value,
             .package = record.control.package.text,
             .version = record.control.version.value.original,
@@ -1094,7 +1177,7 @@ test "package_acquisition.test.exact lock rejects repository and artifact substi
         .architecture = "amd64",
         .repository_id = selection.repository.repository_id.bytes,
         .repository_snapshot_sha256 = @splat(2),
-        .sha256 = selection.index.records[0].transport.sha256.bytes,
+        .sha256 = selection.index.records[0].transport.sha256.?.bytes,
         .declared_size = selection.index.records[0].transport.size.value,
         .retention = .requested,
         .dpkg_selection_hold = false,
@@ -1124,7 +1207,7 @@ test "package_acquisition.test.v2 lock binds downloads and cache hits before acq
             .repository_id = selection.repository.repository_id.bytes,
             .repository_snapshot_sha256 = @splat(1),
         } },
-        .sha256 = selection.index.records[0].transport.sha256.bytes,
+        .sha256 = selection.index.records[0].transport.sha256.?.bytes,
         .declared_size = payload.len,
         .retention = .requested,
         .dpkg_selection_hold = false,
@@ -1241,6 +1324,108 @@ test "verified download publishes CAS and cache-only hit performs no network" {
     try std.testing.expectEqual(Workflow.download_only, cached.provenance.workflow);
 }
 
+test "SHA512-only package uses tagged CAS and verifies without fabricated SHA256" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try testCache(&tmp);
+    defer cache.deinit();
+    var selection = try testSelectionSha512(std.testing.allocator, "package payload");
+    defer selection.deinit(std.testing.allocator);
+
+    var wrong_transport: TestTransport = .{ .responses = &.{.{ .body = "tampered payloa" }} };
+    try std.testing.expectError(error.DigestMismatch, acquirePackage(
+        std.testing.allocator,
+        &cache,
+        .{
+            .selected = selection.selected,
+            .policy = testPolicy(.online),
+        },
+        wrong_transport.dependencies(),
+    ));
+
+    var transport: TestTransport = .{ .responses = &.{.{ .body = "package payload" }} };
+    var downloaded = try acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = testPolicy(.online),
+    }, transport.dependencies());
+    defer downloaded.deinit();
+    try std.testing.expect(downloaded.provenance.expected_sha256 == null);
+    try std.testing.expectEqual(
+        content_digest.Algorithm.sha512,
+        downloaded.provenance.expected_identity.primary,
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        downloaded.provenance.cache_key,
+        "sha512-",
+    ));
+    try std.testing.expectEqual(@as(usize, 135), downloaded.provenance.cache_key.len);
+
+    var offline_transport: TestTransport = .{};
+    var cached = try acquirePackage(std.testing.allocator, &cache, .{
+        .selected = selection.selected,
+        .policy = testPolicy(.cache_only),
+    }, offline_transport.dependencies());
+    defer cached.deinit();
+    try std.testing.expectEqual(Outcome.cache_hit, cached.provenance.outcome);
+    try std.testing.expectEqual(@as(usize, 0), offline_transport.count);
+}
+
+test "package_acquisition.test.tagged CAS reopens and rejects cross-algorithm poisoning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = "persistent tagged object";
+    const full = content_digest.Identity.ofSupported(bytes);
+    const sha512_only = try content_digest.Identity.init(
+        .{ .sha512 = full.digests.sha512.? },
+        .sha512,
+    );
+    {
+        var cache = try testCache(&tmp);
+        defer cache.deinit();
+        try cache.publish(
+            std.testing.allocator,
+            sha512_only,
+            bytes.len,
+            bytes,
+            .fail_fast,
+            .{},
+        );
+    }
+    {
+        var reopened = try testCache(&tmp);
+        defer reopened.deinit();
+        const mixed = try reopened.lookup(
+            std.testing.allocator,
+            full,
+            bytes.len,
+            .verify_all_supported,
+        );
+        defer std.testing.allocator.free(mixed);
+        try std.testing.expectEqualStrings(bytes, mixed);
+
+        var poisoned = full;
+        poisoned.digests.sha256.?[0] ^= 1;
+        try std.testing.expectError(
+            error.CorruptObject,
+            reopened.lookup(
+                std.testing.allocator,
+                poisoned,
+                bytes.len,
+                .verify_all_supported,
+            ),
+        );
+        const original = try reopened.lookup(
+            std.testing.allocator,
+            sha512_only,
+            bytes.len,
+            .verify_all_supported,
+        );
+        defer std.testing.allocator.free(original);
+        try std.testing.expectEqualStrings(bytes, original);
+    }
+}
+
 test "package locations reject platform path separators" {
     try std.testing.expectError(
         error.InvalidBaseUri,
@@ -1303,7 +1488,7 @@ test "size digest truncation and over-limit failures never publish" {
             .selected = selection.selected,
             .policy = testPolicy(.online),
         }, transport.dependencies()));
-        const digest: Digest = .{ .bytes = selection.selected.record.transport.sha256.bytes };
+        const digest: Digest = selection.selected.record.transport.identity;
         try std.testing.expectError(
             error.CacheMiss,
             cache.lookup(std.testing.allocator, digest, "package payload".len, .verify_sha256),
@@ -1320,10 +1505,10 @@ test "corrupt cache fails closed or is repaired only by explicit online policy" 
     defer cache.deinit();
     var selection = try testSelection(std.testing.allocator, "correct");
     defer selection.deinit(std.testing.allocator);
-    const digest: Digest = .{ .bytes = selection.selected.record.transport.sha256.bytes };
-    var name: [64]u8 = undefined;
-    digest.formatHex(&name);
-    try cache.objects.writeFile(std.testing.io, .{ .sub_path = &name, .data = "corrupt" });
+    const digest: Digest = selection.selected.record.transport.identity;
+    var name_buffer: [135]u8 = undefined;
+    const name = digest.cacheKey(&name_buffer);
+    try cache.objects.writeFile(std.testing.io, .{ .sub_path = name, .data = "corrupt" });
     var no_network: TestTransport = .{};
     try std.testing.expectError(error.CorruptObject, acquirePackage(std.testing.allocator, &cache, .{
         .selected = selection.selected,
@@ -1452,7 +1637,7 @@ test "TLS non-retryable and deadline failures publish nothing" {
             .policy = policy,
         }, transport.dependencies()));
         try std.testing.expectEqual(case.expected_count, transport.count);
-        const digest: Digest = .{ .bytes = selection.selected.record.transport.sha256.bytes };
+        const digest: Digest = selection.selected.record.transport.identity;
         try std.testing.expectError(
             error.CacheMiss,
             cache.lookup(std.testing.allocator, digest, "deadlines".len, .verify_sha256),
@@ -1665,9 +1850,9 @@ test "cache rejects object symlinks and bounds non-object garbage entries" {
     var cache = try testCache(&tmp);
     defer cache.deinit();
     const digest = Digest.of("outside");
-    var name: [64]u8 = undefined;
-    digest.formatHex(&name);
-    try cache.objects.symLink(std.testing.io, "../../writer.lock", &name, .{});
+    var name_buffer: [135]u8 = undefined;
+    const name = digest.cacheKey(&name_buffer);
+    try cache.objects.symLink(std.testing.io, "../../writer.lock", name, .{});
     try std.testing.expectError(
         error.CorruptObject,
         cache.lookup(std.testing.allocator, digest, "outside".len, .verify_sha256),
@@ -1704,9 +1889,9 @@ test "package_acquisition.test.directory objects fail closed and repair only whe
     var selection = try testSelection(std.testing.allocator, "directory replacement");
     defer selection.deinit(std.testing.allocator);
     const digest = Digest.of("directory replacement");
-    var name: [64]u8 = undefined;
-    digest.formatHex(&name);
-    try cache.objects.createDir(std.testing.io, &name, .default_dir);
+    var name_buffer: [135]u8 = undefined;
+    const name = digest.cacheKey(&name_buffer);
+    try cache.objects.createDir(std.testing.io, name, .default_dir);
     try std.testing.expectError(
         error.CorruptObject,
         cache.lookup(std.testing.allocator, digest, "directory replacement".len, .verify_sha256),
@@ -1748,14 +1933,14 @@ test "package_acquisition.test.FIFO objects are opened nonblocking and safely re
     var selection = try testSelection(std.testing.allocator, "fifo replacement");
     defer selection.deinit(std.testing.allocator);
     const digest = Digest.of("fifo replacement");
-    var name: [64]u8 = undefined;
-    digest.formatHex(&name);
-    var name_z: [65:0]u8 = undefined;
-    @memcpy(name_z[0..64], &name);
-    name_z[64] = 0;
+    var name_buffer: [135]u8 = undefined;
+    const name = digest.cacheKey(&name_buffer);
+    var name_z: [136:0]u8 = undefined;
+    @memcpy(name_z[0..name.len], name);
+    name_z[name.len] = 0;
     const result = std.os.linux.mknodat(
         cache.objects.handle,
-        &name_z,
+        name_z[0..name.len :0],
         std.os.linux.S.IFIFO | 0o600,
         0,
     );

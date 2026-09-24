@@ -1,6 +1,8 @@
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const native_authorization = @import("native_authorization.zig");
 const native_program = @import("native_program.zig");
 const solver = @import("solver.zig");
@@ -114,7 +116,7 @@ pub fn select(
 }
 
 /// Binds one reviewed request to the authorization the selected backend
-/// requires. Native execution consumes exact-closure-lock v2 plus a native
+/// requires. Native execution consumes exact-closure-lock v3 plus a native
 /// authorization that covers every action, artifact, policy, root, and
 /// architecture constraint. Older lock versions stay readable for the legacy
 /// backend and are never reinterpreted as native authorization.
@@ -129,17 +131,21 @@ pub fn authorize(
             const authorized = authorization orelse return error.AuthorizationRequired;
             if (authorized.backend != .native) return error.AuthorizationBackendMismatch;
             if (request.exact_lock != null) return error.UnauthorizedLockVersion;
-            const lock = request.exact_lock_v2 orelse return error.UnauthorizedLockVersion;
-            if (!std.mem.eql(u8, authorized.exact_lock.schema, exact_lock_v2.schema_id) or
-                authorized.exact_lock.version != exact_lock_v2.schema_version)
-                return error.UnauthorizedLockVersion;
-            if (!std.mem.eql(u8, &authorized.exact_lock.digest_sha256, &lock.digest_sha256) or
-                !std.mem.eql(u8, &authorized.request_sha256, &lock.request_sha256) or
-                !std.mem.eql(u8, &authorized.solver_policy_sha256, &lock.policy_sha256))
-                return error.AuthorizationLockMismatch;
-            if (!std.mem.eql(u8, authorized.target_architecture, lock.target_architecture) or
-                !std.mem.eql(u8, authorized.target_architecture, request.plan.target_architecture))
-                return error.AuthorizationArchitectureMismatch;
+            if (request.exact_lock_v3) |lock| {
+                if (request.exact_lock_v2 != null or
+                    !std.mem.eql(u8, authorized.exact_lock.schema, exact_lock_v3.schema_id) or
+                    authorized.exact_lock.version != exact_lock_v3.schema_version)
+                    return error.UnauthorizedLockVersion;
+                try authorizeLockBinding(authorized.*, request, lock);
+                try authorizeActionsV3(authorized.*, request.plan.*, lock);
+            } else {
+                const lock = request.exact_lock_v2 orelse return error.UnauthorizedLockVersion;
+                if (!std.mem.eql(u8, authorized.exact_lock.schema, exact_lock_v2.schema_id) or
+                    authorized.exact_lock.version != exact_lock_v2.schema_version)
+                    return error.UnauthorizedLockVersion;
+                try authorizeLockBinding(authorized.*, request, lock);
+                try authorizeActions(authorized.*, request.plan.*);
+            }
             if (!std.mem.eql(u8, authorized.install_root, request.install_root) or
                 !std.mem.eql(
                     u8,
@@ -152,9 +158,22 @@ pub fn authorize(
                 &transaction_executor.planDigest(request.plan.*),
             )) return error.AuthorizationPlanMismatch;
             try authorizePolicy(authorized.*, request.policy);
-            try authorizeActions(authorized.*, request.plan.*);
         },
     }
+}
+
+fn authorizeLockBinding(
+    authorized: native_authorization.Authorization,
+    request: transaction_executor.Request,
+    lock: anytype,
+) AuthorizationError!void {
+    if (!std.mem.eql(u8, &authorized.exact_lock.digest_sha256, &lock.digest_sha256) or
+        !std.mem.eql(u8, &authorized.request_sha256, &lock.request_sha256) or
+        !std.mem.eql(u8, &authorized.solver_policy_sha256, &lock.policy_sha256))
+        return error.AuthorizationLockMismatch;
+    if (!std.mem.eql(u8, authorized.target_architecture, lock.target_architecture) or
+        !std.mem.eql(u8, authorized.target_architecture, request.plan.target_architecture))
+        return error.AuthorizationArchitectureMismatch;
 }
 
 const ForceSet = std.EnumSet(transaction_executor.ForceRisk);
@@ -210,6 +229,7 @@ fn authorizeActions(
             if (!std.mem.eql(u8, version, authorized_action.prior_version.?))
                 return error.AuthorizationActionMismatch;
         }
+
         if (solver.isRemoval(action.kind)) {
             if (authorized_action.artifact != null) return error.AuthorizationArtifactMismatch;
             continue;
@@ -220,13 +240,175 @@ fn authorizeActions(
         const size = action.package_size orelse return error.AuthorizationArtifactMismatch;
         if (!std.mem.eql(u8, &hex32(artifact.sha256), &digest) or artifact.size != size)
             return error.AuthorizationArtifactMismatch;
-        try authorizeOrigin(artifact.origin, action);
+        try authorizeOrigin(
+            artifact.origin orelse return error.AuthorizationArtifactMismatch,
+            action,
+            false,
+        );
+    }
+}
+
+fn authorizeActionsV3(
+    authorized: native_authorization.Authorization,
+    plan: solver.Plan,
+    lock: *const exact_lock_v3.Lock,
+) AuthorizationError!void {
+    if (authorized.actions.len != plan.actions.len) return error.AuthorizationActionMismatch;
+    for (plan.actions) |action| {
+        const authorized_action = authorized.findAction(action.package, action.architecture) orelse
+            return error.AuthorizationActionMismatch;
+        if (authorized_action.kind != action.kind or
+            !std.mem.eql(u8, authorized_action.version, action.version))
+            return error.AuthorizationActionMismatch;
+        const prior_version = if (action.prior_installed) |prior| prior.version else null;
+        if ((prior_version == null) != (authorized_action.prior_version == null))
+            return error.AuthorizationActionMismatch;
+        if (prior_version) |version| {
+            if (!std.mem.eql(u8, version, authorized_action.prior_version.?))
+                return error.AuthorizationActionMismatch;
+        }
+        if (solver.isRemoval(action.kind)) {
+            if (authorized_action.artifact != null) return error.AuthorizationArtifactMismatch;
+            continue;
+        }
+        const artifact = authorized_action.artifact orelse
+            return error.AuthorizationArtifactMismatch;
+        const locked = lock.findPackage(
+            action.package,
+            action.version,
+            action.architecture,
+        ) orelse return error.AuthorizationArtifactMismatch;
+        const identity = action.archive_identity orelse
+            return error.AuthorizationArtifactMismatch;
+        const size = action.package_size orelse return error.AuthorizationArtifactMismatch;
+        if (artifact.archive_identity == null or
+            !identity.eql(locked.archive_identity) or
+            !identity.eql(artifact.archive_identity.?) or
+            artifact.size != size or size != locked.declared_size)
+            return error.AuthorizationArtifactMismatch;
+        try authorizeLockedOriginV3(
+            artifact.origin_v2 orelse return error.AuthorizationArtifactMismatch,
+            locked.origin,
+        );
+        try authorizeOriginV3(artifact.origin_v2.?, action);
+    }
+}
+
+fn authorizeLockedOriginV3(
+    observed: exact_lock_v3.PackageOrigin,
+    locked: exact_lock_v3.PackageOrigin,
+) AuthorizationError!void {
+    switch (locked) {
+        .authenticated_repository => |expected| switch (observed) {
+            .authenticated_repository => |actual| {
+                if (!std.mem.eql(u8, &actual.repository_id, &expected.repository_id) or
+                    !std.mem.eql(
+                        u8,
+                        &actual.repository_snapshot_sha256,
+                        &expected.repository_snapshot_sha256,
+                    ))
+                    return error.AuthorizationArtifactMismatch;
+            },
+            .local_artifact => return error.AuthorizationArtifactMismatch,
+        },
+        .local_artifact => |expected| switch (observed) {
+            .authenticated_repository => return error.AuthorizationArtifactMismatch,
+            .local_artifact => |actual| {
+                if (!@import("package_origin.zig").eqlLocalArtifactV2(
+                    actual,
+                    expected,
+                ) or actual.size != expected.size or
+                    !std.mem.eql(u8, actual.package, expected.package) or
+                    !std.mem.eql(u8, actual.version, expected.version) or
+                    !std.mem.eql(u8, actual.architecture, expected.architecture) or
+                    !std.mem.eql(u8, actual.acquisition_url, expected.acquisition_url))
+                    return error.AuthorizationArtifactMismatch;
+            },
+        },
+    }
+}
+
+fn authorizeOriginV3(
+    origin: exact_lock_v3.PackageOrigin,
+    action: solver.PlanAction,
+) AuthorizationError!void {
+    if (action.origin_v2 == null)
+        return authorizeLegacyPlanOriginV3(origin, action);
+    const planned = action.origin_v2.?;
+    switch (origin) {
+        .authenticated_repository => |repository| switch (planned) {
+            .authenticated_repository => |identity| if (!std.mem.eql(
+                u8,
+                &identity.id,
+                &repository.repository_id,
+            )) return error.AuthorizationArtifactMismatch,
+            .local_artifact => return error.AuthorizationArtifactMismatch,
+        },
+        .local_artifact => |artifact| switch (planned) {
+            .authenticated_repository => return error.AuthorizationArtifactMismatch,
+            .local_artifact => |local| {
+                if (!@import("package_origin.zig").eqlLocalArtifactV2(
+                    local.evidence,
+                    artifact,
+                ))
+                    return error.AuthorizationArtifactMismatch;
+                if (!std.mem.eql(u8, action.package, artifact.package) or
+                    !std.mem.eql(u8, action.version, artifact.version) or
+                    !std.mem.eql(u8, action.architecture, artifact.architecture) or
+                    action.package_size != artifact.size)
+                    return error.AuthorizationArtifactMismatch;
+                const identity = action.archive_identity orelse
+                    return error.AuthorizationArtifactMismatch;
+                if (!identity.eql(artifact.archive_identity))
+                    return error.AuthorizationArtifactMismatch;
+            },
+        },
+    }
+}
+
+fn authorizeLegacyPlanOriginV3(
+    origin: exact_lock_v3.PackageOrigin,
+    action: solver.PlanAction,
+) AuthorizationError!void {
+    const planned = action.origin orelse return switch (origin) {
+        .authenticated_repository => |repository| {
+            const identity = action.repository orelse
+                return error.AuthorizationArtifactMismatch;
+            if (!std.mem.eql(u8, &identity.id, &repository.repository_id))
+                return error.AuthorizationArtifactMismatch;
+        },
+        .local_artifact => error.AuthorizationArtifactMismatch,
+    };
+    switch (origin) {
+        .authenticated_repository => |repository| switch (planned) {
+            .authenticated_repository => |identity| if (!std.mem.eql(
+                u8,
+                &identity.id,
+                &repository.repository_id,
+            )) return error.AuthorizationArtifactMismatch,
+            .local_artifact => return error.AuthorizationArtifactMismatch,
+        },
+        .local_artifact => |artifact| switch (planned) {
+            .authenticated_repository => return error.AuthorizationArtifactMismatch,
+            .local_artifact => |local| {
+                const sha256 = artifact.archive_identity.digests.sha256 orelse
+                    return error.AuthorizationArtifactMismatch;
+                if (!std.mem.eql(u8, &local.evidence.sha256, &sha256) or
+                    local.evidence.size != artifact.size or
+                    !std.mem.eql(u8, local.evidence.package, artifact.package) or
+                    !std.mem.eql(u8, local.evidence.version, artifact.version) or
+                    !std.mem.eql(u8, local.evidence.architecture, artifact.architecture) or
+                    !std.mem.eql(u8, local.evidence.acquisition_url, artifact.acquisition_url))
+                    return error.AuthorizationArtifactMismatch;
+            },
+        },
     }
 }
 
 fn authorizeOrigin(
     origin: exact_lock_v2.PackageOrigin,
     action: solver.PlanAction,
+    tagged_lock: bool,
 ) AuthorizationError!void {
     switch (origin) {
         .authenticated_repository => |repository| {
@@ -252,7 +434,8 @@ fn authorizeOrigin(
                 .authenticated_repository => return error.AuthorizationArtifactMismatch,
                 .local_artifact => |local| {
                     const evidence = local.evidence;
-                    if (!std.mem.eql(u8, &evidence.artifact_id, &artifact.artifact_id) or
+                    if ((!tagged_lock and
+                        !std.mem.eql(u8, &evidence.artifact_id, &artifact.artifact_id)) or
                         !std.mem.eql(u8, &evidence.sha256, &artifact.sha256) or
                         evidence.size != artifact.size or
                         !std.mem.eql(u8, evidence.package, artifact.package) or
@@ -310,9 +493,14 @@ pub fn authorizeProgram(
         .native => {
             const compiled = program orelse return error.ProgramRequired;
             const authorized = authorization.?;
-            if (!std.mem.eql(u8, compiled.schema, native_program.schema_id) or
-                compiled.version != native_program.schema_version or
-                compiled.backend != .native)
+            const schema_matches =
+                if (authorized.wire_version == native_authorization.schema_version)
+                    std.mem.eql(u8, compiled.schema, native_program.schema_id) and
+                        compiled.version == native_program.schema_version
+                else
+                    std.mem.eql(u8, compiled.schema, native_program.schema_v2_id) and
+                        compiled.version == native_program.schema_v2_version;
+            if (!schema_matches or compiled.backend != .native)
                 return error.ProgramSchemaMismatch;
             if (compiled.steps.len == 0) return error.EmptyProgram;
             if (!compiled.matchesAuthorization(authorized.*))
@@ -372,11 +560,16 @@ fn authorizeProgramArtifacts(
         if (cursor >= compiled.artifacts.len) return error.ProgramArtifactMismatch;
         const artifact = compiled.artifacts[cursor];
         cursor += 1;
+        const artifact_identity = artifact.identity() orelse
+            return error.ProgramArtifactMismatch;
+        const evidence_identity = evidence.archive_identity orelse
+            content_digest.Identity.init(.{ .sha256 = evidence.sha256 }, .sha256) catch
+            return error.ProgramArtifactMismatch;
         if (artifact.index != cursor - 1 or
             !std.mem.eql(u8, artifact.package.name, action.package) or
             !std.mem.eql(u8, artifact.package.version, action.version) or
             !std.mem.eql(u8, artifact.package.architecture, action.architecture) or
-            !std.mem.eql(u8, &artifact.sha256, &hex32(evidence.sha256)) or
+            !artifact_identity.eql(evidence_identity) or
             artifact.size != evidence.size)
             return error.ProgramArtifactMismatch;
     }

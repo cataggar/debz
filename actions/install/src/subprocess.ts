@@ -516,8 +516,8 @@ export function validateDownloadOutputs(
     matchedKey.includes('\n') ||
     (matchedKey.length !== 0 &&
       !(inputs.transactionBackend === 'native'
-        ? /^debz-package-cas-v2-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
-        : /^debz-package-cas-v1-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
+        ? /^debz-package-cas-v5-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
+        : /^debz-package-cas-v3-[A-Za-z0-9-]+-[0-9a-f]{64}-[0-9a-f]{64}$/u
       ).test(matchedKey)) ||
     (cacheHit && matchedKey.length === 0) ||
     (!cacheHit && matchedKey.length > 512)

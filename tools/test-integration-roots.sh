@@ -116,13 +116,20 @@ import sys
 
 legacy = json.loads(pathlib.Path(sys.argv[1]).read_bytes())
 native = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
-assert native["schema"] == "https://debz.dev/schema/exact-closure-lock-v2"
-assert native["version"] == 2
+assert native["schema"] == "https://debz.dev/schema/exact-closure-lock-v3"
+assert native["version"] == 3
 assert native["request_sha256"] == legacy["request_sha256"]
 assert native["policy_sha256"] == hashlib.sha256(
     b"debz.product-native-solver-policy-v1\0" + bytes.fromhex(legacy["policy_sha256"])
 ).hexdigest()
-assert native["repositories"] == legacy["repositories"]
+assert len(native["repositories"]) == len(legacy["repositories"])
+for repository, previous in zip(native["repositories"], legacy["repositories"]):
+    for field in ("id", "snapshot_sha256", "release_sha256", "signer_fingerprints"):
+        assert repository[field] == previous[field]
+    assert repository["index_identity"]["primary"] == "sha256"
+    assert repository["index_identity"]["digests"] == [
+        {"algorithm": "sha256", "digest": previous["index_sha256"]}
+    ]
 assert native["local_artifacts"] == []
 assert len(native["packages"]) == len(legacy["packages"])
 for package, previous in zip(native["packages"], legacy["packages"]):
@@ -130,11 +137,20 @@ for package, previous in zip(native["packages"], legacy["packages"]):
     assert origin["type"] == "authenticated_repository"
     for field in ("repository_id", "repository_snapshot_sha256"):
         assert origin[field] == previous[field]
-    for field in ("name", "version", "architecture", "sha256", "declared_size", "retention", "dpkg_selection_hold"):
+    for field in ("name", "version", "architecture", "declared_size", "retention", "dpkg_selection_hold"):
         assert package[field] == previous[field]
-    data = (pathlib.Path(sys.argv[3]) / "packages-v1/objects" / package["sha256"]).read_bytes()
+    identity = package["archive_identity"]
+    assert identity["primary"] == "sha256"
+    digests = {value["algorithm"]: value["digest"] for value in identity["digests"]}
+    assert digests["sha256"] == previous["sha256"]
+    data = (
+        pathlib.Path(sys.argv[3])
+        / "packages-v2/objects"
+        / f'{identity["primary"]}-{digests[identity["primary"]]}'
+    ).read_bytes()
     assert len(data) == package["declared_size"]
-    assert hashlib.sha256(data).hexdigest() == package["sha256"]
+    for algorithm, expected in digests.items():
+        assert hashlib.new(algorithm, data).hexdigest() == expected
 expected = native.pop("digest_sha256")
 assert hashlib.sha256(json.dumps(native, separators=(",", ":")).encode()).hexdigest() == expected
 PY
@@ -159,10 +175,10 @@ import jsonschema
 fingerprint, prepared, warm = map(json.loads, sys.argv[1:4])
 lock = json.loads(Path(sys.argv[4]).read_bytes())
 for value, name in ((fingerprint, "fingerprint"), (prepared, "result"), (warm, "result")):
-    schema = json.loads(Path(f"schema/package-cache-{name}-v2.json").read_bytes())
+    schema = json.loads(Path(f"schema/package-cache-{name}-v5.json").read_bytes())
     jsonschema.Draft202012Validator.check_schema(schema)
     jsonschema.validate(value, schema)
-    legacy = json.loads(Path(f"schema/package-cache-{name}-v1.json").read_bytes())
+    legacy = json.loads(Path(f"schema/package-cache-{name}-v4.json").read_bytes())
     assert not jsonschema.Draft202012Validator(legacy).is_valid(value)
     assert value["lock_digest"] == lock["digest_sha256"]
 assert prepared["fingerprint"] == warm["fingerprint"] == fingerprint["fingerprint"]
@@ -170,7 +186,7 @@ assert prepared["downloaded_count"] == prepared["verified_count"] == len(lock["p
 assert prepared["reused_count"] == warm["downloaded_count"] == 0
 assert warm["reused_count"] == prepared["verified_count"]
 archive = Path(sys.argv[5]).read_bytes()
-magic = b"debz-package-cache-archive-v2\n"
+magic = b"debz-package-cache-archive-v3\n"
 assert archive.startswith(magic)
 assert struct.unpack(">I", archive[len(magic):len(magic) + 4])[0] == len(lock["packages"])
 assert hashlib.sha256(archive[:-32]).digest() == archive[-32:]
@@ -210,10 +226,10 @@ from pathlib import Path
 import sys
 
 original = json.loads(Path(sys.argv[1]).read_bytes())
-assert original["version"] == 2
+assert original["version"] == 3
 
 def write_cache_fixture(value, path, name):
-    # These v2 cache fixtures are not used as transaction authorization.
+    # These v3 cache fixtures are not used as transaction authorization.
     value.pop("digest_sha256")
     value["request_sha256"] = hashlib.sha256(name.encode()).hexdigest()
     encoded = json.dumps(value, separators=(",", ":")).encode()
@@ -229,12 +245,16 @@ write_cache_fixture(empty, sys.argv[2], "native-cache-empty")
 mixed = copy.deepcopy(original)
 package = next(value for value in mixed["packages"] if value["name"] == "base-dep")
 artifact = {
-    "artifact_id": package["sha256"],
-    "sha256": package["sha256"],
+    "artifact_id": next(
+        value
+        for value in package["archive_identity"]["digests"]
+        if value["algorithm"] == package["archive_identity"]["primary"]
+    ),
+    "archive_identity": package["archive_identity"],
     "size": package["declared_size"],
     "package": {field: package[field] for field in ("name", "version", "architecture")},
     "acquisition_url": "file:/unused-native-cache-artifact.deb?REDACTED",
-    "trust_mode": "pinned_sha256",
+    "trust_mode": "pinned_content_digest",
 }
 package["origin"] = {"type": "local_artifact", **artifact}
 mixed["local_artifacts"] = [artifact]
@@ -267,11 +287,11 @@ fingerprint, prepared, restored = map(json.loads, sys.argv[1:4])
 lock = json.loads(Path(sys.argv[4]).read_bytes())
 assert lock["packages"] == lock["repositories"] == lock["local_artifacts"] == []
 for value, name in ((fingerprint, "fingerprint"), (prepared, "result"), (restored, "result")):
-    jsonschema.validate(value, json.loads(Path(f"schema/package-cache-{name}-v2.json").read_bytes()))
+    jsonschema.validate(value, json.loads(Path(f"schema/package-cache-{name}-v5.json").read_bytes()))
     assert value["lock_digest"] == lock["digest_sha256"]
 assert prepared["verified_count"] == restored["verified_count"] == 0
 assert prepared["fingerprint"] == restored["fingerprint"] == fingerprint["fingerprint"]
-body = b"debz-package-cache-archive-v2\n" + bytes(4)
+body = b"debz-package-cache-archive-v3\n" + bytes(4)
 assert Path(sys.argv[5]).read_bytes() == body + hashlib.sha256(body).digest()
 PY
 
@@ -292,7 +312,7 @@ import sys
 import jsonschema
 
 mixed, local = map(json.loads, sys.argv[1:])
-schema = json.loads(Path("schema/package-cache-result-v2.json").read_bytes())
+schema = json.loads(Path("schema/package-cache-result-v5.json").read_bytes())
 for value in (mixed, local):
     jsonschema.validate(value, schema)
     assert value["downloaded_count"] == 0
@@ -319,9 +339,11 @@ for backend in native legacy_dpkg; do
   if [ "$backend" = native ]; then
     selected_lock="$native_lock"
     wrong_archive="$workspace/legacy-package-cache.dbzcache"
+    object_directory=packages-v2
   else
     selected_lock="$resolved_lock"
     wrong_archive="$native_package_archive"
+    object_directory=packages-v2
   fi
   refused_cache="$workspace/native-cache-version-refusal-$backend"
   set +e
@@ -334,7 +356,8 @@ for backend in native legacy_dpkg; do
   test "$refused_status" -eq 6
   test ! -s "$stderr_file"
   printf '%s' "$refused" | grep -q '"id":"corrupt_cache_archive"'
-  test -z "$(find "$refused_cache/packages-v1/objects" -mindepth 1 -print -quit)"
+  test ! -d "$refused_cache/$object_directory/objects" ||
+    test -z "$(find "$refused_cache/$object_directory/objects" -mindepth 1 -print -quit)"
 done
 set +e
 native_cache_wrong_lock=$("$debz" package-cache fingerprint \
@@ -403,8 +426,8 @@ root = pathlib.Path(sys.argv[1])
 lock = json.loads(pathlib.Path(sys.argv[2]).read_bytes())
 assert {entry["name"] for entry in lock["packages"]} == {"base-dep", "essential-core", "native-helper-target"}
 namespace = root / "var/lib/debz"
-receipt = json.loads((namespace / "native-transaction-provenance-v1.json").read_bytes())
-completion = json.loads((namespace / "root-operation-completion-v1.json").read_bytes())
+receipt = json.loads((namespace / "native-transaction-provenance-v2.json").read_bytes())
+completion = json.loads((namespace / "root-operation-completion-v2.json").read_bytes())
 assert receipt["outcome"] == "succeeded"
 assert receipt["backend"] == completion["backend"] == "native"
 assert receipt["attempt_id"] == completion["attempt_id"]
@@ -419,7 +442,7 @@ for evidence in receipt["evidence_files"]:
     assert hashlib.sha256(data).hexdigest() == evidence["sha256"]
 assert (root / "usr/share/debz-fixtures/base-dep").is_file()
 assert (root / "usr/bin/dpkg-trigger").read_bytes().startswith(b"native-helper-target=")
-for path in ("root-operation-v1.json", "native-execution-intent-v1.json", "native-recovery-v1"):
+for path in ("root-operation-v1.json", "native-execution-intent-v2.json", "native-recovery-v1"):
     assert not (namespace / path).exists()
 PY
   run_mutating_json install $native_execution --lock-input "$native_execution_lock" \
@@ -458,12 +481,12 @@ import sys
 root = Path(sys.argv[1])
 trace = (root / "native-trigger-trace").read_text().splitlines()
 assert trace == ["configure ", "triggered native-fixture"], trace
-receipt = json.loads((root / "var/lib/debz/native-transaction-provenance-v1.json").read_bytes())
+receipt = json.loads((root / "var/lib/debz/native-transaction-provenance-v2.json").read_bytes())
 assert receipt["outcome"] == "succeeded"
 authorization_file = next(entry for entry in receipt["evidence_files"] if entry["kind"] == "authorization")
 authorization = json.loads((root / authorization_file["path"]).read_bytes())
 assert authorization["trigger_authority"]["allowed_triggers"] == ["native-fixture"]
-assert not (root / "var/lib/debz/native-execution-intent-v1.json").exists()
+assert not (root / "var/lib/debz/native-execution-intent-v2.json").exists()
 PY
   if [ "$mode" = native ]; then
     printf 'integration-root: %s/%s native core passed\n' "$suite" "$architecture"
@@ -476,9 +499,9 @@ package_cache_archives="$workspace/package-cache-archives"
 mkdir -p "$package_cache_archives"
 package_cache_common="--lock-input $resolved_lock --cache-path $package_cache_root --architecture $architecture"
 fingerprint=$(run_json package-cache fingerprint $package_cache_common --json)
-printf '%s' "$fingerprint" | grep -q '"schema":"io.github.cataggar.debz.package-cache-fingerprint.v1"'
-printf '%s' "$fingerprint" | grep -q '"capability":"package-cache-v1"'
-printf '%s' "$fingerprint" | grep -q '"cas_layout":"packages-v1"'
+printf '%s' "$fingerprint" | grep -q '"schema":"io.github.cataggar.debz.package-cache-fingerprint.v3"'
+printf '%s' "$fingerprint" | grep -q '"capability":"package-cache-v3"'
+printf '%s' "$fingerprint" | grep -q '"cas_layout":"packages-v2"'
 
 set +e
 unsupported=$("$debz" package-cache fingerprint \
@@ -504,7 +527,7 @@ printf '%s' "$wrong_architecture" | grep -q '"id":"invalid_request"'
 cold=$(run_json package-cache prepare $package_cache_common \
   --source "$source_file" --keyring "$keyring" \
   --archive-output "$package_cache_archives/base.dbzcache" --json)
-printf '%s' "$cold" | grep -q '"schema":"io.github.cataggar.debz.package-cache-result.v1"'
+printf '%s' "$cold" | grep -q '"schema":"io.github.cataggar.debz.package-cache-result.v3"'
 python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == value["verified_count"]; assert value["reused_count"] == 0' <<EOF
 $cold
 EOF
@@ -518,7 +541,7 @@ lock = json.loads(pathlib.Path(sys.argv[1]).read_text())
 digest = lock["packages"][0]["sha256"]
 name = f"package-{digest[:8]}-0000000000000000.tmp"
 name += "_" * (96 - len(name))
-staging = pathlib.Path(sys.argv[2]) / "packages-v1" / "staging"
+staging = pathlib.Path(sys.argv[2]) / "packages-v2" / "staging"
 staging.mkdir(parents=True)
 (staging / name).write_bytes(b"abandoned")
 PY
@@ -530,12 +553,12 @@ retried=$(run_json package-cache prepare \
 python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["downloaded_count"] == 0; assert value["reused_count"] == value["verified_count"]; assert value["staging"]["deleted"] >= 1' <<EOF
 $retried
 EOF
-test -z "$(find "$retry_cache/packages-v1/staging" -mindepth 1 -print -quit)"
+test -z "$(find "$retry_cache/packages-v2/staging" -mindepth 1 -print -quit)"
 
 limited_cache="$workspace/package-cache-cleanup-limit"
-mkdir -p "$limited_cache/packages-v1/staging"
-printf partial >"$limited_cache/packages-v1/staging/one"
-printf partial >"$limited_cache/packages-v1/staging/two"
+mkdir -p "$limited_cache/packages-v2/staging"
+printf partial >"$limited_cache/packages-v2/staging/one"
+printf partial >"$limited_cache/packages-v2/staging/two"
 set +e
 cleanup_limited=$("$debz" package-cache prepare \
   --lock-input "$resolved_lock" --cache-path "$limited_cache" \
@@ -547,7 +570,7 @@ set -e
 test "$cleanup_limited_status" -eq 3
 test ! -s "$stderr_file"
 printf '%s' "$cleanup_limited" | grep -q '"id":"staging_cleanup_incomplete"'
-test -z "$(find "$limited_cache/packages-v1/objects" -mindepth 1 -type f -print -quit)"
+test -z "$(find "$limited_cache/packages-v2/objects" -mindepth 1 -type f -print -quit)"
 
 exact=$(run_json package-cache prepare $package_cache_common \
   --source "$source_file" --keyring "$keyring" --offline --json)
@@ -603,7 +626,7 @@ python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["gc"]["del
 $pruned
 EOF
 
-first_cache_object=$(find "$package_cache_root/packages-v1/objects" -type f | head -n 1 || true)
+first_cache_object=$(find "$package_cache_root/packages-v2/objects" -type f | head -n 1 || true)
 test -n "$first_cache_object"
 cp "$first_cache_object" "$workspace/package-cache-object.backup"
 printf 'corrupt' >"$first_cache_object"
@@ -624,8 +647,8 @@ EOF
 rm -f "$workspace/package-cache-object.backup"
 
 offline_objects_only="$workspace/offline-objects-only"
-mkdir -p "$offline_objects_only/packages-v1"
-cp -R "$package_cache_root/packages-v1/objects" "$offline_objects_only/packages-v1/objects"
+mkdir -p "$offline_objects_only/packages-v2"
+cp -R "$package_cache_root/packages-v2/objects" "$offline_objects_only/packages-v2/objects"
 set +e
 offline_without_metadata=$("$debz" package-cache prepare \
   --lock-input "$resolved_lock" --cache-path "$offline_objects_only" \
@@ -649,9 +672,9 @@ printf '%s' "$moving_repository" | grep -q '"id":"repository_authentication_fail
 python3 tools/generate-integration-repository.py \
   --output "$repo" --suite "$suite" --architecture "$architecture"
 
-find "$package_cache_root/packages-v1/objects" -mindepth 1 -maxdepth 1 -type f |
+find "$package_cache_root/packages-v2/objects" -mindepth 1 -maxdepth 1 -type f |
   while IFS= read -r object; do
-    basename "$object" | grep -Eq '^[0-9a-f]{64}$'
+    basename "$object" | grep -Eq '^sha(256|512)-[0-9a-f]+$'
   done
 case "$suite" in
   debian-stable) run_json info $common trigger-pkg | grep -q '"version":"1.0-1debian1"' ;;
@@ -697,7 +720,7 @@ EOF
   run_json why $common --status-path "$workspace/held.status" held-fixture |
     grep -q '"detail":"explicit dpkg hold"'
 
-  first_object=$(find "$cache" -type f -path '*/packages-v1/objects/*' | head -n 1 || true)
+  first_object=$(find "$cache" -type f -path '*/packages-v2/objects/*' | head -n 1 || true)
   if [ -n "$first_object" ]; then
     cp "$first_object" "$workspace/cache-object.backup"
     printf 'corrupt' >"$first_object"

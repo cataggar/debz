@@ -14,16 +14,19 @@
 //! preflight with a typed diagnostic instead of being approximated.
 
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 const deb_archive = @import("deb_archive.zig");
 const deb_payload = @import("deb_payload.zig");
 const control_record = @import("control_record.zig");
 const relation = @import("relation.zig");
 
 pub const model_version: u32 = 1;
+pub const identity_model_version: u32 = 2;
 
 /// Domain separator for the deterministic application digest. Changing the
 /// modeled contract requires changing this string and `model_version`.
 pub const digest_domain = "debz.archive-application.v1";
+pub const identity_digest_domain = "debz.archive-application.v2";
 
 pub const Limits = struct {
     payload: deb_payload.Limits = .{},
@@ -556,6 +559,10 @@ pub const Model = struct {
     pub fn verifyArtifactBinding(self: *const Model, bytes: []const u8) error{BindingMismatch}!void {
         const source = self.provenance();
         if (bytes.len != source.size) return error.BindingMismatch;
+        if (source.archive_identity) |identity| {
+            identity.verify(bytes) catch return error.BindingMismatch;
+            return;
+        }
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
         if (!std.crypto.timing_safe.eql([32]u8, digest, source.sha256))
@@ -1304,8 +1311,9 @@ const DigestWriter = struct {
 /// program so the applied archive cannot drift from the reviewed one.
 fn computeDigest(model: *const Model) [32]u8 {
     var writer = DigestWriter.init();
-    writer.text(digest_domain);
-    writer.number(model_version);
+    const typed_identity = model.validation.provenance.archive_identity != null;
+    writer.text(if (typed_identity) identity_digest_domain else digest_domain);
+    writer.number(if (typed_identity) identity_model_version else model_version);
 
     writer.text(model.identity.package);
     writer.text(model.identity.version);
@@ -1316,7 +1324,20 @@ fn computeDigest(model: *const Model) [32]u8 {
     writer.text(source.repository);
     writer.text(source.filename);
     writer.number(source.size);
-    writer.digest(&source.sha256);
+    if (source.archive_identity) |identity| {
+        writer.tag(identity.primary);
+        writer.number(identity.digests.count());
+        inline for (content_digest.supported_algorithms) |algorithm| {
+            if (identity.digests.get(algorithm)) |digest| {
+                writer.tag(algorithm);
+                switch (digest) {
+                    inline else => |bytes| writer.digest(&bytes),
+                }
+            }
+        }
+    } else {
+        writer.digest(&source.sha256);
+    }
 
     writer.flag(model.facts.essential);
     writer.flag(model.facts.protected);

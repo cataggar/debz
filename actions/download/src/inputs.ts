@@ -228,7 +228,7 @@ export async function readInputs(
     scalar(environment, 'CACHE_ROOT'),
     runnerTemp,
   );
-  const cachePath = path.join(cacheRoot, 'packages-v1', 'objects');
+  const cachePath = path.join(cacheRoot, 'packages-v2', 'objects');
   await createSafeDirectory(cachePath, runnerTemp);
 
   const protectedPaths = [
