@@ -723,6 +723,15 @@ config; missing, foreign or changed bytes/mode/ownership remain refusals.
 This serialization does not move or invoke config scripts or change configure
 callback ordering.
 
+Case-only package leaf names require a root-mutation
+`assert_case_sensitive` step immediately before each publication. The guard
+binds an existing, unchanged witness and exact parent directory into the
+journal. The engine rechecks it before the no-replace publication and before
+rollback classifies either spelling. A crash before or after either rename
+restores the old state when the directory still proves case-sensitive; lost
+proof or an externally replaced directory becomes `recovery_required` instead
+of treating the other spelling as a foreign entry and guessing at cleanup.
+
 Caller-owned core cases also cover conffile purge and fresh/upgraded
 configuration retry, including partial database publication, prepared/recorded
 postrm and postinst outcomes, failed purge and its subsequent trigger work,

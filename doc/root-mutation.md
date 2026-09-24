@@ -43,7 +43,7 @@ evidence.
 
 The journal is canonically serialized JSON validated by
 [`root-mutation-journal-v1`](../schema/root-mutation-journal-v1.json). Decoding
-is strict and bounded: unknown fields, missing fields, an unsupported schema, a
+is strict and bounded: unknown fields or step kinds, missing fields, an unsupported schema, a
 step whose recorded shape contradicts its kind, a mismatched step or document
 digest, and any byte sequence that is not the exact canonical encoding are all
 rejected. `digest_sha256` covers the whole document with its own field removed,
@@ -82,6 +82,7 @@ backup names, and the steps it depends on.
 | `publish_hard_link` | a hard link to an existing regular file in the same root |
 | `create_directory` | a directory with an exact mode and ownership |
 | `set_metadata` | a new mode, ownership, or modification time on an existing path |
+| `assert_case_sensitive` | no mutation: binds an exact directory and an existing regular-file witness to a distinct-case lookup |
 | `remove_path` | removal of a regular file, hard link, or symbolic link |
 | `remove_directory` | removal of an empty directory |
 
@@ -104,6 +105,23 @@ Preflight refuses, before anything can change:
 | `capacity_exceeded` / `numeric_overflow` / `step_limit` | bounded resource accounting |
 | `content_digest_mismatch` | content that does not hash to the digest the caller authorized |
 | `metadata_unsupported` | a mode change on a symbolic link, a mode outside `07777`, or an in-place ownership change on a non-directory carrying `security.capability` |
+| `case_sensitivity_unproven` | an absent, replaced, or unsupported parent/witness, or an occupied differently cased witness spelling |
+
+A case-only pair may be published only when each member has an immediately
+preceding read-only `assert_case_sensitive` step on its exact destination
+directory. Preflight binds a pre-existing regular witness in that directory,
+its SHA-256, and the directory's inode; the witness must be untouched by every
+step of the transaction. A differently cased spelling of the same witness
+must be confirmed absent, not merely fail a lookup. The assertion is repeated
+at verification, before each guarded publication, and before rollback
+classifies a guarded target. A guarded publication the forward pass never
+reached may be skipped only if its exact recorded precondition still holds;
+an occupant must not be mistaken for an unpublished case-only sibling. A
+missing witness or newly created parent cannot
+prove case sensitivity and is refused. No probe file is ever created under the
+destination. A `require_absent` publication uses atomic no-replace rename;
+unsupported no-replace operations fail instead of overwriting an occupant.
+Recovery does not interpret one alias as the other's foreign entry.
 
 One ordered hard-link replacement is not an ambiguous alias: after an earlier
 step has modeled replacing the exact declared source, a later hard-link target

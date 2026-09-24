@@ -2514,6 +2514,9 @@ const FoldedPath = struct {
     spelling: []const u8,
     kind: ?Kind,
     requires_directory: bool,
+    /// Null for installed, reserved, cross-package, or ancestor evidence.
+    fresh_package: ?u32 = null,
+    collisions: usize = 0,
 };
 
 /// Exact live-allocation budget used only for rebuilt archive models and
@@ -7044,16 +7047,17 @@ fn emptiedDirectory(
 
 fn indexCaseGraph(builder: *Builder) PlanError!void {
     for (alias_directories) |name|
-        try recordPathPrefixes(builder, name, null);
+        try recordPathPrefixes(builder, name, null, null);
     for (builder.aliases.aliases) |alias|
-        try recordPathPrefixes(builder, alias.to, .directory);
+        try recordPathPrefixes(builder, alias.to, .directory, null);
     try recordPathPrefixes(
         builder,
         package_database.database_directory,
         .directory,
+        null,
     );
     for (builder.ownership.entries) |entry|
-        try recordPathPrefixes(builder, entry.path, null);
+        try recordPathPrefixes(builder, entry.path, null, null);
     var conffile_paths: std.ArrayList([]const u8) = .empty;
     defer conffile_paths.deinit(builder.allocator);
     var conffiles = builder.installed_conffiles.keyIterator();
@@ -7061,10 +7065,15 @@ fn indexCaseGraph(builder: *Builder) PlanError!void {
         try conffile_paths.append(builder.allocator, path.*);
     std.mem.sort([]const u8, conffile_paths.items, {}, lessPath);
     for (conffile_paths.items) |path|
-        try recordPathPrefixes(builder, path, null);
-    for (builder.work.items) |item| {
+        try recordPathPrefixes(builder, path, null, null);
+    for (builder.work.items, 0..) |item, index| {
         for (item.claims) |claim|
-            try recordPathPrefixes(builder, claim.path, claim.kind);
+            try recordPathPrefixes(
+                builder,
+                claim.path,
+                claim.kind,
+                if (item.prior == null) @intCast(index) else null,
+            );
     }
 }
 
@@ -7072,13 +7081,14 @@ fn recordPathPrefixes(
     builder: *Builder,
     path: []const u8,
     final_kind: ?Kind,
+    fresh_package: ?u32,
 ) PlanError!void {
     var index: usize = 0;
     while (index < path.len) : (index += 1) {
         if (path[index] != '/') continue;
-        try recordCasePath(builder, path[0..index], null, true);
+        try recordCasePath(builder, path[0..index], null, true, null);
     }
-    try recordCasePath(builder, path, final_kind, false);
+    try recordCasePath(builder, path, final_kind, false, fresh_package);
 }
 
 /// Records every typed path prefix. Item 10 has no authenticated casefold
@@ -7090,6 +7100,7 @@ fn recordCasePath(
     path: []const u8,
     kind: ?Kind,
     requires_directory: bool,
+    fresh_package: ?u32,
 ) PlanError!void {
     try builder.chargeWork(1, .{
         .surface = .alias,
@@ -7140,12 +7151,15 @@ fn recordCasePath(
             .spelling = path,
             .kind = kind,
             .requires_directory = requires_directory,
+            .fresh_package = fresh_package,
         });
         builder.case_index_bytes = next;
         return;
     }
     const found = existing.?;
     if (std.mem.eql(u8, found.spelling, path)) {
+        if (found.fresh_package != fresh_package)
+            found.fresh_package = null;
         const existing_kind = found.kind;
         if ((found.requires_directory and
             kind != null and kind.? != .directory) or
@@ -7179,20 +7193,78 @@ fn recordCasePath(
         .first = found.spelling,
         .second = path,
     });
+    found.collisions += 1;
 }
 
-/// The item-10 planner has no authenticated casefold capability. Any two
-/// distinct spellings that ASCII-fold together are therefore ambiguous and
-/// refused rather than guessed from the host filesystem.
+/// Only fresh, distinct leaf claims of one signed archive can use the
+/// journaled exact-parent capability assertion at materialization time.
 fn proveCaseEvidence(builder: *Builder) PlanError!void {
     for (builder.case_aliases.items) |pair| {
-        return builder.fail(.{
+        const refusal: Diagnostic = .{
             .surface = .alias,
             .code = .case_alias,
             .path = pair.second,
             .holder = pair.first,
-        });
+        };
+        const first_parent = std.mem.lastIndexOfScalar(u8, pair.first, '/') orelse
+            return builder.fail(refusal);
+        const second_parent = std.mem.lastIndexOfScalar(u8, pair.second, '/') orelse
+            return builder.fail(refusal);
+        if (!std.mem.eql(u8, pair.first[0..first_parent], pair.second[0..second_parent]))
+            return builder.fail(refusal);
+        var scratch: [root_fs.maximum_path_bytes]u8 = undefined;
+        const folded = scratch[0..pair.first.len];
+        for (pair.first, 0..) |byte, index| folded[index] = std.ascii.toLower(byte);
+        const indexed = builder.folded.get(folded) orelse return builder.fail(refusal);
+        if (indexed.collisions != 1) return builder.fail(refusal);
+        const package_index = indexed.fresh_package orelse {
+            try proveInstalledCasePair(builder, pair, refusal);
+            continue;
+        };
+        const item = builder.work.items[package_index];
+        var first: ?Kind = null;
+        var second: ?Kind = null;
+        for (item.claims) |claim| {
+            if (std.mem.eql(u8, claim.path, pair.first)) first = claim.kind;
+            if (std.mem.eql(u8, claim.path, pair.second)) second = claim.kind;
+        }
+        if (first == null or second == null or
+            (first.? != .regular and first.? != .symlink) or
+            (second.? != .regular and second.? != .symlink))
+            return builder.fail(refusal);
     }
+}
+
+/// Previously published aliases are not new permissions for this
+/// transaction. They may remain only when the database assigns both exact
+/// spellings to one untouched owner and the root still exposes distinct
+/// entries in the same directory. Any attempted ownership or content change
+/// falls back to the ordinary case-alias refusal.
+fn proveInstalledCasePair(
+    builder: *Builder,
+    pair: CaseAlias,
+    refusal: Diagnostic,
+) PlanError!void {
+    const first = builder.ownership.ownersOf(pair.first);
+    const second = builder.ownership.ownersOf(pair.second);
+    if (first.len != 1 or second.len != 1 or first[0].owner != second[0].owner or
+        builder.owner_work.contains(first[0].owner) or
+        builder.transaction_claims.contains(pair.first) or
+        builder.transaction_claims.contains(pair.second) or
+        builder.installed_conffiles.contains(pair.first) or
+        builder.installed_conffiles.contains(pair.second))
+        return builder.fail(refusal);
+    const left = builder.request.root.entry(
+        root_fs.Path.initPackage(pair.first) catch return builder.fail(refusal),
+    ) catch return builder.fail(refusal);
+    const right = builder.request.root.entry(
+        root_fs.Path.initPackage(pair.second) catch return builder.fail(refusal),
+    ) catch return builder.fail(refusal);
+    if (!left.modeled or !right.modeled or left.inode == 0 or right.inode == 0 or
+        left.device != right.device or left.inode == right.inode or
+        !(left.isRegularFile() or left.isSymbolicLink()) or
+        !(right.isRegularFile() or right.isSymbolicLink()))
+        return builder.fail(refusal);
 }
 
 // ---------------------------------------------------------------------------
@@ -9163,6 +9235,57 @@ fn rootFileSha256(
     return digest;
 }
 
+fn appendCaseGuard(
+    allocator: std.mem.Allocator,
+    owned: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    touched: *const std.StringHashMapUnmanaged(void),
+    intents: *std.ArrayList(root_mutation.Intent),
+) !void {
+    const separator = std.mem.lastIndexOfScalar(u8, path, '/') orelse
+        return error.CaseSensitivityUnproven;
+    const parent = path[0..separator];
+    const parent_path = try root_fs.Path.initPackage(parent);
+    const parent_entry = root.entry(parent_path) catch
+        return error.CaseSensitivityUnproven;
+    if (!parent_entry.isDirectory() or !parent_entry.modeled or parent_entry.inode == 0)
+        return error.CaseSensitivityUnproven;
+    var dir = root.openDirectory(parent_path) catch
+        return error.CaseSensitivityUnproven;
+    defer dir.close(root.io);
+    var iterator = dir.iterate();
+    var scanned: usize = 0;
+    var selected: ?[]const u8 = null;
+    while (iterator.next(root.io) catch return error.CaseSensitivityUnproven) |member| {
+        scanned += 1;
+        if (scanned > 512) return error.CaseSensitivityUnproven;
+        const witness = try std.fmt.allocPrint(owned, "{s}/{s}", .{ parent, member.name });
+        if (witness.len > root_fs.maximum_path_bytes or touched.contains(witness))
+            continue;
+        const witness_path = root_fs.Path.initPackage(witness) catch continue;
+        var variant_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const variant = root_mutation.caseVariant(witness, &variant_buffer) orelse continue;
+        if (try root.entryIfExists(variant) != null) continue;
+        const entry = root.entry(witness_path) catch
+            return error.CaseSensitivityUnproven;
+        if (!entry.isRegularFile() or !entry.modeled or entry.inode == 0 or
+            entry.device != parent_entry.device or entry.link_count != 1 or
+            entry.size > 1024 * 1024)
+            continue;
+        if (selected == null or std.mem.lessThan(u8, witness, selected.?))
+            selected = witness;
+    }
+    const witness = selected orelse return error.CaseSensitivityUnproven;
+    const digest = rootFileSha256(allocator, root, witness, 1024 * 1024) catch
+        return error.CaseSensitivityUnproven;
+    try intents.append(allocator, .{ .case_sensitive = .{
+        .path = parent,
+        .witness = witness,
+        .witness_sha256 = digest,
+    } });
+}
+
 fn lowerMaterializationIntents(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -9186,8 +9309,22 @@ fn lowerMaterializationIntents(
     defer required_paths.deinit(allocator);
     var publications: std.StringHashMapUnmanaged(PlannedPath) = .empty;
     defer publications.deinit(allocator);
+    var guarded: std.StringHashMapUnmanaged(void) = .empty;
+    defer guarded.deinit(allocator);
+    var touched: std.StringHashMapUnmanaged(void) = .empty;
+    defer touched.deinit(allocator);
     var conffiles: std.StringHashMapUnmanaged(PlannedConffile) = .empty;
     defer conffiles.deinit(allocator);
+    for (plan_value.case_aliases) |pair| {
+        try guarded.put(allocator, pair.first, {});
+        try guarded.put(allocator, pair.second, {});
+    }
+    for (plan_value.filesystem) |change| {
+        const path = switch (change) {
+            inline else => |value| value.path,
+        };
+        try touched.put(allocator, path, {});
+    }
     for (plan_value.packages) |package| {
         for (package.paths) |planned| {
             if (!planned.publish) continue;
@@ -9302,6 +9439,8 @@ fn lowerMaterializationIntents(
             }
         },
         .file => |file| {
+            if (guarded.contains(file.path))
+                try appendCaseGuard(allocator, owned, root, file.path, &touched, &intents);
             const archive = bound.find(file.artifact) orelse
                 return error.MaterializationArchiveMissing;
             if (file.archive_entry >= archive.model.files.len)
@@ -9324,19 +9463,27 @@ fn lowerMaterializationIntents(
             );
             try intents.append(allocator, intent);
         },
-        .symlink => |link| try intents.append(allocator, .{ .symlink = .{
-            .path = link.path,
-            .target = link.target,
-            .uid = link.uid,
-            .gid = link.gid,
-            .modified_nanoseconds = link.modified_nanoseconds,
-            .overwrite = try materializationOverwrite(&publications, link.path),
-        } }),
-        .hardlink => |link| try intents.append(allocator, .{ .hard_link = .{
-            .path = link.path,
-            .source = link.source,
-            .overwrite = try materializationOverwrite(&publications, link.path),
-        } }),
+        .symlink => |link| {
+            if (guarded.contains(link.path))
+                try appendCaseGuard(allocator, owned, root, link.path, &touched, &intents);
+            try intents.append(allocator, .{ .symlink = .{
+                .path = link.path,
+                .target = link.target,
+                .uid = link.uid,
+                .gid = link.gid,
+                .modified_nanoseconds = link.modified_nanoseconds,
+                .overwrite = try materializationOverwrite(&publications, link.path),
+            } });
+        },
+        .hardlink => |link| {
+            if (guarded.contains(link.path))
+                return error.MaterializationPlanMismatch;
+            try intents.append(allocator, .{ .hard_link = .{
+                .path = link.path,
+                .source = link.source,
+                .overwrite = try materializationOverwrite(&publications, link.path),
+            } });
+        },
     };
     std.mem.reverse(root_mutation.Intent, directory_metadata.items);
     try intents.appendSlice(allocator, directory_metadata.items);
@@ -10074,6 +10221,10 @@ fn materialize(
                 .outcome = .refused,
                 .detail = "zero_directory_timestamp_unsupported",
             },
+            error.CaseSensitivityUnproven => return .{
+                .outcome = .refused,
+                .detail = "case_sensitivity_unproven",
+            },
             else => return err,
         };
         defer lowered.deinit();
@@ -10439,6 +10590,10 @@ fn materializePlanned(
         error.ZeroDirectoryTimestampUnsupported => return .{
             .outcome = .refused,
             .detail = "zero_directory_timestamp_unsupported",
+        },
+        error.CaseSensitivityUnproven => return .{
+            .outcome = .refused,
+            .detail = "case_sensitivity_unproven",
         },
         else => return err,
     };
@@ -33580,8 +33735,8 @@ test "native_unpack.test.case ambiguity and folded dpkg namespace fail closed" {
         },
         .{
             .data = &.{
-                .{ .path = "usr/share/Foo", .content = "a\n" },
-                .{ .path = "usr/share/foo", .content = "b\n" },
+                .{ .path = "usr/share/Foo/a", .content = "a\n" },
+                .{ .path = "usr/share/foo/b", .content = "b\n" },
             },
             .code = .case_alias,
         },
@@ -33609,6 +33764,147 @@ test "native_unpack.test.case ambiguity and folded dpkg namespace fail closed" {
             &.{.{ .artifact = 0, .bytes = bytes }},
         ), case.code);
     }
+}
+
+test "native_unpack.test.fresh case-only manpage and symlink require journaled guards" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    try seedFile(fixture.root(), "usr/share/man/man7/witness", "witness\n");
+    var data = [_]Entry{
+        .{ .path = "usr/share/man/man7/PAM.7.gz", .content = "manual\n" },
+        .{ .path = "usr/share/man/man7/pam.7.gz", .kind = '2', .link = "PAM.7.gz" },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "demo", .version = "1" }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    var planned = try expectPlan(try planFor(
+        &fixture,
+        &program,
+        &.{.{ .artifact = 0, .bytes = bytes }},
+    ));
+    defer planned.deinit();
+    try testing.expectEqual(@as(usize, 1), planned.case_aliases.len);
+    try testing.expectEqualStrings("usr/share/man/man7/PAM.7.gz", planned.case_aliases[0].first);
+    try testing.expectEqualStrings("usr/share/man/man7/pam.7.gz", planned.case_aliases[0].second);
+    try fixture.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "usr/share/man/man7/0bad\nname",
+        .data = "unowned\n",
+    });
+
+    var bound_model = try modelOf(bytes);
+    defer bound_model.deinit();
+    var archives = [_]BoundArchive{.{
+        .artifact = 0,
+        .bytes = bytes,
+        .model = bound_model,
+        .binding = try root_mutation.bindArchive(&bound_model, bytes, 0, model.digest),
+    }};
+    const bound: BoundArchives = .{ .items = &archives, .allocator = testing.allocator };
+    var lowered = try lowerMaterializationIntents(
+        testing.allocator,
+        fixture.root(),
+        planned,
+        &bound,
+        false,
+        false,
+    );
+    defer lowered.deinit();
+    var guards: usize = 0;
+    for (lowered.intents.items, 0..) |intent, index| {
+        if (intent != .case_sensitive) continue;
+        guards += 1;
+        try testing.expectEqualStrings("usr/share/man/man7", intent.case_sensitive.path);
+        try testing.expectEqualStrings(
+            "usr/share/man/man7/witness",
+            intent.case_sensitive.witness,
+        );
+        try testing.expect(index + 1 < lowered.intents.items.len);
+        try testing.expect(lowered.intents.items[index + 1] == .file or
+            lowered.intents.items[index + 1] == .symlink);
+    }
+    try testing.expectEqual(@as(usize, 2), guards);
+}
+
+test "native_unpack.test.unchanged installed case pair never authorizes another claimant" {
+    const status =
+        \\Package: prior
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: prior
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{.{
+        .name = "prior.list",
+        .bytes = "/.\n/usr/share/man/man7/PAM.7.gz\n/usr/share/man/man7/pam.7.gz\n",
+    }};
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    try seedFile(fixture.root(), "usr/share/man/man7/PAM.7.gz", "manual\n");
+    try fixture.root().createSymbolicLink(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        "PAM.7.gz",
+    );
+    var new_data = [_]Entry{.{ .path = "usr/share/kbd/new", .content = "new\n" }};
+    const new_bytes = try buildOwnedArchive(
+        .{ .package = "keyboard", .version = "1" },
+        &new_data,
+    );
+    defer testing.allocator.free(new_bytes);
+    var new_model = try modelOf(new_bytes);
+    defer new_model.deinit();
+    const new_steps = [_]native_program.Step{unpackStep(0, &new_model, 0, null, false)};
+    var new_artifacts: [1]native_program.ProgramArtifact = undefined;
+    const new_program = try singleProgram(
+        &fixture,
+        &new_model,
+        new_bytes,
+        &new_steps,
+        &new_artifacts,
+    );
+    var planned = try expectPlan(try planFor(
+        &fixture,
+        &new_program,
+        &.{.{ .artifact = 0, .bytes = new_bytes }},
+    ));
+    defer planned.deinit();
+    try testing.expectEqual(@as(usize, 1), planned.case_aliases.len);
+
+    var third_data = [_]Entry{.{ .path = "usr/share/man/man7/PaM.7.gz", .content = "foreign\n" }};
+    const third_bytes = try buildOwnedArchive(
+        .{ .package = "third", .version = "1" },
+        &third_data,
+    );
+    defer testing.allocator.free(third_bytes);
+    var third_model = try modelOf(third_bytes);
+    defer third_model.deinit();
+    const third_steps = [_]native_program.Step{unpackStep(0, &third_model, 0, null, false)};
+    var third_artifacts: [1]native_program.ProgramArtifact = undefined;
+    const third_program = try singleProgram(
+        &fixture,
+        &third_model,
+        third_bytes,
+        &third_steps,
+        &third_artifacts,
+    );
+    try expectRefusal(try planFor(
+        &fixture,
+        &third_program,
+        &.{.{ .artifact = 0, .bytes = third_bytes }},
+    ), .case_alias);
+    try fixture.root().removeFile(try root_fs.Path.init("usr/share/man/man7/pam.7.gz"));
+    try expectRefusal(try planFor(
+        &fixture,
+        &new_program,
+        &.{.{ .artifact = 0, .bytes = new_bytes }},
+    ), .case_alias);
 }
 
 test "native_unpack.test.removal triggers preserve every interested identity" {
@@ -36513,7 +36809,7 @@ test "native_unpack.test.120k repeated prefixes allocate one bounded case key" {
     };
     defer builder.deinit();
     for (0..120_000) |_|
-        try recordPathPrefixes(&builder, path, .regular);
+        try recordPathPrefixes(&builder, path, .regular, null);
     try testing.expectEqual(components, builder.folded.count());
     try testing.expectEqual(components, builder.folded_keys.items.len);
     try testing.expectEqual(expected_bytes, builder.case_index_bytes);
@@ -36534,7 +36830,7 @@ test "native_unpack.test.120k repeated prefixes allocate one bounded case key" {
     defer rejected.deinit();
     try testing.expectError(
         error.Rejected,
-        recordPathPrefixes(&rejected, path, .regular),
+        recordPathPrefixes(&rejected, path, .regular, null),
     );
     try testing.expectEqual(Code.case_alias_limit, rejected.diagnostic.?.code);
 }

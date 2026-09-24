@@ -160,6 +160,7 @@ pub const Code = enum {
     artifact_binding_mismatch,
     database_plan_mismatch,
     metadata_unsupported,
+    case_sensitivity_unproven,
 
     // Durable state refusals.
     journal_corrupt,
@@ -357,6 +358,9 @@ pub const StepKind = enum {
     /// Change only the mode, ownership, or modification time of an existing
     /// path.
     set_metadata,
+    /// Read-only assertion on a directory and an existing, distinct-case
+    /// witness. The following publication must recheck it on recovery.
+    assert_case_sensitive,
     /// Remove a regular file, hard link, or symbolic link.
     remove_path,
     remove_directory,
@@ -421,6 +425,7 @@ pub const Step = struct {
 
     /// The durability boundaries this step passes through, in order.
     pub fn boundaries(self: Step) []const StepState {
+        if (self.kind == .assert_case_sensitive) return &.{.verified};
         if (self.satisfied()) return &.{.verified};
         return switch (self.kind) {
             .publish_file, .copy_file, .publish_symlink, .publish_hard_link => if (self.needsBackup())
@@ -432,6 +437,7 @@ pub const Step = struct {
             else
                 &.{ .published, .metadata_applied, .parent_synced, .verified },
             .set_metadata => &.{ .metadata_applied, .verified },
+            .assert_case_sensitive => unreachable,
             .remove_path => if (self.needsBackup())
                 &.{ .backup_captured, .published, .parent_synced, .verified }
             else
@@ -1338,6 +1344,22 @@ fn validateStepShape(step: Step) Error!void {
             };
             if (value.kind != previous.kind) return error.NonCanonicalDocument;
         },
+        .assert_case_sensitive => {
+            const value = desired orelse return error.NonCanonicalDocument;
+            if (value.kind != .directory or !step.satisfied() or
+                step.source == null or step.source_sha256 == null or
+                step.artifact != null or step.staging_entry != null or
+                step.backup_entry != null)
+                return error.NonCanonicalDocument;
+            const source = step.source.?;
+            const parent = (root_fs.Path.initPackage(source) catch
+                return error.NonCanonicalDocument).parent() orelse
+                return error.NonCanonicalDocument;
+            var variant_buffer: [maximum_path_bytes]u8 = undefined;
+            if (!std.mem.eql(u8, parent.text, step.path) or
+                caseVariant(source, &variant_buffer) == null)
+                return error.NonCanonicalDocument;
+        },
         .remove_path, .remove_directory => {
             if (desired != null) return error.NonCanonicalDocument;
             switch (step.removal) {
@@ -1916,6 +1938,15 @@ pub const MetadataIntent = struct {
     modified_nanoseconds: ?i128 = null,
 };
 
+pub const CaseSensitiveIntent = struct {
+    /// The exact destination directory, never a symlink or a parent alias.
+    path: []const u8,
+    /// An existing regular file directly inside `path`, not changed by this
+    /// transaction. Its differently cased spelling must be absent.
+    witness: []const u8,
+    witness_sha256: [32]u8,
+};
+
 pub const RemoveIntent = struct {
     path: []const u8,
     removal: Removal = .require_present,
@@ -1928,6 +1959,7 @@ pub const Intent = union(enum) {
     hard_link: HardLinkIntent,
     directory: DirectoryIntent,
     metadata: MetadataIntent,
+    case_sensitive: CaseSensitiveIntent,
     remove: RemoveIntent,
     remove_directory: RemoveIntent,
 
@@ -2086,7 +2118,37 @@ fn build(builder: *Builder, request: PreflightRequest) BuildError!void {
     builder.workspace_device = workspace;
 
     for (request.intents) |intent| try appendIntent(builder, intent);
+    for (builder.steps.items) |step| {
+        if (step.kind != .assert_case_sensitive) continue;
+        for (builder.steps.items) |other| {
+            if (other.index != step.index and
+                std.mem.eql(u8, other.path, step.source.?))
+                return builder.fail(.preflight, .case_sensitivity_unproven, step.path);
+        }
+    }
     try validateHardLinks(builder, request);
+}
+
+/// Toggle one ASCII letter in the final component only. This is a read-only
+/// lookup of the same file under another spelling, not a probe mutation.
+pub fn caseVariant(path: []const u8, buffer: *[maximum_path_bytes]u8) ?root_fs.Path {
+    if (path.len > buffer.len) return null;
+    @memcpy(buffer[0..path.len], path);
+    const leaf = (std.mem.lastIndexOfScalar(u8, path, '/') orelse return null) + 1;
+    for (path[leaf..]) |byte| {
+        if (byte >= 0x80) return null;
+    }
+    for (path[leaf..], leaf..) |byte, index| {
+        if (std.ascii.isLower(byte)) {
+            buffer[index] = std.ascii.toUpper(byte);
+            return .{ .text = buffer[0..path.len] };
+        }
+        if (std.ascii.isUpper(byte)) {
+            buffer[index] = std.ascii.toLower(byte);
+            return .{ .text = buffer[0..path.len] };
+        }
+    }
+    return null;
 }
 
 fn appendIntent(builder: *Builder, intent: Intent) BuildError!void {
@@ -2566,6 +2628,47 @@ fn buildStep(
                     return builder.fail(.preflight, .metadata_unsupported, path.text);
             }
             step.desired = .{ .present = desired };
+        },
+        .case_sensitive => |value| {
+            step.kind = .assert_case_sensitive;
+            const parent = switch (expected) {
+                .absent => return builder.fail(
+                    .preflight,
+                    .case_sensitivity_unproven,
+                    path.text,
+                ),
+                .present => |state| state,
+            };
+            const parent_model = builder.models.items[builder.index.get(path.text).?];
+            if (parent.kind != .directory or
+                (parent.inode == 0 and parent_model.last_step == null))
+                return builder.fail(.preflight, .case_sensitivity_unproven, path.text);
+            const witness = root_fs.Path.initPackage(value.witness) catch
+                return builder.fail(.preflight, .invalid_path, value.witness);
+            const witness_parent = witness.parent() orelse
+                return builder.fail(.preflight, .case_sensitivity_unproven, value.witness);
+            var variant_buffer: [maximum_path_bytes]u8 = undefined;
+            const variant = caseVariant(witness.text, &variant_buffer) orelse
+                return builder.fail(.preflight, .case_sensitivity_unproven, value.witness);
+            if (!std.mem.eql(u8, witness_parent.text, path.text) or
+                builder.index.get(witness.text) != null)
+                return builder.fail(.preflight, .case_sensitivity_unproven, value.witness);
+            const witness_entry = builder.root.entry(witness) catch
+                return builder.fail(.preflight, .case_sensitivity_unproven, witness.text);
+            if (!witness_entry.isRegularFile() or !witness_entry.modeled or
+                witness_entry.inode == 0 or witness_entry.link_count != 1 or
+                witness_entry.device != builder.workspace_device or
+                witness_entry.size > 1024 * 1024)
+                return builder.fail(.preflight, .case_sensitivity_unproven, witness.text);
+            const observed = try digestFile(builder, witness);
+            if (!std.mem.eql(u8, &observed, &value.witness_sha256))
+                return builder.fail(.preflight, .content_digest_mismatch, witness.text);
+            if ((builder.root.entryIfExists(variant) catch
+                return builder.fail(.preflight, .case_sensitivity_unproven, variant.text)) != null)
+                return builder.fail(.preflight, .case_sensitivity_unproven, variant.text);
+            step.source = try builder.arena.dupe(u8, witness.text);
+            step.source_sha256 = observed;
+            step.desired = expected;
         },
         .remove => |value| {
             step.kind = .remove_path;
@@ -3554,6 +3657,66 @@ const Observation = struct {
     modeled: bool = false,
 };
 
+/// A guard is immediately before the one publication it protects. Its
+/// journaled parent state, witness and digest survive crashes without a
+/// second namespace or any untracked mutation in the destination directory.
+fn precedingCaseGuard(engine: *const Engine, step: Step) ?Step {
+    if (step.index == 0) return null;
+    const guard = engine.owned.journal.steps[step.index - 1];
+    if (guard.kind != .assert_case_sensitive) return null;
+    const parent = targetPath(step).parent() orelse return null;
+    if (!std.mem.eql(u8, parent.text, guard.path)) return null;
+    return guard;
+}
+
+fn checkCaseGuard(engine: *Engine, guard: Step, index: u32) Error!Identity {
+    var observation: Observation = .{};
+    try observeTarget(engine, guard, targetPath(guard), &observation);
+    switch (precondition(engine, guard)) {
+        .bound => {},
+        .absent, .pending, .unreported => return engine.reject(
+            .publication,
+            .case_sensitivity_unproven,
+            index,
+            .precondition_check,
+        ),
+    }
+    if (!observation.modeled or observation.device != engine.owned.journal.device or
+        !matchesPrecondition(observation.state, guard.expected, precondition(engine, guard)))
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    const parent = switch (observation.state) {
+        .absent => return engine.reject(
+            .publication,
+            .case_sensitivity_unproven,
+            index,
+            .precondition_check,
+        ),
+        .present => |state| state,
+    };
+    if (parent.kind != .directory or parent.inode == 0)
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    const witness = root_fs.Path{ .text = guard.source.? };
+    const found = engine.root.entryIfExists(witness) catch
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    const entry = found orelse
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    if (!entry.isRegularFile() or !entry.modeled or entry.inode == 0 or
+        entry.device != observation.device or entry.link_count != 1 or
+        entry.size > 1024 * 1024)
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    const digest = hashPath(engine, witness) catch
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    if (!std.mem.eql(u8, &digest, &guard.source_sha256.?))
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    var variant_buffer: [maximum_path_bytes]u8 = undefined;
+    const variant = caseVariant(witness.text, &variant_buffer) orelse
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    if ((engine.root.entryIfExists(variant) catch
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check)) != null)
+        return engine.reject(.publication, .case_sensitivity_unproven, index, .precondition_check);
+    return .{ .device = observation.device, .inode = parent.inode, .link_count = parent.link_count };
+}
+
 /// Compares the target to its recorded precondition. A retry after an
 /// interruption is satisfied by the recorded desired state or, when the
 /// boundary that was interrupted is one this transaction can only have left
@@ -4378,6 +4541,10 @@ fn hashPath(engine: *Engine, path: root_fs.Path) ![32]u8 {
 /// resumable because the recorded expectation and desired state disagree about
 /// exactly one thing.
 fn publishStep(engine: *Engine, step: Step) Error!void {
+    const guarded_parent = if (precedingCaseGuard(engine, step)) |guard|
+        try checkCaseGuard(engine, guard, step.index)
+    else
+        null;
     var observation: Observation = .{};
     try requirePrecondition(engine, step, &observation, true);
     const actual = observation.state;
@@ -4392,8 +4559,29 @@ fn publishStep(engine: *Engine, step: Step) Error!void {
                 return engine.reject(.publication, .staging_missing, step.index, .publish_rename);
             try removeDirectoryTarget(engine, step, actual);
             try engine.hook(.publish_rename, step.index);
-            engine.root.rename(staging.path(), targetPath(step), .replace) catch
-                return engine.reject(.publication, .io_failed, step.index, .publish_rename);
+            engine.root.renameWithParent(
+                staging.path(),
+                targetPath(step),
+                if (step.overwrite == .require_absent) .fail_if_exists else .replace,
+                if (guarded_parent) |parent|
+                    .{ .device = parent.device, .inode = parent.inode }
+                else
+                    null,
+            ) catch |err| switch (err) {
+                error.PathAlreadyExists => return engine.reject(
+                    .publication,
+                    .external_modification,
+                    step.index,
+                    .publish_rename,
+                ),
+                error.ParentChanged => return engine.reject(
+                    .publication,
+                    .case_sensitivity_unproven,
+                    step.index,
+                    .publish_rename,
+                ),
+                else => return engine.reject(.publication, .io_failed, step.index, .publish_rename),
+            };
         },
         .create_directory => {
             switch (actual) {
@@ -4431,7 +4619,7 @@ fn publishStep(engine: *Engine, step: Step) Error!void {
                 else => return engine.reject(.publication, .io_failed, step.index, .target_remove),
             };
         },
-        .set_metadata => {},
+        .set_metadata, .assert_case_sensitive => {},
     }
 }
 
@@ -4561,6 +4749,8 @@ fn syncParent(engine: *Engine, step: Step) Error!void {
 /// and never inferred afterwards.
 fn verifyStep(engine: *Engine, step: Step) Error!Identity {
     try engine.hook(.verify, step.index);
+    if (step.kind == .assert_case_sensitive)
+        _ = try checkCaseGuard(engine, step, step.index);
     var observation: Observation = .{};
     try observeTarget(engine, step, targetPath(step), &observation);
     if (!try matchesDesired(engine, step, observation))
@@ -4653,6 +4843,21 @@ fn revertStep(engine: *Engine, step: Step) Error!void {
     // verifies without binding one - takes the ordinary classification and
     // fails closed instead of skipping real work.
     if (untouchedStep(engine, step)) return;
+    if (precedingCaseGuard(engine, step)) |guard| {
+        if (engine.progress.state(step.index) == .prepared and
+            step.index > forwardFrontier(engine))
+        {
+            // The forward pass never reached this publication. In
+            // particular, a differently cased lookup of a previous alias
+            // is not this step's desired state and must never be deleted.
+            var untouched: Observation = .{};
+            try observeTarget(engine, step, targetPath(step), &untouched);
+            if (matchesPrecondition(untouched.state, step.expected, precondition(engine, step)))
+                return;
+            return engine.reject(.recovery, .recovery_required, step.index, .precondition_check);
+        }
+        _ = try checkCaseGuard(engine, guard, step.index);
+    }
     var observation: Observation = .{};
     try observeTarget(engine, step, targetPath(step), &observation);
     const actual = observation.state;
@@ -6022,6 +6227,230 @@ test "root_mutation.test.crash at every durability boundary recovers exactly" {
     }
 }
 
+fn caseAliasIntents() [4]Intent {
+    var digest: [32]u8 = undefined;
+    Sha256.hash("witness\n", &digest, .{});
+    var file = fileIntent("usr/share/man/man7/PAM.7.gz", "manual\n");
+    file.file.overwrite = .require_absent;
+    var link = symlinkIntent("usr/share/man/man7/pam.7.gz", "PAM.7.gz");
+    link.symlink.overwrite = .require_absent;
+    return .{
+        .{ .case_sensitive = .{
+            .path = "usr/share/man/man7",
+            .witness = "usr/share/man/man7/witness",
+            .witness_sha256 = digest,
+        } },
+        file,
+        .{ .case_sensitive = .{
+            .path = "usr/share/man/man7",
+            .witness = "usr/share/man/man7/witness",
+            .witness_sha256 = digest,
+        } },
+        link,
+    };
+}
+
+test "root_mutation.test.case-only package names publish on a witnessed directory" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "usr/share/man/man7/witness", "witness\n");
+    const intents = caseAliasIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    try testing.expectEqual(StepKind.assert_case_sensitive, plan.steps[0].kind);
+    try testing.expectEqual(StepKind.assert_case_sensitive, plan.steps[2].kind);
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.applied, (try apply(&engine, .fromPlan(&plan))).outcome);
+    try expectContent(root, "usr/share/man/man7/PAM.7.gz", "manual\n");
+    var link_buffer: [32]u8 = undefined;
+    try testing.expectEqualStrings(
+        "PAM.7.gz",
+        try root.readSymbolicLink(
+            try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+            &link_buffer,
+        ),
+    );
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+test "root_mutation.test.case guard refuses a second witness spelling" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "usr/share/man/man7/witness", "witness\n");
+    try writeExisting(root, "usr/share/man/man7/Witness", "other\n");
+    const intents = caseAliasIntents();
+    try expectDiagnostic(&fixture, &intents, .case_sensitivity_unproven);
+    try expectAbsent(root, "usr/share/man/man7/PAM.7.gz");
+}
+
+test "root_mutation.test.ext4 casefold refuses before alias publication" {
+    const raw = std.c.getenv("DEBZ_CASEFOLD_MUTATION_ROOT") orelse
+        return error.SkipZigTest;
+    var opened = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(raw));
+    defer opened.close();
+    const root = opened.root;
+    try writeExisting(root, "usr/share/man/man7/witness", "witness\n");
+    const intents = caseAliasIntents();
+    const result = try preflight(testing.allocator, root, .{ .intents = &intents });
+    switch (result) {
+        .diagnostic => |diagnostic| try testing.expectEqual(
+            Code.case_sensitivity_unproven,
+            diagnostic.code,
+        ),
+        .plan => |value| {
+            var plan = value;
+            defer plan.deinit();
+            return error.TestUnexpectedResult;
+        },
+    }
+    try expectAbsent(root, "usr/share/man/man7/PAM.7.gz");
+    try expectContent(root, "usr/share/man/man7/witness", "witness\n");
+}
+
+test "root_mutation.test.case-only names recover across both publications" {
+    const faults = [_]Fault{
+        .{ .boundary = .progress_append, .step = 0 },
+        .{ .boundary = .stage_create, .step = 1 },
+        .{ .boundary = .publish_rename, .step = 1 },
+        .{ .boundary = .progress_append, .step = 1, .occurrence = 2 },
+        .{ .boundary = .progress_append, .step = 2 },
+        .{ .boundary = .stage_create, .step = 3 },
+        .{ .boundary = .publish_rename, .step = 3 },
+        .{ .boundary = .progress_append, .step = 3, .occurrence = 2 },
+        .{ .boundary = .verify, .step = 3 },
+    };
+    for (faults) |fault| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        try writeExisting(root, "usr/share/man/man7/witness", "witness\n");
+        const intents = caseAliasIntents();
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var injector: Injector = .{ .faults = &.{fault} };
+        var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+            .hooks = injector.interface(),
+        });
+        const result = apply(&engine, .fromPlan(&plan));
+        engine.deinit();
+        try testing.expectError(error.SimulatedCrash, result);
+        try testing.expect(injector.allFired());
+        var recovered = (try open(testing.allocator, root, &fixture.attempt, .{})) orelse
+            return error.TestUnexpectedResult;
+        defer recovered.deinit();
+        const report = try recover(&recovered);
+        try testing.expectEqual(Outcome.rolled_back, report.outcome);
+        try expectAbsent(root, "usr/share/man/man7/PAM.7.gz");
+        try expectAbsent(root, "usr/share/man/man7/pam.7.gz");
+        try expectContent(root, "usr/share/man/man7/witness", "witness\n");
+        try expectWorkspaceEmpty(root);
+        try clear(&recovered);
+    }
+}
+
+test "root_mutation.test.case-only publication never overwrites a late occupant" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "usr/share/man/man7/witness", "witness\n");
+    const intents = caseAliasIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    const Plant = struct {
+        root: root_fs.Root,
+        fired: bool = false,
+
+        fn before(context: ?*anyopaque, boundary: Boundary, index: u32) HookError!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (boundary != .publish_rename or index != 1 or self.fired) return;
+            self.root.writeNewFile(
+                root_fs.Path.init("usr/share/man/man7/PAM.7.gz") catch unreachable,
+                "foreign\n",
+                .{},
+                true,
+            ) catch return error.RenameFailed;
+            self.fired = true;
+        }
+    };
+    var plant: Plant = .{ .root = root };
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = .{ .context = &plant, .beforeFn = Plant.before },
+    });
+    defer engine.deinit();
+    try testing.expectEqual(
+        Outcome.recovery_required,
+        (try apply(&engine, .fromPlan(&plan))).outcome,
+    );
+    try testing.expect(plant.fired);
+    try expectContent(root, "usr/share/man/man7/PAM.7.gz", "foreign\n");
+    try expectAbsent(root, "usr/share/man/man7/pam.7.gz");
+    try testing.expectEqual(Stage.recovery_required, engine.stage());
+}
+
+test "root_mutation.test.unstarted alias cannot delete a foreign desired-looking entry" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try writeExisting(root, "usr/share/man/man7/witness", "witness\n");
+    const intents = caseAliasIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    const Swap = struct {
+        root: root_fs.Root,
+        fired: bool = false,
+
+        fn before(context: ?*anyopaque, boundary: Boundary, index: u32) HookError!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (boundary != .verify or index != 2 or self.fired) return;
+            self.root.rename(
+                root_fs.Path.init("usr/share/man/man7") catch unreachable,
+                root_fs.Path.init("usr/share/man/old-man7") catch unreachable,
+                .fail_if_exists,
+            ) catch return error.RenameFailed;
+            self.root.createDirectory(
+                root_fs.Path.init("usr/share/man/man7") catch unreachable,
+                root_fs.default_directory_permissions,
+            ) catch return error.RenameFailed;
+            const foreign = root_fs.Path.init("usr/share/man/man7/pam.7.gz") catch unreachable;
+            self.root.createSymbolicLink(foreign, "PAM.7.gz") catch
+                return error.RenameFailed;
+            self.root.applyMetadata(foreign, .{
+                .modified_nanoseconds = 1_000_000_000,
+            }) catch return error.RenameFailed;
+            self.fired = true;
+        }
+    };
+    var swap: Swap = .{ .root = root };
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = .{ .context = &swap, .beforeFn = Swap.before },
+    });
+    defer engine.deinit();
+    try testing.expectEqual(
+        Outcome.recovery_required,
+        (try apply(&engine, .fromPlan(&plan))).outcome,
+    );
+    try testing.expect(swap.fired);
+    var link_buffer: [32]u8 = undefined;
+    try testing.expectEqualStrings(
+        "PAM.7.gz",
+        try root.readSymbolicLink(
+            try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+            &link_buffer,
+        ),
+    );
+    try expectContent(root, "usr/share/man/old-man7/PAM.7.gz", "manual\n");
+    try testing.expectEqual(Stage.recovery_required, engine.stage());
+}
+
 test "root_mutation.test.filesystem failures roll the transaction back" {
     const failures = [_]Fault{
         .{ .boundary = .stage_write, .err = error.NoSpaceLeft },
@@ -6319,6 +6748,15 @@ test "root_mutation.test.corrupt journals and progress logs fail closed" {
     try testing.expectError(
         error.UnsupportedSchema,
         open(testing.allocator, root, &fixture.attempt, .{}),
+    );
+
+    const unknown_kind = try testing.allocator.dupe(u8, canonical);
+    defer testing.allocator.free(unknown_kind);
+    const kind = std.mem.indexOf(u8, unknown_kind, "\"kind\":\"publish_file\"").?;
+    @memcpy(unknown_kind[kind + 8 ..][0..12], "unknown_kind");
+    try testing.expectError(
+        error.NonCanonicalDocument,
+        decode(testing.allocator, unknown_kind, maximum_document_bytes),
     );
 
     try root.publishFile(journal_file, canonical, .{});
