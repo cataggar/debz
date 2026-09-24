@@ -1587,6 +1587,13 @@ pub const alias_directories = [_][]const u8{
     "sbin",
 };
 
+fn isAliasDirectory(path: []const u8) bool {
+    for (alias_directories) |name| {
+        if (std.mem.eql(u8, name, path)) return true;
+    }
+    return false;
+}
+
 /// One proven alias. `link_target` is the exact bytes the root holds, so the
 /// evidence for the rewrite is recorded rather than assumed.
 pub const Alias = struct {
@@ -4772,10 +4779,11 @@ fn planClaim(
             .package = item.identity.name,
         });
     var link_source_previous: ?PreviousState = null;
-    const structural_alias = try structuralMergedAliasDirectory(
+    const structural_alias = try structuralMergedAliasClaim(
         builder,
         item,
         claim,
+        model,
         previous,
     );
     const decision = try resolveOwnership(
@@ -5398,16 +5406,22 @@ fn observePrevious(
 // Ownership rules
 // ---------------------------------------------------------------------------
 
-fn structuralMergedAliasDirectory(
+fn structuralMergedAliasClaim(
     builder: *Builder,
     item: *const PackageWork,
     claim: Claim,
+    model: *const archive_application.Model,
     previous: ?PreviousState,
 ) PlanError!bool {
-    if (claim.kind != .directory or claim.aliased or
+    if ((claim.kind != .directory and claim.kind != .symlink) or claim.aliased or
         !std.mem.eql(u8, claim.archive_path, claim.path))
         return false;
     const alias = builder.aliases.find(claim.path) orelse return false;
+    if (claim.kind == .symlink and !std.mem.eql(
+        u8,
+        model.files[claim.file].link_literal orelse return false,
+        alias.link_target,
+    )) return false;
     const state = previous orelse return false;
     if (state.kind != .symlink or state.device != alias.device or
         state.inode != alias.inode or state.link_count != alias.link_count or
@@ -5475,7 +5489,9 @@ fn structuralAliasGuardsMatchPlan(
     steps: []const root_mutation.Step,
 ) bool {
     for (planned.packages) |package| for (package.paths) |path| {
-        if (path.kind != .directory or path.publish or path.previous == null or
+        if ((path.kind != .directory and
+            (path.kind != .symlink or !isAliasDirectory(path.path))) or
+            path.publish or path.previous == null or
             path.previous.?.kind != .symlink)
             continue;
         const previous = path.previous.?;
@@ -5483,6 +5499,8 @@ fn structuralAliasGuardsMatchPlan(
             if (std.mem.eql(u8, candidate.from, path.path)) break candidate;
         } else return false;
         if (!std.mem.eql(u8, path.archive_path, path.path) or
+            (path.kind == .symlink and
+                !std.mem.eql(u8, path.link_literal orelse "", alias.link_target)) or
             !std.mem.eql(u8, previous.link_target orelse "", alias.link_target) or
             previous.device != device or previous.device != alias.device or
             previous.inode != alias.inode)
@@ -5643,7 +5661,7 @@ fn resolveOwnership(
         }
         const holder = builder.ownership.owners[owner];
 
-        if (claim.kind == .directory) {
+        if (claim.kind == .directory or structural_alias) {
             if (observed_previous == null or observed_previous.?.kind == .directory or
                 structural_alias)
             {
@@ -9354,13 +9372,17 @@ fn lowerMaterializationIntents(
     // publishing anything below its canonical target.
     for (plan_value.packages) |package| {
         for (package.paths) |planned| {
-            if (planned.kind != .directory or planned.publish or
+            if ((planned.kind != .directory and
+                (planned.kind != .symlink or !isAliasDirectory(planned.path))) or
+                planned.publish or
                 planned.previous == null or planned.previous.?.kind != .symlink)
                 continue;
             const alias = for (plan_value.aliases) |candidate| {
                 if (std.mem.eql(u8, candidate.from, planned.path)) break candidate;
             } else return error.MaterializationPlanMismatch;
             if (!std.mem.eql(u8, planned.archive_path, planned.path) or
+                (planned.kind == .symlink and
+                    !std.mem.eql(u8, planned.link_literal orelse "", alias.link_target)) or
                 !std.mem.eql(u8, planned.previous.?.link_target orelse "", alias.link_target))
                 return error.MaterializationPlanMismatch;
             try intents.append(allocator, .{ .metadata = .{ .path = planned.path } });
@@ -32877,7 +32899,7 @@ test "native_unpack.test.merged usr diversion directory claim shares a proven al
     }
 }
 
-test "native_unpack.test.structural alias refuses missing target, foreign link, and symlink ownership conflict" {
+test "native_unpack.test.structural alias refuses missing target, foreign link, and changed symlink target" {
     const status =
         \\Package: alias-owner
         \\Status: install ok installed
@@ -32921,7 +32943,7 @@ test "native_unpack.test.structural alias refuses missing target, foreign link, 
         var data = [_]Entry{.{
             .path = "bin",
             .kind = if (case.incoming_link) '2' else '5',
-            .link = if (case.incoming_link) "usr/bin" else "",
+            .link = if (case.incoming_link) "usr/other" else "",
         }};
         const bytes = try buildOwnedArchive(
             .{ .package = "diversion-lifecycle", .version = "1" },
@@ -32939,6 +32961,103 @@ test "native_unpack.test.structural alias refuses missing target, foreign link, 
             &.{.{ .artifact = 0, .bytes = bytes }},
         ), case.expected);
     }
+}
+
+test "native_unpack.test.exact merged usr symlink shares an installed alias owner" {
+    const status =
+        \\Package: alias-owner
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: owns the archive directory
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "alias-owner.list", .bytes = "/.\n/lib\n/lib/systemd\n" },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("usr"),
+        root_fs.default_directory_permissions,
+    );
+    try fixture.root().ensureDirectory(
+        try root_fs.Path.init("usr/lib"),
+        root_fs.default_directory_permissions,
+    );
+    try fixture.root().createSymbolicLink(try root_fs.Path.init("lib"), "usr/lib");
+    const original = try fixture.root().entry(try root_fs.Path.init("lib"));
+    var data = [_]Entry{
+        .{ .path = "lib", .kind = '2', .link = "usr/lib" },
+        .{ .path = "usr/lib/base-files-example", .content = "installed\n" },
+    };
+    const bytes = try buildOwnedArchive(
+        .{ .package = "base-files", .version = "1" },
+        &data,
+    );
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    var program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    var planned = try expectPlan(try planFor(
+        &fixture,
+        &program,
+        &.{.{ .artifact = 0, .bytes = bytes }},
+    ));
+    defer planned.deinit();
+    const link = planned.packages[0].paths[0];
+    try testing.expectEqual(Kind.symlink, link.kind);
+    try testing.expectEqual(Disposition.share_directory, link.disposition);
+    try testing.expect(!link.publish);
+    for (planned.filesystem) |change| switch (change) {
+        .symlink => |value| try testing.expect(!std.mem.eql(u8, value.path, "lib")),
+        else => {},
+    };
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    const applied = try materializeFixture(
+        &fixture,
+        &program,
+        fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = bytes }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.applied, applied.outcome);
+    const unchanged = try fixture.root().entry(try root_fs.Path.init("lib"));
+    try testing.expectEqual(original.inode, unchanged.inode);
+    try testing.expectEqual(original.device, unchanged.device);
+    var target: [root_fs.maximum_link_target_bytes]u8 = undefined;
+    try testing.expectEqualStrings("usr/lib", try fixture.root().readSymbolicLink(
+        try root_fs.Path.init("lib"),
+        &target,
+    ));
+    const installed = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("usr/lib/base-files-example"),
+        1024,
+    );
+    defer testing.allocator.free(installed);
+    try testing.expectEqualStrings("installed\n", installed);
+    const owner_list = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/info/alias-owner.list"),
+        1024,
+    );
+    defer testing.allocator.free(owner_list);
+    try testing.expect(std.mem.indexOf(u8, owner_list, "/lib\n") != null);
+    const incoming_list = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/info/base-files.list"),
+        1024,
+    );
+    defer testing.allocator.free(incoming_list);
+    try testing.expect(std.mem.indexOf(u8, incoming_list, "/lib\n") != null);
 }
 
 test "native_unpack.test.structural alias guard survives interrupted diverted publication" {

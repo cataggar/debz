@@ -1103,6 +1103,13 @@ pub const pinned_tools = [_]ToolBinding{
     },
 };
 
+pub const snapshot_tools = [_]ToolBinding{.{
+    .architecture = "amd64",
+    .sha256 = digestLiteral(
+        "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d",
+    ),
+}};
+
 pub fn pinnedTool(architecture: []const u8) ?ToolBinding {
     for (pinned_tools) |binding| {
         if (std.mem.eql(u8, binding.architecture, architecture))
@@ -1111,12 +1118,21 @@ pub fn pinnedTool(architecture: []const u8) ?ToolBinding {
     return null;
 }
 
+fn matchesPinnedTool(architecture: []const u8, sha256: [32]u8) bool {
+    for (pinned_tools ++ snapshot_tools) |binding| {
+        if (std.mem.eql(u8, binding.architecture, architecture) and
+            std.crypto.timing_safe.eql([32]u8, binding.sha256, sha256))
+            return true;
+    }
+    return false;
+}
+
 pub fn verifyPinnedTool(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     architecture: []const u8,
 ) ![32]u8 {
-    const binding = pinnedTool(architecture) orelse
+    _ = pinnedTool(architecture) orelse
         return error.UnsupportedAlternativesArchitecture;
     var pinned = try root.pinRegularFile(try root_fs.Path.init(tool_path));
     defer pinned.close();
@@ -1131,7 +1147,7 @@ pub fn verifyPinnedTool(
         return error.InvalidAlternativesTool;
     var sha256: [32]u8 = undefined;
     Sha256.hash(observation.bytes, &sha256, .{});
-    if (!std.crypto.timing_safe.eql([32]u8, binding.sha256, sha256))
+    if (!matchesPinnedTool(architecture, sha256))
         return error.InvalidAlternativesTool;
     return sha256;
 }
@@ -2001,6 +2017,27 @@ fn entryFactLess(_: void, left: EntryFact, right: EntryFact) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
 }
 
+fn retainedReadmePath(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "README"))
+        return selector_directory ++ "/README";
+    if (std.mem.eql(u8, name, "README.dpkg-new"))
+        return selector_directory ++ "/README.dpkg-new";
+    return null;
+}
+
+fn exactRetainedReadme(fact: EntryFact) bool {
+    const digest = fact.sha256 orelse return false;
+    return fact.kind == .regular and fact.mode == 0o644 and
+        fact.uid == 0 and fact.gid == 0 and fact.link_count == 1 and
+        fact.size == 100 and std.mem.eql(
+        u8,
+        &digest,
+        &digestLiteral(
+            "a44afdb50eacfc09e45f6dac1e18ae231c179feec633c106e1060bae8ae11df1",
+        ),
+    );
+}
+
 fn immutableDigest(facts: []const EntryFact) [32]u8 {
     var digest = Sha256.init(.{});
     digest.update("debz-native-alternatives-immutable-v1\x00");
@@ -2651,7 +2688,7 @@ pub fn capture(
             authority.limits.max_groups,
             relationships_per_group,
         ) catch return error.AlternativesLimit,
-        1,
+        2,
     ) catch return error.AlternativesLimit;
     const selector_name_limit = std.math.mul(
         usize,
@@ -2665,31 +2702,25 @@ pub fn capture(
     );
     defer selector_members.deinit();
     for (selector_members.members) |member| {
-        if (std.mem.eql(u8, member.name, "README") and
-            authority.allow_retained_readme)
-        {
+        const readme_path = if (authority.allow_retained_readme)
+            retainedReadmePath(member.name)
+        else
+            null;
+        if (readme_path) |path| {
             if (member.kind != .file)
                 return error.UnsupportedAlternativesEntry;
             const readme = try observeRegular(
                 owned,
                 root,
-                selector_directory ++ "/README",
+                path,
                 1024,
             );
-            if (readme.mode != 0o644 or readme.uid != 0 or readme.gid != 0 or
-                readme.link_count != 1 or readme.size != 100 or
-                !std.mem.eql(
-                    u8,
-                    &readme.sha256.?,
-                    &digestLiteral(
-                        "a44afdb50eacfc09e45f6dac1e18ae231c179feec633c106e1060bae8ae11df1",
-                    ),
-                ))
+            if (!exactRetainedReadme(readme))
                 return error.InvalidAlternativesRetainedMetadata;
             try appendUniquePath(
                 owned,
                 &paths,
-                selector_directory ++ "/README",
+                path,
             );
             continue;
         }
@@ -2901,6 +2932,47 @@ pub fn validateScriptTransition(
         }
         if (!matched) return error.AlternativesStateChanged;
     }
+}
+
+test "native_alternatives.test.snapshot tool pin is exact and architecture bound" {
+    const testing = std.testing;
+    const snapshot = snapshot_tools[0].sha256;
+    try testing.expect(matchesPinnedTool("amd64", pinned_tools[0].sha256));
+    try testing.expect(matchesPinnedTool("arm64", pinned_tools[1].sha256));
+    try testing.expect(matchesPinnedTool("amd64", snapshot));
+    try testing.expect(!matchesPinnedTool("arm64", snapshot));
+    try testing.expect(!matchesPinnedTool("i386", snapshot));
+    var changed = snapshot;
+    changed[0] ^= 1;
+    try testing.expect(!matchesPinnedTool("amd64", changed));
+}
+
+test "native_alternatives.test.staged dpkg README retains exact immutable metadata" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("etc/alternatives/README", retainedReadmePath("README").?);
+    try testing.expectEqualStrings("etc/alternatives/README.dpkg-new", retainedReadmePath("README.dpkg-new").?);
+    try testing.expect(retainedReadmePath("README.dpkg-tmp") == null);
+    try testing.expect(retainedReadmePath("foreign.dpkg-new") == null);
+    const expected: EntryFact = .{
+        .path = "etc/alternatives/README.dpkg-new",
+        .kind = .regular,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .link_count = 1,
+        .size = 100,
+        .sha256 = digestLiteral("a44afdb50eacfc09e45f6dac1e18ae231c179feec633c106e1060bae8ae11df1"),
+    };
+    try testing.expect(exactRetainedReadme(expected));
+    var changed = expected;
+    changed.mode = 0o666;
+    try testing.expect(!exactRetainedReadme(changed));
+    changed = expected;
+    changed.link_count = 2;
+    try testing.expect(!exactRetainedReadme(changed));
+    changed = expected;
+    changed.sha256 = null;
+    try testing.expect(!exactRetainedReadme(changed));
 }
 
 test "native_alternatives.test.parser round trips auto manual priorities and empty slaves" {

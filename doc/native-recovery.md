@@ -518,6 +518,14 @@ package payload, with the admitted architecture digest, mode and ownership.
 Absence or mismatch fails closed before that script. The fresh-root snapshot
 workflow must therefore obtain the tool from its authenticated `dpkg` archive;
 seeding it from the runner would not satisfy this gate.
+The reviewed amd64 `stonking` snapshot admits an additional exact executable
+digest for `dpkg` 1.23.7ubuntu2. The older dpkg 1.22.22 pins remain intact;
+the new pin does not authorize arm64, another executable digest, or a wider script
+command grammar.
+The corresponding `README.dpkg-new` conffile staged before `dpkg` configuration
+is accepted only with the exact pinned README bytes and metadata and is
+included in the pre-script managed-path observation; other staging entries
+remain refused.
 
 ### Experimental typed runtime API
 

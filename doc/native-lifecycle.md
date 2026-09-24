@@ -120,9 +120,10 @@ updates. See
 An exact archive directory claim at a proven merged-/usr alias can share an
 installed owner's alias path without replacing the symlink or publishing
 directory metadata, provided its canonical target is an existing directory.
-The symlink's identity and target are checked against a non-mutating filesystem
-journal step before publication and during recovery; foreign links and actual
-symlink claims do not receive this directory-sharing exception.
+An archive symlink claim can also share that path only when its target bytes
+exactly match the observed alias. The symlink's identity and target are checked
+against a non-mutating filesystem journal step before publication and during
+recovery; foreign links and different targets remain refused.
 
 Old postrm now observes journalled `.dpkg-tmp` backups of replaced ordinary
 files: regular backups retain original inodes and hard-link groups, while
