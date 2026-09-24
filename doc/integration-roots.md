@@ -212,8 +212,17 @@ exited successfully, then refused its unpack with
 sampled peak resident memory was 872.4 MiB. This interrupted root is
 retained, not reused. An exact, journal-guarded sharing rule for a
 byte-identical structural alias claim addresses that refusal, but it
-still requires a new replay on the rebased combined code. Neither a
-completed closure nor native/reference parity is established.
+still requires a new replay on the rebased combined code.
+
+That new authenticated replay passed the former step-823 ownership
+refusal: `base-files` unpack published its exact archive payload, and
+configuration proceeded to step 852. Its postinst then exited 1 with
+`chown: invalid user: 'root:root'`. The fresh root has no
+`etc/passwd` or `etc/group` yet; this transaction schedules
+`base-passwd`'s unpack after this configuration barrier. Sampled peak
+resident memory stayed below 883 MiB. This interrupted root is
+retained, not reused. A completed closure and native/reference parity
+still require a correctly ordered fresh-root replay.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
