@@ -393,6 +393,22 @@ step 1145, substep 0. The root is retained and must **not** be reused as a
 fresh trial. This is the next distinct blocker, not a completed closure or
 native/reference parity result.
 
+A separate **new** authenticated 175-package amd64 root on final #240
+squash plus procps (recorded source `3651cc92b65905535e8f2fb8ef8e5a3a88fb647f`,
+ReleaseSafe executable SHA-256
+`dbb1f24eb3e79a426641016168e5546930ee2698559b497859e33b6d0e15cccd`)
+started without dpkg database, helper placeholders, or package state. It
+independently persisted a zero-exit signed `procps.postinst configure ""`
+outcome at step 1065. All four `.procps` providers and their alternatives
+groups remained absent. `sudo-rs.postinst` at step 1145 was prepared but
+refused **before launch** with `PartialAlternativesState`: the `sudo` group
+is absent while the `sudoedit` generic link already belongs to the `sudo`
+package and targets `sudo.ws`. No sudo-rs script outcome was persisted;
+`create.json` exited 8. An ignored local runner copy changed only the
+bounded `create` timeout from 30 to 90 minutes and was removed afterward.
+The interrupted root remains read-only; this does not prove complete install
+or native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
