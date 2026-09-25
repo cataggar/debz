@@ -238,6 +238,26 @@ tool, extra shell tokens, dynamic shell construction, unpinned tools, extra
 groups, cycles, traversal, special files, or changed identities require
 recovery without repair or replay.
 
+The authenticated `stonking` amd64 `less` 668-1build1 archive (SHA-512
+`957502bf7fc7f49b0e146362e9c4bdf094c6c93fcca25dd1a47f47c6f17dec5b525f793c87ea03867411039ebef402a85f702766cd7c46d916beb53c81f0da45`)
+ships a 292-byte `preinst` (SHA-256
+`c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94`).
+Its sole alternatives command is the literal
+`update-alternatives --quiet --remove pager /bin/less` under `upgrade)`.
+The snapshot-pinned tool documents `--quiet` as an output option. An isolated
+`--root` probe of that exact binary found that removing the sole `/bin/less`
+`pager` provider with or without `--quiet` deletes the same record and links;
+the executable reference covers the same typed `--remove` transition.
+Only these exact script bytes and command are recognized with `--quiet`; no
+other wrapper, option, or command receives that authority. Native execution
+admits this script only as the **new** `less:amd64` preinst with exactly
+`["install"]` on amd64. This branch cannot call the tool, so the existing
+`pager` group is immutable across its pre/post checkpoints. The installed
+`update-alternatives` binary must match the **snapshot** amd64 pin above
+(not merely the older amd64 oracle pin), with root-owned executable metadata.
+Upgrade/abort and other identities remain refused rather than relying on the
+unreviewed upgrade branch's `dpkg --compare-versions`.
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is

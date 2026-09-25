@@ -1110,6 +1110,32 @@ pub const snapshot_tools = [_]ToolBinding{.{
     ),
 }};
 
+const snapshot_less_preinst_sha256 = digestLiteral(
+    "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94",
+);
+
+pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_less_preinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotLessTool(
+    architecture: []const u8,
+    sha256: [32]u8,
+) bool {
+    return std.mem.eql(u8, architecture, "amd64") and
+        std.crypto.timing_safe.eql(
+            [32]u8,
+            snapshot_tools[0].sha256,
+            sha256,
+        );
+}
+
 pub fn pinnedTool(architecture: []const u8) ?ToolBinding {
     for (pinned_tools) |binding| {
         if (std.mem.eql(u8, binding.architecture, architecture))
@@ -1342,12 +1368,21 @@ pub fn discoverScriptAuthority(
                 break;
             }
         }
-        const command = command_index orelse
+        var command = command_index orelse
             return error.InvalidAlternativesScript;
         if (!validCommandPrefix(tokens.items, command))
             return error.InvalidAlternativesScript;
         if (command + 1 >= tokens.items.len)
             return error.InvalidAlternativesScript;
+        if (std.mem.eql(u8, tokens.items[command + 1], "--quiet")) {
+            if (!std.mem.eql(
+                u8,
+                line,
+                "update-alternatives --quiet --remove pager /bin/less",
+            ) or !matchesSnapshotLessPreinst(bytes))
+                return error.InvalidAlternativesScript;
+            command += 1;
+        }
         const operation = tokens.items[command + 1];
         if (!shellTokenSafe(operation))
             return error.InvalidAlternativesScript;
@@ -2942,9 +2977,16 @@ test "native_alternatives.test.snapshot tool pin is exact and architecture bound
     try testing.expect(matchesPinnedTool("amd64", snapshot));
     try testing.expect(!matchesPinnedTool("arm64", snapshot));
     try testing.expect(!matchesPinnedTool("i386", snapshot));
+    try testing.expect(matchesSnapshotLessTool("amd64", snapshot));
+    try testing.expect(!matchesSnapshotLessTool(
+        "amd64",
+        pinned_tools[0].sha256,
+    ));
+    try testing.expect(!matchesSnapshotLessTool("arm64", snapshot));
     var changed = snapshot;
     changed[0] ^= 1;
     try testing.expect(!matchesPinnedTool("amd64", changed));
+    try testing.expect(!matchesSnapshotLessTool("amd64", changed));
 }
 
 test "native_alternatives.test.staged dpkg README retains exact immutable metadata" {
@@ -3343,6 +3385,130 @@ test "native_alternatives.test.script authority admits only literal bounded comm
     for (rejected) |bytes| try testing.expectError(
         error.InvalidAlternativesScript,
         discoverScriptAuthority(testing.allocator, bytes, .{}),
+    );
+}
+
+test "native_alternatives.test.snapshot less preinst pins one quiet removal" {
+    const testing = std.testing;
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-less-668-1build1.preinst",
+    );
+    try testing.expect(matchesSnapshotLessPreinst(script));
+    var authority = try discoverScriptAuthority(testing.allocator, script, .{});
+    defer authority.deinit();
+    try testing.expectEqual(@as(usize, 1), authority.commands.len);
+    try testing.expectEqualStrings("pager", authority.commands[0].name);
+    switch (authority.commands[0].command) {
+        .remove => |path| try testing.expectEqualStrings("/bin/less", path),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), authority.groups.len);
+    try testing.expectEqualStrings("pager", authority.groups[0].name);
+    try testing.expect(authority.groups[0].topology == null);
+    try testing.expectEqual(@as(usize, 1), authority.paths.len);
+    try testing.expectEqualStrings("bin/less", authority.paths[0]);
+    try testing.expectEqual(@as(usize, 1), authority.immutable_targets.len);
+    try testing.expectEqualStrings(
+        "/bin/less",
+        authority.immutable_targets[0],
+    );
+
+    const rejected = [_][]const u8{
+        "update-alternatives --quiet --remove pager /bin/less\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --auto pager\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --remove editor /bin/less\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --remove pager /usr/bin/less\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --remove pager /bin/less; true\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --remove pager /bin/less\nexit 0\n",
+    };
+    for (rejected) |bytes| {
+        try testing.expect(!matchesSnapshotLessPreinst(bytes));
+        try testing.expectError(
+            error.InvalidAlternativesScript,
+            discoverScriptAuthority(testing.allocator, bytes, .{}),
+        );
+    }
+}
+
+test "native_alternatives.test.snapshot less install cannot remove pager" {
+    const testing = std.testing;
+    var script = try discoverScriptAuthority(
+        testing.allocator,
+        @embedFile("fixtures/ubuntu-stonking-less-668-1build1.preinst"),
+        .{},
+    );
+    defer script.deinit();
+    const candidates = [_]Candidate{.{
+        .path = "/bin/less",
+        .priority = 50,
+        .targets = &.{},
+    }};
+    var pager: GroupState = .{
+        .name = "pager",
+        .record = .{
+            .name = "pager",
+            .mode = .auto,
+            .master_link = "/usr/bin/pager",
+            .slaves = &.{},
+            .candidates = &candidates,
+        },
+        .record_fact = .{
+            .path = "var/lib/dpkg/alternatives/pager",
+            .kind = .regular,
+        },
+        .selected = "/bin/less",
+        .links = &.{},
+        .missing_master_targets = &.{},
+        .facts = &.{},
+        .digest = undefined,
+    };
+    pager.digest = groupStateDigest(pager);
+    const before: Snapshot = .{
+        .groups = &.{pager},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{pager}),
+        .relationship_count = 1,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    const after: Snapshot = .{
+        .groups = &.{},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{}),
+        .relationship_count = 0,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    const frozen: Authority = .{ .groups = &.{.{
+        .name = "pager",
+        .allow_absent = true,
+        .mutable = false,
+    }} };
+    try validateScriptTransition(
+        testing.allocator,
+        before,
+        before,
+        script,
+        frozen,
+    );
+    try testing.expectError(
+        error.AlternativesStateChanged,
+        validateScriptTransition(
+            testing.allocator,
+            before,
+            after,
+            script,
+            frozen,
+        ),
+    );
+    try validateScriptTransition(
+        testing.allocator,
+        before,
+        after,
+        script,
+        .{ .groups = script.groups },
     );
 }
 
