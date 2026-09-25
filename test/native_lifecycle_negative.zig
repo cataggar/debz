@@ -72,7 +72,15 @@ fn stagingRefusals(fixture: *foundation.Fixture, driver: []const u8, dpkg: []con
             !std.mem.eql(u8, result.value.detail, "config_staging_collision"))
             return error.UnexpectedStagingRefusal;
         const after = try fixture.dir.statFile(fixture.io, relative, .{ .follow_symlinks = false });
-        if (!std.meta.eql(before, after)) return error.StagingCollisionChanged;
+        var before_stable = before;
+        var after_stable = after;
+        // Reads may advance atime on CI filesystems without changing the staged object.
+        before_stable.atime = null;
+        after_stable.atime = null;
+        if (!std.meta.eql(before_stable, after_stable)) {
+            std.debug.print("{s}: staging object changed: before={any}, after={any}\n", .{ collision, before, after });
+            return error.StagingCollisionChanged;
+        }
         if (before_snapshot) |snapshot| {
             const after_snapshot = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
             defer fixture.allocator.free(after_snapshot);
