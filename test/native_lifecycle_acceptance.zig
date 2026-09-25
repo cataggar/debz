@@ -1,6 +1,13 @@
 const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
+const scripts = @import("native_lifecycle_scripts.zig");
+const conffile_scripts = @import("native_lifecycle_conffile_scripts.zig");
+const statoverride = @import("native_lifecycle_statoverride.zig");
+const diversions = @import("native_lifecycle_diversions.zig");
+const metadata = @import("native_lifecycle_metadata.zig");
+const alternatives = @import("native_lifecycle_alternatives.zig");
+const negative = @import("native_lifecycle_negative.zig");
 const options = @import("native_test_options");
 
 const package = foundation.package;
@@ -155,6 +162,34 @@ pub fn main(init: std.process.Init) !void {
     defer fixture.deinit();
     errdefer fixture.retain = true;
     if (!diversions_only) runLifecycle(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only) scripts.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only) conffile_scripts.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only) statoverride.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only) metadata.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only) alternatives.run(&fixture, driver, reference.executable, reference.architecture, pinned != null) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only) negative.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    diversions.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };

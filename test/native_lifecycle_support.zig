@@ -1,5 +1,6 @@
 const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
+const root_fs = @import("debz").root_fs;
 
 pub const trace = "var/log/debz-native-differential.trace";
 pub const failure = "lifecycle-fail";
@@ -78,8 +79,19 @@ pub fn copyProgram(fixture: *foundation.Fixture, root: []const u8, source: []con
     }
 }
 
+pub const ScriptOptions = struct {
+    before_failure: []const u8 = "",
+    after_failure: []const u8 = "",
+    omit_postrm: bool = false,
+};
+
 pub fn scripts(fixture: *foundation.Fixture, source: []const u8, package: []const u8, version: []const u8) !void {
+    return scriptsWith(fixture, source, package, version, .{});
+}
+
+pub fn scriptsWith(fixture: *foundation.Fixture, source: []const u8, package: []const u8, version: []const u8, options: ScriptOptions) !void {
     for (kinds) |kind| {
+        if (options.omit_postrm and std.mem.eql(u8, kind, "postrm")) continue;
         const body = try std.fmt.allocPrint(fixture.allocator,
             \\#!/bin/sh
             \\printf '%s\t%s\t%s\t%s\t%d' '{s}@{s}:{s}' "$DPKG_MAINTSCRIPT_PACKAGE" "$DPKG_MAINTSCRIPT_NAME" "$DPKG_MAINTSCRIPT_ARCH" "$#" >> /{s}
@@ -92,6 +104,7 @@ pub fn scripts(fixture: *foundation.Fixture, source: []const u8, package: []cons
             \\fi
             \\printf '\tpayload=%s' "$payload" >> /{s}
             \\printf '\n' >> /{s}
+            \\{s}
             \\if [ -f /{s} ]; then
             \\    while IFS= read -r failure; do
             \\        if [ "$failure" = "{s}@{s}:{s}:$1" ]; then
@@ -99,9 +112,10 @@ pub fn scripts(fixture: *foundation.Fixture, source: []const u8, package: []cons
             \\        fi
             \\    done < /{s}
             \\fi
+            \\{s}
             \\exit 0
             \\
-        , .{ package, version, kind, trace, trace, package, package, trace, trace, failure, package, version, kind, failure });
+        , .{ package, version, kind, trace, trace, package, package, trace, trace, options.before_failure, failure, package, version, kind, failure, options.after_failure });
         defer fixture.allocator.free(body);
         const relative = try std.fmt.allocPrint(fixture.allocator, "{s}/DEBIAN/{s}", .{ source, kind });
         defer fixture.allocator.free(relative);
@@ -113,6 +127,14 @@ pub const PackageSpec = struct {
     declarations: ?[]const u8 = null,
     activation: ?[]const u8 = null,
     conffile_content: ?[]const u8 = null,
+    conffile_path: []const u8 = "etc/debz-native.conf",
+    extra_conffile: ?foundation.Fixture.ExtraFile = null,
+    extra_files: []const foundation.Fixture.ExtraFile = &.{},
+    control_fields: []const u8 = "",
+    full_payload: bool = false,
+    bootstrap_shell: bool = false,
+    no_scripts: bool = false,
+    scripts: ScriptOptions = .{},
 };
 
 pub fn makePackage(fixture: *foundation.Fixture, architecture: []const u8, version: []const u8, name: []const u8, workspace: []const u8, spec: PackageSpec) ![]u8 {
@@ -122,7 +144,7 @@ pub fn makePackage(fixture: *foundation.Fixture, architecture: []const u8, versi
     defer fixture.allocator.free(source);
     const destination = try std.fmt.allocPrint(fixture.allocator, "{s}.deb", .{stem});
     defer fixture.allocator.free(destination);
-    const control = try std.fmt.allocPrint(fixture.allocator, "Package: {s}\nVersion: {s}\nArchitecture: {s}\nMaintainer: debz fixture <fixture@example.invalid>\nDescription: native lifecycle fixture\n", .{ name, version, architecture });
+    const control = try std.fmt.allocPrint(fixture.allocator, "Package: {s}\nVersion: {s}\nArchitecture: {s}\nMaintainer: debz fixture <fixture@example.invalid>\n{s}Description: native lifecycle fixture\n", .{ name, version, architecture, spec.control_fields });
     defer fixture.allocator.free(control);
     const control_path = try path(fixture.allocator, source, "DEBIAN/control");
     defer fixture.allocator.free(control_path);
@@ -138,15 +160,48 @@ pub fn makePackage(fixture: *foundation.Fixture, architecture: []const u8, versi
     const symbolic = try std.fmt.allocPrint(fixture.allocator, "{s}/usr/share/{s}/current", .{ source, name });
     defer fixture.allocator.free(symbolic);
     try fixture.dir.symLink(fixture.io, "data", symbolic, .{});
+    if (spec.full_payload) {
+        const base = try std.fmt.allocPrint(fixture.allocator, "{s}/usr/share/{s}", .{ source, name });
+        defer fixture.allocator.free(base);
+        const mode = try path(fixture.allocator, base, "mode");
+        defer fixture.allocator.free(mode);
+        try fixture.write(mode, "permission-sensitive payload\n", if (std.mem.eql(u8, version, "1")) 0o600 else 0o640);
+        const changed = try path(fixture.allocator, base, if (std.mem.eql(u8, version, "1")) "obsolete" else "introduced");
+        defer fixture.allocator.free(changed);
+        const changed_content = try std.fmt.allocPrint(fixture.allocator, "only in {s}\n", .{version});
+        defer fixture.allocator.free(changed_content);
+        try fixture.write(changed, changed_content, 0o644);
+        const empty = try path(fixture.allocator, base, "empty");
+        defer fixture.allocator.free(empty);
+        try fixture.directory(empty);
+        try fixture.dir.setFilePermissions(fixture.io, empty, .fromMode(0o750), .{});
+    }
     if (spec.conffile_content) |configuration| {
-        const conffile = try path(fixture.allocator, source, "etc/debz-native.conf");
+        const conffile = try path(fixture.allocator, source, spec.conffile_path);
         defer fixture.allocator.free(conffile);
         try fixture.write(conffile, configuration, 0o644);
         const declaration = try path(fixture.allocator, source, "DEBIAN/conffiles");
         defer fixture.allocator.free(declaration);
-        try fixture.write(declaration, "/etc/debz-native.conf\n", 0o644);
+        const declarations = if (spec.extra_conffile) |extra|
+            try std.fmt.allocPrint(fixture.allocator, "/{s}\n/{s}\n", .{ spec.conffile_path, extra.path })
+        else
+            try std.fmt.allocPrint(fixture.allocator, "/{s}\n", .{spec.conffile_path});
+        defer fixture.allocator.free(declarations);
+        try fixture.write(declaration, declarations, 0o644);
     }
-    try scripts(fixture, source, name, version);
+    if (spec.extra_conffile) |extra| {
+        if (spec.conffile_content == null) return error.ExtraConffileWithoutPrimary;
+        const relative = try path(fixture.allocator, source, extra.path);
+        defer fixture.allocator.free(relative);
+        try fixture.write(relative, extra.content, extra.mode);
+    }
+    for (spec.extra_files) |extra| {
+        const relative = try path(fixture.allocator, source, extra.path);
+        defer fixture.allocator.free(relative);
+        try fixture.write(relative, extra.content, extra.mode);
+    }
+    if (spec.bootstrap_shell) try copyProgram(fixture, source, "/bin/sh", "/bin/sh");
+    if (!spec.no_scripts) try scriptsWith(fixture, source, name, version, spec.scripts);
     if (spec.activation) |trigger| {
         const postinst = try path(fixture.allocator, source, "DEBIAN/postinst");
         defer fixture.allocator.free(postinst);
@@ -164,7 +219,9 @@ pub fn makePackage(fixture: *foundation.Fixture, architecture: []const u8, versi
         defer fixture.allocator.free(member);
         try fixture.write(member, text, 0o644);
     }
-    return fixture.buildPackage(source, destination, .{});
+    return fixture.buildPackage(source, destination, .{
+        .compression = if (spec.bootstrap_shell) .none else .gzip,
+    });
 }
 
 pub const Action = struct {
@@ -178,6 +235,7 @@ pub const Action = struct {
 pub const Phase = struct {
     operation: []const u8,
     archives: []const []const u8 = &.{},
+    reference_groups: ?[]const []const []const u8 = null,
     packages: []const foundation.PackageIdentity = &.{},
     policy: []const u8 = "keep_existing",
     defer_triggers: bool = false,
@@ -185,6 +243,8 @@ pub const Phase = struct {
     fault: ?[]const u8 = null,
     recovery: bool = false,
     ordered_actions: ?[]const Action = null,
+    rollback_links: []const []const u8 = &.{},
+    created_rollback_links: []const []const u8 = &.{},
 };
 
 pub fn runExit(fixture: *foundation.Fixture, argv: []const []const u8, log: []const u8) !u8 {
@@ -343,6 +403,141 @@ pub fn compare(fixture: *foundation.Fixture, reference_root: []const u8, candida
     }
 }
 
+const RollbackLink = struct { path: []const u8, original: ?i64 };
+
+fn normalizeRollback(value: *std.json.Value, links: []const RollbackLink, start: i64, end: i64) !void {
+    const entries = value.object.getPtr("filesystem") orelse return error.InvalidSnapshot;
+    for (links) |link| {
+        var found = false;
+        for (entries.array.items) |*entry| {
+            const path_value = entry.object.get("path") orelse return error.InvalidSnapshot;
+            if (!std.mem.eql(u8, path_value.string, link.path)) continue;
+            found = true;
+            const kind = entry.object.get("kind") orelse return error.InvalidSnapshot;
+            if (!std.mem.eql(u8, kind.string, "symlink")) return error.RollbackLinkTypeChanged;
+            const time = entry.object.getPtr("mtime_ns") orelse return error.InvalidSnapshot;
+            if (time.* != .integer) return error.InvalidSnapshot;
+            if (time.integer != (link.original orelse 0) and (time.integer < start or time.integer > end))
+                return error.RollbackLinkTimeOutsideOperation;
+            time.* = .{ .integer = link.original orelse 0 };
+            break;
+        }
+        if (!found) return error.RollbackLinkMissing;
+    }
+}
+
+pub fn compareRollback(fixture: *foundation.Fixture, reference_root: []const u8, candidate: []const u8, destination: []const u8, links: []const RollbackLink, start: i64, end: i64) !void {
+    const raw_left = try foundation.capture(fixture.allocator, fixture.io, reference_root);
+    defer fixture.allocator.free(raw_left);
+    const raw_right = try foundation.capture(fixture.allocator, fixture.io, candidate);
+    defer fixture.allocator.free(raw_right);
+    for ([_][]const u8{ raw_left, raw_right }, [_][]const u8{ "reference", "native" }) |raw, side| {
+        const path_name = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}.snapshot.json", .{ destination, side });
+        defer fixture.allocator.free(path_name);
+        try fixture.write(path_name, raw, 0o644);
+    }
+    var left = try std.json.parseFromSlice(std.json.Value, fixture.allocator, raw_left, .{ .allocate = .alloc_always });
+    defer left.deinit();
+    var right = try std.json.parseFromSlice(std.json.Value, fixture.allocator, raw_right, .{ .allocate = .alloc_always });
+    defer right.deinit();
+    try normalizeRollback(&left.value, links, start, end);
+    try normalizeRollback(&right.value, links, start, end);
+    const normalized_left = try std.json.Stringify.valueAlloc(fixture.allocator, left.value, .{});
+    defer fixture.allocator.free(normalized_left);
+    const normalized_right = try std.json.Stringify.valueAlloc(fixture.allocator, right.value, .{});
+    defer fixture.allocator.free(normalized_right);
+    if (!std.mem.eql(u8, normalized_left, normalized_right)) {
+        if (fixture.diagnostics) std.debug.print("native/dpkg rollback mismatch in {s}\n", .{destination});
+        return error.NativeDpkgMismatch;
+    }
+}
+
+fn normalizeAlternativeLog(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    var start: usize = 0;
+    while (start < bytes.len) {
+        const end = std.mem.indexOfScalarPos(u8, bytes, start, '\n') orelse bytes.len;
+        const line = bytes[start..end];
+        const prefix = "update-alternatives ";
+        const timestamp = if (std.mem.startsWith(u8, line, prefix) and line.len >= prefix.len + 20)
+            line[prefix.len .. prefix.len + 20]
+        else
+            "";
+        const pattern = "0000-00-00 00:00:00:";
+        var valid = timestamp.len == pattern.len;
+        if (valid) for (pattern, timestamp) |expected, actual| {
+            if ((expected == '0' and !std.ascii.isDigit(actual)) or (expected != '0' and expected != actual)) {
+                valid = false;
+                break;
+            }
+        };
+        if (valid) {
+            try result.appendSlice(allocator, "update-alternatives <clock>:");
+            try result.appendSlice(allocator, line[prefix.len + 20 ..]);
+        } else try result.appendSlice(allocator, line);
+        if (end != bytes.len) try result.append(allocator, '\n');
+        start = end + 1;
+    }
+    return result.toOwnedSlice(allocator);
+}
+
+fn normalizeAlternatives(allocator: std.mem.Allocator, value: *std.json.Value, root: []const u8, fixture: *foundation.Fixture, started: i64, ended: i64) !void {
+    const entries = value.object.getPtr("filesystem") orelse return error.InvalidSnapshot;
+    for (entries.array.items) |*entry| {
+        const path_value = entry.object.get("path") orelse return error.InvalidSnapshot;
+        const relative = path_value.string;
+        const alternative = std.mem.eql(u8, relative, "usr/bin/debz-native-alternatives") or
+            std.mem.eql(u8, relative, "usr/share/man/man1/debz-native-alternatives.1") or
+            std.mem.eql(u8, relative, "var/log/alternatives.log") or
+            std.mem.startsWith(u8, relative, "etc/alternatives/") or
+            std.mem.startsWith(u8, relative, "var/lib/dpkg/alternatives/");
+        if (!alternative) continue;
+        const modified = entry.object.getPtr("mtime_ns") orelse return error.InvalidSnapshot;
+        if (modified.* != .integer) return error.InvalidSnapshot;
+        if (modified.integer != foundation.epoch * std.time.ns_per_s and
+            (modified.integer < started or modified.integer > ended)) return error.AlternativeTimeOutsideOperation;
+        modified.* = .{ .integer = 0 };
+        if (std.mem.eql(u8, relative, "var/log/alternatives.log")) {
+            const file_name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, relative });
+            const log_file = try std.Io.Dir.openFileAbsolute(fixture.io, file_name, .{ .follow_symlinks = false });
+            defer log_file.close(fixture.io);
+            var reader = log_file.reader(fixture.io, &.{});
+            const raw = try reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
+            const normalized = try normalizeAlternativeLog(allocator, raw);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
+            const hex = try allocator.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+            entry.object.getPtr("sha256").?.* = .{ .string = hex };
+            entry.object.getPtr("size").?.* = .{ .integer = @intCast(normalized.len) };
+        }
+    }
+}
+
+pub fn compareAlternatives(fixture: *foundation.Fixture, reference_root: []const u8, candidate: []const u8, destination: []const u8, started: i64, ended: i64) !void {
+    const expected = try foundation.capture(fixture.allocator, fixture.io, reference_root);
+    defer fixture.allocator.free(expected);
+    const actual = try foundation.capture(fixture.allocator, fixture.io, candidate);
+    defer fixture.allocator.free(actual);
+    for ([_][]const u8{ expected, actual }, [_][]const u8{ "reference", "native" }) |raw, side| {
+        const path_name = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}.snapshot.json", .{ destination, side });
+        defer fixture.allocator.free(path_name);
+        try fixture.write(path_name, raw, 0o644);
+    }
+    var arena: std.heap.ArenaAllocator = .init(fixture.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var left = try std.json.parseFromSlice(std.json.Value, a, expected, .{});
+    var right = try std.json.parseFromSlice(std.json.Value, a, actual, .{});
+    try normalizeAlternatives(a, &left.value, reference_root, fixture, started, ended);
+    try normalizeAlternatives(a, &right.value, candidate, fixture, started, ended);
+    const normalized_left = try std.json.Stringify.valueAlloc(a, left.value, .{});
+    const normalized_right = try std.json.Stringify.valueAlloc(a, right.value, .{});
+    if (!std.mem.eql(u8, normalized_left, normalized_right)) {
+        if (fixture.diagnostics) std.debug.print("native/dpkg alternatives mismatch in {s}\n", .{destination});
+        return error.NativeDpkgMismatch;
+    }
+}
+
 pub const Scenario = struct {
     fixture: *foundation.Fixture,
     name: []const u8,
@@ -350,11 +545,17 @@ pub const Scenario = struct {
     dpkg: []const u8,
     architecture: []const u8,
     helper: bool = false,
+    alternatives: bool = false,
+    alternatives_started: ?i64 = null,
     reference_root: []u8,
     native_root: []u8,
     index: usize = 0,
 
     pub fn init(fixture: *foundation.Fixture, name: []const u8, executable: []const u8, dpkg: []const u8, architecture: []const u8, helper: bool) !Scenario {
+        return initWith(fixture, name, executable, dpkg, architecture, helper, false);
+    }
+
+    pub fn initWith(fixture: *foundation.Fixture, name: []const u8, executable: []const u8, dpkg: []const u8, architecture: []const u8, helper: bool, bootstrap: bool) !Scenario {
         const left = try path(fixture.allocator, name, "reference");
         defer fixture.allocator.free(left);
         const right = try path(fixture.allocator, name, "native");
@@ -367,7 +568,7 @@ pub const Scenario = struct {
             const record = try path(fixture.allocator, relative, trace);
             defer fixture.allocator.free(record);
             try fixtureFile(fixture, record, "", 0o644);
-            try copyProgram(fixture, relative, "/bin/sh", "/bin/sh");
+            if (!bootstrap) try copyProgram(fixture, relative, "/bin/sh", "/bin/sh");
             if (helper) try copyProgram(fixture, relative, "/usr/bin/dpkg-trigger", "/usr/bin/dpkg-trigger");
         }
         return .{
@@ -388,7 +589,11 @@ pub const Scenario = struct {
     }
 
     pub fn seed(self: *Scenario, archive: []const u8) !void {
-        const install_phase: Phase = .{ .operation = "install", .archives = &.{archive}, .triggers = self.helper };
+        return self.seedWith(archive, true);
+    }
+
+    pub fn seedWith(self: *Scenario, archive: []const u8, configure: bool) !void {
+        const install_phase: Phase = .{ .operation = if (configure) "install" else "unpack", .archives = &.{archive}, .triggers = self.helper };
         for ([_][]const u8{ self.reference_root, self.native_root }, [_][]const u8{ "reference", "native" }) |root, label| {
             const destination = try std.fmt.allocPrint(self.fixture.allocator, "{s}/seed-{d}-{s}", .{ self.name, self.index, label });
             defer self.fixture.allocator.free(destination);
@@ -406,7 +611,38 @@ pub const Scenario = struct {
         defer self.fixture.allocator.free(destination);
         try self.fixture.directory(destination);
         self.index += 1;
-        const status = try reference(self.fixture, self.dpkg, self.reference_root, input, destination);
+        var links: std.ArrayList(RollbackLink) = .empty;
+        defer links.deinit(self.fixture.allocator);
+        for (input.rollback_links) |relative| {
+            var directory = try foundation.guardedRoot(self.fixture.io, self.reference_root);
+            defer directory.close(self.fixture.io);
+            const entry = try (root_fs.Root.init(self.fixture.io, directory)).entry(try root_fs.Path.init(relative));
+            if (entry.kind != .sym_link) return error.RollbackLinkTypeChanged;
+            try links.append(self.fixture.allocator, .{ .path = relative, .original = @intCast(entry.modified_nanoseconds) });
+        }
+        for (input.created_rollback_links) |relative| {
+            const absolute = try std.fmt.allocPrint(self.fixture.allocator, "{s}/{s}", .{ self.reference_root, relative });
+            defer self.fixture.allocator.free(absolute);
+            if (std.Io.Dir.cwd().statFile(self.fixture.io, absolute, .{ .follow_symlinks = false })) |_|
+                return error.RollbackLinkAlreadyExists
+            else |err| if (err != error.FileNotFound) return err;
+            try links.append(self.fixture.allocator, .{ .path = relative, .original = null });
+        }
+        const started: i64 = @intCast(std.Io.Clock.real.now(self.fixture.io).nanoseconds);
+        if (self.alternatives and self.alternatives_started == null) self.alternatives_started = started;
+        var status: u8 = 0;
+        if (input.reference_groups) |groups| {
+            for (groups, 0..) |archives, index| {
+                const group_destination = try std.fmt.allocPrint(self.fixture.allocator, "{s}/group-{d}", .{ destination, index });
+                defer self.fixture.allocator.free(group_destination);
+                try self.fixture.directory(group_destination);
+                var group = input;
+                group.archives = archives;
+                group.reference_groups = null;
+                status = try reference(self.fixture, self.dpkg, self.reference_root, group, group_destination);
+                if (status != 0) break;
+            }
+        } else status = try reference(self.fixture, self.dpkg, self.reference_root, input, destination);
         if ((status != 0) != expected_failure) return error.UnexpectedReferenceOutcome;
         var outcome = try native(self.fixture, self.executable, self.native_root, self.architecture, input, destination);
         defer outcome.deinit();
@@ -419,7 +655,14 @@ pub const Scenario = struct {
             return error.UnexpectedNativeOutcome;
         }
         try assertNoActiveEvidence(self.fixture, self.native_root);
-        compare(self.fixture, self.reference_root, self.native_root, destination, self.helper) catch |err| {
+        const ended: i64 = @intCast(std.Io.Clock.real.now(self.fixture.io).nanoseconds);
+        const result = if (self.alternatives)
+            compareAlternatives(self.fixture, self.reference_root, self.native_root, destination, self.alternatives_started.?, ended)
+        else if (links.items.len == 0)
+            compare(self.fixture, self.reference_root, self.native_root, destination, self.helper)
+        else
+            compareRollback(self.fixture, self.reference_root, self.native_root, destination, links.items, started, ended);
+        result catch |err| {
             self.fixture.retain = true;
             return err;
         };
@@ -485,4 +728,173 @@ test "empty retained package lists are observable rather than panicking" {
     try compare(&fixture, left, right, "observation", false);
     try fixture.write("native/var/lib/dpkg/info/demo.list", "/usr\n", 0o644);
     try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
+}
+
+test "rollback link timestamp exceptions are bounded to named symlinks and operation clock" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
+    defer fixture.deinit();
+    fixture.diagnostics = false;
+    const left = try fixture.makeRoot("reference", "amd64");
+    defer std.testing.allocator.free(left);
+    const right = try fixture.makeRoot("native", "amd64");
+    defer std.testing.allocator.free(right);
+    try fixture.dir.symLink(fixture.io, "target", "reference/link", .{});
+    try fixture.dir.symLink(fixture.io, "target", "native/link", .{});
+    for ([_][]const u8{ left, right }, [_]i128{ 110, 120 }) |path_name, time| {
+        var dir = try foundation.guardedRoot(fixture.io, path_name);
+        defer dir.close(fixture.io);
+        try (root_fs.Root.init(fixture.io, dir)).applyMetadata(try root_fs.Path.init("link"), .{ .modified_nanoseconds = time });
+    }
+    try fixture.directory("observation");
+    try compareRollback(&fixture, left, right, "observation", &.{.{ .path = "link", .original = 100 }}, 105, 125);
+    {
+        var dir = try foundation.guardedRoot(fixture.io, right);
+        defer dir.close(fixture.io);
+        try (root_fs.Root.init(fixture.io, dir)).applyMetadata(try root_fs.Path.init("link"), .{ .modified_nanoseconds = 999 });
+    }
+    try std.testing.expectError(error.RollbackLinkTimeOutsideOperation, compareRollback(
+        &fixture,
+        left,
+        right,
+        "observation",
+        &.{.{ .path = "link", .original = 100 }},
+        105,
+        125,
+    ));
+    try fixture.dir.deleteFile(fixture.io, "native/link");
+    try fixture.write("native/link", "not a symlink", 0o644);
+    try std.testing.expectError(error.RollbackLinkTypeChanged, compareRollback(
+        &fixture,
+        left,
+        right,
+        "observation",
+        &.{.{ .path = "link", .original = 100 }},
+        105,
+        125,
+    ));
+}
+
+test "non-rollback metadata, hardlinks, symlinks and script payload remain exact" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
+    defer fixture.deinit();
+    fixture.diagnostics = false;
+    const left = try fixture.makeRoot("reference", "amd64");
+    defer std.testing.allocator.free(left);
+    const right = try fixture.makeRoot("native", "amd64");
+    defer std.testing.allocator.free(right);
+    try fixture.directory("observation");
+    try fixtureFile(&fixture, "reference/file", "same bytes\n", 0o644);
+    try fixtureFile(&fixture, "native/file", "same bytes\n", 0o644);
+    try fixture.dir.setTimestamps(fixture.io, "native/file", .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = (foundation.epoch + 1) * std.time.ns_per_s } },
+    });
+    try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
+    try fixtureFile(&fixture, "native/file", "same bytes\n", 0o644);
+    try std.Io.Dir.hardLink(fixture.dir, "reference/file", fixture.dir, "reference/hard", fixture.io, .{});
+    try fixtureFile(&fixture, "native/hard", "same bytes\n", 0o644);
+    try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
+    try fixture.dir.deleteFile(fixture.io, "native/hard");
+    try std.Io.Dir.hardLink(fixture.dir, "native/file", fixture.dir, "native/hard", fixture.io, .{});
+    try fixture.dir.symLink(fixture.io, "file", "reference/symlink", .{});
+    try fixture.dir.symLink(fixture.io, "hard", "native/symlink", .{});
+    for ([_][]const u8{ left, right }) |path_name| {
+        var dir = try foundation.guardedRoot(fixture.io, path_name);
+        defer dir.close(fixture.io);
+        try (root_fs.Root.init(fixture.io, dir)).applyMetadata(try root_fs.Path.init("symlink"), .{
+            .modified_nanoseconds = foundation.epoch * std.time.ns_per_s,
+        });
+    }
+    try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
+    try fixture.dir.deleteFile(fixture.io, "native/symlink");
+    try fixture.dir.symLink(fixture.io, "file", "native/symlink", .{});
+    {
+        var dir = try foundation.guardedRoot(fixture.io, right);
+        defer dir.close(fixture.io);
+        try (root_fs.Root.init(fixture.io, dir)).applyMetadata(try root_fs.Path.init("symlink"), .{
+            .modified_nanoseconds = foundation.epoch * std.time.ns_per_s,
+        });
+    }
+    try fixtureFile(&fixture, "reference/" ++ trace, "postinst\t2\t9:configure\t0:\tpayload=v1\n", 0o644);
+    try fixtureFile(&fixture, "native/" ++ trace, "postinst\t2\t9:configure\t0:\tpayload=v2\n", 0o644);
+    try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
+}
+
+test "malformed diversion, override, package list, checksum and status cannot be normalized away" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
+    defer fixture.deinit();
+    fixture.diagnostics = false;
+    const left = try fixture.makeRoot("reference", "amd64");
+    defer std.testing.allocator.free(left);
+    const right = try fixture.makeRoot("native", "amd64");
+    defer std.testing.allocator.free(right);
+    try fixture.directory("observation");
+    for ([_]struct { path: []const u8, bytes: []const u8, expected: anyerror }{
+        .{ .path = "var/lib/dpkg/diversions", .bytes = "/source\n/destination\n", .expected = error.InvalidDiversions },
+        .{ .path = "var/lib/dpkg/statoverride", .bytes = "#1 #2 0640 /file\n#3 #4 0600 /file\n", .expected = error.InvalidStatoverride },
+        .{ .path = "var/lib/dpkg/info/demo.list", .bytes = "relative\n", .expected = error.UnsafePackagePath },
+        .{ .path = "var/lib/dpkg/info/demo.md5sums", .bytes = "broken checksum\n", .expected = error.InvalidMd5sums },
+        .{ .path = "var/lib/dpkg/status", .bytes = "Version: 1\nVersion: 2\n", .expected = error.InvalidDeb822 },
+    }) |entry| {
+        const right_path = try path(std.testing.allocator, "native", entry.path);
+        defer std.testing.allocator.free(right_path);
+        try fixture.write(right_path, entry.bytes, 0o644);
+        try std.testing.expectError(entry.expected, compare(&fixture, left, right, "observation", false));
+        try fixture.dir.deleteFile(fixture.io, right_path);
+    }
+}
+
+test "native request preserves ordered actions and fault boundary under root guard" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
+    defer fixture.deinit();
+    const root = try fixture.makeRoot("root", "amd64");
+    defer std.testing.allocator.free(root);
+    try fixture.directory("output");
+    try fixture.write("fake-driver", "#!/bin/sh\nreport=$(sed -n 's/.*\"report\":\"\\([^\"]*\\)\".*/\\1/p' \"$DEBZ_NATIVE_LIFECYCLE_REQUEST\")\n" ++
+        "[ -n \"$report\" ] || exit 1\nprintf '{\"outcome\":\"applied\"}' > \"$report\"\n", 0o755);
+    const driver = try fixture.absolute("fake-driver");
+    defer std.testing.allocator.free(driver);
+    const actions = [_]Action{
+        .{ .sequence = 0, .kind = "unpack", .package = "provider", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = "configure_pending", .package = "consumer", .architecture = "amd64" },
+    };
+    var report = try native(&fixture, driver, root, "amd64", .{
+        .operation = "install",
+        .archives = &.{"package.deb"},
+        .ordered_actions = &actions,
+        .fault = "after_script_before_record",
+    }, "output");
+    defer report.deinit();
+    try std.testing.expectEqualStrings("applied", report.value.outcome);
+    const request = try read(&fixture, "output/native.request.json", 64 * 1024);
+    defer std.testing.allocator.free(request);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("after_script_before_record", parsed.value.object.get("fault").?.string);
+    const ordered_actions = parsed.value.object.get("ordered_actions").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), ordered_actions.len);
+    try std.testing.expectEqualStrings("configure_pending", ordered_actions[1].object.get("kind").?.string);
+}
+
+test "published script compensation schema retains bounded invocations and hash identities" {
+    const io = std.testing.io;
+    var file = try std.Io.Dir.cwd().openFile(io, "schema/native-transaction-program-v1.json", .{ .follow_symlinks = false });
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const bytes = try reader.interface.allocRemaining(std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(bytes);
+    var document = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer document.deinit();
+    const definitions = document.value.object.get("$defs").?.object;
+    const script_failure = definitions.get("scriptFailure").?.object.get("properties").?.object;
+    const compensations = script_failure.get("compensations").?.object;
+    try std.testing.expectEqual(@as(i64, 8), compensations.get("maxItems").?.integer);
+    try std.testing.expectEqualStrings("#/$defs/unwind", compensations.get("items").?.object.get("$ref").?.string);
+    const rollback = script_failure.get("rollback_after_compensations").?.object.get("oneOf").?.array.items;
+    try std.testing.expectEqual(@as(i64, 0), rollback[1].object.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), rollback[1].object.get("maximum").?.integer);
+    const unwind = definitions.get("unwind").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("#/$defs/sha256", unwind.get("script_sha256").?.object.get("$ref").?.string);
+    try std.testing.expectEqual(@as(i64, 8), unwind.get("arguments").?.object.get("maxItems").?.integer);
+    try std.testing.expectEqual(@as(i64, 512), unwind.get("arguments").?.object.get("items").?.object.get("maxLength").?.integer);
+    try std.testing.expectEqualStrings("^[0-9a-f]{64}$", definitions.get("sha256").?.object.get("pattern").?.string);
 }

@@ -218,20 +218,24 @@ zig build test-native-lifecycle -j2
 zig build test-native-lifecycle -Doptimize=ReleaseSafe -j2
 ```
 
-The migration-in-progress Zig executable has separate
-`test-native-lifecycle-zig` and `test-native-lifecycle-zig-unit` build steps.
-It runs guarded, bounded real-dpkg/native comparisons for script arguments,
-environment and visible payloads; install/upgrade/downgrade/reinstall and
-repeated remove/purge; selected script failures, old-prerm unwind and
-configure retry; conffile policies; and a diverted hard-link route. It checks
-the complete package database, trace and filesystem snapshot after each
-phase. `-Dnative-diversions-only=true` selects its diversion case; the
-hash-pinned `-Dnative-reference-dpkg` option applies to both implementations.
-The legacy Python suite remains the **required** full parity gate: Zig has
-not yet ported the metadata, statoverride, bootstrap, remaining
-failure/rollback, or all diversion-refusal scenarios. CI runs both
-implementations on amd64 and arm64 in Debug and ReleaseSafe. Do not remove
-the Python runner until its complete root matrix has passed in Zig.
+The Zig acceptance and unprivileged oracle regressions use
+`test-native-lifecycle-zig` and `test-native-lifecycle-zig-unit`. The Zig
+lifecycle fixtures now compare real dpkg with native execution for all
+maintainer-script failure/unwind paths, dependency barriers and bootstrap,
+retained/vendor metadata, conffile retry and purge, statoverrides,
+alternatives, literal paths, diversions and unsafe refusals. Every successful
+or known-failure phase compares complete filesystem, database, status and
+length-prefixed script traces; interrupted operations instead check durable
+recovery evidence and unchanged re-entry snapshots. The pinned reference
+option also supplies and independently verifies `update-alternatives` for
+that scenario; without a pinned reference, only that scenario is skipped.
+`-Dnative-diversions-only=true` selects diversion scenarios.
+
+The Python lifecycle and oracle build/CI gates remain **required** while
+the separately owned diversion route-settlement and trigger suites and CI
+amd64 parity are integrated. CI runs both implementations on amd64 and arm64
+in Debug and ReleaseSafe. Do not remove the Python runner until the complete
+integrated root matrix passes in Zig.
 
 CI uses hash-pinned Debian dpkg 1.22.22 for both architectures. On Ubuntu 24.04
 or another compatible Linux host with an older dpkg, prepare that reference
@@ -307,12 +311,14 @@ Advanced fixtures exercise:
   recovery evidence rather than accepting the changed database as its own
   expected result.
 
-There is one narrow metadata normalization beyond the shared differential
-oracle: during double-postrm upgrade failure, dpkg recreates a rollback symlink
-at wall-clock time. Only that explicitly selected symlink may have its original
-mtime or a timestamp inside the measured operation interval. Its kind, target,
-mode, owner, and every other file remain compared; raw snapshots retain the
-observed times. Ordinary payload mtimes are not normalized.
+Two clock exceptions are bounded and retain raw snapshots. During
+double-postrm upgrade failure, only an explicitly selected recreated symlink
+may have its original mtime or a timestamp inside the measured operation
+interval; its kind, target, mode and owner remain exact. The pinned
+`update-alternatives` scenario normalizes its timestamped log prefix and
+permits its named links, database entries and log to retain creation times
+from earlier phases of that scenario. Other payload mtimes and contents are
+not normalized.
 
 `tools/test-native-lifecycle.py --oracle-only`, run as root, exercises two real
 dpkg roots to establish fixture consistency. It is not native parity evidence.

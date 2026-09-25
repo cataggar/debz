@@ -89,17 +89,17 @@ pub const Fixture = struct {
     }
 
     pub fn absolute(self: Fixture, relative: []const u8) ![]u8 {
-        _ = try root_fs.Path.init(relative);
+        _ = try root_fs.Path.initPackage(relative);
         return std.fs.path.join(self.allocator, &.{ self.path, relative });
     }
 
     pub fn directory(self: Fixture, relative: []const u8) !void {
-        _ = try root_fs.Path.init(relative);
+        _ = try root_fs.Path.initPackage(relative);
         try self.dir.createDirPath(self.io, relative);
     }
 
     pub fn write(self: Fixture, relative: []const u8, bytes: []const u8, mode: u32) !void {
-        const path = try root_fs.Path.init(relative);
+        const path = try root_fs.Path.initPackage(relative);
         if (path.parent()) |parent_path|
             try self.dir.createDirPath(self.io, parent_path.text);
         var file = try self.dir.createFile(self.io, relative, .{
@@ -286,7 +286,7 @@ pub const Fixture = struct {
                     std.mem.startsWith(u8, entry.path, "DEBIAN/")) continue;
                 const relative = try self.allocator.dupe(u8, entry.path);
                 errdefer self.allocator.free(relative);
-                const bytes = try root.readFileAlloc(self.allocator, try root_fs.Path.init(relative), max_database_bytes);
+                const bytes = try root.readFileAlloc(self.allocator, try root_fs.Path.initPackage(relative), max_database_bytes);
                 defer self.allocator.free(bytes);
                 var md5: [16]u8 = undefined;
                 std.crypto.hash.Md5.hash(bytes, &md5, .{});
@@ -312,7 +312,7 @@ pub const Fixture = struct {
             var walker = try source_dir.walk(self.allocator);
             defer walker.deinit();
             while (try walker.next(self.io)) |entry| {
-                const path = try root_fs.Path.init(entry.path);
+                const path = try root_fs.Path.initPackage(entry.path);
                 try root.applyMetadata(path, .{
                     .modified_nanoseconds = (if (options.zero_time_path) |zero| (if (std.mem.eql(u8, entry.path, zero)) @as(i128, 0) else epoch) else epoch) * std.time.ns_per_s,
                 });
@@ -843,7 +843,7 @@ fn captureFilesystem(
         }
         if (entries.items.len >= limits.max_entries) return error.FilesystemEntryLimit;
         const relative = try allocator.dupe(u8, path);
-        const metadata = try root.entry(try root_fs.Path.init(relative));
+        const metadata = try root.entry(try root_fs.Path.initPackage(relative));
         if (!metadata.modeled) return error.UnsupportedFilesystemMetadata;
         const full = try std.fs.path.join(allocator, &.{ absolute, relative });
         const item: FilesystemEntry = .{
@@ -870,7 +870,7 @@ fn captureFilesystem(
             if (metadata.size > limits.max_file_bytes) return error.FilesystemFileLimit;
             total_bytes += metadata.size;
             if (total_bytes > limits.max_total_regular_bytes) return error.FilesystemFileLimit;
-            var file = try root.openRegularFile(try root_fs.Path.init(relative));
+            var file = try root.openRegularFile(try root_fs.Path.initPackage(relative));
             defer file.close(io);
             const opened = try file.stat(io);
             if (opened.size != metadata.size or opened.inode != metadata.inode)
@@ -894,7 +894,7 @@ fn captureFilesystem(
         } else if (metadata.kind == .sym_link) {
             var buffer: [4096]u8 = undefined;
             appended.target = try allocator.dupe(u8, try root.readSymbolicLink(
-                try root_fs.Path.init(relative),
+                try root_fs.Path.initPackage(relative),
                 &buffer,
             ));
         } else if (metadata.kind == .character_device or metadata.kind == .block_device) {
