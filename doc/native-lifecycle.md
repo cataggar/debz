@@ -244,9 +244,10 @@ or references; it does not purport to implement the entire Draft 2020-12
 vocabulary. The `test-native-lifecycle` build target now runs this Zig
 acceptance, not Python; its Python unit gate has been removed. CI requires
 native and both-reference selectors on amd64 and arm64 in Debug and
-ReleaseSafe. `tools/test-native-lifecycle.py` remains importable because
-the separate dpkg-config reference and Python recovery fixture consume its
-helpers; it is no longer a required lifecycle acceptance entry point.
+ReleaseSafe. All four former Python lifecycle/trigger test entry points are
+absent. `tools/native-lifecycle-fixtures.py` is an import-only module for
+the separate dpkg-config reference, Python recovery, and action integration
+fixtures; it has no lifecycle acceptance CLI.
 Trigger acceptance has a separate reference-only
 unconfigured-listener boundary; see [trigger execution](native-triggers.md#independent-acceptance).
 

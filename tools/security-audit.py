@@ -1417,12 +1417,71 @@ def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
     return failures
 
 
+def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    retired = (
+        "tools/test-native-lifecycle.py",
+        "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",
+        "tools/test_native_triggers.py",
+    )
+    for relative in retired:
+        if relative in texts:
+            failures.append(f"{relative}: retired Python test entry point still exists")
+    for relative in (
+        "tools/native-lifecycle-fixtures.py",
+        "tools/native-trigger-fixtures.py",
+    ):
+        source = texts.get(relative)
+        if source is None:
+            failures.append(f"{relative}: required import-only fixture module is missing")
+        elif (
+            source.startswith("#!")
+            or re.search(r"(?m)^import argparse\b|^from argparse\b|^def main\(|^if __name__\s*==", source)
+        ):
+            failures.append(f"{relative}: fixture module restored a Python CLI entry point")
+    for consumer, fixture in (
+        ("tools/native-trigger-fixtures.py", "native-lifecycle-fixtures.py"),
+        ("tools/test-native-recovery.py", "native-trigger-fixtures.py"),
+        ("tools/dpkg-config-reference.py", "native-lifecycle-fixtures.py"),
+        ("actions/install/__tests__/integration.test.ts", "native-lifecycle-fixtures.py"),
+    ):
+        if fixture not in texts.get(consumer, ""):
+            failures.append(f"{consumer}: required fixture import is missing: {fixture}")
+    return failures
+
+
 def audit_ci_pins() -> None:
     for failure in native_lifecycle_migration_failures(
         (ROOT / "build.zig").read_text(),
         (ROOT / "test/native_trigger_acceptance.zig").read_text(),
     ):
         fail(failure)
+    fixture_paths = (
+        "tools/test-native-lifecycle.py",
+        "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",
+        "tools/test_native_triggers.py",
+        "tools/native-lifecycle-fixtures.py",
+        "tools/native-trigger-fixtures.py",
+        "tools/test-native-recovery.py",
+        "tools/dpkg-config-reference.py",
+        "actions/install/__tests__/integration.test.ts",
+    )
+    fixture_texts = {
+        relative: path.read_text()
+        for relative in fixture_paths
+        if (path := ROOT / relative).exists() and path.is_file() and not path.is_symlink()
+    }
+    for relative in fixture_paths[:4]:
+        if (ROOT / relative).is_symlink() or (ROOT / relative).is_dir():
+            fixture_texts[relative] = ""
+    for failure in native_lifecycle_fixture_failures(fixture_texts):
+        fail(failure)
+    for relative in fixture_paths[4:6]:
+        path = ROOT / relative
+        if path.is_symlink() or (path.is_file() and path.stat().st_mode & 0o111):
+            fail(f"{relative}: import-only fixture must not be executable or a symlink")
     workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
     for workflow in workflows:
         text = workflow.read_text()

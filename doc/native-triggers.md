@@ -194,10 +194,11 @@ regressions exercise the exact backup metadata/inode, trigger route, status,
 control, rollback-list, upgrade-outcome and invocation-clock assertions as well
 as the production lowering of authenticated success and rollback profiles.
 Both Python trigger gates have been replaced by the executed Zig selector and
-unit-method inventory. `tools/test-native-triggers.py` remains importable for
-the separately gated recovery harness, but is no longer a required trigger
-acceptance entry point. The failed-postinst listener is covered in Zig against
-dpkg **only**; lack of native parity for that program remains explicit.
+unit-method inventory. The former Python trigger test entry point is absent;
+`tools/native-trigger-fixtures.py` is an import-only helper module for the
+separately gated recovery harness. The failed-postinst listener is covered in
+Zig against dpkg **only**; lack of native parity for that program remains
+explicit.
 
 The 32 former `tools/test_native_triggers.py` unit methods map individually to
 `test-native-triggers-zig-unit` and `test-native-diversion-settlement-zig-unit`

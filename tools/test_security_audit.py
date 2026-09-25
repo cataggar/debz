@@ -574,6 +574,53 @@ class SecurityAuditTests(unittest.TestCase):
             with self.subTest(refusal=token):
                 self.assertTrue(check(build, trigger.replace(token, "")))
 
+    def test_lifecycle_migration_removes_entrypoints_and_preserves_fixture_imports(self) -> None:
+        retired = (
+            "tools/test-native-lifecycle.py",
+            "tools/test_native_lifecycle.py",
+            "tools/test-native-triggers.py",
+            "tools/test_native_triggers.py",
+        )
+        fixture_paths = (
+            "tools/native-lifecycle-fixtures.py",
+            "tools/native-trigger-fixtures.py",
+        )
+        consumers = (
+            "tools/test-native-recovery.py",
+            "tools/dpkg-config-reference.py",
+            "actions/install/__tests__/integration.test.ts",
+        )
+        texts = {path: (ROOT / path).read_text() for path in (*fixture_paths, *consumers)}
+        check = security_audit.native_lifecycle_fixture_failures
+        self.assertEqual([], check(texts))
+        for path in retired:
+            with self.subTest(restored=path):
+                self.assertTrue(check({**texts, path: ""}))
+        for path in fixture_paths:
+            with self.subTest(missing=path):
+                self.assertTrue(check({name: body for name, body in texts.items() if name != path}))
+            for entrypoint in (
+                "#!/usr/bin/env python3\n",
+                "\nimport argparse\n",
+                "\ndef main() -> int:\n",
+                '\nif __name__ == "__main__":\n',
+            ):
+                with self.subTest(fixture=path, entrypoint=entrypoint):
+                    changed = (
+                        entrypoint + texts[path]
+                        if entrypoint.startswith("#!")
+                        else texts[path] + entrypoint
+                    )
+                    self.assertTrue(check({**texts, path: changed}))
+        for path in (fixture_paths[1], *consumers):
+            with self.subTest(importer=path):
+                fixture = (
+                    "native-trigger-fixtures.py"
+                    if path == "tools/test-native-recovery.py"
+                    else "native-lifecycle-fixtures.py"
+                )
+                self.assertTrue(check({**texts, path: texts[path].replace(fixture, "missing.py")}))
+
     def test_build_workloads_keep_both_modes_and_all_existing_suites(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))

@@ -1,10 +1,7 @@
-#!/usr/bin/env python3
-"""Compare native trigger queues, package states, and script traces with dpkg."""
+"""Shared dpkg trigger fixture builders and guarded-root comparison helpers."""
 
 from __future__ import annotations
 
-import argparse
-from contextlib import nullcontext
 import hashlib
 import importlib.util
 import json
@@ -12,23 +9,16 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "debz_trigger_lifecycle", ROOT / "tools/test-native-lifecycle.py",
+    "debz_trigger_lifecycle", ROOT / "tools/native-lifecycle-fixtures.py",
 )
 assert SPEC and SPEC.loader
 lifecycle = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(lifecycle)
 m = lifecycle.m
-SETTLEMENT_SPEC = importlib.util.spec_from_file_location(
-    "debz_diversion_settlement_oracle", ROOT / "tools/native_diversion_settlement_oracle.py",
-)
-assert SETTLEMENT_SPEC and SETTLEMENT_SPEC.loader
-settlement = importlib.util.module_from_spec(SETTLEMENT_SPEC)
-SETTLEMENT_SPEC.loader.exec_module(settlement)
 HELPER = Path("usr/bin/dpkg-trigger")
 RECEIVER = "debz-trigger-receiver"
 SOURCE = "debz-trigger-source"
@@ -713,85 +703,3 @@ def exercise(
         if m.oracle.differences(before, snapshot(current.candidate)):
             raise AssertionError("blocked deferred operation changed package or script state")
         print("deferred-unrelated-selection-change: unexpected selection was not overwritten", flush=True)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("native_test", nargs="?", type=Path)
-    parser.add_argument("--native-helper", type=Path)
-    parser.add_argument(
-        "--oracle-only", action="store_true",
-        help="check reference fixture consistency only; not native parity",
-    )
-    parser.add_argument("--workspace", type=Path)
-    parser.add_argument("--reference-dpkg", type=Path)
-    parser.add_argument("--diversions-only", action="store_true")
-    parser.add_argument(
-        "--diversion-settlement-reference-only", action="store_true",
-        help="run the guarded mid-unpack reference specification only; requires --oracle-only",
-    )
-    arguments = parser.parse_args()
-    if arguments.oracle_only == bool(arguments.native_test):
-        parser.error("provide a native test executable or --oracle-only, not both")
-    if bool(arguments.native_helper) != bool(arguments.native_test):
-        parser.error("native execution requires a native trigger-helper artifact")
-    if arguments.diversion_settlement_reference_only and (
-        not arguments.oracle_only or arguments.diversions_only
-    ):
-        parser.error("--diversion-settlement-reference-only requires --oracle-only and no other selector")
-    if os.geteuid() != 0:
-        raise RuntimeError("trigger acceptance requires root for actual chroot execution")
-    for command in ("dpkg", "dpkg-deb", "dpkg-trigger", "ldd"):
-        if shutil.which(command) is None:
-            raise RuntimeError(f"missing reference prerequisite: {command}")
-    executable = arguments.native_test.resolve(strict=True) if arguments.native_test else None
-    helper = arguments.native_helper.resolve(strict=True) if arguments.native_helper else None
-    if helper is not None:
-        validate_native_helper(helper)
-    architecture = subprocess.run(
-        ["dpkg", "--print-architecture"], check=True, capture_output=True,
-        text=True, timeout=10,
-    ).stdout.strip()
-    if architecture not in ("amd64", "arm64"):
-        raise RuntimeError(f"unsupported trigger acceptance architecture: {architecture}")
-    m.REFERENCE_DPKG = m.reference_dpkg.select(arguments.reference_dpkg, architecture)
-    temporary_root = ROOT / ".tmp"
-    temporary_root.mkdir(exist_ok=True)
-    if arguments.workspace:
-        workspace = arguments.workspace.resolve()
-        if workspace.parent != temporary_root.resolve():
-            parser.error("--workspace must name a new direct child of this worktree's .tmp")
-        workspace.mkdir()
-        context = nullcontext(str(workspace))
-    else:
-        context = tempfile.TemporaryDirectory(prefix="native-triggers-", dir=temporary_root)
-    host_status = Path("/var/lib/dpkg/status").read_bytes()
-    try:
-        with context as temporary:
-            workspace = Path(temporary)
-            environment = m.fixture_environment(workspace)
-            if arguments.diversion_settlement_reference_only:
-                settlement.exercise(
-                    lifecycle, reference, workspace, environment, architecture,
-                )
-            elif arguments.diversions_only:
-                exercise_diversion_triggers(executable, helper, workspace, environment, architecture)
-                settlement.exercise(
-                    lifecycle, reference, workspace, environment, architecture,
-                    executable=executable, helper=helper, native_runner=native,
-                )
-            else:
-                exercise(executable, helper, workspace, environment, architecture)
-                exercise_unconfigured_listener_reference(workspace, environment, architecture)
-                settlement.exercise(
-                    lifecycle, reference, workspace, environment, architecture,
-                    executable=executable, helper=helper, native_runner=native,
-                )
-    finally:
-        if Path("/var/lib/dpkg/status").read_bytes() != host_status:
-            raise AssertionError("host dpkg status changed during trigger acceptance")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

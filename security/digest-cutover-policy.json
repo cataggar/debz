@@ -449,7 +449,7 @@
         "src/transaction_recovery.zig",
         "test/apt-system-schema-validator.zig",
         "tools/derive-vendor-state-reference.py",
-        "tools/test-native-lifecycle.py",
+        "tools/native-lifecycle-fixtures.py",
         "tools/test_vendor_state_capture.py"
       ],
       "count": 172,
