@@ -168,7 +168,7 @@ fn caseRun(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     defer fixture.allocator.free(comparison);
     try fixture.directory(comparison);
     try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
-    const proof_path = recovered.value.provenance_path orelse return error.MissingRecoveryProof;
+    const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);
     var proof = try process.rootDocument(fixture, case.native_root, proof_path);
     defer proof.deinit();
     try process.same(try process.text(proof.value, "attempt_id"), recovered.value.attempt_id orelse return error.MissingRecoveryProof);

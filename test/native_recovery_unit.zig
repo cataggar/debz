@@ -305,6 +305,30 @@ test "recovery-unit.provenance reader refuses symlinks at both document paths" {
     try std.testing.expect((try provenance.read(allocator, root)) == null);
 }
 
+test "recovery-unit.report path is bound before reading provenance" {
+    const expected = provenance.legacy_document_path;
+    try std.testing.expectEqualStrings(expected, try oracle.reportProvenancePath(expected, expected));
+    try std.testing.expectEqualStrings(provenance.document_path, try oracle.reportProvenancePath(provenance.document_path, provenance.document_path));
+    for ([_][]const u8{
+        "/etc/passwd",
+        "var/lib/debz/../../outside",
+        "var/lib/debz-other/proof.json",
+        "var/lib/debz/proof.json",
+        provenance.document_path,
+    }) |reported| try std.testing.expectError(error.UnboundRecoveryProof, oracle.reportProvenancePath(reported, expected));
+
+    var sandbox = try fixture();
+    defer sandbox.deinit();
+    const root = root_fs.Root.init(sandbox.io, sandbox.dir);
+    try sandbox.directory("var/lib/debz");
+    try sandbox.write("outside.json", "not a provenance document", 0o600);
+    const external = try sandbox.absolute("outside.json");
+    defer allocator.free(external);
+    try sandbox.dir.symLink(sandbox.io, external, "var/lib/debz/proof.json", .{});
+    try std.testing.expectError(error.UnboundRecoveryProof, oracle.reportProvenancePath("var/lib/debz/proof.json", expected));
+    try std.testing.expect((try provenance.read(allocator, root)) == null);
+}
+
 test "recovery-unit.unknown receipt fields outcome schema and unsafe paths fail closed" {
     var document = provenance.testDocument();
     try std.testing.expectError(error.UnexpectedToken, provenance.decode(allocator, "[]"));

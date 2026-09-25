@@ -1422,8 +1422,8 @@ Names in the following tables are methods of `tools/test_native_recovery.py`;
 | `empty_exact_lock_v2_schema_preserves_required_bindings` | `recovery-unit.empty v2 closure requires every typed binding and refuses legacy schema` checks the exact canonical digest, all five omitted typed fields, and the v1 reader's `EmptyClosure` refusal after removing v2-only fields |
 | `provenance_is_bound_to_original_execution` | `native_transaction_result.test.owned verification preserves exact owners and never provisions locks`: `OwnershipMismatch`, `ExactIdentityMismatch` |
 | `caller_binding_preserves_outer_operation_and_hash_domains` | `native_execution_request.test.canonical ownership mapping survives allocation failures`: caller request/policy hashes distinct from program request/solver hashes |
-| `report_cannot_point_outside_native_namespace` | `recovery-unit.unknown receipt fields outcome schema and unsafe paths fail closed`: `InvalidEvidence` for absolute, near-prefix and traversal |
-| `report_cannot_follow_a_provenance_symlink` | `recovery-unit.provenance reader refuses symlinks at both document paths`: `NotRegularFile`; the separate retained-evidence test also rejects a symlink without reading its target |
+| `report_cannot_point_outside_native_namespace` | `recovery-unit.report path is bound before reading provenance` rejects the three forged **report** paths, an arbitrary in-namespace path and a wrong version with `UnboundRecoveryProof` before I/O. Separately, receipt *evidence-file* paths return `InvalidEvidence`. |
+| `report_cannot_follow_a_provenance_symlink` | The report-path oracle refuses the arbitrary in-namespace `proof.json` symlink path before I/O; production `native_provenance.read` ignores that path and refuses symlinks at either fixed versioned document path with `NotRegularFile`. Retained-evidence symlinks are also refused. |
 | `native_document_reads_are_bounded_and_objects_only` | `recovery-unit.unknown receipt fields outcome schema and unsafe paths fail closed`: `UnexpectedToken`; `native_provenance.test.canonical byte decoding preserves outcomes and allocation failures`: `DocumentTooLarge` |
 | `canonical_self_digest_cannot_hide_changed_receipt` | `native_provenance.test.digest binds terminal evidence`, `...canonical byte decoding preserves outcomes and allocation failures`: `DigestMismatch` |
 | `digest_summary_cannot_replace_missing_detailed_evidence` | `recovery-unit.retained evidence rejects missing duplicate cross-attempt and altered bytes`: `InvalidEvidence` |
@@ -1487,8 +1487,8 @@ constant nor a mocked Python subprocess counts as an executed transport.
 | 41 | `helper_request_schema_supports_jsonschema_without_referencing` | U (Zig runtime); Python-tool compatibility | `recovery-unit.helper request schemas resolve v1 program policy and reject missing bindings` checks the real v1 `$id`, both external v2/v3 `$ref`s and all three typed persisted decoders; each refuses missing or uppercase embedded `script_policy_sha256`. The Python method also re-imports `tools/test-native-recovery.py` with `referencing` blocked, then checks local `jsonschema.RefResolver` and registry validation of v1/v2/v3 without a network connection. That import-path fallback belongs only to the Python acceptance tool, not to a Zig runtime contract |
 | 42 | `provenance_is_bound_to_original_execution` | U | `native_transaction_result.test.owned verification preserves exact owners and never provisions locks` refuses changed owners/identities |
 | 43 | `caller_binding_preserves_outer_operation_and_hash_domains` | U | `native_execution_request.test.canonical ownership mapping survives allocation failures` preserves outer caller and distinct request/policy domains |
-| 44 | `report_cannot_point_outside_native_namespace` | U+A | Unit receipt validation rejects absolute, near-prefix and traversal evidence paths; Zig acceptance compares report provenance path to its fixed versioned path **before** reading it (no Python arbitrary report-path reader) |
-| 45 | `report_cannot_follow_a_provenance_symlink` | U | `recovery-unit.provenance reader refuses symlinks at both document paths` returns `NotRegularFile`; retained-evidence symlinks are separately refused |
+| 44 | `report_cannot_point_outside_native_namespace` | U+A | `recovery-unit.report path is bound before reading provenance` refuses absolute, traversal, near-prefix, arbitrary in-namespace and wrong-version **report** paths with `UnboundRecoveryProof`; real Zig consumers require the fixed versioned path before reading. Receipt *evidence-file* path refusal is distinct. |
+| 45 | `report_cannot_follow_a_provenance_symlink` | U+A | The unit creates an arbitrary in-namespace symlink and checks that the report path is rejected before I/O; fixed-path production `native_provenance.read` returns `NotRegularFile` for symlinks at both v1/v2 document paths. Real Zig report consumers use the same fixed-path binder. |
 | 46 | `claimed_recovery_cannot_hide_duplicate_script_invocation` | A (crash/helper) | `helper-outcome` appends duplicate to a real recovered trace; `foundation.compare` returns `NativeDpkgMismatch` |
 | 47 | `caller_archive_is_removed_before_recovery` | A (crash/helper) | `caseRun` removes and confirms input archive absent before fresh recovery |
 | 48 | `unknown_script_cannot_be_hidden_by_rolling_back_payload` | A (crash/helper) | `helper-unknown-script` checks unchanged root and rejects deliberate rollback with `BlockedRecoveryMutatedPackageState` |
@@ -1518,14 +1518,25 @@ recovery entry points are retired, no remaining Python consumer needs this
 fallback. Replacing a removed Python interpreter import branch with Zig would
 be a fixture-only substitute, not executed behavior; the actual cross-file
 v1/v2/v3 request refusal remains in the Zig unit target. The table records
-*coverage*, not proof of complete #215 migration or of the separately pending
-FAMILY workflow agent.
-The privileged targets are wired in CI but were not re-run by this bounded
-unit slice. Both `tools/test_native_recovery.py` and
-`tools/test-native-recovery.py` and all existing required gates stay in place
-until full integrated Debug/ReleaseSafe, amd64/arm64 equivalence is established.
-The standalone Zig unit target is now also an explicit required command in
-the native-recovery CI job and in its mutation-tested security audit.
+*coverage*, not approval of gate retirement without both CI matrices.
+Former methods #44 and #45 tested a different Python-tool reader:
+`tools/test-native-recovery.py::provenance` passed a report-supplied path to
+`namespace_path`, which rejected escapes and arbitrary symlinks before
+opening it. Production Zig does **not** consume a report path to find a
+receipt: `native_provenance.read` tries only the fixed v2 then v1 paths and
+`native_provenance.documentPath` derives the output path from the validated
+document version. No production arbitrary-path reader should be added.
+Some Zig acceptance consumers had used the untrusted report path to read
+test evidence, so they now call the shared report-path oracle and read only
+its fixed-path return value. The new unit case injects every Python escape
+path and an actual arbitrary in-namespace symlink, while the existing unit
+case exercises symlinks at both production document paths. This preserves
+the refusal boundary without mistaking a receipt evidence-file path test
+for a report-path test or claiming identical Python and Zig reader APIs.
+The standalone Zig unit target remains a required command in the
+native-recovery CI job. Both `tools/test_native_recovery.py` and
+`tools/test-native-recovery.py` remain required until the integrated
+Debug/ReleaseSafe, amd64/arm64 matrix proves equivalence.
 
 | Python oracle (`test_` + name) | Executed Zig CRASH/HELPER counterpart |
 | --- | --- |

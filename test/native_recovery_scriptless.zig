@@ -1,14 +1,17 @@
 const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
+const oracle = @import("native_recovery_oracle.zig");
 const options = @import("native_test_options");
-const root_fs = @import("debz").root_fs;
+const debz = @import("debz");
+const root_fs = debz.root_fs;
 
 const receiver = "debz-no-handler-receiver";
 const second_receiver = receiver ++ "-second";
 const scripted_receiver = "debz-no-handler-z-scripted";
 const trigger = "debz-no-handler";
 const namespace = "var/lib/debz/";
+const provenance_path = debz.native_provenance.legacy_document_path;
 
 pub const Report = struct {
     outcome: []const u8,
@@ -48,6 +51,10 @@ pub fn rootDocument(fixture: *foundation.Fixture, root: []const u8, name: []cons
     const bytes = try rootBytes(fixture, root, name);
     defer fixture.allocator.free(bytes);
     return std.json.parseFromSlice(std.json.Value, fixture.allocator, bytes, .{ .allocate = .alloc_always });
+}
+
+pub fn reportProvenancePath(reported: ?[]const u8) ![]const u8 {
+    return oracle.reportProvenancePath(reported orelse return error.MissingRecoveryProof, provenance_path);
 }
 
 pub fn rootAbsent(fixture: *foundation.Fixture, root: []const u8, name: []const u8) !void {
@@ -295,9 +302,7 @@ fn runCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     defer fixture.allocator.free(comparison);
     try fixture.directory(comparison);
     try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
-    const proof_path = report.value.provenance_path orelse return error.MissingRecoveryProof;
-    if (!std.mem.startsWith(u8, proof_path, namespace))
-        return error.UnboundRecoveryProof;
+    const proof_path = try reportProvenancePath(report.value.provenance_path);
     var proof = try rootDocument(fixture, case.native_root, proof_path);
     defer proof.deinit();
     try same(try text(proof.value, "attempt_id"), report.value.attempt_id orelse return error.MissingRecoveryProof);

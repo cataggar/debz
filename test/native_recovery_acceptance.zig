@@ -226,7 +226,7 @@ fn assertBinding(
     const program = try text(intent, "program_sha256");
     try equal(report.attempt_id orelse return error.MissingReportBinding, attempt);
     try equal(report.program_sha256 orelse return error.MissingReportBinding, program);
-    try equal(report.provenance_path orelse return error.MissingReportBinding, provenance_path);
+    _ = try oracle.reportProvenancePath(report.provenance_path orelse return error.MissingReportBinding, provenance_path);
     var proof = try rootDocument(fixture, root, provenance_path);
     defer proof.deinit();
     try equal(try text(proof.value, "backend"), "native");

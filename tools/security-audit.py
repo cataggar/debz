@@ -1341,6 +1341,65 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     return failures
 
 
+REPORT_PATH_ORACLE_FILES = (
+    "test/native_recovery_oracle.zig",
+    "test/native_recovery_unit.zig",
+    "test/native_recovery_acceptance.zig",
+    "test/native_recovery_scriptless.zig",
+    "test/native_recovery_conffile.zig",
+    "test/native_recovery_literal.zig",
+    "test/native_recovery_metadata.zig",
+    "test/native_recovery_statoverride.zig",
+)
+
+
+def native_report_path_wiring_failures(texts: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    required = {
+        "test/native_recovery_oracle.zig": (
+            ('pub fn reportProvenancePath(reported: []const u8, expected: []const u8) ![]const u8 {', 1),
+            ('if (!std.mem.eql(u8, reported, expected)) return error.UnboundRecoveryProof;', 1),
+            ("return expected;", 1),
+        ),
+        "test/native_recovery_acceptance.zig": (
+            ('_ = try oracle.reportProvenancePath(report.provenance_path orelse return error.MissingReportBinding, provenance_path);', 1),
+        ),
+        "test/native_recovery_scriptless.zig": (
+            ("pub fn reportProvenancePath(reported: ?[]const u8) ![]const u8 {", 1),
+            ("return oracle.reportProvenancePath(reported orelse return error.MissingRecoveryProof, provenance_path);", 1),
+            ("const proof_path = try reportProvenancePath(report.value.provenance_path);", 1),
+        ),
+        "test/native_recovery_conffile.zig": (
+            ("const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);", 2),
+        ),
+        "test/native_recovery_literal.zig": (
+            ("const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);", 1),
+        ),
+        "test/native_recovery_metadata.zig": (
+            ("const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);", 1),
+        ),
+        "test/native_recovery_statoverride.zig": (
+            ("const proof_path = try process.reportProvenancePath(report.value.provenance_path);", 1),
+        ),
+    }
+    for path, tokens in required.items():
+        source = texts.get(path, "")
+        for token, count in tokens:
+            if source.count(token) < count:
+                failures.append(f"{path}: report provenance path is no longer bound before reading: {token}")
+    unit = texts.get("test/native_recovery_unit.zig", "")
+    case = unit.partition('test "recovery-unit.report path is bound before reading provenance" {')[2].partition('\ntest "')[0]
+    for token in (
+        '"/etc/passwd"', '"var/lib/debz/../../outside"',
+        '"var/lib/debz-other/proof.json"', '"var/lib/debz/proof.json"',
+        "provenance.document_path", "error.UnboundRecoveryProof",
+        'try sandbox.dir.symLink(sandbox.io, external, "var/lib/debz/proof.json", .{});',
+        "try std.testing.expect((try provenance.read(allocator, root)) == null);",
+    ):
+        if token not in case:
+            failures.append(f"test/native_recovery_unit.zig: missing report-path refusal: {token}")
+    return failures
+
 def native_core_completion_wiring_failures(
     build: str, helper: str, support: str,
 ) -> list[str]:
@@ -1893,6 +1952,10 @@ def audit_ci_pins() -> None:
         (ROOT / "test/native_recovery_family.zig").read_text(),
         (ROOT / "test/native_recovery_projected_workflows.zig").read_text(),
     ):
+        fail(failure)
+    for failure in native_report_path_wiring_failures({
+        path: (ROOT / path).read_text() for path in REPORT_PATH_ORACLE_FILES
+    }):
         fail(failure)
     for failure in native_lifecycle_migration_failures(
         (ROOT / "build.zig").read_text(),

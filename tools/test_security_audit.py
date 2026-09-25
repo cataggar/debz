@@ -610,6 +610,25 @@ class SecurityAuditTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, build == recovery == "success")
 
+    def test_report_path_reader_refusals_are_mutation_enforced(self) -> None:
+        paths = security_audit.REPORT_PATH_ORACLE_FILES
+        texts = {path: (ROOT / path).read_text() for path in paths}
+        check = security_audit.native_report_path_wiring_failures
+        self.assertEqual([], check(texts))
+        for path, token in (
+            ("test/native_recovery_oracle.zig", "if (!std.mem.eql(u8, reported, expected)) return error.UnboundRecoveryProof;"),
+            ("test/native_recovery_acceptance.zig", "_ = try oracle.reportProvenancePath(report.provenance_path orelse return error.MissingReportBinding, provenance_path);"),
+            ("test/native_recovery_scriptless.zig", "const proof_path = try reportProvenancePath(report.value.provenance_path);"),
+            ("test/native_recovery_conffile.zig", "const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);"),
+            ("test/native_recovery_literal.zig", "const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);"),
+            ("test/native_recovery_metadata.zig", "const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);"),
+            ("test/native_recovery_statoverride.zig", "const proof_path = try process.reportProvenancePath(report.value.provenance_path);"),
+            ("test/native_recovery_unit.zig", 'try sandbox.dir.symLink(sandbox.io, external, "var/lib/debz/proof.json", .{});'),
+        ):
+            with self.subTest(path=path, token=token):
+                self.assertIn(token, texts[path])
+                self.assertTrue(check({**texts, path: texts[path].replace(token, "", 1)}))
+
     def test_native_core_completion_wiring_is_mutation_enforced(self) -> None:
         build = (ROOT / "build.zig").read_text()
         helper = (ROOT / "test/native_recovery_helper.zig").read_text()

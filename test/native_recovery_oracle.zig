@@ -14,6 +14,11 @@ pub const ScriptInvocation = struct {
 
 pub const EnvironmentEntry = @import("debz").native_recovery.EnvironmentEntry;
 
+pub fn reportProvenancePath(reported: []const u8, expected: []const u8) ![]const u8 {
+    if (!std.mem.eql(u8, reported, expected)) return error.UnboundRecoveryProof;
+    return expected;
+}
+
 fn hashText(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
     var length: [8]u8 = undefined;
     std.mem.writeInt(u64, &length, value.len, .little);
