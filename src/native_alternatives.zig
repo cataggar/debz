@@ -1120,6 +1120,9 @@ const snapshot_less_postinst_sha256 = digestLiteral(
 const snapshot_bash_postinst_sha256 = digestLiteral(
     "e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff",
 );
+const snapshot_procps_postinst_sha256 = digestLiteral(
+    "7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
+);
 
 pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     var sha256: [32]u8 = undefined;
@@ -1147,6 +1150,16 @@ pub fn matchesSnapshotBashPostinst(bytes: []const u8) bool {
     return std.crypto.timing_safe.eql(
         [32]u8,
         snapshot_bash_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotProcpsPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_procps_postinst_sha256,
         sha256,
     );
 }
@@ -1214,6 +1227,7 @@ pub const ScriptAuthority = struct {
     commands: []const ScriptCommand,
     paths: []const []const u8,
     immutable_targets: []const []const u8,
+    require_targets_absent: bool = false,
     arena: *std.heap.ArenaAllocator,
     backing_allocator: std.mem.Allocator,
 
@@ -1403,6 +1417,28 @@ pub fn discoverScriptAuthority(
         allocator.destroy(storage.arena);
     }
     const owned = storage.owned;
+    if (matchesSnapshotProcpsPostinst(bytes)) {
+        // The signed script's variable commands are unreachable when all four guards fail.
+        const targets = &[_][]const u8{
+            "/usr/bin/uptime.procps",
+            "/usr/bin/vmstat.procps",
+            "/usr/bin/w.procps",
+            "/bin/ps.procps",
+        };
+        for (targets) |target| {
+            if (!validAbsolutePath(target, limits))
+                return error.InvalidAlternativesScript;
+        }
+        return .{
+            .groups = &.{},
+            .commands = &.{},
+            .paths = &.{},
+            .immutable_targets = try owned.dupe([]const u8, targets),
+            .require_targets_absent = true,
+            .arena = storage.arena,
+            .backing_allocator = allocator,
+        };
+    }
     var normalized: std.ArrayList(u8) = .empty;
     defer normalized.deinit(owned);
     var index: usize = 0;
@@ -2167,6 +2203,12 @@ fn immutableDigest(facts: []const EntryFact) [32]u8 {
     return digest.finalResult();
 }
 
+fn requireNewAbsentTarget(facts: []const EntryFact, previous_count: usize) !void {
+    if (facts.len != previous_count + 1 or
+        facts[previous_count].kind != .absent)
+        return error.InvalidAlternativesScriptAuthority;
+}
+
 pub fn captureScriptInputs(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -2184,7 +2226,8 @@ pub fn captureScriptInputs(
     defer paths.deinit(owned);
     var facts: std.ArrayList(EntryFact) = .empty;
     defer facts.deinit(owned);
-    for (script.immutable_targets) |target|
+    for (script.immutable_targets) |target| {
+        const previous_count = facts.items.len;
         try observeTargetTopology(
             owned,
             root,
@@ -2193,6 +2236,9 @@ pub fn captureScriptInputs(
             &paths,
             &facts,
         );
+        if (script.require_targets_absent)
+            try requireNewAbsentTarget(facts.items, previous_count);
+    }
     for (before.groups) |group| {
         if (script.group(group.name) == null) continue;
         for (group.record.candidates) |candidate| {
@@ -3927,6 +3973,154 @@ test "native_alternatives.test.signed netcat install matches pinned sorted nc re
             );
         }
     }
+}
+
+test "native_alternatives.test.signed procps only admits absent providers and immutable groups" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
+    );
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    try testing.expectEqualSlices(
+        u8,
+        &digestLiteral(
+            "7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
+        ),
+        &sha256,
+    );
+    try testing.expect(matchesSnapshotProcpsPostinst(bytes));
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expect(script.require_targets_absent);
+    try testing.expectEqual(@as(usize, 0), script.groups.len);
+    try testing.expectEqual(@as(usize, 0), script.commands.len);
+    try testing.expectEqual(@as(usize, 0), script.paths.len);
+    try testing.expectEqual(@as(usize, 4), script.immutable_targets.len);
+    const targets = [_][]const u8{
+        "/usr/bin/uptime.procps",
+        "/usr/bin/vmstat.procps",
+        "/usr/bin/w.procps",
+        "/bin/ps.procps",
+    };
+    for (script.immutable_targets, &targets) |actual, expected|
+        try testing.expectEqualStrings(expected, actual);
+
+    const absent = [_]EntryFact{.{
+        .path = "usr/bin/uptime.procps",
+        .kind = .absent,
+    }};
+    try requireNewAbsentTarget(&absent, 0);
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        requireNewAbsentTarget(&.{}, 0),
+    );
+    for ([_]EntryKind{ .regular, .symlink }) |kind| {
+        var occupied = absent;
+        occupied[0].kind = kind;
+        try testing.expectError(
+            error.InvalidAlternativesScriptAuthority,
+            requireNewAbsentTarget(&occupied, 0),
+        );
+    }
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        requireNewAbsentTarget(&.{ absent[0], absent[0] }, 0),
+    );
+    const changed = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(changed);
+    changed[0] = ' ';
+    try testing.expect(!matchesSnapshotProcpsPostinst(changed));
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(testing.allocator, changed, .{}),
+    );
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(
+            testing.allocator,
+            bytes,
+            .{ .max_path_bytes = 12 },
+        ),
+    );
+
+    var parsed = try parse(
+        testing.allocator,
+        "unexpected",
+        "auto\n/usr/bin/unexpected\n\n/usr/bin/provider\n10\n\n",
+        .{},
+    );
+    defer parsed.deinit();
+    var group: GroupState = .{
+        .name = "unexpected",
+        .record = parsed.record,
+        .record_fact = .{
+            .path = "var/lib/dpkg/alternatives/unexpected",
+            .kind = .regular,
+        },
+        .selected = "/usr/bin/provider",
+        .links = &.{},
+        .missing_master_targets = &.{},
+        .facts = &.{},
+        .digest = undefined,
+    };
+    group.digest = groupStateDigest(group);
+    const before: Snapshot = .{
+        .groups = &.{},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{}),
+        .relationship_count = 0,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    const after: Snapshot = .{
+        .groups = &.{group},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{group}),
+        .relationship_count = 1,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    try testing.expectError(
+        error.UnsupportedAlternativesGroup,
+        validateScriptTransition(
+            testing.allocator,
+            before,
+            after,
+            script,
+            .{ .groups = &.{} },
+        ),
+    );
+    try validateScriptTransition(
+        testing.allocator,
+        after,
+        after,
+        script,
+        .{ .groups = &.{.{ .name = "unexpected", .mutable = false }} },
+    );
+    var changed_group = group;
+    changed_group.digest[0] ^= 1;
+    const changed_after: Snapshot = .{
+        .groups = &.{changed_group},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{changed_group}),
+        .relationship_count = 1,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    try testing.expectError(
+        error.AlternativesStateChanged,
+        validateScriptTransition(
+            testing.allocator,
+            after,
+            changed_after,
+            script,
+            .{ .groups = &.{.{ .name = "unexpected", .mutable = false }} },
+        ),
+    );
 }
 
 test "native_alternatives.test.sorted new slave preserves existing provider targets" {
