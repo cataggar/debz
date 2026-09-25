@@ -1211,6 +1211,30 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         '            .zig-cache/apt-system-acceptance-local 2>/dev/null || true',
     )):
         failures.append("ci.yml: apt acceptance caches must be normalized for both modes")
+    compare_name = (
+        "Compare native materialization, conffiles, differential, "
+        "lifecycle, and triggers with dpkg"
+    )
+    compare = steps.get(compare_name, "")
+    script = compare.split("        run: |\n", 1)
+    compare_commands = (
+        [
+            line.strip() for line in script[1].splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if len(script) == 2
+        else []
+    )
+    expected_compare_commands = [
+        *(line.strip() for line in shared_steps[compare_name]),
+        "zig build test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig \\",
+        shared_steps[compare_name][2].strip(),
+    ]
+    if compare_commands != expected_compare_commands:
+        failures.append(
+            "ci.yml: both native differential suites must execute with "
+            "the pinned dpkg in every build workload"
+        )
     selected_steps = {
         "Test release packaging": ("Debug", (
             "        run: zig build test-release -j2 --summary all",

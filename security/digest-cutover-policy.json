@@ -456,6 +456,18 @@
       "sha512": "0fb9f3bc820e67db2624455d743c38b3d33a7608227b36012fa64059e622bc1926d3801ee71c6e1bac1f89d2b1cbf329386d6a6282499405d300fb4223da9f16"
     },
     {
+      "id": "fixed-lifecycle-control-assertions",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_protocol",
+      "rationale": "These exact Zig test assertions validate a 64-character SHA256 control digest and its schema pattern; they do not define package, repository, or artifact content authority.",
+      "paths": [
+        "test/native_lifecycle_negative.zig",
+        "test/native_lifecycle_support.zig"
+      ],
+      "count": 2,
+      "sha512": "29a9c5f9c376a84277a5fd0582b5192104607bc3d8978d1eb94db9956a28e7a7ebf21d8152656ff689da742de9a0f4273c9ca9bc9112d185ff9300bb4f186a93"
+    },
+    {
       "id": "historical-fixed-cas-layouts",
       "kind": "fixed_sha256_cas",
       "classification": "historical_versioned_compatibility",

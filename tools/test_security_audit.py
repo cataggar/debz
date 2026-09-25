@@ -533,6 +533,17 @@ class SecurityAuditTests(unittest.TestCase):
             ("test-native-materialization test-native-conffiles", "test-native-materialization"),
             ("test-native-differential", ""),
             ("test-native-lifecycle test-native-triggers", "test-native-lifecycle"),
+            (
+                "test-native-lifecycle-zig test-native-triggers-zig "
+                "test-native-diversion-settlement-zig",
+                "test-native-lifecycle-zig test-native-triggers-zig",
+            ),
+            (
+                'test-native-diversion-settlement-zig \\\n'
+                '            -Dnative-reference-dpkg="$reference_dpkg"',
+                'test-native-diversion-settlement-zig \\\n'
+                '            -Dnative-reference-dpkg="$untrusted_dpkg"',
+            ),
             ('reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"', "reference_dpkg=/usr/bin/dpkg"),
             ('-Dnative-reference-dpkg="$reference_dpkg"', ""),
             ("test-native-helper-namespace", "test"),
