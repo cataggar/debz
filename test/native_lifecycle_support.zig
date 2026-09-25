@@ -761,6 +761,100 @@ test "trace and package database mismatches cannot be hidden by a success report
     try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
 }
 
+test "nonrollback payload times and bytes remain exact" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
+    defer fixture.deinit();
+    fixture.diagnostics = false;
+    const left = try fixture.makeRoot("reference", "amd64");
+    defer std.testing.allocator.free(left);
+    const right = try fixture.makeRoot("native", "amd64");
+    defer std.testing.allocator.free(right);
+    try fixtureFile(&fixture, "reference/payload", "same bytes", 0o644);
+    try fixtureFile(&fixture, "native/payload", "same bytes", 0o644);
+    try fixture.directory("observation");
+    try compare(&fixture, left, right, "observation", false);
+    try fixture.dir.setTimestamps(std.testing.io, "native/payload", .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = (foundation.epoch + 10) * std.time.ns_per_s } },
+    });
+    try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
+    try fixtureFile(&fixture, "native/payload", "different bytes", 0o644);
+    try std.testing.expectError(error.NativeDpkgMismatch, compare(&fixture, left, right, "observation", false));
+}
+
+test "rollback symlink exception is confined to the selected kind, path and operation clock" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
+    defer fixture.deinit();
+    const left = try fixture.makeRoot("reference", "amd64");
+    defer std.testing.allocator.free(left);
+    const right = try fixture.makeRoot("native", "amd64");
+    defer std.testing.allocator.free(right);
+    try fixture.dir.symLink(std.testing.io, "target", "reference/link", .{});
+    try fixture.dir.symLink(std.testing.io, "target", "native/link", .{});
+    for ([_][]const u8{ left, right }, [_]i128{ 110, 120 }) |root_path, nanoseconds| {
+        var guarded = try foundation.guardedRoot(std.testing.io, root_path);
+        defer guarded.close(std.testing.io);
+        try (root_fs.Root.init(std.testing.io, guarded)).applyMetadata(try root_fs.Path.init("link"), .{
+            .modified_nanoseconds = nanoseconds,
+        });
+    }
+    try fixture.directory("observation");
+    const links = &.{RollbackLink{ .path = "link", .original = 100 }};
+    try compareRollback(&fixture, left, right, "observation", links, 105, 125);
+    var guarded = try foundation.guardedRoot(std.testing.io, right);
+    defer guarded.close(std.testing.io);
+    try (root_fs.Root.init(std.testing.io, guarded)).applyMetadata(try root_fs.Path.init("link"), .{
+        .modified_nanoseconds = 999,
+    });
+    try std.testing.expectError(error.RollbackLinkTimeOutsideOperation, compareRollback(
+        &fixture,
+        left,
+        right,
+        "observation",
+        links,
+        105,
+        125,
+    ));
+    try fixture.dir.deleteFile(std.testing.io, "native/link");
+    try fixtureFile(&fixture, "native/link", "not a symlink", 0o644);
+    try std.testing.expectError(error.RollbackLinkTypeChanged, compareRollback(
+        &fixture,
+        left,
+        right,
+        "observation",
+        links,
+        105,
+        125,
+    ));
+}
+
+test "applied report cannot conceal a wrong root snapshot" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
+    defer fixture.deinit();
+    fixture.diagnostics = false;
+    try fixture.write("fake-dpkg", "#!/bin/sh\nexit 0\n", 0o755);
+    const dpkg = try fixture.absolute("fake-dpkg");
+    defer fixture.allocator.free(dpkg);
+    const report = try fixture.absolute("wrong-state/0-install/native.report.json");
+    defer fixture.allocator.free(report);
+    const driver_body = try std.fmt.allocPrint(
+        fixture.allocator,
+        "#!/bin/sh\nprintf '%s' '{{\"outcome\":\"applied\"}}' > '{s}'\n",
+        .{report},
+    );
+    defer fixture.allocator.free(driver_body);
+    try fixture.write("fake-driver", driver_body, 0o755);
+    const driver = try fixture.absolute("fake-driver");
+    defer fixture.allocator.free(driver);
+    var case = try Scenario.init(&fixture, "wrong-state", driver, dpkg, "amd64", false);
+    defer case.deinit();
+    try fixtureFile(&fixture, "wrong-state/reference/unexpected-payload", "missing in native", 0o644);
+    try std.testing.expectError(error.NativeDpkgMismatch, case.phase(.{
+        .operation = "install",
+        .archives = &.{"package.deb"},
+    }, false));
+    fixture.retain = false;
+}
+
 test "empty retained package lists are observable rather than panicking" {
     var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
     defer fixture.deinit();

@@ -510,6 +510,59 @@ class SecurityAuditTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, build == recovery == "success")
 
+    def test_lifecycle_migration_keeps_four_gates_and_reference_only_crash_seam(self) -> None:
+        build = (ROOT / "build.zig").read_text()
+        trigger = (ROOT / "test/native_trigger_acceptance.zig").read_text()
+        check = security_audit.native_lifecycle_migration_failures
+        self.assertEqual([], check(build, trigger))
+        for entrypoint in (
+            "tools/test-native-lifecycle.py",
+            "tools/test_native_lifecycle.py",
+            "tools/test-native-triggers.py",
+            "tools/test_native_triggers.py",
+        ):
+            with self.subTest(entrypoint=entrypoint):
+                self.assertTrue(check(build.replace(f'"{entrypoint}"', '""'), trigger))
+        for binding in (
+            "native_lifecycle.addArtifactArg(native_lifecycle_tests);",
+            "native_lifecycle.step.dependOn(&native_lifecycle_oracle_tests.step);",
+            "test_step.dependOn(&native_lifecycle_oracle_tests.step);",
+            "native_triggers.addArtifactArg(native_lifecycle_tests);",
+            'native_triggers.addArg("--native-helper");',
+            "native_triggers.addArtifactArg(native_trigger_helper);",
+            "native_triggers.step.dependOn(&native_trigger_oracle_tests.step);",
+            "test_step.dependOn(&native_trigger_oracle_tests.step);",
+            ".dependOn(&native_lifecycle.step);",
+            ".dependOn(&native_triggers.step);",
+        ):
+            with self.subTest(binding=binding):
+                self.assertTrue(check(build.replace(binding, ""), trigger))
+        for token in (
+            "for ([_]bool{ false, true }) |awaiting|",
+            ".no_scripts = true",
+            "support.reference(fixture, dpkg, root",
+            "Status: install ok unpacked",
+            "Status: install ok half-configured",
+            "Triggers-Pending:",
+            "Triggers-Awaited:",
+            "queue.len != 0",
+            "activation-returned",
+            "exit 1",
+            "failedPostinstUnconfiguredListener(&fixture, reference.executable, reference.architecture)",
+        ):
+            with self.subTest(token=token):
+                self.assertTrue(check(build, trigger.replace(token, "")))
+        for token in (
+            "fn refuseUnconfiguredListenerProgram(",
+            "case.seedWith(handler, false)",
+            'report.value.detail, "program_compile_rejected"',
+            "foundation.captureRealRoot(",
+            "support.assertNoActiveEvidence(",
+            "refuseUnconfiguredListenerProgram(&fixture, driver, selected, reference.executable, reference.architecture)",
+        ):
+            with self.subTest(refusal=token):
+                self.assertTrue(check(build, trigger.replace(token, "")))
+
     def test_build_workloads_keep_both_modes_and_all_existing_suites(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))

@@ -208,7 +208,10 @@ fn runTriggerLifecycle(fixture: *foundation.Fixture, driver: []const u8, helper:
     try mixed.seed(mixed_handler);
     try copyNativeHelper(fixture, &mixed, helper);
     try mixed.phase(.{
-        .operation = "install", .archives = &.{mixed_source}, .triggers = true, .defer_triggers = true,
+        .operation = "install",
+        .archives = &.{mixed_source},
+        .triggers = true,
+        .defer_triggers = true,
     }, false);
     try mixed.phase(.{ .operation = "process_triggers", .triggers = true }, false);
 
@@ -242,8 +245,12 @@ fn runTriggerLifecycle(fixture: *foundation.Fixture, driver: []const u8, helper:
     defer fixture.allocator.free(activating);
     for ([_]bool{ false, true }) |source_first| {
         var case = try support.Scenario.init(
-            fixture, if (source_first) "new-handler-source-first" else "new-handler-receiver-first",
-            driver, dpkg, arch, true,
+            fixture,
+            if (source_first) "new-handler-source-first" else "new-handler-receiver-first",
+            driver,
+            dpkg,
+            arch,
+            true,
         );
         defer case.deinit();
         try copyNativeHelper(fixture, &case, helper);
@@ -259,19 +266,28 @@ fn runTriggerLifecycle(fixture: *foundation.Fixture, driver: []const u8, helper:
     defer fixture.allocator.free(script_source);
     for ([_]bool{ false, true }) |defer_triggers| {
         var case = try support.Scenario.init(
-            fixture, if (defer_triggers) "script-activation-coalesces-deferred" else "script-activation-coalesces",
-            driver, dpkg, arch, true,
+            fixture,
+            if (defer_triggers) "script-activation-coalesces-deferred" else "script-activation-coalesces",
+            driver,
+            dpkg,
+            arch,
+            true,
         );
         defer case.deinit();
         try case.seed(handler);
         try copyNativeHelper(fixture, &case, helper);
         try case.phase(.{
-            .operation = "install", .archives = &.{script_source}, .triggers = true, .defer_triggers = defer_triggers,
+            .operation = "install",
+            .archives = &.{script_source},
+            .triggers = true,
+            .defer_triggers = defer_triggers,
         }, false);
         if (defer_triggers) try case.phase(.{ .operation = "process_triggers", .triggers = true }, false);
     }
     const removing = try support.makePackage(fixture, arch, "1", source, "script-removal", .{
-        .activation = trigger, .activation_kind = "postrm", .activation_when = "remove",
+        .activation = trigger,
+        .activation_kind = "postrm",
+        .activation_when = "remove",
     });
     defer fixture.allocator.free(removing);
     var removal = try support.Scenario.init(fixture, "postrm-script-activation", driver, dpkg, arch, true);
@@ -362,6 +378,82 @@ fn processExistingQueue(fixture: *foundation.Fixture, driver: []const u8, helper
     try case.phase(.{ .operation = "process_triggers", .triggers = true }, false);
 }
 
+fn failedPostinstUnconfiguredListener(fixture: *foundation.Fixture, dpkg: []const u8, arch: []const u8) !void {
+    for ([_]bool{ false, true }) |awaiting| {
+        const label = try std.fmt.allocPrint(fixture.allocator, "failed-postinst-unconfigured-listener-{s}", .{
+            if (awaiting) "await" else "noawait",
+        });
+        defer fixture.allocator.free(label);
+        const declaration = try std.fmt.allocPrint(fixture.allocator, "interest-{s} {s}\n", .{
+            if (awaiting) "await" else "noawait", trigger,
+        });
+        defer fixture.allocator.free(declaration);
+        const handler = try support.makePackage(fixture, arch, "1", receiver, label, .{
+            .declarations = declaration,
+            .no_scripts = true,
+        });
+        defer fixture.allocator.free(handler);
+        const activating = try support.makePackage(fixture, arch, "1", source, label, .{
+            .activation = trigger,
+            .activation_await = awaiting,
+            .postinst_append = "printf 'activation-returned\\n' >> /" ++ support.trace ++ "\nexit 1\n",
+        });
+        defer fixture.allocator.free(activating);
+        const root_relative = try support.path(fixture.allocator, label, "reference");
+        defer fixture.allocator.free(root_relative);
+        const root = try fixture.makeRoot(root_relative, arch);
+        defer fixture.allocator.free(root);
+        try support.copyProgram(fixture, root_relative, "/bin/sh", "/bin/sh");
+        try support.copyProgram(fixture, root_relative, "/usr/bin/dpkg-trigger", "/usr/bin/dpkg-trigger");
+        const trace_path = try support.path(fixture.allocator, root_relative, support.trace);
+        defer fixture.allocator.free(trace_path);
+        try support.fixtureFile(fixture, trace_path, "", 0o644);
+        const unpack_dir = try support.path(fixture.allocator, label, "unpack");
+        defer fixture.allocator.free(unpack_dir);
+        try fixture.directory(unpack_dir);
+        if (try support.reference(fixture, dpkg, root, .{
+            .operation = "unpack",
+            .archives = &.{handler},
+            .triggers = false,
+        }, unpack_dir) != 0) return error.UnconfiguredListenerUnpackFailed;
+        const install_dir = try support.path(fixture.allocator, label, "install");
+        defer fixture.allocator.free(install_dir);
+        try fixture.directory(install_dir);
+        if (try support.reference(fixture, dpkg, root, .{
+            .operation = "install",
+            .archives = &.{activating},
+            .triggers = true,
+        }, install_dir) != 1) return error.UnexpectedReferenceOutcome;
+        const status_path = try support.path(fixture.allocator, root_relative, "var/lib/dpkg/status");
+        defer fixture.allocator.free(status_path);
+        const status = try support.read(fixture, status_path, 1024 * 1024);
+        defer fixture.allocator.free(status);
+        const receiver_start = std.mem.indexOf(u8, status, "Package: " ++ receiver ++ "\n") orelse
+            return error.MissingUnconfiguredListener;
+        const receiver_end = std.mem.indexOfPos(u8, status, receiver_start, "\n\n") orelse status.len;
+        const receiver_status = status[receiver_start..receiver_end];
+        const source_start = std.mem.indexOf(u8, status, "Package: " ++ source ++ "\n") orelse
+            return error.MissingFailedTriggerSource;
+        const source_end = std.mem.indexOfPos(u8, status, source_start, "\n\n") orelse status.len;
+        const source_status = status[source_start..source_end];
+        if (std.mem.indexOf(u8, receiver_status, "Status: install ok unpacked") == null or
+            std.mem.indexOf(u8, receiver_status, "Triggers-Pending:") != null or
+            std.mem.indexOf(u8, source_status, "Status: install ok half-configured") == null or
+            std.mem.indexOf(u8, source_status, "Triggers-Awaited:") != null)
+            return error.UnconfiguredListenerWasScheduled;
+        const queue_path = try support.path(fixture.allocator, root_relative, "var/lib/dpkg/triggers/Unincorp");
+        defer fixture.allocator.free(queue_path);
+        const queue = try support.read(fixture, queue_path, 1024 * 1024);
+        defer fixture.allocator.free(queue);
+        if (queue.len != 0) return error.UnconfiguredListenerQueueNotEmpty;
+        const trace = try support.read(fixture, trace_path, 1024 * 1024);
+        defer fixture.allocator.free(trace);
+        if (std.mem.indexOf(u8, trace, "activation-returned\n") == null)
+            return error.TriggerActivationDidNotReturn;
+        std.debug.print("{s}: pinned dpkg kept the failed source half-configured and the listener unpacked\n", .{label});
+    }
+}
+
 fn refuseMalformedQueue(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const declaration = "interest-await " ++ trigger ++ "\n";
     const archive = try support.makePackage(fixture, arch, "1", receiver, "malformed-packages", .{ .declarations = declaration });
@@ -389,6 +481,53 @@ fn refuseMalformedQueue(fixture: *foundation.Fixture, driver: []const u8, helper
     try support.assertNoActiveEvidence(fixture, case.native_root);
 }
 
+fn refuseUnconfiguredListenerProgram(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    for ([_]bool{ false, true }) |awaiting| {
+        const label = try std.fmt.allocPrint(fixture.allocator, "unconfigured-listener-native-refusal-{s}", .{
+            if (awaiting) "await" else "noawait",
+        });
+        defer fixture.allocator.free(label);
+        const declaration = try std.fmt.allocPrint(fixture.allocator, "interest-{s} {s}\n", .{
+            if (awaiting) "await" else "noawait", trigger,
+        });
+        defer fixture.allocator.free(declaration);
+        const handler = try support.makePackage(fixture, arch, "1", receiver, label, .{
+            .declarations = declaration,
+            .no_scripts = true,
+        });
+        defer fixture.allocator.free(handler);
+        const activating = try support.makePackage(fixture, arch, "1", source, label, .{
+            .activation = trigger,
+            .activation_await = awaiting,
+            .postinst_append = "exit 1\n",
+        });
+        defer fixture.allocator.free(activating);
+        var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, true);
+        defer case.deinit();
+        try case.seedWith(handler, false);
+        try copyNativeHelper(fixture, &case, helper);
+        const excludes: []const []const u8 = &.{ foundation.guard, "usr/bin/dpkg-trigger" };
+        const before = try foundation.captureRealRoot(fixture.allocator, fixture.io, case.native_root, .{}, excludes);
+        defer fixture.allocator.free(before);
+        const destination = try support.path(fixture.allocator, label, "refusal");
+        defer fixture.allocator.free(destination);
+        try fixture.directory(destination);
+        var report = try support.native(fixture, driver, case.native_root, arch, .{
+            .operation = "install",
+            .archives = &.{activating},
+            .triggers = true,
+        }, destination);
+        defer report.deinit();
+        if (!std.mem.eql(u8, report.value.outcome, "refused") or
+            !std.mem.eql(u8, report.value.detail, "program_compile_rejected"))
+            return error.UnconfiguredListenerProgramWasAccepted;
+        const after = try foundation.captureRealRoot(fixture.allocator, fixture.io, case.native_root, .{}, excludes);
+        defer fixture.allocator.free(after);
+        if (!std.mem.eql(u8, before, after)) return error.UnconfiguredListenerRefusalChangedRoot;
+        try support.assertNoActiveEvidence(fixture, case.native_root);
+    }
+}
+
 fn interruptedTriggerHandler(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const handler = try support.makePackage(fixture, arch, "1", receiver, "interruption-packages", .{
         .declarations = "interest-await " ++ trigger ++ "\n",
@@ -404,7 +543,9 @@ fn interruptedTriggerHandler(fixture: *foundation.Fixture, driver: []const u8, h
     try copyNativeHelper(fixture, &case, helper);
     try fixture.directory("trigger-script-outcome-unknown/interrupted");
     var interrupted = try support.native(fixture, driver, case.native_root, arch, .{
-        .operation = "install", .archives = &.{activating}, .triggers = true,
+        .operation = "install",
+        .archives = &.{activating},
+        .triggers = true,
         .fault = "after_triggered_postinst_before_record",
     }, "trigger-script-outcome-unknown/interrupted");
     defer interrupted.deinit();
@@ -458,7 +599,9 @@ fn interruptedTriggerHandler(fixture: *foundation.Fixture, driver: []const u8, h
     const authority = try std.json.parseFromSlice(Authority, fixture.allocator, authority_bytes, json_options);
     defer authority.deinit();
     const installed_script = try support.read(
-        fixture, "trigger-script-outcome-unknown/native/var/lib/dpkg/info/" ++ receiver ++ ".postinst", 64 * 1024,
+        fixture,
+        "trigger-script-outcome-unknown/native/var/lib/dpkg/info/" ++ receiver ++ ".postinst",
+        64 * 1024,
     );
     defer fixture.allocator.free(installed_script);
     var digest: [32]u8 = undefined;
@@ -542,8 +685,7 @@ fn deferredSelectionChange(fixture: *foundation.Fixture, driver: []const u8, hel
     defer fixture.allocator.free(handler);
     const other = try support.makePackage(fixture, arch, "1", unrelated, "selection-packages", .{});
     defer fixture.allocator.free(other);
-    const changing = try support.makePackage(fixture, arch, "1", source, "selection-packages", .{
-        .postinst_append =
+    const changing = try support.makePackage(fixture, arch, "1", source, "selection-packages", .{ .postinst_append =
         \\status=''
         \\selected=no
         \\while IFS= read -r line; do
@@ -568,13 +710,18 @@ fn deferredSelectionChange(fixture: *foundation.Fixture, driver: []const u8, hel
     try copyNativeHelper(fixture, &case, helper);
     try fixture.directory("deferred-unrelated-selection-change/install");
     var result = try support.native(fixture, driver, case.native_root, arch, .{
-        .operation = "install", .archives = &.{changing}, .triggers = true, .defer_triggers = true,
+        .operation = "install",
+        .archives = &.{changing},
+        .triggers = true,
+        .defer_triggers = true,
     }, "deferred-unrelated-selection-change/install");
     defer result.deinit();
     if (!std.mem.eql(u8, result.value.outcome, "recovery_required"))
         return error.DeferredSelectionMutationWasNotBlocked;
     const operation_bytes = try support.read(
-        fixture, "deferred-unrelated-selection-change/native/var/lib/debz/root-operation-v1.json", 1024 * 1024,
+        fixture,
+        "deferred-unrelated-selection-change/native/var/lib/debz/root-operation-v1.json",
+        1024 * 1024,
     );
     defer fixture.allocator.free(operation_bytes);
     const Operation = struct { state: []const u8, mutation_started: bool, program_sha256: []const u8 };
@@ -595,7 +742,8 @@ fn deferredSelectionChange(fixture: *foundation.Fixture, driver: []const u8, hel
     defer fixture.allocator.free(before);
     try fixture.directory("deferred-unrelated-selection-change/blocked");
     var retry = try support.native(fixture, driver, case.native_root, arch, .{
-        .operation = "process_triggers", .triggers = true,
+        .operation = "process_triggers",
+        .triggers = true,
     }, "deferred-unrelated-selection-change/blocked");
     defer retry.deinit();
     if (!std.mem.eql(u8, retry.value.outcome, "recovery_required"))
@@ -707,7 +855,7 @@ fn divertedTriggerRoutes(fixture: *foundation.Fixture, driver: []const u8, helpe
         var case = try support.Scenario.init(fixture, case_name, driver, dpkg, arch, true);
         defer case.deinit();
         for ([_][]const u8{ "reference", "native" }) |side| {
-            const record = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/var/lib/dpkg/diversions", .{case_name, side});
+            const record = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/var/lib/dpkg/diversions", .{ case_name, side });
             defer fixture.allocator.free(record);
             try support.fixtureFile(fixture, record, old_record, 0o644);
         }
@@ -715,7 +863,7 @@ fn divertedTriggerRoutes(fixture: *foundation.Fixture, driver: []const u8, helpe
         if (std.mem.eql(u8, entry.label, "updated") or std.mem.startsWith(u8, entry.label, "cached-")) {
             const replace = std.mem.eql(u8, entry.label, "updated");
             for ([_][]const u8{ "reference", "native" }) |side| {
-                const root = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{case_name, side});
+                const root = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{ case_name, side });
                 defer fixture.allocator.free(root);
                 if (replace) try support.copyProgram(fixture, root, "/bin/mv", "/diversion-mv");
                 const diversion_update = try std.fmt.allocPrint(fixture.allocator, "{s}/diversion-preinst-{s}", .{
@@ -756,7 +904,7 @@ fn divertedTriggerRoutes(fixture: *foundation.Fixture, driver: []const u8, helpe
         var case = try support.Scenario.init(fixture, case_name, driver, dpkg, arch, true);
         defer case.deinit();
         for ([_][]const u8{ "reference", "native" }, [_][]const u8{ case.reference_root, case.native_root }) |side, absolute| {
-            const root = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{case_name, side});
+            const root = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{ case_name, side });
             defer fixture.allocator.free(root);
             const original_shell = try std.fmt.allocPrint(fixture.allocator, "{s}/bin/sh", .{root});
             defer fixture.allocator.free(original_shell);
@@ -841,6 +989,14 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         processExistingQueue(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+            try support.assertHostUnchanged(allocator, init.io, reference.before);
+            return err;
+        };
+        failedPostinstUnconfiguredListener(&fixture, reference.executable, reference.architecture) catch |err| {
+            try support.assertHostUnchanged(allocator, init.io, reference.before);
+            return err;
+        };
+        refuseUnconfiguredListenerProgram(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
@@ -1001,7 +1157,9 @@ test "trigger package declarations, scriptless handler and helper scripts retain
         try std.testing.expect(std.mem.indexOf(u8, postinst, command) != null);
     }
     const third = try support.makePackage(&fixture, "amd64", "1", source, "unit-removal", .{
-        .activation = trigger, .activation_kind = "postrm", .activation_when = "remove",
+        .activation = trigger,
+        .activation_kind = "postrm",
+        .activation_when = "remove",
     });
     defer std.testing.allocator.free(third);
     const remove_script = try support.read(&fixture, "unit-removal/" ++ source ++ "_1_data.source/DEBIAN/postrm", 64 * 1024);
@@ -1023,7 +1181,11 @@ test "reference trigger-only and deferred phases emit distinct guarded dpkg flag
     defer std.testing.allocator.free(root);
     try fixture.directory("process");
     try std.testing.expectEqual(@as(u8, 0), try support.reference(
-        &fixture, binary, root, .{ .operation = "process_triggers", .triggers = true }, "process",
+        &fixture,
+        binary,
+        root,
+        .{ .operation = "process_triggers", .triggers = true },
+        "process",
     ));
     const processed = try support.read(&fixture, "process/reference.log", 64 * 1024);
     defer std.testing.allocator.free(processed);
@@ -1033,9 +1195,16 @@ test "reference trigger-only and deferred phases emit distinct guarded dpkg flag
     try std.testing.expect(std.mem.indexOf(u8, processed, "--install") == null);
     try fixture.directory("deferred");
     try std.testing.expectEqual(@as(u8, 0), try support.reference(
-        &fixture, binary, root, .{
-            .operation = "install", .archives = &.{"package.deb"}, .triggers = true, .defer_triggers = true,
-        }, "deferred",
+        &fixture,
+        binary,
+        root,
+        .{
+            .operation = "install",
+            .archives = &.{"package.deb"},
+            .triggers = true,
+            .defer_triggers = true,
+        },
+        "deferred",
     ));
     const deferred = try support.read(&fixture, "deferred/reference.log", 64 * 1024);
     defer std.testing.allocator.free(deferred);
@@ -1043,13 +1212,25 @@ test "reference trigger-only and deferred phases emit distinct guarded dpkg flag
     try std.testing.expect(std.mem.indexOf(u8, deferred, "--install\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, deferred, "--pending") == null);
     try std.testing.expectError(error.InvalidReferenceOperation, support.reference(
-        &fixture, binary, root, .{ .operation = "process_triggers" }, "unused",
+        &fixture,
+        binary,
+        root,
+        .{ .operation = "process_triggers" },
+        "unused",
     ));
     try std.testing.expectError(error.MissingArchive, support.reference(
-        &fixture, binary, root, .{ .operation = "install", .triggers = true }, "unused",
+        &fixture,
+        binary,
+        root,
+        .{ .operation = "install", .triggers = true },
+        "unused",
     ));
     try std.testing.expectError(error.MissingPackage, support.reference(
-        &fixture, binary, root, .{ .operation = "purge", .triggers = true }, "unused",
+        &fixture,
+        binary,
+        root,
+        .{ .operation = "purge", .triggers = true },
+        "unused",
     ));
     try support.absent(&fixture, "unused/reference.log");
 }
@@ -1062,7 +1243,8 @@ test "native trigger-only request does not invent an archive installation" {
     try fixture.directory("process");
     const report_path = try fixture.absolute("process/native.report.json");
     defer std.testing.allocator.free(report_path);
-    const fake = try std.fmt.allocPrint(std.testing.allocator,
+    const fake = try std.fmt.allocPrint(
+        std.testing.allocator,
         "#!/bin/sh\nprintf '%s' '{{\"outcome\":\"applied\"}}' > '{s}'\n",
         .{report_path},
     );
@@ -1071,8 +1253,12 @@ test "native trigger-only request does not invent an archive installation" {
     const executable = try fixture.absolute("fake-driver");
     defer std.testing.allocator.free(executable);
     var outcome = try support.native(
-        &fixture, executable, root, "amd64",
-        .{ .operation = "process_triggers", .triggers = true }, "process",
+        &fixture,
+        executable,
+        root,
+        "amd64",
+        .{ .operation = "process_triggers", .triggers = true },
+        "process",
     );
     defer outcome.deinit();
     try std.testing.expectEqualStrings("applied", outcome.value.outcome);
@@ -1139,7 +1325,11 @@ test "trigger registry ordering, noawait markers, trace, and active authority re
         try support.compare(&fixture, left, right, "comparison", true);
         try fixture.write(candidate_path, row.changed, 0o644);
         try std.testing.expectError(error.NativeDpkgTriggerMismatch, support.compare(
-            &fixture, left, right, "comparison", true,
+            &fixture,
+            left,
+            right,
+            "comparison",
+            true,
         ));
         try fixture.write(candidate_path, row.expected, 0o644);
     }
@@ -1159,14 +1349,26 @@ test "malformed trigger queue snapshots preserve invalid bytes without normaliza
     try support.compare(&fixture, left, right, "comparison", true);
     try fixture.write("native/var/lib/dpkg/triggers/Unincorp", "invalid\x00trigger -\n", 0o644);
     try std.testing.expectError(error.NativeDpkgTriggerMismatch, support.compare(
-        &fixture, left, right, "comparison", true,
+        &fixture,
+        left,
+        right,
+        "comparison",
+        true,
     ));
     const observed = try foundation.captureRealRoot(
-        std.testing.allocator, std.testing.io, right, .{}, &.{ foundation.guard, "usr/bin/dpkg-trigger" },
+        std.testing.allocator,
+        std.testing.io,
+        right,
+        .{},
+        &.{ foundation.guard, "usr/bin/dpkg-trigger" },
     );
     defer std.testing.allocator.free(observed);
     const again = try foundation.captureRealRoot(
-        std.testing.allocator, std.testing.io, right, .{}, &.{ foundation.guard, "usr/bin/dpkg-trigger" },
+        std.testing.allocator,
+        std.testing.io,
+        right,
+        .{},
+        &.{ foundation.guard, "usr/bin/dpkg-trigger" },
     );
     defer std.testing.allocator.free(again);
     try std.testing.expectEqualSlices(u8, observed, again);

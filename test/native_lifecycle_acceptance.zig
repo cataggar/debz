@@ -238,3 +238,84 @@ test "reference refuses unguarded roots without invoking selected executable" {
     ));
     try support.absent(&fixture, "unused/reference.log");
 }
+
+test "lifecycle request preserves reviewed order and script fault boundary" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, options.repository);
+    defer fixture.deinit();
+    const root = try fixture.makeRoot("root", "amd64");
+    defer std.testing.allocator.free(root);
+    try fixture.directory("request");
+    const report_path = try fixture.absolute("request/native.report.json");
+    defer std.testing.allocator.free(report_path);
+    const script = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "#!/bin/sh\nprintf '%s' '{{\"outcome\":\"applied\"}}' > '{s}'\n",
+        .{report_path},
+    );
+    defer std.testing.allocator.free(script);
+    try fixture.write("fake-driver", script, 0o755);
+    const driver = try fixture.absolute("fake-driver");
+    defer std.testing.allocator.free(driver);
+    const actions = [_]support.Action{
+        .{ .sequence = 0, .kind = "unpack", .package = "provider", .architecture = "amd64" },
+        .{ .sequence = 1, .kind = "configure_pending", .package = "consumer", .architecture = "amd64" },
+        .{ .sequence = 2, .kind = "unpack", .package = "consumer", .architecture = "amd64" },
+        .{ .sequence = 3, .kind = "configure_pending", .package = "consumer", .architecture = "amd64" },
+    };
+    var report = try support.native(&fixture, driver, root, "amd64", .{
+        .operation = "install",
+        .archives = &.{"package.deb"},
+        .ordered_actions = &actions,
+        .fault = "after_script_before_record",
+    }, "request");
+    defer report.deinit();
+    try std.testing.expectEqualStrings("applied", report.value.outcome);
+    const request_bytes = try support.read(&fixture, "request/native.request.json", 64 * 1024);
+    defer std.testing.allocator.free(request_bytes);
+    const Request = struct {
+        operation: []const u8,
+        ordered_actions: []const support.Action,
+        fault: []const u8,
+    };
+    const request = try std.json.parseFromSlice(Request, std.testing.allocator, request_bytes, .{
+        .ignore_unknown_fields = true,
+    });
+    defer request.deinit();
+    try std.testing.expectEqualStrings("install", request.value.operation);
+    try std.testing.expectEqualStrings("after_script_before_record", request.value.fault);
+    try std.testing.expectEqual(actions.len, request.value.ordered_actions.len);
+    for (actions, request.value.ordered_actions) |expected, actual| {
+        try std.testing.expectEqual(expected.sequence, actual.sequence);
+        try std.testing.expectEqualStrings(expected.kind, actual.kind);
+        try std.testing.expectEqualStrings(expected.package, actual.package);
+        try std.testing.expectEqualStrings(expected.architecture, actual.architecture);
+    }
+}
+
+test "published compensation schema bounds count, rollback and script digest" {
+    const schema_path = try std.fs.path.join(std.testing.allocator, &.{
+        options.repository, "schema/native-transaction-program-v1.json",
+    });
+    defer std.testing.allocator.free(schema_path);
+    var file = try std.Io.Dir.openFileAbsolute(std.testing.io, schema_path, .{ .follow_symlinks = false });
+    defer file.close(std.testing.io);
+    var reader = file.reader(std.testing.io, &.{});
+    const bytes = try reader.interface.allocRemaining(std.testing.allocator, .limited(256 * 1024));
+    defer std.testing.allocator.free(bytes);
+    const document = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+    defer document.deinit();
+    const definitions = document.value.object.get("$defs").?.object;
+    const failure = definitions.get("scriptFailure").?.object.get("properties").?.object;
+    const compensations = failure.get("compensations").?.object;
+    try std.testing.expectEqual(@as(i64, 8), compensations.get("maxItems").?.integer);
+    try std.testing.expectEqualStrings("#/$defs/unwind", compensations.get("items").?.object.get("$ref").?.string);
+    const rollback = failure.get("rollback_after_compensations").?.object.get("oneOf").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), rollback.len);
+    try std.testing.expectEqualStrings("null", rollback[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("integer", rollback[1].object.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 0), rollback[1].object.get("minimum").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), rollback[1].object.get("maximum").?.integer);
+    const unwind = definitions.get("unwind").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("#/$defs/sha256", unwind.get("script_sha256").?.object.get("$ref").?.string);
+    try std.testing.expectEqualStrings("^[0-9a-f]{64}$", definitions.get("sha256").?.object.get("pattern").?.string);
+}

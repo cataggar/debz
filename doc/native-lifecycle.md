@@ -231,11 +231,16 @@ option also supplies and independently verifies `update-alternatives` for
 that scenario; without a pinned reference, only that scenario is skipped.
 `-Dnative-diversions-only=true` selects diversion scenarios.
 
-The Python lifecycle and oracle build/CI gates remain **required** while
-the separately owned diversion route-settlement and trigger suites and CI
-amd64 parity are integrated. CI runs both implementations on amd64 and arm64
-in Debug and ReleaseSafe. Do not remove the Python runner until the complete
-integrated root matrix passes in Zig.
+The Python lifecycle and oracle build/CI gates remain **required**. The
+diversion route-settlement suite now runs 24 real upgrade profiles and 16
+follow-ups in Zig, but the Python `--oracle-only` (two real dpkg roots) and
+`--workspace` diagnostic selectors do not have Zig equivalents, and the
+Python schema regression executes example accept/reject documents with a
+Draft 2020-12 validator where Zig currently checks only the schema's bounds.
+Neither lifecycle entry point can be retired on that evidence. CI runs the
+existing and Zig-owned suites on amd64 and arm64 in Debug and ReleaseSafe.
+Trigger acceptance has a separate reference-only
+unconfigured-listener boundary; see [trigger execution](native-triggers.md#independent-acceptance).
 
 CI uses hash-pinned Debian dpkg 1.22.22 for both architectures. On Ubuntu 24.04
 or another compatible Linux host with an older dpkg, prepare that reference

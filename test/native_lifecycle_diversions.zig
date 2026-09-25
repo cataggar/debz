@@ -604,6 +604,21 @@ fn backupRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const 
                         const bytes = try support.read(fixture, changed, 64 * 1024);
                         defer fixture.allocator.free(bytes);
                         if (!std.mem.eql(u8, bytes, "data version 1\n")) return error.WrongUnpackBackup;
+                        const root_path = if (std.mem.eql(u8, side, "reference")) case.reference_root else case.native_root;
+                        var guarded = try foundation.guardedRoot(fixture.io, root_path);
+                        defer guarded.close(fixture.io);
+                        const root: root_fs.Root = .init(fixture.io, guarded);
+                        const backup = try root.entry(try root_fs.Path.initPackage(base ++ "/data.distrib.dpkg-tmp"));
+                        const sibling = try root.entry(try root_fs.Path.initPackage(base ++ "/data.link"));
+                        const incoming = try root.entry(try root_fs.Path.initPackage(base ++ "/data.distrib"));
+                        if (backup.device != sibling.device or backup.inode != sibling.inode or
+                            (incoming.device == sibling.device and incoming.inode == sibling.inode))
+                            return error.WrongUnpackBackupIdentity;
+                        const incoming_relative = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/{s}/data.distrib", .{ label, side, base });
+                        defer fixture.allocator.free(incoming_relative);
+                        const incoming_bytes = try support.read(fixture, incoming_relative, 64 * 1024);
+                        defer fixture.allocator.free(incoming_bytes);
+                        if (!std.mem.eql(u8, incoming_bytes, "data version 2\n")) return error.WrongIncomingRoute;
                     } else try support.absent(fixture, changed);
                 }
                 const marker_path = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/backup-before", .{ label, side });

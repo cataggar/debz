@@ -1318,7 +1318,75 @@ def ghr_zig_workflow_failures(
     return failures
 
 
+def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
+    failures: list[str] = []
+    for entrypoint in (
+        "tools/test-native-lifecycle.py",
+        "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",
+        "tools/test_native_triggers.py",
+    ):
+        if f'"{entrypoint}"' not in build:
+            failures.append(f"build.zig: retain {entrypoint} until Zig has full equivalent coverage")
+    for binding in (
+        "native_lifecycle.addArtifactArg(native_lifecycle_tests);",
+        "native_lifecycle.step.dependOn(&native_lifecycle_oracle_tests.step);",
+        "test_step.dependOn(&native_lifecycle_oracle_tests.step);",
+        "native_triggers.addArtifactArg(native_lifecycle_tests);",
+        'native_triggers.addArg("--native-helper");',
+        "native_triggers.addArtifactArg(native_trigger_helper);",
+        "native_triggers.step.dependOn(&native_trigger_oracle_tests.step);",
+        "test_step.dependOn(&native_trigger_oracle_tests.step);",
+        ".dependOn(&native_lifecycle.step);",
+        ".dependOn(&native_triggers.step);",
+    ):
+        if binding not in build:
+            failures.append(f"build.zig: missing required lifecycle/trigger gate binding: {binding}")
+    marker = "fn failedPostinstUnconfiguredListener("
+    body = trigger.partition(marker)[2].partition("\nfn refuseMalformedQueue(")[0]
+    required = (
+        "for ([_]bool{ false, true }) |awaiting|",
+        ".no_scripts = true",
+        "support.reference(fixture, dpkg, root",
+        "Status: install ok unpacked",
+        "Status: install ok half-configured",
+        "Triggers-Pending:",
+        "Triggers-Awaited:",
+        "queue.len != 0",
+        "activation-returned",
+        "exit 1",
+    )
+    if not body or any(value not in body for value in required) or "support.native(" in body:
+        failures.append(
+            "native_trigger_acceptance.zig: keep both failed-postinst "
+            "unconfigured-listener cases as reference-only observations"
+        )
+    if "failedPostinstUnconfiguredListener(&fixture, reference.executable, reference.architecture)" not in trigger:
+        failures.append(
+            "native_trigger_acceptance.zig: invoke both unconfigured-listener "
+            "references in the required trigger suite"
+        )
+    refusal = trigger.partition("fn refuseUnconfiguredListenerProgram(")[2].partition("\nfn interruptedTriggerHandler(")[0]
+    if not refusal or any(value not in refusal for value in (
+        "for ([_]bool{ false, true }) |awaiting|",
+        "case.seedWith(handler, false)",
+        'report.value.detail, "program_compile_rejected"',
+        "foundation.captureRealRoot(",
+        "support.assertNoActiveEvidence(",
+    )) or "refuseUnconfiguredListenerProgram(&fixture, driver, selected, reference.executable, reference.architecture)" not in trigger:
+        failures.append(
+            "native_trigger_acceptance.zig: both unsupported listener programs "
+            "must refuse before mutation and leave no active authority"
+        )
+    return failures
+
+
 def audit_ci_pins() -> None:
+    for failure in native_lifecycle_migration_failures(
+        (ROOT / "build.zig").read_text(),
+        (ROOT / "test/native_trigger_acceptance.zig").read_text(),
+    ):
+        fail(failure)
     workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
     for workflow in workflows:
         text = workflow.read_text()

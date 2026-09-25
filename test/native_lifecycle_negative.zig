@@ -1,4 +1,5 @@
 const std = @import("std");
+const root_fs = @import("debz").root_fs;
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 
@@ -49,6 +50,11 @@ fn stagingRefusals(fixture: *foundation.Fixture, driver: []const u8, dpkg: []con
             try support.fixtureFile(fixture, relative, "not a directory\n", 0o644);
         } else try fixture.dir.symLink(fixture.io, "info", relative, .{});
         const before = try fixture.dir.statFile(fixture.io, relative, .{ .follow_symlinks = false });
+        const before_snapshot: ?[]u8 = if (std.mem.eql(u8, collision, "symlink") or std.mem.eql(u8, collision, "file"))
+            null
+        else
+            try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer if (before_snapshot) |snapshot| fixture.allocator.free(snapshot);
         const before_status = try status(fixture, try support.path(fixture.allocator, label, "native"));
         defer fixture.allocator.free(before_status);
         const before_trace = try trace(fixture, try support.path(fixture.allocator, label, "native"));
@@ -67,6 +73,24 @@ fn stagingRefusals(fixture: *foundation.Fixture, driver: []const u8, dpkg: []con
             return error.UnexpectedStagingRefusal;
         const after = try fixture.dir.statFile(fixture.io, relative, .{ .follow_symlinks = false });
         if (!std.meta.eql(before, after)) return error.StagingCollisionChanged;
+        if (before_snapshot) |snapshot| {
+            const after_snapshot = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+            defer fixture.allocator.free(after_snapshot);
+            if (!std.mem.eql(u8, snapshot, after_snapshot)) return error.RefusalChangedRoot;
+        } else if (std.mem.eql(u8, collision, "symlink")) {
+            var guarded = try foundation.guardedRoot(fixture.io, case.native_root);
+            defer guarded.close(fixture.io);
+            var target_buffer: [64]u8 = undefined;
+            const target = try (root_fs.Root.init(fixture.io, guarded)).readSymbolicLink(
+                try root_fs.Path.init("var/lib/dpkg/tmp.ci"),
+                &target_buffer,
+            );
+            if (!std.mem.eql(u8, target, "info")) return error.StagingCollisionChanged;
+        } else {
+            const content = try support.read(fixture, relative, 64);
+            defer fixture.allocator.free(content);
+            if (!std.mem.eql(u8, content, "not a directory\n")) return error.StagingCollisionChanged;
+        }
         const after_status = try status(fixture, try support.path(fixture.allocator, label, "native"));
         defer fixture.allocator.free(after_status);
         const after_trace = try trace(fixture, try support.path(fixture.allocator, label, "native"));

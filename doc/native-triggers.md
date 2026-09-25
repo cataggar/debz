@@ -165,15 +165,32 @@ activation, pending Unincorp queues, known failures, dynamic chains and
 no-progress cycles. It also checks interrupted handler evidence and re-entry
 blocking, malformed queue refusal, unrelated deferred selection changes,
 unauthenticated helper refusal, and diverted/aliased file-trigger routes.
+It also runs two **reference-only** guarded, pinned-dpkg cases for a failed
+activating postinst with an unpacked (not configured) listener, once with
+`interest-await` and once with `interest-noawait`. Both assert that the listener
+stays unpacked with no pending work, the source stays half-configured without
+an awaited edge, and `Unincorp` stays empty after the helper returns. These
+cases do **not** compare native execution: the native program compiler currently
+refuses this unconfigured-listener program. Separate Zig tests for both await
+variants assert `program_compile_rejected`, unchanged full private-root
+snapshots, and no active authority. That fail-closed behavior must not be
+relaxed or represented as native parity.
+
 Unit regressions guard exact declarations and scripts, reference command
 flags, root snapshots, ordering and helper identity. The
 `-Dnative-diversions-only=true` option selects the diversion cases; the
 `-Dnative-reference-dpkg` pin applies to both implementations. CI runs these
 steps alongside the existing Python gates on amd64 and arm64 in Debug and
-ReleaseSafe. The Python runner and its independent 24-profile diversion
-settlement oracle (including 16 eligible follow-ups) remain mandatory until
-Zig reproduces the exact settlement observations. The current Zig runner does
-**not** establish full trigger/settlement parity on its own.
+ReleaseSafe. Zig settlement independently executes all 24 upgrade profiles
+and 16 eligible follow-ups against pinned dpkg, including the six partial
+rollbacks; `test-native-diversion-settlement-zig` is required in CI. Both Python
+trigger gates remain mandatory: standalone Python `--oracle-only` (two dpkg
+roots), `--diversion-settlement-reference-only`, and `--workspace` have no
+equivalent Zig selectors yet, and the Python settlement/unit mutation inventory
+has not been fully replaced by Zig tests. The failed-postinst listener is now
+covered in Zig against dpkg **only**; lack of native parity for that program
+must remain explicit even if the reference-only Python case is eventually
+retired.
 
 `test-native-trigger-helper` runs the shared queue/helper unit coverage;
 `native-trigger-helper` builds the private artifact without installing it.
