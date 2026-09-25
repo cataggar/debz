@@ -527,6 +527,9 @@ class SecurityAuditTests(unittest.TestCase):
     def test_build_workloads_keep_both_modes_and_all_existing_suites(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))
+        self.assertEqual([], security_audit.apt_system_ci_failures(
+            workflow, (ROOT / "build.zig").read_text(),
+        ))
         match = re.search(
             r"(?ms)^  build-and-test-workload:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
             workflow,
@@ -539,9 +542,13 @@ class SecurityAuditTests(unittest.TestCase):
             ("optimize: [Debug, ReleaseSafe]", "optimize: [Debug]"),
             ("optimize: [Debug, ReleaseSafe]", "optimize: [ReleaseSafe]"),
             ("            architecture: arm64", "            architecture: amd64"),
+            ("      CI_PLATFORM: ${{ matrix.name }}", "      CI_PLATFORM: linux-x64"),
             ("      OPTIMIZE: ${{ matrix.optimize }}", "      OPTIMIZE: Debug"),
             ("        include:", "        exclude:"),
-            ('          zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('            zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('            zig build test -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('          if [ "$CI_PLATFORM" = linux-x64 ] && [ "$OPTIMIZE" = ReleaseSafe ]; then',
+             '          if [ "$CI_PLATFORM" = linux-x64 ]; then'),
             ('          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
             ("      - name: Build and test\n", "      - name: Build and test\n        if: false\n"),
             ("-Doptimize=\"$OPTIMIZE\"", "-Doptimize=Debug"),
@@ -574,25 +581,31 @@ class SecurityAuditTests(unittest.TestCase):
                 )
                 self.assertTrue(security_audit.native_recovery_ci_failures(changed))
         script = textwrap.dedent(steps["Build and test"].split("        run: |\n", 1)[1])
-        for mode in ("Debug", "ReleaseSafe"):
+        for platform, mode in itertools.product(
+            ("linux-x64", "linux-arm64"), ("Debug", "ReleaseSafe"),
+        ):
+            split = platform == "linux-x64" and mode == "ReleaseSafe"
             commands = [
-                f"build{target} -Doptimize={mode} -j2 --summary all"
-                for target in ("", " fuzz")
+                f"build -Doptimize={mode} -j2 --summary all",
+                f"build test {'-Dci-split-apt-system-tests=true ' if split else ''}-Doptimize={mode} -j2 --summary all",
+                f"build fuzz -Doptimize={mode} -j2 --summary all",
             ]
-            commands.insert(1, f"build test -Dci-split-apt-system-tests=true -Doptimize={mode} -j2 --summary all")
-            with self.subTest(mode=mode):
+            with self.subTest(platform=platform, mode=mode):
                 result = subprocess.run(
                     ["bash", "-e", "-c", 'zig() { printf "%s\\n" "$*"; }\n' + script],
-                    env={**os.environ, "OPTIMIZE": mode},
+                    env={**os.environ, "CI_PLATFORM": platform, "OPTIMIZE": mode},
                     stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), commands)
             for command in commands:
-                with self.subTest(mode=mode, failing_command=command):
+                with self.subTest(platform=platform, mode=mode, failing_command=command):
                     result = subprocess.run(
                         ["bash", "-e", "-c", 'zig() { test "$*" != "$FAIL_COMMAND"; }\n' + script],
-                        env={**os.environ, "OPTIMIZE": mode, "FAIL_COMMAND": command},
+                        env={
+                            **os.environ, "CI_PLATFORM": platform,
+                            "OPTIMIZE": mode, "FAIL_COMMAND": command,
+                        },
                         stdin=subprocess.DEVNULL, capture_output=True, check=False,
                     )
                     self.assertNotEqual(result.returncode, 0)
@@ -609,20 +622,35 @@ class SecurityAuditTests(unittest.TestCase):
         for original, replacement in (
             (shard[0], ""),
             ("  apt-system-tests:\n", "  apt-system-tests:\n    if: false\n"),
-            ("        name: [linux-x64, linux-arm64]", "        name: [linux-x64]"),
-            ("        optimize: [Debug, ReleaseSafe]", "        optimize: [Debug]"),
-            ("        include:\n", "        exclude:\n"),
-            ("          - os: ubuntu-24.04-arm", "          - os: ubuntu-24.04"),
-            ("      fail-fast: false", "      fail-fast: true"),
+            ("    name: Apt/system tests (linux-x64, ReleaseSafe)",
+             "    name: Apt/system tests (linux-x64, Debug)"),
+            ("    runs-on: ubuntu-24.04", "    runs-on: ubuntu-24.04-arm"),
+            ("    steps:\n", "    strategy:\n      matrix:\n        optimize: [Debug, ReleaseSafe]\n    steps:\n"),
             ("    timeout-minutes: 60", "    timeout-minutes: 30"),
             ("      - name: Run apt/system contract and orchestration tests\n",
              "      - name: Run apt/system contract and orchestration tests\n        if: false\n"),
-            ('        run: zig build test-apt-system -Doptimize="$OPTIMIZE" -j2 --summary all',
+            ('        run: zig build test-apt-system -Doptimize=ReleaseSafe -j2 --summary all',
              "        run: true"),
+            ('        run: zig build test-apt-system -Doptimize=ReleaseSafe -j2 --summary all',
+             '        run: zig build test-apt-system -Doptimize=Debug -j2 --summary all'),
             ("      - name: Install metadata decompression dependency\n", ""),
         ):
             with self.subTest(original=original[:70]):
+                self.assertIn(original, shard[0])
                 changed = workflow.replace(shard[0], shard[0].replace(original, replacement, 1), 1)
+                self.assertTrue(security_audit.apt_system_ci_failures(changed, build))
+        for original, replacement in (
+            ("      CI_PLATFORM: ${{ matrix.name }}", "      CI_PLATFORM: linux-x64"),
+            ('[ "$CI_PLATFORM" = linux-x64 ] && [ "$OPTIMIZE" = ReleaseSafe ]',
+             '[ "$CI_PLATFORM" = linux-x64 ]'),
+            ('            zig build test -Doptimize="$OPTIMIZE" -j2 --summary all',
+             '            zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all'),
+            ('            zig build test -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('            zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+        ):
+            with self.subTest(original=original[:70]):
+                self.assertIn(original, workflow)
+                changed = workflow.replace(original, replacement, 1)
                 self.assertTrue(security_audit.apt_system_ci_failures(changed, build))
         for original, replacement in (
             ('"ci-split-apt-system-tests",', '"ci-split-apt-system-tests-old",'),
@@ -660,39 +688,44 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertEqual([], release_policy.audit_ci_apt_shard(workflow, build))
         self.assertTrue(release_policy.audit_ci_apt_shard(workflow.replace(shard[0], ""), build))
         self.assertTrue(release_policy.audit_ci_apt_shard(
+            workflow.replace("  apt-system-tests:\n", "  apt-system-tests:\n    if: false\n"),
+            build,
+        ))
+        self.assertTrue(release_policy.audit_ci_apt_shard(
             workflow.replace('          test "$APT_SYSTEM_RESULT" = success', ""), build
         ))
         self.assertTrue(release_policy.audit_ci_apt_shard(
             workflow, build.replace('    if (!ci_split_apt_system_tests) {', "")
         ))
+        self.assertTrue(release_policy.audit_ci_apt_shard(
+            workflow.replace(
+                '            zig build test -Doptimize="$OPTIMIZE" -j2 --summary all', "",
+            ), build,
+        ))
 
-    def test_apt_system_shard_runs_every_optimization_and_propagates_failures(self) -> None:
+    def test_apt_system_shard_runs_release_safe_and_propagates_failures(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         shard = re.search(
             r"(?ms)^  apt-system-tests:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
             workflow,
         )
         self.assertIsNotNone(shard)
-        command = 'zig build test-apt-system -Doptimize="$OPTIMIZE" -j2 --summary all'
+        command = "zig build test-apt-system -Doptimize=ReleaseSafe -j2 --summary all"
         self.assertIn("        run: " + command, shard[1])
-        for mode in ("Debug", "ReleaseSafe"):
-            with self.subTest(mode=mode):
-                result = subprocess.run(
-                    ["bash", "-e", "-c", 'zig() { printf "%s\\n" "$*"; }\n' + command],
-                    env={**os.environ, "OPTIMIZE": mode},
-                    capture_output=True, text=True, check=False,
-                )
-                self.assertEqual(
-                    result.stdout.strip(),
-                    f"build test-apt-system -Doptimize={mode} -j2 --summary all",
-                )
-                self.assertEqual(result.returncode, 0)
-                failed = subprocess.run(
-                    ["bash", "-e", "-c", "zig() { return 1; }\n" + command],
-                    env={**os.environ, "OPTIMIZE": mode},
-                    capture_output=True, check=False,
-                )
-                self.assertNotEqual(failed.returncode, 0)
+        result = subprocess.run(
+            ["bash", "-e", "-c", 'zig() { printf "%s\\n" "$*"; }\n' + command],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(
+            result.stdout.strip(),
+            "build test-apt-system -Doptimize=ReleaseSafe -j2 --summary all",
+        )
+        self.assertEqual(result.returncode, 0)
+        failed = subprocess.run(
+            ["bash", "-e", "-c", "zig() { return 1; }\n" + command],
+            capture_output=True, check=False,
+        )
+        self.assertNotEqual(failed.returncode, 0)
 
     def test_install_action_reuses_pinned_bundles_and_never_short_circuits(self) -> None:
         package = json.loads((ROOT / "actions/install/package.json").read_text())

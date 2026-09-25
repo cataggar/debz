@@ -1175,6 +1175,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         "    name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})",
         "        name: [linux-x64, linux-arm64]",
         "        optimize: [Debug, ReleaseSafe]",
+        "      CI_PLATFORM: ${{ matrix.name }}",
         "      OPTIMIZE: ${{ matrix.optimize }}",
     )) or re.search(r"(?m)^        exclude:", workload):
         failures.append("ci.yml: build workloads must require both optimization modes on both architectures")
@@ -1184,7 +1185,11 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     shared_steps = {
         "Build and test": (
             '          zig build -Doptimize="$OPTIMIZE" -j2 --summary all',
-            '          zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all',
+            '          if [ "$CI_PLATFORM" = linux-x64 ] && [ "$OPTIMIZE" = ReleaseSafe ]; then',
+            '            zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all',
+            "          else",
+            '            zig build test -Doptimize="$OPTIMIZE" -j2 --summary all',
+            "          fi",
             '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
         "Compare native materialization, conffiles, lifecycle, and triggers with dpkg": (
@@ -1270,37 +1275,23 @@ def apt_system_ci_failures(text: str, build_text: str) -> list[str]:
         text,
     ))
     shard = jobs.get("apt-system-tests", "")
-    matrix = re.search(
-        r"(?ms)^      matrix:\n(.*?)(?=^    (?:env|steps):|\Z)", shard,
-    )
-    expected_matrix = (
-        "        name: [linux-x64, linux-arm64]\n"
-        "        optimize: [Debug, ReleaseSafe]\n"
-        "        include:\n"
-        "          - os: ubuntu-24.04\n"
-        "            name: linux-x64\n"
-        "          - os: ubuntu-24.04-arm\n"
-        "            name: linux-arm64\n"
+    expected_header = (
+        "    name: Apt/system tests (linux-x64, ReleaseSafe)\n"
+        "    runs-on: ubuntu-24.04\n"
+        "    timeout-minutes: 60\n"
+        "    steps:\n"
     )
     if (
-        matrix is None
-        or matrix.group(1) != expected_matrix
-        or any(line not in shard.splitlines() for line in (
-            "    name: Apt/system tests (${{ matrix.name }}, ${{ matrix.optimize }})",
-            "    runs-on: ${{ matrix.os }}",
-            "    timeout-minutes: 60",
-            "      fail-fast: false",
-            "      OPTIMIZE: ${{ matrix.optimize }}",
-        ))
-        or re.search(r"(?m)^\s+if:|^\s+continue-on-error:", shard)
+        not shard.startswith(expected_header)
+        or re.search(r"(?m)^\s+if:|^\s+continue-on-error:|^    strategy:", shard)
         or GHR_ZIG_INSTALL not in shard
     ):
-        failures.append("ci.yml: apt/system shard must run all four required cells without skips")
+        failures.append("ci.yml: apt/system shard must require the single x64 ReleaseSafe cell without skips")
     steps = dict(re.findall(
         r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", shard,
     ))
     if steps.get("Run apt/system contract and orchestration tests", "").strip() != (
-        'run: zig build test-apt-system -Doptimize="$OPTIMIZE" -j2 --summary all'
+        "run: zig build test-apt-system -Doptimize=ReleaseSafe -j2 --summary all"
     ) or not all(token in shard for token in (
         "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
         "          persist-credentials: false",
@@ -1314,11 +1305,22 @@ def apt_system_ci_failures(text: str, build_text: str) -> list[str]:
     build_steps = dict(re.findall(
         r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", workload,
     ))
+    expected_build_run = (
+        'run: |\n'
+        '          zig build -Doptimize="$OPTIMIZE" -j2 --summary all\n'
+        '          if [ "$CI_PLATFORM" = linux-x64 ] && [ "$OPTIMIZE" = ReleaseSafe ]; then\n'
+        '            zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all\n'
+        '          else\n'
+        '            zig build test -Doptimize="$OPTIMIZE" -j2 --summary all\n'
+        '          fi\n'
+        '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all'
+    )
     if (
-        '          zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all'
-        not in build_steps.get("Build and test", "").splitlines()
+        "      CI_PLATFORM: ${{ matrix.name }}" not in workload.splitlines()
+        or "      OPTIMIZE: ${{ matrix.optimize }}" not in workload.splitlines()
+        or build_steps.get("Build and test", "").strip() != expected_build_run
     ):
-        failures.append("ci.yml: full test workload must explicitly enable the apt/system split")
+        failures.append("ci.yml: only x64 ReleaseSafe may split apt/system; the other three cells must run the full test suite")
 
     if not re.search(
         r'(?m)^    const ci_split_apt_system_tests = b\.option\(\n'

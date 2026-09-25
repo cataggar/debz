@@ -16,34 +16,46 @@ deterministic mutation logs its seed and case indexes for exact replay.
 Required build workloads use separate architecture and optimization-mode jobs,
 each retaining the 60-minute limit. Every combination runs the complete build,
 fuzz, native differential, and private helper namespace targets with `-j2`
-and timing summaries. CI passes `-Dci-split-apt-system-tests=true` to `zig build
-test`, moving only the six apt/system Zig test binaries into a separate,
-required four-cell x64/arm64 × Debug/ReleaseSafe `zig build test-apt-system`
-workload, with the same Zig version, system dependencies, `-j2`, and timing
-summaries. Local `zig build test` still runs all six by default, and
-`test-apt-system` always includes them. Debug build jobs also run release
-packaging and the distinct privileged orchestration crash suite; ReleaseSafe
-build jobs run installed-CLI facade acceptance and the download action fixture.
+and timing summaries. Only the linux-x64 ReleaseSafe build workload passes
+`-Dci-split-apt-system-tests=true` to `zig build test`, moving its six
+apt/system Zig test binaries into one separate, required linux-x64 ReleaseSafe
+`zig build test-apt-system` job with the same Zig version, system dependencies,
+`-j2`, and timing summaries. The other three architecture/mode workloads run
+the complete `zig build test`, including all six binaries. Local `zig build
+test` still runs all six by default, and `test-apt-system` always includes
+them. Debug build jobs also run release packaging and the distinct privileged
+orchestration crash suite; ReleaseSafe build jobs run installed-CLI facade
+acceptance and the download action fixture.
 Native crash recovery remains a separate required workload in both modes on
 both architectures. Both existing `Build and test` checks require all four
-build jobs, four apt/system jobs, and both recovery jobs to succeed; failure,
-cancellation, a skipped job, or an incomplete matrix fails both checks.
+build jobs, the single apt/system job, and both recovery jobs to succeed;
+failure, cancellation, a skipped job, or an incomplete matrix fails both
+checks. Security and release workflow policy audits reject a missing or
+disabled shard, a changed one-cell condition, and loss of the complete test
+suite in any of the other three cells.
 
-This split is a candidate, not a demonstrated reduction in the total critical
-path. For PR measurement compare all four architecture/mode pairs against the
-unsharded #229/#228 workflow runs (36064607851/36053148881), including x64
-ReleaseSafe's ~42-minute `zig build test` with 19 fresh test binaries and a
-~7-minute/5-GiB-RSS largest binary. Record both job durations, per-binary and
-combined passed/skipped counts (unsharded x64 ReleaseSafe: 1702 passed,
-94 skipped), peak runner memory, and the timestamp when the last required
-aggregate check finishes. Keep the split only if all four shard cells and both
-aggregates pass with the same tests executed and no newly skipped tests, x64
-ReleaseSafe's build workload improves by at least five minutes, **and** the
-overall required-check critical path improves by at least five minutes without
-a memory or timeout regression. If the comparison is noisy, confirm on a second
-PR run before adopting it. Otherwise remove the CI option and shard job,
-restore the six unconditional `test` dependencies, and retain the existing
-required gates. Neither lane restores Zig build caches.
+This one-cell split is a lower-contention experiment, not a demonstrated
+reduction in the total critical path. The four-cell split in PR #232
+(run 36090731417 attempt 1) preserved exact x64 ReleaseSafe coverage
+(1509 passed/67 skipped in its build workload plus 193 passed/27 skipped in
+its shard = 1702 passed/94 skipped), and shortened that build workload from
+59:55 to 48:46, but its 15:35 queue delay meant final required checks took
+66:41 versus the 60:16 unsharded baseline. PR #232's confirmation attempt
+queued x64 ReleaseSafe until 11:19 after trigger even after a concurrent PR
+cleared; runner contention is a hypothesis, not an established cause. For a
+new PR comparison, record trigger-to-start queue time, job runtime, per-binary
+and combined passed/skipped counts, peak runner memory, and the timestamp of
+the last required aggregate completion for this single-shard variant versus
+both four-cell PR #232 attempts and unsharded #229/#228
+(36064607851/36053148881). Require the x64 ReleaseSafe build plus shard to
+retain 1702 passed/94 skipped, each of the other three cells to retain its
+complete test coverage, and both aggregates to pass. Only adopt the variant
+if x64 ReleaseSafe's build workload and the overall required-check critical
+path each improve by at least five minutes against the unsharded baseline,
+without extra skips, memory regressions, or timeouts; confirm a noisy result
+with a second run. Otherwise restore the unsharded workflow and six
+unconditional `test` dependencies without changing the protected gates. No
+lane restores Zig build caches.
 
 Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
 commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned
