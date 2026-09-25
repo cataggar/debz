@@ -460,7 +460,7 @@ class SecurityAuditTests(unittest.TestCase):
         )
 
     def test_workflows_pin_verified_ghr_zig_installation(self) -> None:
-        for workflow_name, expected_count in (("ci.yml", 14), ("release.yml", 1)):
+        for workflow_name, expected_count in (("ci.yml", 13), ("release.yml", 1)):
             workflow = (ROOT / ".github/workflows" / workflow_name).read_text()
             self.assertEqual(
                 [],
@@ -550,7 +550,7 @@ class SecurityAuditTests(unittest.TestCase):
             r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
             workflow,
         ))
-        recovery_jobs = ("native-recovery", *security_audit.RECOVERY_ZIG_SHARDS)
+        recovery_jobs = tuple(security_audit.RECOVERY_ZIG_SHARDS)
         commands = []
         for name in recovery_jobs:
             body = jobs[name]
@@ -570,14 +570,12 @@ class SecurityAuditTests(unittest.TestCase):
                     r"(?m)^          (zig build test-native-recovery[^\n]+)$", body,
                 )],
             ]
-            if name == "native-recovery":
+            if name == "native-recovery-zig-workflows":
                 tokens.extend((
-                    "            optimize: Debug",
-                    "            optimize: ReleaseSafe",
-                    "        if: ${{ matrix.optimize == 'Debug' }}",
-                    "        if: ${{ matrix.optimize == 'ReleaseSafe' }}",
+                    "          zig build test-native-recovery-zig-unit -j2 --summary all",
+                    "          zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all",
                 ))
-            elif name in ("native-recovery-zig-workflows", "native-recovery-zig-family"):
+            if name in ("native-recovery-zig-workflows", "native-recovery-zig-family"):
                 tokens.append("          mkdir -p .tmp")
             for token in tokens:
                 with self.subTest(job=name, removed=token):
@@ -596,8 +594,18 @@ class SecurityAuditTests(unittest.TestCase):
                         1,
                     )
                     self.assertTrue(security_audit.native_recovery_ci_failures(changed))
+        workflows = jobs["native-recovery-zig-workflows"]
+        acceptance = (
+            "      - name: Exercise Zig core, repository, and helper recovery\n"
+            "        run: |\n          mkdir -p .tmp\n"
+        )
+        self.assertIn(acceptance, workflows)
+        changed = workflow.replace(
+            workflows, workflows.replace(acceptance, acceptance.replace("          mkdir -p .tmp\n", ""), 1), 1
+        )
+        self.assertTrue(security_audit.native_recovery_ci_failures(changed))
         targets = {
-            "test-native-recovery", "test-native-recovery-zig-unit",
+            "test-native-recovery-zig-unit",
             "test-native-recovery-zig", "test-native-recovery-zig-family",
             "test-native-recovery-zig-repository", "test-native-recovery-helper-zig",
             "test-native-recovery-zig-bootstrap", "test-native-recovery-zig-parity",
@@ -616,6 +624,14 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertEqual(inventory, Counter({
             (target, mode): 1 for target in targets for mode in ("Debug", "ReleaseSafe")
         }))
+        self.assertNotIn("  native-recovery:\n", workflow)
+        extra_gate = workflow.replace(
+            "  native-recovery-zig-workflows:\n",
+            "      - name: Duplicate complete recovery suite\n        run: |\n"
+            "          zig build test-native-recovery -j2 --summary all\n\n"
+            "  native-recovery-zig-workflows:\n",
+        )
+        self.assertTrue(security_audit.native_recovery_ci_failures(extra_gate))
         for name in recovery_jobs:
             body = jobs[name]
             if "          zig build test-native-recovery" not in body:
@@ -626,16 +642,14 @@ class SecurityAuditTests(unittest.TestCase):
                 self.assertTrue(security_audit.native_recovery_ci_failures(changed))
         gate = jobs["build-and-test"]
         for token in (
-            "    needs: [build-and-test-workload, native-recovery, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]",
+            "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]",
             "    if: ${{ always() }}",
             "        name: [linux-x64, linux-arm64]",
             "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
-            "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
             "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
             "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
             "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
             '          test "$BUILD_RESULT" = success',
-            '          test "$RECOVERY_RESULT" = success',
             '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
             '          test "$RECOVERY_FAMILY_RESULT" = success',
             '          test "$RECOVERY_SCENARIOS_RESULT" = success',
@@ -651,16 +665,15 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIsNotNone(gate)
         script = gate[1].split("        run: |\n", 1)[1]
         statuses = ("success", "failure", "cancelled", "skipped", "unknown")
-        for build, recovery, workflows, family, scenarios in itertools.product(
-            statuses, repeat=5,
+        for build, workflows, family, scenarios in itertools.product(
+            statuses, repeat=4,
         ):
-            with self.subTest(build=build, recovery=recovery, workflows=workflows, family=family, scenarios=scenarios):
+            with self.subTest(build=build, workflows=workflows, family=family, scenarios=scenarios):
                 result = subprocess.run(
                     ["bash", "-e", "-c", textwrap.dedent(script)],
                     env={
                         **os.environ,
                         "BUILD_RESULT": build,
-                        "RECOVERY_RESULT": recovery,
                         "RECOVERY_WORKFLOWS_RESULT": workflows,
                         "RECOVERY_FAMILY_RESULT": family,
                         "RECOVERY_SCENARIOS_RESULT": scenarios,
@@ -669,7 +682,7 @@ class SecurityAuditTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     result.returncode == 0,
-                    all(status == "success" for status in (build, recovery, workflows, family, scenarios)),
+                    all(status == "success" for status in (build, workflows, family, scenarios)),
                 )
 
     def test_report_path_reader_refusals_are_mutation_enforced(self) -> None:
@@ -690,6 +703,58 @@ class SecurityAuditTests(unittest.TestCase):
             with self.subTest(path=path, token=token):
                 self.assertIn(token, texts[path])
                 self.assertTrue(check({**texts, path: texts[path].replace(token, "", 1)}))
+    def test_recovery_gate_selector_graph_is_mutation_enforced(self) -> None:
+        paths = (
+            "build.zig",
+            "test/native_recovery_helper.zig",
+            "test/native_recovery_family.zig",
+            "test/native_recovery_projected_workflows.zig",
+            "test/native_recovery_repository.zig",
+        )
+        sources = [(ROOT / path).read_text() for path in paths]
+        check = security_audit.native_recovery_gate_wiring_failures
+        self.assertEqual([], check(*sources))
+        build = sources[0]
+        for token in (
+            "native_recovery.dependOn(&run_native_recovery_tests.step);",
+            "native_recovery.dependOn(&run_recovery_unit_tests.step);",
+            "native_recovery.dependOn(&run_repository_recovery_unit.step);",
+            "if (selected > 1 or focused)",
+            "focused Zig case options cannot narrow the complete test-native-recovery gate",
+            "native_core_only,           native_deadline_only,      native_script_failure_only,",
+            'if (native_core_only or zig_core_only) recovery_zig.addArg("--core-only");',
+            'if (native_deadline_only or zig_deadline_only) recovery_zig.addArg("--deadline-only");',
+            "native_recovery.dependOn(&recovery_zig.step);",
+            "native_recovery.dependOn(&recovery_helper.step);",
+            "native_recovery.dependOn(&recovery_bootstrap.step);",
+            "native_recovery.dependOn(&recovery_diversions.step);",
+            "native_recovery.dependOn(&recovery_family.step);",
+            "native_recovery.dependOn(&repository_recovery.step);",
+            "recovery_family.addArtifactArg(native_trigger_helper);",
+            "recovery_family.addArtifactArg(cli);",
+            "repository_recovery.addArtifactArg(cli);",
+            "recovery_parity.addArtifactArg(native_trigger_helper);",
+            "}) |runner| runner.addArgs(&.{ \"--reference-dpkg\", path });",
+            "recovery_zig,       recovery_family,     recovery_parity,   recovery_helper,     final_gaps,",
+            "recovery_parity,   recovery_diversions, statoverride_recovery, conffile_recovery,",
+            "recovery_zig,        recovery_helper,       recovery_bootstrap, recovery_family,",
+        ):
+            with self.subTest(build=token):
+                self.assertIn(token, build)
+                self.assertTrue(check(build.replace(token, "", 1), *sources[1:]))
+        for index, token in (
+            (1, "try knownScriptFailures(&fixture, driver, reference.executable, reference.architecture);"),
+            (2, "try projected.runReadOnly(&fixture, self orelse return error.MissingSelf, driver, reference.architecture);"),
+            (3, "try readOnlyProjection(fixture, runner, driver, arch);"),
+            (4, "const selected = try selectMode(false, projection_only, execution_only, cli_only);"),
+        ):
+            with self.subTest(source=paths[index], token=token):
+                changed = sources.copy()
+                changed[index] = changed[index].replace(token, "", 1)
+                self.assertTrue(check(*changed))
+        for retired in ("tools/test-native-recovery.py", "tools/test_native_recovery.py"):
+            with self.subTest(restored=retired):
+                self.assertTrue(check(build + f'\n"{retired}"', *sources[1:]))
 
     def test_native_core_completion_wiring_is_mutation_enforced(self) -> None:
         build = (ROOT / "build.zig").read_text()
@@ -758,9 +823,9 @@ class SecurityAuditTests(unittest.TestCase):
         main_start = helper.index("pub fn main(")
         for token in (
             "try recoveredOrdinary(",
-            '"after_execution_intent", "during_filesystem_publication",\n        "after_script_outcome", "after_provenance",',
+            '"after_execution_intent", "during_filesystem_publication",\n        "after_script_outcome",   "after_provenance",',
             '"typed-runtime-known-failure" else "caller-known-failure"',
-            '"after_execution_intent", "during_filesystem_publication", "during_database_publication",\n        "after_script_prepared", "after_script_outcome", "after_provenance",',
+            '"after_execution_intent", "during_filesystem_publication", "during_database_publication",\n        "after_script_prepared",  "after_script_outcome",          "after_provenance",',
             '.name = "known-failure-compensation",',
         ):
             with self.subTest(main=token):
@@ -803,8 +868,6 @@ class SecurityAuditTests(unittest.TestCase):
         for token in (
             '          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
             '          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
         ):
             with self.subTest(ci=token):
                 self.assertIn(token, ci)
@@ -1077,13 +1140,14 @@ class SecurityAuditTests(unittest.TestCase):
             "tools/test_native_lifecycle.py",
             "tools/test-native-triggers.py",
             "tools/test_native_triggers.py",
+            "tools/test-native-recovery.py",
+            "tools/test_native_recovery.py",
         )
         fixture_paths = (
             "tools/native-lifecycle-fixtures.py",
             "tools/native-trigger-fixtures.py",
         )
         consumers = (
-            "tools/test-native-recovery.py",
             "tools/dpkg-config-reference.py",
             "actions/install/__tests__/integration.test.ts",
         )
@@ -1111,12 +1175,7 @@ class SecurityAuditTests(unittest.TestCase):
                     self.assertTrue(check({**texts, path: changed}))
         for path in (fixture_paths[1], *consumers):
             with self.subTest(importer=path):
-                fixture = (
-                    "native-trigger-fixtures.py"
-                    if path == "tools/test-native-recovery.py"
-                    else "native-lifecycle-fixtures.py"
-                )
-                self.assertTrue(check({**texts, path: texts[path].replace(fixture, "missing.py")}))
+                self.assertTrue(check({**texts, path: texts[path].replace("native-lifecycle-fixtures.py", "missing.py")}))
 
     def test_build_workloads_keep_both_modes_and_all_existing_suites(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

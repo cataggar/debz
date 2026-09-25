@@ -410,8 +410,13 @@ fn verifyProofFor(
             .invocation_sha256 = script.invocation_sha256,
         };
         if (helper) |bound| try oracle.validateHelperInvocation(
-            fixture.allocator, root, bound.source_path, bound.target_path, bound.sha256,
-            decoded.?.execution().program.script_policy_sha256, invocation,
+            fixture.allocator,
+            root,
+            bound.source_path,
+            bound.target_path,
+            bound.sha256,
+            decoded.?.execution().program.script_policy_sha256,
+            invocation,
         );
         try scripts.append(fixture.allocator, invocation);
     }
@@ -428,8 +433,13 @@ fn verifyProofFor(
         if (oracle.validateScriptTrace(fixture.allocator, trace, others)) |_| return error.TraceOracleAcceptedForgery else |err| if (err != error.ScriptTraceMismatch) return err;
         if (helper) |bound| {
             if (oracle.validateHelperInvocation(
-                fixture.allocator, root, bound.source_path, bound.target_path, bound.sha256,
-                decoded.?.execution().program.script_policy_sha256, altered,
+                fixture.allocator,
+                root,
+                bound.source_path,
+                bound.target_path,
+                bound.sha256,
+                decoded.?.execution().program.script_policy_sha256,
+                altered,
             )) |_| return error.HelperOracleAcceptedForgery else |err| if (err != error.ScriptHelperBindingMismatch) return err;
         }
     }
@@ -948,7 +958,12 @@ fn blockedUnknown(
     }
     const original_helper = try helperIdentity(fixture, scenario.native_root);
     const archive = try support.makePackage(
-        fixture, arch, if (upgrade) "2" else "1", foundation.package, try support.path(fixture.allocator, name, "new"), .{},
+        fixture,
+        arch,
+        if (upgrade) "2" else "1",
+        foundation.package,
+        try support.path(fixture.allocator, name, "new"),
+        .{},
     );
     const crash = if (upgrade) "after_upgrade_postrm_return_before_outcome" else "after_script_return_before_outcome";
     if (try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "crash"), .{
@@ -979,7 +994,9 @@ fn blockedUnknown(
     const package_before = try snapshot(fixture, scenario.native_root);
     const first_output = try support.path(fixture.allocator, name, "fresh-recovery");
     var refused = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, first_output, .{
-        .operation = "recover", .caller_owned = false, .isolated_helper = false,
+        .operation = "recover",
+        .caller_owned = false,
+        .isolated_helper = false,
     }), "recovery_required", "script_outcome_unknown");
     defer refused.deinit();
     try unchanged(fixture, scenario.native_root, package_before);
@@ -997,7 +1014,9 @@ fn blockedUnknown(
     for (0..2) |index| {
         const destination = try std.fmt.allocPrint(fixture.allocator, "{s}/repeat-{d}", .{ name, index });
         var repeated = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, destination, .{
-            .operation = "recover", .caller_owned = false, .isolated_helper = false,
+            .operation = "recover",
+            .caller_owned = false,
+            .isolated_helper = false,
         }), "recovery_required", "script_outcome_unknown");
         defer repeated.deinit();
         try unchanged(fixture, scenario.native_root, package_before);
@@ -1009,7 +1028,10 @@ fn blockedUnknown(
     }
     const selected = [_]foundation.PackageIdentity{.{ .name = "debz-recovery-absent", .architecture = arch }};
     var blocked = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "blocked-purge"), .{
-        .operation = "purge", .packages = &selected, .caller_owned = false, .isolated_helper = false,
+        .operation = "purge",
+        .packages = &selected,
+        .caller_owned = false,
+        .isolated_helper = false,
     }), "recovery_required", null);
     defer blocked.deinit();
     try unchanged(fixture, scenario.native_root, package_before);
@@ -1051,11 +1073,17 @@ fn triggerOutcome(
     const reference_run = try support.path(fixture.allocator, name, "reference-install");
     try fixture.directory(reference_run);
     if (try support.reference(fixture, dpkg, scenario.reference_root, .{
-        .operation = "install", .archives = &.{source}, .triggers = true,
+        .operation = "install",
+        .archives = &.{source},
+        .triggers = true,
     }, reference_run) != 0) return error.UnexpectedReferenceTriggerExit;
     if (try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "crash"), .{
-        .operation = "install", .archive = source, .crash_at = "after_trigger_outcome",
-        .caller_owned = isolated, .isolated_helper = isolated, .trigger_execution = true,
+        .operation = "install",
+        .archive = source,
+        .crash_at = "after_trigger_outcome",
+        .caller_owned = isolated,
+        .isolated_helper = isolated,
+        .trigger_execution = true,
     }) != null) return error.CrashProducedCompletionReport;
     var intent = try debz.native_recovery.decodeIntent(fixture.allocator, try bytes(fixture, scenario.native_root, intent_path, 16 * 1024 * 1024));
     defer intent.deinit();
@@ -1064,7 +1092,10 @@ fn triggerOutcome(
     try fixture.dir.deleteFile(fixture.io, archive_relative);
     try support.absent(fixture, archive_relative);
     var recovered = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "fresh-recovery"), .{
-        .operation = "recover", .caller_owned = isolated, .isolated_helper = isolated, .trigger_execution = true,
+        .operation = "recover",
+        .caller_owned = isolated,
+        .isolated_helper = isolated,
+        .trigger_execution = true,
     }), "applied", null);
     defer recovered.deinit();
     const comparison = try support.path(fixture.allocator, name, "comparison");
@@ -1097,14 +1128,21 @@ fn triggerOutcome(
     if (!found) return error.MissingTriggerEvents;
     const package_before = try snapshot(fixture, scenario.native_root);
     var repeated = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "repeat"), .{
-        .operation = "recover", .caller_owned = isolated, .isolated_helper = isolated, .trigger_execution = true,
+        .operation = "recover",
+        .caller_owned = isolated,
+        .isolated_helper = isolated,
+        .trigger_execution = true,
     }), "applied", null);
     defer repeated.deinit();
     try unchanged(fixture, scenario.native_root, package_before);
     try same(try bytes(fixture, scenario.native_root, provenance_path, 16 * 1024 * 1024), proof_bytes);
     if (isolated) {
         var acknowledged = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "ack"), .{
-            .operation = "recover", .caller_owned = true, .isolated_helper = true, .trigger_execution = true, .acknowledge = true,
+            .operation = "recover",
+            .caller_owned = true,
+            .isolated_helper = true,
+            .trigger_execution = true,
+            .acknowledge = true,
         }), "applied", null);
         defer acknowledged.deinit();
         try missing(fixture, scenario.native_root, operation_path);
@@ -1149,8 +1187,11 @@ fn corruptedOrdinary(
         else => "after_execution_intent",
     };
     if (try invoke(fixture, driver, root, arch, try support.path(fixture.allocator, name, "crash"), .{
-        .operation = "install", .archive = archive, .crash_at = crash,
-        .caller_owned = false, .isolated_helper = false,
+        .operation = "install",
+        .archive = archive,
+        .crash_at = crash,
+        .caller_owned = false,
+        .isolated_helper = false,
     }) != null) return error.CrashProducedCompletionReport;
     var intent = try debz.native_recovery.decodeIntent(fixture.allocator, try bytes(fixture, root, intent_path, 16 * 1024 * 1024));
     defer intent.deinit();
@@ -1189,7 +1230,8 @@ fn corruptedOrdinary(
         },
         .managed_root, .completed_phase => try fixture.write(
             try relative(fixture, root, "usr/share/" ++ foundation.package ++ "/data"),
-            "external replacement\n", 0o644,
+            "external replacement\n",
+            0o644,
         ),
     }
     const archive_relative = archive[fixture.path.len + 1 ..];
@@ -1197,7 +1239,9 @@ fn corruptedOrdinary(
     try support.absent(fixture, archive_relative);
     const package_before = try snapshot(fixture, root);
     var first = try expectReport(try invoke(fixture, driver, root, arch, try support.path(fixture.allocator, name, "fresh-recovery"), .{
-        .operation = "recover", .caller_owned = false, .isolated_helper = false,
+        .operation = "recover",
+        .caller_owned = false,
+        .isolated_helper = false,
     }), "recovery_required", null);
     defer first.deinit();
     try unchanged(fixture, root, package_before);
@@ -1213,7 +1257,9 @@ fn corruptedOrdinary(
     const stable = try rootWithoutActiveClaim(fixture, root);
     for (0..2) |index| {
         var blocked = try expectReport(try invoke(fixture, driver, root, arch, try std.fmt.allocPrint(fixture.allocator, "{s}/repeat-{d}", .{ name, index }), .{
-            .operation = "recover", .caller_owned = false, .isolated_helper = false,
+            .operation = "recover",
+            .caller_owned = false,
+            .isolated_helper = false,
         }), "recovery_required", null);
         defer blocked.deinit();
         try unchanged(fixture, root, package_before);
@@ -1230,7 +1276,10 @@ fn corruptedOrdinary(
     }
     const absent_package = [_]foundation.PackageIdentity{.{ .name = "debz-recovery-absent", .architecture = arch }};
     var refused = try expectReport(try invoke(fixture, driver, root, arch, try support.path(fixture.allocator, name, "blocked-purge"), .{
-        .operation = "purge", .packages = &absent_package, .caller_owned = false, .isolated_helper = false,
+        .operation = "purge",
+        .packages = &absent_package,
+        .caller_owned = false,
+        .isolated_helper = false,
     }), "recovery_required", null);
     defer refused.deinit();
     try unchanged(fixture, root, package_before);
@@ -1610,16 +1659,25 @@ fn namespaceGate(allocator: std.mem.Allocator, io: std.Io) !void {
     if (result.term != .exited or result.term.exited != 0) return error.RequiresMountNamespace;
 }
 
+fn knownScriptFailures(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    for ([_][]const u8{ "after_failure_outcome", "after_script_failure_state" }) |boundary|
+        try knownFailure(fixture, driver, dpkg, arch, boundary);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args = init.minimal.args.iterate();
     _ = args.next();
     const driver = args.next() orelse return error.MissingNativeDriver;
     var pinned: ?[]const u8 = null;
+    var script_failure_only = false;
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
             pinned = args.next() orelse return error.MissingReferencePath;
+        } else if (std.mem.eql(u8, argument, "--script-failure-only")) {
+            if (script_failure_only) return error.DuplicateSelector;
+            script_failure_only = true;
         } else return error.InvalidArguments;
     }
     const reference = try support.prerequisites(init, allocator, pinned);
@@ -1630,6 +1688,11 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after helper failure: {s}\n", .{@errorName(err)});
+    if (script_failure_only) {
+        try knownScriptFailures(&fixture, driver, reference.executable, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     try crashTransport(&fixture, driver, reference.architecture);
     try completedWithoutLiveHelper(&fixture, driver, reference.executable, reference.architecture);
     try missingPackageOwnedHelper(&fixture, driver, reference.architecture);
@@ -1637,11 +1700,13 @@ pub fn main(init: std.process.Init) !void {
     try afterActiveClearLegacyEvidence(&fixture, driver, reference.executable, reference.architecture);
     for ([_][]const u8{
         "after_execution_intent", "during_filesystem_publication",
-        "after_script_outcome", "after_provenance",
+        "after_script_outcome",   "after_provenance",
     }) |boundary| {
         const name = try std.fmt.allocPrint(fixture.allocator, "caller-{s}", .{boundary});
         try recoveredOrdinary(&fixture, driver, reference.executable, reference.architecture, .{
-            .name = name, .crash = boundary, .caller_owned = true,
+            .name = name,
+            .crash = boundary,
+            .caller_owned = true,
         });
     }
     for ([_]bool{ true, false }) |isolated|
@@ -1654,9 +1719,10 @@ pub fn main(init: std.process.Init) !void {
         });
     for ([_][]const u8{
         "after_execution_intent", "during_filesystem_publication", "during_database_publication",
-        "after_script_prepared", "after_script_outcome", "after_provenance",
+        "after_script_prepared",  "after_script_outcome",          "after_provenance",
     }) |boundary| try recoveredOrdinary(&fixture, driver, reference.executable, reference.architecture, .{
-        .name = boundary, .crash = boundary,
+        .name = boundary,
+        .crash = boundary,
     });
     try recoveredOrdinary(&fixture, driver, reference.executable, reference.architecture, .{
         .name = "known-failure-compensation",
@@ -1677,7 +1743,6 @@ pub fn main(init: std.process.Init) !void {
     }) |case| try caseRun(&fixture, driver, reference.executable, reference.architecture, case.name, case.crash, case.unknown, null);
     try caseRun(&fixture, driver, reference.executable, reference.architecture, "helper-source-drift", "after_execution_intent", false, .helper_source);
     try caseRun(&fixture, driver, reference.executable, reference.architecture, "helper-request-missing", "after_execution_intent", false, .request);
-    for ([_][]const u8{ "after_failure_outcome", "after_script_failure_state" }) |boundary|
-        try knownFailure(&fixture, driver, reference.executable, reference.architecture, boundary);
+    try knownScriptFailures(&fixture, driver, reference.executable, reference.architecture);
     try support.assertHostUnchanged(allocator, init.io, reference.before);
 }

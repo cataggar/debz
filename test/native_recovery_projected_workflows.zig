@@ -332,10 +332,16 @@ fn compare(fixture: *foundation.Fixture, scenario: *support.Scenario) !void {
 }
 
 pub fn run(fixture: *foundation.Fixture, self: []const u8, driver: []const u8, reference: []const u8, arch: []const u8) !void {
+    try runReadOnly(fixture, self, driver, arch);
     const runner = if (std.fs.path.isAbsolute(self)) self else try std.fs.path.resolve(fixture.allocator, &.{ options.repository, self });
-    try readOnlyProjection(fixture, runner, driver, arch);
     for ([_][]const u8{ "success", "recovered", "failed" }) |outcome|
         try caseRun(fixture, runner, driver, reference, arch, outcome);
+}
+
+pub fn runReadOnly(fixture: *foundation.Fixture, self: []const u8, driver: []const u8, arch: []const u8) !void {
+    try fixture.directory("executed");
+    const runner = if (std.fs.path.isAbsolute(self)) self else try std.fs.path.resolve(fixture.allocator, &.{ options.repository, self });
+    try readOnlyProjection(fixture, runner, driver, arch);
 }
 
 fn readOnlyProjection(fixture: *foundation.Fixture, self: []const u8, driver: []const u8, arch: []const u8) !void {

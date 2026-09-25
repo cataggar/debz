@@ -3305,6 +3305,7 @@ pub fn main(init: std.process.Init) !void {
     var cli: ?[]const u8 = null;
     var python: []const u8 = "python3";
     var executed_only = false;
+    var projection_only = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
@@ -3320,8 +3321,11 @@ pub fn main(init: std.process.Init) !void {
             python = args.next() orelse return error.MissingFixturePython;
         } else if (std.mem.eql(u8, arg, "--executed-only")) {
             executed_only = true;
+        } else if (std.mem.eql(u8, arg, "--projection-only")) {
+            projection_only = true;
         } else return error.InvalidArguments;
     }
+    if (executed_only and projection_only) return error.ConflictingSelectors;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     var fixture = try foundation.Fixture.init(allocator, init.io, options.repository);
@@ -3329,6 +3333,11 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after family acceptance failure: {s}\n", .{@errorName(err)});
+    if (projection_only) {
+        try projected.runReadOnly(&fixture, self orelse return error.MissingSelf, driver, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     const source = try fixture.absolute("executed/workflow.sources");
     const keyring = try fixture.absolute("executed/repository/fixture-keyring.gpg");
     var phase_arena: std.heap.ArenaAllocator = .init(init.gpa);

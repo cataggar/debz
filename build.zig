@@ -1069,49 +1069,16 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_recovery_unit_tests.step);
     test_step.dependOn(&run_recovery_unit_tests.step);
     test_step.dependOn(&run_native_recovery_tests.step);
-    const native_recovery = b.addSystemCommand(&.{
-        "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}), "python3", "tools/test-native-recovery.py",
-    });
-    native_recovery.addArtifactArg(native_lifecycle_tests);
-    native_recovery.addArg("--native-helper");
-    native_recovery.addArtifactArg(native_trigger_helper);
-    native_recovery.addArg("--result-cli");
-    native_recovery.addArtifactArg(cli);
+    const native_recovery = b.step("test-native-recovery", "Run the complete Zig recovery unit and pinned-dpkg acceptance workload");
     const native_core_only = b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false;
     const native_deadline_only = b.option(bool, "native-deadline-only", "Select native execution deadline acceptance cases") orelse false;
     const native_parity_only = b.option(bool, "native-consumer-parity-only", "Select family and public core parity across signed fixture suites") orelse false;
     const native_helper_only = b.option(bool, "native-fresh-helper-only", "Select authenticated fresh-root helper bootstrap cases") orelse false;
-    const native_diversions_only = b.option(bool, "native-diversions-only", "Run only diversion lifecycle, trigger and recovery fixtures") orelse false;
+    const native_diversions_only = b.option(bool, "native-diversions-only", "Select numbered diversion recovery fixtures") orelse false;
     const native_script_failure_only = b.option(bool, "native-script-failure-only", "Select known native postinst failure/restart boundaries") orelse false;
-    if (native_core_only)
-        native_recovery.addArg("--core-only");
-    if (native_script_failure_only)
-        native_recovery.addArg("--script-failure-only");
-    if (native_deadline_only)
-        native_recovery.addArg("--deadline-only");
     const repository_projection_only = b.option(bool, "native-repository-projection-only", "Select native repository private-root authority cases") orelse false;
     const repository_execution_only = b.option(bool, "native-repository-execution-only", "Select typed native repository execution and recovery cases") orelse false;
     const repository_cli_only = b.option(bool, "native-repository-cli-only", "Select public supervised native repository CLI cases") orelse false;
-    if (repository_projection_only)
-        native_recovery.addArg("--repository-projection-only");
-    if (repository_execution_only)
-        native_recovery.addArg("--repository-execution-only");
-    if (repository_cli_only)
-        native_recovery.addArg("--repository-cli-only");
-    if (native_parity_only)
-        native_recovery.addArg("--consumer-parity-only");
-    if (native_helper_only)
-        native_recovery.addArg("--fresh-helper-only");
-    const native_recovery_oracle_tests = b.addSystemCommand(
-        &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
-    );
-    native_recovery.step.dependOn(&native_recovery_oracle_tests.step);
-    native_recovery.step.dependOn(&run_native_recovery_tests.step);
-    native_recovery.step.dependOn(&run_recovery_unit_tests.step);
-    test_step.dependOn(&native_recovery_oracle_tests.step);
-    b.step("test-native-recovery", "Compare real native crash recovery with dpkg and bound provenance")
-        .dependOn(&native_recovery.step);
 
     const recovery_zig_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_acceptance.zig"),
@@ -1130,10 +1097,14 @@ pub fn build(b: *std.Build) void {
     });
     recovery_zig.addArtifactArg(recovery_zig_executable);
     recovery_zig.addArtifactArg(native_lifecycle_tests);
-    if (b.option(bool, "native-zig-recovery-core-only", "Select scriptless Zig core recovery acceptance") orelse false)
-        recovery_zig.addArg("--core-only");
-    if (b.option(bool, "native-zig-recovery-deadline-only", "Select Zig deadline acceptance") orelse false)
-        recovery_zig.addArg("--deadline-only");
+    const zig_core_only = b.option(bool, "native-zig-recovery-core-only", "Select Zig core completion acceptance") orelse false;
+    const zig_deadline_only = b.option(bool, "native-zig-recovery-deadline-only", "Select Zig deadline acceptance") orelse false;
+    if (native_core_only or zig_core_only) recovery_zig.addArg("--core-only");
+    if (native_deadline_only or zig_deadline_only) recovery_zig.addArg("--deadline-only");
+    if ((native_core_only or zig_core_only) and (native_deadline_only or zig_deadline_only)) {
+        const invalid = b.addFail("core and deadline recovery selectors are mutually exclusive");
+        recovery_zig.step.dependOn(&invalid.step);
+    }
     b.step("test-native-recovery-zig", "Run Zig-owned real-process core and deadline recovery acceptance")
         .dependOn(&recovery_zig.step);
 
@@ -1160,9 +1131,11 @@ pub fn build(b: *std.Build) void {
     recovery_family.addArtifactArg(native_trigger_helper);
     recovery_family.addArg("--cli");
     recovery_family.addArtifactArg(cli);
+    if (repository_projection_only) recovery_family.addArg("--projection-only");
     if (b.option([]const u8, "native-zig-recovery-family-fixture-python", "Python interpreter for the existing signed-archive fixture builder")) |path|
         recovery_family.addArgs(&.{ "--fixture-python", path });
-    if (b.option(bool, "native-zig-recovery-family-executed-only", "Select archive-backed FAMILY execution and active inspection") orelse false)
+    const family_executed_only = b.option(bool, "native-zig-recovery-family-executed-only", "Select archive-backed FAMILY execution and active inspection") orelse false;
+    if (family_executed_only)
         recovery_family.addArg("--executed-only");
     b.step("test-native-recovery-zig-family", "Run Zig-owned private-root family request/result transport and inspection")
         .dependOn(&recovery_family.step);
@@ -1188,7 +1161,8 @@ pub fn build(b: *std.Build) void {
     recovery_parity.addArtifactArg(native_trigger_helper);
     if (b.option([]const u8, "native-zig-recovery-parity-fixture-python", "Python interpreter for signed-archive fixture generation")) |path|
         recovery_parity.addArgs(&.{ "--fixture-python", path });
-    if (b.option([]const u8, "native-zig-recovery-parity-case", "Run one suite/case for signed consumer parity debugging")) |case|
+    const parity_case = b.option([]const u8, "native-zig-recovery-parity-case", "Run one suite/case for signed consumer parity debugging");
+    if (parity_case) |case|
         recovery_parity.addArgs(&.{ "--case", case });
     b.step("test-native-recovery-zig-parity", "Run 28 signed cases through real core, FAMILY, and dpkg consumers")
         .dependOn(&recovery_parity.step);
@@ -1210,6 +1184,7 @@ pub fn build(b: *std.Build) void {
     });
     recovery_helper.addArtifactArg(recovery_helper_executable);
     recovery_helper.addArtifactArg(native_lifecycle_tests);
+    if (native_script_failure_only or native_core_only) recovery_helper.addArg("--script-failure-only");
     b.step("test-native-recovery-helper-zig", "Run Zig-owned real-process crash and helper acceptance")
         .dependOn(&recovery_helper.step);
 
@@ -1251,7 +1226,8 @@ pub fn build(b: *std.Build) void {
     recovery_bootstrap.addArtifactArg(recovery_bootstrap_executable);
     recovery_bootstrap.addArtifactArg(native_lifecycle_tests);
     recovery_bootstrap.addArtifactArg(native_trigger_helper);
-    if (b.option([]const u8, "native-zig-bootstrap-case", "Run one real fresh-helper bootstrap case")) |case|
+    const bootstrap_case = b.option([]const u8, "native-zig-bootstrap-case", "Run one real fresh-helper bootstrap case");
+    if (bootstrap_case) |case|
         recovery_bootstrap.addArgs(&.{ "--case", case });
     b.step("test-native-recovery-zig-bootstrap", "Run real fresh-root helper publication and recovery with pinned dpkg")
         .dependOn(&recovery_bootstrap.step);
@@ -1280,7 +1256,8 @@ pub fn build(b: *std.Build) void {
     repository_recovery.addArtifactArg(cli);
     if (b.option([]const u8, "native-repository-fixture-python", "Python with signed-repository fixture generator dependencies")) |python|
         repository_recovery.addArgs(&.{ "--fixture-python", python });
-    if (b.option([]const u8, "native-zig-repository-case", "Run one Zig repository CLI scenario")) |case|
+    const repository_case = b.option([]const u8, "native-zig-repository-case", "Run one Zig repository CLI scenario");
+    if (repository_case) |case|
         repository_recovery.addArgs(&.{ "--cli-scenario", case });
     if (repository_projection_only) repository_recovery.addArg("--projection-only");
     if (repository_execution_only) repository_recovery.addArg("--execution-only");
@@ -1290,9 +1267,6 @@ pub fn build(b: *std.Build) void {
     repository_recovery_step.dependOn(&run_repository_recovery_unit.step);
     repository_recovery_step.dependOn(&repository_recovery.step);
     test_step.dependOn(&run_repository_recovery_unit.step);
-    if (!native_core_only and !native_deadline_only and !native_script_failure_only and !native_parity_only and
-        !native_helper_only and !native_diversions_only)
-        native_recovery.step.dependOn(&repository_recovery.step);
 
     const rollback_clock_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_rollback_clock.zig"),
@@ -1431,23 +1405,75 @@ pub fn build(b: *std.Build) void {
     });
     recovery_diversions.addArtifactArg(recovery_diversions_executable);
     recovery_diversions.addArtifactArg(native_lifecycle_tests);
-    if (b.option([]const u8, "native-zig-recovery-diversion-case", "Run one numbered Python diversion recovery case")) |number|
+    const diversion_case = b.option([]const u8, "native-zig-recovery-diversion-case", "Run one numbered Python diversion recovery case");
+    if (diversion_case) |number|
         recovery_diversions.addArgs(&.{ "--case", number });
     b.step("test-native-recovery-zig-diversions", "Run counted real-process diversion crash/recovery cases against pinned dpkg")
         .dependOn(&recovery_diversions.step);
 
     if (native_diversions_only) {
-        native_recovery.addArg("--diversions-only");
         for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, lifecycle_oracle_zig, trigger_oracle_zig }) |runner|
             runner.addArg("--diversions-only");
+    }
+    const selectors = [_]bool{
+        native_core_only,           native_deadline_only,      native_script_failure_only,
+        repository_projection_only, repository_execution_only, repository_cli_only,
+        native_parity_only,         native_helper_only,        native_diversions_only,
+    };
+    var selected: usize = 0;
+    for (selectors) |enabled| {
+        if (enabled) selected += 1;
+    }
+    const focused = zig_core_only or zig_deadline_only or family_executed_only or
+        parity_case != null or bootstrap_case != null or repository_case != null or diversion_case != null;
+    if (selected > 1 or focused) {
+        const invalid = b.addFail(if (selected > 1)
+            "native recovery workload selectors are mutually exclusive"
+        else
+            "focused Zig case options cannot narrow the complete test-native-recovery gate; use a focused Zig target");
+        native_recovery.dependOn(&invalid.step);
+    } else {
+        native_recovery.dependOn(&run_native_recovery_tests.step);
+        native_recovery.dependOn(&run_recovery_unit_tests.step);
+        native_recovery.dependOn(&run_repository_recovery_unit.step);
+        if (native_deadline_only) {
+            native_recovery.dependOn(&recovery_zig.step);
+        } else if (native_script_failure_only) {
+            native_recovery.dependOn(&recovery_helper.step);
+        } else if (native_helper_only) {
+            native_recovery.dependOn(&recovery_bootstrap.step);
+        } else if (native_diversions_only) {
+            native_recovery.dependOn(&recovery_diversions.step);
+        } else if (repository_projection_only) {
+            native_recovery.dependOn(&recovery_family.step);
+            native_recovery.dependOn(&repository_recovery.step);
+        } else if (repository_execution_only or repository_cli_only) {
+            native_recovery.dependOn(&repository_recovery.step);
+        } else if (native_parity_only) {
+            for ([_]*std.Build.Step.Run{
+                recovery_parity,   recovery_diversions, statoverride_recovery, conffile_recovery,
+                metadata_recovery, literal_recovery,    scriptless_recovery,
+            }) |runner| native_recovery.dependOn(&runner.step);
+        } else if (native_core_only) {
+            for ([_]*std.Build.Step.Run{
+                recovery_zig,        recovery_helper,       recovery_bootstrap, recovery_family,
+                recovery_diversions, statoverride_recovery, conffile_recovery,  metadata_recovery,
+                literal_recovery,
+            }) |runner| native_recovery.dependOn(&runner.step);
+        } else {
+            for ([_]*std.Build.Step.Run{
+                recovery_zig,       recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
+                recovery_bootstrap, repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
+                literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions,
+            }) |runner| native_recovery.dependOn(&runner.step);
+        }
     }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
         run_native_fixture.addArgs(&.{ "--reference-dpkg", path });
         run_native_conffile_zig.addArgs(&.{ "--reference-dpkg", path });
         run_native_differential_zig.addArgs(&.{ "--reference-dpkg", path });
-        for ([_]*std.Build.Step.Run{
-            dpkg_config_reference, dpkg_alternatives_reference, native_recovery,
-        }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
+        for ([_]*std.Build.Step.Run{ dpkg_config_reference, dpkg_alternatives_reference }) |runner|
+            runner.addArgs(&.{ "--reference-dpkg", path });
         for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, settlement, lifecycle_oracle_zig, trigger_oracle_zig, settlement_oracle_zig }) |runner|
             runner.addArgs(&.{ "--reference-dpkg", path });
         for ([_]*std.Build.Step.Run{

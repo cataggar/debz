@@ -10,6 +10,14 @@ Reference acceptance uses the same
 as lifecycle acceptance, including both CI architectures and optimization modes.
 Named statoverride coverage is never skipped for an older host dpkg.
 
+On the isolated #215 gate-transition branch, `test-native-recovery` executes
+Zig units and all Zig recovery acceptance runners; the two former Python test
+entry points are removed here, but signed Python fixture generation remains.
+This is **prepared, not accepted**: the published parent retains both Python
+gates until its complete pre-retirement amd64/arm64 Debug/ReleaseSafe CI run
+passes, and the transition must then pass the same matrix after retirement.
+Focused Zig target names remain available for diagnosis.
+
 ## Durable execution authority
 
 Before package mutation, native execution persists the exact authorization,
@@ -731,8 +739,8 @@ Each case uses a real exit-86 child and an archive-evicted fresh recovery.
 The Zig consumer checks the persisted handler's absent postinst hash, pending
 status before completion, drift refusal without package mutation, exact
 reference-root parity, retained scripted-trigger receipt count, and immutable
-recovery repeats. This target runs in both modes on both CI architectures;
-other Python recovery matrices and both Python gates remain required.
+recovery repeats. This target is included in the complete aggregate in both modes on both CI
+architectures.
 `zig build test-native-recovery-zig-statoverride` runs all 17 named
 statoverride crash/recovery variants in fresh guarded roots, including
 install, upgrade, remove and purge, failed postinst, script-replaced account
@@ -741,8 +749,8 @@ identity, stored-blob and owner drifts. The Zig runner checks exact persisted
 account/group bytes, archive-evicted core recovery, unchanged helper inode and
 bytes, pinned-dpkg filesystem/database/script parity or refusal without
 package mutation, terminal completion, and immutable repeated receipts.
-Both optimization modes are required on both CI architectures; these
-variants do not retire either Python recovery gate.
+Both optimization modes are required on both CI architectures; this target
+alone was never sufficient to retire either Python recovery gate.
 `zig build test-native-recovery-zig-literal` runs all five literal-backslash
 path crash/recovery variants: first install at filesystem publication and
 trigger outcome, upgrade with a locally edited conffile, and conffile or
@@ -750,7 +758,7 @@ staged-script drift. The Zig consumer requires real exit 86, archive eviction,
 pinned-dpkg root parity or drift refusal without mutation, an unchanged
 package-owned helper, retained literal trigger/path authority, bound outer
 completion, and immutable repeated recovery. Both CI modes and
-architectures run this target; other Python recovery matrices remain required.
+architectures run this target through the aggregate.
 `zig build test-native-recovery-zig-metadata` covers all eleven retained
 metadata recovery variants in real guarded roots: install, upgrade, remove,
 purge, and seven independent bytes/mode/ownership/deletion drifts of the
@@ -759,7 +767,7 @@ member bytes in the retained intent for upgrade and remove, pinned-dpkg
 root/script/database parity for successful recovery, drift refusal without
 mutation, unchanged package-owned helper identity, bound completion, and
 immutable replay after archive eviction. CI runs Debug and ReleaseSafe on
-both architectures while the remaining Python recovery gate stays required.
+both architectures through the aggregate.
 `zig build test-native-recovery-zig-conffile` executes all twenty lifecycle
 crash/recovery cases for configured or failed-configure packages and removal
 through purge. The matrix includes deferred and in-script trigger activation,
@@ -768,8 +776,7 @@ conffile drift. Each successful case requires a real exit 86, evicted
 archives, exact pinned-dpkg root/database/trace parity, bound receipt and
 outer completion, unchanged package-owned helper, and immutable repeat;
 unknown or drifted inputs refuse recovery without package mutation. Both
-architectures run Debug and ReleaseSafe. Other recovery scenarios still
-require the Python gates.
+architectures run Debug and ReleaseSafe through the aggregate.
 `zig build test-native-recovery-helper-zig` runs the separate, bounded
 CRASH/HELPER real-process acceptance; both targets honor
 `-Dnative-reference-dpkg=...`. The helper target selects a valid crash seam
@@ -819,13 +826,15 @@ rollback. This slice does not cover rollback-clock integration, consumer
 parity suites, family/repository transport, or every helper bootstrap seam.
 The required Zig core/repository CI shard runs this helper target alongside
 core, repository, rollback-clock and signed-parity Zig acceptance; a separate
-FAMILY shard runs signed workflow acceptance. Both use SHA-256-pinned dpkg on
-both architectures in Debug and ReleaseSafe without weakening either Python gate.
-The shard creates `.tmp` as the runner user before privileged fixtures run,
-and the standalone repository target orders its workspace creation ahead of
-both the privileged acceptance process and its unprivileged unit tests.
-The two Python recovery gates remain mandatory until the complete
-amd64/arm64 Debug/ReleaseSafe matrix reaches end-to-end parity.
+FAMILY shard runs signed workflow acceptance. Both use pinned dpkg on both
+architectures in Debug and ReleaseSafe. The core/repository shard creates
+`.tmp` as the runner user before its Zig unit tests or privileged fixtures
+run; the FAMILY shard also creates it before privileged fixtures. The
+standalone repository target orders workspace creation ahead of both its
+privileged acceptance process and unprivileged unit tests. This prepared
+branch exposes the complete public Zig aggregate and selectors; the
+published parent retains both Python gates until its pre-retirement matrix
+passes.
 
 ### `exercise()` real-process case ledger (separate from workflow parity)
 
@@ -862,8 +871,8 @@ then checks immutable repeat and caller acknowledgment where applicable.
 All **32 named `exercise()` scenarios** in this ledger now have bounded
 real-process Zig executions in the required helper target, including the
 cases added before this slice. This does **not** claim parity for any other
-Python recovery selector: both mandatory Python gates and the existing Zig
-core, workflow, repository and family targets remain in CI. Exact digest
+former Python recovery selector: the Zig aggregate includes the core,
+workflow, repository and family targets in CI. Exact digest
 inventory and audit mutations protect the new executed cases. The ordinary
 `after_provenance` test initially exposed `CompletionChanged`: a completed
 record already had a receipt before crash, then published provenance advanced
@@ -891,8 +900,8 @@ compile-time ordering check rejects omissions and duplicates. CI requires
 the entire set in **both**
 optimization modes on amd64 and arm64, with the SHA-256-pinned private dpkg;
 `-Dnative-zig-recovery-diversion-case=N` selects a single number for
-diagnostics only. The full Python recovery gate and its diversion-only
-selector remain required.
+diagnostics only on the focused Zig target. The aggregate's
+`-Dnative-diversions-only=true` selector always runs all 100 numbers.
 
 These cases install a package-owned `dpkg-trigger` helper, execute package
 scripts and triggers in real guarded roots, run the pinned dpkg on the
@@ -920,9 +929,8 @@ clock to pinned dpkg and to the retained unpack-backup evidence; success
 cases check route-settlement bindings and, when an unpack payload already
 committed, require its inode/bytes/mtime and staged conffile contents to
 survive recovery. There are **no unexecuted tuples in this Python function**.
-This local parity result does **not** retire either Python gate: complete
-amd64/arm64 Debug/ReleaseSafe CI and the other recovery groups still require
-their own executed parity.
+This local parity result alone did **not** justify retiring either Python
+gate: complete amd64/arm64 Debug/ReleaseSafe CI still gates the transition.
 
 For the core/deadline target,
 `-Dnative-zig-recovery-core-only=true` and
@@ -940,9 +948,8 @@ latter refuses recovery without package mutation or losing the original
 claim; an actual FAMILY recovery also refuses to reclassify the unknown
 outcome, while read-only FAMILY inspection reports the unchanged active
 operation. Both require an unchanged package-owned helper and immutable repeats.
-This focused workload does not
-replace the Python `test-native-recovery` build/CI gate or its lifecycle,
-trigger and repository coverage.
+This focused workload alone does not replace the aggregate recovery gate or
+its other lifecycle, trigger and repository coverage.
 
 ### Fresh package-owned helper bootstrap (#215)
 
@@ -994,17 +1001,18 @@ its generation/step on refusal and is not asserted byte-identical.
 | `script-after_script_return_before_outcome` | Unrecorded script outcome; repeated `script_outcome_unknown` refusal, no replay |
 
 This is executed coverage of all 20 cases in that **one Python method**,
-not the entire recovery suite. `--fresh-helper-only`, both Python entry
-points, and their CI gates remain unchanged. The new Zig target runs in the
-required Zig core/repository recovery shard on amd64 and arm64 in Debug and ReleaseSafe;
-the security audit rejects removal of either CI command and detects a
+not the entire recovery suite. The fresh-helper selector now selects these
+Zig cases; the parent draft retains the Python gates pending its full matrix.
+The target runs in the required Zig core/repository shard on both architectures
+in Debug and ReleaseSafe; the security audit rejects removal of either
+sharded command and detects a
 bootstrap-source digest-inventory mutation. It does not exercise #231's
 known-failure/trigger seams, unrelated helper-bound scripts, or the remaining
-Python recovery methods. There is no production-authority blocker for these
+recovery methods. There is no production-authority blocker for these
 20 bootstrap cases.
 
-`tools/test-native-recovery.py` runs native execution in real guarded chroots
-and terminates the actual fixture process at selected durable boundaries,
+The former `tools/test-native-recovery.py` ran native execution in real guarded chroots
+and terminated the actual fixture process at selected durable boundaries,
 without ordinary unwinding. The harness requires the reserved crash exit code,
 not a normal report pretending that a crash occurred. Script-return faults
 occur after the child is reaped, avoiding orphan fixture processes.
@@ -1254,24 +1262,49 @@ zig build test-native-recovery -Dnative-repository-execution-only=true -j2
 zig build test-native-recovery -Dnative-repository-cli-only=true -j2
 ```
 
+These commands now run Zig oracles and executed acceptance directly. The
+default includes all 14 pinned-dpkg recovery executables plus the production,
+recovery-oracle and repository unit runners. The nine mutually exclusive
+public workload selectors retain their former scenario boundaries:
+
+| Public build selector | Executed Zig workload (in addition to units) |
+| --- | --- |
+| `native-core-recovery-only` | Core completion, two unowned failed-postinst cases, fresh-helper bootstrap, FAMILY workflows/read-only projection, diversion, statoverride, conffile, metadata and literal recovery |
+| `native-deadline-only` | Three real core/deadline cases; no other crash suites |
+| `native-script-failure-only` | Exactly two unowned failed-postinst restart boundaries |
+| `native-repository-projection-only` | Read-only private projection plus repository projection, execution and CLI |
+| `native-repository-execution-only` | Repository execution, dispatch and CLI |
+| `native-repository-cli-only` | Public CLI cases alone |
+| `native-consumer-parity-only` | Diversion, statoverride, conffile, metadata, literal, scriptless and 28 signed consumer cases |
+| `native-fresh-helper-only` | Twenty fresh package-owned helper/bootstrap cases |
+| `native-diversions-only` | All 100 numbered diversion recovery cases |
+
+Focused Zig `-Dnative-zig-*` case/partial-workload options remain available
+on their individual targets, but the complete `test-native-recovery` gate
+rejects them rather than silently running an incomplete matrix. The default
+and public selectors retain pinned `-Dnative-reference-dpkg` propagation and
+real native-helper/result-CLI artifacts. CI runs just the complete gate once
+per mode on each architecture, not the same expensive suites again as
+separate focused commands.
+
 The native Linux amd64/arm64 runner requires the existing dpkg/chroot fixture
 prerequisites and passwordless sudo. Only fixture execution is elevated.
-Artifacts stay under the worktree's `.tmp`; `--workspace` retains a new direct
-child there. `test-native-recovery-unit` runs focused journal/provenance units,
+Artifacts stay under the worktree's `.tmp`.
+`test-native-recovery-unit` runs focused journal/provenance units,
 and the default unit target includes the independent oracle regressions.
 
-### Zig-owned repository transport slice (#215, partial migration)
+### Zig-owned repository transport slice (#215)
 
 `zig build test-native-recovery-zig-repository
 -Dnative-repository-projection-only=true -j2` runs the repository-only
 acceptance in a private PID/mount namespace (the runner and generated fixture
 live under this worktree's `.tmp`). The execution-only selector runs typed
 execution plus CLI, and the CLI-only selector runs CLI alone, matching the
-existing Python selector hierarchy. Without a selector the Zig repository
-target runs all three. The existing `test-native-recovery` target continues
-to run **both Python recovery entry points** and now also the Zig repository
-process acceptance when its selector includes repository cases; no Python
-gate has been removed. Unprivileged Zig transport negatives also run under
+former Python selector hierarchy. Without a selector the Zig repository
+target runs all three. The complete `test-native-recovery` gate includes
+repository execution when the selected workload calls for it; the two
+Python test entry points are retired only on the isolated transition branch.
+Unprivileged Zig transport negatives also run under
 the repository target and the standard `zig build test` target. A pinned
 `-Dnative-reference-dpkg=...` is forwarded without changing its existing
 meaning. For a local Python installation lacking the signed fixture
@@ -1312,8 +1345,8 @@ projection-mode pairs, host-root rejection for all three transports,
 incorrect marker, PID and UID are checked before entering/mounting; focused
 transport tests also assert a host-root refusal leaves no process log.
 
-The transport methods now exercised by Zig (Python remains mandatory pending
-full parity) are:
+The transport methods now exercised by Zig (publication still awaits both
+pre- and post-retirement matrices) are:
 
 | Python `test_` method | Zig execution or exact refusal |
 | --- | --- |
@@ -1347,8 +1380,8 @@ This is **not** a claim of full #215 or upstream parity: the shared
 methods are outside this repository-only slice. Repository `repo add`
 only installs the descriptor: its failed postinst has no rollback symlink
 clock. A separate failed-upgrade acceptance below exercises that clock
-without attributing it to the repository CLI. Python recovery gates and
-amd64/arm64 CI parity remain required. The repository `known_failure` CLI
+without attributing it to the repository CLI. The pre- and post-retirement
+amd64/arm64 CI matrices remain required. The repository `known_failure` CLI
 row does **not** exercise or claim #231's failed-postinst crash seams or
 unconfigured trigger listeners.
 
@@ -1369,7 +1402,8 @@ normalizes the actual snapshots with `normalizeRollbackTimes(require_clock =
 true)`, and compares the complete normalized dpkg/filesystem/trace images.
 Mutating a copy of the real native after-snapshot to either original pre-upgrade
 mtime or timestamps immediately before/after the measured interval must
-yield `UnexpectedRollbackSymlinkTimestamp`. The shared Python gates remain.
+yield `UnexpectedRollbackSymlinkTimestamp`. This target remains in the
+complete Zig aggregate.
 
 | Python `test_` method | Executed Zig consumer / remaining boundary |
 | --- | --- |
@@ -1387,7 +1421,7 @@ refusals use a nonexistent driver, demand the precise Zig diagnostic and no
 request directory, and compare the untouched private-root snapshot. A real
 non-core helper-bound caller, rather than a fixture-only report, exercises
 both positive recovery paths. CI requires the unfiltered target in Debug
-and ReleaseSafe on amd64 and arm64. The two Python recovery gates remain.
+and ReleaseSafe on amd64 and arm64 through the aggregate.
 
 | Python `test_` method | Executed Zig transport / scope |
 | --- | --- |
@@ -1401,8 +1435,8 @@ and ReleaseSafe on amd64 and arm64. The two Python recovery gates remain.
 `zig build test-native-recovery-zig-unit` runs the unprivileged Zig-owned
 receipt, progress, script-output, handler-schema and reusable comparative
 negatives without a chroot or a crash.
-It also runs as part of `test-native-recovery`; the Python oracle remains
-mandatory. This inventory distinguishes a production Zig test from an assertion
+It also runs as part of `test-native-recovery`. This inventory distinguishes
+a production Zig test from an assertion
 about the Python fixture transport; the latter is **not** counted as ported.
 The focused `test-native-recovery-unit` step also runs the existing root
 completion-store idempotence and symlink refusals
@@ -1504,10 +1538,10 @@ constant nor a mocked Python subprocess counts as an executed transport.
 | 55 | `receipt_arguments_must_match_the_actual_script_trace` | U+A | `verifyProof` checks actual trace/helper digest; unit oracle refuses forged arguments |
 | 56 | `retained_output_supports_separate_and_combined_capture` | U | `recovery-unit.script output binds split and combined capture to exact bytes and accounting` |
 
-There are 56 names: all have Zig assertions for the portable behavior, while
+There were 56 Python methods: all have Zig assertions for the portable behavior, while
 #41 additionally tests a **Python-tool compatibility branch**. The only
-`referencing`/`Registry`/`RefResolver` implementation in `tools/*.py` is in
-`tools/test-native-recovery.py`, whose sole Python importer is
+`referencing`/`Registry`/`RefResolver` implementation in `tools/*.py` was in
+`tools/test-native-recovery.py`, whose sole Python importer was
 `tools/test_native_recovery.py`. The signed Zig FAMILY, parity and repository
 targets instead invoke `tools/generate-integration-repository.py`, which
 imports `generate-openpgp-fixtures.py` and `cryptography`, not the recovery
@@ -1516,8 +1550,8 @@ acceptance module or `jsonschema`. Remaining required Python schema checks
 `test_dpkg_config_reference.py`, `test_dpkg_alternatives_reference.py`,
 `test_dpkg_oracle_evidence.py`) call `jsonschema.Draft202012Validator`
 directly on self-contained schemas; none imports the recovery fallback or
-resolves an external `$ref`. Once both Python
-recovery entry points are retired, no remaining Python consumer needs this
+resolves an external `$ref`. With both Python
+recovery entry points retired on this branch, no remaining Python consumer needs this
 fallback. Replacing a removed Python interpreter import branch with Zig would
 be a fixture-only substitute, not executed behavior; the actual cross-file
 v1/v2/v3 request refusal remains in the Zig unit target. The table records
@@ -1536,10 +1570,10 @@ path and an actual arbitrary in-namespace symlink, while the existing unit
 case exercises symlinks at both production document paths. This preserves
 the refusal boundary without mistaking a receipt evidence-file path test
 for a report-path test or claiming identical Python and Zig reader APIs.
-The standalone Zig unit target remains required in both modes in the
-Debug row of the `native-recovery` CI job. Both `tools/test_native_recovery.py` and
-`tools/test-native-recovery.py` remain required until the integrated
-Debug/ReleaseSafe, amd64/arm64 matrix proves equivalence.
+The standalone Zig unit target runs in both modes in the core/repository
+CI shard; the public aggregate also includes it for local default and
+selector runs. The parent draft retains both Python gates until the
+complete pre-retirement matrix proves parity.
 
 | Python oracle (`test_` + name) | Executed Zig CRASH/HELPER counterpart |
 | --- | --- |
@@ -1567,8 +1601,7 @@ requires Python `cryptography`; when it is not in `/usr/bin/python3`, use
 target is required in CI on amd64 and arm64 in Debug and ReleaseSafe.
 Local execution against digest-pinned dpkg 1.22.22 has passed on **arm64**
 in both modes with #231 integrated; amd64 still requires CI validation.
-Both Python recovery gates and their signed consumer
-transport remain required.
+Signed consumer transport remains required in the Zig aggregate.
 
 | Python method (`test_` omitted) | Executed Zig acceptance |
 | --- | --- |
@@ -1579,10 +1612,10 @@ The known-script-failure case here is an ordinary failed postinst, **not**
 #231's interrupted failed-script restart or awaited/no-await unpacked-listener
 reference. Repository CLI and projection transport are also out of scope.
 
-The FAMILY, repository, and final-gaps transports above remain independently
-required acceptance targets. Row 41's Python-only `referencing` fallback stays
-in the unchanged Python gate until retirement; its request-schema behavior
-already has executed Zig coverage. No Python recovery gate is removed here.
+The FAMILY, repository, and final-gaps transports remain separate focused
+targets and required aggregate runners. Row 41's former Python-only
+`referencing` fallback is retired with its only consumer; its request-schema
+behavior already has executed Zig coverage.
 
 ### FAMILY request/result transport slice (#215)
 
@@ -1605,13 +1638,12 @@ without dropping signed child processes or pinned-dpkg comparisons. The existing
 `tools/generate-integration-repository.py` is invoked **only to build**
 worktree-local signed metadata and matching `.deb` archives; the test runner,
 all assertions and all FAMILY invocations are Zig-owned. The fixture builder
-needs Python `cryptography` as do the existing Python gates; environments where
+needs Python `cryptography`; environments where
 the system Python lacks it can select a dependency-equipped interpreter with
 `-Dnative-zig-recovery-family-fixture-python=/absolute/path/to/python`.
 `-Dnative-zig-recovery-family-executed-only=true` selects just the
 archive-backed and active-inspection scenarios for focused runs.
-The existing Python oracle and privileged acceptance gates remain unchanged.
-This is a separate target, not a replacement for their repository, crash or
+The aggregate includes this target alongside the repository, crash and
 helper selectors. The following table records the **original transport/unit
 baseline**; its third column is historical, not the current acceptance-gap
 inventory. The current case-by-case `exercise_workflows` inventory follows.
@@ -1619,7 +1651,7 @@ inventory. The current case-by-case `exercise_workflows` inventory follows.
 | Python method (`test_` omitted) | Zig FAMILY transport exercised at baseline | Gap at baseline |
 | --- | --- | --- |
 | `family_verification_preserves_expected_request_without_execution_flags` | The missing-lock case returns `verified:false` / `FileNotFound` without execution flags or evidence. Archive-backed create and customize pass read-only verification both without and with their returned completion; their exact summary bytes match. Create verifies equivalently as customize; its completion is rejected against the **separate actual customize attempt**. On completed create, individually changing **each of seven returned digest/identifier fields**, the outcome, settlement or operation fails with the corresponding exact completion error; changing package, operation, conffile or recommends fails with `NativeFamilyRequestMismatch`. Corrupting the retained receipt, completion, status or input lock and adding an unsettled root operation all refuse verification without further mutation; restored evidence verifies again. Selected and upgrade-all updates pass returned-completion verification. | Python additionally rejects `allow_downgrade` and `foreign_architectures` policy changes, cross-attempt completion from a separately **recovered** transaction and verifies the public CLI's broader result negatives. |
-| `native_completion_capture_is_separate_from_command_report` | The ordinary signed-repository plan emits separate report and evidence documents with null completion/install. Mutating FAMILY create/customize, both updates and failed customize/update emit separate reports and **non-null** completion evidence. Successful completion's seven returned identifiers/digests match the actual lock, receipt and root completion; failed completion's digest and outcome match its actual retained failed receipt. | The complete Python failed-script returned-evidence digest matrix is still required. |
+| `native_completion_capture_is_separate_from_command_report` | The ordinary signed-repository plan emits separate report and evidence documents with null completion/install. Mutating FAMILY create/customize, both updates and failed customize/update emit separate reports and **non-null** completion evidence. Successful completion's seven returned identifiers/digests match the actual lock, receipt and root completion; failed completion's digest and outcome match its actual retained failed receipt. | At baseline, the complete failed-script returned-evidence digest matrix still needed execution; the later case ledger records that coverage. |
 | `family_execution_preserves_request_and_separate_evidence` | Actual private-root `inspect` and `recover`, then archive-backed `create`, `customize`, selected `update` and upgrade-all `update` preserve request root, architecture, selector and input-lock path across the driver transport. Each mutation produces a distinct result/evidence pair and a bound completed receipt. The corresponding root state is compared with a pinned-dpkg install of the matching archives. | Only the selected fixture operations are compared, **not** the full signed consumer-parity matrix or failure/restart cases. |
 | `family_execution_refuses_host_root_before_spawn` | Host `/` is rejected with `NotDisposableRoot` / `"disposable fixture root"` before even creating the request directory; a nonexistent driver proves spawn was not reached. Root mismatches are also refused. | None for this transport guard. |
 | `family_update_planning_preserves_explicit_method_and_request` | Both selected `alpha:amd64=1` and upgrade-all `resolve_lock` requests run the *actual* update-planning method with the existing signed local batch repository; the unflagged upgrade-all request returns `invalid_request` without a lock. Separately, signed archive plans for host architecture feed executed selected and upgrade-all updates and pinned-dpkg comparisons. An install-mode lock, wrong operation/selector/recommends refuse update without mutation; the update lock has a different bound request digest. A repeated real plan/update changes nothing and retains the original receipt and dpkg parity. | Interrupted update recovery after eviction of the cache and input lock remains Python-only. |
@@ -1627,7 +1659,7 @@ inventory. The current case-by-case `exercise_workflows` inventory follows.
 | `family-missing-helper` | A genuine signed `scenario-main` plan in a private root with seeded `essential-core` but no `/usr/bin/dpkg-trigger` refuses execution, reports a helper diagnostic, produces no completion/receipt or placeholder, and preserves status bytes. | Inspection of this exact missing-helper root remains Python-only (other Zig inspection scenarios are executed). |
 | `family_update_planning_requires_family_request_before_spawn` | Missing FAMILY request returns `FamilyRequestRequired` / `"requires a family request"` before directory creation or spawn, using a nonexistent driver. | None for this transport guard. |
 | `diagnostic_inspection_retains_partial_package_states_without_success_proof` | Actual FAMILY `inspect` reads a marked root containing `hold ok installed`, `install reinstreq half-configured` and `deinstall ok config-files`. Separately, a real bounded native child exits at `after_execution_intent`; FAMILY inspection of that **genuinely active** root returns the persisted operation state and `native_active_evidence:true`. Both driver-produced reports and evidence pass `validateDiagnosticInspection`, contain no invented install/completion/authority, and leave the root snapshot unchanged. | Active inspection here is a seed for diagnostics, **not** proof of crash completion, failed-script replay or #231 trigger parity. |
-| `diagnostic_inspection_refuses_completion_or_authoritative_relabelling` | The Zig consumer mutates the **driver-produced** report/evidence, not a hand-written success fixture, and requires `InvalidDiagnosticInspection` for changed, invented lock/provenance, relabelled operation, invented install/completion, false diagnostic flag and wrong root. | None for the listed report/evidence negatives; Python acceptance remains required. |
+| `diagnostic_inspection_refuses_completion_or_authoritative_relabelling` | The Zig consumer mutates the **driver-produced** report/evidence, not a hand-written success fixture, and requires `InvalidDiagnosticInspection` for changed, invented lock/provenance, relabelled operation, invented install/completion, false diagnostic flag and wrong root. | None for the listed report/evidence negatives. |
 | `family_verification_still_refuses_host_root_before_spawn` | Host `/` is refused before a request directory or child exists, with the same exact diagnostic and nonexistent driver. | None for this transport guard. |
 
 The embedded batch repository remains **planning-only**: its published
@@ -1655,8 +1687,7 @@ pinned reference dpkg; owned verification checks read-only root snapshots.
 The transport checks exit **86** and absence of report/evidence for crashed
 children, and bounds each spawned child to 120 seconds plus kill grace.
 This extends the already-required focused target rather than adding a second
-target that runs the same signed repository twice. The Python gates and
-selectors are **not** removed. A shared primitive elsewhere in Zig is not
+target that runs the same signed repository twice. A shared primitive elsewhere in Zig is not
 counted as parity for an unexecuted Python workflow scenario:
 
 `test/native_recovery_projected_workflows.zig` is invoked from that required
@@ -1687,7 +1718,7 @@ dpkg comparisons include the same non-package fixture dependencies.
 | `family-missing-helper` | **Executed:** inspection of the actual precise missing-helper root before planning (only essential-core installed), signed plan, refusal and immutable status. No named Python check remains in this row. |
 | `family-update-selected`, `family-update-all` | **Executed:** install-lock rejection, update binding refusals, selected/all update, complete seven-field returned completion digests, exact successful verification's 24-field v2 schema inventory and bindings to lock/receipt/completion, byte-equal with-/without-returned-completion summaries, wrong-install proof refusal and unchanged complete-root bytes/metadata, pinned-dpkg parity and unchanged second updates. No named Python check remains in this row. |
 | `family-update-recovery` | **Executed:** selected **ordinary signed `upgrade`** interrupted at `after_native_receipt`, cache and original input-lock eviction, FAMILY recovery without replay, all seven completion evidence digests, byte-equal repeat successful return summaries and immutable complete-root evidence during refusal and proof, pinned-dpkg parity. No named Python cache-byte inventory exists beyond asserted absence of unused inputs, which Zig also checks. No named Python check remains in this row. |
-| `family-update-failure` | **Executed:** signed failed upgrade with all seven returned-completion digests bound to the real lock/receipt/completion, native failure/recoverable diagnostic and exact pinned-dpkg state, failed-result and relabeled-success refusal with immutable complete-root evidence, followed by clean no-op recovery. No named Python check remains unexecuted in this case; both Python gates remain for other recovery selectors. |
+| `family-update-failure` | **Executed:** signed failed upgrade with all seven returned-completion digests bound to the real lock/receipt/completion, native failure/recoverable diagnostic and exact pinned-dpkg state, failed-result and relabeled-success refusal with immutable complete-root evidence, followed by clean no-op recovery. No named Python check remains unexecuted in this case. |
 | `workflow-batch` | **Executed:** signed three-item version-3 lock with exact package set, reverse-selector ordinary install, unchanged `upgrade_all`, two-selector remove; each changed transaction binds real receipt/completion/lock and compares against pinned dpkg. The required target also runs the actual public `transaction-result` capabilities and verify commands against the **same signed roots**, checks canonical output and complete required 13-/24-field schema inventories with all known literals and lock/receipt/completion/owner-state bindings, unchanged namespace bytes/metadata, and refuses wrong architecture, a separately canonicalized valid wrong lock, unsettled record and damaged program/receipt/completion/database; successful proof repeats after all refusals and after removal. No named Python check remains in this row; the no-op upgrade-all intentionally overwrites the original install lock, and Python does not issue public proof against that overwritten lock. |
 | `workflow-known-failure` | **Executed:** ordinary multi-selector plan/failed execute/recover, failed bound receipt/completion and **byte-exact complete** pinned-dpkg comparison, including `status-old`, status, files, info and trace. The reference is a single real pinned `dpkg --abort-after=1 --install fail-script base-dep scenario-main` invocation: unpack all three, configure the failing package first, abort rather than configure the others. This reproduces native's single failed transaction without advancing `status-old` through a second dpkg call. The public CLI refuses both the terminal failed receipt and its no-op recovery without changing namespace evidence. |
 | `workflow-after_native_receipt`, `after_completed_record`, `after_owed_provenance_document`, `after_provenance_published`, `after_native_acknowledged` | **Executed:** all five ordinary signed batch crash/recover chains, matching pending root records, immutable root snapshots through completion, repeated no-op recoveries, original lock/receipt/completion bindings and pinned-dpkg parity. Each recovered root also passes the **actual public CLI** `transaction-result verify` with a canonical 24-field successful result and unchanged evidence. After-receipt non-owner deferral, wrong operation/selector/recommends/conffile, and replacement lock/source/keyring/force recovery options produce the same distinct refusal statuses as Python; each preserves exact pending record and namespace bytes/metadata. No named Python check remains in this row. |
@@ -1701,9 +1732,8 @@ one signed ordinary-install root through all successful-result refusals, the
 failed second install and clean recovery. The five recovered ordinary roots
 also execute the public CLI proof that Python's `assert_completion` invokes.
 No named `exercise_workflows` check remains unexecuted in this case ledger;
-this does **not** retire either Python recovery acceptance gate or establish
-parity for the other Python recovery entry points and selectors inventoried
-above.
+this case ledger alone did **not** establish parity for the other Python
+recovery entry points and selectors inventoried above.
 
 #### Upstream #231 compatibility boundary
 
@@ -1716,21 +1746,23 @@ an unpacked listener must stay unpacked, without a pending trigger, after
 the source postinst fails. The Zig trigger suite now runs both as
 **reference-only** pinned-dpkg cases; the native program compiler refuses
 this unconfigured-listener program, so this is not a native parity claim.
-The `--native-script-failure-only` Python selector and both Python recovery
-gates remain required. The Zig trigger gates keep these two reference-only
+The Zig recovery `-Dnative-script-failure-only=true` selector runs both
+unowned postinst boundaries. The Zig trigger gates keep the separate two reference-only
 cases on both architectures and in both optimization modes.
 
-### Recovery entry-point selector reconciliation (#215; Python gates retained)
+### Recovery entry-point selector reconciliation (#215; gate transition prepared)
 
 This is an inventory of **executed processes**, not of unit tests or fixture
-constants. Each Zig target below is required by one of the two
+constants. Each Zig target below is required by one of the three
 `native-recovery-zig-*` CI shards in Debug and ReleaseSafe on amd64/arm64;
-`-Dnative-reference-dpkg=...` selects pinned
+the public aggregate offers the same default and focused selectors without
+duplicating the complete suite in CI. `-Dnative-reference-dpkg=...` selects pinned
 dpkg 1.22.22. "Executed" means that the named case reaches the driver or
 public binary in a disposable root; **partial** means that some Python
 assertions about the resulting evidence are still not checked by Zig.
-Neither `tools/test-native-recovery.py` nor `tools/test_native_recovery.py`
-may be removed on the strength of the matching names alone.
+Neither Python test entry point was removed on the strength of matching
+names alone; the unit and selector-ledger observations were reconciled
+before this local, still-unpublished transition.
 
 | Python selector and complete case inventory | Required Zig target / actual observation | Status |
 | --- | --- | --- |
@@ -1744,12 +1776,12 @@ may be removed on the strength of the matching names alone.
 | `exercise_metadata_recovery`: install/during-filesystem; upgrade/after-trigger; remove/after-script; purge/after-script; install/after-trigger drift in `symbols` bytes, mode, absence or `config` bytes, mode, owner, absence | `test-native-recovery-zig-metadata`, 11 ordered `cases` + `runCase`; script/helper-bound crashes, immutable seven drift refusals, original retained metadata and pinned dpkg. | Executed: 11/11. |
 | `exercise_literal_path_recovery`: v1/during-filesystem, v1/after-trigger, v2/after-trigger, v1/after-trigger conffile drift, v2/after-trigger staged-script drift | `test-native-recovery-zig-literal`, five `cases` + `runCase`; escaped path and trigger evidence, genuine crash/refusal and pinned-dpkg successful recovery. | Executed: 5/5. |
 | `exercise_scriptless_recovery`: `{installed,new}` × `{before_scriptless_trigger_completion,after_scriptless_trigger_completion,before_scriptless_trigger_completion + postinst-presence drift}` | `test-native-recovery-zig-scriptless`, six calls to `runCase`; real scriptless/no-handler and scripted listener, absence of invented script, pending state, reference dpkg and changed-presence refusals. | Executed: 6/6. |
-| `exercise_consumer_parity`: `{debian-stable,ubuntu-26.04}` × `{pre-depends,virtual-provides,dependency-cycle,without-recommends,with-recommends,multiarch-package,literal-package-paths,retained-metadata,suite-trigger,upgrade-all,held-unchanged,conffile-keep,conffile-replace,known-script-failure}` | `test-native-recovery-zig-parity`, `parity_suites × parity_cases` + `execute`: 28 signed real public core/FAMILY plans and executions, byte-equal exact locks, pinned-dpkg snapshot parity and installed helper identity. For each of the 26 changed cases, both receipts run `native_recovery_parity_evidence.verify`: canonical provenance and all retained-byte digests, typed manifest/document digests, caller request and program/authorization bindings, progress/outcome and managed histories, isolated helper and script output/invocation/expected environment, successful script trace, typed diversion-cache and unpack-cache bindings, and independent bounded capture of actual dpkg files for both final generation and distinct final closure digests. Failed scripts must retain nonzero exit evidence; the failed-script fixture does not promise a trace line. Both held cases instead require no receipt/completion and an unchanged entire root. | Executed per receipt on arm64 with pinned dpkg; 28/28 signed cases, 52 changed receipts and four held roots. Python gate retained. |
-| `exercise_workflows`: each named signed create/customize/update/recover/inspect/batch/owner/verification/review case in the [workflow scenario inventory](#exercise_workflows-scenario-inventory-python-lines-27824136) | `test-native-recovery-zig-family` (`native_recovery_family` and `native_recovery_projected_workflows`); signed driver/reference children and projected owner reviews. | Executed at the named-scenario level per the workflow ledger; Python gate retained. |
+| `exercise_consumer_parity`: `{debian-stable,ubuntu-26.04}` × `{pre-depends,virtual-provides,dependency-cycle,without-recommends,with-recommends,multiarch-package,literal-package-paths,retained-metadata,suite-trigger,upgrade-all,held-unchanged,conffile-keep,conffile-replace,known-script-failure}` | `test-native-recovery-zig-parity`, `parity_suites × parity_cases` + `execute`: 28 signed real public core/FAMILY plans and executions, byte-equal exact locks, pinned-dpkg snapshot parity and installed helper identity. For each of the 26 changed cases, both receipts run `native_recovery_parity_evidence.verify`: canonical provenance and all retained-byte digests, typed manifest/document digests, caller request and program/authorization bindings, progress/outcome and managed histories, isolated helper and script output/invocation/expected environment, successful script trace, typed diversion-cache and unpack-cache bindings, and independent bounded capture of actual dpkg files for both final generation and distinct final closure digests. Failed scripts must retain nonzero exit evidence; the failed-script fixture does not promise a trace line. Both held cases instead require no receipt/completion and an unchanged entire root. | Executed per receipt on arm64 with pinned dpkg; 28/28 signed cases, 52 changed receipts and four held roots; aggregate runner. |
+| `exercise_workflows`: each named signed create/customize/update/recover/inspect/batch/owner/verification/review case in the [workflow scenario inventory](#exercise_workflows-scenario-inventory-python-lines-27824136) | `test-native-recovery-zig-family` (`native_recovery_family` and `native_recovery_projected_workflows`); signed driver/reference children and projected owner reviews. | Executed at the named-scenario level per the workflow ledger; aggregate runner. |
 | `exercise_repository_cli` / `repository_cli_cases`: `success`, `no_refresh`, `unchanged`, `unchanged_no_refresh`, `known_failure`, `refresh_failure`, `signal`, `lock_wait`, `lock_signal`, `unsafe_runtime`, `deadline`, `network` | `test-native-recovery-zig-repository`, `cliScenario` and `verifyCliScenario`: twelve supervised public CLI processes in disposable projections, canonical typed result decoding, three-call replay or bounded one-call refusal, real lock/signal/HTTP and helper/stale-root checks. | Executed: 12/12; CLI success and refusal shapes checked. |
 | `exercise_projection`: one read-only root with *both* `native_transaction_result.test.projected root external fixture` and `apt_system_orchestrator.test.projected native dispatch external fixture` | `test-native-recovery-zig-family`, `readOnlyProjection`: private PID/mount child runs the **actual test executable** with `DEBZ_NATIVE_PROJECTION_FIXTURE=1`, requires both named tests to report OK, byte-identical root evidence, empty lock and no leaked projection mount. The three signed projected workflows are separate cases, not proxies for this row. | Executed: 1/1. |
 | `exercise_repository_projection`: scoped caller preparation/adoption and cleanup | `test-native-recovery-zig-repository`, `projectionCase`: real private projected root, exact completion marker, lock-only namespace, absence of installed list and unchanged held bytes. | Executed: 1/1. |
-| `exercise_repository_execution`: execution `{success,known_failure,interrupted,missing_helper,unchanged,diagnostic,expired}`; resume `{success,known_failure,interrupted,unchanged}`; held unchanged `{refresh,no-refresh}`; dispatch `{success,no_refresh,unchanged,unchanged_no_refresh,known_failure,interrupted,completion_interrupted,locked_interrupted,scope_lost,refresh_failure,expired}` | `test-native-recovery-zig-repository`, `executionCase` (11), `unchangedCases` (2), `dispatchCases` (11): real private projected caller/backend children and original-input eviction. The six terminal execution/resume receipts now validate original locked checkpoint against typed final checkpoint, managed files against typed manifest and live bytes, caller completion record/generation and independently recomputed discharge, byte-identical private-mode completion copies, retained-document and actual database digests, exactly two source-bound script outcomes and isolated helper invocations, helper bytes/inode, and resumed caller/history identity (eight original inode/byte witnesses for success). Five nonterminal cases explicitly refuse all receipt/helper/repository artifacts and preserve the held path. Both no-receipt unchanged cases validate original vs publisher caller identity, checkpoint/manifest, held database, exact lock and descriptor archive/link digests; all eleven dispatch cases decode canonical result/checkpoint/provenance or unchanged evidence, hold state, non-success initial interruption, repeated result and unchanged helper identity. | Executed per named scenario and evidence shape: 11 + 2 + 11. The projected Zig fixture has its own pinned **amd64** target architecture even when the outer runner validates the pinned arm64 dpkg environment; do not mistake this synthetic projection for an arm64 dpkg differential. Python gate retained. |
+| `exercise_repository_execution`: execution `{success,known_failure,interrupted,missing_helper,unchanged,diagnostic,expired}`; resume `{success,known_failure,interrupted,unchanged}`; held unchanged `{refresh,no-refresh}`; dispatch `{success,no_refresh,unchanged,unchanged_no_refresh,known_failure,interrupted,completion_interrupted,locked_interrupted,scope_lost,refresh_failure,expired}` | `test-native-recovery-zig-repository`, `executionCase` (11), `unchangedCases` (2), `dispatchCases` (11): real private projected caller/backend children and original-input eviction. The six terminal execution/resume receipts now validate original locked checkpoint against typed final checkpoint, managed files against typed manifest and live bytes, caller completion record/generation and independently recomputed discharge, byte-identical private-mode completion copies, retained-document and actual database digests, exactly two source-bound script outcomes and isolated helper invocations, helper bytes/inode, and resumed caller/history identity (eight original inode/byte witnesses for success). Five nonterminal cases explicitly refuse all receipt/helper/repository artifacts and preserve the held path. Both no-receipt unchanged cases validate original vs publisher caller identity, checkpoint/manifest, held database, exact lock and descriptor archive/link digests; all eleven dispatch cases decode canonical result/checkpoint/provenance or unchanged evidence, hold state, non-success initial interruption, repeated result and unchanged helper identity. | Executed per named scenario and evidence shape: 11 + 2 + 11. The projected Zig fixture has its own pinned **amd64** target architecture even when the outer runner validates the pinned arm64 dpkg environment; do not mistake this synthetic projection for an arm64 dpkg differential. Aggregate runner. |
 | `exercise_fresh_helper_bootstrap`: recoverable `{after_execution_intent,during_filesystem_publication,during_database_publication,after_helper_source_prepared,during_helper_source_publication,after_helper_source_publication,after_helper_probe_prepared,after_helper_probe_outcome,after_helper_probe_completed,after_provenance}`; unknown `{after_helper_probe_in_flight,after_helper_probe_return_before_outcome}`; `ambient-target`, `ambient-source`; cleanup `{after_helper_cleanup_prepared,during_helper_cleanup,after_helper_cleanup_completed}`; scripted `{after_script_prepared,after_script_outcome,after_script_return_before_outcome}` | `test-native-recovery-zig-bootstrap`, explicit `recoverable`, `unknown_probe`, `cleanup`, `script_known` loops and `blocked` script case: real package-owned helper bootstrap, exit 86, eviction, fresh recovery, pinned dpkg and two immutable refusals for unknown/ambient cases. | Executed: 20/20. |
 
 **Repository architecture scope:** Python `exercise_repository_projection`
@@ -1775,12 +1807,14 @@ than imposing a 2 MiB artifact limit. Its Zig regression places the marker
 across a chunk boundary both near the start and beyond 2 MiB; the same
 scanner runs after each real CLI invocation in both required build modes.
 
-**Remaining before Python gate retirement:** no named entry-point scenario
-in this ledger has an outstanding evidence-shape item. Keep both Python
-gates: this ledger accounts for the named selector observations, not an
-approval to remove independent acceptance or the separate #231 reference-only
-unconfigured-listener cases. `test_native_recovery.py` also has the Python-only
-`referencing`-absent schema import path (method 41 in the unit ledger), for
-which Zig's schema reader is not an equivalent test. Keep both gates through
-integrated amd64/arm64 Debug/ReleaseSafe acceptance and a separate decision
-about preserving that Python-specific validation.
+**Remaining before publication:** complete pre-retirement amd64/arm64
+Debug/ReleaseSafe CI on the parent with both Python gates, followed by the
+same matrix on this Zig-only transition. The selector ledger accounts for
+the named observations, not independent acceptance for #231's separate
+reference-only unconfigured-listener cases. Method 41's `referencing`-absent
+import is Python-tool compatibility, not an unported production Zig schema
+reader; its consumer retires only on this prepared branch. The repository's
+private projected fixture intentionally targets amd64 even on arm64, matching
+the former Python fixture. FAMILY independently performs host-architecture
+projected transactions and pinned-dpkg comparisons; neither is an arm64
+repository-backend/dpkg differential.
