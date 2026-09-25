@@ -232,10 +232,6 @@ pub fn build(b: *std.Build) void {
     );
     test_step.dependOn(&run_real_snapshot_comparator_tests.step);
 
-    const apt_system_acceptance_python = b.addSystemCommand(
-        &.{ "python3", "tools/test-apt-system-acceptance.py" },
-    );
-    apt_system_acceptance_python.addArtifactArg(cli);
     const apt_system_acceptance_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-acceptance.zig"),
         .target = target,
@@ -255,14 +251,11 @@ pub fn build(b: *std.Build) void {
     apt_system_acceptance_zig.addArtifactArg(cli);
     b.step("test-apt-system-acceptance-zig", "Run executable Zig apt facade acceptance (requires root)")
         .dependOn(&apt_system_acceptance_zig.step);
-    b.step("test-apt-system-acceptance-python", "Retain historical Python apt acceptance (requires root)")
-        .dependOn(&apt_system_acceptance_python.step);
     const apt_system_acceptance_step = b.step(
         "test-apt-system-acceptance",
         "Run real apt facade and dpkg in a disposable root (requires root)",
     );
     apt_system_acceptance_step.dependOn(&apt_system_acceptance_zig.step);
-    apt_system_acceptance_step.dependOn(&apt_system_acceptance_python.step);
 
     const native_differential_step = b.step(
         "test-native-differential",
@@ -354,12 +347,6 @@ pub fn build(b: *std.Build) void {
         .dependOn(&run_apt_schema_tests.step);
     release_test_step.dependOn(&run_apt_schema_tests.step);
     test_step.dependOn(&run_apt_schema_tests.step);
-    // Keep the existing Python gate until every legacy case has Zig parity.
-    const apt_system_schema_tests = b.addSystemCommand(
-        &.{ "python3", "-m", "unittest", "tools/test_apt_system_schema.py" },
-    );
-    release_test_step.dependOn(&apt_system_schema_tests.step);
-    test_step.dependOn(&apt_system_schema_tests.step);
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);

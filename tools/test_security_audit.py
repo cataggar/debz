@@ -538,8 +538,8 @@ class SecurityAuditTests(unittest.TestCase):
             ("test-native-helper-namespace", "test"),
             ("        run: zig build test-release -j2 --summary all", ""),
             ("        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help", ""),
-            ("            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz", ""),
-            ('            "$(command -v zig)" build test-apt-system-acceptance-zig \\', ""),
+            ('            "$(command -v zig)" build test-apt-system-acceptance \\', ""),
+            ('              -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
             ("              -Drequire-privileged-orchestration-tests=true \\", ""),
             ("          python3 tools/generate-integration-repository.py \\", ""),
             ("        uses: ./actions/download", ""),
@@ -552,6 +552,24 @@ class SecurityAuditTests(unittest.TestCase):
         steps = dict(re.findall(
             r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", workload,
         ))
+        root_step = steps["Run required real apt facade acceptance"]
+        for token in (
+            "          sudo env \\",
+            '            TMPDIR="$PWD/.zig-cache" \\',
+            '            PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" \\',
+            '            ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-global" \\',
+            '            ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-local" \\',
+        ):
+            with self.subTest(root_fixture_isolation=token):
+                changed = workflow.replace(root_step, root_step.replace(token, "", 1), 1)
+                self.assertTrue(security_audit.native_recovery_ci_failures(changed))
+        normalization = steps["Normalize apt facade acceptance diagnostics"]
+        changed = workflow.replace(
+            normalization,
+            normalization.replace("        if: ${{ always() }}", "        if: false", 1),
+            1,
+        )
+        self.assertTrue(security_audit.native_recovery_ci_failures(changed))
         for name, body in steps.items():
             if "        if: ${{ matrix.optimize ==" not in body:
                 continue

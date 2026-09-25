@@ -588,11 +588,13 @@ fn insideScenarios(runner: *Runner) !void {
     const initial_status = try runner.readRoot("/var/lib/dpkg/status");
     runner.mountinfo = try runner.readFile("/proc/self/mountinfo");
 
-    for ([_][]const []const u8{
-        &.{ "install", "--unsupported", "base-dep" },
-        &.{ "install", "base-dep", "base-dep" },
-    }) |args| {
-        _ = try runner.apt(2, args);
+    for ([_]struct { []const []const u8, []const u8 }{
+        .{ &.{ "install", "--unsupported", "base-dep" }, "package_looks_like_option" },
+        .{ &.{ "install", "base-dep", "base-dep" }, "duplicate_package" },
+    }) |case| {
+        const rejected = try runner.apt(2, case[0]);
+        try check(eq(value(rejected, "id"), case[1]), "wrong invalid-syntax id");
+        try check(eq(value(rejected, "topic"), "install"), "wrong invalid-syntax topic");
         try unchangedRoot(runner, initial_status);
     }
     const arch = text(value(try parseFile(runner, "/etc/debz/default.json"), "architecture"));
@@ -613,8 +615,13 @@ fn insideScenarios(runner: *Runner) !void {
         if (case[0] == 8) {
             try check(eq(value(rejected, "mutation_status"), "unknown"), "invalid recovery status");
             const ds = value(rejected, "diagnostics");
-            try check(ds == .array and ds.array.items.len > 0 and
+            try check(ds == .array and ds.array.items.len == 1 and
                 eq(value(ds.array.items[0], "id"), "recovery_required"), "invalid recovery diagnostic");
+        } else {
+            const ds = value(rejected, "diagnostics");
+            try check(ds == .array and ds.array.items.len == 1 and
+                eq(value(ds.array.items[0], "id"), "profile_invalid") and
+                eq(value(ds.array.items[0], "phase"), "profile"), "invalid profile diagnostic");
         }
         try unchangedRoot(runner, initial_status);
     }
@@ -622,7 +629,7 @@ fn insideScenarios(runner: *Runner) !void {
     _ = try runner.apt(0, &.{"update"});
     const reviewed = try runner.apt(2, &.{ "install", "base-dep", "alt-a" });
     const review_diagnostics = value(reviewed, "diagnostics");
-    try check(review_diagnostics == .array and review_diagnostics.array.items.len > 0 and
+    try check(review_diagnostics == .array and review_diagnostics.array.items.len == 1 and
         eq(value(review_diagnostics.array.items[0], "id"), "confirmation_required"), "missing review diagnostic");
     try expectNames(value(reviewed, "items"), "package", &.{ "base-dep", "alt-a" });
     try check(std.mem.eql(u8, initial_status, try runner.readRoot("/var/lib/dpkg/status")), "review changed dpkg status");
@@ -743,7 +750,10 @@ fn insideRemaining(runner: *Runner, arch: []const u8, trigger_sha: [32]u8) !void
     }
     const before_rejection = try runner.readRoot("/var/lib/dpkg/status");
     const rejected = try runner.apt(5, &.{ "install", "-y", "base-dep", "nonexistent-fixture-package" });
-    try check(!boolean(value(rejected, "changed")) and
+    const rejection_diagnostics = value(rejected, "diagnostics");
+    try check(rejection_diagnostics == .array and rejection_diagnostics.array.items.len == 1 and
+        eq(value(rejection_diagnostics.array.items[0], "id"), "planning_failed") and
+        !boolean(value(rejected, "changed")) and
         std.mem.eql(u8, before_rejection, try runner.readRoot("/var/lib/dpkg/status")) and
         !runner.exists("/usr/share/debz-fixtures/base-dep"), "atomic planning rejection changed root");
 
@@ -752,7 +762,7 @@ fn insideRemaining(runner: *Runner, arch: []const u8, trigger_sha: [32]u8) !void
         const failure_diagnostics = value(failure, "diagnostics");
         const evidence = value(failure, "evidence");
         try check(boolean(value(failure, "changed")) and
-            failure_diagnostics == .array and failure_diagnostics.array.items.len > 0 and
+            failure_diagnostics == .array and failure_diagnostics.array.items.len == 1 and
             eq(value(failure_diagnostics.array.items[0], "id"), "transaction_failed") and
             value(evidence, "root_operation_completion") == .null, "failed script did not record transaction failure");
         const receipt_binding = try rootBinding(runner, evidence, "transaction_result");

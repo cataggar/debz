@@ -6,6 +6,9 @@ const Store = validator.Store;
 const v2_profile =
     \\{"schema":"https://debz.dev/schema/system-profile-v2","version":2,"transaction_backend":"native","repositories":[{"source_path":"/etc/debz/repository.sources"}],"keyring_paths":["/etc/debz/keyring.gpg"],"architecture":"amd64"}
 ;
+const operation_state =
+    \\{"schema":"https://debz.dev/schema/apt-system-operation-state-v1","version":1,"attempt_id":"1111111111111111111111111111111111111111111111111111111111111111","generation":2,"operation":"install","phase":"executing","mutation_started":false,"outcome":"pending","request_sha256":"1111111111111111111111111111111111111111111111111111111111111111","profile":null,"exact_lock":null,"transaction_result":null,"root_operation_completion":null,"updated_unix":1800000000,"diagnostic":"","digest_sha256":"6666666666666666666666666666666666666666666666666666666666666666"}
+;
 
 fn fixture(path: []const u8) !std.json.Parsed(std.json.Value) {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1024 * 1024));
@@ -39,6 +42,29 @@ fn valid(store: *Store, name: []const u8, value: std.json.Value) !void {
 
 fn invalid(store: *Store, name: []const u8, value: std.json.Value) !void {
     try std.testing.expect(!try store.validValue(name, value));
+}
+
+fn rejectClosedFields(store: *Store, name: []const u8, document: *std.json.Parsed(std.json.Value), required: []const u8) !void {
+    try valid(store, name, document.value);
+    const original = try std.json.Stringify.valueAlloc(allocator, document.value, .{});
+    defer allocator.free(original);
+    const marker = "\"schema\":";
+    const offset = std.mem.indexOf(u8, original, marker) orelse return error.InvalidFixture;
+    const duplicate = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
+        original[0..offset], marker ++ "\"duplicate\",", original[offset..],
+    });
+    defer allocator.free(duplicate);
+    try std.testing.expectError(error.DuplicateField, store.valid(name, duplicate));
+    try add(&document.value, document.arena.allocator(), "unknown_field", .null);
+    try invalid(store, name, document.value);
+    remove(&document.value, "unknown_field");
+    const old = field(&document.value, required).*;
+    try put(&document.value, required, .{ .bool = true });
+    try invalid(store, name, document.value);
+    remove(&document.value, required);
+    try invalid(store, name, document.value);
+    try add(&document.value, document.arena.allocator(), required, old);
+    try valid(store, name, document.value);
 }
 
 test "apt schema security manifests select six tests exactly once" {
@@ -180,6 +206,13 @@ test "canonical v3 confirmation and unknown examples enforce conditional evidenc
     try put(diagnostic, "phase", .{ .string = "request" });
     try invalid(&store, "apt-system-result-v3", confirmation.value);
     try put(diagnostic, "phase", .{ .string = "confirmation" });
+    var extra = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"id":"invalid_request","outcome":"usage","phase":"request","message":"extra diagnostic"}
+    , .{});
+    defer extra.deinit();
+    try field(&confirmation.value, "diagnostics").array.append(extra.value);
+    try invalid(&store, "apt-system-result-v3", confirmation.value);
+    _ = field(&confirmation.value, "diagnostics").array.pop();
     try field(&confirmation.value, "diagnostics").array.append(diagnostic.*);
     try invalid(&store, "apt-system-result-v3", confirmation.value);
     _ = field(&confirmation.value, "diagnostics").array.pop();
@@ -223,9 +256,7 @@ test "operation state executing and unchanged cannot claim mutation or lose lock
     defer store.deinit();
     var example = try fixture("tools/fixtures/apt-system-result-v3-confirmation.document.json");
     defer example.deinit();
-    var state = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\{"schema":"https://debz.dev/schema/apt-system-operation-state-v1","version":1,"attempt_id":"1111111111111111111111111111111111111111111111111111111111111111","generation":2,"operation":"install","phase":"executing","mutation_started":false,"outcome":"pending","request_sha256":"1111111111111111111111111111111111111111111111111111111111111111","profile":null,"exact_lock":null,"transaction_result":null,"root_operation_completion":null,"updated_unix":1800000000,"diagnostic":"","digest_sha256":"6666666666666666666666666666666666666666666666666666666666666666"}
-    , .{ .allocate = .alloc_always });
+    var state = try std.json.parseFromSlice(std.json.Value, allocator, operation_state, .{ .allocate = .alloc_always });
     defer state.deinit();
     try put(&state.value, "profile", field(&example.value, "profile").*);
     try put(&state.value, "exact_lock", field(field(&example.value, "evidence"), "exact_lock").*);
@@ -274,21 +305,49 @@ test "request and result package contracts distinguish leading punctuation and r
 test "missing duplicate unknown and invalid apt fields fail closed" {
     var store = try Store.init(allocator);
     defer store.deinit();
+    {
+        var profile = try std.json.parseFromSlice(std.json.Value, allocator, v2_profile, .{ .allocate = .alloc_always });
+        defer profile.deinit();
+        try rejectClosedFields(&store, "system-profile-v2", &profile, "architecture");
+        try put(&profile.value, "schema", .{ .string = "https://debz.dev/schema/system-profile-v1" });
+        try put(&profile.value, "version", .{ .integer = 1 });
+        remove(&profile.value, "transaction_backend");
+        try rejectClosedFields(&store, "system-profile-v1", &profile, "architecture");
+    }
     for ([_]struct { path: []const u8, schema: []const u8, required: []const u8 }{
         .{ .path = "tools/fixtures/apt-system-request-v1-origin-main.document.json", .schema = "apt-system-request-v1", .required = "packages" },
         .{ .path = "tools/fixtures/apt-system-result-v2-origin-main.document.json", .schema = "apt-system-result-v2", .required = "profile" },
         .{ .path = "tools/fixtures/apt-system-result-v3-confirmation.document.json", .schema = "apt-system-result-v3", .required = "mutation_status" },
+        .{ .path = "tools/fixtures/apt-system-request-v1-origin-main.document.json", .schema = "frozen-request-v1", .required = "packages" },
+        .{ .path = "tools/fixtures/apt-system-result-v2-origin-main.document.json", .schema = "frozen-result-v2", .required = "profile" },
     }) |case| {
         var doc = try fixture(case.path);
         defer doc.deinit();
-        try valid(&store, case.schema, doc.value);
-        try add(&doc.value, doc.arena.allocator(), "unknown_field", .null);
-        try invalid(&store, case.schema, doc.value);
-        remove(&doc.value, "unknown_field");
-        try put(&doc.value, case.required, .{ .bool = true });
-        try invalid(&store, case.schema, doc.value);
-        remove(&doc.value, case.required);
-        try invalid(&store, case.schema, doc.value);
+        try rejectClosedFields(&store, case.schema, &doc, case.required);
+    }
+    {
+        var result_v1 = try fixture("tools/fixtures/apt-system-result-v2-origin-main.document.json");
+        defer result_v1.deinit();
+        remove(&result_v1.value, "items");
+        try put(&result_v1.value, "schema", .{ .string = "https://debz.dev/schema/apt-system-result-v1" });
+        try put(&result_v1.value, "version", .{ .integer = 1 });
+        try rejectClosedFields(&store, "apt-system-result-v1", &result_v1, "profile");
+    }
+    {
+        var state = try std.json.parseFromSlice(std.json.Value, allocator, operation_state, .{ .allocate = .alloc_always });
+        defer state.deinit();
+        var confirmation = try fixture("tools/fixtures/apt-system-result-v3-confirmation.document.json");
+        defer confirmation.deinit();
+        try put(&state.value, "profile", field(&confirmation.value, "profile").*);
+        try put(&state.value, "exact_lock", field(field(&confirmation.value, "evidence"), "exact_lock").*);
+        try rejectClosedFields(&store, "apt-system-operation-state-v1", &state, "phase");
+    }
+    {
+        var diagnostic = try std.json.parseFromSlice(std.json.Value, allocator,
+            \\{"schema":"io.github.cataggar.debz.apt-system-cli-diagnostic.v1","version":1,"exit_status":2,"id":"unsupported_syntax","topic":"apt","message":"bad option"}
+        , .{ .allocate = .alloc_always });
+        defer diagnostic.deinit();
+        try rejectClosedFields(&store, "apt-system-cli-diagnostic-v1", &diagnostic, "version");
     }
     try std.testing.expectError(error.DuplicateField, store.valid("apt-system-request-v1",
         \\{"schema":"https://debz.dev/schema/apt-system-request-v1","schema":"https://debz.dev/schema/apt-system-request-v1"}
@@ -305,6 +364,15 @@ test "missing duplicate unknown and invalid apt fields fail closed" {
         defer result.deinit();
         try add(field(&result.value, "profile"), result.arena.allocator(), "unexpected", .null);
         try invalid(&store, "apt-system-result-v3", result.value);
+        remove(field(&result.value, "profile"), "unexpected");
+        remove(field(&result.value, "evidence"), "exact_lock");
+        try invalid(&store, "apt-system-result-v3", result.value);
+    }
+    {
+        var profile = try std.json.parseFromSlice(std.json.Value, allocator, v2_profile, .{ .allocate = .alloc_always });
+        defer profile.deinit();
+        try add(&profile.value.object.getPtr("repositories").?.array.items[0], profile.arena.allocator(), "unexpected", .null);
+        try invalid(&store, "system-profile-v2", profile.value);
     }
     const oversized = try allocator.alloc(u8, validator.max_document_bytes + 1);
     defer allocator.free(oversized);

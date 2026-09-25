@@ -38,19 +38,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 433,
-      "sha512": "cc7d7e038d5b159fbf6f8c612334db28a5dd99f45baf2c12d64de4db7a618b3c5e1eb28b2191ef436ae54b74d1ebb34bdf55086a554b2ab05c29b24e33616a8a"
+      "count": 431,
+      "sha512": "3d1e45277e9f15689b43e2d0c45235614738846ab9c6c04fdbe13d52fb2721f59cb61e4d950e9ae728c8159c4a8f064487f68594ef52dc1c58d4d4aca6692b86"
     },
     "findings": {
-      "count": 20381,
+      "count": 20347,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
         "fixed_64_hex": 172,
         "raw_32_byte": 1085,
-        "sha256_token": 18825
+        "sha256_token": 18791
       },
-      "sha512": "943455664b1fac1b8ec01c624fbd52dd0cb3168213cd522d32f07b6a513bed3cd0bcb0c1bdf06810096da48858bbee5f2230b794db541e99bb46384270ae3f76"
+      "sha512": "9c53e2f0657e625cf2409a58f4ef2242ae0dc7dad37cbe0c634794a9c80735ec92c3071cdd90a20cedf5ab6d65f4886622ebef28f91abad7e02300be17d8eff1"
     },
     "classifications": [
       {
@@ -183,15 +183,15 @@
         "scope": "tools",
         "classification": "release_and_reference_tooling",
         "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes; production authorities remain typed and versioned.",
-        "count": 5456,
+        "count": 5422,
         "counts": {
           "cas_layout": 25,
           "digest_version": 2,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5425
+          "sha256_token": 5391
         },
-        "sha512": "0f3c6b1a51b4685ed5cc0f27767be55199992926887c30ddca930308b690a0312887aad7d8053a035be8b0167d5ec821120818a747a48b1cedae77452e1c9be5"
+        "sha512": "0f129a4f54c111117a527334f6e1c1dee7ffaa945b9b059b2c9e38799504bc4729ff7a1697756eb145d23c14bf76882af2408416522b801efbb5803a7e2ff2ea"
       }
     ]
   },
