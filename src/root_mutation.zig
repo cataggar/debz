@@ -6355,6 +6355,65 @@ test "root_mutation.test.case-only names recover across both publications" {
     }
 }
 
+test "root_mutation.test.case-only re-unpack replacements recover both original children" {
+    const faults = [_]Fault{
+        .{ .boundary = .stage_create, .step = 1 },
+        .{ .boundary = .publish_rename, .step = 1 },
+        .{ .boundary = .progress_append, .step = 2 },
+        .{ .boundary = .stage_create, .step = 3 },
+        .{ .boundary = .publish_rename, .step = 3 },
+        .{ .boundary = .verify, .step = 3 },
+    };
+    for (faults) |fault| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        try writeExisting(root, "usr/share/man/man7/witness", "witness\n");
+        try writeExisting(root, "usr/share/man/man7/PAM.7.gz", "manual\n");
+        try root.createSymbolicLink(
+            try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+            "PAM.7.gz",
+        );
+        const before_file = try root.entry(try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"));
+        const before_link = try root.entry(try root_fs.Path.init("usr/share/man/man7/pam.7.gz"));
+        try testing.expect(before_file.inode != before_link.inode);
+        var intents = caseAliasIntents();
+        intents[1].file.overwrite = .replace;
+        intents[3].symlink.overwrite = .replace;
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var injector: Injector = .{ .faults = &.{fault} };
+        var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+            .hooks = injector.interface(),
+        });
+        const result = apply(&engine, .fromPlan(&plan));
+        engine.deinit();
+        try testing.expectError(error.SimulatedCrash, result);
+        try testing.expect(injector.allFired());
+        var recovered = (try open(testing.allocator, root, &fixture.attempt, .{})) orelse
+            return error.TestUnexpectedResult;
+        defer recovered.deinit();
+        const report = try recover(&recovered);
+        try testing.expectEqual(Outcome.rolled_back, report.outcome);
+        try expectContent(root, "usr/share/man/man7/PAM.7.gz", "manual\n");
+        var target: [32]u8 = undefined;
+        try testing.expectEqualStrings(
+            "PAM.7.gz",
+            try root.readSymbolicLink(
+                try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+                &target,
+            ),
+        );
+        const after_file = try root.entry(try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"));
+        const after_link = try root.entry(try root_fs.Path.init("usr/share/man/man7/pam.7.gz"));
+        try testing.expect(after_file.inode != after_link.inode);
+        try expectContent(root, "usr/share/man/man7/witness", "witness\n");
+        try expectWorkspaceEmpty(root);
+        try clear(&recovered);
+    }
+}
+
 test "root_mutation.test.case-only publication never overwrites a late occupant" {
     var fixture: Fixture = undefined;
     try fixture.init();
