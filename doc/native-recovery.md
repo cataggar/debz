@@ -538,6 +538,16 @@ is accepted only with the exact pinned README bytes and metadata and is
 included in the pre-script managed-path observation; other staging entries
 remain refused.
 
+The signed `bash` 5.3-3ubuntu1 amd64 postinst has a separate allowance bound
+to its exact script digest for one literal priority-10 `builtins.7.gz`
+install followed by `|| true`. Only a new-package `postinst configure` with
+exactly `["configure", ""]` and the snapshot amd64 tool is admitted. The
+shell may mask that tool's nonzero exit, but native code neither invents a
+script outcome nor swallows another failure: the complete script runs and
+its actual outcome is journaled. Normal return permits only an unchanged
+group or the typed install transition, with immutable inputs and unmentioned
+groups unchanged; unknown or malformed state still requires recovery.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and

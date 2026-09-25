@@ -271,6 +271,45 @@ for `builtins.7.gz`, followed by `|| true`; this shell wrapper is outside the
 reviewed literal-command grammar. Neither interrupted root is reused; the
 new refusal does not establish full amd64 native/reference parity.
 
+The signed `bash` archive and exact script bytes are now reviewed separately
+in the [alternatives reference](dpkg-alternatives-reference.md#native-admission).
+The exception binds one command and its `|| true` tail to that script,
+`bash:amd64` 5.3-3ubuntu1, new-package `postinst configure` arguments
+`["configure", ""]`, and the snapshot tool. It does not disable
+script-outcome checks or permit general shell wrappers. A **new** authenticated
+root was required to determine whether execution passes step 976; the
+interrupted step-976 root was not resumed as a fresh trial.
+
+That new authenticated 175-package amd64 root persisted a zero-exit
+`bash.postinst configure` outcome at step 976. Its `builtins.7.gz`
+alternatives record selected `/usr/share/man/man7/bash-builtins.7.gz` in auto
+mode at priority 10, with the expected generic and selector symlinks.
+Execution reached step 1026 and launched `netcat-openbsd` 1.238-1
+`postinst` (SHA-256
+`81abc862db99e322e5d6cda436769bc21b9394ce287ea35d057761b6313cb6ef`),
+but refused the resulting alternatives transition with
+`AlternativesStateChanged` before persisting a script outcome. Its signed
+script registers `nc` with three slaves. The command lists `netcat` before
+`nc.1.gz`, while the resulting record puts `nc.1.gz` first; the native typed
+registration currently preserves command order, so this ordering difference
+needs a separate pinned-reference investigation. This interrupted root is
+retained and not reused. Complete amd64 install and native/reference parity
+remain unproven.
+
+A further **new** authenticated 175-package amd64 root on final #235 squash
+plus the bash change (recorded source `aa7ab6ed6d399266a016140780ef309380bf1a08`,
+ReleaseSafe binary SHA-256
+`6a753f12343319423f4045e9053966fbd72ee5d17c8a6622d457242e2921ab0a`)
+began without dpkg database, helpers, or package state. It independently
+persisted zero-exit account setup at steps 830 and 862, both `less` scripts at
+878 and 888, and the signed `bash.postinst configure ""` at 976. The
+priority-10 `builtins.7.gz` record and links agree with the earlier trial.
+At step 1026, `netcat-openbsd.postinst` was launched, but
+`AlternativesStateChanged` prevented persisting its script outcome;
+`create.json` exited 8. An ignored local runner copy increased only the
+bounded `create` timeout from 30 to 90 minutes. The root is retained read-only;
+it does not establish complete install or native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
