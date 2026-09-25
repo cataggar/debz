@@ -38,19 +38,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 426,
-      "sha512": "79c6bcf196509e66add2d7b4ba5914d0743c9c30d90da3a9ec2aaec771ed986da2035f13e44647b8fe3f18bab456b81b78ee9298dd7e893209d11616532c8134"
+      "count": 427,
+      "sha512": "747292586f73b6cec36ab5e7cb854ec0b7f967ad70fbbe57623b73c437e2873bbd449bf8fdaa429f5f927541baef490e3a00342f6211ec9db66cfff947e5239d"
     },
     "findings": {
-      "count": 20302,
+      "count": 20324,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
         "fixed_64_hex": 171,
-        "raw_32_byte": 1066,
-        "sha256_token": 18766
+        "raw_32_byte": 1073,
+        "sha256_token": 18781
       },
-      "sha512": "2444f10c347244a52895d424c55381f4c0f2e89c86d78daf404ba5d49f9dcf0f3967aac695ce58f539fd53baa4bda35cccd7b38de42d9f0bf53f5ee8a2e28a22"
+      "sha512": "fb0fb79963626c9aa57b81be9b2413ac0cb7bbe49951e1b1082a965abd9449e4681fef4c43ff69dc733135ea6cc1578811e93a979d9ed8bad06cea334312f4c7"
     },
     "classifications": [
       {
@@ -169,15 +169,15 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 13,
+        "count": 35,
         "counts": {
           "cas_layout": 0,
           "digest_version": 0,
           "fixed_64_hex": 0,
-          "raw_32_byte": 1,
-          "sha256_token": 12
+          "raw_32_byte": 8,
+          "sha256_token": 27
         },
-        "sha512": "2fb708576e46953eaa708fb2695af3d841cb1c91180bada66a2347c505eaeb4a77b66a6e4da106fd853cdc5926264eacdc51bd1ee0641d9f15f836bdf1fa57bf"
+        "sha512": "ebee48ebff1eb1343b1dff1d1b6d4d2d0e5973f3211d942defd164b98ec1a3869ff7c14de744cefcb06eaf04d588113e50afc8f80dbd40984e09fca3dc230013"
       },
       {
         "scope": "tools",
@@ -191,7 +191,7 @@
           "raw_32_byte": 0,
           "sha256_token": 5425
         },
-        "sha512": "e6bc44495dc1ccc46b8cecf5f6e1f8b55ecd085933aa23d3843dcb752065072d65f8a6fd37517d459b7fd6a9f26151864a453ccfc5a2647e08f46049e00b5d24"
+        "sha512": "0f3c6b1a51b4685ed5cc0f27767be55199992926887c30ddca930308b690a0312887aad7d8053a035be8b0167d5ec821120818a747a48b1cedae77452e1c9be5"
       }
     ]
   },

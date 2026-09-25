@@ -3,7 +3,7 @@
 `zig build test-native-conffiles` compares the private native fixture driver
 with real dpkg on isolated disposable roots. It does not select a production
 native backend or execute maintainer scripts. The independent runner is
-`tools/test-native-conffiles.py`, sharing the package builder, root guard,
+`test/native_conffiles.zig`, sharing the Zig package builder, root guard,
 bounded subprocess runner, and semantic comparator used by item 10b.
 
 ## Phase contract

@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-"""Execute data-only native unpack and compare disposable roots with real dpkg."""
+"""Reusable disposable-root fixture helpers for Python lifecycle acceptance."""
 
 from __future__ import annotations
 
-import argparse
 from collections.abc import Callable
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
-import tempfile
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -265,104 +262,6 @@ def native(
     return result
 
 
-def exercise(
-    executable: Path | None,
-    workspace: Path,
-    environment: dict[str, str],
-    architecture: str,
-) -> None:
-    archives = {
-        version: make_package(workspace, environment, architecture, version)
-        for version in ("1", "2")
-    }
-    scenarios = (
-        ("install", None, "1"),
-        ("upgrade", "1", "2"),
-        ("downgrade", "2", "1"),
-        ("reinstall", "1", "1"),
-    )
-    for operation, initial, final in scenarios:
-        case = workspace / operation
-        expected, candidate = case / "reference", case / "native"
-        make_root(expected, architecture)
-        make_root(candidate, architecture)
-        if initial:
-            for root in (expected, candidate):
-                reference(
-                    root, archives[initial], environment,
-                    case / f"{root.name}.seed.log", configure=True,
-                )
-                if operation == "reinstall":
-                    (root / PAYLOAD / "data").write_bytes(b"local modification\n")
-        reference(expected, archives[final], environment, case / "reference.log")
-        if executable:
-            report = native(
-                executable, candidate, archives[final], architecture,
-                operation, environment, case,
-            )
-            if report["outcome"] != "applied":
-                raise AssertionError(f"{operation}: native did not apply: {report}")
-            assert_parity(expected, candidate, case)
-        else:
-            reference(candidate, archives[final], environment, case / "candidate.log")
-            assert_parity(expected, candidate, case)
-        print(f"{operation}: {'native/dpkg parity' if executable else 'oracle fixture'} passed")
-
-    sequence = workspace / "sequence"
-    expected, candidate = sequence / "reference", sequence / "native"
-    make_root(expected, architecture)
-    make_root(candidate, architecture)
-    lock_identity = None
-    for index, (operation, version) in enumerate(
-        (("install", "1"), ("upgrade", "2"), ("downgrade", "1"), ("reinstall", "1"))
-    ):
-        step = sequence / f"{index}-{operation}"
-        step.mkdir()
-        reference(expected, archives[version], environment, step / "reference.log")
-        if executable:
-            report = native(
-                executable, candidate, archives[version], architecture,
-                operation, environment, step,
-            )
-            if report["outcome"] != "applied":
-                raise AssertionError(f"sequence {operation}: native did not apply: {report}")
-            lock = (candidate / "var/lib/debz/root-operation.lock").stat()
-            identity = (lock.st_dev, lock.st_ino)
-            if lock_identity is not None and identity != lock_identity:
-                raise AssertionError("native cleanup replaced the shared lock inode")
-            lock_identity = identity
-        else:
-            reference(candidate, archives[version], environment, step / "candidate.log")
-        assert_parity(expected, candidate, step)
-    print(f"repeated unpack: {'native/dpkg parity' if executable else 'oracle fixture'} passed")
-
-    if executable:
-        for feature in ("conffile", "script", "zero-time"):
-            archive = make_package(workspace, environment, architecture, "1", feature)
-            case = workspace / feature
-            candidate = case / "native"
-            make_root(candidate, architecture)
-            before = snapshot(candidate)
-            report = native(
-                executable, candidate, archive, architecture, "install",
-                environment, case,
-            )
-            if report["outcome"] not in ("handoff", "refused"):
-                raise AssertionError(f"{feature}: unsafe native outcome: {report}")
-            if feature == "zero-time" and report != {
-                "outcome": "refused",
-                "detail": "zero_directory_timestamp_unsupported",
-            }:
-                raise AssertionError(f"zero timestamp did not receive its explicit refusal: {report}")
-            mismatches = oracle.differences(before, snapshot(candidate), maximum=30)
-            if mismatches:
-                raise AssertionError(f"{feature}: refusal changed root:\n" + "\n".join(mismatches))
-            for name in ("root-operation-v1.json", "root-mutation-v1.json"):
-                if (candidate / "var/lib/debz" / name).exists():
-                    raise AssertionError(f"{feature}: handoff stranded active evidence: {name}")
-            print(f"{feature}: pre-mutation handoff passed")
-
-
 def fixture_environment(workspace: Path) -> dict[str, str]:
     (workspace / "home").mkdir()
     (workspace / "tmp").mkdir()
@@ -374,44 +273,3 @@ def fixture_environment(workspace: Path) -> dict[str, str]:
         "TMPDIR": str(workspace / "tmp"),
         "SOURCE_DATE_EPOCH": str(EPOCH),
     }
-
-
-def main() -> int:
-    global REFERENCE_DPKG
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("native_test", nargs="?", type=Path)
-    parser.add_argument("--reference-dpkg", type=Path)
-    parser.add_argument(
-        "--oracle-only", action="store_true",
-        help="check fixture/reference consistency only; does not establish native parity",
-    )
-    arguments = parser.parse_args()
-    if arguments.oracle_only == bool(arguments.native_test):
-        parser.error("provide a native test executable or --oracle-only, not both")
-    for command in ("dpkg", "dpkg-deb"):
-        if shutil.which(command) is None:
-            raise RuntimeError(f"required reference tool is missing: {command}")
-    executable = arguments.native_test.resolve(strict=True) if arguments.native_test else None
-    architecture = subprocess.run(
-        ["dpkg", "--print-architecture"], check=True, capture_output=True,
-        text=True, timeout=10,
-    ).stdout.strip()
-    if architecture not in ("amd64", "arm64"):
-        raise RuntimeError(f"unsupported acceptance architecture: {architecture}")
-    REFERENCE_DPKG = reference_dpkg.select(arguments.reference_dpkg, architecture)
-    host_status = Path("/var/lib/dpkg/status").read_bytes()
-    temporary_root = REPOSITORY / ".tmp"
-    temporary_root.mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix="native-materialization-", dir=temporary_root,
-    ) as temporary:
-        workspace = Path(temporary)
-        environment = fixture_environment(workspace)
-        exercise(executable, workspace, environment, architecture)
-    if Path("/var/lib/dpkg/status").read_bytes() != host_status:
-        raise AssertionError("host dpkg status changed during disposable-root acceptance")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
