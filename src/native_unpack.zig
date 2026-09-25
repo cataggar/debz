@@ -19737,6 +19737,27 @@ fn snapshotSudoRsPostinstIsBound(
     return true;
 }
 
+fn snapshotUtilLinuxPostinstIsBound(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotUtilLinuxPostinst(bytes)) return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "util-linux") or
+        !std.mem.eql(u8, package.version, "2.41.3-3ubuntu2") or
+        kind != .postinst or source != .new_package or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[0], "configure") or
+        arguments[1].len != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
 fn verifySudoRsStructuralOwner(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -19916,6 +19937,97 @@ test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure"
     for (cases) |case| try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
         snapshotSudoRsPostinstIsBound(
+            script,
+            case.architecture,
+            case.package,
+            case.kind,
+            case.source,
+            case.arguments,
+        ),
+    );
+}
+
+test "native_unpack.test.snapshot util-linux requires signed fresh amd64 configure" {
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-util-linux-2.41.3-3ubuntu2.postinst",
+    );
+    const util_linux: native_program.PackageIdentity = .{
+        .name = "util-linux",
+        .version = "2.41.3-3ubuntu2",
+        .architecture = "amd64",
+    };
+    try testing.expect(try snapshotUtilLinuxPostinstIsBound(
+        script,
+        "amd64",
+        util_linux,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expect(!(try snapshotUtilLinuxPostinstIsBound(
+        "#!/bin/sh\nupdate-alternatives --auto pager\n",
+        "amd64",
+        util_linux,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    changed[changed.len - 1] = ' ';
+    try testing.expect(!(try snapshotUtilLinuxPostinstIsBound(
+        changed,
+        "amd64",
+        util_linux,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    var wrong = util_linux;
+    wrong.name = "bsdutils";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotUtilLinuxPostinstIsBound(
+            script,
+            "amd64",
+            wrong,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+        ),
+    );
+    wrong = util_linux;
+    wrong.version = "2.41.3-3ubuntu3";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotUtilLinuxPostinstIsBound(
+            script,
+            "amd64",
+            wrong,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+        ),
+    );
+    wrong = util_linux;
+    wrong.architecture = "arm64";
+    for ([_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = util_linux,
+        kind: maintainer_script.Kind = .postinst,
+        source: native_program.ScriptSource = .new_package,
+        arguments: []const []const u8 = &.{ "configure", "" },
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = wrong },
+        .{ .kind = .preinst },
+        .{ .source = .installed_package },
+        .{ .arguments = &.{"configure"} },
+        .{ .arguments = &.{ "configure", "1" } },
+        .{ .arguments = &.{ "abort-upgrade", "" } },
+    }) |case| try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotUtilLinuxPostinstIsBound(
             script,
             case.architecture,
             case.package,
@@ -20285,6 +20397,14 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    const snapshot_util_linux_postinst = try snapshotUtilLinuxPostinstIsBound(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -20302,10 +20422,11 @@ fn prepareAlternativesScriptBoundary(
         architecture,
     );
     if ((inert or snapshot_postinst or snapshot_bash_postinst or
-        snapshot_sudo_rs_postinst) and !native_alternatives.matchesSnapshotTool(
-        architecture,
-        tool_digest,
-    )) return error.InvalidAlternativesTool;
+        snapshot_sudo_rs_postinst or snapshot_util_linux_postinst) and
+        !native_alternatives.matchesSnapshotTool(
+            architecture,
+            tool_digest,
+        )) return error.InvalidAlternativesTool;
     if (snapshot_sudo_rs_postinst)
         try verifySudoRsStructuralOwner(allocator, root, program);
     var listed = try native_alternatives.listGroups(

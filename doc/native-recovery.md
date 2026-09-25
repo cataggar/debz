@@ -574,6 +574,18 @@ its actual outcome is journaled. Normal return permits only an unchanged
 group or the typed install transition, with immutable inputs and unmentioned
 groups unchanged; unknown or malformed state still requires recovery.
 
+The authenticated `util-linux` 2.41.3-3ubuntu2 amd64 postinst has a separate
+exact-digest allowance for its `OS=linux` and `command -v
+update-alternatives` guard followed by one literal continued `--install`
+of `/bin/more` at priority 50 into the existing `pager` group. It is admitted
+only as new-package `postinst` with `["configure", ""]` and the exact snapshot
+amd64 tool. The guard is not a general shell grammar: altered scripts or
+unrecognized commands still fail before launch. The existing priority-77
+less provider remains selected; both proposed target files are immutable
+and the typed record, links, other groups, and recovery checkpoints must
+match. The [alternatives reference](dpkg-alternatives-reference.md#native-admission)
+documents signed bytes and independent pinned-dpkg/tool observations.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and

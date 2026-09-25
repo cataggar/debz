@@ -436,6 +436,50 @@ step 1173, documented in the [integration root
 log](integration-roots.md#hermetic-debian-family-integration-roots).
 The new failed root is retained for recovery.
 
+The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
+`4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)
+ships the exact 2,112-byte `postinst` (SHA-256
+`31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9`).
+It assigns `OS=linux`, tests that constant and `command -v
+update-alternatives`, then runs one literal, continued command:
+`update-alternatives --install /usr/bin/pager pager /bin/more 50 --slave
+/usr/share/man/man1/pager.1.gz pager.1.gz
+/usr/share/man/man1/more.1.gz`. The existing `pager` record already selects
+the priority-77 `/usr/bin/less` provider with that slave; `/bin/more` and
+its manpage are root-owned regular files. The exact snapshot tool has SHA-256
+`3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d`.
+
+The interrupted root was **copied only for disposable reference probes**;
+its package status was already `install ok installed`, so pinned dpkg 1.22.22
+first re-unpacked the separately rehashed signed util-linux archive in its
+copy, then configured the exact script. It exited 0 and produced a 154-byte
+`pager` record (SHA-256
+`efb067c8704b11530e836705a78bbfdacbe298b9d13df3a01e1f84ca794747a9`):
+the priority-50 `/bin/more` provider precedes the priority-77 `/usr/bin/less`
+provider; both selector links still point to `less` and its manpage. Applying
+the exact install command with pinned `update-alternatives` 1.22.22 to an
+independent disposable copy produced **identical** record bytes and selectors.
+These probes are not fresh native-root executions.
+
+Native recognition skips **only** that literal tool-availability guard for
+the complete signed script digest, then parses the continued literal install
+using the existing typed grammar. This does not interpret a generic `if`,
+shell variable, redirect, or alternative command. Admission is bound to the
+new-package `util-linux:amd64` postinst at that exact version, exactly
+`["configure", ""]`, and the snapshot amd64 tool identity and metadata.
+Both `/bin/more` and its manpage are immutable script inputs. Before/after
+capture, the selected less provider, unchanged other groups, typed reachable
+registration, outcome journaling, and unknown-outcome recovery remain required.
+Altered guards, operands, slaves, arguments, package identity, tool digest,
+or resulting record fail closed. The interrupted predecessor roots are not
+reused. A different authenticated 175-package root persisted util-linux
+postinst exit 0 at step 1243 with the exact 154-byte pinned `pager` record
+and both selectors still pointing to `less`. It then refused **before
+launching** the unrelated `console-setup-linux.postinst` at step 1292: that
+script uses two variable-expanded `update-alternatives --install` candidates.
+This admission does not establish full-root parity; the newly interrupted
+root is retained for recovery.
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is

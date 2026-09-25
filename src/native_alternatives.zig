@@ -1126,6 +1126,9 @@ const snapshot_procps_postinst_sha256 = digestLiteral(
 const snapshot_sudo_rs_postinst_sha256 = digestLiteral(
     "a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17",
 );
+const snapshot_util_linux_postinst_sha256 = digestLiteral(
+    "31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
+);
 
 pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     var sha256: [32]u8 = undefined;
@@ -1173,6 +1176,16 @@ pub fn matchesSnapshotSudoRsPostinst(bytes: []const u8) bool {
     return std.crypto.timing_safe.eql(
         [32]u8,
         snapshot_sudo_rs_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotUtilLinuxPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_util_linux_postinst_sha256,
         sha256,
     );
 }
@@ -1487,6 +1500,11 @@ pub fn discoverScriptAuthority(
         const line = std.mem.trim(u8, raw_line, " \t");
         if (std.mem.indexOf(u8, line, "update-alternatives") == null)
             continue;
+        if (matchesSnapshotUtilLinuxPostinst(bytes) and std.mem.eql(
+            u8,
+            line,
+            "if [ \"${OS}\" = \"linux\" ] && command -v update-alternatives >/dev/null 2>&1; then",
+        )) continue;
         var tokens: std.ArrayList([]const u8) = .empty;
         defer tokens.deinit(owned);
         var words = std.mem.tokenizeAny(u8, line, " \t");
@@ -3763,6 +3781,175 @@ test "native_alternatives.test.snapshot less postinst registers only the pinned 
             .groups = &.{pager},
             .paths = &.{},
             .digest = snapshotDigest(&.{pager}),
+            .relationship_count = 2,
+            .parsed_records = &.{},
+            .arena = undefined,
+            .backing_allocator = testing.allocator,
+        };
+        if (case.allowed) {
+            try validateScriptTransition(
+                testing.allocator,
+                before,
+                after,
+                script,
+                .{ .groups = script.groups },
+            );
+        } else {
+            try testing.expectError(
+                error.AlternativesStateChanged,
+                validateScriptTransition(
+                    testing.allocator,
+                    before,
+                    after,
+                    script,
+                    .{ .groups = script.groups },
+                ),
+            );
+        }
+    }
+}
+
+test "native_alternatives.test.snapshot util-linux postinst pins the guarded pager install" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-util-linux-2.41.3-3ubuntu2.postinst",
+    );
+    try testing.expect(matchesSnapshotUtilLinuxPostinst(bytes));
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 1), script.commands.len);
+    try testing.expectEqualStrings("pager", script.commands[0].name);
+    switch (script.commands[0].command) {
+        .install => |install| {
+            try testing.expectEqualStrings("/usr/bin/pager", install.master_link);
+            try testing.expectEqualStrings("/bin/more", install.path);
+            try testing.expectEqual(@as(i32, 50), install.priority);
+            try testing.expectEqual(@as(usize, 1), install.slaves.len);
+            try testing.expectEqualStrings(
+                "/usr/share/man/man1/pager.1.gz",
+                install.slaves[0].link,
+            );
+            try testing.expectEqualStrings("pager.1.gz", install.slaves[0].name);
+            try testing.expectEqualStrings(
+                "/usr/share/man/man1/more.1.gz",
+                install.slaves[0].target,
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), script.groups.len);
+    try testing.expectEqual(@as(usize, 2), script.immutable_targets.len);
+
+    for ([_]struct { needle: []const u8, replacement: u8 }{
+        .{ .needle = "OS=linux", .replacement = 'u' },
+        .{ .needle = "command -v update-alternatives", .replacement = 'x' },
+        .{ .needle = "/bin/more 50", .replacement = 'x' },
+        .{ .needle = "pager.1.gz \\", .replacement = 'x' },
+        .{ .needle = "/usr/share/man/man1/more.1.gz", .replacement = 'x' },
+    }) |case| {
+        const altered = try testing.allocator.dupe(u8, bytes);
+        defer testing.allocator.free(altered);
+        const offset = std.mem.indexOf(u8, altered, case.needle) orelse
+            return error.TestUnexpectedResult;
+        altered[offset] = case.replacement;
+        try testing.expect(!matchesSnapshotUtilLinuxPostinst(altered));
+        try testing.expectError(
+            error.InvalidAlternativesScript,
+            discoverScriptAuthority(testing.allocator, altered, .{}),
+        );
+    }
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(
+            testing.allocator,
+            "if [ \"${OS}\" = \"linux\" ] && command -v update-alternatives >/dev/null 2>&1; then\nupdate-alternatives --install /usr/bin/pager pager /bin/more 50\n",
+            .{},
+        ),
+    );
+}
+
+test "native_alternatives.test.snapshot util-linux preserves the selected less pager" {
+    const testing = std.testing;
+    var script = try discoverScriptAuthority(
+        testing.allocator,
+        @embedFile("fixtures/ubuntu-stonking-util-linux-2.41.3-3ubuntu2.postinst"),
+        .{},
+    );
+    defer script.deinit();
+    const prior_bytes =
+        "auto\n/usr/bin/pager\npager.1.gz\n/usr/share/man/man1/pager.1.gz\n\n" ++
+        "/usr/bin/less\n77\n/usr/share/man/man1/less.1.gz\n\n";
+    const pinned_after =
+        "auto\n/usr/bin/pager\npager.1.gz\n/usr/share/man/man1/pager.1.gz\n\n" ++
+        "/bin/more\n50\n/usr/share/man/man1/more.1.gz\n" ++
+        "/usr/bin/less\n77\n/usr/share/man/man1/less.1.gz\n\n";
+    var prior = try parse(testing.allocator, "pager", prior_bytes, .{});
+    defer prior.deinit();
+    var prior_group: GroupState = .{
+        .name = "pager",
+        .record = prior.record,
+        .record_fact = .{
+            .path = "var/lib/dpkg/alternatives/pager",
+            .kind = .regular,
+        },
+        .selected = "/usr/bin/less",
+        .links = &.{},
+        .missing_master_targets = &.{},
+        .facts = &.{},
+        .digest = undefined,
+    };
+    prior_group.digest = groupStateDigest(prior_group);
+    const before: Snapshot = .{
+        .groups = &.{prior_group},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{prior_group}),
+        .relationship_count = 2,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    var mutation = try mutate(testing.allocator, .{
+        .name = "pager",
+        .current = prior.record,
+        .selected = prior_group.selected,
+        .command = script.commands[0].command,
+    });
+    defer mutation.deinit();
+    const expected = try canonicalBytes(testing.allocator, mutation.record.?);
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(pinned_after, expected);
+    try testing.expectEqualStrings("/usr/bin/less", mutation.selected.?);
+    for ([_]struct {
+        record: []const u8,
+        selected: []const u8 = "/usr/bin/less",
+        allowed: bool,
+    }{
+        .{ .record = pinned_after, .allowed = true },
+        .{ .record = prior_bytes, .allowed = true },
+        .{ .record = pinned_after, .selected = "/bin/more", .allowed = false },
+        .{
+            .record = "auto\n/usr/bin/pager\npager.1.gz\n/usr/share/man/man1/pager.1.gz\n\n" ++
+                "/bin/more\n51\n/usr/share/man/man1/more.1.gz\n" ++
+                "/usr/bin/less\n77\n/usr/share/man/man1/less.1.gz\n\n",
+            .allowed = false,
+        },
+        .{
+            .record = "auto\n/usr/bin/pager\npager.1.gz\n/usr/share/man/man1/pager.1.gz\n\n" ++
+                "/bin/more\n50\n/usr/share/man/man1/less.1.gz\n" ++
+                "/usr/bin/less\n77\n/usr/share/man/man1/less.1.gz\n\n",
+            .allowed = false,
+        },
+    }) |case| {
+        var parsed = try parse(testing.allocator, "pager", case.record, .{});
+        defer parsed.deinit();
+        var after_group = prior_group;
+        after_group.record = parsed.record;
+        after_group.selected = case.selected;
+        after_group.digest = groupStateDigest(after_group);
+        const after: Snapshot = .{
+            .groups = &.{after_group},
+            .paths = &.{},
+            .digest = snapshotDigest(&.{after_group}),
             .relationship_count = 2,
             .parsed_records = &.{},
             .arena = undefined,
