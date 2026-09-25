@@ -1116,6 +1116,9 @@ const snapshot_less_preinst_sha256 = digestLiteral(
 const snapshot_less_postinst_sha256 = digestLiteral(
     "a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4",
 );
+const snapshot_bash_postinst_sha256 = digestLiteral(
+    "e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff",
+);
 
 pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     var sha256: [32]u8 = undefined;
@@ -1137,7 +1140,17 @@ pub fn matchesSnapshotLessPostinst(bytes: []const u8) bool {
     );
 }
 
-pub fn matchesSnapshotLessTool(
+pub fn matchesSnapshotBashPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_bash_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotTool(
     architecture: []const u8,
     sha256: [32]u8,
 ) bool {
@@ -1319,6 +1332,29 @@ fn snapshotLessPostinstCommand(
     return true;
 }
 
+fn snapshotBashPostinstCommand(
+    bytes: []const u8,
+    tokens: []const []const u8,
+    command: usize,
+) bool {
+    if (!matchesSnapshotBashPostinst(bytes)) return false;
+    const expected = [_][]const u8{
+        "update-alternatives",
+        "--install",
+        "/usr/share/man/man7/builtins.7.gz",
+        "builtins.7.gz",
+        "/usr/share/man/man7/bash-builtins.7.gz",
+        "10",
+        "||",
+        "true",
+    };
+    if (command != 0 or tokens.len != expected.len) return false;
+    for (tokens, &expected) |actual, literal| {
+        if (!std.mem.eql(u8, actual, literal)) return false;
+    }
+    return true;
+}
+
 fn scriptGroup(
     allocator: std.mem.Allocator,
     groups: *std.ArrayList(GroupAuthority),
@@ -1430,6 +1466,12 @@ pub fn discoverScriptAuthority(
         const operation = tokens.items[command + 1];
         if (!shellTokenSafe(operation))
             return error.InvalidAlternativesScript;
+        if (std.mem.eql(u8, operation, "--install") and
+            snapshotBashPostinstCommand(bytes, tokens.items, command))
+        {
+            // Parse only the tool operands; the complete pinned script still runs.
+            tokens.items = tokens.items[0 .. tokens.items.len - 2];
+        }
         if (std.mem.eql(u8, operation, "--install")) {
             if (command + 6 > tokens.items.len)
                 return error.InvalidAlternativesScript;
@@ -3021,16 +3063,16 @@ test "native_alternatives.test.snapshot tool pin is exact and architecture bound
     try testing.expect(matchesPinnedTool("amd64", snapshot));
     try testing.expect(!matchesPinnedTool("arm64", snapshot));
     try testing.expect(!matchesPinnedTool("i386", snapshot));
-    try testing.expect(matchesSnapshotLessTool("amd64", snapshot));
-    try testing.expect(!matchesSnapshotLessTool(
+    try testing.expect(matchesSnapshotTool("amd64", snapshot));
+    try testing.expect(!matchesSnapshotTool(
         "amd64",
         pinned_tools[0].sha256,
     ));
-    try testing.expect(!matchesSnapshotLessTool("arm64", snapshot));
+    try testing.expect(!matchesSnapshotTool("arm64", snapshot));
     var changed = snapshot;
     changed[0] ^= 1;
     try testing.expect(!matchesPinnedTool("amd64", changed));
-    try testing.expect(!matchesSnapshotLessTool("amd64", changed));
+    try testing.expect(!matchesSnapshotTool("amd64", changed));
 }
 
 test "native_alternatives.test.staged dpkg README retains exact immutable metadata" {
@@ -3583,6 +3625,146 @@ test "native_alternatives.test.snapshot less postinst registers only the pinned 
             .paths = &.{},
             .digest = snapshotDigest(&.{pager}),
             .relationship_count = 2,
+            .parsed_records = &.{},
+            .arena = undefined,
+            .backing_allocator = testing.allocator,
+        };
+        if (case.allowed) {
+            try validateScriptTransition(
+                testing.allocator,
+                before,
+                after,
+                script,
+                .{ .groups = script.groups },
+            );
+        } else {
+            try testing.expectError(
+                error.AlternativesStateChanged,
+                validateScriptTransition(
+                    testing.allocator,
+                    before,
+                    after,
+                    script,
+                    .{ .groups = script.groups },
+                ),
+            );
+        }
+    }
+}
+
+test "native_alternatives.test.snapshot bash postinst pins one masked builtins install" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst",
+    );
+    try testing.expect(matchesSnapshotBashPostinst(bytes));
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 1), script.commands.len);
+    try testing.expectEqualStrings("builtins.7.gz", script.commands[0].name);
+    switch (script.commands[0].command) {
+        .install => |install| {
+            try testing.expectEqualStrings(
+                "/usr/share/man/man7/builtins.7.gz",
+                install.master_link,
+            );
+            try testing.expectEqualStrings(
+                "/usr/share/man/man7/bash-builtins.7.gz",
+                install.path,
+            );
+            try testing.expectEqual(@as(i32, 10), install.priority);
+            try testing.expectEqual(@as(usize, 0), install.slaves.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), script.groups.len);
+    try testing.expectEqualStrings("builtins.7.gz", script.groups[0].name);
+    try testing.expectEqualStrings(
+        "/usr/share/man/man7/builtins.7.gz",
+        script.groups[0].topology.?.master_link,
+    );
+    try testing.expectEqual(@as(usize, 1), script.immutable_targets.len);
+    try testing.expectEqualStrings(
+        "/usr/share/man/man7/bash-builtins.7.gz",
+        script.immutable_targets[0],
+    );
+
+    const rejected = [_][]const u8{
+        "#!/bin/sh\nupdate-alternatives --install /usr/share/man/man7/builtins.7.gz builtins.7.gz /usr/share/man/man7/bash-builtins.7.gz 10 || true\n",
+        "#!/bin/sh\nupdate-alternatives --install /usr/share/man/man7/builtins.7.gz builtins.7.gz /usr/share/man/man7/bash-builtins.7.gz 10 || false\n",
+        "#!/bin/sh\nupdate-alternatives --install /usr/share/man/man7/builtins.7.gz builtins.7.gz /usr/share/man/man7/bash-builtins.7.gz 11 || true\n",
+        "#!/bin/sh\nupdate-alternatives --install /usr/share/man/man7/builtins.7.gz builtins.7.gz /usr/share/man/man7/bash-builtins.7.gz 10; true\n",
+        "#!/bin/sh\nupdate-alternatives --auto builtins.7.gz || true\n",
+    };
+    for (rejected) |wrong| try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(testing.allocator, wrong, .{}),
+    );
+    var changed = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(changed);
+    changed[changed.len - 1] = '1';
+    try testing.expect(!matchesSnapshotBashPostinst(changed));
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(testing.allocator, changed, .{}),
+    );
+}
+
+test "native_alternatives.test.snapshot bash postinst bounds masked tool failure and success" {
+    const testing = std.testing;
+    var script = try discoverScriptAuthority(
+        testing.allocator,
+        @embedFile("fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst"),
+        .{},
+    );
+    defer script.deinit();
+    const before: Snapshot = .{
+        .groups = &.{},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{}),
+        .relationship_count = 0,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    try validateScriptTransition(
+        testing.allocator,
+        before,
+        before,
+        script,
+        .{ .groups = script.groups },
+    );
+    for ([_]struct { priority: []const u8, allowed: bool }{
+        .{ .priority = "10", .allowed = true },
+        .{ .priority = "11", .allowed = false },
+    }) |case| {
+        const record = try std.fmt.allocPrint(
+            testing.allocator,
+            "auto\n/usr/share/man/man7/builtins.7.gz\n\n/usr/share/man/man7/bash-builtins.7.gz\n{s}\n\n",
+            .{case.priority},
+        );
+        defer testing.allocator.free(record);
+        var parsed = try parse(testing.allocator, "builtins.7.gz", record, .{});
+        defer parsed.deinit();
+        var group: GroupState = .{
+            .name = "builtins.7.gz",
+            .record = parsed.record,
+            .record_fact = .{
+                .path = "var/lib/dpkg/alternatives/builtins.7.gz",
+                .kind = .regular,
+            },
+            .selected = "/usr/share/man/man7/bash-builtins.7.gz",
+            .links = &.{},
+            .missing_master_targets = &.{},
+            .facts = &.{},
+            .digest = undefined,
+        };
+        group.digest = groupStateDigest(group);
+        const after: Snapshot = .{
+            .groups = &.{group},
+            .paths = &.{},
+            .digest = snapshotDigest(&.{group}),
+            .relationship_count = 1,
             .parsed_records = &.{},
             .arena = undefined,
             .backing_allocator = testing.allocator,

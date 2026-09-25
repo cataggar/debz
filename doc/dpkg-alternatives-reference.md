@@ -279,6 +279,38 @@ outcome and the expected `pager` record and links at step 888, then refused
 an unrelated `bash.postinst` `update-alternatives --install ... || true`
 script at step 976 before launch.
 
+The same signed amd64 snapshot's `bash` 5.3-3ubuntu1 archive (SHA-512
+`05fc4be7d1457e8e853a04c259d73c2c16de18154275612051f0d8efd6d4ec74c23f85b80c6a60c11e217aa4756a6a27650dd03502733b53141ac69c0732d3b4`)
+ships a 492-byte `postinst` (SHA-256
+`e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff`).
+It invokes the literal `update-alternatives --install
+/usr/share/man/man7/builtins.7.gz builtins.7.gz
+/usr/share/man/man7/bash-builtins.7.gz 10 || true`, split over shell
+continuations. In the refused fresh root `/bin/sh` already points to `dash`,
+the candidate exists, no `builtins.7.gz` group exists, and `update-menus` is
+absent. The maintainer script runs even for other postinst arguments, so
+native admission is restricted to the observed **new** `bash:amd64`
+`postinst` with exactly `["configure", ""]`.
+
+A disposable chroot probe with the signed script and pinned dpkg 1.22.22
+configured a synthetic fixture both when the candidate was present (the
+priority-10 auto group was registered) and when it was missing (the tool
+reported an error but `|| true` left dpkg exit 0 and no group). The
+snapshot-pinned amd64 tool independently returned 0 with the provider and 2
+without it, producing the same typed group/absence. Only the complete
+authenticated script digest and these exact command tokens allow the
+`|| true` tail to be excluded **from operand parsing**. The script itself
+still runs unmodified; its actual exit, output, immutable provider/tool
+identities, group transitions, managed checkpoints, and unknown-outcome
+recovery are not suppressed. No other use of `|| true`, architecture, tool
+digest, package, source, or arguments gains authority. This does not prove
+full fresh-root parity. A new authenticated root did persist the `bash`
+postinst's zero-exit outcome and priority-10 `builtins.7.gz` group at step
+976, then stopped after launching `netcat-openbsd.postinst` at step 1026:
+its three-slave registration returned a state outside the existing typed
+transition model. The interrupted root remains a recovery case, not a
+completed parity result.
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is
