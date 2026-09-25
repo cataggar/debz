@@ -666,7 +666,15 @@ with `["configure", ""]` hit `InvalidAlternativesScript`. The final journal
 has only a `script prepared` action for that step, no script outcome.
 The signed script contains an `OS=linux` guard and a multi-line
 `update-alternatives --install` of the `pager` group with its manpage slave;
-its authorization and reference behavior require separate investigation.
+its exact archive SHA-512, control-member bytes, and installed script digest
+were independently checked. The non-command `command -v update-alternatives`
+guard is what the literal-command parser refused. Pinned dpkg 1.22.22,
+using the snapshot-pinned alternatives tool, configured the script in a
+disposable copy after re-unpacking the signed archive; its pager record and
+selectors matched a separate direct pinned-`update-alternatives` 1.22.22
+probe byte-for-byte. The [alternatives
+reference](dpkg-alternatives-reference.md#native-admission) documents the
+exact identity, branch, resulting record, and narrow script/tool admission.
 Both interrupted roots and their durable claims are retained; neither is
 reusable as a fresh root, and neither proves full amd64 parity.
 
@@ -693,6 +701,36 @@ before launch, with only `script prepared` in the journal and **no** script
 outcome. The overall operation remains `recovery_required`. Preserve this
 interrupted root; it is not a retry target or proof of full snapshot parity.
 Util-linux admission is a separate signed-authority problem.
+
+A different **new** root,
+`.real-snapshot/amd64-util-linux-fresh-long-2`, refreshed the reviewed
+`stonking` snapshot, resolved an independent 175-package SHA-512 lock
+(file SHA-256
+`6f56ebfd7a787ea006ed08be9215ad9b50522f377349883f3a08fbcd94d15275`),
+and separately rehashed all 175 downloaded CAS objects. Its exact signed
+`util-linux.postinst` at step 1243 **launched**, persisted an exit-0
+outcome, and reached `install ok installed`. The 154-byte `pager` record
+has SHA-256
+`efb067c8704b11530e836705a78bbfdacbe298b9d13df3a01e1f84ca794747a9`,
+identical to both pinned reference probes; both selector links still point
+to `/usr/bin/less` and its manpage. This proves only that transition,
+not the entire root.
+
+The next distinct refusal is **before script launch** at step 1292:
+`console-setup-linux:all` 1.248ubuntu3 new-package `postinst` SHA-256
+`5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`,
+arguments `["configure", ""]`, returned `InvalidAlternativesScript`.
+The archive was rehashed against the same signed lock (SHA-512
+`b5ad0ebf1b9a526b5af67422b720b29b4e2738ebd945871223bef8241e59b47558f51a31e9638b8e5ce84ea1b42334682f86f9c3d62de224e7c55caa7a5e0f14`);
+its installed and archive scripts match. After `CONFIGDIR=/etc/console-setup`,
+the script contains two `update-alternatives --install /etc/vtrgb vtrgb
+"$CONFIGDIR/vtrgb"` (priority 50) and `"$CONFIGDIR/vtrgb.vga"` (priority 20)
+commands, outside the literal grammar. The final journal entry is only
+`script prepared` at step 1292 and no outcome file exists. This root is
+interrupted, retained for recovery, and **must not** be reused as fresh.
+The earlier `.real-snapshot/amd64-util-linux-fresh-long-1` stopped after
+authenticated refresh because a diagnostic invocation used an unsupported
+`resolve-lock` command; it never planned or executed a package.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
