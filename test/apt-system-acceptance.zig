@@ -304,7 +304,7 @@ const Runner = struct {
             try check(source != null, "missing required dpkg fixture helper");
             try self.copyBinary(source.?, try std.fmt.allocPrint(self.arena, "/usr/sbin/{s}", .{name}), 0);
         }
-        try std.Io.Dir.symLinkAbsolute(self.io, "tar", try self.path("/usr/bin/gtar"), .{});
+        try std.Io.Dir.cwd().symLink(self.io, "tar", try self.path("/usr/bin/gtar"), .{});
         try self.writeRoot("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
         try self.writeRoot("/etc/group", "root:x:0:\n");
         try self.writeRoot("/etc/os-release", "ID=debian\nNAME=\"debz disposable fixture\"\n");
