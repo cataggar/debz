@@ -19716,6 +19716,77 @@ fn snapshotProcpsPostinstIsInert(
     return true;
 }
 
+fn snapshotProcpsTriggerPostinstIsInert(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+    action_kind: native_recovery.ActionKind,
+) !bool {
+    if (!native_alternatives.matchesSnapshotProcpsPostinst(bytes) or
+        arguments.len == 0 or !std.mem.eql(u8, arguments[0], "triggered"))
+        return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "procps") or
+        !std.mem.eql(u8, package.version, "2:4.0.6-3ubuntu1") or
+        kind != .postinst or source != .new_package or
+        action_kind != .trigger or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[1], "/usr/lib/sysctl.d"))
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+fn verifySnapshotProcpsTriggerHandler(
+    program: *const native_program.Program,
+    package: native_program.PackageIdentity,
+    bytes: []const u8,
+) !void {
+    const handler = triggerHandlerBinding(program.*, package) orelse
+        return error.InvalidAlternativesScriptAuthority;
+    try verifySnapshotProcpsTriggerHandlerBinding(handler, package, bytes);
+}
+
+fn verifySnapshotProcpsTriggerHandlerBinding(
+    handler: native_program.TriggerHandlerBinding,
+    package: native_program.PackageIdentity,
+    bytes: []const u8,
+) !void {
+    const postinst = handler.postinst_sha256 orelse
+        return error.InvalidAlternativesScriptAuthority;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const bound = parseHex(32, &postinst) orelse
+        return error.InvalidAlternativesScriptAuthority;
+    if (!std.mem.eql(u8, handler.package.name, package.name) or
+        !std.mem.eql(u8, handler.package.version, package.version) or
+        !std.mem.eql(u8, handler.package.architecture, package.architecture) or
+        handler.source != .new_package or
+        !std.mem.eql(u8, &digest, &bound))
+        return error.InvalidAlternativesScriptAuthority;
+}
+
+fn guardSnapshotProcpsTriggerInputs(
+    root: root_fs.Root,
+    script: *native_alternatives.ScriptAuthority,
+) !void {
+    if (script.groups.len != 0 or script.commands.len != 0 or
+        script.immutable_targets.len != 4 or !script.require_targets_absent)
+        return error.InvalidAlternativesScriptAuthority;
+    if (try root.entryIfExists(try root_fs.Path.init("proc/sys")) != null)
+        return error.InvalidAlternativesScriptAuthority;
+    const targets = try script.arena.allocator().alloc(
+        []const u8,
+        script.immutable_targets.len + 1,
+    );
+    @memcpy(targets[0..script.immutable_targets.len], script.immutable_targets);
+    targets[script.immutable_targets.len] = "/proc/sys";
+    script.immutable_targets = targets;
+}
+
 fn snapshotSudoRsPostinstIsBound(
     bytes: []const u8,
     architecture: []const u8,
@@ -20308,6 +20379,146 @@ test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure
     );
 }
 
+test "native_unpack.test.signed procps trigger requires bound callback and absent proc sys" {
+    const script_bytes = @embedFile(
+        "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
+    );
+    const procps: native_program.PackageIdentity = .{
+        .name = "procps",
+        .version = "2:4.0.6-3ubuntu1",
+        .architecture = "amd64",
+    };
+    const arguments: []const []const u8 = &.{ "triggered", "/usr/lib/sysctl.d" };
+    try testing.expect(try snapshotProcpsTriggerPostinstIsInert(
+        script_bytes,
+        "amd64",
+        procps,
+        .postinst,
+        .new_package,
+        arguments,
+        .trigger,
+    ));
+    try testing.expect(!(try snapshotProcpsTriggerPostinstIsInert(
+        script_bytes,
+        "amd64",
+        procps,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+        .script,
+    )));
+    try testing.expect(!(try snapshotProcpsTriggerPostinstIsInert(
+        "#!/bin/sh\nexit 0\n",
+        "amd64",
+        procps,
+        .postinst,
+        .new_package,
+        arguments,
+        .trigger,
+    )));
+    for ([_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = procps,
+        kind: maintainer_script.Kind = .postinst,
+        source: native_program.ScriptSource = .new_package,
+        arguments: []const []const u8 = arguments,
+        action_kind: native_recovery.ActionKind = .trigger,
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = .{ .name = "other", .version = procps.version, .architecture = "amd64" } },
+        .{ .package = .{ .name = procps.name, .version = "4.0.6", .architecture = "amd64" } },
+        .{ .package = .{ .name = procps.name, .version = procps.version, .architecture = "arm64" } },
+        .{ .kind = .preinst },
+        .{ .source = .installed_package },
+        .{ .action_kind = .script },
+        .{ .arguments = &.{"triggered"} },
+        .{ .arguments = &.{ "triggered", "" } },
+        .{ .arguments = &.{ "triggered", "/usr/lib/sysctl.d", "other" } },
+        .{ .arguments = &.{ "triggered", "/etc/sysctl.d" } },
+    }) |case| try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotProcpsTriggerPostinstIsInert(
+            script_bytes,
+            case.architecture,
+            case.package,
+            case.kind,
+            case.source,
+            case.arguments,
+            case.action_kind,
+        ),
+    );
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(script_bytes, &sha256, .{});
+    const bound_digest: native_program.Digest = std.fmt.bytesToHex(sha256, .lower);
+    const handler: native_program.TriggerHandlerBinding = .{
+        .package = procps,
+        .source = .new_package,
+        .postinst_sha256 = bound_digest,
+        .declarations_sha256 = @splat('0'),
+    };
+    try verifySnapshotProcpsTriggerHandlerBinding(handler, procps, script_bytes);
+    var changed = handler;
+    changed.postinst_sha256 = @splat('0');
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        verifySnapshotProcpsTriggerHandlerBinding(changed, procps, script_bytes),
+    );
+    changed = handler;
+    changed.postinst_sha256 = null;
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        verifySnapshotProcpsTriggerHandlerBinding(changed, procps, script_bytes),
+    );
+    changed = handler;
+    changed.source = .installed_package;
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        verifySnapshotProcpsTriggerHandlerBinding(changed, procps, script_bytes),
+    );
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        verifySnapshotProcpsTriggerHandlerBinding(handler, .{
+            .name = "other",
+            .version = procps.version,
+            .architecture = procps.architecture,
+        }, script_bytes),
+    );
+
+    var script = try native_alternatives.discoverScriptAuthority(
+        testing.allocator,
+        script_bytes,
+        .{},
+    );
+    defer script.deinit();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "proc", .default_dir);
+    const root = root_fs.Root.init(testing.io, tmp.dir);
+    try guardSnapshotProcpsTriggerInputs(root, &script);
+    try testing.expectEqual(@as(usize, 5), script.immutable_targets.len);
+    try testing.expectEqualStrings("/proc/sys", script.immutable_targets[4]);
+    try tmp.dir.createDir(testing.io, "proc/sys", .default_dir);
+    var present_script = try native_alternatives.discoverScriptAuthority(
+        testing.allocator,
+        script_bytes,
+        .{},
+    );
+    defer present_script.deinit();
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        guardSnapshotProcpsTriggerInputs(root, &present_script),
+    );
+    const tool = parseHex(
+        32,
+        "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d",
+    ).?;
+    try testing.expect(native_alternatives.matchesSnapshotTool("amd64", tool));
+    var wrong_tool = tool;
+    wrong_tool[0] ^= 1;
+    try testing.expect(!native_alternatives.matchesSnapshotTool("amd64", wrong_tool));
+    try testing.expect(!native_alternatives.matchesSnapshotTool("arm64", tool));
+}
+
 test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst",
@@ -20570,6 +20781,7 @@ fn prepareAlternativesScriptBoundary(
     kind: maintainer_script.Kind,
     source: native_program.ScriptSource,
     arguments: []const []const u8,
+    action_kind: native_recovery.ActionKind,
 ) !?AlternativesScriptBoundary {
     if (!native_alternatives.scriptMayInvoke(script_bytes)) return null;
     const less_inert = try snapshotLessPreinstIsInert(
@@ -20580,7 +20792,16 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
-    const procps_inert = try snapshotProcpsPostinstIsInert(
+    const procps_trigger_inert = try snapshotProcpsTriggerPostinstIsInert(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+        action_kind,
+    );
+    const procps_inert = if (procps_trigger_inert) false else try snapshotProcpsPostinstIsInert(
         script_bytes,
         architecture,
         package,
@@ -20588,7 +20809,9 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
-    const inert = less_inert or procps_inert;
+    const inert = less_inert or procps_inert or procps_trigger_inert;
+    if (procps_trigger_inert)
+        try verifySnapshotProcpsTriggerHandler(program, package, script_bytes);
     const snapshot_postinst = try snapshotLessPostinstIsBound(
         script_bytes,
         architecture,
@@ -20640,6 +20863,8 @@ fn prepareAlternativesScriptBoundary(
         .{},
     );
     errdefer script.deinit();
+    if (procps_trigger_inert)
+        try guardSnapshotProcpsTriggerInputs(root, &script);
     const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
         root,
@@ -21082,6 +21307,7 @@ fn runLifecycleScript(
         kind,
         source,
         arguments,
+        recovery_action.kind,
     ) catch |err| {
         if (attempt.record().mutation_started)
             try attempt.requireRecovery(allocator, .script);
