@@ -140,7 +140,9 @@ The compiler expands the authorized actions into dpkg-compatible transitions:
   eligible directory and status-record removal;
 - essential bootstrap materialization precedes all other lifecycle work, and
   each `Pre-Depends` barrier configures every pending package before the next
-  unpack. A dependency cycle configures its whole group at one barrier.
+  unpack. The fresh-root `base-passwd` prerequisite also configures pending
+  packages before `base-files` unpacks. A dependency cycle configures its
+  whole group at one barrier.
 
 An unpacked package need not have been configured: upgrading it does not call
 its old prerm, and the new postinst still receives an empty previous version

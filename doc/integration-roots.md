@@ -228,8 +228,16 @@ activations without scheduling an unpacked listener after a known failing
 postinst. Native settlement now applies that eligibility check and tests
 crashes before and after the failed status publication. Sampled peak resident
 memory stayed below 883 MiB. This interrupted root is retained, not reused;
-the separate account-ordering fix and a correctly ordered fresh-root replay
-are still needed to establish completed closure and native/reference parity.
+its account-ordering failure is addressed by the fresh-root replay below,
+which does not establish a completed closure or native/reference parity.
+
+A new authenticated amd64 replay with fresh-root account ordering
+configured `base-passwd` at step 830 and `base-files` at step 862; both
+postinst outcomes exited 0. It then refused the authenticated
+`less` 668-1build1 preinst at step 878 with
+`InvalidAlternativesScript`, before launching that script. This
+interrupted root is retained, not reused. The successful account setup
+does not establish a completed closure or native/reference parity.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

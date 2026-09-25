@@ -453,8 +453,8 @@ pub const DeferredTriggerWork = struct {
 };
 
 pub const BarrierReason = enum {
-    /// A `Pre-Depends` barrier: pending packages must be configured before the
-    /// next unpack.
+    /// A `Pre-Depends` or fresh-root account prerequisite barrier: pending
+    /// packages must be configured before the next unpack.
     pre_depends,
     /// The final configure barrier of the transaction.
     final,

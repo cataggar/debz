@@ -47,6 +47,17 @@ Pre-Depends while leaving normal dependency-cycle ordering to dpkg. Plan-only
 and download-only never execute dpkg. Schema v1 remains published for older
 consumers.
 
+On an empty root, `base-files` needs the root account database installed by
+the selected Essential `base-passwd` package, although the signed package
+metadata does not declare that relationship. The planner promotes
+`base-passwd` and its explicit dependency closure ahead of `base-files`,
+preserving the other actions' relative order and adding a configure barrier
+before `base-files` if necessary. Only selected authenticated repository
+records can authorize this promotion; ambiguous, cyclic or unsupported
+dependency evidence fails planning rather than moving an action across an
+unmet prerequisite. The promotion scans at most one million dependency groups
+and does not change installed-root or removal ordering.
+
 Repository-only plans retain canonical schema-v2 output. A plan containing a
 local artifact uses schema v3, where every archive-producing action serializes
 a tagged `origin` rather than reinterpreting the v2 `repository` field.
