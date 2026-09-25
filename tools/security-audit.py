@@ -1193,7 +1193,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         ),
         "Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg": (
             '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-            "          zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \\",
+            "          zig build test-native-materialization test-native-conffiles test-native-differential \\",
             '            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
         "Require private native helper namespaces": (
@@ -1348,19 +1348,21 @@ def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
         "tools/test-native-triggers.py",
         "tools/test_native_triggers.py",
     ):
-        if f'"{entrypoint}"' not in build:
-            failures.append(f"build.zig: retain {entrypoint} until Zig has full equivalent coverage")
+        if f'"{entrypoint}"' in build:
+            failures.append(f"build.zig: retired Python acceptance gate was restored: {entrypoint}")
     for binding in (
-        "native_lifecycle.addArtifactArg(native_lifecycle_tests);",
-        "native_lifecycle.step.dependOn(&native_lifecycle_oracle_tests.step);",
-        "test_step.dependOn(&native_lifecycle_oracle_tests.step);",
-        "native_triggers.addArtifactArg(native_lifecycle_tests);",
-        'native_triggers.addArg("--native-helper");',
-        "native_triggers.addArtifactArg(native_trigger_helper);",
-        "native_triggers.step.dependOn(&native_trigger_oracle_tests.step);",
-        "test_step.dependOn(&native_trigger_oracle_tests.step);",
-        ".dependOn(&native_lifecycle.step);",
-        ".dependOn(&native_triggers.step);",
+        'const native_lifecycle_step = b.step("test-native-lifecycle",',
+        'const native_triggers_step = b.step("test-native-triggers",',
+        "native_lifecycle_step.dependOn(&lifecycle_zig.step);",
+        "native_triggers_step.dependOn(&trigger_zig.step);",
+        "native_triggers_step.dependOn(&run_native_trigger_queue_tests.step);",
+        "lifecycle_zig.addArtifactArg(native_lifecycle_tests);",
+        "trigger_zig.addArtifactArg(native_lifecycle_tests);",
+        'trigger_zig.addArg("--native-helper");',
+        "trigger_zig.addArtifactArg(native_trigger_helper);",
+        "test_step.dependOn(&run_lifecycle_zig_tests.step);",
+        "test_step.dependOn(&run_trigger_zig_tests.step);",
+        "test_step.dependOn(&run_settlement_tests.step);",
         'b.step("test-native-lifecycle-zig-oracle",',
         'b.step("test-native-triggers-zig-oracle",',
         'b.step("test-native-triggers-zig-settlement-reference",',

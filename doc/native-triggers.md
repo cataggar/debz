@@ -41,11 +41,9 @@ or inventing a script outcome.
 `zig build test-native-recovery -Dnative-script-failure-only -j2` exercises
 known exit, failed status publication, restart, and active-claim retention.
 Zig tests cover trigger eligibility and the durable root-operation transition.
-The narrow Python acceptance cases remain necessary to launch independent
-crashing Zig processes and compare real dpkg scripts inside disposable chroots;
-moving that privileged oracle and process orchestration into Zig is tracked
-by [#213](https://github.com/cataggar/debz/issues/213) and
-[#215](https://github.com/cataggar/debz/issues/215).
+The independent Python recovery harness still launches crashing Zig processes
+and compares real dpkg scripts in disposable chroots; its migration is tracked
+separately by [#215](https://github.com/cataggar/debz/issues/215).
 
 Trigger-only processing must consume compiled authority without pretending to
 reinstall an archive. Deferred completion must retain the real pending and
@@ -120,7 +118,7 @@ malicious maintainer scripts running as the same UID.
 
 ## Independent acceptance
 
-`tools/test-native-triggers.py` uses real packages and guarded disposable
+The Zig trigger acceptance uses real packages and guarded disposable
 chroots. It compares package status/status-old, every trigger registry/queue
 file, info metadata, package filesystem effects, and exact script traces after
 each operation. Cases include:
@@ -187,20 +185,21 @@ Unit regressions guard exact declarations and scripts, reference command
 flags, root snapshots, ordering and helper identity. The
 `-Dnative-diversions-only=true` option selects the diversion cases; the
 `-Dnative-reference-dpkg` pin applies to both implementations. CI runs these
-steps alongside the existing Python gates on amd64 and arm64 in Debug and
-ReleaseSafe. Zig settlement independently executes all 24 upgrade profiles
+steps on amd64 and arm64 in Debug and ReleaseSafe; the `test-native-triggers`
+target now executes Zig, not the old Python gates. Zig settlement independently
+executes all 24 upgrade profiles
 and 16 eligible follow-ups against pinned dpkg, including the six partial
 rollbacks; `test-native-diversion-settlement-zig` is required in CI. Mutation
 regressions exercise the exact backup metadata/inode, trigger route, status,
 control, rollback-list, upgrade-outcome and invocation-clock assertions as well
 as the production lowering of authenticated success and rollback profiles.
-Both Python trigger gates remain mandatory until the complete selector and
-unit method inventory passes in both pinned modes. The failed-postinst listener is now
-covered in Zig against dpkg **only**; lack of native parity for that program
-must remain explicit even if the reference-only Python case is eventually
-retired.
+Both Python trigger gates have been replaced by the executed Zig selector and
+unit-method inventory. `tools/test-native-triggers.py` remains importable for
+the separately gated recovery harness, but is no longer a required trigger
+acceptance entry point. The failed-postinst listener is covered in Zig against
+dpkg **only**; lack of native parity for that program remains explicit.
 
-The 32 `tools/test_native_triggers.py` unit methods map individually to
+The 32 former `tools/test_native_triggers.py` unit methods map individually to
 `test-native-triggers-zig-unit` and `test-native-diversion-settlement-zig-unit`
 (the latter includes the production lowering test):
 

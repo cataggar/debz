@@ -510,7 +510,7 @@ class SecurityAuditTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, build == recovery == "success")
 
-    def test_lifecycle_migration_keeps_four_gates_and_reference_only_crash_seam(self) -> None:
+    def test_lifecycle_migration_retires_four_python_gates_without_weakening_reference_refusal(self) -> None:
         build = (ROOT / "build.zig").read_text()
         trigger = (ROOT / "test/native_trigger_acceptance.zig").read_text()
         check = security_audit.native_lifecycle_migration_failures
@@ -522,18 +522,20 @@ class SecurityAuditTests(unittest.TestCase):
             "tools/test_native_triggers.py",
         ):
             with self.subTest(entrypoint=entrypoint):
-                self.assertTrue(check(build.replace(f'"{entrypoint}"', '""'), trigger))
+                self.assertTrue(check(build + f' \"{entrypoint}\"', trigger))
         for binding in (
-            "native_lifecycle.addArtifactArg(native_lifecycle_tests);",
-            "native_lifecycle.step.dependOn(&native_lifecycle_oracle_tests.step);",
-            "test_step.dependOn(&native_lifecycle_oracle_tests.step);",
-            "native_triggers.addArtifactArg(native_lifecycle_tests);",
-            'native_triggers.addArg("--native-helper");',
-            "native_triggers.addArtifactArg(native_trigger_helper);",
-            "native_triggers.step.dependOn(&native_trigger_oracle_tests.step);",
-            "test_step.dependOn(&native_trigger_oracle_tests.step);",
-            ".dependOn(&native_lifecycle.step);",
-            ".dependOn(&native_triggers.step);",
+            'const native_lifecycle_step = b.step("test-native-lifecycle",',
+            'const native_triggers_step = b.step("test-native-triggers",',
+            "native_lifecycle_step.dependOn(&lifecycle_zig.step);",
+            "native_triggers_step.dependOn(&trigger_zig.step);",
+            "native_triggers_step.dependOn(&run_native_trigger_queue_tests.step);",
+            "lifecycle_zig.addArtifactArg(native_lifecycle_tests);",
+            "trigger_zig.addArtifactArg(native_lifecycle_tests);",
+            'trigger_zig.addArg("--native-helper");',
+            "trigger_zig.addArtifactArg(native_trigger_helper);",
+            "test_step.dependOn(&run_lifecycle_zig_tests.step);",
+            "test_step.dependOn(&run_trigger_zig_tests.step);",
+            "test_step.dependOn(&run_settlement_tests.step);",
             'b.step("test-native-lifecycle-zig-oracle",',
             'b.step("test-native-triggers-zig-oracle",',
             'b.step("test-native-triggers-zig-settlement-reference",',
@@ -594,7 +596,6 @@ class SecurityAuditTests(unittest.TestCase):
             ("-Doptimize=\"$OPTIMIZE\"", "-Doptimize=Debug"),
             ("test-native-materialization test-native-conffiles", "test-native-materialization"),
             ("test-native-differential", ""),
-            ("test-native-lifecycle test-native-triggers", "test-native-lifecycle"),
             (
                 "test-native-lifecycle-zig test-native-triggers-zig "
                 "test-native-diversion-settlement-zig",

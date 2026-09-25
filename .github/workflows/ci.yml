@@ -775,9 +775,9 @@ jobs:
       - name: Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg
         run: |
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
-          zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \
+          zig build test-native-materialization test-native-conffiles test-native-differential \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
-          # Retain Python gates until their selector and mutation inventories are independently verified.
+          # Zig-owned lifecycle and trigger targets replace all four Python gate invocations.
           # Failed-postinst listeners remain pinned-dpkg reference-only, never native parity.
           zig build test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all

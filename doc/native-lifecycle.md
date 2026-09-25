@@ -241,14 +241,16 @@ Zig unit tests execute valid and rejected compensation examples against the
 published `scriptFailure` schema closure (including actual count, digest, and
 rollback bounds). This bounded validator fails closed on unsupported keywords
 or references; it does not purport to implement the entire Draft 2020-12
-vocabulary. The Python lifecycle and oracle build/CI gates remain **required**
-until the remaining exact inventory and both pinned modes are verified.
-CI runs the existing and Zig-owned suites on amd64 and arm64 in Debug and
-ReleaseSafe.
+vocabulary. The `test-native-lifecycle` build target now runs this Zig
+acceptance, not Python; its Python unit gate has been removed. CI requires
+native and both-reference selectors on amd64 and arm64 in Debug and
+ReleaseSafe. `tools/test-native-lifecycle.py` remains importable because
+the separate dpkg-config reference and Python recovery fixture consume its
+helpers; it is no longer a required lifecycle acceptance entry point.
 Trigger acceptance has a separate reference-only
 unconfigured-listener boundary; see [trigger execution](native-triggers.md#independent-acceptance).
 
-The eleven `tools/test_native_lifecycle.py` unit-method counterparts are
+The eleven former `tools/test_native_lifecycle.py` unit-method counterparts are
 individually exercised by `test-native-lifecycle-zig-unit`:
 
 | Python `test_` method | Executed Zig assertion |
@@ -348,7 +350,8 @@ permits its named links, database entries and log to retain creation times
 from earlier phases of that scenario. Other payload mtimes and contents are
 not normalized.
 
-`tools/test-native-lifecycle.py --oracle-only`, run as root, exercises two real
-dpkg roots to establish fixture consistency. It is not native parity evidence.
+`zig build test-native-lifecycle-zig-oracle -Dnative-reference-dpkg="$reference_dpkg"`
+exercises two real dpkg roots to establish fixture consistency. It is not
+native parity evidence.
 `--workspace` can retain diagnostics in a new directory directly under this
 worktree's `.tmp`; ordinary runs clean up their temporary roots.
