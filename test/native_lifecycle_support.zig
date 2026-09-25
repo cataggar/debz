@@ -126,6 +126,13 @@ pub fn scriptsWith(fixture: *foundation.Fixture, source: []const u8, package: []
 pub const PackageSpec = struct {
     declarations: ?[]const u8 = null,
     activation: ?[]const u8 = null,
+    activations: []const []const u8 = &.{},
+    activation_kind: []const u8 = "postinst",
+    activation_when: []const u8 = "configure",
+    activation_await: bool = false,
+    postinst: bool = true,
+    postinst_append: ?[]const u8 = null,
+    preinst_append: ?[]const u8 = null,
     conffile_content: ?[]const u8 = null,
     conffile_path: []const u8 = "etc/debz-native.conf",
     extra_conffile: ?foundation.Fixture.ExtraFile = null,
@@ -202,17 +209,56 @@ pub fn makePackage(fixture: *foundation.Fixture, architecture: []const u8, versi
     }
     if (spec.bootstrap_shell) try copyProgram(fixture, source, "/bin/sh", "/bin/sh");
     if (!spec.no_scripts) try scriptsWith(fixture, source, name, version, spec.scripts);
-    if (spec.activation) |trigger| {
-        const postinst = try path(fixture.allocator, source, "DEBIAN/postinst");
-        defer fixture.allocator.free(postinst);
-        const original = try read(fixture, postinst, 64 * 1024);
+    if (spec.activation != null or spec.activations.len != 0) {
+        if (!std.mem.eql(u8, spec.activation_kind, "postinst") and
+            !std.mem.eql(u8, spec.activation_kind, "postrm")) return error.InvalidFixtureActivationKind;
+        if (spec.no_scripts or
+            (spec.scripts.omit_postrm and std.mem.eql(u8, spec.activation_kind, "postrm")))
+            return error.InvalidFixtureActivationKind;
+        if (!spec.postinst and std.mem.eql(u8, spec.activation_kind, "postinst"))
+            return error.InvalidFixtureActivationKind;
+        const script = try std.fmt.allocPrint(fixture.allocator, "{s}/DEBIAN/{s}", .{ source, spec.activation_kind });
+        defer fixture.allocator.free(script);
+        const original = try read(fixture, script, 64 * 1024);
         defer fixture.allocator.free(original);
         if (!std.mem.endsWith(u8, original, "exit 0\n")) return error.InvalidFixtureScript;
-        const activation = try std.fmt.allocPrint(fixture.allocator, "if [ \"$1\" = configure ]; then\n    /usr/bin/dpkg-trigger --no-await {s} || exit $?\nfi\nexit 0\n", .{trigger});
-        defer fixture.allocator.free(activation);
-        const body = try std.mem.concat(fixture.allocator, u8, &.{ original[0 .. original.len - "exit 0\n".len], activation });
+        var body: std.Io.Writer.Allocating = .init(fixture.allocator);
+        defer body.deinit();
+        try body.writer.writeAll(original[0 .. original.len - "exit 0\n".len]);
+        try body.writer.print("if [ \"$1\" = \"{s}\" ]; then\n", .{spec.activation_when});
+        const mode = if (spec.activation_await) "--await" else "--no-await";
+        if (spec.activation) |trigger|
+            try body.writer.print("    /usr/bin/dpkg-trigger {s} {s} || exit $?\n", .{ mode, trigger });
+        for (spec.activations) |trigger|
+            try body.writer.print("    /usr/bin/dpkg-trigger {s} {s} || exit $?\n", .{ mode, trigger });
+        try body.writer.writeAll("fi\nexit 0\n");
+        try fixture.write(script, body.written(), 0o755);
+    }
+    if (spec.postinst_append) |addition| {
+        if (!spec.postinst) return error.InvalidFixtureScript;
+        const script = try path(fixture.allocator, source, "DEBIAN/postinst");
+        defer fixture.allocator.free(script);
+        const original = try read(fixture, script, 64 * 1024);
+        defer fixture.allocator.free(original);
+        if (!std.mem.endsWith(u8, original, "exit 0\n")) return error.InvalidFixtureScript;
+        const body = try std.mem.concat(fixture.allocator, u8, &.{ original[0 .. original.len - "exit 0\n".len], addition, "exit 0\n" });
         defer fixture.allocator.free(body);
-        try fixture.write(postinst, body, 0o755);
+        try fixture.write(script, body, 0o755);
+    }
+    if (spec.preinst_append) |addition| {
+        const script = try path(fixture.allocator, source, "DEBIAN/preinst");
+        defer fixture.allocator.free(script);
+        const original = try read(fixture, script, 64 * 1024);
+        defer fixture.allocator.free(original);
+        if (!std.mem.endsWith(u8, original, "exit 0\n")) return error.InvalidFixtureScript;
+        const body = try std.mem.concat(fixture.allocator, u8, &.{ original[0 .. original.len - "exit 0\n".len], addition, "exit 0\n" });
+        defer fixture.allocator.free(body);
+        try fixture.write(script, body, 0o755);
+    }
+    if (!spec.postinst) {
+        const script = try path(fixture.allocator, source, "DEBIAN/postinst");
+        defer fixture.allocator.free(script);
+        try fixture.dir.deleteFile(fixture.io, script);
     }
     if (spec.declarations) |text| {
         const member = try path(fixture.allocator, source, "DEBIAN/triggers");
@@ -319,7 +365,11 @@ pub fn reference(fixture: *foundation.Fixture, executable: []const u8, root: []c
     return runExit(fixture, argv.items, log);
 }
 
-pub const Report = struct { outcome: []const u8, detail: []const u8 = "" };
+pub const Report = struct {
+    outcome: []const u8,
+    detail: []const u8 = "",
+    program_sha256: ?[]const u8 = null,
+};
 
 pub fn native(fixture: *foundation.Fixture, executable: []const u8, root: []const u8, architecture: []const u8, phase: Phase, destination: []const u8) !std.json.Parsed(Report) {
     var guarded = try foundation.guardedRoot(fixture.io, root);
