@@ -628,6 +628,48 @@ after a non-elevated helper-bootstrap preflight refusal; neither
 interrupted root is a fresh retry target. The later iproute2 and alternatives
 failures require separate investigation, not broader keyboard admission.
 
+The `iproute2` archive was independently rehashed against the third signed
+lock (SHA-512
+`56ec4c51d91cbcea3a1270ee13eb0ff79c92bb2cba844af4efac3e6601e21392ab53167c8b51694054e5dd93d0d27cf90178cb9999c18d98aefc556306be7e34`).
+Its exact postinst and root-owned 15912-byte templates member match the
+installed info copies; the templates SHA-256 is
+`33e0ed65a34dbb3a951613c64ac9a71b268eaa2b3827cdd6378875e54112bf46`.
+Separate disposable *diagnostic copies*, never used as fresh authenticated
+roots, isolated the frontend: private postinst without adjacent templates
+exited 10/zero output; with that exact sibling and dpkg's script environment
+it exited 0/zero output. Pinned dpkg 1.22.22 configured the installed-info
+copy with exit 0 in the diagnostic copy. These probes identify the cause of
+the script refusal, not a successful native closure.
+
+The earlier `invalid_transition` followed a completed journaled `iproute2`
+`half-configured` failure-state publication. Its unincorporated `libc-upgrade`
+event named `systemd`, still `install ok unpacked`; the old serial branch
+lacked #231's previously proven guard against scheduling an unconfigured
+trigger listener. Final main already retains that guard and Zig reference
+regressions; this change does not add a second guard or relax the typed
+transition table. Only a **new** independently authenticated root on the
+combined #245 tree can establish the next native execution boundary.
+
+Two **new** roots, `.real-snapshot/amd64-iproute-fresh-long-1` and
+`.real-snapshot/amd64-iproute-fresh-long-2`, each refreshed, planned,
+downloaded and independently rehashed all 175 SHA-512 archive objects under
+the reviewed Ubuntu signer. Both completed keyboard preinst step 1217
+and the exact `iproute2` postinst step 1230 with exit 0 and zero output;
+`iproute2` reached `install ok installed`. The second root used the final
+formatted ReleaseSafe binary recorded in `evidence/identity.txt`; its
+signed lock fingerprint and CAS rehash are retained separately from the first.
+This is **not** a completed 175-package installation. Both roots next refused
+before script launch at step 1243: `util-linux:amd64` 2.41.3-3ubuntu2
+postinst SHA-256
+`31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9`
+with `["configure", ""]` hit `InvalidAlternativesScript`. The final journal
+has only a `script prepared` action for that step, no script outcome.
+The signed script contains an `OS=linux` guard and a multi-line
+`update-alternatives --install` of the `pager` group with its manpage slave;
+its authorization and reference behavior require separate investigation.
+Both interrupted roots and their durable claims are retained; neither is
+reusable as a fresh root, and neither proves full amd64 parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

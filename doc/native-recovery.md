@@ -541,6 +541,18 @@ database phases without repeating the failed script or inventing an install
 success. This intentionally differs from dpkg's preinst abort-install removal
 of a non-bootstrapped package; it is not a general half-installed admission.
 
+The signed iproute postinst failure exposed a separate immediate-trigger
+settlement issue: its nonzero exit and `half-configured` state were already
+journaled, but an unincorporated `libc-upgrade` event named still-unpacked
+`systemd`. Publishing `triggers-pending` for that listener is a typed
+`invalid_transition`, not an unknown script exit. Final main already has the
+bounded incorporation guard: it checks actual listener state, drains
+authorized queue work without scheduling unconfigured listeners, and leaves
+the failed script outcome authoritative. Root-operation completion after a
+known failure still needs the failed-after-mutation claim and provenance;
+unknown outcomes remain
+recovery-required and must never rerun the script.
+
 The reviewed amd64 `stonking` snapshot admits an additional exact executable
 digest for `dpkg` 1.23.7ubuntu2. The older dpkg 1.22.22 pins remain intact;
 the new pin does not authorize arm64, another executable digest, or a wider
