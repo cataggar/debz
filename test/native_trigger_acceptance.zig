@@ -2,6 +2,7 @@ const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const options = @import("native_test_options");
+const root_fs = @import("debz").root_fs;
 
 const receiver = "debz-trigger-receiver";
 const source = "debz-trigger-source";
@@ -754,7 +755,7 @@ fn divertedTriggerRoutes(fixture: *foundation.Fixture, driver: []const u8, helpe
         defer fixture.allocator.free(watcher);
         var case = try support.Scenario.init(fixture, case_name, driver, dpkg, arch, true);
         defer case.deinit();
-        for ([_][]const u8{ "reference", "native" }) |side| {
+        for ([_][]const u8{ "reference", "native" }, [_][]const u8{ case.reference_root, case.native_root }) |side, absolute| {
             const root = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{case_name, side});
             defer fixture.allocator.free(root);
             const original_shell = try std.fmt.allocPrint(fixture.allocator, "{s}/bin/sh", .{root});
@@ -766,6 +767,11 @@ fn divertedTriggerRoutes(fixture: *foundation.Fixture, driver: []const u8, helpe
             defer fixture.allocator.free(bin);
             try fixture.dir.deleteDir(fixture.io, bin);
             try fixture.dir.symLink(fixture.io, "usr/bin", bin, .{});
+            var guarded = try foundation.guardedRoot(fixture.io, absolute);
+            defer guarded.close(fixture.io);
+            try (root_fs.Root.init(fixture.io, guarded)).applyMetadata(try root_fs.Path.init("bin"), .{
+                .modified_nanoseconds = foundation.epoch * std.time.ns_per_s,
+            });
             const record = try std.fmt.allocPrint(fixture.allocator, "{s}/var/lib/dpkg/diversions", .{root});
             defer fixture.allocator.free(record);
             try support.fixtureFile(fixture, record, "/" ++ alias_route ++ "\n/" ++ alias_destination ++ "\n:\n", 0o644);
