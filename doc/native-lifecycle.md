@@ -93,6 +93,20 @@ bootstrap-staged config still receives its original digest/mode/owner check
 before the template stage; foreign or altered siblings are refused. Script
 exit and postrm compensation remain authoritative, not ignored.
 
+The signed `iproute2:amd64` 6.19.0-1ubuntu2 postinst is a second, distinct
+debconf template placement case. Its `configure ""` branch calls
+`db_get iproute2/setcaps` after sourcing `confmodule`; the private staged
+script exited 10 with no output, whereas pinned dpkg 1.22.22 configured
+the installed-info script in a disposable diagnostic copy. In separately
+copied roots, the private path exited 10 without its templates and 0 with
+the exact signed 15912-byte sibling and dpkg's maintainer-script environment.
+Only the exact postinst digest, package/version/amd64 identity, source and
+arguments can stage this archive member. The same authorized program must
+prove the dependent bootstrap preinst, completed unpack and unpacked state;
+the installed postinst, templates and config retain their signed integrity,
+and a collision requires journaled recovery. The stage uses the ordinary
+cleanup path, not a blanket debconf or config-script permission.
+
 If a fresh preinst fails after its package was already bootstrapped, the
 payload and database ownership are real and cannot be erased by writing an
 unowned `not-installed` record. For an exact bootstrap-to-preinst-to-unpack

@@ -855,6 +855,8 @@ pub fn build(b: *std.Build) void {
     native_triggers.addArtifactArg(native_lifecycle_tests);
     native_triggers.addArg("--native-helper");
     native_triggers.addArtifactArg(native_trigger_helper);
+    if (b.option(bool, "native-script-failure-only", "Select known script failure with unconfigured trigger listeners") orelse false)
+        native_triggers.addArg("--script-failure-only");
     const native_trigger_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_triggers.py" },
     );

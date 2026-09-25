@@ -29,6 +29,15 @@ cleanup do. Events remain durably bound to their original package and program.
 Known lifecycle-script failure still processes or defers authorized pending
 work before publishing the failed outcome. It neither discards those events
 nor converts the original package failure into a successful receipt.
+For an immediate known failure, incorporation resolves each authorized
+listener in the current database and schedules it only if already configured.
+An `unpacked` or `half-configured` listener cannot become
+`triggers-pending` or impose `triggers-awaited` on the failed source.
+Missing listeners still refuse. Pinned dpkg 1.22.22 confirmed both awaited
+and no-await failed-postinst cases with an unpacked listener, and the Zig
+regression uses the observed `libc-upgrade`/unpacked `systemd` relationship.
+This restores the bounded #231 behavior absent from the serial worktree;
+it does not relax database transition validation or discard failure evidence.
 
 Trigger-only processing must consume compiled authority without pretending to
 reinstall an archive. Deferred completion must retain the real pending and
