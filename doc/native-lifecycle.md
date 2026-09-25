@@ -218,6 +218,21 @@ zig build test-native-lifecycle -j2
 zig build test-native-lifecycle -Doptimize=ReleaseSafe -j2
 ```
 
+The migration-in-progress Zig executable has separate
+`test-native-lifecycle-zig` and `test-native-lifecycle-zig-unit` build steps.
+It runs guarded, bounded real-dpkg/native comparisons for script arguments,
+environment and visible payloads; install/upgrade/downgrade/reinstall and
+repeated remove/purge; selected script failures, old-prerm unwind and
+configure retry; conffile policies; and a diverted hard-link route. It checks
+the complete package database, trace and filesystem snapshot after each
+phase. `-Dnative-diversions-only=true` selects its diversion case; the
+hash-pinned `-Dnative-reference-dpkg` option applies to both implementations.
+The legacy Python suite remains the **required** full parity gate: Zig has
+not yet ported the metadata, statoverride, bootstrap, remaining
+failure/rollback, or all diversion-refusal scenarios. CI runs both
+implementations on amd64 and arm64 in Debug and ReleaseSafe. Do not remove
+the Python runner until its complete root matrix has passed in Zig.
+
 CI uses hash-pinned Debian dpkg 1.22.22 for both architectures. On Ubuntu 24.04
 or another compatible Linux host with an older dpkg, prepare that reference
 without root privileges:

@@ -155,6 +155,21 @@ zig build test-native-triggers -j2
 zig build test-native-triggers -Doptimize=ReleaseSafe -j2
 ```
 
+The incremental Zig-owned runner is available through
+`test-native-triggers-zig` and `test-native-triggers-zig-unit`. It authenticates
+a distinct private helper, compares exact guarded reference/native snapshots
+for await/noawait immediate and deferred processing, tests a pre-existing
+Unincorp queue, postinst-driven activation and a known triggered-postinst
+failure, malformed queue refusal,
+and exercises a diverted file-trigger route.
+`-Dnative-diversions-only=true` selects the latter; the
+`-Dnative-reference-dpkg` pin applies to both implementations. CI runs these
+steps alongside the existing Python gates on amd64 and arm64 in Debug and
+ReleaseSafe. The Python runner and its independent 24-profile diversion
+settlement oracle (including 16 eligible follow-ups) remain mandatory until
+Zig reproduces the full trigger matrix and exact settlement observations.
+The current Zig runner does **not** establish full trigger/settlement parity.
+
 `test-native-trigger-helper` runs the shared queue/helper unit coverage;
 `native-trigger-helper` builds the private artifact without installing it.
 Both the focused parity target and the default unit target include the

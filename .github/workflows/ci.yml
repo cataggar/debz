@@ -751,14 +751,15 @@ jobs:
       - name: Install metadata decompression dependency
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd; then
+             ! pkg-config --exists liblzma libzstd ||
+             ! python3 -c 'import jsonschema' 2>/dev/null; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema
           fi
       - name: Build and test
         run: |
@@ -775,6 +776,9 @@ jobs:
         run: |
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
           zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \
+            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
+          # Retain the Python lifecycle and trigger gates while Zig coverage is incomplete.
+          zig build test-native-lifecycle-zig test-native-triggers-zig \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Require private native helper namespaces
         run: |

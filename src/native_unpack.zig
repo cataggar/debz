@@ -12567,8 +12567,10 @@ fn materializeRemoval(
 
         for (record.paths orelse &.{}) |listed| {
             const relative = relativeListPath(listed) orelse {
+                // dpkg retains `/.` while an installed postrm can still run.
                 if (partial_purge or
-                    (!purge and record.conffiles.len != 0 and !shared_root))
+                    (!purge and (record.conffiles.len != 0 or
+                        request.borrowed_attempt != null) and !shared_root))
                     try retained_paths.append(allocator, listed);
                 continue;
             };

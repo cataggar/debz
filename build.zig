@@ -948,6 +948,60 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-triggers", "Compare native trigger activation and processing with dpkg")
         .dependOn(&native_triggers.step);
 
+    const lifecycle_zig_module = b.createModule(.{
+        .root_source_file = b.path("test/native_lifecycle_acceptance.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lifecycle_zig_module.addImport("debz", debz);
+    lifecycle_zig_module.addOptions("native_test_options", native_fixture_options);
+    const lifecycle_zig_tests = b.addTest(.{ .root_module = lifecycle_zig_module });
+    const run_lifecycle_zig_tests = b.addRunArtifact(lifecycle_zig_tests);
+    test_step.dependOn(&run_lifecycle_zig_tests.step);
+    b.step("test-native-lifecycle-zig-unit", "Run unprivileged Zig lifecycle oracle regressions")
+        .dependOn(&run_lifecycle_zig_tests.step);
+    const lifecycle_zig_executable = b.addExecutable(.{
+        .name = "native-lifecycle-zig-acceptance",
+        .root_module = lifecycle_zig_module,
+    });
+    const lifecycle_zig = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    lifecycle_zig.addArtifactArg(lifecycle_zig_executable);
+    lifecycle_zig.addArtifactArg(native_lifecycle_tests);
+    lifecycle_zig.step.dependOn(&run_lifecycle_zig_tests.step);
+    b.step("test-native-lifecycle-zig", "Run Zig-owned lifecycle and diversion acceptance against dpkg")
+        .dependOn(&lifecycle_zig.step);
+
+    const trigger_zig_module = b.createModule(.{
+        .root_source_file = b.path("test/native_trigger_acceptance.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    trigger_zig_module.addImport("debz", debz);
+    trigger_zig_module.addOptions("native_test_options", native_fixture_options);
+    const trigger_zig_tests = b.addTest(.{ .root_module = trigger_zig_module });
+    const run_trigger_zig_tests = b.addRunArtifact(trigger_zig_tests);
+    test_step.dependOn(&run_trigger_zig_tests.step);
+    b.step("test-native-triggers-zig-unit", "Run unprivileged Zig trigger oracle regressions")
+        .dependOn(&run_trigger_zig_tests.step);
+    const trigger_zig_executable = b.addExecutable(.{
+        .name = "native-trigger-zig-acceptance",
+        .root_module = trigger_zig_module,
+    });
+    const trigger_zig = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    trigger_zig.addArtifactArg(trigger_zig_executable);
+    trigger_zig.addArtifactArg(native_lifecycle_tests);
+    trigger_zig.addArg("--native-helper");
+    trigger_zig.addArtifactArg(native_trigger_helper);
+    trigger_zig.step.dependOn(&run_trigger_zig_tests.step);
+    b.step("test-native-triggers-zig", "Run Zig-owned trigger and helper acceptance against dpkg")
+        .dependOn(&trigger_zig.step);
+
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -996,6 +1050,8 @@ pub fn build(b: *std.Build) void {
     if (b.option(bool, "native-diversions-only", "Run only diversion lifecycle, trigger and recovery fixtures") orelse false) {
         for ([_]*std.Build.Step.Run{ native_lifecycle, native_triggers, native_recovery }) |runner|
             runner.addArg("--diversions-only");
+        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig }) |runner|
+            runner.addArg("--diversions-only");
     }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
         run_native_fixture.addArgs(&.{ "--reference-dpkg", path });
@@ -1004,6 +1060,8 @@ pub fn build(b: *std.Build) void {
         for ([_]*std.Build.Step.Run{
             dpkg_config_reference, dpkg_alternatives_reference, native_lifecycle, native_triggers, native_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
+        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig }) |runner|
+            runner.addArgs(&.{ "--reference-dpkg", path });
     }
     if (b.option(
         []const u8,

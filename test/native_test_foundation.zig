@@ -20,6 +20,7 @@ pub const Fixture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     diagnostics: bool = true,
+    retain: bool = false,
     path: []u8,
     name: []const u8,
     parent: std.Io.Dir,
@@ -76,8 +77,12 @@ pub const Fixture = struct {
     pub fn deinit(self: *Fixture) void {
         self.environment.deinit();
         self.dir.close(self.io);
-        self.parent.deleteTree(self.io, self.name) catch |err|
-            std.debug.print("failed to remove disposable fixture {s}: {s}\n", .{ self.path, @errorName(err) });
+        if (self.retain) {
+            std.debug.print("retained failed native fixture: {s}\n", .{self.path});
+        } else {
+            self.parent.deleteTree(self.io, self.name) catch |err|
+                std.debug.print("failed to remove disposable fixture {s}: {s}\n", .{ self.path, @errorName(err) });
+        }
         self.parent.close(self.io);
         self.allocator.free(self.path);
         self.allocator.free(self.name);
@@ -600,7 +605,7 @@ fn normalizedLines(allocator: std.mem.Allocator, content: []const u8, path_list:
         try lines.append(allocator, line);
     }
     std.mem.sort([]const u8, lines.items, {}, lessText);
-    if (path_list) for (lines.items[1..], lines.items[0..lines.items.len -| 1]) |after, before| {
+    if (path_list and lines.items.len > 1) for (lines.items[1..], lines.items[0 .. lines.items.len - 1]) |after, before| {
         if (std.mem.eql(u8, after, before)) return error.DuplicatePackagePath;
     };
     return std.mem.join(allocator, "\n", lines.items);
