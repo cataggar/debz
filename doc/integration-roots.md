@@ -214,28 +214,22 @@ retained, not reused. An exact, journal-guarded sharing rule for a
 byte-identical structural alias claim addresses that refusal, but it
 still requires a new replay on the rebased combined code.
 
-The next authenticated amd64 replay passed that merged-/usr alias boundary.
-At configure step 852, `base-files.postinst` durably exited 1 because the
-target root lacked the `root:root` account lookup; the package's
-`half-configured` status was also durably applied. Subsequent failure-trigger
-settlement attempted to promote an unpacked listener directly to
-`triggers-pending` and returned `recovery_required: invalid_transition`,
-leaving the root claim pending. A separate reference probe confirms that dpkg
-incorporates awaited and no-await activations without scheduling an unpacked
-listener after a known failing postinst. Native settlement now applies the
-same eligibility check and tests a crash after the failed status publication.
-The account-ordering cause is separate; this interrupted root is retained,
-not reused, and neither completed closure nor parity is claimed.
-
-That new authenticated replay passed the former step-823 ownership
+The next authenticated amd64 replay passed the former step-823 ownership
 refusal: `base-files` unpack published its exact archive payload, and
-configuration proceeded to step 852. Its postinst then exited 1 with
-`chown: invalid user: 'root:root'`. The fresh root has no
-`etc/passwd` or `etc/group` yet; this transaction schedules
-`base-passwd`'s unpack after this configuration barrier. Sampled peak
-resident memory stayed below 883 MiB. This interrupted root is
-retained, not reused. A completed closure and native/reference parity
-still require a correctly ordered fresh-root replay.
+configuration reached step 852. Its postinst durably exited 1 with
+`chown: invalid user: 'root:root'`; the package's `half-configured` status
+was also durably applied. The fresh root has no `etc/passwd` or `etc/group`
+yet because this transaction schedules `base-passwd`'s unpack after this
+configuration barrier. Failure-trigger settlement then tried to promote an
+unpacked listener directly to `triggers-pending`, returned
+`recovery_required: invalid_transition`, and left the root claim pending.
+A separate reference probe confirms dpkg incorporates awaited and no-await
+activations without scheduling an unpacked listener after a known failing
+postinst. Native settlement now applies that eligibility check and tests
+crashes before and after the failed status publication. Sampled peak resident
+memory stayed below 883 MiB. This interrupted root is retained, not reused;
+the separate account-ordering fix and a correctly ordered fresh-root replay
+are still needed to establish completed closure and native/reference parity.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

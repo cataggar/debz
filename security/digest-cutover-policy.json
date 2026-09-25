@@ -42,15 +42,15 @@
       "sha512": "79c6bcf196509e66add2d7b4ba5914d0743c9c30d90da3a9ec2aaec771ed986da2035f13e44647b8fe3f18bab456b81b78ee9298dd7e893209d11616532c8134"
     },
     "findings": {
-      "count": 20287,
+      "count": 20288,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
         "fixed_64_hex": 171,
         "raw_32_byte": 1066,
-        "sha256_token": 18751
+        "sha256_token": 18752
       },
-      "sha512": "239d2eaee6c28c4f6f2c497bd89ddb1a161eb3e19185efc1cd004f13d273deb89f9090c51529d0e6ab1b34ced33b3178d21af065c7319679cee93814b487b68b"
+      "sha512": "61eb883565cf5a7733a032cbcdd9f0fb86822e0a82c72102c9c66d41b2a725fdccf2fd481f8c5483c3bada872f46c2d8a5c4836d9821b93ef8add14af52b6843"
     },
     "classifications": [
       {
@@ -155,15 +155,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes and versioned compatibility readers.",
-        "count": 11987,
+        "count": 11988,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
           "raw_32_byte": 1060,
-          "sha256_token": 10780
+          "sha256_token": 10781
         },
-        "sha512": "bff1c3e228da6409be2af39d65b534870dbd11366df2f617024470bb25bad5826640a24b261d6be8ffb2ce5a95f54662dd135aaa1981f34d6c43bd9dd93b9a85"
+        "sha512": "31292becb017fa112b82c0b6573822c5c4488c80f8b3056a26a175bb66fa8c964c1bcad15779fdfa705f90fb11d418956704d8cfcd497c778d1e1be00de6b2db"
       },
       {
         "scope": "test",

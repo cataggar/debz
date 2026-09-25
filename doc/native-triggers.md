@@ -40,6 +40,12 @@ Failure recovery rechecks that state from the database rather than replaying
 or inventing a script outcome.
 `zig build test-native-recovery -Dnative-script-failure-only -j2` exercises
 known exit, failed status publication, restart, and active-claim retention.
+Zig tests cover trigger eligibility and the durable root-operation transition.
+The narrow Python acceptance cases remain necessary to launch independent
+crashing Zig processes and compare real dpkg scripts inside disposable chroots;
+moving that privileged oracle and process orchestration into Zig is tracked
+by [#213](https://github.com/cataggar/debz/issues/213) and
+[#215](https://github.com/cataggar/debz/issues/215).
 
 Trigger-only processing must consume compiled authority without pretending to
 reinstall an archive. Deferred completion must retain the real pending and
