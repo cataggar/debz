@@ -19762,6 +19762,109 @@ fn snapshotUtilLinuxPostinstIsBound(
     return true;
 }
 
+fn snapshotConsoleSetupLinuxPostinstIsBound(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotConsoleSetupLinuxPostinst(bytes))
+        return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "all") or
+        !std.mem.eql(u8, package.name, "console-setup-linux") or
+        !std.mem.eql(u8, package.version, "1.248ubuntu3") or
+        kind != .postinst or source != .new_package or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[0], "configure") or
+        arguments[1].len != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+const ConsoleSetupFileBinding = struct {
+    path: []const u8,
+    size: u64,
+    sha256: []const u8,
+};
+
+fn matchesConsoleSetupFile(
+    entry: root_fs.Entry,
+    sha256: [32]u8,
+    binding: ConsoleSetupFileBinding,
+) !bool {
+    const expected = (try content_digest.Value.parse(
+        .sha256,
+        binding.sha256,
+    )).sha256;
+    return entry.modeled and entry.kind == .file and entry.mode == 0o644 and
+        entry.uid == 0 and entry.gid == 0 and entry.link_count == 1 and
+        entry.size == binding.size and
+        std.crypto.timing_safe.eql([32]u8, sha256, expected);
+}
+
+fn verifyConsoleSetupProviders(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+) !void {
+    const expected_archive = (try content_digest.Value.parse(
+        .sha512,
+        "b5ad0ebf1b9a526b5af67422b720b29b4e2738ebd945871223bef8241e59b47558f51a31e9638b8e5ce84ea1b42334682f86f9c3d62de224e7c55caa7a5e0f14",
+    )).sha512;
+    var found = false;
+    for (program.artifacts) |artifact| {
+        if (!std.mem.eql(u8, artifact.package.name, "console-setup-linux") or
+            !std.mem.eql(u8, artifact.package.architecture, "all"))
+            continue;
+        const identity = artifact.identity() orelse
+            return error.InvalidAlternativesScriptAuthority;
+        const observed = identity.digests.sha512 orelse
+            return error.InvalidAlternativesScriptAuthority;
+        if (found or
+            !std.mem.eql(u8, artifact.package.version, "1.248ubuntu3") or
+            artifact.size != 6207548 or identity.primary != .sha512 or
+            !std.crypto.timing_safe.eql([64]u8, observed, expected_archive))
+            return error.InvalidAlternativesScriptAuthority;
+        const origin = artifact.origin_v2 orelse
+            return error.InvalidAlternativesScriptAuthority;
+        switch (origin) {
+            .authenticated_repository => {},
+            else => return error.InvalidAlternativesScriptAuthority,
+        }
+        found = true;
+    }
+    if (!found) return error.InvalidAlternativesScriptAuthority;
+    for ([_]ConsoleSetupFileBinding{
+        .{
+            .path = "var/lib/dpkg/info/console-setup-linux.list",
+            .size = 41489,
+            .sha256 = "fcbd5a4757d10f8e93472331cff45fd91667dad80b16e6e3dffd4a550097c79f",
+        },
+        .{
+            .path = "etc/console-setup/vtrgb",
+            .size = 158,
+            .sha256 = "684cd905549f78e025870dd5c8a3835e49f79f2bb08952eb7424537f6df5fa13",
+        },
+        .{
+            .path = "etc/console-setup/vtrgb.vga",
+            .size = 155,
+            .sha256 = "1018702de86f8c570d097eadda5c2ec807375beb663e3a7afeec2cd1cd3e8f76",
+        },
+    }) |binding| {
+        var pinned = try root.pinRegularFile(try root_fs.Path.init(binding.path));
+        defer pinned.close();
+        const observation = try pinned.observeStableAlloc(allocator, 8 * 1024 * 1024);
+        defer allocator.free(observation.bytes);
+        var sha256: [32]u8 = undefined;
+        Sha256.hash(observation.bytes, &sha256, .{});
+        if (!try matchesConsoleSetupFile(observation.entry, sha256, binding))
+            return error.InvalidAlternativesScriptAuthority;
+    }
+}
+
 fn verifySudoRsStructuralOwner(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -20040,6 +20143,119 @@ test "native_unpack.test.snapshot util-linux requires signed fresh amd64 configu
             case.arguments,
         ),
     );
+}
+
+test "native_unpack.test.snapshot console-setup requires signed fresh amd64 configure" {
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst",
+    );
+    const package: native_program.PackageIdentity = .{
+        .name = "console-setup-linux",
+        .version = "1.248ubuntu3",
+        .architecture = "all",
+    };
+    try testing.expect(try snapshotConsoleSetupLinuxPostinstIsBound(
+        script,
+        "amd64",
+        package,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expect(!(try snapshotConsoleSetupLinuxPostinstIsBound(
+        "#!/bin/sh\nupdate-alternatives --auto vtrgb\n",
+        "amd64",
+        package,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    changed[changed.len - 1] = ' ';
+    try testing.expect(!(try snapshotConsoleSetupLinuxPostinstIsBound(
+        changed,
+        "amd64",
+        package,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    for ([_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = package,
+        kind: maintainer_script.Kind = .postinst,
+        source: native_program.ScriptSource = .new_package,
+        arguments: []const []const u8 = &.{ "configure", "" },
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = .{ .name = "console-setup", .version = package.version, .architecture = "all" } },
+        .{ .package = .{ .name = package.name, .version = "1.248ubuntu4", .architecture = "all" } },
+        .{ .package = .{ .name = package.name, .version = package.version, .architecture = "amd64" } },
+        .{ .kind = .preinst },
+        .{ .source = .installed_package },
+        .{ .arguments = &.{"configure"} },
+        .{ .arguments = &.{ "configure", "1" } },
+        .{ .arguments = &.{ "abort-upgrade", "" } },
+    }) |case| try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotConsoleSetupLinuxPostinstIsBound(
+            script,
+            case.architecture,
+            case.package,
+            case.kind,
+            case.source,
+            case.arguments,
+        ),
+    );
+    try testing.expect(native_alternatives.matchesSnapshotTool(
+        "amd64",
+        native_alternatives.snapshot_tools[0].sha256,
+    ));
+    try testing.expect(!native_alternatives.matchesSnapshotTool(
+        "amd64",
+        native_alternatives.pinned_tools[0].sha256,
+    ));
+}
+
+test "native_unpack.test.snapshot console-setup provider metadata and hash are exact" {
+    const binding: ConsoleSetupFileBinding = .{
+        .path = "etc/console-setup/vtrgb",
+        .size = 158,
+        .sha256 = "684cd905549f78e025870dd5c8a3835e49f79f2bb08952eb7424537f6df5fa13",
+    };
+    const digest = (try content_digest.Value.parse(.sha256, binding.sha256)).sha256;
+    var entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = 158,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try testing.expect(try matchesConsoleSetupFile(entry, digest, binding));
+    entry.size = 159;
+    try testing.expect(!(try matchesConsoleSetupFile(entry, digest, binding)));
+    entry.size = 158;
+    entry.mode = 0o664;
+    try testing.expect(!(try matchesConsoleSetupFile(entry, digest, binding)));
+    entry.mode = 0o644;
+    entry.uid = 1;
+    try testing.expect(!(try matchesConsoleSetupFile(entry, digest, binding)));
+    entry.uid = 0;
+    entry.link_count = 2;
+    try testing.expect(!(try matchesConsoleSetupFile(entry, digest, binding)));
+    entry.link_count = 1;
+    entry.modeled = false;
+    try testing.expect(!(try matchesConsoleSetupFile(entry, digest, binding)));
+    entry.modeled = true;
+    var changed = digest;
+    changed[0] ^= 1;
+    try testing.expect(!(try matchesConsoleSetupFile(entry, changed, binding)));
 }
 
 test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure" {
@@ -20409,6 +20625,14 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    const snapshot_console_setup_postinst = try snapshotConsoleSetupLinuxPostinstIsBound(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -20426,19 +20650,32 @@ fn prepareAlternativesScriptBoundary(
         architecture,
     );
     if ((inert or snapshot_postinst or snapshot_bash_postinst or
-        snapshot_sudo_rs_postinst or snapshot_util_linux_postinst) and
+        snapshot_sudo_rs_postinst or snapshot_util_linux_postinst or
+        snapshot_console_setup_postinst) and
         !native_alternatives.matchesSnapshotTool(
             architecture,
             tool_digest,
         )) return error.InvalidAlternativesTool;
     if (snapshot_sudo_rs_postinst)
         try verifySudoRsStructuralOwner(allocator, root, program);
+    if (snapshot_console_setup_postinst)
+        try verifyConsoleSetupProviders(allocator, root, program);
     var listed = try native_alternatives.listGroups(
         allocator,
         root,
         .{},
     );
     defer listed.deinit();
+    if (snapshot_console_setup_postinst) {
+        if (script.groups.len != 1 or
+            !std.mem.eql(u8, script.groups[0].name, "vtrgb") or
+            script.commands.len != 2)
+            return error.InvalidAlternativesScriptAuthority;
+        for (listed.names) |name| {
+            if (std.mem.eql(u8, name, "vtrgb"))
+                return error.InvalidAlternativesScriptAuthority;
+        }
+    }
     const before_groups = try scratch.alloc(
         native_alternatives.GroupAuthority,
         listed.names.len + script.groups.len,
@@ -20995,6 +21232,22 @@ fn runLifecycleScript(
         ) catch |err| {
             try attempt.requireRecovery(allocator, .script);
             return err;
+        };
+        if (native_alternatives.matchesSnapshotConsoleSetupLinuxPostinst(
+            script_bytes,
+        )) switch (report.outcome) {
+            .exited => |code| if (code == 0) {
+                native_alternatives.validateSnapshotConsoleSetupLinuxSuccess(
+                    allocator,
+                    boundary.before,
+                    alternatives_after.?,
+                    boundary.script,
+                ) catch |err| {
+                    try attempt.requireRecovery(allocator, .script);
+                    return err;
+                };
+            },
+            else => {},
         };
         var checkpoint_paths: std.ArrayList([]const u8) = .empty;
         defer checkpoint_paths.deinit(boundary.arena.allocator());

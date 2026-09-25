@@ -757,6 +757,48 @@ only `script prepared` in the journal and no outcome file. The operation
 remains `recovery_required`; preserve the interrupted root, not a fresh
 retry or proof of full snapshot parity.
 
+The signed console-setup archive, installed postinst, two signed `vtrgb`
+provider files, and exact package ownership list were separately verified
+against the lock and retained root. In disposable **copies** of that root,
+pinned dpkg 1.22.22 re-unpacked and configured the archive, while pinned
+`update-alternatives` 1.22.22 executed the corresponding two literal
+registrations independently. Both produced the same 78-byte record
+(SHA-256 `1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`)
+and `/etc/vtrgb` selector chain, selecting priority-50
+`/etc/console-setup/vtrgb`. Native admission is bound to the exact signed
+postinst, fresh `console-setup-linux:all` identity, amd64 configure
+arguments, snapshot tool, signed providers, and an absent `vtrgb` group.
+The [alternatives reference](dpkg-alternatives-reference.md#native-admission)
+describes the fail-closed authority and success-state requirements. The
+interrupted predecessor root remains untouched; only another new signed
+root can show whether step 1292 now succeeds.
+
+That **new** root,
+`.real-snapshot/amd64-console-setup-fresh-long-1`, resolved a separate
+175-package authenticated amd64 lock (file SHA-256
+`02d84b6867204a7a4c28402f30909bb42dd60f3df411f8db918555d1da03a3d6`)
+and independently rehashed all 175 downloaded SHA-512 archives. Its exact
+`console-setup-linux.postinst` at step 1292 **launched** with
+`["configure", ""]`, durably exited 0, and reached `install ok installed`.
+The resulting 78-byte `vtrgb` record has SHA-256
+`1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`,
+byte-identical to pinned dpkg and pinned `update-alternatives`; the generic
+and selector links resolve to the signed priority-50 `vtrgb` provider.
+
+This is **not** a completed install. During deferred trigger processing
+at step 1428, libc-bin, debianutils and libselinux1 triggered postinst
+callbacks persisted exit 0. The next callback, ordinal 3, was only
+`prepared`; no outcome exists. `procps:amd64` 2:4.0.6-3ubuntu1 has
+`Triggers-Pending: /usr/lib/sysctl.d` and a bound postinst SHA-256
+`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`.
+Its exact script exits the `triggered` branch before any alternatives
+command, but the existing snapshot procps authorization admits only
+`["configure", ""]`. The attempted
+`["triggered", "/usr/lib/sysctl.d"]` callback therefore refused **before
+launch** with `InvalidAlternativesScriptAuthority`; no other pending
+postinst contains an alternatives command. The root and all its durable
+trigger claims are retained for recovery, **never** reused as fresh.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

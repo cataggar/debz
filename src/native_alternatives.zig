@@ -1129,6 +1129,9 @@ const snapshot_sudo_rs_postinst_sha256 = digestLiteral(
 const snapshot_util_linux_postinst_sha256 = digestLiteral(
     "31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
 );
+const snapshot_console_setup_linux_postinst_sha256 = digestLiteral(
+    "5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a",
+);
 
 pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     var sha256: [32]u8 = undefined;
@@ -1186,6 +1189,16 @@ pub fn matchesSnapshotUtilLinuxPostinst(bytes: []const u8) bool {
     return std.crypto.timing_safe.eql(
         [32]u8,
         snapshot_util_linux_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotConsoleSetupLinuxPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_console_setup_linux_postinst_sha256,
         sha256,
     );
 }
@@ -1444,6 +1457,23 @@ pub fn discoverScriptAuthority(
 ) !ScriptAuthority {
     if (bytes.len > (package_database.Limits{}).max_maintainer_script_bytes)
         return error.AlternativesScriptTooLarge;
+    if (matchesSnapshotConsoleSetupLinuxPostinst(bytes)) {
+        // The signed script assigns CONFIGDIR once and invokes both installs unconditionally.
+        var script = try discoverScriptAuthority(
+            allocator,
+            "update-alternatives --install /etc/vtrgb vtrgb /etc/console-setup/vtrgb 50\n" ++
+                "update-alternatives --install /etc/vtrgb vtrgb /etc/console-setup/vtrgb.vga 20\n",
+            limits,
+        );
+        errdefer script.deinit();
+        const owned = script.arena.allocator();
+        var targets: std.ArrayList([]const u8) = .empty;
+        defer targets.deinit(owned);
+        try targets.appendSlice(owned, script.immutable_targets);
+        try targets.append(owned, "/var/lib/dpkg/info/console-setup-linux.list");
+        script.immutable_targets = try owned.dupe([]const u8, targets.items);
+        return script;
+    }
     var storage = try createArena(allocator);
     errdefer {
         storage.arena.deinit();
@@ -3151,6 +3181,7 @@ pub fn validateScriptTransition(
             commands[command_count] = command.command;
             command_count += 1;
         }
+
         if (command_count == 0)
             return error.InvalidAlternativesScriptAuthority;
         const prior = before.group(script_group.name);
@@ -3210,6 +3241,42 @@ pub fn validateScriptTransition(
         }
         if (!matched) return error.AlternativesStateChanged;
     }
+}
+
+pub fn validateSnapshotConsoleSetupLinuxSuccess(
+    allocator: std.mem.Allocator,
+    before: Snapshot,
+    after: Snapshot,
+    script: ScriptAuthority,
+) !void {
+    if (before.group("vtrgb") != null or script.groups.len != 1 or
+        !std.mem.eql(u8, script.groups[0].name, "vtrgb") or
+        script.commands.len != 2 or
+        !std.mem.eql(u8, script.commands[0].name, "vtrgb") or
+        !std.mem.eql(u8, script.commands[1].name, "vtrgb"))
+        return error.InvalidAlternativesScriptAuthority;
+    var first = try mutate(allocator, .{
+        .name = "vtrgb",
+        .current = null,
+        .selected = null,
+        .command = script.commands[0].command,
+    });
+    defer first.deinit();
+    var second = try mutate(allocator, .{
+        .name = "vtrgb",
+        .current = first.record,
+        .selected = first.selected,
+        .command = script.commands[1].command,
+    });
+    defer second.deinit();
+    const observed = after.group("vtrgb") orelse
+        return error.AlternativesStateChanged;
+    if (!try transitionMatchesGroup(
+        allocator,
+        second.record,
+        second.selected,
+        observed,
+    )) return error.AlternativesStateChanged;
 }
 
 test "native_alternatives.test.snapshot tool pin is exact and architecture bound" {
@@ -3976,6 +4043,176 @@ test "native_alternatives.test.snapshot util-linux preserves the selected less p
             );
         }
     }
+}
+
+test "native_alternatives.test.snapshot console-setup pins two literal vtrgb installs" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst",
+    );
+    try testing.expect(matchesSnapshotConsoleSetupLinuxPostinst(bytes));
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 1), script.groups.len);
+    try testing.expectEqualStrings("vtrgb", script.groups[0].name);
+    try testing.expectEqual(@as(usize, 2), script.commands.len);
+    for ([_]struct { candidate: []const u8, priority: i32 }{
+        .{ .candidate = "/etc/console-setup/vtrgb", .priority = 50 },
+        .{ .candidate = "/etc/console-setup/vtrgb.vga", .priority = 20 },
+    }, script.commands) |expected, command| {
+        try testing.expectEqualStrings("vtrgb", command.name);
+        switch (command.command) {
+            .install => |install| {
+                try testing.expectEqualStrings("/etc/vtrgb", install.master_link);
+                try testing.expectEqualStrings(expected.candidate, install.path);
+                try testing.expectEqual(expected.priority, install.priority);
+                try testing.expectEqual(@as(usize, 0), install.slaves.len);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), script.immutable_targets.len);
+    try testing.expectEqualStrings(
+        "/var/lib/dpkg/info/console-setup-linux.list",
+        script.immutable_targets[2],
+    );
+    for ([_][]const u8{
+        "CONFIGDIR=/etc/console-setup",
+        "\"$CONFIGDIR/vtrgb\" 50",
+        "\"$CONFIGDIR/vtrgb.vga\" 20",
+        "set -e",
+    }) |needle| {
+        const altered = try testing.allocator.dupe(u8, bytes);
+        defer testing.allocator.free(altered);
+        const offset = std.mem.indexOf(u8, altered, needle) orelse
+            return error.TestUnexpectedResult;
+        altered[offset] = 'x';
+        try testing.expect(!matchesSnapshotConsoleSetupLinuxPostinst(altered));
+        try testing.expectError(
+            error.InvalidAlternativesScript,
+            discoverScriptAuthority(testing.allocator, altered, .{}),
+        );
+    }
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(
+            testing.allocator,
+            "CONFIGDIR=/etc/console-setup\nupdate-alternatives --install /etc/vtrgb vtrgb \"$CONFIGDIR/vtrgb\" 50\n",
+            .{},
+        ),
+    );
+}
+
+test "native_alternatives.test.snapshot console-setup successful exit requires both registrations" {
+    const testing = std.testing;
+    var script = try discoverScriptAuthority(
+        testing.allocator,
+        @embedFile("fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst"),
+        .{},
+    );
+    defer script.deinit();
+    const before: Snapshot = .{
+        .groups = &.{},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{}),
+        .relationship_count = 0,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    var first = try mutate(testing.allocator, .{
+        .name = "vtrgb",
+        .current = null,
+        .selected = null,
+        .command = script.commands[0].command,
+    });
+    defer first.deinit();
+    var second = try mutate(testing.allocator, .{
+        .name = "vtrgb",
+        .current = first.record,
+        .selected = first.selected,
+        .command = script.commands[1].command,
+    });
+    defer second.deinit();
+    const pinned =
+        "auto\n/etc/vtrgb\n\n" ++
+        "/etc/console-setup/vtrgb\n50\n" ++
+        "/etc/console-setup/vtrgb.vga\n20\n\n";
+    const actual = try canonicalBytes(testing.allocator, second.record.?);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(pinned, actual);
+    try testing.expectEqualStrings("/etc/console-setup/vtrgb", second.selected.?);
+    for ([_]struct {
+        bytes: []const u8,
+        selected: []const u8 = "/etc/console-setup/vtrgb",
+        allowed: bool,
+    }{
+        .{ .bytes = pinned, .allowed = true },
+        .{ .bytes = "auto\n/etc/vtrgb\n\n/etc/console-setup/vtrgb\n50\n\n", .allowed = false },
+        .{ .bytes = pinned, .selected = "/etc/console-setup/vtrgb.vga", .allowed = false },
+        .{ .bytes = "auto\n/etc/vtrgb\n\n/etc/console-setup/vtrgb\n50\n/etc/console-setup/vtrgb.vga\n21\n\n", .allowed = false },
+        .{ .bytes = "auto\n/etc/vtrgb\n\n/etc/console-setup/vtrgb\n50\n/etc/console-setup/zther\n20\n\n", .allowed = false },
+    }) |case| {
+        var parsed = try parse(testing.allocator, "vtrgb", case.bytes, .{});
+        defer parsed.deinit();
+        var group: GroupState = .{
+            .name = "vtrgb",
+            .record = parsed.record,
+            .record_fact = .{
+                .path = "var/lib/dpkg/alternatives/vtrgb",
+                .kind = .regular,
+            },
+            .selected = case.selected,
+            .links = &.{},
+            .missing_master_targets = &.{},
+            .facts = &.{},
+            .digest = undefined,
+        };
+        group.digest = groupStateDigest(group);
+        const after: Snapshot = .{
+            .groups = &.{group},
+            .paths = &.{},
+            .digest = snapshotDigest(&.{group}),
+            .relationship_count = 1,
+            .parsed_records = &.{},
+            .arena = undefined,
+            .backing_allocator = testing.allocator,
+        };
+        if (case.allowed) {
+            try validateScriptTransition(
+                testing.allocator,
+                before,
+                after,
+                script,
+                .{ .groups = script.groups },
+            );
+            try validateSnapshotConsoleSetupLinuxSuccess(
+                testing.allocator,
+                before,
+                after,
+                script,
+            );
+        } else {
+            try testing.expectError(
+                error.AlternativesStateChanged,
+                validateSnapshotConsoleSetupLinuxSuccess(
+                    testing.allocator,
+                    before,
+                    after,
+                    script,
+                ),
+            );
+        }
+    }
+    try testing.expectError(
+        error.AlternativesStateChanged,
+        validateSnapshotConsoleSetupLinuxSuccess(
+            testing.allocator,
+            before,
+            before,
+            script,
+        ),
+    );
 }
 
 test "native_alternatives.test.snapshot bash postinst pins one masked builtins install" {
