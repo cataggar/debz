@@ -351,6 +351,19 @@ exited 8. An ignored runner copy extended only the bounded `create` timeout
 from 30 to 90 minutes. The root is retained read-only, not reused as a fresh
 trial; complete install and native/reference parity remain unproven.
 
+A second new authenticated combined-tree root on final #238 squash plus netcat
+(recorded source `4394bf85214ac25d366f420ff41ca7c75d6b8c12`,
+ReleaseSafe executable SHA-256
+`91bf4bffdf388a6347e3360079ba9992db8761ffe64f2c81683db63b4f9c981f`)
+started without dpkg state or helper seeding. It independently persisted
+zero-exit `netcat-openbsd.postinst configure ""` at step 1026; its 221-byte
+`nc` record again matched the pinned digest and all eight links matched the
+reference. `procps.postinst` at step 1065 was prepared but refused **before
+launch**, with no procps script outcome and `create.json` exit 8. The ignored
+runner copy changed only the bounded `create` timeout from 30 to 90 minutes
+and was removed afterward. This root also remains read-only, not a completed
+install or a native/reference parity result.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
