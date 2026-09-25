@@ -269,8 +269,20 @@ validated separately. Ordering is normalized only where the dpkg format treats
 it as semantically irrelevant; content, metadata, state, and script order are
 never discarded.
 
-`python3 tools/native-differential.py capture` produces a bounded canonical
-snapshot. `compare` reports stable JSON paths for mismatches.
+`zig build -Doptimize=ReleaseSafe` installs
+`zig-out/bin/native-differential`. Its `capture`, `compare`, and
+`validate-corpus` commands produce and check bounded snapshots in the existing
+`native-transaction-snapshot-v1` format; `compare` reports JSON paths for
+mismatches. The real-snapshot reference script and CI job invoke the Zig
+capture CLI. The Python CLI remains available for existing downstream imports
+and snapshot consumers.
+`zig build test-native-differential` validates the versioned corpus inventory
+in Zig and executes reference/native root comparisons. The 145 inventory
+entries are **not** 145 executed oracle scenarios; the dedicated lifecycle,
+conffile, trigger, recovery and materialization gates establish their own
+executed coverage. The required CI workload runs the executed differential
+gate on amd64 and arm64 in both Debug and ReleaseSafe; ordinary `zig build test`
+alone runs its unit tests, not its external reference/native comparisons.
 
 ## Production cutover gates
 

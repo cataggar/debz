@@ -654,8 +654,21 @@ unasserted directory timestamp. The adapter does not silently substitute the
 current time. This limitation, conffiles, scripts, triggers, and the other
 typed handoffs remain outside its supported data-only subset.
 
-The independent runner, `tools/test-native-materialization.py`, builds ordinary
-packages with `dpkg-deb`. Their ownership matches the test user, so reference
+The test-owned Zig runner, `test/native_materialization.zig`, builds ordinary
+packages with `dpkg-deb` through reusable guarded-root, bounded-process,
+package and canonical snapshot helpers in `test/native_test_foundation.zig`.
+The Python materialization acceptance and unit gates have been replaced after
+Debug and ReleaseSafe parity. The Zig unit tests include executable
+regressions for root parity and refusals, selected dpkg, pinned-executable
+tampering, version-gated fallback, archive verification before extraction,
+cache tampering, root refusal, and the package manifest. Python lifecycle,
+trigger, and recovery tests still import reusable compatibility fixtures from
+`tools/native-materialization-fixtures.py`. Offline reference-preparation
+regressions use `tools/prepare-native-dpkg.py --fixture-root` with a disposable
+marker and `--fixture-archive` bytes that must still match the published pin;
+`--simulate-root` can only force refusal. These options never relax the
+production digest, privilege, or HTTPS checks. Package ownership matches the
+test user, so reference
 unpack can use `--force-not-root` without host privilege. Every candidate and
 reference root has an explicit disposable-root marker, its own dpkg database,
 and a bounded temporary workspace. Native execution never invokes dpkg; only

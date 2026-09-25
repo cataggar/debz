@@ -771,10 +771,10 @@ jobs:
       - name: Check ReleaseSafe CLI help
         if: ${{ matrix.optimize == 'ReleaseSafe' }}
         run: zig build -Doptimize=ReleaseSafe -j2 run -- --help
-      - name: Compare native materialization, conffiles, lifecycle, and triggers with dpkg
+      - name: Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg
         run: |
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
-          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers \
+          zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Require private native helper namespaces
         run: |
@@ -1438,7 +1438,7 @@ jobs:
               sudo tee "$evidence/vendor-state-capture-skipped.txt" >/dev/null
           fi
           differential_status=0
-          sudo python3 tools/native-differential.py capture \
+          sudo zig-out/bin/native-differential capture \
             --root "$PWD/$work/root" \
             --exclude dev/null \
             --output "$PWD/$evidence/native.snapshot.json" \

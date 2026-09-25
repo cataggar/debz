@@ -531,6 +531,7 @@ class SecurityAuditTests(unittest.TestCase):
             ("      - name: Build and test\n", "      - name: Build and test\n        if: false\n"),
             ("-Doptimize=\"$OPTIMIZE\"", "-Doptimize=Debug"),
             ("test-native-materialization test-native-conffiles", "test-native-materialization"),
+            ("test-native-differential", ""),
             ("test-native-lifecycle test-native-triggers", "test-native-lifecycle"),
             ('reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"', "reference_dpkg=/usr/bin/dpkg"),
             ('-Dnative-reference-dpkg="$reference_dpkg"', ""),

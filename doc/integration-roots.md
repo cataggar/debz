@@ -140,6 +140,10 @@ before capture. A fresh amd64 rehearsal configured all 175 packages, processed
 pending triggers, and captured the healthy reference root. The reference-only
 `dev/null` chroot device is excluded from both bounded captures only when no
 package claims it; no package payload path is excluded.
+Both reference and candidate captures use the installed
+`zig-out/bin/native-differential capture` with the same `dev/null` exclusion
+and bounds. Its output retains the typed v1 snapshot format consumed by
+`test/real-snapshot-comparator.zig`.
 `test/real-snapshot-comparator.zig` is the equality authority for the bounded
 filesystem and normalized dpkg
 status/info/trigger/diversion/statoverride/alternatives sections. It compares

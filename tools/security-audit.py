@@ -148,7 +148,13 @@ def tracked_files() -> list[pathlib.Path]:
         check=True,
         stdout=subprocess.PIPE,
     )
-    return [ROOT / item.decode() for item in result.stdout.split(b"\0") if item]
+    return [
+        path
+        for item in result.stdout.split(b"\0")
+        if item
+        for path in (ROOT / item.decode(),)
+        if path.exists() or path.is_symlink()
+    ]
 
 
 def untracked_files() -> list[pathlib.Path]:
@@ -188,6 +194,8 @@ def tracked_digest_texts(files: list[pathlib.Path]) -> dict[str, str]:
             continue
         try:
             texts[relative] = path.read_text(errors="strict")
+        except FileNotFoundError:
+            continue  # A tracked file may be deleted in the working tree before commit.
         except UnicodeDecodeError:
             continue
     return texts
@@ -1172,9 +1180,9 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             '          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all',
             '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
-        "Compare native materialization, conffiles, lifecycle, and triggers with dpkg": (
+        "Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg": (
             '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-            "          zig build test-native-materialization test-native-conffiles test-native-lifecycle test-native-triggers \\",
+            "          zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \\",
             '            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
         "Require private native helper namespaces": (

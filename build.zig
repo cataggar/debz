@@ -239,15 +239,10 @@ pub fn build(b: *std.Build) void {
     b.step("test-apt-system-acceptance", "Run real apt facade and dpkg in a disposable root (requires root)")
         .dependOn(&apt_system_acceptance.step);
 
-    const native_differential_tests = b.addSystemCommand(
-        &.{ "python3", "-m", "unittest", "tools/test_native_differential.py" },
-    );
     const native_differential_step = b.step(
         "test-native-differential",
         "Validate the native transaction compatibility corpus and comparator",
     );
-    native_differential_step.dependOn(&native_differential_tests.step);
-    test_step.dependOn(&native_differential_tests.step);
 
     const repository_add_module = b.createModule(.{
         .root_source_file = b.path("test/repository-add-integration.zig"),
@@ -683,29 +678,94 @@ pub fn build(b: *std.Build) void {
         .root_module = debz,
         .filters = &.{"native_unpack.test.materialization external fixture"},
     });
-    const native_materialization = b.addSystemCommand(
-        &.{ "python3", "tools/test-native-materialization.py" },
+    const native_differential_module = b.createModule(.{
+        .root_source_file = b.path("test/native_differential.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_differential_module.addImport("debz", debz);
+    const native_snapshot_module = b.createModule(.{
+        .root_source_file = b.path("test/native_differential_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_snapshot_module.addImport("debz", debz);
+    const native_differential_options = b.addOptions();
+    native_differential_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_differential_options.addOption(
+        []const u8,
+        "corpus",
+        b.pathFromRoot("test/native-transaction/corpus-v1.json"),
     );
-    native_materialization.addArtifactArg(native_materialization_tests);
-    const native_materialization_oracle_tests = b.addSystemCommand(
-        &.{ "python3", "-m", "unittest", "tools/test_native_materialization.py" },
+    native_differential_module.addOptions("native_test_options", native_differential_options);
+    native_snapshot_module.addOptions("native_test_options", native_differential_options);
+    const native_snapshot_cli = b.addExecutable(.{
+        .name = "native-differential",
+        .root_module = native_snapshot_module,
+    });
+    b.installArtifact(native_snapshot_cli);
+    const native_snapshot_tests = b.addTest(.{ .root_module = native_snapshot_module });
+    const run_native_snapshot_tests = b.addRunArtifact(native_snapshot_tests);
+    native_differential_step.dependOn(&run_native_snapshot_tests.step);
+    test_step.dependOn(&run_native_snapshot_tests.step);
+    const native_differential_zig_tests = b.addTest(.{ .root_module = native_differential_module });
+    const run_native_differential_zig_tests = b.addRunArtifact(native_differential_zig_tests);
+    const native_differential_zig = b.addExecutable(.{
+        .name = "native-differential-acceptance",
+        .root_module = native_differential_module,
+    });
+    const run_native_differential_zig = b.addRunArtifact(native_differential_zig);
+    run_native_differential_zig.addArtifactArg(native_materialization_tests);
+    run_native_differential_zig.step.dependOn(&run_native_differential_zig_tests.step);
+    native_differential_step.dependOn(&run_native_differential_zig.step);
+    test_step.dependOn(&run_native_differential_zig_tests.step);
+    const native_fixture_module = b.createModule(.{
+        .root_source_file = b.path("test/native_materialization.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_fixture_module.addImport("debz", debz);
+    const native_fixture_options = b.addOptions();
+    native_fixture_options.addOption([]const u8, "repository", b.pathFromRoot("."));
+    native_fixture_module.addOptions("native_test_options", native_fixture_options);
+    const native_fixture_tests = b.addTest(.{ .root_module = native_fixture_module });
+    const run_native_fixture_tests = b.addRunArtifact(native_fixture_tests);
+    const native_fixture = b.addExecutable(.{
+        .name = "native-materialization-acceptance",
+        .root_module = native_fixture_module,
+    });
+    const run_native_fixture = b.addRunArtifact(native_fixture);
+    run_native_fixture.addArtifactArg(native_materialization_tests);
+    run_native_fixture.step.dependOn(&run_native_fixture_tests.step);
+    test_step.dependOn(&run_native_fixture_tests.step);
+    const native_materialization_step = b.step(
+        "test-native-materialization",
+        "Compare real native data-only unpack with dpkg",
     );
-    native_materialization.step.dependOn(&native_materialization_oracle_tests.step);
-    test_step.dependOn(&native_materialization_oracle_tests.step);
-    b.step("test-native-materialization", "Compare real native data-only unpack with dpkg")
-        .dependOn(&native_materialization.step);
+    native_materialization_step.dependOn(&run_native_fixture.step);
 
-    const native_conffiles = b.addSystemCommand(
-        &.{ "python3", "tools/test-native-conffiles.py" },
+    const native_conffile_module = b.createModule(.{
+        .root_source_file = b.path("test/native_conffiles.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    native_conffile_module.addImport("debz", debz);
+    native_conffile_module.addOptions("native_test_options", native_fixture_options);
+    const native_conffile_zig_tests = b.addTest(.{ .root_module = native_conffile_module });
+    const run_native_conffile_zig_tests = b.addRunArtifact(native_conffile_zig_tests);
+    const native_conffile_zig = b.addExecutable(.{
+        .name = "native-conffile-acceptance",
+        .root_module = native_conffile_module,
+    });
+    const run_native_conffile_zig = b.addRunArtifact(native_conffile_zig);
+    run_native_conffile_zig.addArtifactArg(native_materialization_tests);
+    run_native_conffile_zig.step.dependOn(&run_native_conffile_zig_tests.step);
+    test_step.dependOn(&run_native_conffile_zig_tests.step);
+    const native_conffile_step = b.step(
+        "test-native-conffiles",
+        "Compare native conffile and remove/purge phases with dpkg",
     );
-    native_conffiles.addArtifactArg(native_materialization_tests);
-    const native_conffile_oracle_tests = b.addSystemCommand(
-        &.{ "python3", "-m", "unittest", "tools/test_native_conffiles.py" },
-    );
-    native_conffiles.step.dependOn(&native_conffile_oracle_tests.step);
-    test_step.dependOn(&native_conffile_oracle_tests.step);
-    b.step("test-native-conffiles", "Compare native conffile and remove/purge phases with dpkg")
-        .dependOn(&native_conffiles.step);
+    native_conffile_step.dependOn(&run_native_conffile_zig.step);
 
     const dpkg_config_reference = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
@@ -914,8 +974,11 @@ pub fn build(b: *std.Build) void {
             runner.addArg("--diversions-only");
     }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
+        run_native_fixture.addArgs(&.{ "--reference-dpkg", path });
+        run_native_conffile_zig.addArgs(&.{ "--reference-dpkg", path });
+        run_native_differential_zig.addArgs(&.{ "--reference-dpkg", path });
         for ([_]*std.Build.Step.Run{
-            native_materialization, native_conffiles, dpkg_config_reference, dpkg_alternatives_reference, native_lifecycle, native_triggers, native_recovery,
+            dpkg_config_reference, dpkg_alternatives_reference, native_lifecycle, native_triggers, native_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
     }
     if (b.option(

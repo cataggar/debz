@@ -20,7 +20,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "debz_lifecycle_materialization", ROOT / "tools/test-native-materialization.py",
+    "debz_lifecycle_materialization", ROOT / "tools/native-materialization-fixtures.py",
 )
 assert SPEC and SPEC.loader
 m = importlib.util.module_from_spec(SPEC)

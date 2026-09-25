@@ -123,7 +123,7 @@ if (( device_claim != 1 )); then
   echo "reference package claims excluded chroot device" >&2
   exit 1
 fi
-python3 tools/native-differential.py capture \
+zig-out/bin/native-differential capture \
   --root "$reference_root" \
   --exclude dev/null \
   --output "$evidence/reference.snapshot.json"
