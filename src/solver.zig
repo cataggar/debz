@@ -1397,7 +1397,22 @@ fn planTransactionInternal(
                 return failureOne(allocator, arena_ptr, .lock_package_mismatch, action.package, null, "planned package evidence differs from the exact lock");
         }
     }
-    const ordered_actions = try materializeOrdering(owned, actions.items);
+    if (input.installed.records.len == 0) {
+        const account_order = try orderFreshRootAccounts(
+            allocator,
+            context,
+            actions.items,
+            input.repositories,
+            repository_lookup_order,
+        );
+        switch (account_order) {
+            .ordered => {},
+            .unsupported_dependency => return failureOne(allocator, arena_ptr, .unsupported_feature, "base-passwd", null, "fresh-root account ordering has an ambiguous or unsupported dependency"),
+            .dependency_cycle => return failureOne(allocator, arena_ptr, .unsupported_feature, "base-passwd", null, "fresh-root account ordering conflicts with an explicit dependency"),
+            .work_limit => return failureOne(allocator, arena_ptr, .limit_exceeded, "base-passwd", null, "fresh-root account ordering exceeded its work limit"),
+        }
+    }
+    const ordered_actions = try materializeOrdering(owned, actions.items, input.installed.records.len == 0);
     std.mem.sort(PlanAction, actions.items, {}, lessAction);
     const action_slice = try actions.toOwnedSlice(owned);
     const summary = summarizeActions(action_slice, download_bytes, size_delta);
@@ -3060,9 +3075,139 @@ fn summarizeActions(
     return summary;
 }
 
+const AccountOrderResult = enum { ordered, unsupported_dependency, dependency_cycle, work_limit };
+const maximum_account_ordering_work: usize = 1_000_000;
+
+fn isFreshAccountPackage(action: PlanAction, name: []const u8) bool {
+    return action.kind == .install and action.essential and action.prior_installed == null and
+        std.mem.eql(u8, action.package, name);
+}
+
+fn accountOrderingRecord(
+    repositories: []const RepositoryInput,
+    repository_order: []const usize,
+    action: PlanAction,
+) ?packages_index.PackageRecord {
+    const origin = action.selected_origin_v2 orelse return null;
+    const repository = switch (origin) {
+        .authenticated_repository => |selected| selected,
+        .local_artifact => return null,
+    };
+    const index = findRepositoryIndexSorted(repositories, repository_order, repository.repository_id) orelse return null;
+    if (repository.record_index >= repositories[index].packages.records.len) return null;
+    return repositories[index].packages.records[repository.record_index];
+}
+
+fn orderFreshRootAccounts(
+    allocator: std.mem.Allocator,
+    context: *Context,
+    actions: []PlanAction,
+    repositories: []const RepositoryInput,
+    repository_order: []const usize,
+) !AccountOrderResult {
+    var files_index: ?usize = null;
+    var passwd_index: ?usize = null;
+    for (actions, 0..) |action, index| {
+        if (isFreshAccountPackage(action, "base-files")) {
+            if (files_index != null) return .unsupported_dependency;
+            files_index = index;
+        }
+        if (isFreshAccountPackage(action, "base-passwd")) {
+            if (passwd_index != null) return .unsupported_dependency;
+            passwd_index = index;
+        }
+    }
+    const files = files_index orelse return .ordered;
+    const passwd = passwd_index orelse return .ordered;
+    if (passwd < files) return .ordered;
+
+    var by_name = std.StringHashMap(usize).init(allocator);
+    defer by_name.deinit();
+    for (actions, 0..) |action, index| {
+        const entry = try by_name.getOrPut(action.package);
+        if (entry.found_existing)
+            entry.value_ptr.* = std.math.maxInt(usize)
+        else
+            entry.value_ptr.* = index;
+    }
+    var promoted = try allocator.alloc(bool, actions.len);
+    defer allocator.free(promoted);
+    @memset(promoted, false);
+    var pending: std.ArrayList(usize) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, passwd);
+    promoted[passwd] = true;
+    var work: usize = 0;
+    var next: usize = 0;
+    while (next < pending.items.len) : (next += 1) {
+        const index = pending.items[next];
+        const record = accountOrderingRecord(repositories, repository_order, actions[index]) orelse
+            return .unsupported_dependency;
+        inline for (.{ record.control.pre_depends, record.control.depends }) |value| {
+            if (value) |field| for (field.value.groups) |group| {
+                work += 1;
+                if (work > maximum_account_ordering_work) return .work_limit;
+                if (group.alternatives.len != 1) return .unsupported_dependency;
+                const alternative = group.alternatives[0];
+                if (alternative.package.architecture_qualifier != null) return .unsupported_dependency;
+                const dependency = by_name.get(alternative.package.name.text) orelse
+                    return .unsupported_dependency;
+                if (dependency == std.math.maxInt(usize) or isRemoval(actions[dependency].kind))
+                    return .unsupported_dependency;
+                if (dependency == files or dependency >= index) return .dependency_cycle;
+                if (alternative.version) |constraint| {
+                    const state = internal(context);
+                    const comparison = libsolv.pool_evrcmp(
+                        state.pool,
+                        stringId(state.pool, actions[dependency].version),
+                        stringId(state.pool, constraint.version.text),
+                        libsolv.EVRCMP_COMPARE,
+                    );
+                    const matches = switch (constraint.operator) {
+                        .less_than => comparison < 0,
+                        .less_than_or_equal => comparison <= 0,
+                        .equal => comparison == 0,
+                        .greater_than_or_equal => comparison >= 0,
+                        .greater_than => comparison > 0,
+                    };
+                    if (!matches) return .unsupported_dependency;
+                }
+                if (dependency > files and !promoted[dependency]) {
+                    promoted[dependency] = true;
+                    try pending.append(allocator, dependency);
+                }
+            };
+        }
+    }
+
+    const reordered = try allocator.alloc(PlanAction, actions.len);
+    defer allocator.free(reordered);
+    var count: usize = 0;
+    for (actions[0..files]) |action| {
+        reordered[count] = action;
+        count += 1;
+    }
+    for (actions[files + 1 ..], files + 1..) |action, index| {
+        if (!promoted[index]) continue;
+        reordered[count] = action;
+        count += 1;
+    }
+    reordered[count] = actions[files];
+    count += 1;
+    for (actions[files + 1 ..], files + 1..) |action, index| {
+        if (promoted[index]) continue;
+        reordered[count] = action;
+        count += 1;
+    }
+    std.debug.assert(count == actions.len);
+    @memcpy(actions, reordered);
+    return .ordered;
+}
+
 fn materializeOrdering(
     allocator: std.mem.Allocator,
     actions: []const PlanAction,
+    fresh_root: bool,
 ) ![]OrderedAction {
     var ordered: std.ArrayList(OrderedAction) = .empty;
     defer ordered.deinit(allocator);
@@ -3085,6 +3230,7 @@ fn materializeOrdering(
     }
     var pending_unpacks: usize = 0;
     var last_install: ?PlanAction = null;
+    var account_pending = false;
     for (actions) |action| {
         if (isRemoval(action.kind)) {
             try ordered.append(allocator, .{
@@ -3095,7 +3241,10 @@ fn materializeOrdering(
                 .architecture = action.architecture,
             });
         } else {
-            if (action.has_pre_depends and pending_unpacks != 0) {
+            if ((action.has_pre_depends or
+                (fresh_root and isFreshAccountPackage(action, "base-files") and account_pending)) and
+                pending_unpacks != 0)
+            {
                 try ordered.append(allocator, .{
                     .sequence = ordered.items.len,
                     .kind = .configure_pending,
@@ -3104,6 +3253,7 @@ fn materializeOrdering(
                     .architecture = action.architecture,
                 });
                 pending_unpacks = 0;
+                account_pending = false;
             }
             try ordered.append(allocator, .{
                 .sequence = ordered.items.len,
@@ -3113,6 +3263,8 @@ fn materializeOrdering(
                 .architecture = action.architecture,
             });
             pending_unpacks += 1;
+            if (fresh_root and isFreshAccountPackage(action, "base-passwd"))
+                account_pending = true;
             last_install = action;
         }
     }
@@ -4283,11 +4435,14 @@ fn minimizedUbuntuMetadata(allocator: std.mem.Allocator, architecture: []const u
         allocator,
         "Package: ubuntu-minimal\nVersion: 1.570\nArchitecture: {s}\nDepends: apt, python3:any, sudo, sudo-rs\nFilename: pool/ubuntu-minimal.deb\nSize: 1\nSHA256: {s}\n\n" ++
             "Package: apt\nVersion: 3.2.0\nArchitecture: {s}\nProvides: apt-transport-https (= 3.2.0)\nDepends: base-passwd, gpgv, libapt-pkg7.0 (>= 3.2.0), libc6 (>= 2.38)\nReplaces: apt-transport-https (<< 1.5~)\nFilename: pool/apt.deb\nSize: 1\nSHA256: {s}\n\n" ++
-            "Package: base-files\nVersion: 14ubuntu1\nArchitecture: {s}\nEssential: yes\nPre-Depends: libc6 (>= 2.38)\nFilename: pool/base-files.deb\nSize: 1\nSHA256: {s}\n\n" ++
-            "Package: base-passwd\nVersion: 3.6.8\nArchitecture: {s}\nEssential: yes\nPre-Depends: libc6 (>= 2.38)\nFilename: pool/base-passwd.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: base-files\nVersion: 14.2ubuntu1\nArchitecture: {s}\nEssential: yes\nPre-Depends: awk\nDepends: libc6 (>= 2.34)\nFilename: pool/base-files.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: base-passwd\nVersion: 3.6.8\nArchitecture: {s}\nEssential: yes\nDepends: libc6 (>= 2.34), libdebconfclient0 (>= 0.145), libselinux1 (>= 3.1~)\nFilename: pool/base-passwd.deb\nSize: 1\nSHA256: {s}\n\n" ++
             "Package: gpgv\nVersion: 2.4.8\nArchitecture: {s}\nMulti-Arch: foreign\nDepends: libc6 (>= 2.38)\nFilename: pool/gpgv.deb\nSize: 1\nSHA256: {s}\n\n" ++
             "Package: libapt-pkg7.0\nVersion: 3.2.0\nArchitecture: {s}\nMulti-Arch: same\nProvides: libapt-pkg (= 3.2.0)\nDepends: libc6 (>= 2.38)\nFilename: pool/libapt-pkg.deb\nSize: 1\nSHA256: {s}\n\n" ++
             "Package: libc6\nVersion: 2.43\nArchitecture: {s}\nEssential: yes\nMulti-Arch: same\nFilename: pool/libc6.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: mawk\nVersion: 1.3\nArchitecture: {s}\nProvides: awk\nDepends: libc6 (>= 2.34)\nFilename: pool/mawk.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: libdebconfclient0\nVersion: 0.282\nArchitecture: {s}\nDepends: libc6 (>= 2.34)\nFilename: pool/libdebconfclient0.deb\nSize: 1\nSHA256: {s}\n\n" ++
+            "Package: libselinux1\nVersion: 3.11\nArchitecture: {s}\nDepends: libc6 (>= 2.34)\nFilename: pool/libselinux1.deb\nSize: 1\nSHA256: {s}\n\n" ++
             "Package: python3\nVersion: 3.14\nArchitecture: {s}\nMulti-Arch: allowed\nDepends: libc6 (>= 2.38)\nFilename: pool/python3.deb\nSize: 1\nSHA256: {s}\n\n" ++
             "Package: sudo\nVersion: 1.9.17\nArchitecture: {s}\nPre-Depends: sudo-common\nDepends: libc6 (>= 2.38)\nRecommends: sudo-rs\nConflicts: sudo-ldap\nReplaces: sudo-ldap\nFilename: pool/sudo.deb\nSize: 1\nSHA256: {s}\n\n" ++
             "Package: sudo-common\nVersion: 1.2ubuntu\nArchitecture: all\nBreaks: sudo (<< 1.9.16)\nReplaces: sudo (<< 1.9.16)\nFilename: pool/sudo-common.deb\nSize: 1\nSHA256: {s}\n\n" ++
@@ -4302,10 +4457,134 @@ fn minimizedUbuntuMetadata(allocator: std.mem.Allocator, architecture: []const u
             architecture, hash,
             architecture, hash,
             architecture, hash,
+            architecture, hash,
+            architecture, hash,
+            architecture, hash,
             hash,         architecture,
             hash,
         },
     );
+}
+
+fn accountOrderingTestAction(
+    index: *const packages_index.Index,
+    repository_id: source.RepositoryId,
+    record_index: usize,
+) PlanAction {
+    const record = index.records[record_index];
+    const control = record.control;
+    return .{
+        .kind = .install,
+        .package = control.package.text,
+        .version = control.version.value.original,
+        .architecture = control.architecture.text,
+        .repository = null,
+        .sha256 = null,
+        .package_size = null,
+        .installed_size_delta_bytes = 0,
+        .source_package = control.package.text,
+        .prior_installed = null,
+        .requested = false,
+        .reason = .dependency,
+        .essential = control.essential == true,
+        .has_pre_depends = control.pre_depends != null,
+        .selected_origin = null,
+        .selected_origin_v2 = .{ .authenticated_repository = .{
+            .repository_id = repository_id,
+            .repository_priority = 500,
+            .record_index = record_index,
+            .package = control.package.text,
+            .version = control.version.value.original,
+            .architecture = control.architecture.text,
+            .source_location = record.location.source,
+        } },
+    };
+}
+
+test "fresh root configures signed base-passwd and its dependencies before base-files" {
+    const hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    const text =
+        "Package: libc6\nVersion: 2.44\nArchitecture: amd64\nFilename: pool/libc6.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: libpcre2-8-0\nVersion: 10.46\nArchitecture: amd64\nDepends: libc6\nFilename: pool/libpcre2.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: libdebconfclient0\nVersion: 0.282\nArchitecture: amd64\nDepends: libc6\nFilename: pool/libdebconf.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: mawk\nVersion: 1.3\nArchitecture: amd64\nProvides: awk\nDepends: libc6\nFilename: pool/mawk.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: base-files\nVersion: 14.2ubuntu1\nArchitecture: amd64\nEssential: yes\nPre-Depends: awk\nDepends: libc6 (>= 2.34)\nProvides: base, usr-is-merged\nFilename: pool/base-files.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: libselinux1\nVersion: 3.11\nArchitecture: amd64\nDepends: libc6 (>= 2.38), libpcre2-8-0 (>= 10.22)\nFilename: pool/libselinux.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: bash\nVersion: 5.3\nArchitecture: amd64\nPre-Depends: libc6 (>= 2.38)\nDepends: base-files (>= 2.1.12)\nFilename: pool/bash.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: base-passwd\nVersion: 3.6.8\nArchitecture: amd64\nEssential: yes\nDepends: libc6 (>= 2.34), libdebconfclient0 (>= 0.145), libselinux1 (>= 3.1~)\nFilename: pool/base-passwd.deb\nSize: 1\nSHA256: " ++ hash ++ "\n";
+    const id = testRepositoryId('a');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(repositories[0], .{});
+    const repository_order = [_]usize{0};
+    var actions: [8]PlanAction = undefined;
+    for (&actions, 0..) |*action, record_index|
+        action.* = accountOrderingTestAction(&index, id, record_index);
+
+    try std.testing.expectEqual(
+        AccountOrderResult.ordered,
+        try orderFreshRootAccounts(std.testing.allocator, context, &actions, &repositories, &repository_order),
+    );
+    try std.testing.expectEqualStrings("libselinux1", actions[4].package);
+    try std.testing.expectEqualStrings("base-passwd", actions[5].package);
+    try std.testing.expectEqualStrings("base-files", actions[6].package);
+    try std.testing.expectEqualStrings("bash", actions[7].package);
+
+    const ordered = try materializeOrdering(std.testing.allocator, &actions, true);
+    defer std.testing.allocator.free(ordered);
+    var account_configured = false;
+    var account_pending = false;
+    var files_after_account = false;
+    for (ordered, 0..) |step, step_index| {
+        if (step.kind == .unpack and std.mem.eql(u8, step.package, "base-passwd"))
+            account_pending = true;
+        if (step.kind == .configure_pending and account_pending) {
+            account_configured = true;
+            account_pending = false;
+        }
+        if (step.kind == .unpack and std.mem.eql(u8, step.package, "base-files")) {
+            files_after_account = account_configured;
+            try std.testing.expectEqual(OrderedActionKind.configure_pending, ordered[step_index - 1].kind);
+        }
+    }
+    try std.testing.expect(files_after_account);
+
+    actions[6].has_pre_depends = false;
+    const implicit_barrier = try materializeOrdering(std.testing.allocator, &actions, true);
+    defer std.testing.allocator.free(implicit_barrier);
+    for (implicit_barrier, 0..) |step, step_index| {
+        if (step.kind == .unpack and std.mem.eql(u8, step.package, "base-files")) {
+            try std.testing.expectEqual(OrderedActionKind.configure_pending, implicit_barrier[step_index - 1].kind);
+            break;
+        }
+    }
+}
+
+test "fresh-root account order refuses an explicit dependency on base-files" {
+    const hash = "1111111111111111111111111111111111111111111111111111111111111111";
+    const text =
+        "Package: base-files\nVersion: 1\nArchitecture: amd64\nEssential: yes\nFilename: pool/files.deb\nSize: 1\nSHA256: " ++ hash ++ "\n\n" ++
+        "Package: base-passwd\nVersion: 1\nArchitecture: amd64\nEssential: yes\nDepends: base-files\nFilename: pool/passwd.deb\nSize: 1\nSHA256: " ++ hash ++ "\n";
+    const id = testRepositoryId('b');
+    var index = try availableIndex(id, text);
+    defer index.deinit();
+    const repositories = [_]RepositoryInput{RepositoryInput.trustedTest(id, 500, &index)};
+    const context = try Context.createForArchitecture(std.testing.allocator, "amd64");
+    defer context.destroy();
+    try context.importAvailable(repositories[0], .{});
+    const repository_order = [_]usize{0};
+    var actions = [_]PlanAction{
+        accountOrderingTestAction(&index, id, 0),
+        accountOrderingTestAction(&index, id, 1),
+    };
+    try std.testing.expectEqual(
+        AccountOrderResult.dependency_cycle,
+        try orderFreshRootAccounts(std.testing.allocator, context, &actions, &repositories, &repository_order),
+    );
+    try std.testing.expectEqualStrings("base-files", actions[0].package);
 }
 
 test "available import requires explicit trust and owns identities" {
@@ -5301,15 +5580,26 @@ test "real metadata facts produce ubuntu-minimal closures on native architecture
         try std.testing.expectEqual(OrderedActionKind.configure_pending, plan.ordered_actions[plan.ordered_actions.len - 1].kind);
         var saw_bootstrap = false;
         var saw_pre_depends_barrier = false;
+        var account_unpacked = false;
+        var account_configured = false;
+        var base_files_configured = false;
         for (plan.ordered_actions, 0..) |ordered, ordered_index| {
             if (ordered.kind == .bootstrap_extract) saw_bootstrap = true;
+            if (ordered.kind == .unpack and std.mem.eql(u8, ordered.package, "base-passwd"))
+                account_unpacked = true;
+            if (ordered.kind == .configure_pending and account_unpacked) {
+                account_configured = true;
+                account_unpacked = false;
+            }
             if (ordered.kind == .unpack and std.mem.eql(u8, ordered.package, "base-files")) {
                 try std.testing.expect(ordered_index != 0);
                 saw_pre_depends_barrier = plan.ordered_actions[ordered_index - 1].kind == .configure_pending;
+                base_files_configured = account_configured;
             }
         }
         try std.testing.expect(saw_bootstrap);
         try std.testing.expect(saw_pre_depends_barrier);
+        try std.testing.expect(base_files_configured);
     }
 }
 
