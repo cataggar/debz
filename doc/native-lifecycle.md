@@ -74,6 +74,36 @@ members. Debconf or another frontend invoking config is a different contract.
 Arm64 admission is backed by its executed canonical oracle observation, not by
 architecture-independent parsing.
 
+The authenticated `keyboard-configuration:all` 1.248ubuntu3 fresh-install
+preinst is a narrower debconf exception, not permission to execute `config`
+members. Pinned dpkg 1.22.22 registers the archive's templates before this
+preinst calls `db_get keyboard-configuration/toggle`. In the native root the
+frontend instead found no adjacent templates beside the private staged script,
+so that call exited 10. A disposable chroot reproduced exit 10 at the native
+path and exit 0 when the **exact signed** 576415-byte templates member was
+placed beside that script. Native stages that member only for the matching
+package, version, architecture, preinst digest and `install` argument, after
+proving its dependent bootstrap step, signed installed copy and journaled
+publication. The separate journaled template stage runs **at preinst**, even
+when bootstrap already staged the package's other scripts: stage-once
+short-circuiting had omitted this later sibling in the first new signed
+175-package replay. A preexisting sibling requires authenticated recovery,
+the stage's progress action and matching bytes/metadata. The existing
+bootstrap-staged config still receives its original digest/mode/owner check
+before the template stage; foreign or altered siblings are refused. Script
+exit and postrm compensation remain authoritative, not ignored.
+
+If a fresh preinst fails after its package was already bootstrapped, the
+payload and database ownership are real and cannot be erased by writing an
+unowned `not-installed` record. For an exact bootstrap-to-preinst-to-unpack
+dependency and complete publication journal, native instead retains its
+package list and signed files and durably marks it `install reinstreq
+half-installed`. That is a **conservative failed state**, not byte-for-byte
+dpkg rollback parity, and it does not turn the failed script into success.
+Other already-present packages remain refused. The pinned-dpkg lifecycle
+fixture checks the nonzero preinst and compensating postrm plus durable native
+failure state independently.
+
 Alternatives use a separate active-state boundary. Opaque package
 `.alternatives` members follow ordinary retained-metadata replacement,
 failure, removal, and purge behavior, while direct dpkg never interprets them.
@@ -313,6 +343,16 @@ postinst failure/configure retry, upgrade unwind, failed remove/purge, and
 successful settlement. A separate config-only cohort covers all seven pinned
 vendor package names and sizes, and ambient `tmp.ci` files, directories,
 symlinks, or occupants refuse before mutation.
+The essential-bootstrap preinst-failure case runs an actual nonzero preinst
+and `abort-install` against pinned dpkg and, independently, checks that native
+durably reports `script_failed`, retains its claimed bootstrap payload and
+info list, publishes the conservative half-installed state and cleans its
+operation journal. A second, independently fresh synthetic root interrupts
+after executing that failing preinst but **before** recording its exit: its
+script stays in flight, the unpacked owner remains claimed, and a retry
+returns recovery required without rerunning the script or changing the root.
+An additional config-and-templates-bearing bootstrap fixture exercises signed
+staging/cleanup and the same known-failure state.
 
 Advanced fixtures exercise:
 

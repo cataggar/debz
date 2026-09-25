@@ -518,6 +518,21 @@ package payload, with the admitted architecture digest, mode and ownership.
 Absence or mismatch fails closed before that script. The fresh-root snapshot
 workflow must therefore obtain the tool from its authenticated `dpkg` archive;
 seeding it from the runner would not satisfy this gate.
+
+For an already published fresh bootstrap package whose later incoming preinst
+fails, the failed script outcome and successful `postrm abort-install` remain
+separate durable actions. Settlement requires the dependent bootstrapped
+unpack in the same authorized program, a completed bootstrap publication
+journal (including config staging/cleanup when applicable), the matching
+unpacked database owner and signed preinst. It updates only the state to
+`install reinstreq half-installed`, retaining the existing claimed payload and
+info list rather than falsely reporting absent files. If any dependency,
+publication, installed owner, signed metadata or script evidence differs,
+settlement refuses and leaves recovery required. Recovery consumes completed
+database phases without repeating the failed script or inventing an install
+success. This intentionally differs from dpkg's preinst abort-install removal
+of a non-bootstrapped package; it is not a general half-installed admission.
+
 The reviewed amd64 `stonking` snapshot admits an additional exact executable
 digest for `dpkg` 1.23.7ubuntu2. The older dpkg 1.22.22 pins remain intact;
 the new pin does not authorize arm64, another executable digest, or a wider

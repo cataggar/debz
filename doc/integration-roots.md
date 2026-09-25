@@ -534,6 +534,68 @@ with last durable database action step 1217, substep 0. This interrupted
 root is retained, **never** reused as a fresh trial. It proves the
 step-1173 transition, not completed closure or native/reference parity.
 
+The exact authenticated keyboard archive (SHA-512
+`e69402c6d44c6715e165868b1824da00485403b8157b18235945627fead82710e812c7d4b350e5a3d89444816e769ac5dc883886f905e446aecca123bb7b72db`)
+and pinned dpkg 1.22.22 were examined in an isolated disposable root with
+independently verified signed bootstrap tools. Pinned dpkg's unpack completed
+the keyboard preinst and registered `keyboard-configuration/toggle`; the
+single-package oracle used `--force-depends` **only** to isolate the preinst
+from packages missing in that oracle, not as a claim about full-closure
+dependency parity. In controlled chroot probes against the earlier native
+debconf database, the private preinst path without adjacent templates exited
+10; the installed-info path and the private path with the exact signed
+templates sibling both exited 0. The only staged addition is that authenticated
+templates member, tied to its exact preinst and bootstrapped installed owner;
+no arbitrary debconf frontend/config execution is admitted.
+
+A newly resolved and independently SHA-512-rehashed 175-package root,
+`.real-snapshot/amd64-keyboard-fresh-long-1`, confirmed the **first** staging
+attempt did not solve step 1217: the package's scripts had already been staged
+by its early bootstrap, so the later preinst staging call returned early and
+did not add its adjacent templates. Its preinst again exited 10; abort-install
+postrm exited 0. The failure-settlement database published
+`install reinstreq half-installed` with the package files still claimed, but
+the operation subsequently returned `native recovery_required:
+invalid_transition`. The retained trigger event includes
+`keyboard-configuration:all` activating `libc-upgrade` for `systemd`, which
+remains `unpacked`; its transition to `triggers-pending` is forbidden by the
+existing database state contract. Do not relax that transition to force a
+terminal failure receipt: this root is **interrupted**, not a fresh retry or
+a demonstration of full trigger-bearing failure parity. The corrected implementation
+stages the signed templates in a distinct journaled preinst phase even when
+other scripts were staged at bootstrap.
+
+A second independently planned, downloaded and SHA-512-rehashed **new**
+175-package root, `.real-snapshot/amd64-keyboard-fresh-long-2`, used the
+corrected template stage and completed the exact keyboard preinst at step
+1217 with exit 0 and zero output
+(`native-script-outcome-v1-script-1217-0-0.json`). Its keyboard status was
+`install ok installed`. This is **not** a full-root success: step 1230
+`iproute2:amd64` 6.19.0-1ubuntu2 postinst SHA-256
+`bb5318e85da2497d1b2b6fcdf2d612bd02ec54bc5d9f86005506d8e91bb79d3a`
+with `["configure", ""]` exited 10, zero output; the journal recorded
+`script completed failed` and the subsequent database action completed, but
+the operation returned `native recovery_required: invalid_transition`.
+The installed script has that exact hash, sources `confmodule` and calls
+`db_get iproute2/setcaps`; an installed `iproute2.templates` file exists.
+The precise cause of exit 10 and the secondary transition are not yet proven.
+Preserve this interrupted root; investigate that distinct script failure and
+secondary transition separately, not by replaying this root as fresh.
+
+After rebuilding the final ReleaseSafe candidate with the bootstrap-staged
+config integrity check restored, a **third** newly refreshed, planned,
+downloaded and independently SHA-512-rehashed 175-package root,
+`.real-snapshot/amd64-keyboard-fresh-long-3`, reproduced the result. Its
+signed lock matches the second root, and `evidence/identity.txt` records the
+final binary. Step 1217 again completed the exact keyboard preinst with exit
+0, zero output and `install ok installed` status; step 1230 again recorded
+the same `iproute2` postinst exit 10 and zero output, followed by a completed
+failure-state database action and `native recovery_required:
+invalid_transition`. Its `evidence/create.json`, script outcome files and
+execution journal are retained. This third root is **also interrupted**, not
+proof of completed amd64 installation; neither interrupted root is a fresh
+retry target.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
