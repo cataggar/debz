@@ -446,6 +446,29 @@ managed action is the preceding database step 1172, substep 0; the
 step-1173 root is interrupted, retained for recovery, and **must not** be
 reused as a fresh installation. No case-alias rule was changed here.
 
+After #241 squash `b24f3816e13c3897bdd3892963f31dde9b4e2de9`, another
+**new** root, `.real-snapshot/amd64-sudo-rs-combined-241-fresh-1`, ran the
+combined source `8df430db0be9a3042dc9a4cfa83ba18c01c57510`
+(ReleaseSafe executable SHA-256
+`828d92b967cd1ecc36c873dbd9309c3f7f4ba6c56c981bca7182d2bcb2bb8ae1`).
+Its recorded prestate had no dpkg database, helper placeholders, or package
+state. The pinned Ubuntu signer authenticated its 175-package amd64 lock
+(file SHA-256
+`07f096da1a1fa614dc73e1797ff0b8cab917a59ce9d6dba400f64473ca24420a`);
+all 175 cached archives were independently rehashed against their signed
+SHA-512 identities. An untracked runner copy used the same bounded
+10,800,000-ms deadline throughout and a 90-minute `create` timeout; it was
+removed afterward. The exact signed `sudo-rs.postinst configure ""` at step
+1145 **spawned and persisted exit 0**. Its 464-byte `sudo` record matched
+the pinned dpkg SHA-256
+`4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6`,
+and both `sudoedit` links point into `/etc/alternatives`. The same run then
+exited 8 with `native recovery_required: case_alias` before the signed
+`libpam-runtime:all` unpack at step 1173; database step 1172 is the last
+stable action. The interrupted root is retained, **not** reusable as a fresh
+trial. This establishes only the step-1145 transition, not full
+native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

@@ -429,8 +429,11 @@ and unknown-outcome recovery remain unchanged. The interrupted root was not
 reused. A separate newly authenticated 175-package root persisted the exact
 signed `sudo-rs.postinst` exit-0 outcome at step 1145; its `sudo` record
 matched the 464-byte pinned dpkg reference digest above, and both structural
-links became the expected generic links into `/etc/alternatives`. This is
-step-1145 evidence, not a claim of full fresh-root parity: the run later
+links became the expected generic links into `/etc/alternatives`. A further
+fresh root on final #241 squash plus the sudo-rs change independently
+reproduced that exact signed outcome and record; see
+[integration roots](integration-roots.md). This is step-1145 evidence, not a
+claim of full fresh-root parity: the run later
 required recovery on a distinct `libpam-runtime` case-alias unpack at
 step 1173, documented in the [integration root
 log](integration-roots.md#hermetic-debian-family-integration-roots).
