@@ -800,12 +800,12 @@ jobs:
             zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \
             --diversions-only --reference-dpkg "$reference_dpkg" \
             2>"$PWD/.tmp/zig-invalid-selector.log"; then exit 1; fi
-          grep -Fq 'error.InvalidSettlementSelection' "$PWD/.tmp/zig-invalid-selector.log"
+          grep -Fxq 'error: InvalidSettlementSelection' "$PWD/.tmp/zig-invalid-selector.log"
           if sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
             zig-out/bin/native-lifecycle-zig-acceptance --oracle-only \
             --reference-dpkg "$reference_dpkg" --workspace "$lifecycle" \
             2>"$PWD/.tmp/zig-existing-workspace.log"; then exit 1; fi
-          grep -Fq 'error.PathAlreadyExists' "$PWD/.tmp/zig-existing-workspace.log"
+          grep -Fxq 'error: PathAlreadyExists' "$PWD/.tmp/zig-existing-workspace.log"
       - name: Require private native helper namespaces
         run: |
           zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all

@@ -1252,8 +1252,8 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             '            --reference-dpkg "$reference_dpkg" --workspace "$lifecycle"',
             '            --reference-dpkg "$reference_dpkg" --workspace "$trigger"',
             '          test -d "$lifecycle" && test -d "$trigger"',
-            "          grep -Fq 'error.InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"",
-            "          grep -Fq 'error.PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"",
+            "          grep -Fxq 'error: InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"",
+            "          grep -Fxq 'error: PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"",
         )
     ):
         failures.append("ci.yml: standalone Zig workspace selectors and refusals must run in every mode")
