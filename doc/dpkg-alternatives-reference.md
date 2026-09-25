@@ -386,6 +386,57 @@ alternatives group. It later refused **before launching** the unrelated
 `/usr/bin/sudoedit` already existed as a `sudo` package-owned symlink to
 `sudo.ws`. This partial-state refusal does not grant authority to replace
 that symlink, nor does the earlier procps success establish full parity.
+
+The signed `sudo-rs:amd64` 0.2.14-1ubuntu2 archive (SHA-512
+`0d4aba12d8a354c6bae762c81c95573c5d9e6d40046e415955da73c32c4e86d6d9923efeffcb0aefc12cbc59591a1348e8e094cbe957a2e765b85e5575681364`)
+ships the exact 2,100-byte `postinst` (SHA-256
+`a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17`).
+For `["configure", ""]`, it calls `set_perms root root 4755` on both
+`/usr/lib/cargo/bin/sudo` and `/usr/lib/cargo/bin/su`, then invokes a literal
+`update-alternatives --install /usr/bin/sudo sudo /usr/lib/cargo/bin/sudo 50`
+with six literal slaves. The earlier `sudo:amd64` 1.9.17p2-7ubuntu3
+archive (SHA-512
+`92d4e2391529356a959f226ed9da03119736f5e7c68458ea3cc7413caeb1dcbe610ccdfad3474516fca862153cfa149a0a4bb712e985158a9410cfa0363474f7`)
+owns **two** existing generic symlinks:
+`/usr/bin/sudoedit -> sudo.ws` and
+`/usr/share/man/man8/sudoedit.8.gz -> sudo.ws.8.gz`. The exact signed
+`sudo.list` (SHA-256
+`92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f`)
+claims both; the proposed `sudo` group, record, selectors, and all other
+generic links are absent.
+
+In disposable copies of the interrupted root, receipt-verified pinned dpkg
+1.22.22 configured the script successfully: its snapshot-pinned
+`update-alternatives` replaced **both** package-owned generic symlinks with
+links into `/etc/alternatives`. The new 464-byte `sudo` record (SHA-256
+`4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6`)
+registers the `/usr/lib/cargo/bin/sudo` candidate at priority 50 and sorts
+all six slaves by name. A separate probe confirmed that the `chown`/`chmod`
+calls change only the ctime of `sudo` and `su`; their inode, content, mode
+4755, uid/gid, link count, size, and mtime remain unchanged.
+
+Native admission binds the complete script digest, new-package amd64
+`sudo-rs` identity, exact configure arguments, snapshot tool, both signed
+archive identities, the signed `sudo.list`, and signed `sudo.ws` target
+identities. Only the two root-owned `0777`, single-link, exact-target
+package-owned generic symlinks may preexist in this **absent** group. The
+record, selectors, and other generic links must still be absent; missing
+or changed structural links refuse before launch. The only relaxed
+immutable-provider facts are the ctimes of the two signed setuid cargo
+binaries, and all their other facts remain exact. The original script and
+its exit semantics, typed reachable installation, other groups, checkpoints,
+and unknown-outcome recovery remain unchanged. The interrupted root was not
+reused. A separate newly authenticated 175-package root persisted the exact
+signed `sudo-rs.postinst` exit-0 outcome at step 1145; its `sudo` record
+matched the 464-byte pinned dpkg reference digest above, and both structural
+links became the expected generic links into `/etc/alternatives`. A further
+fresh root on final #241 squash plus the sudo-rs change independently
+reproduced that exact signed outcome and record; see
+[integration roots](integration-roots.md). This is step-1145 evidence, not a
+claim of full fresh-root parity: the run later
+required recovery on a distinct `libpam-runtime` case-alias unpack at
+step 1173, documented in the [integration root
+log](integration-roots.md#hermetic-debian-family-integration-roots).
 The new failed root is retained for recovery.
 
 External tool execution intentionally retains the oracle's observable

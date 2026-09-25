@@ -18972,6 +18972,216 @@ fn snapshotProcpsPostinstIsInert(
     return true;
 }
 
+fn snapshotSudoRsPostinstIsBound(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotSudoRsPostinst(bytes)) return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "sudo-rs") or
+        !std.mem.eql(u8, package.version, "0.2.14-1ubuntu2") or
+        kind != .postinst or source != .new_package or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[0], "configure") or
+        arguments[1].len != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+fn verifySudoRsStructuralOwner(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+) !void {
+    const expected_artifacts = [_]struct {
+        name: []const u8,
+        version: []const u8,
+        size: u64,
+        sha512: []const u8,
+    }{
+        .{
+            .name = "sudo",
+            .version = "1.9.17p2-7ubuntu3",
+            .size = 954870,
+            .sha512 = "92d4e2391529356a959f226ed9da03119736f5e7c68458ea3cc7413caeb1dcbe610ccdfad3474516fca862153cfa149a0a4bb712e985158a9410cfa0363474f7",
+        },
+        .{
+            .name = "sudo-rs",
+            .version = "0.2.14-1ubuntu2",
+            .size = 595874,
+            .sha512 = "0d4aba12d8a354c6bae762c81c95573c5d9e6d40046e415955da73c32c4e86d6d9923efeffcb0aefc12cbc59591a1348e8e094cbe957a2e765b85e5575681364",
+        },
+    };
+    for (expected_artifacts) |expected| {
+        const digest = (try content_digest.Value.parse(.sha512, expected.sha512)).sha512;
+        var found = false;
+        for (program.artifacts) |artifact| {
+            if (!std.mem.eql(u8, artifact.package.name, expected.name) or
+                !std.mem.eql(u8, artifact.package.architecture, "amd64"))
+                continue;
+            const identity = artifact.identity() orelse
+                return error.InvalidAlternativesScriptAuthority;
+            const observed = identity.digests.sha512 orelse
+                return error.InvalidAlternativesScriptAuthority;
+            if (found or
+                !std.mem.eql(u8, artifact.package.version, expected.version) or
+                artifact.size != expected.size or
+                identity.primary != .sha512 or
+                !std.crypto.timing_safe.eql([64]u8, observed, digest))
+                return error.InvalidAlternativesScriptAuthority;
+            const origin = artifact.origin_v2 orelse
+                return error.InvalidAlternativesScriptAuthority;
+            switch (origin) {
+                .authenticated_repository => {},
+                else => return error.InvalidAlternativesScriptAuthority,
+            }
+            found = true;
+        }
+        if (!found) return error.InvalidAlternativesScriptAuthority;
+    }
+    const expected_files = [_]struct {
+        path: []const u8,
+        mode: u32,
+        size: u64,
+        sha256: []const u8,
+    }{
+        .{
+            .path = "var/lib/dpkg/info/sudo.list",
+            .mode = 0o644,
+            .size = 2376,
+            .sha256 = "92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f",
+        },
+        .{
+            .path = "usr/bin/sudo.ws",
+            .mode = 0o4755,
+            .size = 282080,
+            .sha256 = "6937a49a2396307d74c575c4066a8db8bcea21bbc6fa4dc01cadc724e586d4aa",
+        },
+        .{
+            .path = "usr/share/man/man8/sudo.ws.8.gz",
+            .mode = 0o644,
+            .size = 12804,
+            .sha256 = "43b6a4b66f9eb6a430f64e2b25084a100b2e152cfd8896cb83f9ced170793d75",
+        },
+    };
+    for (expected_files) |expected| {
+        var pinned = try root.pinRegularFile(try root_fs.Path.init(expected.path));
+        defer pinned.close();
+        const observation = try pinned.observeStableAlloc(allocator, 8 * 1024 * 1024);
+        defer allocator.free(observation.bytes);
+        if (observation.entry.uid != 0 or observation.entry.gid != 0 or
+            observation.entry.mode != expected.mode or
+            observation.entry.link_count != 1 or
+            observation.entry.size != expected.size)
+            return error.InvalidAlternativesScriptAuthority;
+        var observed: [32]u8 = undefined;
+        Sha256.hash(observation.bytes, &observed, .{});
+        const digest = (try content_digest.Value.parse(
+            .sha256,
+            expected.sha256,
+        )).sha256;
+        if (!std.crypto.timing_safe.eql([32]u8, observed, digest))
+            return error.InvalidAlternativesScriptAuthority;
+    }
+}
+
+test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure" {
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst",
+    );
+    const sudo_rs: native_program.PackageIdentity = .{
+        .name = "sudo-rs",
+        .version = "0.2.14-1ubuntu2",
+        .architecture = "amd64",
+    };
+    try testing.expect(try snapshotSudoRsPostinstIsBound(
+        script,
+        "amd64",
+        sudo_rs,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expect(!(try snapshotSudoRsPostinstIsBound(
+        "#!/bin/sh\nupdate-alternatives --auto sudo\n",
+        "amd64",
+        sudo_rs,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    changed[changed.len - 1] = ' ';
+    try testing.expect(!(try snapshotSudoRsPostinstIsBound(
+        changed,
+        "amd64",
+        sudo_rs,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    var wrong = sudo_rs;
+    wrong.name = "sudo";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotSudoRsPostinstIsBound(
+            script,
+            "amd64",
+            wrong,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+        ),
+    );
+    wrong = sudo_rs;
+    wrong.version = "0.2.14-1ubuntu3";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotSudoRsPostinstIsBound(
+            script,
+            "amd64",
+            wrong,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+        ),
+    );
+    wrong = sudo_rs;
+    wrong.architecture = "arm64";
+    const cases = [_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = sudo_rs,
+        kind: maintainer_script.Kind = .postinst,
+        source: native_program.ScriptSource = .new_package,
+        arguments: []const []const u8 = &.{ "configure", "" },
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = wrong },
+        .{ .kind = .preinst },
+        .{ .source = .installed_package },
+        .{ .arguments = &.{"configure"} },
+        .{ .arguments = &.{ "configure", "1" } },
+        .{ .arguments = &.{ "abort-upgrade", "" } },
+    };
+    for (cases) |case| try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotSudoRsPostinstIsBound(
+            script,
+            case.architecture,
+            case.package,
+            case.kind,
+            case.source,
+            case.arguments,
+        ),
+    );
+}
+
 test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
@@ -19281,6 +19491,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
 fn prepareAlternativesScriptBoundary(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
+    program: *const native_program.Program,
     architecture: []const u8,
     script_bytes: []const u8,
     package: native_program.PackageIdentity,
@@ -19322,6 +19533,14 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    const snapshot_sudo_rs_postinst = try snapshotSudoRsPostinstIsBound(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -19338,10 +19557,13 @@ fn prepareAlternativesScriptBoundary(
         root,
         architecture,
     );
-    if ((inert or snapshot_postinst or snapshot_bash_postinst) and !native_alternatives.matchesSnapshotTool(
+    if ((inert or snapshot_postinst or snapshot_bash_postinst or
+        snapshot_sudo_rs_postinst) and !native_alternatives.matchesSnapshotTool(
         architecture,
         tool_digest,
     )) return error.InvalidAlternativesTool;
+    if (snapshot_sudo_rs_postinst)
+        try verifySudoRsStructuralOwner(allocator, root, program);
     var listed = try native_alternatives.listGroups(
         allocator,
         root,
@@ -19374,6 +19596,10 @@ fn prepareAlternativesScriptBoundary(
             .topology = group.topology,
             .allow_absent = true,
             .mutable = !inert,
+            .structural_links = if (snapshot_sudo_rs_postinst)
+                group.structural_links
+            else
+                &.{},
         };
         before_count += 1;
     }
@@ -19747,6 +19973,7 @@ fn runLifecycleScript(
     alternatives_boundary = prepareAlternativesScriptBoundary(
         allocator,
         root,
+        program,
         program.target_architecture,
         script_bytes,
         package,

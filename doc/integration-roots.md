@@ -409,6 +409,66 @@ bounded `create` timeout from 30 to 90 minutes and was removed afterward.
 The interrupted root remains read-only; this does not prove complete install
 or native/reference parity.
 
+The signed `sudo-rs` postinst and pinned dpkg 1.22.22 were probed in
+**disposable copies** of that root. Both `/usr/bin/sudoedit -> sudo.ws` and
+`/usr/share/man/man8/sudoedit.8.gz -> sudo.ws.8.gz` are exact signed
+`sudo` package-owned symlinks; the `sudo` alternatives record and selectors
+are absent. Pinned dpkg configures `sudo-rs` successfully, replacing both
+links and registering the six-slave priority-50 group. Its `set_perms`
+calls change only the ctimes of the setuid cargo `sudo` and `su` binaries.
+The [alternatives reference](dpkg-alternatives-reference.md#native-admission)
+records the exact archives, script, record digest, narrow structural-link
+exception, scoped ctime checks, and unchanged failure/recovery boundary.
+The interrupted procps-root was not retried or modified.
+
+A separate **new** root,
+`.real-snapshot/amd64-sudo-rs-fresh-long-1`, authenticated the reviewed
+Ubuntu signer, reverified all 175 signed SHA-512 package objects, and used
+one consistent 10,800,000-ms refresh/plan/download/install deadline. It
+resolved a new lock (file SHA-256
+`07f096da1a1fa614dc73e1797ff0b8cab917a59ce9d6dba400f64473ca24420a`).
+It persisted exit 0 for less.postinst step 888, bash.postinst step 976,
+netcat-openbsd.postinst step 1026, procps.postinst step 1065, and the exact
+sudo-rs.postinst step 1145. The resulting 464-byte priority-50 `sudo`
+record has SHA-256
+`4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6`,
+identical to pinned dpkg; both package-owned `sudoedit` generic symlinks
+were replaced by links into `/etc/alternatives`. This evidence establishes
+the step-1145 transition only, not complete native/reference parity.
+The same run subsequently returned `native recovery_required: case_alias`
+during the **unpack** of `libpam-runtime:all` 1.7.0-5ubuntu4 at step 1173
+(archive SHA-512
+`3f957eea17e67a3ac263667d62c2f292c684fb28b6bb282ec60cf01559bfaf960528695c3e674e7e350830bb9ed35eb31612d920f505e05b78cc48cd06ea2edf`).
+The signed archive contains both
+`usr/share/man/man7/PAM.7.gz` (regular) and
+`usr/share/man/man7/pam.7.gz -> PAM.7.gz` (symlink). Its last stable
+managed action is the preceding database step 1172, substep 0; the
+step-1173 root is interrupted, retained for recovery, and **must not** be
+reused as a fresh installation. No case-alias rule was changed here.
+
+After #241 squash `b24f3816e13c3897bdd3892963f31dde9b4e2de9`, another
+**new** root, `.real-snapshot/amd64-sudo-rs-combined-241-fresh-1`, ran the
+combined source `8df430db0be9a3042dc9a4cfa83ba18c01c57510`
+(ReleaseSafe executable SHA-256
+`828d92b967cd1ecc36c873dbd9309c3f7f4ba6c56c981bca7182d2bcb2bb8ae1`).
+Its recorded prestate had no dpkg database, helper placeholders, or package
+state. The pinned Ubuntu signer authenticated its 175-package amd64 lock
+(file SHA-256
+`07f096da1a1fa614dc73e1797ff0b8cab917a59ce9d6dba400f64473ca24420a`);
+all 175 cached archives were independently rehashed against their signed
+SHA-512 identities. An untracked runner copy used the same bounded
+10,800,000-ms deadline throughout and a 90-minute `create` timeout; it was
+removed afterward. The exact signed `sudo-rs.postinst configure ""` at step
+1145 **spawned and persisted exit 0**. Its 464-byte `sudo` record matched
+the pinned dpkg SHA-256
+`4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6`,
+and both `sudoedit` links point into `/etc/alternatives`. The same run then
+exited 8 with `native recovery_required: case_alias` before the signed
+`libpam-runtime:all` unpack at step 1173; database step 1172 is the last
+stable action. The interrupted root is retained, **not** reusable as a fresh
+trial. This establishes only the step-1145 transition, not full
+native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
