@@ -510,6 +510,117 @@ class SecurityAuditTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode == 0, build == recovery == "success")
 
+    def test_lifecycle_migration_retires_four_python_gates_without_weakening_reference_refusal(self) -> None:
+        build = (ROOT / "build.zig").read_text()
+        trigger = (ROOT / "test/native_trigger_acceptance.zig").read_text()
+        check = security_audit.native_lifecycle_migration_failures
+        self.assertEqual([], check(build, trigger))
+        for entrypoint in (
+            "tools/test-native-lifecycle.py",
+            "tools/test_native_lifecycle.py",
+            "tools/test-native-triggers.py",
+            "tools/test_native_triggers.py",
+        ):
+            with self.subTest(entrypoint=entrypoint):
+                self.assertTrue(check(build + f' \"{entrypoint}\"', trigger))
+        for binding in (
+            'const native_lifecycle_step = b.step("test-native-lifecycle",',
+            'const native_triggers_step = b.step("test-native-triggers",',
+            "native_lifecycle_step.dependOn(&lifecycle_zig.step);",
+            "native_triggers_step.dependOn(&trigger_zig.step);",
+            "native_triggers_step.dependOn(&run_native_trigger_queue_tests.step);",
+            "lifecycle_zig.addArtifactArg(native_lifecycle_tests);",
+            "trigger_zig.addArtifactArg(native_lifecycle_tests);",
+            'trigger_zig.addArg("--native-helper");',
+            "trigger_zig.addArtifactArg(native_trigger_helper);",
+            "test_step.dependOn(&run_lifecycle_zig_tests.step);",
+            "test_step.dependOn(&run_trigger_zig_tests.step);",
+            "test_step.dependOn(&run_settlement_tests.step);",
+            'b.step("test-native-lifecycle-zig-oracle",',
+            'b.step("test-native-triggers-zig-oracle",',
+            'b.step("test-native-triggers-zig-settlement-reference",',
+            'settlement_oracle_zig.addArgs(&.{ "--oracle-only", "--diversion-settlement-reference-only" });',
+            "settlement_unit_step.dependOn(&run_settlement_lowering_tests.step);",
+        ):
+            with self.subTest(binding=binding):
+                self.assertTrue(check(build.replace(binding, ""), trigger))
+        for token in (
+            "for ([_]bool{ false, true }) |awaiting|",
+            ".no_scripts = true",
+            "support.reference(fixture, dpkg, root",
+            "Status: install ok unpacked",
+            "Status: install ok half-configured",
+            "Triggers-Pending:",
+            "Triggers-Awaited:",
+            "queue.len != 0",
+            "activation-returned",
+            "exit 1",
+            "failedPostinstUnconfiguredListener(&fixture, reference.executable, reference.architecture)",
+        ):
+            with self.subTest(token=token):
+                self.assertTrue(check(build, trigger.replace(token, "")))
+        for token in (
+            "fn refuseUnconfiguredListenerProgram(",
+            "case.seedWith(handler, false)",
+            'report.value.detail, "program_compile_rejected"',
+            "foundation.captureRealRoot(",
+            "support.assertNoActiveEvidence(",
+            "refuseUnconfiguredListenerProgram(&fixture, native_driver, selected, reference.executable, reference.architecture)",
+            "if (oracle_only == (driver != null) or (helper != null) != (driver != null))",
+            "if (settlement_reference_only and (!oracle_only or diversions_only))",
+            "if (fixture.oracle_only) return;",
+            "settlement.run(&fixture, native_driver, reference.executable, selected, reference.architecture)",
+        ):
+            with self.subTest(refusal=token):
+                self.assertTrue(check(build, trigger.replace(token, "")))
+
+    def test_lifecycle_migration_removes_entrypoints_and_preserves_fixture_imports(self) -> None:
+        retired = (
+            "tools/test-native-lifecycle.py",
+            "tools/test_native_lifecycle.py",
+            "tools/test-native-triggers.py",
+            "tools/test_native_triggers.py",
+        )
+        fixture_paths = (
+            "tools/native-lifecycle-fixtures.py",
+            "tools/native-trigger-fixtures.py",
+        )
+        consumers = (
+            "tools/test-native-recovery.py",
+            "tools/dpkg-config-reference.py",
+            "actions/install/__tests__/integration.test.ts",
+        )
+        texts = {path: (ROOT / path).read_text() for path in (*fixture_paths, *consumers)}
+        check = security_audit.native_lifecycle_fixture_failures
+        self.assertEqual([], check(texts))
+        for path in retired:
+            with self.subTest(restored=path):
+                self.assertTrue(check({**texts, path: ""}))
+        for path in fixture_paths:
+            with self.subTest(missing=path):
+                self.assertTrue(check({name: body for name, body in texts.items() if name != path}))
+            for entrypoint in (
+                "#!/usr/bin/env python3\n",
+                "\nimport argparse\n",
+                "\ndef main() -> int:\n",
+                '\nif __name__ == "__main__":\n',
+            ):
+                with self.subTest(fixture=path, entrypoint=entrypoint):
+                    changed = (
+                        entrypoint + texts[path]
+                        if entrypoint.startswith("#!")
+                        else texts[path] + entrypoint
+                    )
+                    self.assertTrue(check({**texts, path: changed}))
+        for path in (fixture_paths[1], *consumers):
+            with self.subTest(importer=path):
+                fixture = (
+                    "native-trigger-fixtures.py"
+                    if path == "tools/test-native-recovery.py"
+                    else "native-lifecycle-fixtures.py"
+                )
+                self.assertTrue(check({**texts, path: texts[path].replace(fixture, "missing.py")}))
+
     def test_build_workloads_keep_both_modes_and_all_existing_suites(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))
@@ -532,7 +643,31 @@ class SecurityAuditTests(unittest.TestCase):
             ("-Doptimize=\"$OPTIMIZE\"", "-Doptimize=Debug"),
             ("test-native-materialization test-native-conffiles", "test-native-materialization"),
             ("test-native-differential", ""),
-            ("test-native-lifecycle test-native-triggers", "test-native-lifecycle"),
+            (
+                "test-native-lifecycle-zig test-native-triggers-zig "
+                "test-native-diversion-settlement-zig",
+                "test-native-lifecycle-zig test-native-triggers-zig",
+            ),
+            (
+                "test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle "
+                "test-native-triggers-zig-settlement-reference",
+                "test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle",
+            ),
+            (
+                'test-native-diversion-settlement-zig \\\n'
+                '            -Dnative-reference-dpkg="$reference_dpkg"',
+                'test-native-diversion-settlement-zig \\\n'
+                '            -Dnative-reference-dpkg="$untrusted_dpkg"',
+            ),
+            (
+                "      - name: Exercise standalone Zig workspace selectors and fail-closed combinations\n",
+                "      - name: Exercise standalone Zig workspace selectors and fail-closed combinations\n        if: false\n",
+            ),
+            ('          zig build build-native-acceptance-zig -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \\', ""),
+            ('            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\', ""),
+            ("          grep -Fxq 'error: InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"", ""),
+            ("          grep -Fxq 'error: PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"", ""),
             ('reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"', "reference_dpkg=/usr/bin/dpkg"),
             ('-Dnative-reference-dpkg="$reference_dpkg"', ""),
             ("test-native-helper-namespace", "test"),

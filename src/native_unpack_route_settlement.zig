@@ -3047,6 +3047,32 @@ test "native_unpack.test.success route settlement lowers every reference profile
                 expected_disposition,
                 rolled_back.partial_routes[0].disposition,
             );
+            try testing.expectEqualStrings(
+                profile.payload_route,
+                rolled_back.partial_routes[0].payload_route,
+            );
+            try testing.expectEqual(
+                profile.trigger_paths.len,
+                rolled_back.partial_routes[0].trigger_paths.len,
+            );
+            for (
+                profile.trigger_paths,
+                rolled_back.partial_routes[0].trigger_paths,
+            ) |expected, actual|
+                try testing.expectEqualStrings(expected, actual);
+            if (profile.backup == .retain) {
+                const expected_backup = try std.fmt.allocPrint(
+                    owned,
+                    "{s}.dpkg-tmp",
+                    .{profile.payload_route},
+                );
+                try testing.expectEqualStrings(
+                    expected_backup,
+                    rolled_back.partial_routes[0].backup_path.?,
+                );
+            } else {
+                try testing.expect(rolled_back.partial_routes[0].backup_path == null);
+            }
             if (std.mem.eql(u8, profile.member, "regular")) {
                 const unwound = try lowerOutcome(
                     owned,

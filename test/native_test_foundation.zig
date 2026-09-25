@@ -20,13 +20,19 @@ pub const Fixture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     diagnostics: bool = true,
+    retain: bool = false,
     path: []u8,
     name: []const u8,
     parent: std.Io.Dir,
     dir: std.Io.Dir,
     environment: std.process.Environ.Map,
+    oracle_only: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, repository: []const u8) !Fixture {
+        return initWorkspace(allocator, io, repository, null);
+    }
+
+    pub fn initWorkspace(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, requested: ?[]const u8) !Fixture {
         var repository_dir = try openRealDirectory(io, repository);
         defer repository_dir.close(io);
         try repository_dir.createDirPath(io, ".tmp");
@@ -35,13 +41,34 @@ pub const Fixture = struct {
             .follow_symlinks = false,
         });
         errdefer parent.close(io);
-        var random: [12]u8 = undefined;
-        try io.randomSecure(&random);
-        const name = try std.fmt.allocPrint(allocator, "native-zig-{x}", .{std.fmt.bytesToHex(random, .lower)});
+        const name = if (requested) |workspace| blk: {
+            var cwd: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const cwd_len = try std.process.currentPath(io, &cwd);
+            const resolved = try std.fs.path.resolve(allocator, &.{ cwd[0..cwd_len], workspace });
+            defer allocator.free(resolved);
+            const fixture_parent = try std.fs.path.join(allocator, &.{ repository, ".tmp" });
+            defer allocator.free(fixture_parent);
+            if (!std.mem.eql(u8, std.fs.path.dirname(resolved) orelse "", fixture_parent))
+                return error.WorkspaceOutsideFixtureParent;
+            const leaf = std.fs.path.basename(resolved);
+            _ = try root_fs.Path.init(leaf);
+            break :blk try allocator.dupe(u8, leaf);
+        } else blk: {
+            var random: [12]u8 = undefined;
+            try io.randomSecure(&random);
+            break :blk try std.fmt.allocPrint(allocator, "native-zig-{x}", .{std.fmt.bytesToHex(random, .lower)});
+        };
         errdefer allocator.free(name);
-        const dir = try parent.createDirPathOpen(io, name, .{
-            .open_options = .{ .iterate = true, .follow_symlinks = false },
-        });
+        if (requested != null) {
+            try parent.createDir(io, name, .fromMode(0o700));
+            errdefer parent.deleteDir(io, name) catch {};
+        }
+        const dir = if (requested != null)
+            try parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false })
+        else
+            try parent.createDirPathOpen(io, name, .{
+                .open_options = .{ .iterate = true, .follow_symlinks = false },
+            });
         errdefer {
             dir.close(io);
             parent.deleteTree(io, name) catch {};
@@ -65,6 +92,7 @@ pub const Fixture = struct {
         return .{
             .allocator = allocator,
             .io = io,
+            .retain = requested != null,
             .path = path,
             .name = name,
             .parent = parent,
@@ -76,25 +104,29 @@ pub const Fixture = struct {
     pub fn deinit(self: *Fixture) void {
         self.environment.deinit();
         self.dir.close(self.io);
-        self.parent.deleteTree(self.io, self.name) catch |err|
-            std.debug.print("failed to remove disposable fixture {s}: {s}\n", .{ self.path, @errorName(err) });
+        if (self.retain) {
+            std.debug.print("retained native fixture: {s}\n", .{self.path});
+        } else {
+            self.parent.deleteTree(self.io, self.name) catch |err|
+                std.debug.print("failed to remove disposable fixture {s}: {s}\n", .{ self.path, @errorName(err) });
+        }
         self.parent.close(self.io);
         self.allocator.free(self.path);
         self.allocator.free(self.name);
     }
 
     pub fn absolute(self: Fixture, relative: []const u8) ![]u8 {
-        _ = try root_fs.Path.init(relative);
+        _ = try root_fs.Path.initPackage(relative);
         return std.fs.path.join(self.allocator, &.{ self.path, relative });
     }
 
     pub fn directory(self: Fixture, relative: []const u8) !void {
-        _ = try root_fs.Path.init(relative);
+        _ = try root_fs.Path.initPackage(relative);
         try self.dir.createDirPath(self.io, relative);
     }
 
     pub fn write(self: Fixture, relative: []const u8, bytes: []const u8, mode: u32) !void {
-        const path = try root_fs.Path.init(relative);
+        const path = try root_fs.Path.initPackage(relative);
         if (path.parent()) |parent_path|
             try self.dir.createDirPath(self.io, parent_path.text);
         var file = try self.dir.createFile(self.io, relative, .{
@@ -230,7 +262,7 @@ pub const Fixture = struct {
             }
         }
         for (options.extra_files) |file| {
-            _ = try root_fs.Path.init(file.path);
+            _ = try root_fs.Path.initPackage(file.path);
             const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ source, file.path });
             defer self.allocator.free(path);
             try self.write(path, file.content, file.mode);
@@ -281,7 +313,7 @@ pub const Fixture = struct {
                     std.mem.startsWith(u8, entry.path, "DEBIAN/")) continue;
                 const relative = try self.allocator.dupe(u8, entry.path);
                 errdefer self.allocator.free(relative);
-                const bytes = try root.readFileAlloc(self.allocator, try root_fs.Path.init(relative), max_database_bytes);
+                const bytes = try root.readFileAlloc(self.allocator, try root_fs.Path.initPackage(relative), max_database_bytes);
                 defer self.allocator.free(bytes);
                 var md5: [16]u8 = undefined;
                 std.crypto.hash.Md5.hash(bytes, &md5, .{});
@@ -307,7 +339,7 @@ pub const Fixture = struct {
             var walker = try source_dir.walk(self.allocator);
             defer walker.deinit();
             while (try walker.next(self.io)) |entry| {
-                const path = try root_fs.Path.init(entry.path);
+                const path = try root_fs.Path.initPackage(entry.path);
                 try root.applyMetadata(path, .{
                     .modified_nanoseconds = (if (options.zero_time_path) |zero| (if (std.mem.eql(u8, entry.path, zero)) @as(i128, 0) else epoch) else epoch) * std.time.ns_per_s,
                 });
@@ -600,7 +632,7 @@ fn normalizedLines(allocator: std.mem.Allocator, content: []const u8, path_list:
         try lines.append(allocator, line);
     }
     std.mem.sort([]const u8, lines.items, {}, lessText);
-    if (path_list) for (lines.items[1..], lines.items[0..lines.items.len -| 1]) |after, before| {
+    if (path_list and lines.items.len > 1) for (lines.items[1..], lines.items[0 .. lines.items.len - 1]) |after, before| {
         if (std.mem.eql(u8, after, before)) return error.DuplicatePackagePath;
     };
     return std.mem.join(allocator, "\n", lines.items);
@@ -838,7 +870,7 @@ fn captureFilesystem(
         }
         if (entries.items.len >= limits.max_entries) return error.FilesystemEntryLimit;
         const relative = try allocator.dupe(u8, path);
-        const metadata = try root.entry(try root_fs.Path.init(relative));
+        const metadata = try root.entry(try root_fs.Path.initPackage(relative));
         if (!metadata.modeled) return error.UnsupportedFilesystemMetadata;
         const full = try std.fs.path.join(allocator, &.{ absolute, relative });
         const item: FilesystemEntry = .{
@@ -865,7 +897,7 @@ fn captureFilesystem(
             if (metadata.size > limits.max_file_bytes) return error.FilesystemFileLimit;
             total_bytes += metadata.size;
             if (total_bytes > limits.max_total_regular_bytes) return error.FilesystemFileLimit;
-            var file = try root.openRegularFile(try root_fs.Path.init(relative));
+            var file = try root.openRegularFile(try root_fs.Path.initPackage(relative));
             defer file.close(io);
             const opened = try file.stat(io);
             if (opened.size != metadata.size or opened.inode != metadata.inode)
@@ -889,7 +921,7 @@ fn captureFilesystem(
         } else if (metadata.kind == .sym_link) {
             var buffer: [4096]u8 = undefined;
             appended.target = try allocator.dupe(u8, try root.readSymbolicLink(
-                try root_fs.Path.init(relative),
+                try root_fs.Path.initPackage(relative),
                 &buffer,
             ));
         } else if (metadata.kind == .character_device or metadata.kind == .block_device) {

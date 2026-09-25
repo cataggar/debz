@@ -34,7 +34,7 @@ except ModuleNotFoundError as error:
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "debz_recovery_triggers", ROOT / "tools/test-native-triggers.py",
+    "debz_recovery_triggers", ROOT / "tools/native-trigger-fixtures.py",
 )
 assert SPEC and SPEC.loader
 triggers = importlib.util.module_from_spec(SPEC)

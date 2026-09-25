@@ -1193,7 +1193,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         ),
         "Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg": (
             '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-            "          zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \\",
+            "          zig build test-native-materialization test-native-conffiles test-native-differential \\",
             '            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
         "Require private native helper namespaces": (
@@ -1211,6 +1211,52 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         '            .zig-cache/apt-system-acceptance-local 2>/dev/null || true',
     )):
         failures.append("ci.yml: apt acceptance caches must be normalized for both modes")
+    compare_name = (
+        "Compare native materialization, conffiles, differential, "
+        "lifecycle, and triggers with dpkg"
+    )
+    compare = steps.get(compare_name, "")
+    script = compare.split("        run: |\n", 1)
+    compare_commands = (
+        [
+            line.strip() for line in script[1].splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if len(script) == 2
+        else []
+    )
+    expected_compare_commands = [
+        *(line.strip() for line in shared_steps[compare_name]),
+        "zig build test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig \\",
+        shared_steps[compare_name][2].strip(),
+        "zig build test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle test-native-triggers-zig-settlement-reference \\",
+        shared_steps[compare_name][2].strip(),
+    ]
+    if compare_commands != expected_compare_commands:
+        failures.append(
+            "ci.yml: both native differential suites must execute with "
+            "the pinned dpkg in every build workload"
+        )
+    selectors = steps.get(
+        "Exercise standalone Zig workspace selectors and fail-closed combinations", ""
+    )
+    if re.search(r"(?m)^        if:", selectors) or selectors.count(
+        '            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\'
+    ) != 2 or any(
+        command not in selectors.splitlines()
+        for command in (
+            '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+            '          zig build build-native-acceptance-zig -Doptimize="$OPTIMIZE" -j2 --summary all',
+            '            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \\',
+            '            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\',
+            '            --reference-dpkg "$reference_dpkg" --workspace "$lifecycle"',
+            '            --reference-dpkg "$reference_dpkg" --workspace "$trigger"',
+            '          test -d "$lifecycle" && test -d "$trigger"',
+            "          grep -Fxq 'error: InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"",
+            "          grep -Fxq 'error: PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"",
+        )
+    ):
+        failures.append("ci.yml: standalone Zig workspace selectors and refusals must run in every mode")
     selected_steps = {
         "Test release packaging": ("Debug", (
             "        run: zig build test-release -j2 --summary all",
@@ -1294,7 +1340,148 @@ def ghr_zig_workflow_failures(
     return failures
 
 
+def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
+    failures: list[str] = []
+    for entrypoint in (
+        "tools/test-native-lifecycle.py",
+        "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",
+        "tools/test_native_triggers.py",
+    ):
+        if f'"{entrypoint}"' in build:
+            failures.append(f"build.zig: retired Python acceptance gate was restored: {entrypoint}")
+    for binding in (
+        'const native_lifecycle_step = b.step("test-native-lifecycle",',
+        'const native_triggers_step = b.step("test-native-triggers",',
+        "native_lifecycle_step.dependOn(&lifecycle_zig.step);",
+        "native_triggers_step.dependOn(&trigger_zig.step);",
+        "native_triggers_step.dependOn(&run_native_trigger_queue_tests.step);",
+        "lifecycle_zig.addArtifactArg(native_lifecycle_tests);",
+        "trigger_zig.addArtifactArg(native_lifecycle_tests);",
+        'trigger_zig.addArg("--native-helper");',
+        "trigger_zig.addArtifactArg(native_trigger_helper);",
+        "test_step.dependOn(&run_lifecycle_zig_tests.step);",
+        "test_step.dependOn(&run_trigger_zig_tests.step);",
+        "test_step.dependOn(&run_settlement_tests.step);",
+        'b.step("test-native-lifecycle-zig-oracle",',
+        'b.step("test-native-triggers-zig-oracle",',
+        'b.step("test-native-triggers-zig-settlement-reference",',
+        'settlement_oracle_zig.addArgs(&.{ "--oracle-only", "--diversion-settlement-reference-only" });',
+        "settlement_unit_step.dependOn(&run_settlement_lowering_tests.step);",
+    ):
+        if binding not in build:
+            failures.append(f"build.zig: missing required lifecycle/trigger gate binding: {binding}")
+    marker = "fn failedPostinstUnconfiguredListener("
+    body = trigger.partition(marker)[2].partition("\nfn refuseMalformedQueue(")[0]
+    required = (
+        "for ([_]bool{ false, true }) |awaiting|",
+        ".no_scripts = true",
+        "support.reference(fixture, dpkg, root",
+        "Status: install ok unpacked",
+        "Status: install ok half-configured",
+        "Triggers-Pending:",
+        "Triggers-Awaited:",
+        "queue.len != 0",
+        "activation-returned",
+        "exit 1",
+    )
+    if not body or any(value not in body for value in required) or "support.native(" in body:
+        failures.append(
+            "native_trigger_acceptance.zig: keep both failed-postinst "
+            "unconfigured-listener cases as reference-only observations"
+        )
+    if "failedPostinstUnconfiguredListener(&fixture, reference.executable, reference.architecture)" not in trigger:
+        failures.append(
+            "native_trigger_acceptance.zig: invoke both unconfigured-listener "
+            "references in the required trigger suite"
+        )
+    refusal = trigger.partition("fn refuseUnconfiguredListenerProgram(")[2].partition("\nfn interruptedTriggerHandler(")[0]
+    if not refusal or any(value not in refusal for value in (
+        "for ([_]bool{ false, true }) |awaiting|",
+        "case.seedWith(handler, false)",
+        'report.value.detail, "program_compile_rejected"',
+        "foundation.captureRealRoot(",
+        "support.assertNoActiveEvidence(",
+    )) or "refuseUnconfiguredListenerProgram(&fixture, native_driver, selected, reference.executable, reference.architecture)" not in trigger:
+        failures.append(
+            "native_trigger_acceptance.zig: both unsupported listener programs "
+            "must refuse before mutation and leave no active authority"
+        )
+    if any(token not in trigger for token in (
+        "if (oracle_only == (driver != null) or (helper != null) != (driver != null))",
+        "if (settlement_reference_only and (!oracle_only or diversions_only))",
+        "if (fixture.oracle_only) return;",
+        "settlement.run(&fixture, native_driver, reference.executable, selected, reference.architecture)",
+    )):
+        failures.append("native_trigger_acceptance.zig: selector or helper reference isolation removed")
+    return failures
+
+
+def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    retired = (
+        "tools/test-native-lifecycle.py",
+        "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",
+        "tools/test_native_triggers.py",
+    )
+    for relative in retired:
+        if relative in texts:
+            failures.append(f"{relative}: retired Python test entry point still exists")
+    for relative in (
+        "tools/native-lifecycle-fixtures.py",
+        "tools/native-trigger-fixtures.py",
+    ):
+        source = texts.get(relative)
+        if source is None:
+            failures.append(f"{relative}: required import-only fixture module is missing")
+        elif (
+            source.startswith("#!")
+            or re.search(r"(?m)^import argparse\b|^from argparse\b|^def main\(|^if __name__\s*==", source)
+        ):
+            failures.append(f"{relative}: fixture module restored a Python CLI entry point")
+    for consumer, fixture in (
+        ("tools/native-trigger-fixtures.py", "native-lifecycle-fixtures.py"),
+        ("tools/test-native-recovery.py", "native-trigger-fixtures.py"),
+        ("tools/dpkg-config-reference.py", "native-lifecycle-fixtures.py"),
+        ("actions/install/__tests__/integration.test.ts", "native-lifecycle-fixtures.py"),
+    ):
+        if fixture not in texts.get(consumer, ""):
+            failures.append(f"{consumer}: required fixture import is missing: {fixture}")
+    return failures
+
+
 def audit_ci_pins() -> None:
+    for failure in native_lifecycle_migration_failures(
+        (ROOT / "build.zig").read_text(),
+        (ROOT / "test/native_trigger_acceptance.zig").read_text(),
+    ):
+        fail(failure)
+    fixture_paths = (
+        "tools/test-native-lifecycle.py",
+        "tools/test_native_lifecycle.py",
+        "tools/test-native-triggers.py",
+        "tools/test_native_triggers.py",
+        "tools/native-lifecycle-fixtures.py",
+        "tools/native-trigger-fixtures.py",
+        "tools/test-native-recovery.py",
+        "tools/dpkg-config-reference.py",
+        "actions/install/__tests__/integration.test.ts",
+    )
+    fixture_texts = {
+        relative: path.read_text()
+        for relative in fixture_paths
+        if (path := ROOT / relative).exists() and path.is_file() and not path.is_symlink()
+    }
+    for relative in fixture_paths[:4]:
+        if (ROOT / relative).is_symlink() or (ROOT / relative).is_dir():
+            fixture_texts[relative] = ""
+    for failure in native_lifecycle_fixture_failures(fixture_texts):
+        fail(failure)
+    for relative in fixture_paths[4:6]:
+        path = ROOT / relative
+        if path.is_symlink() or (path.is_file() and path.stat().st_mode & 0o111):
+            fail(f"{relative}: import-only fixture must not be executable or a symlink")
     workflows = sorted((ROOT / ".github/workflows").glob("*.y*ml"))
     for workflow in workflows:
         text = workflow.read_text()

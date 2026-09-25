@@ -110,7 +110,7 @@ def limit_contract() -> dict[str, int]:
 
 
 LIFECYCLE_SPEC = importlib.util.spec_from_file_location(
-    "debz_config_lifecycle", ROOT / "tools/test-native-lifecycle.py",
+    "debz_config_lifecycle", ROOT / "tools/native-lifecycle-fixtures.py",
 )
 assert LIFECYCLE_SPEC and LIFECYCLE_SPEC.loader
 lifecycle = importlib.util.module_from_spec(LIFECYCLE_SPEC)

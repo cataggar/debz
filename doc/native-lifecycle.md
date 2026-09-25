@@ -218,6 +218,56 @@ zig build test-native-lifecycle -j2
 zig build test-native-lifecycle -Doptimize=ReleaseSafe -j2
 ```
 
+The Zig acceptance and unprivileged oracle regressions use
+`test-native-lifecycle-zig` and `test-native-lifecycle-zig-unit`. The Zig
+lifecycle fixtures now compare real dpkg with native execution for all
+maintainer-script failure/unwind paths, dependency barriers and bootstrap,
+retained/vendor metadata, conffile retry and purge, statoverrides,
+alternatives, literal paths, diversions and unsafe refusals. Every successful
+or known-failure phase compares complete filesystem, database, status and
+length-prefixed script traces; interrupted operations instead check durable
+recovery evidence and unchanged re-entry snapshots. The pinned reference
+option also supplies and independently verifies `update-alternatives` for
+that scenario; without a pinned reference, only that scenario is skipped.
+`-Dnative-diversions-only=true` selects diversion scenarios.
+
+`test-native-lifecycle-zig-oracle` executes the standalone `--oracle-only`
+selector against two guarded roots with the same selected dpkg, independently
+running ordered reference groups and comparing each phase's exit and exact
+snapshot. `--workspace` retains a *new direct child* of this worktree's
+`.tmp`; existing or out-of-tree paths refuse before execution. In
+oracle-only mode native-specific refusals are not mislabelled reference parity.
+Zig unit tests execute valid and rejected compensation examples against the
+published `scriptFailure` schema closure (including actual count, digest, and
+rollback bounds). This bounded validator fails closed on unsupported keywords
+or references; it does not purport to implement the entire Draft 2020-12
+vocabulary. The `test-native-lifecycle` build target now runs this Zig
+acceptance, not Python; its Python unit gate has been removed. CI requires
+native and both-reference selectors on amd64 and arm64 in Debug and
+ReleaseSafe. All four former Python lifecycle/trigger test entry points are
+absent. `tools/native-lifecycle-fixtures.py` is an import-only module for
+the separate dpkg-config reference, Python recovery, and action integration
+fixtures; it has no lifecycle acceptance CLI.
+Trigger acceptance has a separate reference-only
+unconfigured-listener boundary; see [trigger execution](native-triggers.md#independent-acceptance).
+
+The eleven former `tools/test_native_lifecycle.py` unit-method counterparts are
+individually exercised by `test-native-lifecycle-zig-unit`:
+
+| Python `test_` method | Executed Zig assertion |
+| --- | --- |
+| `reference_refuses_host_and_unguarded_roots_before_spawn` | `native_lifecycle_support` root guard and acceptance pre-spawn refusal |
+| `fixture_scripts_record_exact_arguments_and_visible_payload` | lifecycle fixture script byte and `/bin/sh -n` test |
+| `backup_probe_uses_real_inode_and_metadata_observations_before_failure` | `native_lifecycle_diversions` backup-probe script syntax and byte test |
+| `script_and_bootstrap_payload_are_part_of_real_archive_source` | built essential archive's executable source, md5sums and scripts |
+| `bootstrap_fixture_can_use_uncompressed_archive_without_runtime_fallback` | actual archive `data.tar` member and two-root bootstrap execution |
+| `published_schema_accepts_and_bounds_compensations` | `native_failure_schema_validation` valid/invalid published failure examples |
+| `empty_argument_and_payload_differences_cannot_be_normalized_away` | `native_lifecycle_support` trace/payload mutations |
+| `rollback_clock_exception_is_path_type_and_time_bounded` | `native_lifecycle_support` named-link type and clock bounds |
+| `nonrollback_metadata_is_still_exact` | `native_lifecycle_support` ordinary mtime and metadata mutations |
+| `native_request_preserves_reviewed_order_and_fault_boundary` | native request JSON ordered-actions/fault assertion |
+| `success_report_cannot_hide_wrong_state` | applied-report/wrong-root snapshot rejection |
+
 CI uses hash-pinned Debian dpkg 1.22.22 for both architectures. On Ubuntu 24.04
 or another compatible Linux host with an older dpkg, prepare that reference
 without root privileges:
@@ -292,14 +342,17 @@ Advanced fixtures exercise:
   recovery evidence rather than accepting the changed database as its own
   expected result.
 
-There is one narrow metadata normalization beyond the shared differential
-oracle: during double-postrm upgrade failure, dpkg recreates a rollback symlink
-at wall-clock time. Only that explicitly selected symlink may have its original
-mtime or a timestamp inside the measured operation interval. Its kind, target,
-mode, owner, and every other file remain compared; raw snapshots retain the
-observed times. Ordinary payload mtimes are not normalized.
+Two clock exceptions are bounded and retain raw snapshots. During
+double-postrm upgrade failure, only an explicitly selected recreated symlink
+may have its original mtime or a timestamp inside the measured operation
+interval; its kind, target, mode and owner remain exact. The pinned
+`update-alternatives` scenario normalizes its timestamped log prefix and
+permits its named links, database entries and log to retain creation times
+from earlier phases of that scenario. Other payload mtimes and contents are
+not normalized.
 
-`tools/test-native-lifecycle.py --oracle-only`, run as root, exercises two real
-dpkg roots to establish fixture consistency. It is not native parity evidence.
+`zig build test-native-lifecycle-zig-oracle -Dnative-reference-dpkg="$reference_dpkg"`
+exercises two real dpkg roots to establish fixture consistency. It is not
+native parity evidence.
 `--workspace` can retain diagnostics in a new directory directly under this
 worktree's `.tmp`; ordinary runs clean up their temporary roots.

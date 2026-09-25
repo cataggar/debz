@@ -38,19 +38,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 432,
-      "sha512": "af90909702a6376570b12ea18320abd5d4f4fcfe47672a4f86768ad485e23af439c52655be9e88e0d4780690bca6de566c3b34f6173fd618bcb23a4e3cf28045"
+      "count": 442,
+      "sha512": "748187a954e792e31ad996524f24071fa49ac3d4fd7ac1203c70b114ca622237fc9fa522104077f6c4b4ea7bf07b4ae51e3ae708f3dd0017e14c275f3f46407e"
     },
     "findings": {
-      "count": 20358,
+      "count": 20418,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
-        "fixed_64_hex": 172,
-        "raw_32_byte": 1087,
-        "sha256_token": 18800
+        "fixed_64_hex": 176,
+        "raw_32_byte": 1097,
+        "sha256_token": 18846
       },
-      "sha512": "4f969385074c3cfb52ee19ea65051b87ab3618187d6c48af75ffdb45e7c0acbfa27989f51d0cfdeebf09ad62db13f82ff22d8f02552857c7b76ebefe015d695f"
+      "sha512": "ea7ffb2717c40e956b3e029dee8bbbcb02c80ece6b0a38a2d3a537fba927a852903ce48a2fcf5eef2ab22c976a19ebb3b49f43903d910b059569be3237bcf27b"
     },
     "classifications": [
       {
@@ -169,29 +169,29 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 65,
+        "count": 130,
         "counts": {
           "cas_layout": 0,
           "digest_version": 0,
-          "fixed_64_hex": 1,
-          "raw_32_byte": 14,
-          "sha256_token": 50
+          "fixed_64_hex": 5,
+          "raw_32_byte": 24,
+          "sha256_token": 101
         },
-        "sha512": "21115c20b4b6c096e895e977e10f97fae231d272095d2e142eb12b93e664311252c01368e9ecae7900b9d6b1a78f6ae1c5dd19f0da491c58ebf17b33ff9919ae"
+        "sha512": "9497691b3c2364525df0b17c0a5f5f55f30399eae709a6ef54d6896cb101536e9e5bddd26d0b8088f76a1469a93ef931cad6d9394adf103d685c0b56a5744127"
       },
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
         "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes; production authorities remain typed and versioned.",
-        "count": 5422,
+        "count": 5417,
         "counts": {
           "cas_layout": 25,
           "digest_version": 2,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5391
+          "sha256_token": 5386
         },
-        "sha512": "0f129a4f54c111117a527334f6e1c1dee7ffaa945b9b059b2c9e38799504bc4729ff7a1697756eb145d23c14bf76882af2408416522b801efbb5803a7e2ff2ea"
+        "sha512": "101b7f7584d28b33d49a8721d0981f5cffaef9183be91528f556afb3faefc57f85c1085f61ac0e3f28d1b9aa6941e2c00e06be2fb660c891bf8200a6e0d667d5"
       }
     ]
   },
@@ -449,11 +449,25 @@
         "src/transaction_recovery.zig",
         "test/apt-system-schema-validator.zig",
         "tools/derive-vendor-state-reference.py",
-        "tools/test-native-lifecycle.py",
+        "tools/native-lifecycle-fixtures.py",
         "tools/test_vendor_state_capture.py"
       ],
       "count": 172,
-      "sha512": "0fb9f3bc820e67db2624455d743c38b3d33a7608227b36012fa64059e622bc1926d3801ee71c6e1bac1f89d2b1cbf329386d6a6282499405d300fb4223da9f16"
+      "sha512": "f679a42d56b23689ca3462bd3d18d0196117bebd323a37bebfd259e8fd4b0e7c6107492b150ab10d81042e9ad6a0aaf2e37ddb66712f8d098876ae648517bbf9"
+    },
+    {
+      "id": "fixed-lifecycle-control-assertions",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_protocol",
+      "rationale": "These exact Zig test assertions validate a 64-character SHA256 control digest and its schema pattern; they do not define package, repository, or artifact content authority.",
+      "paths": [
+        "test/native_failure_schema_validation.zig",
+        "test/native_lifecycle_acceptance.zig",
+        "test/native_lifecycle_negative.zig",
+        "test/native_lifecycle_support.zig"
+      ],
+      "count": 4,
+      "sha512": "6d6a6d9c06742ea79d1fa92ff00845aa80ee7ad80e3828bdf273175cd67375dd5bc5320200ccbd9df569659ad7e2cc0f6cc87faf7a21b8aa89f98dffd99e2342"
     },
     {
       "id": "historical-fixed-cas-layouts",

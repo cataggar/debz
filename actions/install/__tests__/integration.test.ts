@@ -187,7 +187,7 @@ def load(name, filename):
     spec.loader.exec_module(module)
     return module
 generator = load("install_repository", "generate-integration-repository.py")
-lifecycle = load("install_lifecycle", "test-native-lifecycle.py")
+lifecycle = load("install_lifecycle", "native-lifecycle-fixtures.py")
 repository = workspace / "repository"
 generator.write_repository(repository, "debian-stable", arch)
 keyring = workspace / "keyring.gpg"

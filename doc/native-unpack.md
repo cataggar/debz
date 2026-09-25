@@ -299,7 +299,9 @@ reference specification:
 
 ```sh
 reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
-sudo -n env PYTHONDONTWRITEBYTECODE=1 python3 tools/test-native-triggers.py \
+zig build build-native-acceptance-zig -j2
+sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
+  zig-out/bin/native-trigger-zig-acceptance \
   --oracle-only --diversion-settlement-reference-only \
   --reference-dpkg "$reference_dpkg"
 ```

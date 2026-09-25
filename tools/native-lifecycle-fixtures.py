@@ -1,10 +1,7 @@
-#!/usr/bin/env python3
-"""Compare native lifecycle execution with real dpkg scripts in disposable chroots."""
+"""Shared dpkg lifecycle fixture builders and guarded-root comparison helpers."""
 
 from __future__ import annotations
 
-import argparse
-from contextlib import nullcontext
 import hashlib
 import importlib.util
 import json
@@ -14,7 +11,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import tempfile
 import time
 
 
@@ -1942,58 +1938,3 @@ def exercise(
         ):
             raise AssertionError("script did not actually change the unselected package")
         print("unexpected-final-package-version: final verification blocked completion", flush=True)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("native_test", nargs="?", type=Path)
-    parser.add_argument(
-        "--oracle-only", action="store_true",
-        help="check reference fixture consistency only; does not establish native parity",
-    )
-    parser.add_argument("--workspace", type=Path, help="retain artifacts in a new .tmp directory")
-    parser.add_argument("--reference-dpkg", type=Path)
-    parser.add_argument("--diversions-only", action="store_true")
-    arguments = parser.parse_args()
-    if arguments.oracle_only == bool(arguments.native_test):
-        parser.error("provide a native test executable or --oracle-only, not both")
-    if os.geteuid() != 0:
-        raise RuntimeError("lifecycle acceptance requires root for actual chroot execution")
-    for command in ("dpkg", "dpkg-deb", "ldd"):
-        if shutil.which(command) is None:
-            raise RuntimeError(f"required reference tool is missing: {command}")
-    executable = arguments.native_test.resolve(strict=True) if arguments.native_test else None
-    architecture = subprocess.run(
-        ["dpkg", "--print-architecture"], check=True, capture_output=True,
-        text=True, timeout=10,
-    ).stdout.strip()
-    if architecture not in ("amd64", "arm64"):
-        raise RuntimeError(f"unsupported acceptance architecture: {architecture}")
-    m.REFERENCE_DPKG = m.reference_dpkg.select(arguments.reference_dpkg, architecture, root_accounts=True)
-    temporary_root = ROOT / ".tmp"
-    temporary_root.mkdir(exist_ok=True)
-    if arguments.workspace:
-        workspace = arguments.workspace.resolve()
-        if workspace.parent != temporary_root.resolve():
-            parser.error("--workspace must name a new directory directly under this worktree's .tmp")
-        workspace.mkdir()
-        context = nullcontext(str(workspace))
-    else:
-        context = tempfile.TemporaryDirectory(prefix="native-lifecycle-", dir=temporary_root)
-    host_status = Path("/var/lib/dpkg/status").read_bytes()
-    try:
-        with context as temporary:
-            workspace = Path(temporary)
-            environment = m.fixture_environment(workspace)
-            if arguments.diversions_only:
-                exercise_diversion_lifecycle(executable, workspace, environment, architecture)
-            else:
-                exercise(executable, workspace, environment, architecture)
-    finally:
-        if Path("/var/lib/dpkg/status").read_bytes() != host_status:
-            raise AssertionError("host dpkg status changed during lifecycle acceptance")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
