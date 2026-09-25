@@ -196,6 +196,7 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
                 }, false);
             };
 
+    if (fixture.oracle_only) return;
     const changed = try archive(fixture, arch, "1", true);
     defer fixture.allocator.free(changed);
     for ([_][]const u8{ "unpacked-missing-stage", "unpacked-changed-stage", "configured-changed-archive" }) |mode| {

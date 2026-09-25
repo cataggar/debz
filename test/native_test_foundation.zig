@@ -26,8 +26,13 @@ pub const Fixture = struct {
     parent: std.Io.Dir,
     dir: std.Io.Dir,
     environment: std.process.Environ.Map,
+    oracle_only: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, repository: []const u8) !Fixture {
+        return initWorkspace(allocator, io, repository, null);
+    }
+
+    pub fn initWorkspace(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, requested: ?[]const u8) !Fixture {
         var repository_dir = try openRealDirectory(io, repository);
         defer repository_dir.close(io);
         try repository_dir.createDirPath(io, ".tmp");
@@ -36,13 +41,34 @@ pub const Fixture = struct {
             .follow_symlinks = false,
         });
         errdefer parent.close(io);
-        var random: [12]u8 = undefined;
-        try io.randomSecure(&random);
-        const name = try std.fmt.allocPrint(allocator, "native-zig-{x}", .{std.fmt.bytesToHex(random, .lower)});
+        const name = if (requested) |workspace| blk: {
+            var cwd: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const cwd_len = try std.process.currentPath(io, &cwd);
+            const resolved = try std.fs.path.resolve(allocator, &.{ cwd[0..cwd_len], workspace });
+            defer allocator.free(resolved);
+            const fixture_parent = try std.fs.path.join(allocator, &.{ repository, ".tmp" });
+            defer allocator.free(fixture_parent);
+            if (!std.mem.eql(u8, std.fs.path.dirname(resolved) orelse "", fixture_parent))
+                return error.WorkspaceOutsideFixtureParent;
+            const leaf = std.fs.path.basename(resolved);
+            _ = try root_fs.Path.init(leaf);
+            break :blk try allocator.dupe(u8, leaf);
+        } else blk: {
+            var random: [12]u8 = undefined;
+            try io.randomSecure(&random);
+            break :blk try std.fmt.allocPrint(allocator, "native-zig-{x}", .{std.fmt.bytesToHex(random, .lower)});
+        };
         errdefer allocator.free(name);
-        const dir = try parent.createDirPathOpen(io, name, .{
-            .open_options = .{ .iterate = true, .follow_symlinks = false },
-        });
+        if (requested != null) {
+            try parent.createDir(io, name, .fromMode(0o700));
+            errdefer parent.deleteDir(io, name) catch {};
+        }
+        const dir = if (requested != null)
+            try parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false })
+        else
+            try parent.createDirPathOpen(io, name, .{
+                .open_options = .{ .iterate = true, .follow_symlinks = false },
+            });
         errdefer {
             dir.close(io);
             parent.deleteTree(io, name) catch {};
@@ -66,6 +92,7 @@ pub const Fixture = struct {
         return .{
             .allocator = allocator,
             .io = io,
+            .retain = requested != null,
             .path = path,
             .name = name,
             .parent = parent,
@@ -78,7 +105,7 @@ pub const Fixture = struct {
         self.environment.deinit();
         self.dir.close(self.io);
         if (self.retain) {
-            std.debug.print("retained failed native fixture: {s}\n", .{self.path});
+            std.debug.print("retained native fixture: {s}\n", .{self.path});
         } else {
             self.parent.deleteTree(self.io, self.name) catch |err|
                 std.debug.print("failed to remove disposable fixture {s}: {s}\n", .{ self.path, @errorName(err) });

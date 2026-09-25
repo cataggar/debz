@@ -165,6 +165,7 @@ fn staticRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const 
 }
 
 fn unsafeRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
+    if (fixture.oracle_only) return;
     const source = base ++ "/mode";
     const original = try record(fixture, source, source ++ ".original", ":");
     defer fixture.allocator.free(original);
@@ -397,7 +398,7 @@ fn failureRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
     defer fixture.allocator.free(original);
     const changed = try record(fixture, source, source ++ ".changed", ":");
     defer fixture.allocator.free(changed);
-    for ([_][]const u8{ "success", "failure", "double-failure" }) |outcome| {
+    if (!fixture.oracle_only) for ([_][]const u8{ "success", "failure", "double-failure" }) |outcome| {
         const label = try std.fmt.allocPrint(fixture.allocator, "diversion-refusal-mid-unpack-{s}", .{outcome});
         defer fixture.allocator.free(label);
         var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
@@ -425,7 +426,7 @@ fn failureRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
         const shifted = try std.fmt.allocPrint(fixture.allocator, "{s}/native/{s}.changed", .{ label, source });
         defer fixture.allocator.free(shifted);
         try support.absent(fixture, shifted);
-    }
+    };
 }
 
 fn modeBoth(case: *support.Scenario, relative: []const u8, content: []const u8, mode: u32) !void {
@@ -516,7 +517,7 @@ fn aliasRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u
     }
 }
 
-fn backupScript(fixture: *foundation.Fixture, version: []const u8, suffix: []const u8) ![]u8 {
+fn backupScript(fixture: *foundation.Fixture, version: []const u8, suffix: []const u8, mode_suffix: []const u8) ![]u8 {
     return std.fmt.allocPrint(fixture.allocator,
         \\if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ] && [ "$1" = upgrade ]; then
         \\    /backup-probe-stat --printf='%d:%i\n' /{s}/data{s} /{s}/current > /backup-before || exit 31
@@ -530,7 +531,7 @@ fn backupScript(fixture: *foundation.Fixture, version: []const u8, suffix: []con
         \\    [ "$(/backup-probe-stat --printf='%d:%i' /{s}/data.link.dpkg-tmp)" = "$original_data" ] || exit 34
         \\    [ -L /{s}/current.dpkg-tmp ] || exit 35
         \\    [ "$(/backup-probe-stat --printf='%d:%i' /{s}/current.dpkg-tmp)" != "$original_symlink" ] || exit 36
-        \\    [ "$(/backup-probe-stat --printf='%a:%u:%g:%Y' /{s}/mode.dpkg-tmp)" = '{s}:0:0:1700000000' ] || exit 37
+        \\    [ "$(/backup-probe-stat --printf='%a:%u:%g:%Y' /{s}/mode{s}.dpkg-tmp)" = '{s}:0:0:1700000000' ] || exit 37
         \\    IFS= read -r previous < /{s}/data{s}.dpkg-tmp || exit 38
         \\    [ "$previous" = 'data version {s}' ] || exit 39
         \\    [ ! -e /etc/debz-native.conf.dpkg-tmp ] || exit 40
@@ -543,7 +544,7 @@ fn backupScript(fixture: *foundation.Fixture, version: []const u8, suffix: []con
         \\fi
         \\
     , .{
-        base,                                                suffix, base,   base,    suffix,  base, base, base, base,
+        base,                                                suffix, base,   base,    suffix,  base, base, base, base, mode_suffix,
         if (std.mem.eql(u8, version, "1")) "600" else "640", base,   suffix, version, version, base, base,
     });
 }
@@ -554,7 +555,7 @@ fn backupRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const 
         const suffix = if (diverted) ".distrib" else "";
         var packages: [2][]u8 = undefined;
         for ([_][]const u8{ "1", "2" }, 0..) |version, index| {
-            const probe = try backupScript(fixture, version, suffix);
+            const probe = try backupScript(fixture, version, suffix, "");
             defer fixture.allocator.free(probe);
             const script = try std.mem.concat(fixture.allocator, u8, &.{ hook, probe });
             defer fixture.allocator.free(script);
@@ -652,15 +653,26 @@ test "backup probe requires real inode, link, mode and old payload before script
     var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, @import("native_test_options").repository);
     defer fixture.deinit();
     for ([_][]const u8{ "1", "2" }) |version| {
-        const script = try backupScript(&fixture, version, ".distrib");
+        const script = try backupScript(&fixture, version, ".distrib", ".distrib");
         defer std.testing.allocator.free(script);
         for ([_][]const u8{
-            "data.distrib.dpkg-tmp", "mode.dpkg-tmp",                     "current.dpkg-tmp",
+            "data.distrib.dpkg-tmp", "mode.distrib.dpkg-tmp",             "current.dpkg-tmp",
             "\"$original_data\"",    "backup-probe-rm -f /backup-before", "obsolete",
         }) |phrase| try std.testing.expect(std.mem.indexOf(u8, script, phrase) != null);
         try fixture.write("probe.sh", script, 0o755);
         const script_path = try fixture.absolute("probe.sh");
         defer std.testing.allocator.free(script_path);
         try fixture.run(&.{ "/bin/sh", "-n", script_path }, "probe-syntax.log", 10);
+        const package_archive = try support.makePackage(&fixture, "arm64", version, name, "backup-probe-unit", .{
+            .full_payload = true,
+            .scripts = .{ .before_failure = script },
+        });
+        defer std.testing.allocator.free(package_archive);
+        const postrm_path = try std.fmt.allocPrint(std.testing.allocator, "backup-probe-unit/{s}_{s}_data.source/DEBIAN/postrm", .{ name, version });
+        defer std.testing.allocator.free(postrm_path);
+        const postrm = try support.read(&fixture, postrm_path, 64 * 1024);
+        defer std.testing.allocator.free(postrm);
+        try std.testing.expect(std.mem.indexOf(u8, postrm, "/backup-probe-rm -f /backup-before") != null);
+        try std.testing.expect(std.mem.indexOf(u8, postrm, "/backup-probe-rm -f /backup-before").? < std.mem.indexOf(u8, postrm, "exit 23").?);
     }
 }

@@ -205,6 +205,8 @@ fn runBootstrap(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const 
         try support.absent(fixture, shell);
     }
     try fixture.run(&.{ "dpkg-deb", "--extract", archive, case.reference_root }, "script-essential-bootstrap/bootstrap.log", 120);
+    if (fixture.oracle_only)
+        try fixture.run(&.{ "dpkg-deb", "--extract", archive, case.native_root }, "script-essential-bootstrap/oracle-bootstrap.log", 120);
     const names = selected(name, arch);
     const actions = [_]support.Action{
         .{ .sequence = 0, .kind = "bootstrap_extract", .package = name, .architecture = arch },

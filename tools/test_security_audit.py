@@ -534,6 +534,11 @@ class SecurityAuditTests(unittest.TestCase):
             "test_step.dependOn(&native_trigger_oracle_tests.step);",
             ".dependOn(&native_lifecycle.step);",
             ".dependOn(&native_triggers.step);",
+            'b.step("test-native-lifecycle-zig-oracle",',
+            'b.step("test-native-triggers-zig-oracle",',
+            'b.step("test-native-triggers-zig-settlement-reference",',
+            'settlement_oracle_zig.addArgs(&.{ "--oracle-only", "--diversion-settlement-reference-only" });',
+            "settlement_unit_step.dependOn(&run_settlement_lowering_tests.step);",
         ):
             with self.subTest(binding=binding):
                 self.assertTrue(check(build.replace(binding, ""), trigger))
@@ -558,7 +563,11 @@ class SecurityAuditTests(unittest.TestCase):
             'report.value.detail, "program_compile_rejected"',
             "foundation.captureRealRoot(",
             "support.assertNoActiveEvidence(",
-            "refuseUnconfiguredListenerProgram(&fixture, driver, selected, reference.executable, reference.architecture)",
+            "refuseUnconfiguredListenerProgram(&fixture, native_driver, selected, reference.executable, reference.architecture)",
+            "if (oracle_only == (driver != null) or (helper != null) != (driver != null))",
+            "if (settlement_reference_only and (!oracle_only or diversions_only))",
+            "if (fixture.oracle_only) return;",
+            "settlement.run(&fixture, native_driver, reference.executable, selected, reference.architecture)",
         ):
             with self.subTest(refusal=token):
                 self.assertTrue(check(build, trigger.replace(token, "")))
@@ -592,11 +601,25 @@ class SecurityAuditTests(unittest.TestCase):
                 "test-native-lifecycle-zig test-native-triggers-zig",
             ),
             (
+                "test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle "
+                "test-native-triggers-zig-settlement-reference",
+                "test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle",
+            ),
+            (
                 'test-native-diversion-settlement-zig \\\n'
                 '            -Dnative-reference-dpkg="$reference_dpkg"',
                 'test-native-diversion-settlement-zig \\\n'
                 '            -Dnative-reference-dpkg="$untrusted_dpkg"',
             ),
+            (
+                "      - name: Exercise standalone Zig workspace selectors and fail-closed combinations\n",
+                "      - name: Exercise standalone Zig workspace selectors and fail-closed combinations\n        if: false\n",
+            ),
+            ('          zig build build-native-acceptance-zig -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \\', ""),
+            ('            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\', ""),
+            ("          grep -Fq 'error.InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"", ""),
+            ("          grep -Fq 'error.PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"", ""),
             ('reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"', "reference_dpkg=/usr/bin/dpkg"),
             ('-Dnative-reference-dpkg="$reference_dpkg"', ""),
             ("test-native-helper-namespace", "test"),

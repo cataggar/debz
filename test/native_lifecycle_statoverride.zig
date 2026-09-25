@@ -220,6 +220,7 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
         try expectMetadata(&case, "etc/debz-native.conf", .{ .mode = 0o600, .uid = 42424, .gid = 42425 });
     }
 
+    if (fixture.oracle_only) return;
     for ([_]struct { label: []const u8, user: []const u8, group_name: []const u8 }{
         .{ .label = "missing-user", .user = "nobody", .group_name = "#42421" },
         .{ .label = "missing-group", .user = "#42420", .group_name = "nogroup" },

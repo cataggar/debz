@@ -1,6 +1,7 @@
 const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
+const settlement = @import("native_diversion_settlement.zig");
 const options = @import("native_test_options");
 const root_fs = @import("debz").root_fs;
 
@@ -37,6 +38,7 @@ const settlement_cases = [_]SettlementCase{
 };
 
 fn copyNativeHelper(fixture: *foundation.Fixture, case: *support.Scenario, helper: []const u8) !void {
+    if (fixture.oracle_only) return;
     var executable = try std.Io.Dir.cwd().openFile(fixture.io, helper, .{ .follow_symlinks = false });
     defer executable.close(fixture.io);
     var stream = executable.reader(fixture.io, &.{});
@@ -945,14 +947,22 @@ fn assertWatchedRoute(fixture: *foundation.Fixture, case_name: []const u8, arch:
     }
 }
 
+fn validateSelection(driver: ?[]const u8, helper: ?[]const u8, oracle_only: bool, diversions_only: bool, settlement_reference_only: bool) !void {
+    if (oracle_only == (driver != null) or (helper != null) != (driver != null)) return error.InvalidReferenceSelection;
+    if (settlement_reference_only and (!oracle_only or diversions_only)) return error.InvalidSettlementSelection;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var arguments = init.minimal.args.iterate();
     _ = arguments.next();
-    const driver = arguments.next() orelse return error.MissingNativeDriver;
+    var driver: ?[]const u8 = null;
     var helper: ?[]const u8 = null;
     var pinned: ?[]const u8 = null;
+    var workspace: ?[]const u8 = null;
+    var oracle_only = false;
     var diversions_only = false;
+    var settlement_reference_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--native-helper")) {
             if (helper != null) return error.DuplicateHelper;
@@ -960,35 +970,52 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
             pinned = arguments.next() orelse return error.MissingReferencePath;
+        } else if (std.mem.eql(u8, option, "--workspace")) {
+            if (workspace != null) return error.DuplicateWorkspace;
+            workspace = arguments.next() orelse return error.MissingWorkspacePath;
+        } else if (std.mem.eql(u8, option, "--oracle-only")) {
+            if (oracle_only) return error.DuplicateSelector;
+            oracle_only = true;
         } else if (std.mem.eql(u8, option, "--diversions-only")) {
             if (diversions_only) return error.DuplicateSelector;
             diversions_only = true;
-        } else return error.InvalidArguments;
+        } else if (std.mem.eql(u8, option, "--diversion-settlement-reference-only")) {
+            if (settlement_reference_only) return error.DuplicateSelector;
+            settlement_reference_only = true;
+        } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
+            driver = option;
+        }
     }
+    try validateSelection(driver, helper, oracle_only, diversions_only, settlement_reference_only);
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
-    var fixture = try foundation.Fixture.init(allocator, init.io, options.repository);
+    var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
     defer fixture.deinit();
     errdefer fixture.retain = true;
-    const selected = helper orelse return error.MissingNativeHelper;
-    if (!diversions_only) {
-        runTriggerCases(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+    fixture.oracle_only = oracle_only;
+    const selected = if (helper) |path|
+        try std.fs.path.resolve(allocator, &.{ options.repository, path })
+    else
+        "";
+    const native_driver = driver orelse "";
+    if (!diversions_only and !settlement_reference_only) {
+        runTriggerCases(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
-        runTriggeredFailure(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+        runTriggeredFailure(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
-        runTriggerLifecycle(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+        runTriggerLifecycle(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
-        runTriggerChains(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+        runTriggerChains(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
-        processExistingQueue(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+        processExistingQueue(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
@@ -996,36 +1023,37 @@ pub fn main(init: std.process.Init) !void {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
-        refuseUnconfiguredListenerProgram(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
-            try support.assertHostUnchanged(allocator, init.io, reference.before);
-            return err;
-        };
-        refuseMalformedQueue(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
-            try support.assertHostUnchanged(allocator, init.io, reference.before);
-            return err;
-        };
-        interruptedTriggerHandler(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
-            try support.assertHostUnchanged(allocator, init.io, reference.before);
-            return err;
-        };
-        deferredSelectionChange(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
-            try support.assertHostUnchanged(allocator, init.io, reference.before);
-            return err;
-        };
+        if (!oracle_only) {
+            try refuseUnconfiguredListenerProgram(&fixture, native_driver, selected, reference.executable, reference.architecture);
+            try refuseMalformedQueue(&fixture, native_driver, selected, reference.executable, reference.architecture);
+            try interruptedTriggerHandler(&fixture, native_driver, selected, reference.executable, reference.architecture);
+            try deferredSelectionChange(&fixture, native_driver, selected, reference.executable, reference.architecture);
+        }
     }
-    runDivertedTrigger(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+    if (!settlement_reference_only) {
+        try runDivertedTrigger(&fixture, native_driver, selected, reference.executable, reference.architecture);
+        try divertedTriggerRoutes(&fixture, native_driver, selected, reference.executable, reference.architecture);
+    }
+    if (!oracle_only and !settlement_reference_only) refuseUnauthenticatedHelper(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    divertedTriggerRoutes(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
-        try support.assertHostUnchanged(allocator, init.io, reference.before);
-        return err;
-    };
-    refuseUnauthenticatedHelper(&fixture, driver, selected, reference.executable, reference.architecture) catch |err| {
+    settlement.run(&fixture, native_driver, reference.executable, selected, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
     try support.assertHostUnchanged(allocator, init.io, reference.before);
+}
+
+test "standalone settlement selector cannot claim native parity or combine with diversion selector" {
+    try validateSelection(null, null, true, false, true);
+    try validateSelection(null, null, true, true, false);
+    try validateSelection("driver", "helper", false, false, false);
+    try std.testing.expectError(error.InvalidSettlementSelection, validateSelection(null, null, true, true, true));
+    try std.testing.expectError(error.InvalidSettlementSelection, validateSelection("driver", "helper", false, false, true));
+    try std.testing.expectError(error.InvalidReferenceSelection, validateSelection("driver", null, false, false, false));
+    try std.testing.expectError(error.InvalidReferenceSelection, validateSelection(null, "helper", true, false, true));
+    try std.testing.expectError(error.InvalidReferenceSelection, validateSelection("driver", "helper", true, false, false));
 }
 
 test "trigger helper exclusion cannot hide package status and queue mutations" {

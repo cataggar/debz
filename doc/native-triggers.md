@@ -156,7 +156,14 @@ zig build test-native-triggers -Doptimize=ReleaseSafe -j2
 ```
 
 The Zig-owned runner is available through `test-native-triggers-zig` and
-`test-native-triggers-zig-unit`. It authenticates a distinct private helper
+`test-native-triggers-zig-unit`; its standalone `--oracle-only` selector runs
+two bounded guarded dpkg roots without installing the private native helper.
+`--workspace` retains only a newly created direct child of this worktree's
+`.tmp`. The dedicated `test-native-triggers-zig-settlement-reference` target
+selects **only** pinned-dpkg route settlement: it rejects native executable
+or `--diversions-only` combinations rather than describing these observations
+as parity. The default trigger target now includes route settlement. In native
+mode it authenticates a distinct private helper
 and compares guarded reference/native roots after each trigger phase. The
 trigger matrix covers immediate and deferred await/noawait named activation,
 scriptless and newly installed listeners, aliases, mixed named/file ordering,
@@ -183,14 +190,54 @@ flags, root snapshots, ordering and helper identity. The
 steps alongside the existing Python gates on amd64 and arm64 in Debug and
 ReleaseSafe. Zig settlement independently executes all 24 upgrade profiles
 and 16 eligible follow-ups against pinned dpkg, including the six partial
-rollbacks; `test-native-diversion-settlement-zig` is required in CI. Both Python
-trigger gates remain mandatory: standalone Python `--oracle-only` (two dpkg
-roots), `--diversion-settlement-reference-only`, and `--workspace` have no
-equivalent Zig selectors yet, and the Python settlement/unit mutation inventory
-has not been fully replaced by Zig tests. The failed-postinst listener is now
+rollbacks; `test-native-diversion-settlement-zig` is required in CI. Mutation
+regressions exercise the exact backup metadata/inode, trigger route, status,
+control, rollback-list, upgrade-outcome and invocation-clock assertions as well
+as the production lowering of authenticated success and rollback profiles.
+Both Python trigger gates remain mandatory until the complete selector and
+unit method inventory passes in both pinned modes. The failed-postinst listener is now
 covered in Zig against dpkg **only**; lack of native parity for that program
 must remain explicit even if the reference-only Python case is eventually
 retired.
+
+The 32 `tools/test_native_triggers.py` unit methods map individually to
+`test-native-triggers-zig-unit` and `test-native-diversion-settlement-zig-unit`
+(the latter includes the production lowering test):
+
+| Python `test_` method | Executed Zig assertion |
+| --- | --- |
+| `trigger_only_reference_still_requires_disposable_root` | trigger-only guarded reference refusal |
+| `settlement_reference_selector_cannot_claim_native_parity` | selector validation rejects native or combined diversion mode |
+| `reference_processing_and_deferral_are_explicit` | actual reference dpkg flag construction |
+| `real_package_contains_exact_trigger_declarations` | source `DEBIAN/triggers` bytes |
+| `native_trigger_only_request_does_not_fake_archive_reinstall` | serialized trigger-only request with empty archive list |
+| `scripts_use_real_helper_and_propagate_its_failure` | script bytes and real known-failure trigger execution |
+| `removal_activation_is_in_postrm_not_postinst` | source script bytes and removal-phase execution |
+| `helper_exclusion_does_not_hide_package_or_trigger_changes` | differing helper excluded, mutated registry/status rejected |
+| `success_report_cannot_hide_a_wrong_trigger_database` | exact status/registry comparison after reported success |
+| `order_and_noawait_markers_remain_observable` | five distinct registry, queue, status and trace mutations |
+| `known_outcome_cannot_leave_helper_authority_active` | active-authority artifact mutation rejected |
+| `malformed_queue_can_be_observed_without_normalizing_it` | invalid queue byte retained and compared |
+| `reference_binary_cannot_be_supplied_as_native_helper` | helper/reference digest identity refusal |
+| `reference_matrix_preserves_full_failure_scope` | distinct 24-case/16-follow-up/six-rollback assertions |
+| `success_lowering_corpus_is_derived_from_the_reference_profiles` | all 15 corpus rows matched by production lowering |
+| `success_lowering_omits_only_the_successful_unwind_profile` | 16 successful outcomes, 15 eligible old-postrm profiles |
+| `outcome_lowering_covers_all_reference_and_subsequent_profiles` | 24 executed cases plus production outcome-lowering assertion |
+| `failure_lowering_preserves_exact_partial_route_dispositions` | partial route disposition, backup and trigger paths on rollback |
+| `failure_and_unwind_profiles_cannot_enter_success_lowering` | corpus mutations for unwind, rollback and postinst failure |
+| `subsequent_directory_trigger_does_not_invent_an_obsolete_removal` | exact directory reinstall trigger route |
+| `retained_backup_cannot_be_missing_or_replaced` | missing/changed inode, mode, digest, owner and clock mutations |
+| `backup_visibility_requires_the_original_inode_during_postrm` | immediate old-postrm backup inode assertion |
+| `backup_visibility_cannot_be_deferred_until_postinst` | deferred trace probe refusal |
+| `trigger_cannot_be_rerouted_after_publication` | changed trigger path rejected by exact script trace |
+| `status_and_control_publication_are_not_inferred_from_exit` | status, version, conffile digest and control byte mutations |
+| `full_rollback_cannot_replace_reference_partial_rollback` | rollback filesystem expectation mutation |
+| `partial_rollback_preserves_the_old_backup_hard_link` | hard-link backup mutation |
+| `partial_rollback_does_not_publish_the_incoming_file_list` | rollback installed-list extra entry rejected |
+| `partial_rollback_requires_the_complete_compensation_sequence` | omitted compensation script rejected |
+| `known_failure_cannot_be_relabelled_success` | rollback exit changed to success rejected |
+| `atomic_replacement_is_not_an_in_place_edit_or_an_unchanged_database` | diversion inode and bytes mutations |
+| `recreated_symlink_time_is_bounded_not_ignored` | invocation-clock failure on stale symlink mtime |
 
 `test-native-trigger-helper` runs the shared queue/helper unit coverage;
 `native-trigger-helper` builds the private artifact without installing it.

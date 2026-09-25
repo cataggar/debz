@@ -777,10 +777,35 @@ jobs:
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
           zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
-          # Keep all four Python gates until the oracle-only/diagnostic selectors
-          # and unit inventories are ported; failed-postinst listeners are reference-only.
+          # Retain Python gates until their selector and mutation inventories are independently verified.
+          # Failed-postinst listeners remain pinned-dpkg reference-only, never native parity.
           zig build test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
+          zig build test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle test-native-triggers-zig-settlement-reference \
+            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
+      - name: Exercise standalone Zig workspace selectors and fail-closed combinations
+        run: |
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build build-native-acceptance-zig -Doptimize="$OPTIMIZE" -j2 --summary all
+          lifecycle="$PWD/.tmp/zig-lifecycle-workspace-$OPTIMIZE"
+          trigger="$PWD/.tmp/zig-trigger-workspace-$OPTIMIZE"
+          sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
+            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \
+            --reference-dpkg "$reference_dpkg" --workspace "$lifecycle"
+          sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
+            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \
+            --reference-dpkg "$reference_dpkg" --workspace "$trigger"
+          test -d "$lifecycle" && test -d "$trigger"
+          if sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
+            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \
+            --diversions-only --reference-dpkg "$reference_dpkg" \
+            2>"$PWD/.tmp/zig-invalid-selector.log"; then exit 1; fi
+          grep -Fq 'error.InvalidSettlementSelection' "$PWD/.tmp/zig-invalid-selector.log"
+          if sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
+            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only \
+            --reference-dpkg "$reference_dpkg" --workspace "$lifecycle" \
+            2>"$PWD/.tmp/zig-existing-workspace.log"; then exit 1; fi
+          grep -Fq 'error.PathAlreadyExists' "$PWD/.tmp/zig-existing-workspace.log"
       - name: Require private native helper namespaces
         run: |
           zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all

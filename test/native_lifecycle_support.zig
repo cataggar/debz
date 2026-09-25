@@ -694,17 +694,37 @@ pub const Scenario = struct {
             }
         } else status = try reference(self.fixture, self.dpkg, self.reference_root, input, destination);
         if ((status != 0) != expected_failure) return error.UnexpectedReferenceOutcome;
-        var outcome = try native(self.fixture, self.executable, self.native_root, self.architecture, input, destination);
-        defer outcome.deinit();
-        if (expected_failure) {
-            if (!std.mem.eql(u8, outcome.value.outcome, "script_failed") and
-                (!self.helper or !std.mem.eql(u8, outcome.value.outcome, "trigger_failed")))
+        if (self.fixture.oracle_only) {
+            const oracle = try path(self.fixture.allocator, destination, "oracle");
+            defer self.fixture.allocator.free(oracle);
+            try self.fixture.directory(oracle);
+            var mirror: u8 = 0;
+            if (input.reference_groups) |groups| {
+                for (groups, 0..) |archives, index| {
+                    const group_destination = try std.fmt.allocPrint(self.fixture.allocator, "{s}/group-{d}", .{ oracle, index });
+                    defer self.fixture.allocator.free(group_destination);
+                    try self.fixture.directory(group_destination);
+                    var group = input;
+                    group.archives = archives;
+                    group.reference_groups = null;
+                    mirror = try reference(self.fixture, self.dpkg, self.native_root, group, group_destination);
+                    if (mirror != 0) break;
+                }
+            } else mirror = try reference(self.fixture, self.dpkg, self.native_root, input, oracle);
+            if (mirror != status) return error.NonRepeatableReference;
+        } else {
+            var outcome = try native(self.fixture, self.executable, self.native_root, self.architecture, input, destination);
+            defer outcome.deinit();
+            if (expected_failure) {
+                if (!std.mem.eql(u8, outcome.value.outcome, "script_failed") and
+                    (!self.helper or !std.mem.eql(u8, outcome.value.outcome, "trigger_failed")))
+                    return error.UnexpectedNativeOutcome;
+            } else if (!std.mem.eql(u8, outcome.value.outcome, "applied")) {
+                std.debug.print("{s}/{s}: {s}: {s}\n", .{ self.name, input.operation, outcome.value.outcome, outcome.value.detail });
                 return error.UnexpectedNativeOutcome;
-        } else if (!std.mem.eql(u8, outcome.value.outcome, "applied")) {
-            std.debug.print("{s}/{s}: {s}: {s}\n", .{ self.name, input.operation, outcome.value.outcome, outcome.value.detail });
-            return error.UnexpectedNativeOutcome;
+            }
+            try assertNoActiveEvidence(self.fixture, self.native_root);
         }
-        try assertNoActiveEvidence(self.fixture, self.native_root);
         const ended: i64 = @intCast(std.Io.Clock.real.now(self.fixture.io).nanoseconds);
         const result = if (self.alternatives)
             compareAlternatives(self.fixture, self.reference_root, self.native_root, destination, self.alternatives_started.?, ended)
@@ -716,7 +736,9 @@ pub const Scenario = struct {
             self.fixture.retain = true;
             return err;
         };
-        std.debug.print("{s}/{s}: native/dpkg parity passed\n", .{ self.name, input.operation });
+        std.debug.print("{s}/{s}: {s} passed\n", .{
+            self.name, input.operation, if (self.fixture.oracle_only) "dpkg fixture repeatability" else "native/dpkg parity",
+        });
     }
 };
 

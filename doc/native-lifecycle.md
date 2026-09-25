@@ -231,16 +231,39 @@ option also supplies and independently verifies `update-alternatives` for
 that scenario; without a pinned reference, only that scenario is skipped.
 `-Dnative-diversions-only=true` selects diversion scenarios.
 
-The Python lifecycle and oracle build/CI gates remain **required**. The
-diversion route-settlement suite now runs 24 real upgrade profiles and 16
-follow-ups in Zig, but the Python `--oracle-only` (two real dpkg roots) and
-`--workspace` diagnostic selectors do not have Zig equivalents, and the
-Python schema regression executes example accept/reject documents with a
-Draft 2020-12 validator where Zig currently checks only the schema's bounds.
-Neither lifecycle entry point can be retired on that evidence. CI runs the
-existing and Zig-owned suites on amd64 and arm64 in Debug and ReleaseSafe.
+`test-native-lifecycle-zig-oracle` executes the standalone `--oracle-only`
+selector against two guarded roots with the same selected dpkg, independently
+running ordered reference groups and comparing each phase's exit and exact
+snapshot. `--workspace` retains a *new direct child* of this worktree's
+`.tmp`; existing or out-of-tree paths refuse before execution. In
+oracle-only mode native-specific refusals are not mislabelled reference parity.
+Zig unit tests execute valid and rejected compensation examples against the
+published `scriptFailure` schema closure (including actual count, digest, and
+rollback bounds). This bounded validator fails closed on unsupported keywords
+or references; it does not purport to implement the entire Draft 2020-12
+vocabulary. The Python lifecycle and oracle build/CI gates remain **required**
+until the remaining exact inventory and both pinned modes are verified.
+CI runs the existing and Zig-owned suites on amd64 and arm64 in Debug and
+ReleaseSafe.
 Trigger acceptance has a separate reference-only
 unconfigured-listener boundary; see [trigger execution](native-triggers.md#independent-acceptance).
+
+The eleven `tools/test_native_lifecycle.py` unit-method counterparts are
+individually exercised by `test-native-lifecycle-zig-unit`:
+
+| Python `test_` method | Executed Zig assertion |
+| --- | --- |
+| `reference_refuses_host_and_unguarded_roots_before_spawn` | `native_lifecycle_support` root guard and acceptance pre-spawn refusal |
+| `fixture_scripts_record_exact_arguments_and_visible_payload` | lifecycle fixture script byte and `/bin/sh -n` test |
+| `backup_probe_uses_real_inode_and_metadata_observations_before_failure` | `native_lifecycle_diversions` backup-probe script syntax and byte test |
+| `script_and_bootstrap_payload_are_part_of_real_archive_source` | built essential archive's executable source, md5sums and scripts |
+| `bootstrap_fixture_can_use_uncompressed_archive_without_runtime_fallback` | actual archive `data.tar` member and two-root bootstrap execution |
+| `published_schema_accepts_and_bounds_compensations` | `native_failure_schema_validation` valid/invalid published failure examples |
+| `empty_argument_and_payload_differences_cannot_be_normalized_away` | `native_lifecycle_support` trace/payload mutations |
+| `rollback_clock_exception_is_path_type_and_time_bounded` | `native_lifecycle_support` named-link type and clock bounds |
+| `nonrollback_metadata_is_still_exact` | `native_lifecycle_support` ordinary mtime and metadata mutations |
+| `native_request_preserves_reviewed_order_and_fault_boundary` | native request JSON ordered-actions/fault assertion |
+| `success_report_cannot_hide_wrong_state` | applied-report/wrong-root snapshot rejection |
 
 CI uses hash-pinned Debian dpkg 1.22.22 for both architectures. On Ubuntu 24.04
 or another compatible Linux host with an older dpkg, prepare that reference

@@ -1229,12 +1229,34 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         *(line.strip() for line in shared_steps[compare_name]),
         "zig build test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig \\",
         shared_steps[compare_name][2].strip(),
+        "zig build test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle test-native-triggers-zig-settlement-reference \\",
+        shared_steps[compare_name][2].strip(),
     ]
     if compare_commands != expected_compare_commands:
         failures.append(
             "ci.yml: both native differential suites must execute with "
             "the pinned dpkg in every build workload"
         )
+    selectors = steps.get(
+        "Exercise standalone Zig workspace selectors and fail-closed combinations", ""
+    )
+    if re.search(r"(?m)^        if:", selectors) or selectors.count(
+        '            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\'
+    ) != 2 or any(
+        command not in selectors.splitlines()
+        for command in (
+            '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+            '          zig build build-native-acceptance-zig -Doptimize="$OPTIMIZE" -j2 --summary all',
+            '            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \\',
+            '            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\',
+            '            --reference-dpkg "$reference_dpkg" --workspace "$lifecycle"',
+            '            --reference-dpkg "$reference_dpkg" --workspace "$trigger"',
+            '          test -d "$lifecycle" && test -d "$trigger"',
+            "          grep -Fq 'error.InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"",
+            "          grep -Fq 'error.PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"",
+        )
+    ):
+        failures.append("ci.yml: standalone Zig workspace selectors and refusals must run in every mode")
     selected_steps = {
         "Test release packaging": ("Debug", (
             "        run: zig build test-release -j2 --summary all",
@@ -1339,6 +1361,11 @@ def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
         "test_step.dependOn(&native_trigger_oracle_tests.step);",
         ".dependOn(&native_lifecycle.step);",
         ".dependOn(&native_triggers.step);",
+        'b.step("test-native-lifecycle-zig-oracle",',
+        'b.step("test-native-triggers-zig-oracle",',
+        'b.step("test-native-triggers-zig-settlement-reference",',
+        'settlement_oracle_zig.addArgs(&.{ "--oracle-only", "--diversion-settlement-reference-only" });',
+        "settlement_unit_step.dependOn(&run_settlement_lowering_tests.step);",
     ):
         if binding not in build:
             failures.append(f"build.zig: missing required lifecycle/trigger gate binding: {binding}")
@@ -1373,11 +1400,18 @@ def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
         'report.value.detail, "program_compile_rejected"',
         "foundation.captureRealRoot(",
         "support.assertNoActiveEvidence(",
-    )) or "refuseUnconfiguredListenerProgram(&fixture, driver, selected, reference.executable, reference.architecture)" not in trigger:
+    )) or "refuseUnconfiguredListenerProgram(&fixture, native_driver, selected, reference.executable, reference.architecture)" not in trigger:
         failures.append(
             "native_trigger_acceptance.zig: both unsupported listener programs "
             "must refuse before mutation and leave no active authority"
         )
+    if any(token not in trigger for token in (
+        "if (oracle_only == (driver != null) or (helper != null) != (driver != null))",
+        "if (settlement_reference_only and (!oracle_only or diversions_only))",
+        "if (fixture.oracle_only) return;",
+        "settlement.run(&fixture, native_driver, reference.executable, selected, reference.architecture)",
+    )):
+        failures.append("native_trigger_acceptance.zig: selector or helper reference isolation removed")
     return failures
 
 

@@ -12,6 +12,10 @@ const options = @import("native_test_options");
 
 const package = foundation.package;
 
+test {
+    _ = @import("native_failure_schema_validation.zig");
+}
+
 fn failureMarker(case: *support.Scenario, content: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |label| {
         const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{
@@ -140,64 +144,104 @@ fn runDiversions(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
     try case.phase(.{ .operation = "purge", .packages = &selected }, false);
 }
 
+fn validateSelection(driver: ?[]const u8, oracle_only: bool) !void {
+    if (oracle_only == (driver != null)) return error.InvalidReferenceSelection;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var arguments = init.minimal.args.iterate();
     _ = arguments.next();
-    const driver = arguments.next() orelse return error.MissingNativeDriver;
+    var driver: ?[]const u8 = null;
     var pinned: ?[]const u8 = null;
+    var workspace: ?[]const u8 = null;
+    var oracle_only = false;
     var diversions_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
             pinned = arguments.next() orelse return error.MissingReferencePath;
+        } else if (std.mem.eql(u8, option, "--workspace")) {
+            if (workspace != null) return error.DuplicateWorkspace;
+            workspace = arguments.next() orelse return error.MissingWorkspacePath;
+        } else if (std.mem.eql(u8, option, "--oracle-only")) {
+            if (oracle_only) return error.DuplicateSelector;
+            oracle_only = true;
         } else if (std.mem.eql(u8, option, "--diversions-only")) {
             if (diversions_only) return error.DuplicateSelector;
             diversions_only = true;
-        } else return error.InvalidArguments;
+        } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
+            driver = option;
+        }
     }
+    try validateSelection(driver, oracle_only);
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
-    var fixture = try foundation.Fixture.init(allocator, init.io, options.repository);
+    var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
     defer fixture.deinit();
     errdefer fixture.retain = true;
-    if (!diversions_only) runLifecycle(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    fixture.oracle_only = oracle_only;
+    const selected = driver orelse "";
+    if (!diversions_only) runLifecycle(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    if (!diversions_only) scripts.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    if (!diversions_only) scripts.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    if (!diversions_only) conffile_scripts.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    if (!diversions_only) conffile_scripts.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    if (!diversions_only) statoverride.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    if (!diversions_only) statoverride.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    if (!diversions_only) metadata.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    if (!diversions_only) metadata.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    if (!diversions_only) alternatives.run(&fixture, driver, reference.executable, reference.architecture, pinned != null) catch |err| {
+    if (!diversions_only) alternatives.run(&fixture, selected, reference.executable, reference.architecture, pinned != null) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    if (!diversions_only) negative.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    if (!diversions_only and !oracle_only) negative.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    diversions.run(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    diversions.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
-    runDiversions(&fixture, driver, reference.executable, reference.architecture) catch |err| {
+    runDiversions(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };
     try support.assertHostUnchanged(allocator, init.io, reference.before);
+}
+
+test "standalone lifecycle selector requires exactly one of native driver and oracle-only" {
+    try validateSelection(null, true);
+    try validateSelection("driver", false);
+    try std.testing.expectError(error.InvalidReferenceSelection, validateSelection(null, false));
+    try std.testing.expectError(error.InvalidReferenceSelection, validateSelection("driver", true));
+}
+
+test "requested workspace is a new retained direct child of the fixture parent" {
+    const a = std.testing.allocator;
+    var random: [8]u8 = undefined;
+    try std.testing.io.randomSecure(&random);
+    const relative = try std.fmt.allocPrint(a, ".tmp/native-zig-workspace-{x}", .{std.fmt.bytesToHex(random, .lower)});
+    defer a.free(relative);
+    var fixture = try foundation.Fixture.initWorkspace(a, std.testing.io, options.repository, relative);
+    try std.testing.expect(fixture.retain);
+    try std.testing.expectError(error.PathAlreadyExists, foundation.Fixture.initWorkspace(a, std.testing.io, options.repository, relative));
+    try std.testing.expectError(error.WorkspaceOutsideFixtureParent, foundation.Fixture.initWorkspace(a, std.testing.io, options.repository, ".tmp"));
+    try std.testing.expectError(error.WorkspaceOutsideFixtureParent, foundation.Fixture.initWorkspace(a, std.testing.io, options.repository, ".tmp/../escape"));
+    fixture.retain = false;
+    fixture.diagnostics = false;
+    fixture.deinit();
 }
 
 test "lifecycle scripts encode empty arguments, environment, payload and failure boundary" {
@@ -218,6 +262,38 @@ test "lifecycle scripts encode empty arguments, environment, payload and failure
         defer std.testing.allocator.free(file);
         try fixture.run(&.{ "/bin/sh", "-n", file }, "script-syntax.log", 10);
     }
+}
+
+test "bootstrap archive includes essential controls, executable interpreter, checksum and plain payload" {
+    var fixture = try foundation.Fixture.init(std.testing.allocator, std.testing.io, options.repository);
+    defer fixture.deinit();
+    const archive = try support.makePackage(&fixture, "arm64", "1", "debz-lifecycle-essential", "bootstrap", .{
+        .control_fields = "Essential: yes\n",
+        .bootstrap_shell = true,
+    });
+    defer std.testing.allocator.free(archive);
+    const prefix = "bootstrap/debz-lifecycle-essential_1_data.source";
+    const control = try support.read(&fixture, prefix ++ "/DEBIAN/control", 16 * 1024);
+    defer std.testing.allocator.free(control);
+    try std.testing.expect(std.mem.indexOf(u8, control, "Essential: yes\n") != null);
+    const manifest = try support.read(&fixture, prefix ++ "/DEBIAN/md5sums", 16 * 1024);
+    defer std.testing.allocator.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "  bin/sh\n") != null);
+    for ([_][]const u8{ prefix ++ "/bin/sh", prefix ++ "/DEBIAN/preinst", prefix ++ "/DEBIAN/postinst", prefix ++ "/DEBIAN/prerm", prefix ++ "/DEBIAN/postrm" }) |name| {
+        const file = try fixture.dir.statFile(std.testing.io, name, .{});
+        try std.testing.expectEqual(@as(u32, 0o755), file.permissions.toMode() & 0o777);
+    }
+    const listing = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "/usr/bin/ar", "t", archive },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    });
+    defer std.testing.allocator.free(listing.stdout);
+    defer std.testing.allocator.free(listing.stderr);
+    try std.testing.expect(listing.term == .exited and listing.term.exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, listing.stdout, "data.tar\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listing.stdout, "data.tar.gz") == null);
 }
 
 test "reference refuses unguarded roots without invoking selected executable" {

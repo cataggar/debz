@@ -656,6 +656,10 @@ fn phaseCheck(
     return calls;
 }
 
+fn verifyUpgradeExit(c: Case, status: u8) !void {
+    try check((status != 0) == !succeeds(c), "reference upgrade exit");
+}
+
 fn runCase(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, helper: []const u8, arch: []const u8, first: []const u8, second: []const u8, controls: [2][]const u8, c: Case) !bool {
     const a = f.allocator;
     const label = try std.fmt.allocPrint(a, "{s}-{s}", .{ c.update, c.member });
@@ -677,7 +681,7 @@ fn runCase(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, helper:
             try seedRecord(f, root, "diversion-preinst-inplace", try diversionRecord(a, source, changed, ":"));
         }
     }
-    {
+    if (!f.oracle_only) {
         const relative = try std.fmt.allocPrint(a, "{s}/native/usr/bin/dpkg-trigger", .{label});
         try f.dir.deleteFile(f.io, relative);
         const native_relative = try std.fmt.allocPrint(a, "{s}/native", .{label});
@@ -714,13 +718,20 @@ fn runCase(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, helper:
         if (phase_index == 0) earliest[0] = reference_start;
         const reference_exit = try lifecycle.reference(f, dpkg, scenario.reference_root, input, destination);
         const reference_end = std.Io.Clock.real.now(f.io).nanoseconds;
-        try check((reference_exit != 0) == (phase_index == 0 and !succeeds(c)), "reference upgrade exit");
+        if (phase_index == 0) try verifyUpgradeExit(c, reference_exit) else try check(reference_exit == 0, "reference reinstall exit");
         const native_start = std.Io.Clock.real.now(f.io).nanoseconds;
         if (phase_index == 0) earliest[1] = native_start;
-        var report = try lifecycle.native(f, driver, scenario.native_root, arch, input, destination);
-        defer report.deinit();
+        if (f.oracle_only) {
+            const oracle = try std.fmt.allocPrint(a, "{s}/oracle", .{destination});
+            try f.directory(oracle);
+            const oracle_exit = try lifecycle.reference(f, dpkg, scenario.native_root, input, oracle);
+            try check(oracle_exit == reference_exit, "reference settlement exit differs across guarded roots");
+        } else {
+            var report = try lifecycle.native(f, driver, scenario.native_root, arch, input, destination);
+            defer report.deinit();
+            try check(eq(report.value.outcome, if (reference_exit == 0) "applied" else "script_failed"), "native outcome differs from reference");
+        }
         const native_end = std.Io.Clock.real.now(f.io).nanoseconds;
-        try check(eq(report.value.outcome, if (reference_exit == 0) "applied" else "script_failed"), "native outcome differs from reference");
         var reference_after = try capture(a, f.io, scenario.reference_root);
         defer reference_after.deinit(a);
         var native_after = try capture(a, f.io, scenario.native_root);
@@ -743,13 +754,29 @@ fn runCase(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, helper:
             });
             return error.SettlementMismatch;
         }
-        std.debug.print("{s}/{s}: native/dpkg exact settlement passed\n", .{ label, operation });
+        std.debug.print("{s}/{s}: {s} exact settlement passed\n", .{ label, operation, if (f.oracle_only) "dpkg fixture repeatability" else "native/dpkg" });
         if (phase_index == 0 and succeeds(c)) {
             try seedRecord(f, scenario.reference_root, lifecycle.trace, "");
             try seedRecord(f, scenario.native_root, lifecycle.trace, "");
         }
     }
     return succeeds(c);
+}
+
+pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, helper: []const u8, arch: []const u8) !void {
+    const f = fixture;
+    try f.directory("packages");
+    const first = try makePackage(f, arch, "1");
+    const second = try makePackage(f, arch, "2");
+    const controls: [2][]const u8 = .{ "packages/" ++ package ++ "_1_conffile.source", "packages/" ++ package ++ "_2_conffile.source" };
+    var subsequent: usize = 0;
+    for (cases) |c| {
+        subsequent += @intFromBool(runCase(f, driver, dpkg, helper, arch, first, second, controls, c) catch |err| {
+            std.debug.print("{s}-{s}: {s}\n", .{ c.update, c.member, @errorName(err) });
+            return err;
+        });
+    }
+    try check(subsequent == 16, "expected exactly sixteen subsequent invocations");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -774,19 +801,7 @@ pub fn main(init: std.process.Init) !void {
     var fixture = try foundation.Fixture.init(a, init.io, options.repository);
     defer fixture.deinit();
     errdefer fixture.retain = true;
-    try fixture.directory("packages");
-    const first = try makePackage(&fixture, reference.architecture, "1");
-    const second = try makePackage(&fixture, reference.architecture, "2");
-    const controls: [2][]const u8 = .{ "packages/" ++ package ++ "_1_conffile.source", "packages/" ++ package ++ "_2_conffile.source" };
-    var subsequent: usize = 0;
-    for (cases) |c| {
-        subsequent += @intFromBool(runCase(&fixture, driver, reference.executable, helper_absolute, reference.architecture, first, second, controls, c) catch |err| {
-            std.debug.print("{s}-{s}: {s}\n", .{ c.update, c.member, @errorName(err) });
-            try lifecycle.assertHostUnchanged(a, init.io, reference.before);
-            return err;
-        });
-    }
-    try check(subsequent == 16, "expected exactly sixteen subsequent invocations");
+    try run(&fixture, driver, reference.executable, helper_absolute, reference.architecture);
     try lifecycle.assertHostUnchanged(a, init.io, reference.before);
 }
 
@@ -845,6 +860,15 @@ test "settlement matrix includes all 24 upgrades, 16 follow-ups and six partial 
     try std.testing.expectEqual(6, rollback);
     try std.testing.expectEqual(18, published);
     try std.testing.expectEqual(15, successful_postrm);
+}
+
+test "known partial rollback cannot be relabelled as a successful upgrade" {
+    const c: Case = .{ .update = "rollback", .member = "hardlink-source" };
+    try verifyUpgradeExit(c, 1);
+    try std.testing.expectError(error.SettlementMismatch, verifyUpgradeExit(c, 0));
+    try std.testing.expectEqualStrings("reference upgrade exit", last_failure);
+    try verifyUpgradeExit(.{ .update = "atomic", .member = "regular" }, 0);
+    try std.testing.expectError(error.SettlementMismatch, verifyUpgradeExit(.{ .update = "atomic", .member = "regular" }, 1));
 }
 
 test "settlement filesystem mutations reject missing backups, wrong metadata and partial rollback repair" {
@@ -927,6 +951,18 @@ test "script trace refuses rerouted triggers, missing compensation and malformed
     try std.testing.expectError(error.SettlementMismatch, scriptLines(a, missing, "arm64", calls));
     const invalid = try std.mem.replaceOwned(u8, a, text.items, "\t7:upgrade", "\t8:upgrade");
     try std.testing.expectError(error.SettlementMismatch, scriptLines(a, invalid, "arm64", calls));
+}
+
+test "directory reinstall trigger retains its changed route without an obsolete removal" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const calls = try expectedCalls(arena.allocator(), .{ .update = "atomic", .member = "directory" }, true);
+    try std.testing.expect(calls.len > 0);
+    const final = calls[calls.len - 1];
+    try std.testing.expectEqualStrings(watcher ++ "@1:postinst", final.identity);
+    try std.testing.expectEqual(@as(usize, 2), final.args.len);
+    try std.testing.expectEqualStrings("triggered", final.args[0]);
+    try std.testing.expectEqualStrings("/" ++ base ++ ".changed", final.args[1]);
 }
 
 test "old-postrm probe rejects deferred backups, metadata mutation and replacement inode" {
@@ -1027,6 +1063,22 @@ test "status, logical list and installed controls cannot be inferred from succes
     try fixture.write("status-root/var/lib/dpkg/info/" ++ package ++ ".postrm", "old control\n", 0o644);
     try std.testing.expectError(error.SettlementMismatch, verifyDatabase(&fixture, c, root, "2", source, false));
     try std.testing.expectEqualStrings("installed control bytes", last_failure);
+
+    for (lifecycle.kinds ++ [_][]const u8{ "md5sums", "conffiles" }) |name| {
+        const installed = try std.fmt.allocPrint(a, "status-root/var/lib/dpkg/info/{s}.{s}", .{ package, name });
+        try fixture.write(installed, "old control\n", 0o644);
+    }
+    var old_digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash("configuration 1\n", &old_digest, .{});
+    const old_status = try std.fmt.allocPrint(a, "Package: {s}\nStatus: install ok installed\nVersion: 1\nArchitecture: arm64\nConffiles:\n /{s} {s}\n\n", .{ package, config, std.fmt.bytesToHex(old_digest, .lower) });
+    try fixture.write(status_path, old_status, 0o644);
+    const old_list = try std.mem.replaceOwned(u8, a, files, "/" ++ base ++ "/introduced", "/" ++ base ++ "/obsolete");
+    try fixture.write(list_path, old_list, 0o644);
+    const rollback: Case = .{ .update = "rollback", .member = "hardlink-source" };
+    try verifyDatabase(&fixture, rollback, root, "1", source, false);
+    try fixture.write(list_path, try std.mem.concat(a, u8, &.{ old_list, "/" ++ base ++ "/introduced\n" }), 0o644);
+    try std.testing.expectError(error.SettlementMismatch, verifyDatabase(&fixture, rollback, root, "1", source, false));
+    try std.testing.expectEqualStrings("logical installed file list count", last_failure);
 }
 
 fn corpusField(row: std.json.Value, name: []const u8) !std.json.Value {
@@ -1110,4 +1162,9 @@ test "successful settlement corpus exactly lowers 15 profiles and refuses malfor
     try std.testing.expectEqualStrings("trigger path list", last_failure);
     try changed[0].object.put(a, "update", .{ .integer = 17 });
     try std.testing.expectError(error.SettlementMismatch, validateCorpus(a, changed));
+    for ([_][]const u8{ "unwind-success", "rollback", "postinst-failure" }) |failure_update| {
+        try changed[0].object.put(a, "update", .{ .string = failure_update });
+        try std.testing.expectError(error.SettlementMismatch, validateCorpus(a, changed));
+        try std.testing.expectEqualStrings("update", last_failure);
+    }
 }

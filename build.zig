@@ -973,6 +973,15 @@ pub fn build(b: *std.Build) void {
     lifecycle_zig.step.dependOn(&run_lifecycle_zig_tests.step);
     b.step("test-native-lifecycle-zig", "Run Zig-owned lifecycle and diversion acceptance against dpkg")
         .dependOn(&lifecycle_zig.step);
+    const lifecycle_oracle_zig = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    lifecycle_oracle_zig.addArtifactArg(lifecycle_zig_executable);
+    lifecycle_oracle_zig.addArg("--oracle-only");
+    lifecycle_oracle_zig.step.dependOn(&run_lifecycle_zig_tests.step);
+    b.step("test-native-lifecycle-zig-oracle", "Run two guarded dpkg roots for every lifecycle and diversion reference scenario")
+        .dependOn(&lifecycle_oracle_zig.step);
 
     const trigger_zig_module = b.createModule(.{
         .root_source_file = b.path("test/native_trigger_acceptance.zig"),
@@ -1001,6 +1010,27 @@ pub fn build(b: *std.Build) void {
     trigger_zig.step.dependOn(&run_trigger_zig_tests.step);
     b.step("test-native-triggers-zig", "Run Zig-owned trigger and helper acceptance against dpkg")
         .dependOn(&trigger_zig.step);
+    const trigger_oracle_zig = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    trigger_oracle_zig.addArtifactArg(trigger_zig_executable);
+    trigger_oracle_zig.addArg("--oracle-only");
+    trigger_oracle_zig.step.dependOn(&run_trigger_zig_tests.step);
+    b.step("test-native-triggers-zig-oracle", "Run trigger and settlement reference scenarios in two guarded dpkg roots")
+        .dependOn(&trigger_oracle_zig.step);
+    const settlement_oracle_zig = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    settlement_oracle_zig.addArtifactArg(trigger_zig_executable);
+    settlement_oracle_zig.addArgs(&.{ "--oracle-only", "--diversion-settlement-reference-only" });
+    settlement_oracle_zig.step.dependOn(&run_trigger_zig_tests.step);
+    b.step("test-native-triggers-zig-settlement-reference", "Run only 24 upgrades and 16 follow-ups against two pinned dpkg roots")
+        .dependOn(&settlement_oracle_zig.step);
+    const install_acceptance = b.step("build-native-acceptance-zig", "Install the standalone lifecycle and trigger Zig selector executables");
+    install_acceptance.dependOn(&b.addInstallArtifact(lifecycle_zig_executable, .{}).step);
+    install_acceptance.dependOn(&b.addInstallArtifact(trigger_zig_executable, .{}).step);
 
     const settlement_module = b.createModule(.{
         .root_source_file = b.path("test/native_diversion_settlement.zig"),
@@ -1011,9 +1041,15 @@ pub fn build(b: *std.Build) void {
     settlement_module.addOptions("native_test_options", native_fixture_options);
     const settlement_tests = b.addTest(.{ .root_module = settlement_module });
     const run_settlement_tests = b.addRunArtifact(settlement_tests);
+    const settlement_lowering_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"native_unpack.test.success route settlement lowers every reference profile"},
+    });
+    const run_settlement_lowering_tests = b.addRunArtifact(settlement_lowering_tests);
     test_step.dependOn(&run_settlement_tests.step);
-    b.step("test-native-diversion-settlement-zig-unit", "Run Zig settlement oracle mutation and count tests")
-        .dependOn(&run_settlement_tests.step);
+    const settlement_unit_step = b.step("test-native-diversion-settlement-zig-unit", "Run Zig settlement oracle mutation and production lowering tests");
+    settlement_unit_step.dependOn(&run_settlement_tests.step);
+    settlement_unit_step.dependOn(&run_settlement_lowering_tests.step);
     const settlement_executable = b.addExecutable(.{
         .name = "native-diversion-settlement-zig-acceptance",
         .root_module = settlement_module,
@@ -1078,7 +1114,7 @@ pub fn build(b: *std.Build) void {
     if (b.option(bool, "native-diversions-only", "Run only diversion lifecycle, trigger and recovery fixtures") orelse false) {
         for ([_]*std.Build.Step.Run{ native_lifecycle, native_triggers, native_recovery }) |runner|
             runner.addArg("--diversions-only");
-        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig }) |runner|
+        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, lifecycle_oracle_zig, trigger_oracle_zig }) |runner|
             runner.addArg("--diversions-only");
     }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
@@ -1088,7 +1124,7 @@ pub fn build(b: *std.Build) void {
         for ([_]*std.Build.Step.Run{
             dpkg_config_reference, dpkg_alternatives_reference, native_lifecycle, native_triggers, native_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
-        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, settlement }) |runner|
+        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, settlement, lifecycle_oracle_zig, trigger_oracle_zig, settlement_oracle_zig }) |runner|
             runner.addArgs(&.{ "--reference-dpkg", path });
     }
     if (b.option(
