@@ -336,6 +336,21 @@ using inconsistent planning/install deadlines, which made its exact-lock
 repository unavailable; it was never retried. The step-1065 refusal is the
 next distinct blocker, **not** complete closure or native/reference parity.
 
+A separate **new** authenticated 175-package amd64 root on final #237 squash
+plus this netcat change (recorded source
+`55779e7a89f41ab50abf3b1c3c429ec7d4353c6d`, ReleaseSafe executable
+SHA-256 `bbe6d9e8c2cf6f47c0ae1a8f4aad68028168f749204dce083323f7ce2ec562ea`)
+began without dpkg database, helpers, or package state. It independently
+persisted a zero-exit signed `netcat-openbsd.postinst configure ""` outcome at
+step 1026. The resulting 221-byte `nc` record has the pinned SHA-256
+`2d38af8c8cc5565fd092c8e7b09cb8517eb5347616141b3e7d92034386671c4e`;
+all eight selector and generic links match. At step 1065,
+`procps.postinst` was prepared but refused **before launch** with
+`InvalidAlternativesScript`, leaving no procps script outcome; `create.json`
+exited 8. An ignored runner copy extended only the bounded `create` timeout
+from 30 to 90 minutes. The root is retained read-only, not reused as a fresh
+trial; complete install and native/reference parity remain unproven.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
