@@ -7,6 +7,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const version = b.option([]const u8, "version", "Release version (SemVer)") orelse package_version;
+    const ci_split_apt_system_tests = b.option(
+        bool,
+        "ci-split-apt-system-tests",
+        "CI only: run the six apt/system test binaries in the separate test-apt-system job",
+    ) orelse false;
     _ = std.SemanticVersion.parse(version) catch {
         std.debug.panic("invalid -Dversion '{s}': expected SemVer (for example 0.3.0 or 1.2.3-rc.1)", .{version});
     };
@@ -512,12 +517,14 @@ pub fn build(b: *std.Build) void {
     apt_system_test_step.dependOn(&run_apt_system_command_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_orchestrator_tests.step);
-    test_step.dependOn(&run_system_profile_tests.step);
-    test_step.dependOn(&run_apt_system_api_tests.step);
-    test_step.dependOn(&run_apt_system_cli_tests.step);
-    test_step.dependOn(&run_apt_system_command_tests.step);
-    test_step.dependOn(&run_apt_system_state_tests.step);
-    test_step.dependOn(&run_apt_system_orchestrator_tests.step);
+    if (!ci_split_apt_system_tests) {
+        test_step.dependOn(&run_system_profile_tests.step);
+        test_step.dependOn(&run_apt_system_api_tests.step);
+        test_step.dependOn(&run_apt_system_cli_tests.step);
+        test_step.dependOn(&run_apt_system_command_tests.step);
+        test_step.dependOn(&run_apt_system_state_tests.step);
+        test_step.dependOn(&run_apt_system_orchestrator_tests.step);
+    }
     const required_security_test_step = b.step(
         "test-required-security",
         "Run mandatory production ownership and restart security tests",

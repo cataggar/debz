@@ -15,13 +15,35 @@ deterministic mutation logs its seed and case indexes for exact replay.
 
 Required build workloads use separate architecture and optimization-mode jobs,
 each retaining the 60-minute limit. Every combination runs the complete build,
-test, fuzz, native differential, and private helper namespace targets with
-`-j2` and timing summaries. Debug jobs also run release packaging and privileged
-orchestration; ReleaseSafe jobs run installed-CLI facade acceptance and the
-download action fixture. Native crash recovery remains a separate required
-workload in both modes on both architectures. The existing `Build and test`
-checks require all four build jobs and both recovery jobs to succeed; failure,
-cancellation, or a skipped workload cannot make the aggregate pass.
+fuzz, native differential, and private helper namespace targets with `-j2`
+and timing summaries. CI passes `-Dci-split-apt-system-tests=true` to `zig build
+test`, moving only the six apt/system Zig test binaries into a separate,
+required four-cell x64/arm64 × Debug/ReleaseSafe `zig build test-apt-system`
+workload, with the same Zig version, system dependencies, `-j2`, and timing
+summaries. Local `zig build test` still runs all six by default, and
+`test-apt-system` always includes them. Debug build jobs also run release
+packaging and the distinct privileged orchestration crash suite; ReleaseSafe
+build jobs run installed-CLI facade acceptance and the download action fixture.
+Native crash recovery remains a separate required workload in both modes on
+both architectures. Both existing `Build and test` checks require all four
+build jobs, four apt/system jobs, and both recovery jobs to succeed; failure,
+cancellation, a skipped job, or an incomplete matrix fails both checks.
+
+This split is a candidate, not a demonstrated reduction in the total critical
+path. For PR measurement compare all four architecture/mode pairs against the
+unsharded #229/#228 workflow runs (36064607851/36053148881), including x64
+ReleaseSafe's ~42-minute `zig build test` with 19 fresh test binaries and a
+~7-minute/5-GiB-RSS largest binary. Record both job durations, per-binary and
+combined passed/skipped counts (unsharded x64 ReleaseSafe: 1702 passed,
+94 skipped), peak runner memory, and the timestamp when the last required
+aggregate check finishes. Keep the split only if all four shard cells and both
+aggregates pass with the same tests executed and no newly skipped tests, x64
+ReleaseSafe's build workload improves by at least five minutes, **and** the
+overall required-check critical path improves by at least five minutes without
+a memory or timeout regression. If the comparison is noisy, confirm on a second
+PR run before adopting it. Otherwise remove the CI option and shard job,
+restore the six unconditional `test` dependencies, and retain the existing
+required gates. Neither lane restores Zig build caches.
 
 Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
 commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned

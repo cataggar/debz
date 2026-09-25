@@ -389,7 +389,7 @@ class SecurityAuditTests(unittest.TestCase):
         )
 
     def test_workflows_pin_verified_ghr_zig_installation(self) -> None:
-        for workflow_name, expected_count in (("ci.yml", 11), ("release.yml", 1)):
+        for workflow_name, expected_count in (("ci.yml", 12), ("release.yml", 1)):
             workflow = (ROOT / ".github/workflows" / workflow_name).read_text()
             self.assertEqual(
                 [],
@@ -477,12 +477,14 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))
         for token in (
             "    timeout-minutes: 180",
-            "    needs: [build-and-test-workload, native-recovery]",
+            "    needs: [build-and-test-workload, apt-system-tests, native-recovery]",
             "    if: ${{ always() }}",
             "        name: [linux-x64, linux-arm64]",
             "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
+            "          APT_SYSTEM_RESULT: ${{ needs.apt-system-tests.result }}",
             "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
             '          test "$BUILD_RESULT" = success',
+            '          test "$APT_SYSTEM_RESULT" = success',
             '          test "$RECOVERY_RESULT" = success',
             '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
             '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
@@ -493,22 +495,34 @@ class SecurityAuditTests(unittest.TestCase):
                 self.assertTrue(security_audit.native_recovery_ci_failures(
                     workflow.replace(token, ""),
                 ))
+        self.assertTrue(security_audit.native_recovery_ci_failures(
+            workflow.replace(
+                "      matrix:\n        name: [linux-x64, linux-arm64]\n    steps:\n",
+                "      matrix:\n        name: [linux-x64, linux-arm64]\n"
+                "        exclude:\n          - name: linux-arm64\n    steps:\n",
+            )
+        ))
         gate = re.search(
             r"(?ms)^  build-and-test:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
             workflow,
         )
         self.assertIsNotNone(gate)
         script = gate[1].split("        run: |\n", 1)[1]
-        for build, recovery in itertools.product(
-            ("success", "failure", "cancelled", "skipped", "unknown"), repeat=2,
+        for build, apt_system, recovery in itertools.product(
+            ("success", "failure", "cancelled", "skipped", "unknown"), repeat=3,
         ):
-            with self.subTest(build=build, recovery=recovery):
+            with self.subTest(build=build, apt_system=apt_system, recovery=recovery):
                 result = subprocess.run(
                     ["bash", "-e", "-c", textwrap.dedent(script)],
-                    env={**os.environ, "BUILD_RESULT": build, "RECOVERY_RESULT": recovery},
+                    env={
+                        **os.environ, "BUILD_RESULT": build,
+                        "APT_SYSTEM_RESULT": apt_system, "RECOVERY_RESULT": recovery,
+                    },
                     stdin=subprocess.DEVNULL, capture_output=True, check=False,
                 )
-                self.assertEqual(result.returncode == 0, build == recovery == "success")
+                self.assertEqual(
+                    result.returncode == 0, build == apt_system == recovery == "success"
+                )
 
     def test_build_workloads_keep_both_modes_and_all_existing_suites(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
@@ -524,9 +538,10 @@ class SecurityAuditTests(unittest.TestCase):
             ("name: [linux-x64, linux-arm64]", "name: [linux-x64]"),
             ("optimize: [Debug, ReleaseSafe]", "optimize: [Debug]"),
             ("optimize: [Debug, ReleaseSafe]", "optimize: [ReleaseSafe]"),
+            ("            architecture: arm64", "            architecture: amd64"),
             ("      OPTIMIZE: ${{ matrix.optimize }}", "      OPTIMIZE: Debug"),
             ("        include:", "        exclude:"),
-            ('          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
+            ('          zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
             ('          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all', ""),
             ("      - name: Build and test\n", "      - name: Build and test\n        if: false\n"),
             ("-Doptimize=\"$OPTIMIZE\"", "-Doptimize=Debug"),
@@ -562,8 +577,9 @@ class SecurityAuditTests(unittest.TestCase):
         for mode in ("Debug", "ReleaseSafe"):
             commands = [
                 f"build{target} -Doptimize={mode} -j2 --summary all"
-                for target in ("", " test", " fuzz")
+                for target in ("", " fuzz")
             ]
+            commands.insert(1, f"build test -Dci-split-apt-system-tests=true -Doptimize={mode} -j2 --summary all")
             with self.subTest(mode=mode):
                 result = subprocess.run(
                     ["bash", "-e", "-c", 'zig() { printf "%s\\n" "$*"; }\n' + script],
@@ -580,6 +596,103 @@ class SecurityAuditTests(unittest.TestCase):
                         stdin=subprocess.DEVNULL, capture_output=True, check=False,
                     )
                     self.assertNotEqual(result.returncode, 0)
+
+    def test_apt_system_shard_and_default_build_graph_are_fail_closed(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        build = (ROOT / "build.zig").read_text()
+        self.assertEqual([], security_audit.apt_system_ci_failures(workflow, build))
+        shard = re.search(
+            r"(?ms)^  apt-system-tests:\n.*?(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+            workflow,
+        )
+        self.assertIsNotNone(shard)
+        for original, replacement in (
+            (shard[0], ""),
+            ("  apt-system-tests:\n", "  apt-system-tests:\n    if: false\n"),
+            ("        name: [linux-x64, linux-arm64]", "        name: [linux-x64]"),
+            ("        optimize: [Debug, ReleaseSafe]", "        optimize: [Debug]"),
+            ("        include:\n", "        exclude:\n"),
+            ("          - os: ubuntu-24.04-arm", "          - os: ubuntu-24.04"),
+            ("      fail-fast: false", "      fail-fast: true"),
+            ("    timeout-minutes: 60", "    timeout-minutes: 30"),
+            ("      - name: Run apt/system contract and orchestration tests\n",
+             "      - name: Run apt/system contract and orchestration tests\n        if: false\n"),
+            ('        run: zig build test-apt-system -Doptimize="$OPTIMIZE" -j2 --summary all',
+             "        run: true"),
+            ("      - name: Install metadata decompression dependency\n", ""),
+        ):
+            with self.subTest(original=original[:70]):
+                changed = workflow.replace(shard[0], shard[0].replace(original, replacement, 1), 1)
+                self.assertTrue(security_audit.apt_system_ci_failures(changed, build))
+        for original, replacement in (
+            ('"ci-split-apt-system-tests",', '"ci-split-apt-system-tests-old",'),
+            ('"CI only: run the six apt/system test binaries in the separate test-apt-system job",\n    ) orelse false;',
+             '"CI only: run the six apt/system test binaries in the separate test-apt-system job",\n    ) orelse true;'),
+            ('"Fail instead of skipping privileged production orchestration tests",\n    ) orelse false;',
+             '"Fail instead of skipping privileged production orchestration tests",\n    ) orelse true;'),
+            ('    if (!ci_split_apt_system_tests) {', '    if (ci_split_apt_system_tests) {'),
+            ('    apt_system_test_step.dependOn(&run_apt_system_cli_tests.step);', ""),
+            ('        test_step.dependOn(&run_apt_system_state_tests.step);', ""),
+            ('.filters = &.{"system_profile.test."}', '.filters = &.{}'),
+            ('&.{"apt_system_command.test."},', '&.{"apt_system_command.test.no_match."},'),
+            ('&.{ "apt_system_orchestrator.test.", "apt_system_lower_ownership_token.test." },',
+             '&.{"apt_system_orchestrator.test.no_match."},'),
+        ):
+            with self.subTest(original=original):
+                changed = build.replace(original, replacement, 1)
+                self.assertNotEqual(changed, build)
+                self.assertTrue(security_audit.apt_system_ci_failures(workflow, changed))
+        for name in (
+            "system_profile", "apt_system_api", "apt_system_cli",
+            "apt_system_command", "apt_system_state", "apt_system_orchestrator",
+        ):
+            for step in ("apt_system_test_step", "test_step"):
+                edge = f"{step}.dependOn(&run_{name}_tests.step);"
+                with self.subTest(binary=name, step=step):
+                    changed = build.replace(edge, "", 1)
+                    self.assertTrue(security_audit.apt_system_ci_failures(workflow, changed))
+        release_spec = importlib.util.spec_from_file_location(
+            "debz_release_policy", ROOT / "tools/release-workflow-policy.py"
+        )
+        assert release_spec and release_spec.loader
+        release_policy = importlib.util.module_from_spec(release_spec)
+        release_spec.loader.exec_module(release_policy)
+        self.assertEqual([], release_policy.audit_ci_apt_shard(workflow, build))
+        self.assertTrue(release_policy.audit_ci_apt_shard(workflow.replace(shard[0], ""), build))
+        self.assertTrue(release_policy.audit_ci_apt_shard(
+            workflow.replace('          test "$APT_SYSTEM_RESULT" = success', ""), build
+        ))
+        self.assertTrue(release_policy.audit_ci_apt_shard(
+            workflow, build.replace('    if (!ci_split_apt_system_tests) {', "")
+        ))
+
+    def test_apt_system_shard_runs_every_optimization_and_propagates_failures(self) -> None:
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        shard = re.search(
+            r"(?ms)^  apt-system-tests:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+            workflow,
+        )
+        self.assertIsNotNone(shard)
+        command = 'zig build test-apt-system -Doptimize="$OPTIMIZE" -j2 --summary all'
+        self.assertIn("        run: " + command, shard[1])
+        for mode in ("Debug", "ReleaseSafe"):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    ["bash", "-e", "-c", 'zig() { printf "%s\\n" "$*"; }\n' + command],
+                    env={**os.environ, "OPTIMIZE": mode},
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(
+                    result.stdout.strip(),
+                    f"build test-apt-system -Doptimize={mode} -j2 --summary all",
+                )
+                self.assertEqual(result.returncode, 0)
+                failed = subprocess.run(
+                    ["bash", "-e", "-c", "zig() { return 1; }\n" + command],
+                    env={**os.environ, "OPTIMIZE": mode},
+                    capture_output=True, check=False,
+                )
+                self.assertNotEqual(failed.returncode, 0)
 
     def test_install_action_reuses_pinned_bundles_and_never_short_circuits(self) -> None:
         package = json.loads((ROOT / "actions/install/package.json").read_text())

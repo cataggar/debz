@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import pathlib
 import re
@@ -49,7 +50,7 @@ def audit_actions(text: str, workflow: pathlib.Path) -> None:
 
 def audit_zig_installation(ci: str, release: str) -> None:
     for label, text, expected_count in (
-        ("ci.yml", ci, 11),
+        ("ci.yml", ci, 12),
         ("release.yml", release, 1),
     ):
         if "mlugg/setup-zig" in text or "use-cache:" in text:
@@ -59,6 +60,17 @@ def audit_zig_installation(ci: str, release: str) -> None:
             FAILURES.append(
                 f"{label}: expected {expected_count} exact verified ghr Zig install blocks, found {count}"
             )
+
+
+def audit_ci_apt_shard(ci: str, build: str) -> list[str]:
+    spec = importlib.util.spec_from_file_location(
+        "debz_security_audit", ROOT / "tools/security-audit.py"
+    )
+    if spec is None or spec.loader is None:
+        return ["CI apt/system shard policy is unavailable"]
+    audit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audit)
+    return audit.apt_system_ci_failures(ci, build) + audit.native_recovery_ci_failures(ci)
 
 
 def audit_setup_action(ci: str, release: str) -> None:
@@ -359,6 +371,7 @@ def main() -> None:
     audit_actions(release, RELEASE)
     audit_actions(ci, CI)
     audit_zig_installation(ci, release)
+    FAILURES.extend(audit_ci_apt_shard(ci, (ROOT / "build.zig").read_text()))
     audit_setup_action(ci, release)
     audit_download_action(ci, release)
     audit_install_action(ci, release)

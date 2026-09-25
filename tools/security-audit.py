@@ -1156,6 +1156,21 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         )) or re.search(r"(?m)^    if:", body) or "continue-on-error:" in body:
             failures.append(f"ci.yml: {name} must require both architectures within its reviewed job limit")
     workload = jobs.get("build-and-test-workload", "")
+    workload_matrix = re.search(
+        r"(?ms)^      matrix:\n(.*?)(?=^    (?:env|steps):|\Z)", workload,
+    )
+    if workload_matrix is None or workload_matrix.group(1) != (
+        "        name: [linux-x64, linux-arm64]\n"
+        "        optimize: [Debug, ReleaseSafe]\n"
+        "        include:\n"
+        "          - os: ubuntu-24.04\n"
+        "            name: linux-x64\n"
+        "            architecture: amd64\n"
+        "          - os: ubuntu-24.04-arm\n"
+        "            name: linux-arm64\n"
+        "            architecture: arm64\n"
+    ):
+        failures.append("ci.yml: build workloads must run exactly four architecture/mode cells")
     if any(line not in workload.splitlines() for line in (
         "    name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})",
         "        name: [linux-x64, linux-arm64]",
@@ -1169,7 +1184,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     shared_steps = {
         "Build and test": (
             '          zig build -Doptimize="$OPTIMIZE" -j2 --summary all',
-            '          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all',
+            '          zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all',
             '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
         "Compare native materialization, conffiles, lifecycle, and triggers with dpkg": (
@@ -1227,18 +1242,134 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     )) or re.search(r"(?m)^        if:", recovery):
         failures.append("ci.yml: native recovery must run the full Debug and ReleaseSafe targets")
     gate = jobs.get("build-and-test", "")
+    gate_matrix = re.search(r"(?ms)^      matrix:\n(.*?)(?=^    steps:|\Z)", gate)
     if any(line not in gate.splitlines() for line in (
         "    name: Build and test (${{ matrix.name }})",
-        "    needs: [build-and-test-workload, native-recovery]",
+        "    needs: [build-and-test-workload, apt-system-tests, native-recovery]",
         "    if: ${{ always() }}",
         "      fail-fast: false",
         "        name: [linux-x64, linux-arm64]",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
+        "          APT_SYSTEM_RESULT: ${{ needs.apt-system-tests.result }}",
         "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
         '          test "$BUILD_RESULT" = success',
+        '          test "$APT_SYSTEM_RESULT" = success',
         '          test "$RECOVERY_RESULT" = success',
-    )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate):
+    )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate) or (
+        gate_matrix is None
+        or gate_matrix.group(1) != "        name: [linux-x64, linux-arm64]\n"
+    ):
         failures.append("ci.yml: existing required build checks must reject any incomplete workload")
+    return failures
+
+
+def apt_system_ci_failures(text: str, build_text: str) -> list[str]:
+    failures = []
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        text,
+    ))
+    shard = jobs.get("apt-system-tests", "")
+    matrix = re.search(
+        r"(?ms)^      matrix:\n(.*?)(?=^    (?:env|steps):|\Z)", shard,
+    )
+    expected_matrix = (
+        "        name: [linux-x64, linux-arm64]\n"
+        "        optimize: [Debug, ReleaseSafe]\n"
+        "        include:\n"
+        "          - os: ubuntu-24.04\n"
+        "            name: linux-x64\n"
+        "          - os: ubuntu-24.04-arm\n"
+        "            name: linux-arm64\n"
+    )
+    if (
+        matrix is None
+        or matrix.group(1) != expected_matrix
+        or any(line not in shard.splitlines() for line in (
+            "    name: Apt/system tests (${{ matrix.name }}, ${{ matrix.optimize }})",
+            "    runs-on: ${{ matrix.os }}",
+            "    timeout-minutes: 60",
+            "      fail-fast: false",
+            "      OPTIMIZE: ${{ matrix.optimize }}",
+        ))
+        or re.search(r"(?m)^\s+if:|^\s+continue-on-error:", shard)
+        or GHR_ZIG_INSTALL not in shard
+    ):
+        failures.append("ci.yml: apt/system shard must run all four required cells without skips")
+    steps = dict(re.findall(
+        r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", shard,
+    ))
+    if steps.get("Run apt/system contract and orchestration tests", "").strip() != (
+        'run: zig build test-apt-system -Doptimize="$OPTIMIZE" -j2 --summary all'
+    ) or not all(token in shard for token in (
+        "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+        "          persist-credentials: false",
+        "      - name: Install metadata decompression dependency",
+        "pkg-config --exists liblzma libzstd",
+        "liblzma-dev libzstd-dev",
+    )):
+        failures.append("ci.yml: apt/system shard must execute all tests with audited dependencies")
+
+    workload = jobs.get("build-and-test-workload", "")
+    build_steps = dict(re.findall(
+        r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", workload,
+    ))
+    if (
+        '          zig build test -Dci-split-apt-system-tests=true -Doptimize="$OPTIMIZE" -j2 --summary all'
+        not in build_steps.get("Build and test", "").splitlines()
+    ):
+        failures.append("ci.yml: full test workload must explicitly enable the apt/system split")
+
+    if not re.search(
+        r'(?m)^    const ci_split_apt_system_tests = b\.option\(\n'
+        r'        bool,\n        "ci-split-apt-system-tests",\n'
+        r'        "[^"\n]+",\n    \) orelse false;$',
+        build_text,
+    ) or not re.search(
+        r'(?m)^    const require_privileged_orchestration_tests = b\.option\(\n'
+        r'        bool,\n        "require-privileged-orchestration-tests",\n'
+        r'        "[^"\n]+",\n    \) orelse false;$',
+        build_text,
+    ):
+        failures.append("build.zig: apt/system split must be opt-in; local test must remain complete")
+    names = (
+        "system_profile",
+        "apt_system_api",
+        "apt_system_cli",
+        "apt_system_command",
+        "apt_system_state",
+        "apt_system_orchestrator",
+    )
+    apt_step = re.search(
+        r"(?ms)^    const apt_system_test_step = b\.step\(\n(.*?)(?=^    const required_security_test_step)",
+        build_text,
+    )
+    expected_edges = (
+        "\n".join(f"    apt_system_test_step.dependOn(&run_{name}_tests.step);" for name in names)
+        + "\n    if (!ci_split_apt_system_tests) {\n"
+        + "\n".join(f"        test_step.dependOn(&run_{name}_tests.step);" for name in names)
+        + "\n    }\n"
+    )
+    required_filters = (
+        '.filters = &.{"system_profile.test."}',
+        '.filters = &.{"apt_system_api.test."}',
+        '.filters = &.{"apt_system_cli.test."}',
+        '.filters = &.{"apt_system_state.test."}',
+        '.filters = if (require_privileged_orchestration_tests)\n'
+        '            &.{"apt_system_command.test.required_privileged."}\n'
+        '        else\n'
+        '            &.{"apt_system_command.test."},',
+        '.filters = if (require_privileged_orchestration_tests)\n'
+        '            &.{"apt_system_orchestrator.test.required_privileged."}\n'
+        '        else\n'
+        '            &.{ "apt_system_orchestrator.test.", "apt_system_lower_ownership_token.test." },',
+    )
+    if (
+        apt_step is None
+        or expected_edges not in apt_step.group(1)
+        or any(test_filter not in build_text for test_filter in required_filters)
+    ):
+        failures.append("build.zig: the default test and apt/system shard must retain all six binaries and filters")
     return failures
 
 
@@ -1285,7 +1416,9 @@ def audit_ci_pins() -> None:
         if workflow.name == "ci.yml":
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 11, "release.yml": 1}.get(workflow.name)
+            for failure in apt_system_ci_failures(text, (ROOT / "build.zig").read_text()):
+                fail(failure)
+        expected_ghr_installs = {"ci.yml": 12, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
