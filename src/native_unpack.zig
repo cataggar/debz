@@ -18887,13 +18887,160 @@ fn appendAlternativeSlave(
     try slaves.append(allocator, incoming);
 }
 
+fn snapshotLessPreinstIsInert(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotLessPreinst(bytes)) return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "less") or
+        !std.mem.eql(u8, package.version, "668-1build1") or
+        kind != .preinst or source != .new_package or
+        arguments.len != 1 or
+        !std.mem.eql(u8, arguments[0], "install"))
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-less-668-1build1.preinst",
+    );
+    const less: native_program.PackageIdentity = .{
+        .name = "less",
+        .version = "668-1build1",
+        .architecture = "amd64",
+    };
+    try testing.expect(try snapshotLessPreinstIsInert(
+        script,
+        "amd64",
+        less,
+        .preinst,
+        .new_package,
+        &.{"install"},
+    ));
+    try testing.expect(!(try snapshotLessPreinstIsInert(
+        "#!/bin/sh\nexit 0\n",
+        "amd64",
+        less,
+        .preinst,
+        .new_package,
+        &.{"install"},
+    )));
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "arm64",
+            less,
+            .preinst,
+            .new_package,
+            &.{"install"},
+        ),
+    );
+    var other = less;
+    other.name = "most";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "amd64",
+            other,
+            .preinst,
+            .new_package,
+            &.{"install"},
+        ),
+    );
+    other = less;
+    other.version = "668-1build2";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "amd64",
+            other,
+            .preinst,
+            .new_package,
+            &.{"install"},
+        ),
+    );
+    other = less;
+    other.architecture = "arm64";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "amd64",
+            other,
+            .preinst,
+            .new_package,
+            &.{"install"},
+        ),
+    );
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "amd64",
+            less,
+            .postinst,
+            .new_package,
+            &.{"install"},
+        ),
+    );
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "amd64",
+            less,
+            .preinst,
+            .installed_package,
+            &.{"install"},
+        ),
+    );
+    for ([_][]const []const u8{
+        &.{"upgrade"},
+        &.{ "install", "1" },
+        &.{"abort-upgrade"},
+        &.{},
+    }) |arguments| try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "amd64",
+            less,
+            .preinst,
+            .new_package,
+            arguments,
+        ),
+    );
+}
+
 fn prepareAlternativesScriptBoundary(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     architecture: []const u8,
     script_bytes: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
 ) !?AlternativesScriptBoundary {
     if (!native_alternatives.scriptMayInvoke(script_bytes)) return null;
+    const inert = try snapshotLessPreinstIsInert(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -18905,11 +19052,15 @@ fn prepareAlternativesScriptBoundary(
         .{},
     );
     errdefer script.deinit();
-    _ = try native_alternatives.verifyPinnedTool(
+    const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
         root,
         architecture,
     );
+    if (inert and !native_alternatives.matchesSnapshotLessTool(
+        architecture,
+        tool_digest,
+    )) return error.InvalidAlternativesTool;
     var listed = try native_alternatives.listGroups(
         allocator,
         root,
@@ -18924,7 +19075,7 @@ fn prepareAlternativesScriptBoundary(
     for (listed.names) |name| {
         before_groups[before_count] = .{
             .name = name,
-            .mutable = alternativesScriptGroupMutable(script, name),
+            .mutable = !inert and alternativesScriptGroupMutable(script, name),
         };
         before_count += 1;
     }
@@ -18941,7 +19092,7 @@ fn prepareAlternativesScriptBoundary(
             .name = group.name,
             .topology = group.topology,
             .allow_absent = true,
-            .mutable = true,
+            .mutable = !inert,
         };
         before_count += 1;
     }
@@ -18991,7 +19142,7 @@ fn prepareAlternativesScriptBoundary(
             },
             .allow_slave_subset = scripted != null,
             .allow_absent = scripted != null,
-            .mutable = scripted != null,
+            .mutable = scripted != null and !inert,
         };
         after_count += 1;
     }
@@ -19002,7 +19153,7 @@ fn prepareAlternativesScriptBoundary(
             .name = group.name,
             .topology = topology,
             .allow_absent = true,
-            .mutable = true,
+            .mutable = !inert,
         };
         after_count += 1;
     }
@@ -19317,6 +19468,10 @@ fn runLifecycleScript(
         root,
         program.target_architecture,
         script_bytes,
+        package,
+        kind,
+        source,
+        arguments,
     ) catch |err| {
         if (attempt.record().mutation_started)
             try attempt.requireRecovery(allocator, .script);
