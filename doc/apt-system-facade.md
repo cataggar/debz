@@ -17,13 +17,43 @@ outcome before repository, root, or package mutation.
 
 ## Executable acceptance
 
-`zig build test-apt-system-acceptance` is a required Linux CI check on amd64
-and arm64, separate from the adapter and orchestration unit tests. Run it as
+`zig build test-apt-system-schema` validates the repository-owned profile,
+request, result, and operation-state schemas with bounded local fragment and
+cross-file reference resolution. It checks frozen v1/v2 contracts, v3
+conditional evidence, package grammar, and malformed documents in Debug and
+ReleaseSafe. `zig build test` and `zig build test-release` run these checks
+alongside the historical Python schema gate while migration parity is
+completed. Release-install tests compare installed schema bytes with source
+and documentation copies, including the CLI diagnostic. The validator treats
+integral decimal and exponent notation as JSON Schema integers and compares
+numeric constants by value, while rejecting fractional values. Its explicit
+192 MiB document cap, shared with the acceptance runner's bounded stdout
+capture, accommodates the result schema's 4,096 maximum-length items even
+with JSON string escaping; inputs beyond the cap fail closed.
+
+Migration inventory for #217 (not yet complete):
+
+| Coverage | Zig entry point | Still required from Python |
+| --- | --- | --- |
+| Schema cases (13/13 historical Python methods), including profile, request, result v1/v2/v3, and durable operation state | Closed local registry, fragment references, conditional branches, field bounds, frozen documents, canonical examples, invalid packages, duplicate/missing/unknown fields, and six security test selections | Historical schema unittest remains active until migration completion |
+| Installed schema copies | Release-install compares source, runtime, and documentation copies byte-for-byte | None |
+| Privileged apt acceptance | Zig executable guards root and PID namespace, builds a signed-repository disposable root with real dpkg bootstrap, mounts only inside private namespaces, checks ambient isolation, host status, and cleanup | The Python suite remains required until the new runner passes privileged CI |
+| Executed apt scenarios | Zig runs invalid syntax/profiles, update, reviewed and confirmed multi-package install, exact-lock and receipt evidence, installed listing, both backends, upgrade and unchanged native upgrade, reinstall, removal, atomic planning rejection, failed script, and interactive recovery | Python executes the same scenarios independently as a parity gate |
+| Acceptance invocation | Zig accepts an optional executable, `--inside`, and `--transaction-backend` (both backends by default), with bounded command output and deadlines | The historical Python invocation remains a separate CI root gate |
+
+`zig build test-apt-system-acceptance` runs **both** independent privileged
+entry points; `test-apt-system-acceptance-zig` and
+`test-apt-system-acceptance-python` select one. CI runs both on Linux amd64
+and arm64 in ReleaseSafe. The Zig runner has only been compiled and checked
+for unprivileged fail-closed behavior locally: privileged CI execution is an
+explicit merge gate, not a local pass or a skip. Do not remove the Python
+entry point until the Zig suite succeeds under root on both architectures.
+Run the acceptance targets as
 root with Linux mount, PID, and network namespace support, Python 3 with
 `cryptography`, and the host's dpkg, dpkg-deb, dpkg-split, dpkg-trigger, GNU tar, shell,
 ldconfig, start-stop-daemon, rm, and diff available.
-CI invokes the same acceptance script with the preceding build's ReleaseSafe
-executable rather than compiling it again in a separate privileged cache.
+The Zig runner also uses host `cp`, `ldd`, `mknod`, `unshare`, `mount`, and
+`chroot` for disposable fixture setup and execution.
 
 The check invokes the built `debz` executable in separate disposable legacy and
 native chroots under the repository's `.zig-cache`, using an authenticated fixture

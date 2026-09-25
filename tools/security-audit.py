@@ -1203,6 +1203,10 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         "Run required real apt facade acceptance": ("ReleaseSafe", (
             "            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz",
         )),
+        "Run Zig real apt facade acceptance": ("ReleaseSafe", (
+            '            "$(command -v zig)" build test-apt-system-acceptance-zig \\',
+            "              -Doptimize=ReleaseSafe -j2 --summary all",
+        )),
         "Run required privileged orchestration crash suite": ("Debug", (
             '            "$(command -v zig)" build test-apt-system \\',
             "              -Drequire-privileged-orchestration-tests=true \\",

@@ -539,6 +539,7 @@ class SecurityAuditTests(unittest.TestCase):
             ("        run: zig build test-release -j2 --summary all", ""),
             ("        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help", ""),
             ("            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz", ""),
+            ('            "$(command -v zig)" build test-apt-system-acceptance-zig \\', ""),
             ("              -Drequire-privileged-orchestration-tests=true \\", ""),
             ("          python3 tools/generate-integration-repository.py \\", ""),
             ("        uses: ./actions/download", ""),

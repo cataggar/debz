@@ -38,19 +38,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 429,
-      "sha512": "fb174909873538dbe95b0ce064baa2d53340086876916c1a38d02ae351194a87acf537282c7c64bd44c4a636d9e05e8fe4db19ac71b432b0c28853bf136d5920"
+      "count": 433,
+      "sha512": "cc7d7e038d5b159fbf6f8c612334db28a5dd99f45baf2c12d64de4db7a618b3c5e1eb28b2191ef436ae54b74d1ebb34bdf55086a554b2ab05c29b24e33616a8a"
     },
     "findings": {
-      "count": 20351,
+      "count": 20381,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
-        "fixed_64_hex": 171,
-        "raw_32_byte": 1079,
-        "sha256_token": 18802
+        "fixed_64_hex": 172,
+        "raw_32_byte": 1085,
+        "sha256_token": 18825
       },
-      "sha512": "f32e6417557e36ee9a48e53eaf743e74173201483f7043f670f15b76d568adeb8204c2ed3fa99f4ab16c9df543a4200b4f8b2e191a9aa50f9e05f40b8d9c87ab"
+      "sha512": "943455664b1fac1b8ec01c624fbd52dd0cb3168213cd522d32f07b6a513bed3cd0bcb0c1bdf06810096da48858bbee5f2230b794db541e99bb46384270ae3f76"
     },
     "classifications": [
       {
@@ -169,15 +169,15 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 35,
+        "count": 65,
         "counts": {
           "cas_layout": 0,
           "digest_version": 0,
-          "fixed_64_hex": 0,
-          "raw_32_byte": 8,
-          "sha256_token": 27
+          "fixed_64_hex": 1,
+          "raw_32_byte": 14,
+          "sha256_token": 50
         },
-        "sha512": "ebee48ebff1eb1343b1dff1d1b6d4d2d0e5973f3211d942defd164b98ec1a3869ff7c14de744cefcb06eaf04d588113e50afc8f80dbd40984e09fca3dc230013"
+        "sha512": "21115c20b4b6c096e895e977e10f97fae231d272095d2e142eb12b93e664311252c01368e9ecae7900b9d6b1a78f6ae1c5dd19f0da491c58ebf17b33ff9919ae"
       },
       {
         "scope": "tools",
@@ -447,12 +447,13 @@
         "src/transaction_provenance_v2.zig",
         "src/transaction_provenance_v3.zig",
         "src/transaction_recovery.zig",
+        "test/apt-system-schema-validator.zig",
         "tools/derive-vendor-state-reference.py",
         "tools/test-native-lifecycle.py",
         "tools/test_vendor_state_capture.py"
       ],
-      "count": 171,
-      "sha512": "2ee070574df77a39f636cc545bd5d07fa90f647c3a4687262193d9ca277042bb43467d8b6549d748577c21c53733338fafe26514b18c07ba65182f0dc2d56b3b"
+      "count": 172,
+      "sha512": "0fb9f3bc820e67db2624455d743c38b3d33a7608227b36012fa64059e622bc1926d3801ee71c6e1bac1f89d2b1cbf329386d6a6282499405d300fb4223da9f16"
     },
     {
       "id": "historical-fixed-cas-layouts",
