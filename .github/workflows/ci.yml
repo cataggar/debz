@@ -780,13 +780,21 @@ jobs:
         run: |
           zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Run required real apt facade acceptance
-        if: ${{ matrix.optimize == 'ReleaseSafe' }}
         run: |
           sudo env \
             PATH="$PATH" \
             TMPDIR="$PWD/.zig-cache" \
             PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" \
-            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz
+            ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-global" \
+            ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-local" \
+            "$(command -v zig)" build test-apt-system-acceptance \
+              -Doptimize="$OPTIMIZE" -j2 --summary all
+      - name: Normalize apt facade acceptance diagnostics
+        if: ${{ always() }}
+        run: |
+          sudo chown -R "$USER:$USER" \
+            .zig-cache/apt-system-acceptance-global \
+            .zig-cache/apt-system-acceptance-local 2>/dev/null || true
       - name: Run required privileged orchestration crash suite
         if: ${{ matrix.optimize == 'Debug' }}
         run: |

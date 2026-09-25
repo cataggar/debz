@@ -110,6 +110,23 @@ do
   test -f "$release_prefix/share/debz/schema/$schema"
   test -f "$release_prefix/share/doc/debz/schema/$schema"
 done
+for prefix in "$gnu_prefix" "$release_prefix"
+do
+  for schema in \
+    apt-system-cli-diagnostic-v1.json \
+    apt-system-execution-completion-v1.json \
+    apt-system-operation-state-v1.json \
+    apt-system-request-v1.json \
+    apt-system-result-v1.json \
+    apt-system-result-v2.json \
+    apt-system-result-v3.json \
+    system-profile-v1.json \
+    system-profile-v2.json
+  do
+    cmp "schema/$schema" "$prefix/share/debz/schema/$schema"
+    cmp "schema/$schema" "$prefix/share/doc/debz/schema/$schema"
+  done
+done
 test -f "$release_prefix/share/doc/debz/doc/target-apt-config.md"
 test -f "$release_prefix/share/doc/debz/doc/repository-management.md"
 test -f "$release_prefix/share/doc/debz/doc/root-filesystem.md"

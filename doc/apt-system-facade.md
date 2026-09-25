@@ -17,13 +17,43 @@ outcome before repository, root, or package mutation.
 
 ## Executable acceptance
 
-`zig build test-apt-system-acceptance` is a required Linux CI check on amd64
-and arm64, separate from the adapter and orchestration unit tests. Run it as
-root with Linux mount, PID, and network namespace support, Python 3 with
-`cryptography`, and the host's dpkg, dpkg-deb, dpkg-split, dpkg-trigger, GNU tar, shell,
-ldconfig, start-stop-daemon, rm, and diff available.
-CI invokes the same acceptance script with the preceding build's ReleaseSafe
-executable rather than compiling it again in a separate privileged cache.
+`zig build test-apt-system-schema` validates the repository-owned profile,
+request, result, and operation-state schemas with bounded local fragment and
+cross-file reference resolution. It checks frozen v1/v2 contracts, v3
+conditional evidence, package grammar, and malformed documents in Debug and
+ReleaseSafe. `zig build test` and `zig build test-release` run these checks
+without a Python schema test entry point. Release-install tests compare both
+ordinary GNU and release musl installed schema bytes with source and
+documentation copies, including the CLI diagnostic. The validator treats
+integral decimal and exponent notation as JSON Schema integers and compares
+numeric constants by value, while rejecting fractional values. Its explicit
+192 MiB document cap, shared with the acceptance runner's bounded stdout
+capture, accommodates the result schema's 4,096 maximum-length items even
+with JSON string escaping; inputs beyond the cap fail closed.
+
+Completed #217 migration inventory:
+
+| Historical assertions | Executed Zig coverage |
+| --- | --- |
+| Profile v1 rejects backend, v2 requires `legacy_dpkg`/`native`, rejects unknown backends, invalid paths/keyrings and version | `system profile v1 and v2 backend compatibility and strict paths` |
+| Frozen request v1/result v2 documents and schemas; v2 must reject v3 status; v2 list cannot be reinterpreted as v3 | `historical request and v2 schema and document remain compatible`, `result v1 keeps its strict historical shape` |
+| V3 confirmation exactly one diagnostic and correct phase, unchanged lock/retained state without receipts, unknown recovery without fabricated evidence; executing/unchanged durable state cannot claim mutation | `canonical v3 confirmation and unknown examples enforce conditional evidence`, `operation state executing and unchanged cannot claim mutation or lose lock` |
+| Distinct request/result package grammar, canonical generated v3 examples, six required security test names and selections | `request and result package contracts distinguish leading punctuation and reject invalid bytes`, `apt schema security manifests select six tests exactly once` |
+| Fail-closed malformed JSON across all ten local/frozen schemas | `missing duplicate unknown and invalid apt fields fail closed` checks top-level duplicate, unknown, wrong-type and missing required fields plus nested profile/evidence fields; validator tests cover closed refs, patterns, numeric semantics and size bounds |
+| Installed source schema parity | `tools/test-release-install.sh` byte-compares all nine apt/system source schemas with both runtime and documentation copies for GNU install and musl release-install |
+| Python disposable-root acceptance: syntax and profile failures, update, review/install, lock/receipt/completion, listing/backend compatibility, upgrade/reinstall/removal, atomic rejection, unchanged and failed native recovery | `test/apt-system-acceptance.zig` executes every scenario for both backends in separate signed-repository disposable roots with exact exit/diagnostic, mount, state/cache, host-status and helper integrity checks |
+
+`zig build test-apt-system-acceptance` runs the privileged Zig acceptance;
+`test-apt-system-acceptance-zig` remains an equivalent selector, and
+`test-apt-system-acceptance-unit` tests its unprivileged guards. CI runs the
+privileged gate on Linux amd64 and arm64 in both Debug and ReleaseSafe; local
+arm64 root runs passed in both modes. Missing privileges or fixture
+prerequisites fail rather than skip. Run the acceptance target as root with
+Linux mount, PID, and network namespace support, Python 3 with `cryptography`
+for the **fixture generator only**, and the host's dpkg, dpkg-deb, dpkg-split,
+dpkg-trigger, GNU tar, shell, ldconfig, start-stop-daemon, rm, and diff available.
+The Zig runner also uses host `cp`, `ldd`, `mknod`, `unshare`, `mount`, and
+`chroot` for disposable fixture setup and execution.
 
 The check invokes the built `debz` executable in separate disposable legacy and
 native chroots under the repository's `.zig-cache`, using an authenticated fixture

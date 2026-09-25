@@ -463,7 +463,7 @@ import importlib.util
 from pathlib import Path
 import sys
 
-spec = importlib.util.spec_from_file_location("runtime", "tools/test-apt-system-acceptance.py")
+spec = importlib.util.spec_from_file_location("runtime", "tools/disposable_root_runtime.py")
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
 runtime.copy_program(Path(sys.argv[1]), Path("/bin/sh"), "/bin/sh")

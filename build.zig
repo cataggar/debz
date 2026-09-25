@@ -232,12 +232,30 @@ pub fn build(b: *std.Build) void {
     );
     test_step.dependOn(&run_real_snapshot_comparator_tests.step);
 
-    const apt_system_acceptance = b.addSystemCommand(
-        &.{ "python3", "tools/test-apt-system-acceptance.py" },
+    const apt_system_acceptance_module = b.createModule(.{
+        .root_source_file = b.path("test/apt-system-acceptance.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    apt_system_acceptance_module.link_libc = true;
+    const apt_system_acceptance_binary = b.addExecutable(.{
+        .name = "apt-system-acceptance",
+        .root_module = apt_system_acceptance_module,
+    });
+    const apt_acceptance_unit_tests = b.addTest(.{ .root_module = apt_system_acceptance_module });
+    const run_apt_acceptance_unit_tests = b.addRunArtifact(apt_acceptance_unit_tests);
+    b.step("test-apt-system-acceptance-unit", "Check Zig acceptance fixture guards without root")
+        .dependOn(&run_apt_acceptance_unit_tests.step);
+    test_step.dependOn(&run_apt_acceptance_unit_tests.step);
+    const apt_system_acceptance_zig = b.addRunArtifact(apt_system_acceptance_binary);
+    apt_system_acceptance_zig.addArtifactArg(cli);
+    b.step("test-apt-system-acceptance-zig", "Run executable Zig apt facade acceptance (requires root)")
+        .dependOn(&apt_system_acceptance_zig.step);
+    const apt_system_acceptance_step = b.step(
+        "test-apt-system-acceptance",
+        "Run real apt facade and dpkg in a disposable root (requires root)",
     );
-    apt_system_acceptance.addArtifactArg(cli);
-    b.step("test-apt-system-acceptance", "Run real apt facade and dpkg in a disposable root (requires root)")
-        .dependOn(&apt_system_acceptance.step);
+    apt_system_acceptance_step.dependOn(&apt_system_acceptance_zig.step);
 
     const native_differential_step = b.step(
         "test-native-differential",
@@ -318,11 +336,17 @@ pub fn build(b: *std.Build) void {
     const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
     const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });
     release_test_step.dependOn(&release_tests.step);
-    const apt_system_schema_tests = b.addSystemCommand(
-        &.{ "python3", "-m", "unittest", "tools/test_apt_system_schema.py" },
-    );
-    release_test_step.dependOn(&apt_system_schema_tests.step);
-    test_step.dependOn(&apt_system_schema_tests.step);
+    const apt_schema_module = b.createModule(.{
+        .root_source_file = b.path("test/apt-system-schema-tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const apt_schema_tests = b.addTest(.{ .root_module = apt_schema_module });
+    const run_apt_schema_tests = b.addRunArtifact(apt_schema_tests);
+    b.step("test-apt-system-schema", "Validate local apt/system schemas with the Zig validator")
+        .dependOn(&run_apt_schema_tests.step);
+    release_test_step.dependOn(&run_apt_schema_tests.step);
+    test_step.dependOn(&run_apt_schema_tests.step);
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);

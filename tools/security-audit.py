@@ -1180,6 +1180,17 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             '          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all',
             '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all',
         ),
+        "Run required real apt facade acceptance": (
+            "        run: |",
+            "          sudo env \\",
+            '            PATH="$PATH" \\',
+            '            TMPDIR="$PWD/.zig-cache" \\',
+            '            PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" \\',
+            '            ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-global" \\',
+            '            ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-local" \\',
+            '            "$(command -v zig)" build test-apt-system-acceptance \\',
+            '              -Doptimize="$OPTIMIZE" -j2 --summary all',
+        ),
         "Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg": (
             '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
             "          zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \\",
@@ -1193,15 +1204,19 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         body = steps.get(name, "")
         if any(line not in body.splitlines() for line in commands) or re.search(r"(?m)^        if:", body):
             failures.append(f"ci.yml: {name} must run in every build workload")
+    normalized = steps.get("Normalize apt facade acceptance diagnostics", "")
+    if any(line not in normalized.splitlines() for line in (
+        "        if: ${{ always() }}",
+        '            .zig-cache/apt-system-acceptance-global \\',
+        '            .zig-cache/apt-system-acceptance-local 2>/dev/null || true',
+    )):
+        failures.append("ci.yml: apt acceptance caches must be normalized for both modes")
     selected_steps = {
         "Test release packaging": ("Debug", (
             "        run: zig build test-release -j2 --summary all",
         )),
         "Check ReleaseSafe CLI help": ("ReleaseSafe", (
             "        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help",
-        )),
-        "Run required real apt facade acceptance": ("ReleaseSafe", (
-            "            python3 tools/test-apt-system-acceptance.py zig-out/bin/debz",
         )),
         "Run required privileged orchestration crash suite": ("Debug", (
             '            "$(command -v zig)" build test-apt-system \\',
