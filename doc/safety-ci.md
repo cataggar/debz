@@ -22,7 +22,7 @@ private helper namespace targets with `-j2` and timing summaries. Debug jobs
 also run release packaging and privileged orchestration; ReleaseSafe jobs run
 installed-CLI facade acceptance and the download action fixture.
 
-Native crash recovery has three required jobs on each architecture, each
+Native crash recovery has four required jobs on each architecture, each
 bounded to 35 minutes. `native-recovery` has four independent matrix rows:
 amd64/arm64 × Debug/ReleaseSafe. Debug runs the Python recovery gate plus both
 Zig unit modes; ReleaseSafe runs the other Python recovery gate. The two
@@ -31,17 +31,20 @@ both architectures, with pinned dpkg and signed fixture dependencies:
 
 | Required job | Zig targets (prefix `test-native-recovery-` unless shown) |
 | --- | --- |
-| `native-recovery-zig-workflows` | `zig`, `zig-family`, `zig-repository`, `helper-zig`, `zig-bootstrap`, `zig-parity`, `zig-rollback-clock` |
+| `native-recovery-zig-workflows` | `zig`, `zig-repository`, `helper-zig`, `zig-bootstrap`, `zig-parity`, `zig-rollback-clock` |
+| `native-recovery-zig-family` | `zig-family` |
 | `native-recovery-zig-scenarios` | `zig-scriptless`, `zig-statoverride`, `zig-literal`, `zig-metadata`, `zig-conffile`, `zig-final-gaps`, `zig-diversions` |
 
 On two x64 hosted runners the old serial job received a shutdown signal
 after about 40–42 minutes, after both Python modes and the core Zig target
 passed but before the FAMILY target completed. The Python modes alone took
 about 34 minutes on the second run; moving only the Zig targets would leave
-too little runner margin. Sharding **both** the legacy modes and Zig targets
+too little runner margin. The first split still lost its x64 core/workflows
+runner after about 21 minutes during FAMILY, so FAMILY runs in its own shard.
+Sharding **both** the legacy modes and Zig targets
 preserves every pre-retirement CI command exactly once per mode and architecture.
 The existing `Build and test` checks require all four build rows and all
-eight recovery rows to succeed; failure, cancellation, or a skipped row of
+ten recovery rows to succeed; failure, cancellation, or a skipped row of
 any shard cannot make either architecture's aggregate pass. The hosted
 runner budget remains a measured risk until all shards complete in CI.
 

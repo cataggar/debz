@@ -1143,17 +1143,21 @@ def workflow_failure_handling_failures(text: str, label: str) -> list[str]:
 
 RECOVERY_ZIG_SHARDS = {
     "native-recovery-zig-workflows": (
-        "Native crash recovery Zig core and workflows (${{ matrix.name }})",
-        "Exercise Zig core, signed workflows, repository, and helper recovery",
+        "Native crash recovery Zig core and repository (${{ matrix.name }})",
+        "Exercise Zig core, repository, and helper recovery",
         (
             "test-native-recovery-zig",
-            "test-native-recovery-zig-family",
             "test-native-recovery-zig-repository",
             "test-native-recovery-helper-zig",
             "test-native-recovery-zig-bootstrap",
             "test-native-recovery-zig-parity",
             "test-native-recovery-zig-rollback-clock",
         ),
+    ),
+    "native-recovery-zig-family": (
+        "Native crash recovery Zig signed FAMILY (${{ matrix.name }})",
+        "Exercise Zig signed FAMILY recovery",
+        ("test-native-recovery-zig-family",),
     ),
     "native-recovery-zig-scenarios": (
         "Native crash recovery Zig scenario matrices (${{ matrix.name }})",
@@ -1382,6 +1386,10 @@ def native_recovery_ci_failures(text: str) -> list[str]:
                 step_name: (
                     None,
                     [
+                        *(["mkdir -p .tmp"] if name in (
+                            "native-recovery-zig-workflows",
+                            "native-recovery-zig-family",
+                        ) else []),
                         'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
                         *recovery_zig_commands(targets),
                     ],
@@ -1466,21 +1474,24 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         'test "$BUILD_RESULT" = success',
         'test "$RECOVERY_RESULT" = success',
         'test "$RECOVERY_WORKFLOWS_RESULT" = success',
+        'test "$RECOVERY_FAMILY_RESULT" = success',
         'test "$RECOVERY_SCENARIOS_RESULT" = success',
     ]
     if any(line not in gate.splitlines() for line in (
         "    name: Build and test (${{ matrix.name }})",
-        "    needs: [build-and-test-workload, native-recovery, native-recovery-zig-workflows, native-recovery-zig-scenarios]",
+        "    needs: [build-and-test-workload, native-recovery, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]",
         "    if: ${{ always() }}",
         "      fail-fast: false",
         "        name: [linux-x64, linux-arm64]",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
         "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
         "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
+        "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
         "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
         '          test "$BUILD_RESULT" = success',
         '          test "$RECOVERY_RESULT" = success',
         '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
+        '          test "$RECOVERY_FAMILY_RESULT" = success',
         '          test "$RECOVERY_SCENARIOS_RESULT" = success',
     )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate) or (
         len(gate_steps) != 1
@@ -2152,7 +2163,7 @@ def audit_ci_pins() -> None:
         if workflow.name == "ci.yml":
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 13, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 14, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs

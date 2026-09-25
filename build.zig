@@ -1265,6 +1265,8 @@ pub fn build(b: *std.Build) void {
     repository_recovery_module.addOptions("native_test_options", native_fixture_options);
     const repository_recovery_unit = b.addTest(.{ .root_module = repository_recovery_module });
     const run_repository_recovery_unit = b.addRunArtifact(repository_recovery_unit);
+    const repository_fixture_parent = b.addSystemCommand(&.{ "mkdir", "-p", b.pathFromRoot(".tmp") });
+    run_repository_recovery_unit.step.dependOn(&repository_fixture_parent.step);
     const repository_recovery_executable = b.addExecutable(.{
         .name = "native-recovery-zig-repository",
         .root_module = repository_recovery_module,
@@ -1283,6 +1285,7 @@ pub fn build(b: *std.Build) void {
     if (repository_projection_only) repository_recovery.addArg("--projection-only");
     if (repository_execution_only) repository_recovery.addArg("--execution-only");
     if (repository_cli_only) repository_recovery.addArg("--cli-only");
+    repository_recovery.step.dependOn(&repository_fixture_parent.step);
     const repository_recovery_step = b.step("test-native-recovery-zig-repository", "Run Zig-owned private-root repository transport and CLI acceptance");
     repository_recovery_step.dependOn(&run_repository_recovery_unit.step);
     repository_recovery_step.dependOn(&repository_recovery.step);

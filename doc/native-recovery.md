@@ -817,10 +817,13 @@ These controlled negative mutations are private-root/oracle checks, not claims
 that the native runtime emitted a success report on a crash or attempted a
 rollback. This slice does not cover rollback-clock integration, consumer
 parity suites, family/repository transport, or every helper bootstrap seam.
-The required Zig core/workflows CI shard runs this helper target alongside
-core, FAMILY, repository, rollback-clock and signed-parity Zig acceptance against its
-SHA-256-pinned dpkg on both architectures in Debug and ReleaseSafe without
-removing or weakening either Python gate.
+The required Zig core/repository CI shard runs this helper target alongside
+core, repository, rollback-clock and signed-parity Zig acceptance; a separate
+FAMILY shard runs signed workflow acceptance. Both use SHA-256-pinned dpkg on
+both architectures in Debug and ReleaseSafe without weakening either Python gate.
+The shard creates `.tmp` as the runner user before privileged fixtures run,
+and the standalone repository target orders its workspace creation ahead of
+both the privileged acceptance process and its unprivileged unit tests.
 The two Python recovery gates remain mandatory until the complete
 amd64/arm64 Debug/ReleaseSafe matrix reaches end-to-end parity.
 
@@ -993,7 +996,7 @@ its generation/step on refusal and is not asserted byte-identical.
 This is executed coverage of all 20 cases in that **one Python method**,
 not the entire recovery suite. `--fresh-helper-only`, both Python entry
 points, and their CI gates remain unchanged. The new Zig target runs in the
-required Zig core/workflows recovery shard on amd64 and arm64 in Debug and ReleaseSafe;
+required Zig core/repository recovery shard on amd64 and arm64 in Debug and ReleaseSafe;
 the security audit rejects removal of either CI command and detects a
 bootstrap-source digest-inventory mutation. It does not exercise #231's
 known-failure/trigger seams, unrelated helper-bound scripts, or the remaining

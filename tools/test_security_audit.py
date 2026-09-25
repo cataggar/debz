@@ -460,7 +460,7 @@ class SecurityAuditTests(unittest.TestCase):
         )
 
     def test_workflows_pin_verified_ghr_zig_installation(self) -> None:
-        for workflow_name, expected_count in (("ci.yml", 13), ("release.yml", 1)):
+        for workflow_name, expected_count in (("ci.yml", 14), ("release.yml", 1)):
             workflow = (ROOT / ".github/workflows" / workflow_name).read_text()
             self.assertEqual(
                 [],
@@ -577,6 +577,8 @@ class SecurityAuditTests(unittest.TestCase):
                     "        if: ${{ matrix.optimize == 'Debug' }}",
                     "        if: ${{ matrix.optimize == 'ReleaseSafe' }}",
                 ))
+            elif name in ("native-recovery-zig-workflows", "native-recovery-zig-family"):
+                tokens.append("          mkdir -p .tmp")
             for token in tokens:
                 with self.subTest(job=name, removed=token):
                     self.assertIn(token, body)
@@ -624,16 +626,18 @@ class SecurityAuditTests(unittest.TestCase):
                 self.assertTrue(security_audit.native_recovery_ci_failures(changed))
         gate = jobs["build-and-test"]
         for token in (
-            "    needs: [build-and-test-workload, native-recovery, native-recovery-zig-workflows, native-recovery-zig-scenarios]",
+            "    needs: [build-and-test-workload, native-recovery, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]",
             "    if: ${{ always() }}",
             "        name: [linux-x64, linux-arm64]",
             "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
             "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
             "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
+            "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
             "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
             '          test "$BUILD_RESULT" = success',
             '          test "$RECOVERY_RESULT" = success',
             '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
+            '          test "$RECOVERY_FAMILY_RESULT" = success',
             '          test "$RECOVERY_SCENARIOS_RESULT" = success',
         ):
             with self.subTest(gate=token):
@@ -647,10 +651,10 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIsNotNone(gate)
         script = gate[1].split("        run: |\n", 1)[1]
         statuses = ("success", "failure", "cancelled", "skipped", "unknown")
-        for build, recovery, workflows, scenarios in itertools.product(
-            statuses, repeat=4,
+        for build, recovery, workflows, family, scenarios in itertools.product(
+            statuses, repeat=5,
         ):
-            with self.subTest(build=build, recovery=recovery, workflows=workflows, scenarios=scenarios):
+            with self.subTest(build=build, recovery=recovery, workflows=workflows, family=family, scenarios=scenarios):
                 result = subprocess.run(
                     ["bash", "-e", "-c", textwrap.dedent(script)],
                     env={
@@ -658,13 +662,14 @@ class SecurityAuditTests(unittest.TestCase):
                         "BUILD_RESULT": build,
                         "RECOVERY_RESULT": recovery,
                         "RECOVERY_WORKFLOWS_RESULT": workflows,
+                        "RECOVERY_FAMILY_RESULT": family,
                         "RECOVERY_SCENARIOS_RESULT": scenarios,
                     },
                     stdin=subprocess.DEVNULL, capture_output=True, check=False,
                 )
                 self.assertEqual(
                     result.returncode == 0,
-                    all(status == "success" for status in (build, recovery, workflows, scenarios)),
+                    all(status == "success" for status in (build, recovery, workflows, family, scenarios)),
                 )
 
     def test_report_path_reader_refusals_are_mutation_enforced(self) -> None:
