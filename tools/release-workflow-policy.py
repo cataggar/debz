@@ -49,7 +49,7 @@ def audit_actions(text: str, workflow: pathlib.Path) -> None:
 
 def audit_zig_installation(ci: str, release: str) -> None:
     for label, text, expected_count in (
-        ("ci.yml", ci, 14),
+        ("ci.yml", ci, 13),
         ("release.yml", release, 1),
     ):
         if "mlugg/setup-zig" in text or "use-cache:" in text:
