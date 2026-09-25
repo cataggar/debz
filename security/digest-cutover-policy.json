@@ -38,19 +38,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 429,
-      "sha512": "7dfe01c3f47ad52bf325ef2ee30d8744bd3bc10c6664282d1befd2db768517028f9896dfc316b6f4e39c62c00fae654b29e16ab76305b9a49d43bb10ac48debe"
+      "count": 430,
+      "sha512": "371803e5bfe8a36ee918f4a868fa8525a2734fcc828f3ab4ad10bfbcba46ce069fed422704bb5145f07898eb3640e8f474358df9e5a787ba9e301e62cbbb96a2"
     },
     "findings": {
-      "count": 20338,
+      "count": 20349,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
         "fixed_64_hex": 171,
-        "raw_32_byte": 1074,
-        "sha256_token": 18794
+        "raw_32_byte": 1075,
+        "sha256_token": 18804
       },
-      "sha512": "6ceedbb94391a8d729918bb43017dfff8675935d7b85416a9aceb6726eed0fa5df9542ad0ef8ff00af33f5a7ebf404973356d7d677059564de39fa84f60fe513"
+      "sha512": "11848ad2b6c1a7b57e9e26c3113465e1dc58f8df11105a8ecfcb84d360783e5382f1c925d678ab90640b220e2c7e7d73607f070dcfb923610aeaec643c9c82e6"
     },
     "classifications": [
       {
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 162,
+        "count": 168,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 131
+          "sha256_token": 137
         },
-        "sha512": "797f55b6109af9073e7a8e48c0f0d5a7d7d267e913b725d18faf73cc8b2b649f005e8c81b48997824d51063956dd5be0e132ee4f918d805a708e264bd7d8c1ca"
+        "sha512": "606efce96adb3fbf1796d878967031f514dfb222fee7039e1e4bf1e21c097530a08c6c3b0fd287ea4a6ca2ba3a45b1fe9e577af8bafba7380b7982a7cbe6b7a0"
       },
       {
         "scope": "fuzz",
@@ -154,16 +154,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including the exact authenticated less and bash maintainer-script gates, and versioned compatibility readers.",
-        "count": 12031,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including the exact authenticated less and bash maintainer-script gates and the signed netcat script regression, and versioned compatibility readers.",
+        "count": 12036,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1068,
-          "sha256_token": 10816
+          "raw_32_byte": 1069,
+          "sha256_token": 10820
         },
-        "sha512": "79b0ba2ae63424748815087d99b17df4ec677a8d5fc4b19935a456c5b7d20e5adcadb2d3a7aae9c338de53354278266477c5ed02c4fa22f8a9dd4b88a4cbf928"
+        "sha512": "1e672f479ac857b107abfe4e75bbdd3df9124378c843b7eac2dee5dd91675b36fcb03d9f5e31311114e5c83d9b420201ff197985ab3afb5077e75f996f30162f"
       },
       {
         "scope": "test",

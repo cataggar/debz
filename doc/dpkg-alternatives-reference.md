@@ -107,7 +107,8 @@ file. Its exact line format is:
 
 1. `auto` or `manual`;
 2. the master generic link;
-3. ordered pairs of slave name and generic slave link;
+3. pairs of slave name and generic slave link, sorted bytewise by slave name
+   regardless of command-argument order;
 4. a blank line;
 5. for each candidate, the candidate path, signed decimal priority, and one
    target line per declared slave;
@@ -118,6 +119,12 @@ are root-owned `0777` symlinks. Generic links target
 `/etc/alternatives/<name>`; selectors target the selected provider bytes.
 Record bytes, order, sizes, SHA-256, modes, uid/gid, and every symlink target
 are in the canonical observation.
+When a registration adds a slave, existing candidates retain their targets
+by slave **name**, not by their former position in the record; a candidate
+without that slave has an empty target line. Both pinned 1.22.22 and snapshot
+1.23.7ubuntu2 tools produced the same sorted record in a two-provider probe
+that inserted `b-man` between existing `a-man` and `z-man` slaves (record
+SHA-256 `0b7c0ad2bb53aaab05bd57d81db15dcee652a89a7e677ba6c8eb5c9dfef746bb`).
 
 Selection behavior is exact:
 
@@ -310,6 +317,36 @@ postinst's zero-exit outcome and priority-10 `builtins.7.gz` group at step
 its three-slave registration returned a state outside the existing typed
 transition model. The interrupted root remains a recovery case, not a
 completed parity result.
+
+The authenticated amd64 `netcat-openbsd` 1.238-1 archive (SHA-512
+`c4d9b42055c0b9473c40a93205de115c104b79fdd51a9a8c1728d4e09ba1766fbb9bc7375abdea5fb68a0f0be7de338d8e86039f827b0a51852c99f4bb5fbe58`)
+ships a 414-byte `postinst` (SHA-256
+`81abc862db99e322e5d6cda436769bc21b9394ce287ea35d057761b6313cb6ef`).
+With `["configure", ""]`, its literal `--install` registers `/bin/nc`
+as group `nc` at priority 50, with slaves in script order `netcat`,
+`nc.1.gz`, `netcat.1.gz`. The before-script checkpoint had no `nc` group or
+links, but did contain the immutable `/usr/bin/nc.openbsd` provider. A
+disposable pinned-dpkg 1.22.22 chroot configured a synthetic package with
+the exact authenticated script; the resulting record (SHA-256
+`2d38af8c8cc5565fd092c8e7b09cb8517eb5347616141b3e7d92034386671c4e`)
+and all eight selector/generic links match the interrupted native root.
+The snapshot-pinned tool independently wrote the same bytes and links. Both
+sort the slaves as `nc.1.gz`, `netcat`, `netcat.1.gz`, which was the sole
+discrepancy with the native typed transition: it had retained script order.
+The native writer now sorts slaves by name and maps existing candidate targets
+by name; exact transition, provider/tool identity, and durable script-outcome
+checks remain in force. This is a normalized record-model correction, not
+new script authority or an exception for altered state. The interrupted root
+cannot be retried as a fresh root.
+
+In a new authenticated 175-package amd64 root, the exact netcat postinst
+persisted an exit-0 outcome at step 1026, and the resulting 221-byte record
+and eight links again matched the pinned reference. Installation then refused
+**before launching** the unrelated `procps.postinst` at step 1065: its
+`check_alternatives` shell function constructs several alternative commands
+from variables, outside the reviewed literal-command grammar. That root is
+retained for recovery; neither the netcat success nor the later refusal
+establishes full installation or native/reference parity.
 
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
