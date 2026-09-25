@@ -1140,7 +1140,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     ))
     failures = []
     timeout_lines = {
-        "build-and-test-workload": "    timeout-minutes: 60",
+        "build-and-test-workload": "    timeout-minutes: 90",
         "native-recovery": "    timeout-minutes: 180",
     }
     for name, timeout_line in timeout_lines.items():

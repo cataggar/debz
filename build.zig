@@ -886,6 +886,8 @@ pub fn build(b: *std.Build) void {
     native_recovery.addArtifactArg(cli);
     if (b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false)
         native_recovery.addArg("--core-only");
+    if (b.option(bool, "native-script-failure-only", "Select known native postinst failure/restart boundaries") orelse false)
+        native_recovery.addArg("--script-failure-only");
     if (b.option(bool, "native-deadline-only", "Select native execution deadline acceptance cases") orelse false)
         native_recovery.addArg("--deadline-only");
     if (b.option(bool, "native-repository-projection-only", "Select native repository private-root authority cases") orelse false)

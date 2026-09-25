@@ -718,7 +718,7 @@ jobs:
   build-and-test-workload:
     name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

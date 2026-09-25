@@ -14,14 +14,17 @@ deterministic corpora and Debug/ReleaseSafe builds and tests. A failing
 deterministic mutation logs its seed and case indexes for exact replay.
 
 Required build workloads use separate architecture and optimization-mode jobs,
-each retaining the 60-minute limit. Every combination runs the complete build,
-test, fuzz, native differential, and private helper namespace targets with
-`-j2` and timing summaries. Debug jobs also run release packaging and privileged
-orchestration; ReleaseSafe jobs run installed-CLI facade acceptance and the
-download action fixture. Native crash recovery remains a separate required
-workload in both modes on both architectures. The existing `Build and test`
-checks require all four build jobs and both recovery jobs to succeed; failure,
-cancellation, or a skipped workload cannot make the aggregate pass.
+each bounded by a 90-minute limit. The earlier 60-minute limit cancelled an
+x64 ReleaseSafe workload after its build, tests, and native differential checks
+passed but before the required facade acceptance could complete. Every
+combination runs the complete build, test, fuzz, native differential, and
+private helper namespace targets with `-j2` and timing summaries. Debug jobs
+also run release packaging and privileged orchestration; ReleaseSafe jobs run
+installed-CLI facade acceptance and the download action fixture. Native crash
+recovery remains a separate required workload in both modes on both
+architectures. The existing `Build and test` checks require all four build
+jobs and both recovery jobs to succeed; failure, cancellation, or a skipped
+workload cannot make the aggregate pass.
 
 Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
 commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned

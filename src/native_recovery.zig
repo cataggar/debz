@@ -141,6 +141,7 @@ pub const CrashPoint = enum {
     during_known_unpack_rollback,
     after_known_unpack_rollback,
     after_failure_outcome,
+    after_script_failure_state,
     after_trigger_outcome,
     after_provenance,
     after_active_clear,

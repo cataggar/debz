@@ -16348,6 +16348,49 @@ fn lifecycleSyncTriggerRegistry(
     );
 }
 
+fn incorporateTriggerEvent(
+    allocator: std.mem.Allocator,
+    database: package_database.Model,
+    architecture: []const u8,
+    event: RuntimeTriggerEvent,
+    pending: *std.ArrayList(SimulatedTriggerPackage),
+    pending_index: *std.StringHashMapUnmanaged(usize),
+    awaited: *std.ArrayList(SimulatedTriggerPackage),
+    awaited_index: *std.StringHashMapUnmanaged(usize),
+) !void {
+    for (event.listeners) |listener| {
+        const handler_architecture = if (listener.package.architecture.len == 0)
+            architecture
+        else
+            listener.package.architecture;
+        const handler_record = database.find(
+            listener.package.name,
+            handler_architecture,
+        ) orelse return error.TriggerPackageMissing;
+        // dpkg incorporates an activation without scheduling a handler
+        // whose package has not successfully been configured.
+        if (!configuredState(handler_record.status.current)) continue;
+        const handler = try simulatedTriggerPackage(
+            allocator,
+            pending,
+            pending_index,
+            listener.package.name,
+            handler_architecture,
+        );
+        try appendUniqueText(allocator, &handler.values, event.trigger);
+        if (event.activation_awaits and listener.await_mode == .awaited) {
+            const source = try simulatedTriggerPackage(
+                allocator,
+                awaited,
+                awaited_index,
+                event.source.name,
+                event.source.architecture,
+            );
+            try appendUniqueText(allocator, &source.values, listener.package.name);
+        }
+    }
+}
+
 fn lifecycleApplyTriggerEvents(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -16427,29 +16470,22 @@ fn lifecycleApplyTriggerEvents(
         }
     }
     for (events) |event| {
-        for (event.listeners) |listener| {
-            const handler = try simulatedTriggerPackage(
-                owned,
-                &pending,
-                &pending_index,
-                listener.package.name,
-                if (listener.package.architecture.len == 0)
-                    program.target_architecture
-                else
-                    listener.package.architecture,
-            );
-            try appendUniqueText(owned, &handler.values, event.trigger);
-            if (event.activation_awaits and listener.await_mode == .awaited) {
-                const source = try simulatedTriggerPackage(
-                    owned,
-                    &awaited,
-                    &awaited_index,
-                    event.source.name,
-                    event.source.architecture,
-                );
-                try appendUniqueText(owned, &source.values, listener.package.name);
-            }
-        }
+        incorporateTriggerEvent(
+            owned,
+            database.model,
+            program.target_architecture,
+            event,
+            &pending,
+            &pending_index,
+            &awaited,
+            &awaited_index,
+        ) catch |err| switch (err) {
+            error.TriggerPackageMissing => return .{
+                .outcome = .refused,
+                .detail = "trigger_package_missing",
+            },
+            else => return err,
+        };
     }
     var updates: std.ArrayList(TriggerPackageUpdate) = .empty;
     defer updates.deinit(allocator);
@@ -26416,6 +26452,8 @@ fn executeLifecycleProgramWithRequest(
                 );
                 if (lifecycleMaterializationFailure(result)) |failure| return failure;
             }
+            if (execution.recovery) |runtime|
+                runtime.crash.hit(.after_script_failure_state);
             if (program.trigger_authority != null) {
                 const trigger_step = for (program.steps) |candidate| {
                     if (candidate.operation == .process_deferred_triggers) break candidate;
@@ -28294,6 +28332,148 @@ test "native_unpack.test.trigger authority binds old and new scripts of every ki
         native_authorization.TriggerScriptSource.new_package,
         authority.handlers[0].source,
     );
+}
+
+test "native_unpack.test.failed script incorporation cannot schedule an unpacked listener" {
+    const Record = struct {
+        fn make(name: []const u8, state: package_database.CurrentState) !package_database.PackageRecord {
+            return .{
+                .name = name,
+                .architecture = "amd64",
+                .version = "1",
+                .parsed_version = try version_module.DebianVersion.parse("1"),
+                .status = .{ .want = .install, .error_state = .ok, .current = state },
+                .multi_arch = null,
+                .essential = false,
+                .protected = false,
+                .fields = &.{},
+                .conffiles = &.{},
+                .triggers_pending = &.{},
+                .triggers_awaited = &.{},
+                .info_stem = name,
+                .paths = &.{},
+                .md5sums = null,
+                .declared_conffiles = null,
+                .trigger_declarations = null,
+                .scripts = &.{},
+            };
+        }
+    };
+    var records = [_]package_database.PackageRecord{
+        try Record.make("listener", .unpacked),
+        try Record.make("failed-script", .half_configured),
+    };
+    var database: package_database.Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = records.len },
+        .packages = &records,
+    };
+    const listeners = [_]package_database.TriggerInterest{.{
+        .trigger = "needs-configured-listener",
+        .package = .{ .name = "listener", .architecture = "" },
+        .await_mode = .awaited,
+    }};
+    const activation: RuntimeTriggerEvent = .{
+        .origin = .dynamic,
+        .source = .{ .name = "failed-script", .architecture = "amd64" },
+        .trigger = "needs-configured-listener",
+        .activation_awaits = true,
+        .listeners = &listeners,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var pending: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    var awaited: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    var pending_index: std.StringHashMapUnmanaged(usize) = .empty;
+    var awaited_index: std.StringHashMapUnmanaged(usize) = .empty;
+
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        activation,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 0), pending.items.len);
+    try testing.expectEqual(@as(usize, 0), awaited.items.len);
+    records[0].status.current = .half_configured;
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        activation,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 0), pending.items.len);
+    records[0].status.current = .installed;
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        activation,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 1), pending.items.len);
+    try testing.expectEqualStrings("needs-configured-listener", pending.items[0].values.items[0]);
+    try testing.expectEqual(@as(usize, 1), awaited.items.len);
+    try testing.expectEqualStrings("listener", awaited.items[0].values.items[0]);
+
+    records[0].status.current = .unpacked;
+    var noawait_listener = listeners;
+    noawait_listener[0].await_mode = .noawait;
+    var noawait_activation = activation;
+    noawait_activation.listeners = &noawait_listener;
+    noawait_activation.activation_awaits = false;
+    var noawait_pending: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    var noawait_index: std.StringHashMapUnmanaged(usize) = .empty;
+    var noawait_awaited: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    var noawait_awaited_index: std.StringHashMapUnmanaged(usize) = .empty;
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        noawait_activation,
+        &noawait_pending,
+        &noawait_index,
+        &noawait_awaited,
+        &noawait_awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 0), noawait_pending.items.len);
+    records[0].status.current = .installed;
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        noawait_activation,
+        &noawait_pending,
+        &noawait_index,
+        &noawait_awaited,
+        &noawait_awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 1), noawait_pending.items.len);
+    try testing.expectEqual(@as(usize, 0), noawait_awaited.items.len);
+
+    database.packages = &.{};
+    try testing.expectError(error.TriggerPackageMissing, incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        activation,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    ));
 }
 
 test "native_unpack.test.derived trigger closure rejects missing reordered and unrelated changes" {

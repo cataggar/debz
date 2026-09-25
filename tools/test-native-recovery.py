@@ -1490,7 +1490,49 @@ def exercise(executable: Path, helper: Path, workspace: Path, environment: dict,
         current.blocked(binding)
 
 
+def exercise_script_failure_state(
+    executable: Path, helper: Path, workspace: Path,
+    environment: dict, architecture: str,
+) -> None:
+    for boundary in ("after_failure_outcome", "after_script_failure_state"):
+        current = Scenario(
+            workspace, f"postinst-failure-{boundary}",
+            executable, helper, architecture, environment,
+        )
+        archive = m.make_package(
+            workspace / "packages" / f"postinst-failure-{boundary}",
+            environment, architecture, "1",
+            scripts=lifecycle.scripts(m.PACKAGE, "1"),
+        )
+        lifecycle.Scenario.fail(current, f"{m.PACKAGE}@1:postinst:configure")
+        binding = current.crash("install", [archive], boundary, failure=True)
+        claim = document(current.candidate / OPERATION)
+        if claim["state"] == "completed" or claim["outcome"] != "pending":
+            raise AssertionError(f"failed script prematurely cleared the root claim: {claim}")
+        progress = document(current.candidate / PROGRESS, 16 * 1024 * 1024)
+        scripts = [record for record in progress["records"]
+                   if record["action"]["kind"] == "script"]
+        if not any(record["stage"] == "outcome" and record["result"] == "exited"
+                   for record in scripts):
+            raise AssertionError("known exit was not persisted before the crash")
+        if boundary == "after_script_failure_state":
+            failures = [record for record in scripts
+                        if record["stage"] == "completed" and record["result"] == "failed"]
+            if len(failures) != 1 or not any(
+                record["action"]["kind"] == "database"
+                and record["action"]["program_step"] == failures[0]["action"]["program_step"]
+                and record["stage"] == "completed" and record["result"] == "applied"
+                for record in progress["records"]
+            ):
+                raise AssertionError("failed script state was not durably committed")
+            status = (current.candidate / "var/lib/dpkg/status").read_text()
+            if "Status: install ok half-configured" not in status:
+                raise AssertionError("failed postinst did not preserve half-configured status")
+        current.completed(binding, failure=True)
+
+
 def exercise_core(executable: Path, helper: Path, workspace: Path, environment: dict, architecture: str) -> None:
+    exercise_script_failure_state(executable, helper, workspace, environment, architecture)
     for boundary in (
         "after_native_receipt", "after_completed_record", "after_owed_provenance_document",
         "after_provenance_published", "after_native_acknowledged",
@@ -5094,6 +5136,7 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path)
     parser.add_argument("--reference-dpkg", type=Path)
     parser.add_argument("--core-only", action="store_true")
+    parser.add_argument("--script-failure-only", action="store_true")
     parser.add_argument("--deadline-only", action="store_true")
     parser.add_argument("--repository-projection-only", action="store_true")
     parser.add_argument("--repository-execution-only", action="store_true")
@@ -5105,7 +5148,7 @@ def main() -> int:
     arguments = parser.parse_args()
     if sum((arguments.core_only, arguments.deadline_only, arguments.repository_projection_only,
             arguments.repository_execution_only, arguments.repository_cli_only, arguments.consumer_parity_only,
-            arguments.diversions_only, arguments.fresh_helper_only)) > 1:
+            arguments.diversions_only, arguments.fresh_helper_only, arguments.script_failure_only)) > 1:
         parser.error("native recovery workload selectors are mutually exclusive")
     if os.geteuid() != 0:
         raise RuntimeError("recovery acceptance requires root for actual chroot execution")
@@ -5140,6 +5183,8 @@ def main() -> int:
             environment = m.fixture_environment(workspace)
             if arguments.diversions_only:
                 exercise_diversion_recovery(executable, helper, workspace, environment, architecture)
+            elif arguments.script_failure_only:
+                exercise_script_failure_state(executable, helper, workspace, environment, architecture)
             elif arguments.fresh_helper_only:
                 exercise_fresh_helper_bootstrap(
                     executable,
