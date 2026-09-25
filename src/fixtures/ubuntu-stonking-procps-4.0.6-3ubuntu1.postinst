@@ -1,0 +1,78 @@
+#!/bin/sh
+
+set -e
+
+_update_sysctl() {
+    # Conditionally apply the updated sysctl configuration:
+    # - The init system must not be systemd; if it is then its own
+    #   file trigger will handle this.
+    # - /proc/sys must be available.
+    # - We must not be running in a chroot, as we would then wrongly
+    #   override the outer system.
+    # - We must not be running in a container, as many sysctls will
+    #   not be writable and we don't know how to handle that.
+    if ! [ -d /run/systemd/system ] \
+       && [ -d /proc/sys ] \
+       && ! ischroot \
+       && ! grep -qz '^container=' /proc/1/environ; then
+        echo 'procps: Applying updated sysctl configuration'
+        sysctl -q --system || true
+    fi
+}
+
+if [ "$1" = "triggered" ]; then
+    shift
+    for trigger in "$@"; do
+        case "$trigger" in
+            /usr/lib/sysctl.d)
+                _update_sysctl
+                ;;
+        esac
+    done
+    exit 0
+fi
+
+# update alternative, if it exists
+check_alternatives() {
+    BINNAME="$1"
+    BINPATH="$2"
+    MANSEC="$3"
+    if [ -r "$BINPATH"/"$BINNAME".procps ] ; then
+        update-alternatives --install "$BINPATH"/"$BINNAME" "$BINNAME" \
+            "$BINPATH"/"$BINNAME".procps 50 \
+                --slave /usr/share/man/man"$MANSEC"/"$BINNAME"."$MANSEC".gz "$BINNAME"."$MANSEC".gz \
+                /usr/share/man/man"$MANSEC"/"$BINNAME".procps."$MANSEC".gz
+    fi
+}
+
+case "$1" in
+    configure|abort-remove|abort-deconfigure)
+        # Do alternatives for uptime vmstat w and ps, if required
+        check_alternatives "uptime" "/usr/bin" "1"
+        check_alternatives "vmstat" "/usr/bin" "8"
+        check_alternatives "w" "/usr/bin" "1"
+        check_alternatives "ps" "/bin" "1"        
+    ;;
+esac
+
+# Automatically added by dh_installdeb/14.3ubuntu1
+dpkg-maintscript-helper rm_conffile /etc/sysctl.conf 2:4.0.4-7\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-bufferbloat.conf /usr/lib/sysctl.d/55-bufferbloat.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-console-messages.conf /usr/lib/sysctl.d/55-console-messages.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-ipv6-privacy.conf /usr/lib/sysctl.d/55-ipv6-privacy.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-kernel-hardening.conf /usr/lib/sysctl.d/55-kernel-hardening.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-magic-sysrq.conf /usr/lib/sysctl.d/55-magic-sysrq.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-map-count.conf /usr/lib/sysctl.d/55-map-count.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-network-security.conf /usr/lib/sysctl.d/55-network-security.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-ptrace.conf /usr/lib/sysctl.d/55-ptrace.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-qemu.conf /usr/lib/sysctl.d/55-qemu.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+dpkg-maintscript-helper mv_conffile /etc/sysctl.d/10-zeropage.conf /usr/lib/sysctl.d/55-zeropage.conf 2:4.0.4-8ubuntu1\~ -- "$@"
+# End automatically added section
+# Automatically added by dh_installinit/14.3ubuntu1
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
+	if [ -x "/etc/init.d/procps" ]; then
+		update-rc.d procps defaults >/dev/null || exit 1
+	fi
+fi
+# End automatically added section
+

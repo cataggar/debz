@@ -18951,6 +18951,81 @@ fn snapshotBashPostinstIsBound(
     return true;
 }
 
+fn snapshotProcpsPostinstIsInert(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotProcpsPostinst(bytes)) return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "procps") or
+        !std.mem.eql(u8, package.version, "2:4.0.6-3ubuntu1") or
+        kind != .postinst or source != .new_package or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[0], "configure") or
+        arguments[1].len != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure" {
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
+    );
+    const procps: native_program.PackageIdentity = .{
+        .name = "procps",
+        .version = "2:4.0.6-3ubuntu1",
+        .architecture = "amd64",
+    };
+    try testing.expect(try snapshotProcpsPostinstIsInert(
+        script,
+        "amd64",
+        procps,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expect(!(try snapshotProcpsPostinstIsInert(
+        "#!/bin/sh\nexit 0\n",
+        "amd64",
+        procps,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    for ([_]struct {
+        architecture: []const u8,
+        package: native_program.PackageIdentity,
+        kind: maintainer_script.Kind,
+        source: native_program.ScriptSource,
+        arguments: []const []const u8,
+    }{
+        .{ .architecture = "arm64", .package = procps, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = .{ .name = "procps", .version = procps.version, .architecture = "arm64" }, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = .{ .name = "other", .version = procps.version, .architecture = "amd64" }, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = .{ .name = "procps", .version = "4.0.6-3ubuntu1", .architecture = "amd64" }, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = procps, .kind = .preinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = procps, .kind = .postinst, .source = .installed_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = procps, .kind = .postinst, .source = .new_package, .arguments = &.{"configure"} },
+        .{ .architecture = "amd64", .package = procps, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "1" } },
+        .{ .architecture = "amd64", .package = procps, .kind = .postinst, .source = .new_package, .arguments = &.{ "abort-remove", "" } },
+    }) |case| try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotProcpsPostinstIsInert(
+            script,
+            case.architecture,
+            case.package,
+            case.kind,
+            case.source,
+            case.arguments,
+        ),
+    );
+}
+
 test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst",
@@ -19214,7 +19289,7 @@ fn prepareAlternativesScriptBoundary(
     arguments: []const []const u8,
 ) !?AlternativesScriptBoundary {
     if (!native_alternatives.scriptMayInvoke(script_bytes)) return null;
-    const inert = try snapshotLessPreinstIsInert(
+    const less_inert = try snapshotLessPreinstIsInert(
         script_bytes,
         architecture,
         package,
@@ -19222,6 +19297,15 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    const procps_inert = try snapshotProcpsPostinstIsInert(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
+    const inert = less_inert or procps_inert;
     const snapshot_postinst = try snapshotLessPostinstIsBound(
         script_bytes,
         architecture,

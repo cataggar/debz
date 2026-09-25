@@ -18,6 +18,8 @@ fuzz/corpus/alternatives/** whitespace=-blank-at-eof
 # a faithful status fixture ends with one. That is exact database content, not
 # a stray blank line to be trimmed.
 src/fixtures/package-database/** whitespace=-blank-at-eof
+# The authenticated script's trailing spaces and blank EOF are digest-bound bytes.
+src/fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst whitespace=-blank-at-eof,-trailing-space
 
 # Binary artifacts, wherever they appear.
 *.deb binary

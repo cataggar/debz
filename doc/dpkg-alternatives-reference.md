@@ -348,6 +348,46 @@ from variables, outside the reviewed literal-command grammar. That root is
 retained for recovery; neither the netcat success nor the later refusal
 establishes full installation or native/reference parity.
 
+The next script is the authenticated `procps:amd64` 2:4.0.6-3ubuntu1
+`postinst` (3,559 bytes, SHA-256
+`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`)
+from archive SHA-512
+`1e9ae9a5912c64c42dcfa5582f04c4bcda21261f7c98dfc45110e2a413666998b5eedfc9f0e53c794b2f7227762f7dd17976572d4b223aa3669e5c4280e15cbf`.
+For `["configure", ""]`, its shell function is called only with the four
+literal triples `("uptime", "/usr/bin", "1")`,
+`("vmstat", "/usr/bin", "8")`, `("w", "/usr/bin", "1")`, and
+`("ps", "/bin", "1")`. Each call tests readability of its corresponding
+`<binpath>/<name>.procps` provider **before** its parameterized
+`update-alternatives --install` command. None of those four providers exists
+in the signed fresh-root checkpoint or the signed package payload. In a
+disposable copy of that root, pinned dpkg 1.22.22 configured the **exact
+signed** script with exit 0 and no new alternatives group. As a negative
+control, staging a readable `uptime.procps` in another disposable copy made
+the same pinned dpkg execute the conditional command and create an `uptime`
+record; this is not an authorized native transition.
+
+Native admission does **not** parse or execute variable-generated
+alternatives operands. Only this script digest, the new
+`procps:amd64` postinst, exact version and configure arguments, and the
+snapshot amd64 alternatives tool are bound. All four providers must be
+absent before launch and remain absent after the script; every existing
+alternatives group must remain unchanged and no group can appear or disappear.
+Their missing-path facts, tool identity, records, and links stay in the
+managed before/after checkpoint. If any provider is present, authorization
+fails **before** running the script. Script failures and unknown outcomes
+still require the normal recovery path. No other variable expansion, script
+branch, architecture, or tool digest gains authority.
+
+The new authenticated amd64 root persisted the exact `procps.postinst`
+step-1065 outcome with exit 0 and no `uptime`, `vmstat`, `w`, or `ps`
+alternatives group. It later refused **before launching** the unrelated
+`sudo-rs.postinst` at step 1145 with `PartialAlternativesState`: the group
+`sudo` was absent, but the proposed `sudoedit` slave's generic
+`/usr/bin/sudoedit` already existed as a `sudo` package-owned symlink to
+`sudo.ws`. This partial-state refusal does not grant authority to replace
+that symlink, nor does the earlier procps success establish full parity.
+The new failed root is retained for recovery.
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is
