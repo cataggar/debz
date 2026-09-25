@@ -29,6 +29,17 @@ cleanup do. Events remain durably bound to their original package and program.
 Known lifecycle-script failure still processes or defers authorized pending
 work before publishing the failed outcome. It neither discards those events
 nor converts the original package failure into a successful receipt.
+Incorporation checks the listener's current database state: an interested
+package that is still unpacked or otherwise not configured does not become
+`triggers-pending` or cause its activating package to become
+`triggers-awaited`. This matches dpkg's handling of both awaited and
+no-await activations after a failed postinst: the activation is evidenced,
+the unincorporated queue is drained, and the unconfigured listener remains
+unpacked. Missing listeners are refused, not treated as unconfigured.
+Failure recovery rechecks that state from the database rather than replaying
+or inventing a script outcome.
+`zig build test-native-recovery -Dnative-script-failure-only -j2` exercises
+known exit, failed status publication, restart, and active-claim retention.
 
 Trigger-only processing must consume compiled authority without pretending to
 reinstall an archive. Deferred completion must retain the real pending and

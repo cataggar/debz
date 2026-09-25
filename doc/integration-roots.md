@@ -214,6 +214,19 @@ retained, not reused. An exact, journal-guarded sharing rule for a
 byte-identical structural alias claim addresses that refusal, but it
 still requires a new replay on the rebased combined code.
 
+The next authenticated amd64 replay passed that merged-/usr alias boundary.
+At configure step 852, `base-files.postinst` durably exited 1 because the
+target root lacked the `root:root` account lookup; the package's
+`half-configured` status was also durably applied. Subsequent failure-trigger
+settlement attempted to promote an unpacked listener directly to
+`triggers-pending` and returned `recovery_required: invalid_transition`,
+leaving the root claim pending. A separate reference probe confirms that dpkg
+incorporates awaited and no-await activations without scheduling an unpacked
+listener after a known failing postinst. Native settlement now applies the
+same eligibility check and tests a crash after the failed status publication.
+The account-ordering cause is separate; this interrupted root is retained,
+not reused, and neither completed closure nor parity is claimed.
+
 That new authenticated replay passed the former step-823 ownership
 refusal: `base-files` unpack published its exact archive payload, and
 configuration proceeded to step 852. Its postinst then exited 1 with

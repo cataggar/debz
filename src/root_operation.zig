@@ -6726,6 +6726,43 @@ test "root_operation.test.an attempt that owes provenance blocks the next mutati
     );
 }
 
+test "root_operation.test.known native script failure survives status publication and restart" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+
+    var request = packageRequest();
+    request.backend = .native;
+    {
+        var first = try coordinator.acquire(testing.allocator, request);
+        defer first.release();
+        try first.advance(testing.allocator, .{ .state = .preflight, .phase = .preflight });
+        try first.markMutationStarted(testing.allocator, .script);
+        try first.advance(testing.allocator, .{ .state = .mutating, .phase = .database });
+        try testing.expectError(error.InvalidTransition, first.clear());
+    }
+
+    var interrupted = (try coordinator.inspect(testing.allocator)).?;
+    defer interrupted.deinit();
+    try testing.expectEqual(State.mutating, interrupted.record.state);
+    try testing.expectEqual(Phase.database, interrupted.record.phase);
+    try testing.expect(interrupted.record.mutation_started);
+    try testing.expectEqual(Outcome.pending, interrupted.record.outcome);
+
+    request.intent = .recovery;
+    var resumed = try coordinator.acquire(testing.allocator, request);
+    defer resumed.release();
+    try resumed.beginRecovery(testing.allocator, .script);
+    try resumed.complete(testing.allocator, .failed_after_mutation);
+    try testing.expectEqual(Outcome.failed_after_mutation, resumed.record().outcome);
+    try testing.expectError(error.ProvenanceRequired, resumed.clear());
+    try resumed.publishProvenance(testing.allocator, @splat(0xee));
+    try resumed.clear();
+    try testing.expect((try coordinator.inspect(testing.allocator)) == null);
+}
+
 test "root_operation.test.corrupt, truncated, symlinked, and special records fail closed" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

@@ -276,6 +276,51 @@ class Scenario:
         print(f"{self.directory.name}: {label} passed", flush=True)
 
 
+def exercise_unconfigured_listener_reference(
+    workspace: Path, environment: dict[str, str], architecture: str,
+) -> None:
+    for awaiting in (False, True):
+        label = f"failed-postinst-unconfigured-listener-{'await' if awaiting else 'noawait'}"
+        directory = workspace / label
+        root = directory / "root"
+        m.make_root(root, architecture)
+        lifecycle.runtime.copy_program(root, Path("/bin/sh"), "/bin/sh")
+        lifecycle.runtime.copy_program(root, Path("/usr/bin/dpkg-trigger"), "/" + HELPER.as_posix())
+        receiver = m.make_package(
+            directory / "receiver", environment, architecture, "1",
+            package=RECEIVER, scripts={},
+            triggers=f"interest-{'await' if awaiting else 'noawait'} {TRIGGER}\n".encode(),
+        )
+        source = m.make_package(
+            directory / "source", environment, architecture, "1",
+            package=SOURCE,
+            scripts={"postinst": (
+                f"#!/bin/sh\n/usr/bin/dpkg-trigger --{'await' if awaiting else 'no-await'} "
+                f"{TRIGGER} || exit $?\nexit 1\n"
+            ).encode()},
+        )
+        m.run(
+            [*m.reference_command(root), "--unpack", str(receiver)],
+            environment, directory / "unpack.log",
+        )
+        if reference(root, "install", [source], [], environment, directory) != 1:
+            raise AssertionError("reference postinst unexpectedly succeeded")
+        status = (root / "var/lib/dpkg/status").read_text()
+        receiver_record = next(
+            entry for entry in status.split("\n\n") if entry.startswith(f"Package: {RECEIVER}\n")
+        )
+        source_record = next(
+            entry for entry in status.split("\n\n") if entry.startswith(f"Package: {SOURCE}\n")
+        )
+        if ("Status: install ok unpacked" not in receiver_record or
+            "Triggers-Pending:" in receiver_record or
+            "Status: install ok half-configured" not in source_record or
+            "Triggers-Awaited:" in source_record or
+            (root / "var/lib/dpkg/triggers/Unincorp").read_text() != ""):
+            raise AssertionError(f"dpkg scheduled an unconfigured listener: {label}")
+        print(f"{label}: dpkg incorporation retained the unpacked listener", flush=True)
+
+
 def exercise_diversion_triggers(
     executable: Path | None, helper: Path | None, workspace: Path,
     environment: dict[str, str], architecture: str,
@@ -737,6 +782,7 @@ def main() -> int:
                 )
             else:
                 exercise(executable, helper, workspace, environment, architecture)
+                exercise_unconfigured_listener_reference(workspace, environment, architecture)
                 settlement.exercise(
                     lifecycle, reference, workspace, environment, architecture,
                     executable=executable, helper=helper, native_runner=native,
