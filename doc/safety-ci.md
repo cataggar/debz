@@ -49,6 +49,9 @@ or a skipped row of any shard cannot make either architecture's aggregate
 pass. The audit also rejects any recovery command duplicated outside its
 assigned shard. The hosted runner budget remains a measured risk until both
 the pre-retirement and post-retirement matrices complete in CI.
+The published four-job recovery graph uses 14 verified Zig installations;
+this prepared three-job graph requires exactly 13 in both security and
+release workflow policy audits.
 
 Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
 commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned
