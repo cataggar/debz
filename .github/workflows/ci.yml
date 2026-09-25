@@ -778,7 +778,7 @@ jobs:
           zig build test-native-materialization test-native-conffiles test-native-differential test-native-lifecycle test-native-triggers \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
           # Retain the Python lifecycle and trigger gates while Zig coverage is incomplete.
-          zig build test-native-lifecycle-zig test-native-triggers-zig \
+          zig build test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig \
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
       - name: Require private native helper namespaces
         run: |

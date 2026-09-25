@@ -235,7 +235,7 @@ pub const Fixture = struct {
             }
         }
         for (options.extra_files) |file| {
-            _ = try root_fs.Path.init(file.path);
+            _ = try root_fs.Path.initPackage(file.path);
             const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ source, file.path });
             defer self.allocator.free(path);
             try self.write(path, file.content, file.mode);

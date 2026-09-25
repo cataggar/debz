@@ -1002,6 +1002,34 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-triggers-zig", "Run Zig-owned trigger and helper acceptance against dpkg")
         .dependOn(&trigger_zig.step);
 
+    const settlement_module = b.createModule(.{
+        .root_source_file = b.path("test/native_diversion_settlement.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    settlement_module.addImport("debz", debz);
+    settlement_module.addOptions("native_test_options", native_fixture_options);
+    const settlement_tests = b.addTest(.{ .root_module = settlement_module });
+    const run_settlement_tests = b.addRunArtifact(settlement_tests);
+    test_step.dependOn(&run_settlement_tests.step);
+    b.step("test-native-diversion-settlement-zig-unit", "Run Zig settlement oracle mutation and count tests")
+        .dependOn(&run_settlement_tests.step);
+    const settlement_executable = b.addExecutable(.{
+        .name = "native-diversion-settlement-zig-acceptance",
+        .root_module = settlement_module,
+    });
+    const settlement = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    settlement.addArtifactArg(settlement_executable);
+    settlement.addArtifactArg(native_lifecycle_tests);
+    settlement.addArg("--native-helper");
+    settlement.addArtifactArg(native_trigger_helper);
+    settlement.step.dependOn(&run_settlement_tests.step);
+    b.step("test-native-diversion-settlement-zig", "Compare 24 Zig settlement upgrades and 16 follow-ups with pinned dpkg")
+        .dependOn(&settlement.step);
+
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
@@ -1060,7 +1088,7 @@ pub fn build(b: *std.Build) void {
         for ([_]*std.Build.Step.Run{
             dpkg_config_reference, dpkg_alternatives_reference, native_lifecycle, native_triggers, native_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
-        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig }) |runner|
+        for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, settlement }) |runner|
             runner.addArgs(&.{ "--reference-dpkg", path });
     }
     if (b.option(
