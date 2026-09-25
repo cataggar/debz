@@ -971,6 +971,18 @@ class SecurityAuditTests(unittest.TestCase):
         ):
             with self.subTest(family=token):
                 self.assertTrue(check(build, family.replace(token, "", 1), projected))
+        for original, weakened in (
+            ("fixture.allocator = phase_arena.allocator();", ""),
+            ("defer fixture.allocator = allocator;", ""),
+            ("first_completion = try std.json.parseFromSlice(std.json.Value, persistent_allocator,", "first_completion = try std.json.parseFromSlice(std.json.Value, fixture.allocator,"),
+            ("    _ = phase_arena.reset(.free_all);\n    try ordinaryFamilyTimeline", "    try ordinaryFamilyTimeline"),
+            ("    _ = phase_arena.reset(.free_all);\n    try ownedSuccess", "    try ownedSuccess"),
+            ("        _ = phase_arena.reset(.free_all);\n        const label:", "        const label:"),
+            ("    _ = phase_arena.reset(.free_all);\n    try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, true);", "    try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, true);"),
+        ):
+            with self.subTest(allocation=original):
+                self.assertIn(original, family)
+                self.assertTrue(check(build, family.replace(original, weakened, 1), projected))
         dpkg = "try referenceSingleFailure(fixture, reference, scenario.reference_root, arch, name)"
         self.assertEqual(2, family.count(dpkg))
         self.assertTrue(check(build, family.replace(dpkg, "", 1), projected))

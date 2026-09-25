@@ -1595,6 +1595,13 @@ with a two-second kill grace and a 125-second process deadline, retains
 bounded logs on failure, and compares root snapshots and the host dpkg status
 before/after. The optional `-Dnative-reference-dpkg=...` is forwarded to the
 fixture and used for executed state comparisons. The existing
+signed repository files and fixture metadata persist across scenarios, while
+completed scenarios release their arena-backed snapshots and JSON. The
+archive-backed create/customize and same-root checks, each update, and each
+interrupted recovery have separate release boundaries; the signed source and
+keyring paths, lock path, and first completion used across those boundaries
+remain in the fixture's outer allocator. This bounds FAMILY runner memory
+without dropping signed child processes or pinned-dpkg comparisons. The existing
 `tools/generate-integration-repository.py` is invoked **only to build**
 worktree-local signed metadata and matching `.deb` archives; the test runner,
 all assertions and all FAMILY invocations are Zig-owned. The fixture builder

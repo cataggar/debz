@@ -856,11 +856,15 @@ fn inspectInstalledFamily(
 
 fn archiveExecution(
     fixture: *foundation.Fixture,
+    persistent_allocator: std.mem.Allocator,
+    phase_arena: *std.heap.ArenaAllocator,
     driver: []const u8,
     helper: []const u8,
     reference: []const u8,
     arch: []const u8,
     python: []const u8,
+    source: []const u8,
+    keyring: []const u8,
 ) !void {
     try fixture.directory("executed");
     const generator = try std.fs.path.join(fixture.allocator, &.{ options.repository, "tools/generate-integration-repository.py" });
@@ -868,152 +872,153 @@ fn archiveExecution(
     try fixture.run(&.{
         python, generator, "--output", repository, "--suite", "debian-stable", "--architecture", arch,
     }, "executed/generate.log", 120);
-    const keyring = try fixture.absolute("executed/repository/fixture-keyring.gpg");
-    const source = try fixture.absolute("executed/workflow.sources");
     const source_text = try std.fmt.allocPrint(fixture.allocator, "Types: deb\nURIs: file://{s}\nSuites: debian-stable\nComponents: main\nArchitectures: {s}\nSigned-By: {s}\n", .{ repository, arch, keyring });
     try fixture.write("executed/workflow.sources", source_text, 0o644);
-    var scenario = try seededScenario(fixture, driver, helper, reference, arch, "executed", false);
-    defer scenario.deinit();
-    try inspectInstalledFamily(fixture, driver, scenario.native_root, arch, "executed/inspect-initial", "essential-core", true, false);
-    const lock = try fixture.absolute("executed/lock.json");
+    const lock = try persistent_allocator.dupe(u8, try fixture.absolute("executed/lock.json"));
     var first_completion: ?std.json.Parsed(std.json.Value) = null;
     defer if (first_completion) |*value| value.deinit();
-    for ([_]struct {
-        label: []const u8,
-        operation: []const u8,
-        package: []const u8,
-        archives: []const []const u8,
-        install_evidence: bool,
-    }{
-        .{ .label = "create", .operation = "create", .package = "scenario-main", .archives = &.{ "base-dep", "scenario-main" }, .install_evidence = true },
-        .{ .label = "customize", .operation = "customize", .package = "conffile-pkg", .archives = &.{"conffile-pkg"}, .install_evidence = true },
-    }) |case| {
-        const planned = try signedRequest(fixture, scenario.native_root, arch, "resolve_lock", case.package, source, keyring, lock);
-        const plan_name = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-plan", .{case.label});
-        var plan = try workflow(fixture, driver, scenario.native_root, arch, plan_name, .{
-            .family_execution = planned,
-            .capture_evidence = true,
-        });
-        defer plan.deinit();
-        try expectFamily(plan.report.value, "resolve_lock", true);
-        try std.testing.expect(!(try field(plan.report.value, "changed")).bool);
-        const request = try signedRequest(fixture, scenario.native_root, arch, case.operation, case.package, source, keyring, lock);
-        const execution_name = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-execute", .{case.label});
-        var executed = try workflow(fixture, driver, scenario.native_root, arch, execution_name, .{
-            .family_execution = request,
-            .capture_evidence = true,
-        });
-        defer executed.deinit();
-        const returned = try completed(fixture, scenario.native_root, executed, case.operation, lock, case.install_evidence);
-        try assertExecutionWire(fixture, execution_name, request);
-        const before_verification = try foundation.capture(fixture.allocator, fixture.io, scenario.native_root);
-        var verified = try workflow(fixture, driver, scenario.native_root, arch, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify", .{case.label}), .{
-            .family_verification = request,
-            .verification_expect_failure = false,
-        });
-        defer verified.deinit();
-        try same(try string(verified.report.value, "operation"), "install");
-        var with_result = try workflow(fixture, driver, scenario.native_root, arch, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify-result", .{case.label}), .{
-            .family_verification = request,
-            .verification_expect_failure = false,
-            .verification_completion = returned,
-        });
-        defer with_result.deinit();
-        const original_summary = try support.read(fixture, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify/workflow.report.json", .{case.label}), 64 * 1024);
-        const returned_summary = try support.read(fixture, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify-result/workflow.report.json", .{case.label}), 64 * 1024);
-        try std.testing.expectEqualSlices(u8, original_summary, returned_summary);
-        try same(try string(with_result.report.value, "transaction_digest_sha256"), try string(verified.report.value, "transaction_digest_sha256"));
-        try same(try string(with_result.report.value, "completion_digest_sha256"), try string(verified.report.value, "completion_digest_sha256"));
-        if (std.mem.eql(u8, case.operation, "create")) {
-            var equivalent = request;
-            equivalent.operation = "customize";
-            var relabeled = try workflow(fixture, driver, scenario.native_root, arch, "executed/create-as-customize-verification", .{
-                .family_verification = equivalent,
+    {
+        var scenario = try seededScenario(fixture, driver, helper, reference, arch, "executed", false);
+        defer scenario.deinit();
+        try inspectInstalledFamily(fixture, driver, scenario.native_root, arch, "executed/inspect-initial", "essential-core", true, false);
+        for ([_]struct {
+            label: []const u8,
+            operation: []const u8,
+            package: []const u8,
+            archives: []const []const u8,
+            install_evidence: bool,
+        }{
+            .{ .label = "create", .operation = "create", .package = "scenario-main", .archives = &.{ "base-dep", "scenario-main" }, .install_evidence = true },
+            .{ .label = "customize", .operation = "customize", .package = "conffile-pkg", .archives = &.{"conffile-pkg"}, .install_evidence = true },
+        }) |case| {
+            const planned = try signedRequest(fixture, scenario.native_root, arch, "resolve_lock", case.package, source, keyring, lock);
+            const plan_name = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-plan", .{case.label});
+            var plan = try workflow(fixture, driver, scenario.native_root, arch, plan_name, .{
+                .family_execution = planned,
+                .capture_evidence = true,
+            });
+            defer plan.deinit();
+            try expectFamily(plan.report.value, "resolve_lock", true);
+            try std.testing.expect(!(try field(plan.report.value, "changed")).bool);
+            const request = try signedRequest(fixture, scenario.native_root, arch, case.operation, case.package, source, keyring, lock);
+            const execution_name = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-execute", .{case.label});
+            var executed = try workflow(fixture, driver, scenario.native_root, arch, execution_name, .{
+                .family_execution = request,
+                .capture_evidence = true,
+            });
+            defer executed.deinit();
+            const returned = try completed(fixture, scenario.native_root, executed, case.operation, lock, case.install_evidence);
+            try assertExecutionWire(fixture, execution_name, request);
+            const before_verification = try foundation.capture(fixture.allocator, fixture.io, scenario.native_root);
+            var verified = try workflow(fixture, driver, scenario.native_root, arch, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify", .{case.label}), .{
+                .family_verification = request,
                 .verification_expect_failure = false,
             });
-            defer relabeled.deinit();
-            const equivalent_summary = try support.read(fixture, "executed/create-as-customize-verification/workflow.report.json", 64 * 1024);
-            try std.testing.expectEqualSlices(u8, original_summary, equivalent_summary);
-            try verificationRefusals(fixture, driver, request, returned, original_summary, "executed");
-            first_completion = try std.json.parseFromSlice(std.json.Value, fixture.allocator, try std.json.Stringify.valueAlloc(fixture.allocator, returned, .{}), .{ .allocate = .alloc_always });
-        } else {
-            try refusedVerification(fixture, driver, request, "executed/refuse-previous-attempt", first_completion.?.value, "NativeFamilyCompletionMismatch");
+            defer verified.deinit();
+            try same(try string(verified.report.value, "operation"), "install");
+            var with_result = try workflow(fixture, driver, scenario.native_root, arch, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify-result", .{case.label}), .{
+                .family_verification = request,
+                .verification_expect_failure = false,
+                .verification_completion = returned,
+            });
+            defer with_result.deinit();
+            const original_summary = try support.read(fixture, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify/workflow.report.json", .{case.label}), 64 * 1024);
+            const returned_summary = try support.read(fixture, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify-result/workflow.report.json", .{case.label}), 64 * 1024);
+            try std.testing.expectEqualSlices(u8, original_summary, returned_summary);
+            try same(try string(with_result.report.value, "transaction_digest_sha256"), try string(verified.report.value, "transaction_digest_sha256"));
+            try same(try string(with_result.report.value, "completion_digest_sha256"), try string(verified.report.value, "completion_digest_sha256"));
+            if (std.mem.eql(u8, case.operation, "create")) {
+                var equivalent = request;
+                equivalent.operation = "customize";
+                var relabeled = try workflow(fixture, driver, scenario.native_root, arch, "executed/create-as-customize-verification", .{
+                    .family_verification = equivalent,
+                    .verification_expect_failure = false,
+                });
+                defer relabeled.deinit();
+                const equivalent_summary = try support.read(fixture, "executed/create-as-customize-verification/workflow.report.json", 64 * 1024);
+                try std.testing.expectEqualSlices(u8, original_summary, equivalent_summary);
+                try verificationRefusals(fixture, driver, request, returned, original_summary, "executed");
+                first_completion = try std.json.parseFromSlice(std.json.Value, persistent_allocator, try std.json.Stringify.valueAlloc(fixture.allocator, returned, .{}), .{ .allocate = .alloc_always });
+            } else {
+                try refusedVerification(fixture, driver, request, "executed/refuse-previous-attempt", first_completion.?.value, "NativeFamilyCompletionMismatch");
+            }
+            var held = try parse(fixture, "executed/lock.json", 1024 * 1024);
+            defer held.deinit();
+            try same(try string(verified.report.value, "lock_sha256"), try string(held.value, "digest_sha256"));
+            const after_verification = try foundation.capture(fixture.allocator, fixture.io, scenario.native_root);
+            try std.testing.expectEqualSlices(u8, before_verification, after_verification);
+            try support.absent(fixture, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify/native-evidence.json", .{case.label}));
+            var list: std.ArrayList([]const u8) = .empty;
+            for (case.archives) |name| try list.append(fixture.allocator, try archive(fixture, arch, name, "1.0-1"));
+            const reference_name = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-reference", .{case.label});
+            try fixture.directory(reference_name);
+            if (try support.reference(fixture, reference, scenario.reference_root, .{ .operation = "install", .archives = list.items, .triggers = true }, reference_name) != 0)
+                return error.ReferenceFamilyInstallFailed;
+            const comparison = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-comparison", .{case.label});
+            try fixture.directory(comparison);
+            try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);
+            if (std.mem.eql(u8, case.operation, "create")) {
+                const lock_file = try support.path(fixture.allocator, scenario.native_root[fixture.path.len + 1 ..], "var/lib/debz/root-operation.lock");
+                var holder = try fixture.dir.openFile(fixture.io, lock_file, .{});
+                defer holder.close(fixture.io);
+                if (linux.errno(linux.flock(holder.handle, 2 | 4)) != .SUCCESS) return error.FamilyInspectionLockSetupFailed;
+                defer _ = linux.flock(holder.handle, 8);
+                try inspectInstalledFamily(fixture, driver, scenario.native_root, arch, "executed/inspect-while-root-lock-held", "scenario-main", true, false);
+            }
+            std.debug.print("family {s}: signed archives, native completion, verified receipt and dpkg state passed\n", .{case.label});
         }
-        var held = try parse(fixture, "executed/lock.json", 1024 * 1024);
-        defer held.deinit();
-        try same(try string(verified.report.value, "lock_sha256"), try string(held.value, "digest_sha256"));
-        const after_verification = try foundation.capture(fixture.allocator, fixture.io, scenario.native_root);
-        try std.testing.expectEqualSlices(u8, before_verification, after_verification);
-        try support.absent(fixture, try std.fmt.allocPrint(fixture.allocator, "executed/{s}-verify/native-evidence.json", .{case.label}));
-        var list: std.ArrayList([]const u8) = .empty;
-        for (case.archives) |name| try list.append(fixture.allocator, try archive(fixture, arch, name, "1.0-1"));
-        const reference_name = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-reference", .{case.label});
-        try fixture.directory(reference_name);
-        if (try support.reference(fixture, reference, scenario.reference_root, .{ .operation = "install", .archives = list.items, .triggers = true }, reference_name) != 0)
-            return error.ReferenceFamilyInstallFailed;
-        const comparison = try std.fmt.allocPrint(fixture.allocator, "executed/{s}-comparison", .{case.label});
-        try fixture.directory(comparison);
-        try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);
-        if (std.mem.eql(u8, case.operation, "create")) {
-            const lock_file = try support.path(fixture.allocator, scenario.native_root[fixture.path.len + 1 ..], "var/lib/debz/root-operation.lock");
-            var holder = try fixture.dir.openFile(fixture.io, lock_file, .{});
-            defer holder.close(fixture.io);
-            if (linux.errno(linux.flock(holder.handle, 2 | 4)) != .SUCCESS) return error.FamilyInspectionLockSetupFailed;
-            defer _ = linux.flock(holder.handle, 8);
-            try inspectInstalledFamily(fixture, driver, scenario.native_root, arch, "executed/inspect-while-root-lock-held", "scenario-main", true, false);
-        }
-        std.debug.print("family {s}: signed archives, native completion, verified receipt and dpkg state passed\n", .{case.label});
+        const failed_plan_request = try signedRequest(fixture, scenario.native_root, arch, "resolve_lock", "fail-script", source, keyring, lock);
+        var failed_plan = try workflow(fixture, driver, scenario.native_root, arch, "executed/same-root-failure-plan", .{
+            .family_execution = failed_plan_request,
+            .capture_evidence = true,
+        });
+        defer failed_plan.deinit();
+        try expectFamily(failed_plan.report.value, "resolve_lock", true);
+        const failed_request = try signedRequest(fixture, scenario.native_root, arch, "customize", "fail-script", source, keyring, lock);
+        var failed = try workflow(fixture, driver, scenario.native_root, arch, "executed/same-root-failure", .{
+            .family_execution = failed_request,
+            .capture_evidence = true,
+        });
+        defer failed.deinit();
+        try expectFamily(failed.report.value, "customize", false);
+        try same(try string(failed.report.value, "exit_status"), "transaction");
+        try std.testing.expect((try field(failed.report.value, "changed")).bool);
+        try std.testing.expect((try field(try field(failed.report.value, "diagnostic"), "recoverable")).bool);
+        const same_root_receipt = try support.path(fixture.allocator, scenario.native_root[fixture.path.len + 1 ..], debz.native_provenance.document_path);
+        var failed_receipt = try parse(fixture, same_root_receipt, 16 * 1024 * 1024);
+        defer failed_receipt.deinit();
+        try same(try string(failed_receipt.value, "outcome"), "failed");
+        const failed_returned = try field(failed.evidence.?.value, "native_completion");
+        try same(try string(failed_returned, "outcome"), "failed");
+        try same(try string(failed_returned, "settlement"), "cleared");
+        const receipt_before_recovery = try support.read(fixture, same_root_receipt, 16 * 1024 * 1024);
+        const reference_failure = "executed/same-root-failure-reference";
+        try fixture.directory(reference_failure);
+        if (try support.reference(fixture, reference, scenario.reference_root, .{
+            .operation = "install",
+            .archives = &.{try archive(fixture, arch, "fail-script", "1.0-1")},
+            .triggers = true,
+        }, reference_failure) != 1) return error.ReferenceSameRootFailureMissing;
+        try fixture.directory("executed/same-root-failure-comparison");
+        try support.compare(fixture, scenario.reference_root, scenario.native_root, "executed/same-root-failure-comparison", true);
+        const before_recovery = try projected.rootInventory(fixture, scenario.native_root, false);
+        var clean = try workflow(fixture, driver, scenario.native_root, arch, "executed/same-root-clean-recovery", .{
+            .family_execution = try familyRequest(fixture, scenario.native_root, arch, "recover"),
+            .capture_evidence = true,
+        });
+        defer clean.deinit();
+        try expectFamily(clean.report.value, "recover", true);
+        try std.testing.expect(!(try field(clean.report.value, "changed")).bool);
+        try std.testing.expectEqual(.null, try field(clean.report.value, "lock_path"));
+        try std.testing.expectEqual(.null, try field(clean.report.value, "provenance_path"));
+        try std.testing.expectEqual(.null, try field(clean.evidence.?.value, "native_completion"));
+        try std.testing.expectEqualSlices(u8, before_recovery, try projected.rootInventory(fixture, scenario.native_root, false));
+        try std.testing.expectEqualSlices(u8, receipt_before_recovery, try support.read(fixture, same_root_receipt, 16 * 1024 * 1024));
+        try support.compare(fixture, scenario.reference_root, scenario.native_root, "executed/same-root-failure-comparison", true);
+        try inspectInstalledFamily(fixture, driver, scenario.native_root, arch, "executed/inspect-failed-same-root", "fail-script", false, false);
     }
-    const failed_plan_request = try signedRequest(fixture, scenario.native_root, arch, "resolve_lock", "fail-script", source, keyring, lock);
-    var failed_plan = try workflow(fixture, driver, scenario.native_root, arch, "executed/same-root-failure-plan", .{
-        .family_execution = failed_plan_request,
-        .capture_evidence = true,
-    });
-    defer failed_plan.deinit();
-    try expectFamily(failed_plan.report.value, "resolve_lock", true);
-    const failed_request = try signedRequest(fixture, scenario.native_root, arch, "customize", "fail-script", source, keyring, lock);
-    var failed = try workflow(fixture, driver, scenario.native_root, arch, "executed/same-root-failure", .{
-        .family_execution = failed_request,
-        .capture_evidence = true,
-    });
-    defer failed.deinit();
-    try expectFamily(failed.report.value, "customize", false);
-    try same(try string(failed.report.value, "exit_status"), "transaction");
-    try std.testing.expect((try field(failed.report.value, "changed")).bool);
-    try std.testing.expect((try field(try field(failed.report.value, "diagnostic"), "recoverable")).bool);
-    const same_root_receipt = try support.path(fixture.allocator, scenario.native_root[fixture.path.len + 1 ..], debz.native_provenance.document_path);
-    var failed_receipt = try parse(fixture, same_root_receipt, 16 * 1024 * 1024);
-    defer failed_receipt.deinit();
-    try same(try string(failed_receipt.value, "outcome"), "failed");
-    const failed_returned = try field(failed.evidence.?.value, "native_completion");
-    try same(try string(failed_returned, "outcome"), "failed");
-    try same(try string(failed_returned, "settlement"), "cleared");
-    const receipt_before_recovery = try support.read(fixture, same_root_receipt, 16 * 1024 * 1024);
-    const reference_failure = "executed/same-root-failure-reference";
-    try fixture.directory(reference_failure);
-    if (try support.reference(fixture, reference, scenario.reference_root, .{
-        .operation = "install",
-        .archives = &.{try archive(fixture, arch, "fail-script", "1.0-1")},
-        .triggers = true,
-    }, reference_failure) != 1) return error.ReferenceSameRootFailureMissing;
-    try fixture.directory("executed/same-root-failure-comparison");
-    try support.compare(fixture, scenario.reference_root, scenario.native_root, "executed/same-root-failure-comparison", true);
-    const before_recovery = try projected.rootInventory(fixture, scenario.native_root, false);
-    var clean = try workflow(fixture, driver, scenario.native_root, arch, "executed/same-root-clean-recovery", .{
-        .family_execution = try familyRequest(fixture, scenario.native_root, arch, "recover"),
-        .capture_evidence = true,
-    });
-    defer clean.deinit();
-    try expectFamily(clean.report.value, "recover", true);
-    try std.testing.expect(!(try field(clean.report.value, "changed")).bool);
-    try std.testing.expectEqual(.null, try field(clean.report.value, "lock_path"));
-    try std.testing.expectEqual(.null, try field(clean.report.value, "provenance_path"));
-    try std.testing.expectEqual(.null, try field(clean.evidence.?.value, "native_completion"));
-    try std.testing.expectEqualSlices(u8, before_recovery, try projected.rootInventory(fixture, scenario.native_root, false));
-    try std.testing.expectEqualSlices(u8, receipt_before_recovery, try support.read(fixture, same_root_receipt, 16 * 1024 * 1024));
-    try support.compare(fixture, scenario.reference_root, scenario.native_root, "executed/same-root-failure-comparison", true);
-    try inspectInstalledFamily(fixture, driver, scenario.native_root, arch, "executed/inspect-failed-same-root", "fail-script", false, false);
     for ([_]bool{ true, false }) |selected| {
+        _ = phase_arena.reset(.free_all);
         const label: []const u8 = if (selected) "update-selected" else "update-all";
         var update = try seededScenario(fixture, driver, helper, reference, arch, label, true);
         defer update.deinit();
@@ -1176,7 +1181,9 @@ fn archiveExecution(
         try support.compare(fixture, update.reference_root, update.native_root, comparison, true);
         std.debug.print("family {s}: archive-backed update, completion and pinned dpkg state passed\n", .{label});
     }
+    _ = phase_arena.reset(.free_all);
     try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, false);
+    _ = phase_arena.reset(.free_all);
     try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, true);
 }
 
@@ -3322,28 +3329,51 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after family acceptance failure: {s}\n", .{@errorName(err)});
-    if (!executed_only) {
-        try refusals(&fixture, reference.architecture);
-        try transport(&fixture, driver, reference.architecture);
-        try planning(&fixture, driver);
-    }
-    try activeInspection(&fixture, driver, reference.architecture);
-    try archiveExecution(&fixture, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, python);
     const source = try fixture.absolute("executed/workflow.sources");
     const keyring = try fixture.absolute("executed/repository/fixture-keyring.gpg");
+    var phase_arena: std.heap.ArenaAllocator = .init(init.gpa);
+    defer phase_arena.deinit();
+    fixture.allocator = phase_arena.allocator();
+    defer fixture.allocator = allocator;
+    // Fixture paths and files persist; only completed scenario snapshots and JSON are released.
+    if (!executed_only) {
+        try refusals(&fixture, reference.architecture);
+        _ = phase_arena.reset(.free_all);
+        try transport(&fixture, driver, reference.architecture);
+        _ = phase_arena.reset(.free_all);
+        try planning(&fixture, driver);
+        _ = phase_arena.reset(.free_all);
+    }
+    try activeInspection(&fixture, driver, reference.architecture);
+    _ = phase_arena.reset(.free_all);
+    try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, python, source, keyring);
+    _ = phase_arena.reset(.free_all);
     try ordinaryFamilyTimeline(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);
+    _ = phase_arena.reset(.free_all);
     try batchWorkflow(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);
+    _ = phase_arena.reset(.free_all);
     try ownedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);
+    _ = phase_arena.reset(.free_all);
     try reconciliation(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);
+    _ = phase_arena.reset(.free_all);
     try ordinaryRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);
+    _ = phase_arena.reset(.free_all);
     try ordinaryKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);
+    _ = phase_arena.reset(.free_all);
     try ownedAbandon(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);
+    _ = phase_arena.reset(.free_all);
     try ownedRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);
+    _ = phase_arena.reset(.free_all);
     try ownedKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);
+    _ = phase_arena.reset(.free_all);
     try ownedFinalizationBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);
+    _ = phase_arena.reset(.free_all);
     try projected.run(&fixture, self orelse return error.MissingSelf, driver, reference.executable, reference.architecture);
+    _ = phase_arena.reset(.free_all);
     try missingHelper(&fixture, driver, reference.executable, reference.architecture);
+    _ = phase_arena.reset(.free_all);
     try failedTransaction(&fixture, driver, reference.executable, reference.architecture, false);
+    _ = phase_arena.reset(.free_all);
     try failedTransaction(&fixture, driver, reference.executable, reference.architecture, true);
     try support.assertHostUnchanged(allocator, init.io, reference.before);
 }

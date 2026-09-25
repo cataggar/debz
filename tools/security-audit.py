@@ -1915,6 +1915,44 @@ def native_workflow_acceptance_wiring_failures(
     ):
         if token not in family:
             failures.append(f"native_recovery_family.zig: required signed workflow acceptance lost {token}")
+    for token in (
+        'const source = try fixture.absolute("executed/workflow.sources");\n    const keyring = try fixture.absolute("executed/repository/fixture-keyring.gpg");\n    var phase_arena: std.heap.ArenaAllocator = .init(init.gpa);',
+        "fixture.allocator = phase_arena.allocator();",
+        "defer fixture.allocator = allocator;",
+        'const lock = try persistent_allocator.dupe(u8, try fixture.absolute("executed/lock.json"));',
+        "first_completion = try std.json.parseFromSlice(std.json.Value, persistent_allocator,",
+        "    for ([_]bool{ true, false }) |selected| {\n        _ = phase_arena.reset(.free_all);",
+    ):
+        if token not in family:
+            failures.append(f"native_recovery_family.zig: bounded signed workflow allocation lost {token}")
+    for token in (
+        "try refusals(&fixture, reference.architecture);",
+        "try transport(&fixture, driver, reference.architecture);",
+        "try planning(&fixture, driver);",
+        "try activeInspection(&fixture, driver, reference.architecture);",
+        "try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, python, source, keyring);",
+        "try ordinaryFamilyTimeline(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        "try batchWorkflow(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);",
+        "try ownedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try reconciliation(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        "try ordinaryRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);",
+        "try ordinaryKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedAbandon(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        "try ownedRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedFinalizationBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try projected.run(&fixture, self orelse return error.MissingSelf, driver, reference.executable, reference.architecture);",
+        "try missingHelper(&fixture, driver, reference.executable, reference.architecture);",
+        "try failedTransaction(&fixture, driver, reference.executable, reference.architecture, false);",
+    ):
+        if token + "\n    _ = phase_arena.reset(.free_all);" not in family and token + "\n        _ = phase_arena.reset(.free_all);" not in family:
+            failures.append(f"native_recovery_family.zig: scenario allocations retained after {token}")
+    for token in (
+        "    }\n    _ = phase_arena.reset(.free_all);\n    try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, false);",
+        "try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, false);\n    _ = phase_arena.reset(.free_all);\n    try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, true);",
+    ):
+        if token not in family:
+            failures.append(f"native_recovery_family.zig: interrupted signed workflow allocations retained after {token}")
     if family.count("try referenceSingleFailure(fixture, reference, scenario.reference_root, arch, name)") != 2:
         failures.append("native_recovery_family.zig: both failed workflows require single-invocation pinned dpkg parity")
     if family.count('"verify-public-finalized"') != 2:
