@@ -258,6 +258,27 @@ admits this script only as the **new** `less:amd64` preinst with exactly
 Upgrade/abort and other identities remain refused rather than relying on the
 unreviewed upgrade branch's `dpkg --compare-versions`.
 
+The same authenticated archive ships a 374-byte `postinst` (SHA-256
+`a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4`).
+Its only alternatives command, in the `configure)` branch, is
+`update-alternatives --quiet --install /usr/bin/pager pager /usr/bin/less 77 --slave /usr/share/man/man1/pager.1.gz pager.1.gz /usr/share/man/man1/less.1.gz`.
+In a disposable root, the exact snapshot-pinned executable registered an
+auto-selected `pager` group at priority 77 with that slave and links; its
+record and selectors match the pinned reference's typed `--install` model.
+Native admission binds the complete script SHA-256, exactly these literal
+tokens (including `--quiet`), the **new** `less:amd64` 668-1build1 postinst,
+exactly `["configure", ""]`, and the snapshot amd64 tool digest and metadata.
+Unlike the preinst's inert install branch, this configure branch may register
+the group, subject to the existing before/after checkpoints, immutable
+provider and tool identities, and reachable-transition validation. Other
+scripts, options, source identities, arguments, and tool digests remain
+refused. The interrupted root that exposed this refusal is not reused; no
+full install or native/reference parity is inferred from authorizing it.
+A separate authenticated fresh-root replay persisted a zero-exit postinst
+outcome and the expected `pager` record and links at step 888, then refused
+an unrelated `bash.postinst` `update-alternatives --install ... || true`
+script at step 976 before launch.
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is

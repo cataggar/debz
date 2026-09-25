@@ -18907,6 +18907,96 @@ fn snapshotLessPreinstIsInert(
     return true;
 }
 
+fn snapshotLessPostinstIsBound(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+) !bool {
+    if (!native_alternatives.matchesSnapshotLessPostinst(bytes)) return false;
+    if (!std.mem.eql(u8, architecture, "amd64") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, package.name, "less") or
+        !std.mem.eql(u8, package.version, "668-1build1") or
+        kind != .postinst or source != .new_package or
+        arguments.len != 2 or
+        !std.mem.eql(u8, arguments[0], "configure") or
+        arguments[1].len != 0)
+        return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
+test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" {
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-less-668-1build1.postinst",
+    );
+    const less: native_program.PackageIdentity = .{
+        .name = "less",
+        .version = "668-1build1",
+        .architecture = "amd64",
+    };
+    try testing.expect(try snapshotLessPostinstIsBound(
+        script,
+        "amd64",
+        less,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    ));
+    try testing.expect(!(try snapshotLessPostinstIsBound(
+        "#!/bin/sh\nexit 0\n",
+        "amd64",
+        less,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+    )));
+    var other = less;
+    for ([_]struct {
+        architecture: []const u8,
+        package: native_program.PackageIdentity,
+        kind: maintainer_script.Kind,
+        source: native_program.ScriptSource,
+        arguments: []const []const u8,
+    }{
+        .{ .architecture = "arm64", .package = less, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = less, .kind = .preinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = less, .kind = .postinst, .source = .installed_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = less, .kind = .postinst, .source = .new_package, .arguments = &.{"configure"} },
+        .{ .architecture = "amd64", .package = less, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "1" } },
+        .{ .architecture = "amd64", .package = less, .kind = .postinst, .source = .new_package, .arguments = &.{ "abort-upgrade", "" } },
+    }) |case| try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPostinstIsBound(
+            script,
+            case.architecture,
+            case.package,
+            case.kind,
+            case.source,
+            case.arguments,
+        ),
+    );
+    other.name = "most";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+    );
+    other = less;
+    other.version = "668-1build2";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+    );
+    other = less;
+    other.architecture = "arm64";
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+    );
+}
+
 test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-less-668-1build1.preinst",
@@ -19041,6 +19131,14 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    const snapshot_postinst = try snapshotLessPostinstIsBound(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+    );
     const arena = try allocator.create(std.heap.ArenaAllocator);
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -19057,7 +19155,7 @@ fn prepareAlternativesScriptBoundary(
         root,
         architecture,
     );
-    if (inert and !native_alternatives.matchesSnapshotLessTool(
+    if ((inert or snapshot_postinst) and !native_alternatives.matchesSnapshotLessTool(
         architecture,
         tool_digest,
     )) return error.InvalidAlternativesTool;

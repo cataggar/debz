@@ -243,6 +243,34 @@ postinst outcomes exited 0. It then refused the authenticated
 interrupted root is retained, not reused. The successful account setup
 does not establish a completed closure or native/reference parity.
 
+With the local fresh-root account ordering and exact `less` preinst gate, a new
+authenticated 175-package amd64 root completed `base-passwd.postinst` at
+step 830, `base-files.postinst` at step 862, and `less.preinst install` at
+step 878 (each with a persisted zero-exit outcome). It then refused
+`less.postinst configure` at step 888 before launch with
+`InvalidAlternativesScript`. The authenticated `less` archive's postinst
+SHA-256 is
+`a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4`;
+its literal `--quiet --install` command is reviewed in the
+[alternatives reference](dpkg-alternatives-reference.md#native-admission).
+This failed root remains untouched. Authorization of the exact script
+requires another new authenticated root to identify any subsequent blocker;
+none of these intermediate successes establishes complete parity.
+
+A separate fresh-root replay, using a newly authenticated 175-package SHA-512
+lock, the reviewed archive signer, and a longer bounded install window,
+persisted a zero-exit `less.postinst configure` outcome at step 888. Its
+`pager` record selects `/usr/bin/less` at priority 77 with the
+`pager.1.gz` slave, and the generic and selector links target the expected
+paths. Execution continued until step 976, where `bash` 5.3-3ubuntu1
+`postinst` (SHA-256
+`e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff`)
+was prepared but refused **before launch** with `InvalidAlternativesScript`.
+That authenticated script uses a multiline `update-alternatives --install`
+for `builtins.7.gz`, followed by `|| true`; this shell wrapper is outside the
+reviewed literal-command grammar. Neither interrupted root is reused; the
+new refusal does not establish full amd64 native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

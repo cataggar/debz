@@ -525,9 +525,13 @@ script command grammar. The exact `less` 668-1build1 amd64 preinst has one
 script-digest-bound exception for its literal `--quiet --remove pager /bin/less`
 line. Only a new-package `preinst install` can use it: that line is in the
 unreachable `upgrade` branch, and every alternatives group remains immutable.
-The exact snapshot-tool check, pre/post capture, and
-recovery-on-unknown-outcome still apply; other scripts using `--quiet` fail
-closed. See the
+The same authenticated archive's exact postinst admits only its literal
+`--quiet --install` of `pager` with the `pager.1.gz` slave, on a new
+`less:amd64` 668-1build1 `postinst` with arguments `["configure", ""]`.
+This reachable command is not inert: typed transition validation must account
+for the registered provider. The exact snapshot-tool check, pre/post capture,
+immutable provider/tool inputs, and recovery-on-unknown-outcome still apply;
+other scripts using `--quiet` fail closed. See the
 [alternatives reference](dpkg-alternatives-reference.md#native-admission).
 The corresponding `README.dpkg-new` conffile staged before `dpkg` configuration
 is accepted only with the exact pinned README bytes and metadata and is

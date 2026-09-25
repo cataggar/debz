@@ -1113,6 +1113,9 @@ pub const snapshot_tools = [_]ToolBinding{.{
 const snapshot_less_preinst_sha256 = digestLiteral(
     "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94",
 );
+const snapshot_less_postinst_sha256 = digestLiteral(
+    "a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4",
+);
 
 pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     var sha256: [32]u8 = undefined;
@@ -1120,6 +1123,16 @@ pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     return std.crypto.timing_safe.eql(
         [32]u8,
         snapshot_less_preinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotLessPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_less_postinst_sha256,
         sha256,
     );
 }
@@ -1280,6 +1293,32 @@ fn validCommandTail(tokens: []const []const u8, first: usize) bool {
         (first + 1 == tokens.len and commandEnd(tokens[first]));
 }
 
+fn snapshotLessPostinstCommand(
+    bytes: []const u8,
+    tokens: []const []const u8,
+    command: usize,
+) bool {
+    if (!matchesSnapshotLessPostinst(bytes)) return false;
+    const expected = [_][]const u8{
+        "update-alternatives",
+        "--quiet",
+        "--install",
+        "/usr/bin/pager",
+        "pager",
+        "/usr/bin/less",
+        "77",
+        "--slave",
+        "/usr/share/man/man1/pager.1.gz",
+        "pager.1.gz",
+        "/usr/share/man/man1/less.1.gz",
+    };
+    if (command != 0 or tokens.len != expected.len) return false;
+    for (tokens, &expected) |actual, literal| {
+        if (!std.mem.eql(u8, actual, literal)) return false;
+    }
+    return true;
+}
+
 fn scriptGroup(
     allocator: std.mem.Allocator,
     groups: *std.ArrayList(GroupAuthority),
@@ -1375,11 +1414,16 @@ pub fn discoverScriptAuthority(
         if (command + 1 >= tokens.items.len)
             return error.InvalidAlternativesScript;
         if (std.mem.eql(u8, tokens.items[command + 1], "--quiet")) {
-            if (!std.mem.eql(
+            const preinst_remove = std.mem.eql(
                 u8,
                 line,
                 "update-alternatives --quiet --remove pager /bin/less",
-            ) or !matchesSnapshotLessPreinst(bytes))
+            ) and matchesSnapshotLessPreinst(bytes);
+            if (!preinst_remove and !snapshotLessPostinstCommand(
+                bytes,
+                tokens.items,
+                command,
+            ))
                 return error.InvalidAlternativesScript;
             command += 1;
         }
@@ -3427,6 +3471,142 @@ test "native_alternatives.test.snapshot less preinst pins one quiet removal" {
             error.InvalidAlternativesScript,
             discoverScriptAuthority(testing.allocator, bytes, .{}),
         );
+    }
+}
+
+test "native_alternatives.test.snapshot less postinst pins one quiet install" {
+    const testing = std.testing;
+    const script = @embedFile(
+        "fixtures/ubuntu-stonking-less-668-1build1.postinst",
+    );
+    try testing.expect(matchesSnapshotLessPostinst(script));
+    var authority = try discoverScriptAuthority(testing.allocator, script, .{});
+    defer authority.deinit();
+    try testing.expectEqual(@as(usize, 1), authority.commands.len);
+    try testing.expectEqualStrings("pager", authority.commands[0].name);
+    switch (authority.commands[0].command) {
+        .install => |install| {
+            try testing.expectEqualStrings("/usr/bin/pager", install.master_link);
+            try testing.expectEqualStrings("/usr/bin/less", install.path);
+            try testing.expectEqual(@as(i32, 77), install.priority);
+            try testing.expectEqual(@as(usize, 1), install.slaves.len);
+            try testing.expectEqualStrings(
+                "/usr/share/man/man1/pager.1.gz",
+                install.slaves[0].link,
+            );
+            try testing.expectEqualStrings("pager.1.gz", install.slaves[0].name);
+            try testing.expectEqualStrings(
+                "/usr/share/man/man1/less.1.gz",
+                install.slaves[0].target,
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), authority.groups.len);
+    try testing.expectEqualStrings("pager", authority.groups[0].name);
+    try testing.expectEqualStrings(
+        "/usr/bin/pager",
+        authority.groups[0].topology.?.master_link,
+    );
+    try testing.expectEqual(@as(usize, 1), authority.groups[0].topology.?.slaves.len);
+    try testing.expect(authority.paths.len >= 6);
+    try testing.expectEqual(@as(usize, 2), authority.immutable_targets.len);
+
+    const rejected = [_][]const u8{
+        "#!/bin/sh\nupdate-alternatives --quiet --install /usr/bin/pager pager /usr/bin/less 77 --slave /usr/share/man/man1/pager.1.gz pager.1.gz /usr/share/man/man1/less.1.gz\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --install /usr/bin/pager pager /usr/bin/less 77\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --auto pager\n",
+        "#!/bin/sh\nupdate-alternatives --quiet --remove pager /bin/less\n",
+    };
+    for (rejected) |bytes| {
+        try testing.expect(!matchesSnapshotLessPostinst(bytes));
+        try testing.expectError(
+            error.InvalidAlternativesScript,
+            discoverScriptAuthority(testing.allocator, bytes, .{}),
+        );
+    }
+    var changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    changed[changed.len - 1] = '1';
+    try testing.expect(!matchesSnapshotLessPostinst(changed));
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(testing.allocator, changed, .{}),
+    );
+}
+
+test "native_alternatives.test.snapshot less postinst registers only the pinned pager provider" {
+    const testing = std.testing;
+    var script = try discoverScriptAuthority(
+        testing.allocator,
+        @embedFile("fixtures/ubuntu-stonking-less-668-1build1.postinst"),
+        .{},
+    );
+    defer script.deinit();
+    const before: Snapshot = .{
+        .groups = &.{},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{}),
+        .relationship_count = 0,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    for ([_]struct { priority: []const u8, allowed: bool }{
+        .{ .priority = "77", .allowed = true },
+        .{ .priority = "78", .allowed = false },
+    }) |case| {
+        const record = try std.fmt.allocPrint(
+            testing.allocator,
+            "auto\n/usr/bin/pager\npager.1.gz\n/usr/share/man/man1/pager.1.gz\n\n/usr/bin/less\n{s}\n/usr/share/man/man1/less.1.gz\n\n",
+            .{case.priority},
+        );
+        defer testing.allocator.free(record);
+        var parsed = try parse(testing.allocator, "pager", record, .{});
+        defer parsed.deinit();
+        var pager: GroupState = .{
+            .name = "pager",
+            .record = parsed.record,
+            .record_fact = .{
+                .path = "var/lib/dpkg/alternatives/pager",
+                .kind = .regular,
+            },
+            .selected = "/usr/bin/less",
+            .links = &.{},
+            .missing_master_targets = &.{},
+            .facts = &.{},
+            .digest = undefined,
+        };
+        pager.digest = groupStateDigest(pager);
+        const after: Snapshot = .{
+            .groups = &.{pager},
+            .paths = &.{},
+            .digest = snapshotDigest(&.{pager}),
+            .relationship_count = 2,
+            .parsed_records = &.{},
+            .arena = undefined,
+            .backing_allocator = testing.allocator,
+        };
+        if (case.allowed) {
+            try validateScriptTransition(
+                testing.allocator,
+                before,
+                after,
+                script,
+                .{ .groups = script.groups },
+            );
+        } else {
+            try testing.expectError(
+                error.AlternativesStateChanged,
+                validateScriptTransition(
+                    testing.allocator,
+                    before,
+                    after,
+                    script,
+                    .{ .groups = script.groups },
+                ),
+            );
+        }
     }
 }
 
