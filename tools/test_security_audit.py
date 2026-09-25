@@ -752,6 +752,30 @@ class SecurityAuditTests(unittest.TestCase):
                 changed = sources.copy()
                 changed[index] = changed[index].replace(token, "", 1)
                 self.assertTrue(check(*changed))
+        pinned_start = '    if (b.option([]const u8, "native-reference-dpkg",'
+        before, marker, pinned = build.partition(pinned_start)
+        self.assertTrue(marker)
+        for runner in (
+            "recovery_zig", "recovery_family", "recovery_parity", "recovery_helper",
+            "final_gaps", "recovery_bootstrap", "repository_recovery", "rollback_clock",
+            "scriptless_recovery", "statoverride_recovery", "literal_recovery",
+            "metadata_recovery", "conffile_recovery", "recovery_diversions",
+        ):
+            with self.subTest(pinned_runner=runner):
+                changed, count = re.subn(rf"\b{runner}\b", "omitted_runner", pinned, count=1)
+                self.assertEqual(1, count)
+                self.assertTrue(check(before + marker + changed, *sources[1:]))
+        for option, variable, runner in (
+            ("native-zig-recovery-family-fixture-python", "path", "recovery_family"),
+            ("native-zig-recovery-parity-fixture-python", "path", "recovery_parity"),
+            ("native-repository-fixture-python", "python", "repository_recovery"),
+        ):
+            with self.subTest(fixture_option=option):
+                self.assertTrue(check(build.replace(f'"{option}"', '"missing-fixture-option"', 1), *sources[1:]))
+            handoff = f'{runner}.addArgs(&.{{ "--fixture-python", {variable} }});'
+            with self.subTest(fixture_handoff=runner):
+                self.assertIn(handoff, build)
+                self.assertTrue(check(build.replace(handoff, "", 1), *sources[1:]))
         for retired in ("tools/test-native-recovery.py", "tools/test_native_recovery.py"):
             with self.subTest(restored=retired):
                 self.assertTrue(check(build + f'\n"{retired}"', *sources[1:]))

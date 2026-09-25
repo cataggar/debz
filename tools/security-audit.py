@@ -1596,6 +1596,26 @@ def native_recovery_gate_wiring_failures(
     )
     if tuple(tuple(re.findall(r"[a-z_]+", group)) for group in arrays) != expected:
         failures.append("build.zig: parity, core, or default recovery workload lost an executed runner")
+    pinned = graph.partition('if (b.option([]const u8, "native-reference-dpkg",')[2]
+    pinned_runners = re.search(
+        r'for \(\[_\]\*std\.Build\.Step\.Run\{([^}]+)\}\) \|runner\| '
+        r'runner\.addArgs\(&\.\{ "--reference-dpkg", path \}\);',
+        pinned,
+    )
+    if pinned_runners is None or tuple(re.findall(r"[a-z_]+", pinned_runners[1])) != expected[-1]:
+        failures.append("build.zig: pinned dpkg must reach every default recovery acceptance runner")
+    for option, variable, runner in (
+        ("native-zig-recovery-family-fixture-python", "path", "recovery_family"),
+        ("native-zig-recovery-parity-fixture-python", "path", "recovery_parity"),
+        ("native-repository-fixture-python", "python", "repository_recovery"),
+    ):
+        handoff = re.search(
+            rf'if \(b\.option\(\[\]const u8, "{re.escape(option)}", [^\n]+\)\) \|{variable}\|\s*'
+            + re.escape(f'{runner}.addArgs(&.{{ "--fixture-python", {variable} }});'),
+            graph,
+        )
+        if handoff is None:
+            failures.append(f"build.zig: signed recovery fixture interpreter lost {option} handoff")
     for source, tokens in (
         (helper, ("if (script_failure_only) {", '"after_failure_outcome", "after_script_failure_state"')),
         (family, ('if (projection_only) {', "try projected.runReadOnly(&fixture, self orelse return error.MissingSelf, driver, reference.architecture);")),

@@ -1806,6 +1806,9 @@ in bounded chunks, retaining the secret-prefix overlap across reads rather
 than imposing a 2 MiB artifact limit. Its Zig regression places the marker
 across a chunk boundary both near the start and beyond 2 MiB; the same
 scanner runs after each real CLI invocation in both required build modes.
+The recovery gate audit also mutation-checks that pinned dpkg reaches all
+14 default acceptance runners and that the FAMILY, consumer-parity and
+repository signed-fixture interpreter options reach their respective drivers.
 
 **Remaining before publication:** complete pre-retirement amd64/arm64
 Debug/ReleaseSafe CI on the parent with both Python gates, followed by the
