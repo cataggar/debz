@@ -291,10 +291,17 @@ but refused the resulting alternatives transition with
 `AlternativesStateChanged` before persisting a script outcome. Its signed
 script registers `nc` with three slaves. The command lists `netcat` before
 `nc.1.gz`, while the resulting record puts `nc.1.gz` first; the native typed
-registration currently preserves command order, so this ordering difference
-needs a separate pinned-reference investigation. This interrupted root is
-retained and not reused. Complete amd64 install and native/reference parity
-remain unproven.
+registration had preserved command order. A disposable pinned-dpkg 1.22.22
+install of the **exact signed script**, plus a separate snapshot-tool probe,
+reproduced the interrupted root's 221-byte `nc` record (SHA-256
+`2d38af8c8cc5565fd092c8e7b09cb8517eb5347616141b3e7d92034386671c4e`)
+and all eight links. Both tool versions sort slaves bytewise by name and
+retain each older candidate's slave targets by name when adding a slave.
+Native registration now models that sorted record without waiving strict
+before/after transition checks or admitting additional scripts. This
+interrupted root is retained and not reused; only a **new** authenticated
+root can show whether step 1026 now settles. Complete amd64 install and
+native/reference parity remain unproven.
 
 A further **new** authenticated 175-package amd64 root on final #235 squash
 plus the bash change (recorded source `aa7ab6ed6d399266a016140780ef309380bf1a08`,
@@ -309,6 +316,53 @@ At step 1026, `netcat-openbsd.postinst` was launched, but
 `create.json` exited 8. An ignored local runner copy increased only the
 bounded `create` timeout from 30 to 90 minutes. The root is retained read-only;
 it does not establish complete install or native/reference parity.
+
+The new fresh amd64 root at
+`.real-snapshot/amd64-netcat-fresh-long-2` used a newly resolved lock (file
+SHA-256 `da34756c986eab0ae3744c3021f2d1e1609e81333af3ba52481d1c48924e75c8`),
+the reviewed archive signer, and 175 independently reverified SHA-512 package
+objects. Its `netcat-openbsd.postinst configure` at step 1026 **ran and
+persisted exit 0**, with the pinned 221-byte `nc` record and all eight
+generic/selector links. It continued through step 1062, then refused
+**before launch** at step 1065 with `InvalidAlternativesScript` for
+`procps:amd64` 2:4.0.6-3ubuntu1 `postinst configure` (signed script SHA-256
+`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`,
+arguments `["configure", ""]`). That script builds several `--install`
+commands inside a parameterized `check_alternatives` function. No procps
+script outcome was persisted; the failed root is retained for recovery and
+must not be reused as a fresh run. A separate earlier fresh workspace
+(`amd64-netcat-fresh-long-1`) was abandoned before package execution after
+using inconsistent planning/install deadlines, which made its exact-lock
+repository unavailable; it was never retried. The step-1065 refusal is the
+next distinct blocker, **not** complete closure or native/reference parity.
+
+A separate **new** authenticated 175-package amd64 root on final #237 squash
+plus this netcat change (recorded source
+`55779e7a89f41ab50abf3b1c3c429ec7d4353c6d`, ReleaseSafe executable
+SHA-256 `bbe6d9e8c2cf6f47c0ae1a8f4aad68028168f749204dce083323f7ce2ec562ea`)
+began without dpkg database, helpers, or package state. It independently
+persisted a zero-exit signed `netcat-openbsd.postinst configure ""` outcome at
+step 1026. The resulting 221-byte `nc` record has the pinned SHA-256
+`2d38af8c8cc5565fd092c8e7b09cb8517eb5347616141b3e7d92034386671c4e`;
+all eight selector and generic links match. At step 1065,
+`procps.postinst` was prepared but refused **before launch** with
+`InvalidAlternativesScript`, leaving no procps script outcome; `create.json`
+exited 8. An ignored runner copy extended only the bounded `create` timeout
+from 30 to 90 minutes. The root is retained read-only, not reused as a fresh
+trial; complete install and native/reference parity remain unproven.
+
+A second new authenticated combined-tree root on final #238 squash plus netcat
+(recorded source `4394bf85214ac25d366f420ff41ca7c75d6b8c12`,
+ReleaseSafe executable SHA-256
+`91bf4bffdf388a6347e3360079ba9992db8761ffe64f2c81683db63b4f9c981f`)
+started without dpkg state or helper seeding. It independently persisted
+zero-exit `netcat-openbsd.postinst configure ""` at step 1026; its 221-byte
+`nc` record again matched the pinned digest and all eight links matched the
+reference. `procps.postinst` at step 1065 was prepared but refused **before
+launch**, with no procps script outcome and `create.json` exit 8. The ignored
+runner copy changed only the bounded `create` timeout from 30 to 90 minutes
+and was removed afterward. This root also remains read-only, not a completed
+install or a native/reference parity result.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

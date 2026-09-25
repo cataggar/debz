@@ -505,6 +505,10 @@ fn candidateLess(_: void, left: Candidate, right: Candidate) bool {
     return std.mem.order(u8, left.path, right.path) == .lt;
 }
 
+fn slaveNameLess(_: void, left: Slave, right: Slave) bool {
+    return std.mem.order(u8, left.name, right.name) == .lt;
+}
+
 fn validateRegistration(
     registration: Registration,
     limits: Limits,
@@ -568,6 +572,7 @@ fn installRecord(
             .link = try owned.dupe(u8, incoming.link),
         });
     }
+    std.mem.sort(Slave, slave_list.items, {}, slaveNameLess);
 
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(owned);
@@ -575,17 +580,13 @@ fn installRecord(
         for (record.candidates) |candidate| {
             if (std.mem.eql(u8, candidate.path, registration.path)) continue;
             const targets = try owned.alloc([]const u8, slave_list.items.len);
-            for (targets, 0..) |*target, target_index| {
+            for (targets, slave_list.items) |*target, new_slave| {
                 target.* = "";
-                if (target_index >= record.slaves.len) continue;
-                const old_slave = record.slaves[target_index];
-                for (slave_list.items, 0..) |new_slave, new_index| {
-                    if (new_index == target_index and
-                        std.mem.eql(u8, old_slave.name, new_slave.name))
-                    {
+                for (record.slaves, 0..) |old_slave, old_index| {
+                    if (std.mem.eql(u8, old_slave.name, new_slave.name)) {
                         target.* = try owned.dupe(
                             u8,
-                            candidate.targets[target_index],
+                            candidate.targets[old_index],
                         );
                         break;
                     }
@@ -3790,6 +3791,237 @@ test "native_alternatives.test.snapshot bash postinst bounds masked tool failure
             );
         }
     }
+}
+
+test "native_alternatives.test.signed netcat install matches pinned sorted nc record" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-netcat-openbsd-1.238-1.postinst",
+    );
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    try testing.expectEqualSlices(
+        u8,
+        &digestLiteral(
+            "81abc862db99e322e5d6cda436769bc21b9394ce287ea35d057761b6313cb6ef",
+        ),
+        &sha256,
+    );
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 1), script.commands.len);
+    try testing.expectEqualStrings("nc", script.commands[0].name);
+    switch (script.commands[0].command) {
+        .install => |install| {
+            try testing.expectEqualStrings("/bin/nc", install.master_link);
+            try testing.expectEqualStrings("/bin/nc.openbsd", install.path);
+            try testing.expectEqual(@as(i32, 50), install.priority);
+            try testing.expectEqual(@as(usize, 3), install.slaves.len);
+            try testing.expectEqualStrings("netcat", install.slaves[0].name);
+            try testing.expectEqualStrings("nc.1.gz", install.slaves[1].name);
+            try testing.expectEqualStrings("netcat.1.gz", install.slaves[2].name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const pinned =
+        "auto\n/bin/nc\n" ++
+        "nc.1.gz\n/usr/share/man/man1/nc.1.gz\n" ++
+        "netcat\n/bin/netcat\n" ++
+        "netcat.1.gz\n/usr/share/man/man1/netcat.1.gz\n\n" ++
+        "/bin/nc.openbsd\n50\n" ++
+        "/usr/share/man/man1/nc_openbsd.1.gz\n" ++
+        "/bin/nc.openbsd\n" ++
+        "/usr/share/man/man1/nc_openbsd.1.gz\n\n";
+    var installed = try mutate(testing.allocator, .{
+        .name = script.commands[0].name,
+        .current = null,
+        .selected = null,
+        .command = script.commands[0].command,
+    });
+    defer installed.deinit();
+    const actual = try canonicalBytes(testing.allocator, installed.record.?);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(pinned, actual);
+    try testing.expectEqualStrings(
+        "/bin/nc.openbsd",
+        installed.selected.?,
+    );
+    const before: Snapshot = .{
+        .groups = &.{},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{}),
+        .relationship_count = 0,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    const variants = [_]struct { record: []const u8, allowed: bool }{
+        .{ .record = pinned, .allowed = true },
+        .{
+            .record = "auto\n/bin/nc\n" ++
+                "nc.1.gz\n/usr/share/man/man1/nc.1.gz\n" ++
+                "netcat\n/bin/netcat\n" ++
+                "netcat.1.gz\n/usr/share/man/man1/netcat.1.gz\n\n" ++
+                "/bin/nc.openbsd\n51\n" ++
+                "/usr/share/man/man1/nc_openbsd.1.gz\n" ++
+                "/bin/nc.openbsd\n" ++
+                "/usr/share/man/man1/nc_openbsd.1.gz\n\n",
+            .allowed = false,
+        },
+        .{
+            .record = "auto\n/bin/nc\n" ++
+                "netcat\n/bin/netcat\n" ++
+                "nc.1.gz\n/usr/share/man/man1/nc.1.gz\n" ++
+                "netcat.1.gz\n/usr/share/man/man1/netcat.1.gz\n\n" ++
+                "/bin/nc.openbsd\n50\n" ++
+                "/bin/nc.openbsd\n" ++
+                "/usr/share/man/man1/nc_openbsd.1.gz\n" ++
+                "/usr/share/man/man1/nc_openbsd.1.gz\n\n",
+            .allowed = false,
+        },
+    };
+    for (variants) |case| {
+        var parsed = try parse(testing.allocator, "nc", case.record, .{});
+        defer parsed.deinit();
+        var group: GroupState = .{
+            .name = "nc",
+            .record = parsed.record,
+            .record_fact = .{
+                .path = "var/lib/dpkg/alternatives/nc",
+                .kind = .regular,
+            },
+            .selected = "/bin/nc.openbsd",
+            .links = &.{},
+            .missing_master_targets = &.{},
+            .facts = &.{},
+            .digest = undefined,
+        };
+        group.digest = groupStateDigest(group);
+        const after: Snapshot = .{
+            .groups = &.{group},
+            .paths = &.{},
+            .digest = snapshotDigest(&.{group}),
+            .relationship_count = 4,
+            .parsed_records = &.{},
+            .arena = undefined,
+            .backing_allocator = testing.allocator,
+        };
+        if (case.allowed) {
+            try validateScriptTransition(
+                testing.allocator,
+                before,
+                after,
+                script,
+                .{ .groups = script.groups },
+            );
+        } else {
+            try testing.expectError(
+                error.AlternativesStateChanged,
+                validateScriptTransition(
+                    testing.allocator,
+                    before,
+                    after,
+                    script,
+                    .{ .groups = script.groups },
+                ),
+            );
+        }
+    }
+}
+
+test "native_alternatives.test.sorted new slave preserves existing provider targets" {
+    const testing = std.testing;
+    var initial = try parse(
+        testing.allocator,
+        "sort-probe",
+        "auto\n/usr/bin/sort-probe\n" ++
+            "a-man\n/usr/share/man/man1/a.1.gz\n" ++
+            "z-man\n/usr/share/man/man1/z.1.gz\n\n" ++
+            "/usr/lib/sort-probe-a\n10\n" ++
+            "/usr/lib/a-a\n/usr/lib/z-a\n\n",
+        .{},
+    );
+    defer initial.deinit();
+    var updated = try mutate(testing.allocator, .{
+        .name = "sort-probe",
+        .current = initial.record,
+        .selected = "/usr/lib/sort-probe-a",
+        .command = .{ .install = .{
+            .master_link = "/usr/bin/sort-probe",
+            .path = "/usr/lib/sort-probe-b",
+            .priority = 20,
+            .slaves = &.{
+                .{
+                    .name = "b-man",
+                    .link = "/usr/share/man/man1/b.1.gz",
+                    .target = "/usr/lib/b-b",
+                },
+                .{
+                    .name = "a-man",
+                    .link = "/usr/share/man/man1/a.1.gz",
+                    .target = "/usr/lib/a-b",
+                },
+            },
+        } },
+    });
+    defer updated.deinit();
+    try testing.expectEqualStrings("/usr/lib/sort-probe-b", updated.selected.?);
+    const actual = try canonicalBytes(testing.allocator, updated.record.?);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings(
+        "auto\n/usr/bin/sort-probe\n" ++
+            "a-man\n/usr/share/man/man1/a.1.gz\n" ++
+            "b-man\n/usr/share/man/man1/b.1.gz\n" ++
+            "z-man\n/usr/share/man/man1/z.1.gz\n\n" ++
+            "/usr/lib/sort-probe-a\n10\n" ++
+            "/usr/lib/a-a\n\n/usr/lib/z-a\n" ++
+            "/usr/lib/sort-probe-b\n20\n" ++
+            "/usr/lib/a-b\n/usr/lib/b-b\n\n\n",
+        actual,
+    );
+    try testing.expectError(
+        error.InvalidSlave,
+        mutate(testing.allocator, .{
+            .name = "sort-probe",
+            .current = initial.record,
+            .selected = "/usr/lib/sort-probe-a",
+            .command = .{ .install = .{
+                .master_link = "/usr/bin/sort-probe",
+                .path = "/usr/lib/sort-probe-b",
+                .priority = 20,
+                .slaves = &.{.{
+                    .name = "a-man",
+                    .link = "/usr/share/man/man1/other.1.gz",
+                    .target = "/usr/lib/a-b",
+                }},
+            } },
+        }),
+    );
+    try testing.expectError(
+        error.DuplicateSlave,
+        mutate(testing.allocator, .{
+            .name = "sort-probe",
+            .current = initial.record,
+            .selected = "/usr/lib/sort-probe-a",
+            .command = .{ .install = .{
+                .master_link = "/usr/bin/sort-probe",
+                .path = "/usr/lib/sort-probe-b",
+                .priority = 20,
+                .slaves = &.{
+                    .{
+                        .name = "a-man",
+                        .link = "/usr/share/man/man1/a.1.gz",
+                        .target = "/usr/lib/a-b",
+                    },
+                    .{
+                        .name = "a-man",
+                        .link = "/usr/share/man/man1/other.1.gz",
+                        .target = "/usr/lib/a-b",
+                    },
+                },
+            } },
+        }),
+    );
 }
 
 test "native_alternatives.test.snapshot less install cannot remove pager" {
