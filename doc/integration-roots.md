@@ -364,6 +364,35 @@ runner copy changed only the bounded `create` timeout from 30 to 90 minutes
 and was removed afterward. This root also remains read-only, not a completed
 install or a native/reference parity result.
 
+The signed `procps` archive and exact configure branch are reviewed in the
+[alternatives reference](dpkg-alternatives-reference.md#native-admission).
+Pinned dpkg 1.22.22 configured the signed script without alternatives changes
+in a disposable copy of the failed root because all four `.procps` providers
+were absent. An isolated provider-present control registered `uptime`, so
+native authorization is restricted to this specific digest, package, version,
+new-script configure arguments, snapshot amd64 tool, and a checkpointed
+**absence** of each provider; all existing alternatives groups are immutable.
+The step-1065 interrupted root remains untouched. Only another **new**
+authenticated root can establish whether this refusal is resolved; that
+subsequent run is recorded below.
+
+The new root `.real-snapshot/amd64-procps-fresh-long-1` resolved another
+signed 175-package SHA-512 lock (file SHA-256
+`6b92c0dbb16a73145368e9d1b5b66feade6cf94efafdeeed001b79d25339e7e5`)
+with the reviewed Ubuntu archive signer; all 175 objects were reverified.
+Its `procps.postinst configure` at step 1065 **ran and persisted exit 0**,
+and all four guarded alternatives groups remained absent. The next refusal
+is **before launch** at step 1145, `sudo-rs:amd64` 0.2.14-1ubuntu2
+`postinst configure` (SHA-256
+`a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17`)
+with `PartialAlternativesState`. Its proposed `sudo` alternatives group
+does not yet exist, but the `sudoedit` slave's generic link
+`/usr/bin/sudoedit` is already a `sudo` package-owned symlink to `sudo.ws`.
+No step-1145 script outcome was persisted; the last stable action is
+step 1145, substep 0. The root is retained and must **not** be reused as a
+fresh trial. This is the next distinct blocker, not a completed closure or
+native/reference parity result.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
