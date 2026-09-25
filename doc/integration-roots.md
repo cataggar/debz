@@ -271,6 +271,31 @@ for `builtins.7.gz`, followed by `|| true`; this shell wrapper is outside the
 reviewed literal-command grammar. Neither interrupted root is reused; the
 new refusal does not establish full amd64 native/reference parity.
 
+The signed `bash` archive and exact script bytes are now reviewed separately
+in the [alternatives reference](dpkg-alternatives-reference.md#native-admission).
+The exception binds one command and its `|| true` tail to that script,
+`bash:amd64` 5.3-3ubuntu1, new-package `postinst configure` arguments
+`["configure", ""]`, and the snapshot tool. It does not disable
+script-outcome checks or permit general shell wrappers. A **new** authenticated
+root is required to determine whether execution passes step 976; the
+interrupted step-976 root cannot be resumed as a fresh trial.
+
+That new authenticated 175-package amd64 root persisted a zero-exit
+`bash.postinst configure` outcome at step 976. Its `builtins.7.gz`
+alternatives record selected `/usr/share/man/man7/bash-builtins.7.gz` in auto
+mode at priority 10, with the expected generic and selector symlinks.
+Execution reached step 1026 and launched `netcat-openbsd` 1.238-1
+`postinst` (SHA-256
+`81abc862db99e322e5d6cda436769bc21b9394ce287ea35d057761b6313cb6ef`),
+but refused the resulting alternatives transition with
+`AlternativesStateChanged` before persisting a script outcome. Its signed
+script registers `nc` with three slaves. The command lists `netcat` before
+`nc.1.gz`, while the resulting record puts `nc.1.gz` first; the native typed
+registration currently preserves command order, so this ordering difference
+needs a separate pinned-reference investigation. This interrupted root is
+retained and not reused. Complete amd64 install and native/reference parity
+remain unproven.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
