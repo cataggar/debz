@@ -586,6 +586,18 @@ and the typed record, links, other groups, and recovery checkpoints must
 match. The [alternatives reference](dpkg-alternatives-reference.md#native-admission)
 documents signed bytes and independent pinned-dpkg/tool observations.
 
+The signed `console-setup-linux:all` 1.248ubuntu3 postinst has one
+digest-bound expansion of its literal `CONFIGDIR=/etc/console-setup` for
+two unconditional `vtrgb` registrations. It is restricted to the
+new-package amd64 `postinst` with `["configure", ""]`, exact signed
+archive, provider files and owner list, absent prior group and links, and
+the snapshot amd64 tool. An exit-0 outcome requires **both** typed
+registrations and their exact record and links; nonzero and unknown
+outcomes retain existing failure and recovery semantics. This is not
+general variable substitution. The [alternatives
+reference](dpkg-alternatives-reference.md#native-admission) records the
+independent pinned-dpkg and pinned-tool probes.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and
