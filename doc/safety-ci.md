@@ -46,8 +46,9 @@ which still requires both Python gates. Only this prepared transition removes
 its legacy job. Its `Build and test` checks require all four build rows and
 all three Zig recovery shards on each architecture; failure, cancellation,
 or a skipped row of any shard cannot make either architecture's aggregate
-pass. The hosted runner budget remains a measured risk until both the
-pre-retirement and post-retirement matrices complete in CI.
+pass. The audit also rejects any recovery command duplicated outside its
+assigned shard. The hosted runner budget remains a measured risk until both
+the pre-retirement and post-retirement matrices complete in CI.
 
 Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
 commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned

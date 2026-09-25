@@ -1429,6 +1429,11 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     ]
     if len(inventory_commands) != 30 or len(inventory_commands) != len(set(inventory_commands)):
         failures.append("ci.yml: recovery command inventory contains duplicate targets")
+    actual_commands = re.findall(
+        r"(?m)^[ \t]+(zig build test-native-recovery[^\n]+)$", text,
+    )
+    if sorted(actual_commands) != sorted(inventory_commands):
+        failures.append("ci.yml: recovery targets must execute only in the two required Zig shards")
     gate = jobs.get("build-and-test", "")
     gate_steps = dict(re.findall(
         r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", gate,

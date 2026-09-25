@@ -632,6 +632,15 @@ class SecurityAuditTests(unittest.TestCase):
             "  native-recovery-zig-workflows:\n",
         )
         self.assertTrue(security_audit.native_recovery_ci_failures(extra_gate))
+        extra_focused = workflow + (
+            "\n  duplicate-recovery:\n    runs-on: ubuntu-24.04\n    steps:\n"
+            "      - name: Duplicate signed FAMILY recovery\n        run: |\n"
+            '          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all\n'
+        )
+        self.assertIn(
+            "ci.yml: recovery targets must execute only in the two required Zig shards",
+            security_audit.native_recovery_ci_failures(extra_focused),
+        )
         for name in recovery_jobs:
             body = jobs[name]
             if "          zig build test-native-recovery" not in body:
