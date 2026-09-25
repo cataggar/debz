@@ -38,19 +38,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 443,
-      "sha512": "85cc1601c9ecabe7a718d7e823b042ee90fcc39b15b312f21f4d9586c08ac94397edc17fdfa3f2d365a2f49812b299824241f2abdf7abad03e3d72cfb5424310"
+      "count": 461,
+      "sha512": "7784c9e32cc816389eacdf032f855ab487ad1f677ff93015cd8313b5376f0f532df92940e278b10a72a5c06c6d7ded4a7fa28dec40f4b23b0376e71431d794ed"
     },
     "findings": {
-      "count": 20432,
+      "count": 21112,
       "counts": {
-        "cas_layout": 195,
+        "cas_layout": 198,
         "digest_version": 104,
-        "fixed_64_hex": 176,
-        "raw_32_byte": 1098,
-        "sha256_token": 18859
+        "fixed_64_hex": 177,
+        "raw_32_byte": 1141,
+        "sha256_token": 19492
       },
-      "sha512": "8d87df8fd738cd7866050f05f27c99f22dfc052f2e62c3c1942fd3ca70eb42a202df6d02cbe183bdc9160429439890de17dcf300104e20024f449ddae73e6285"
+      "sha512": "c238c7ba7c77f73f1548daf4280a559961114b3b8534234cd5b46480c505bf09e4960a743c362cbb7ff4d90c2326f5f0f5d3ff8bb1cbcadcc2ea9f4757fc0b28"
     },
     "classifications": [
       {
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 172,
+        "count": 177,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 141
+          "sha256_token": 146
         },
-        "sha512": "f520c68b53ffc43334d0bfcdeaa4f12dd04b985703f24de43631a4076a28ebb79915886cdc0464e6cc7825aa9476dc0c46a2f26af9d5b7ae0c92eecea6095d4d"
+        "sha512": "872aa825db771a9cdd1a5bd978adcd6dc223c00c003e53475af14043a92f80b5acdd37fa1ea49b3cf0c68dc45c9f3283ac3c965a11c1697b183c0cefad4acb48"
       },
       {
         "scope": "fuzz",
@@ -155,29 +155,29 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including the exact authenticated less preinst/postinst and bash postinst script gates and signed netcat script regression, and versioned compatibility readers.",
-        "count": 12037,
+        "count": 12053,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
           "raw_32_byte": 1069,
-          "sha256_token": 10821
+          "sha256_token": 10837
         },
-        "sha512": "a9d08b9e0d29b27d5320fb1fa1429ac5397e95467cc98e732bf543c4c0f1a2f3a312e958caaa30c7902ad87616d56791f0b916833f24d12af5883bda8b5dc9bb"
+        "sha512": "b89ac7eef9fc1fb1afd9cd6b5b9381c5192d939a521e3a60b4b46805b2ce7b4c62a8f00a73c67e722227050bf35168e81e6f4eefcfbf45d62d4539ed08b663ba"
       },
       {
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 130,
+        "count": 789,
         "counts": {
-          "cas_layout": 0,
+          "cas_layout": 3,
           "digest_version": 0,
-          "fixed_64_hex": 5,
-          "raw_32_byte": 24,
-          "sha256_token": 101
+          "fixed_64_hex": 6,
+          "raw_32_byte": 67,
+          "sha256_token": 713
         },
-        "sha512": "9497691b3c2364525df0b17c0a5f5f55f30399eae709a6ef54d6896cb101536e9e5bddd26d0b8088f76a1469a93ef931cad6d9394adf103d685c0b56a5744127"
+        "sha512": "92bf35786b3090afc2bc247828939d189712fa392c4416ff279d5480e89e6fc32fd61509f00eb560598d4069ef602d01a5b36366c8d0019060c2b3d5cdff0a17"
       },
       {
         "scope": "tools",
@@ -468,6 +468,28 @@
       ],
       "count": 4,
       "sha512": "6d6a6d9c06742ea79d1fa92ff00845aa80ee7ad80e3828bdf273175cd67375dd5bc5320200ccbd9df569659ad7e2cc0f6cc87faf7a21b8aa89f98dffd99e2342"
+    },
+    {
+      "id": "fixed-recovery-handler-schema-control",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_protocol",
+      "rationale": "The exact Zig recovery oracle checks the frozen lowercase SHA256 handler-schema digest pattern; it cannot authorize package, repository, or artifact content.",
+      "paths": [
+        "test/native_recovery_oracle.zig"
+      ],
+      "count": 1,
+      "sha512": "590590a536c126c6c7c6e33268efcd14f444132860bd0827a679cd5bcd6d292ff3fe1726e5524b8e5855bedf6dba25607c298a379cdd2f58510888b419840926"
+    },
+    {
+      "id": "projected-workflow-lock-control",
+      "kind": "raw_32_byte_field",
+      "classification": "fixed_control_protocol",
+      "rationale": "These exact projected workflow fields serialize the frozen v3 exact-lock and native-receipt SHA256 controls into real owner verification and marker-clear review requests; they do not authorize package archive content.",
+      "paths": [
+        "test/native_recovery_projected_workflows.zig"
+      ],
+      "count": 4,
+      "sha512": "a80263d8351df26e83c53850a030adb508187e5ab2469a7b2cd4d7db8fbdd3b3217a42fee823b47c0777ce4fffbb07a5275d5493c018029aeeaef7fa7d44d6ee"
     },
     {
       "id": "historical-fixed-cas-layouts",

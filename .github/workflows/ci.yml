@@ -924,23 +924,54 @@ jobs:
             RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       - name: Validate Zig version
         run: test "$(zig version)" = 0.16.0
-      - name: Install metadata decompression dependency
+      - name: Install metadata decompression and signed fixture dependencies
         run: |
           if ! command -v pkg-config >/dev/null ||
-             ! pkg-config --exists liblzma libzstd; then
+             ! pkg-config --exists liblzma libzstd ||
+             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
             if [ -f /etc/apt/apt-mirrors.txt ]; then
               sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
                 /etc/apt/apt-mirrors.txt
             fi
             sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
               -o Acquire::https::Timeout=30 update
-            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
           fi
       - name: Exercise native recovery and signed-suite consumer parity
         run: |
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build test-native-recovery-zig-unit -j2 --summary all
+          zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-parity -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-parity -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-rollback-clock -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-rollback-clock -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-statoverride -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-statoverride -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-literal -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-literal -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   arm64-dpkg-oracles:
     if: github.event_name == 'workflow_dispatch' && inputs.run_arm64_dpkg_oracles

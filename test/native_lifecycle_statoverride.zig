@@ -3,11 +3,11 @@ const root_fs = @import("debz").root_fs;
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 
-const name = "statoverride-lifecycle";
-const base = "usr/share/" ++ name;
-const literal = "etc/stato\\literal";
-const passwd = "root:x:0:0:root:/root:/bin/sh\n_debzstat:x:42420:42421:fixture:/:/bin/sh\n";
-const group = "root:x:0:\n_debzstat:x:42421:\n";
+pub const name = "statoverride-lifecycle";
+pub const base = "usr/share/" ++ name;
+pub const literal = "etc/stato\\literal";
+pub const passwd = "root:x:0:0:root:/root:/bin/sh\n_debzstat:x:42420:42421:fixture:/:/bin/sh\n";
+pub const group = "root:x:0:\n_debzstat:x:42421:\n";
 const hook =
     \\if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ]; then
     \\    if [ -f /statoverride-passwd-replace ]; then
@@ -23,12 +23,16 @@ const hook =
     \\
 ;
 
-fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8) ![]u8 {
+pub fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8) ![]u8 {
+    return archiveAt(fixture, arch, version, "packages/statoverride");
+}
+
+pub fn archiveAt(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
     const content = try std.fmt.allocPrint(fixture.allocator, "configuration {s}\n", .{version});
     defer fixture.allocator.free(content);
     const extra = try std.fmt.allocPrint(fixture.allocator, "literal version {s}\n", .{version});
     defer fixture.allocator.free(extra);
-    return support.makePackage(fixture, arch, version, name, "packages/statoverride", .{
+    return support.makePackage(fixture, arch, version, name, workspace, .{
         .full_payload = true,
         .conffile_content = content,
         .extra_files = &.{.{ .path = literal, .content = extra }},
@@ -36,7 +40,7 @@ fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8) 
     });
 }
 
-fn both(case: *support.Scenario, relative: []const u8, content: []const u8) !void {
+pub fn both(case: *support.Scenario, relative: []const u8, content: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
         const location = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, relative });
         defer case.fixture.allocator.free(location);
@@ -44,7 +48,7 @@ fn both(case: *support.Scenario, relative: []const u8, content: []const u8) !voi
     }
 }
 
-fn seed(case: *support.Scenario, records: []const u8) !void {
+pub fn seed(case: *support.Scenario, records: []const u8) !void {
     try both(case, "etc/passwd", passwd);
     try both(case, "etc/group", group);
     try both(case, "var/lib/dpkg/statoverride", records);
@@ -66,7 +70,7 @@ fn expectMetadata(case: *support.Scenario, target: []const u8, expected: Expecte
     }
 }
 
-fn replace(case: *support.Scenario, marker: []const u8, content: []const u8) !void {
+pub fn replace(case: *support.Scenario, marker: []const u8, content: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
         const root = try support.path(case.fixture.allocator, case.name, side);
         defer case.fixture.allocator.free(root);

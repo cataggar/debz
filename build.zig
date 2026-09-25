@@ -1047,13 +1047,27 @@ pub fn build(b: *std.Build) void {
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
-            "native_recovery.test.", "native_provenance.test.",         "native_execution_request.test.",
-            "native_helper.test.",   "native_transaction_result.test.", "native_install_result.test.",
+            "native_recovery.test.",                                                      "native_provenance.test.",                                                           "native_execution_request.test.",
+            "native_helper.test.",                                                        "native_transaction_result.test.",                                                   "native_install_result.test.",
+            "root_operation_completion.test.store publishes atomically and idempotently", "root_operation_completion.test.store refuses a symbolic link at the document path",
         },
     });
     const run_native_recovery_tests = b.addRunArtifact(native_recovery_tests);
-    b.step("test-native-recovery-unit", "Run native execution journal and provenance tests")
-        .dependOn(&run_native_recovery_tests.step);
+    const recovery_unit_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_unit.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recovery_unit_module.addImport("debz", debz);
+    recovery_unit_module.addOptions("native_test_options", native_fixture_options);
+    const recovery_unit_tests = b.addTest(.{ .root_module = recovery_unit_module });
+    const run_recovery_unit_tests = b.addRunArtifact(recovery_unit_tests);
+    const recovery_unit_step = b.step("test-native-recovery-unit", "Run native execution journal, provenance and Zig oracle tests");
+    recovery_unit_step.dependOn(&run_native_recovery_tests.step);
+    recovery_unit_step.dependOn(&run_recovery_unit_tests.step);
+    b.step("test-native-recovery-zig-unit", "Run unprivileged Zig recovery negative oracles")
+        .dependOn(&run_recovery_unit_tests.step);
+    test_step.dependOn(&run_recovery_unit_tests.step);
     test_step.dependOn(&run_native_recovery_tests.step);
     const native_recovery = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",     "PYTHONDONTWRITEBYTECODE=1",
@@ -1064,32 +1078,362 @@ pub fn build(b: *std.Build) void {
     native_recovery.addArtifactArg(native_trigger_helper);
     native_recovery.addArg("--result-cli");
     native_recovery.addArtifactArg(cli);
-    if (b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false)
+    const native_core_only = b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false;
+    const native_deadline_only = b.option(bool, "native-deadline-only", "Select native execution deadline acceptance cases") orelse false;
+    const native_parity_only = b.option(bool, "native-consumer-parity-only", "Select family and public core parity across signed fixture suites") orelse false;
+    const native_helper_only = b.option(bool, "native-fresh-helper-only", "Select authenticated fresh-root helper bootstrap cases") orelse false;
+    const native_diversions_only = b.option(bool, "native-diversions-only", "Run only diversion lifecycle, trigger and recovery fixtures") orelse false;
+    const native_script_failure_only = b.option(bool, "native-script-failure-only", "Select known native postinst failure/restart boundaries") orelse false;
+    if (native_core_only)
         native_recovery.addArg("--core-only");
-    if (b.option(bool, "native-script-failure-only", "Select known native postinst failure/restart boundaries") orelse false)
+    if (native_script_failure_only)
         native_recovery.addArg("--script-failure-only");
-    if (b.option(bool, "native-deadline-only", "Select native execution deadline acceptance cases") orelse false)
+    if (native_deadline_only)
         native_recovery.addArg("--deadline-only");
-    if (b.option(bool, "native-repository-projection-only", "Select native repository private-root authority cases") orelse false)
+    const repository_projection_only = b.option(bool, "native-repository-projection-only", "Select native repository private-root authority cases") orelse false;
+    const repository_execution_only = b.option(bool, "native-repository-execution-only", "Select typed native repository execution and recovery cases") orelse false;
+    const repository_cli_only = b.option(bool, "native-repository-cli-only", "Select public supervised native repository CLI cases") orelse false;
+    if (repository_projection_only)
         native_recovery.addArg("--repository-projection-only");
-    if (b.option(bool, "native-repository-execution-only", "Select typed native repository execution and recovery cases") orelse false)
+    if (repository_execution_only)
         native_recovery.addArg("--repository-execution-only");
-    if (b.option(bool, "native-repository-cli-only", "Select public supervised native repository CLI cases") orelse false)
+    if (repository_cli_only)
         native_recovery.addArg("--repository-cli-only");
-    if (b.option(bool, "native-consumer-parity-only", "Select family and public core parity across signed fixture suites") orelse false)
+    if (native_parity_only)
         native_recovery.addArg("--consumer-parity-only");
-    if (b.option(bool, "native-fresh-helper-only", "Select authenticated fresh-root helper bootstrap cases") orelse false)
+    if (native_helper_only)
         native_recovery.addArg("--fresh-helper-only");
     const native_recovery_oracle_tests = b.addSystemCommand(
         &.{ "python3", "-m", "unittest", "tools/test_native_recovery.py" },
     );
     native_recovery.step.dependOn(&native_recovery_oracle_tests.step);
     native_recovery.step.dependOn(&run_native_recovery_tests.step);
+    native_recovery.step.dependOn(&run_recovery_unit_tests.step);
     test_step.dependOn(&native_recovery_oracle_tests.step);
     b.step("test-native-recovery", "Compare real native crash recovery with dpkg and bound provenance")
         .dependOn(&native_recovery.step);
 
-    if (b.option(bool, "native-diversions-only", "Run only diversion lifecycle, trigger and recovery fixtures") orelse false) {
+    const recovery_zig_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_acceptance.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recovery_zig_module.addImport("debz", debz);
+    recovery_zig_module.addOptions("native_test_options", native_fixture_options);
+    const recovery_zig_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-acceptance",
+        .root_module = recovery_zig_module,
+    });
+    const recovery_zig = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    recovery_zig.addArtifactArg(recovery_zig_executable);
+    recovery_zig.addArtifactArg(native_lifecycle_tests);
+    if (b.option(bool, "native-zig-recovery-core-only", "Select scriptless Zig core recovery acceptance") orelse false)
+        recovery_zig.addArg("--core-only");
+    if (b.option(bool, "native-zig-recovery-deadline-only", "Select Zig deadline acceptance") orelse false)
+        recovery_zig.addArg("--deadline-only");
+    b.step("test-native-recovery-zig", "Run Zig-owned real-process core and deadline recovery acceptance")
+        .dependOn(&recovery_zig.step);
+
+    const recovery_family_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_family.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recovery_family_module.addImport("debz", debz);
+    recovery_family_module.addOptions("native_test_options", native_fixture_options);
+    const recovery_family_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-family",
+        .root_module = recovery_family_module,
+    });
+    const recovery_family = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    recovery_family.addArtifactArg(recovery_family_executable);
+    recovery_family.addArtifactArg(native_lifecycle_tests);
+    recovery_family.addArg("--self");
+    recovery_family.addArtifactArg(recovery_family_executable);
+    recovery_family.addArg("--native-helper");
+    recovery_family.addArtifactArg(native_trigger_helper);
+    recovery_family.addArg("--cli");
+    recovery_family.addArtifactArg(cli);
+    if (b.option([]const u8, "native-zig-recovery-family-fixture-python", "Python interpreter for the existing signed-archive fixture builder")) |path|
+        recovery_family.addArgs(&.{ "--fixture-python", path });
+    if (b.option(bool, "native-zig-recovery-family-executed-only", "Select archive-backed FAMILY execution and active inspection") orelse false)
+        recovery_family.addArg("--executed-only");
+    b.step("test-native-recovery-zig-family", "Run Zig-owned private-root family request/result transport and inspection")
+        .dependOn(&recovery_family.step);
+
+    const recovery_parity_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_parity.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recovery_parity_module.addImport("debz", debz);
+    recovery_parity_module.addOptions("native_test_options", native_fixture_options);
+    const recovery_parity_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-parity",
+        .root_module = recovery_parity_module,
+    });
+    const recovery_parity = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    recovery_parity.addArtifactArg(recovery_parity_executable);
+    recovery_parity.addArtifactArg(native_lifecycle_tests);
+    recovery_parity.addArtifactArg(cli);
+    recovery_parity.addArtifactArg(native_trigger_helper);
+    if (b.option([]const u8, "native-zig-recovery-parity-fixture-python", "Python interpreter for signed-archive fixture generation")) |path|
+        recovery_parity.addArgs(&.{ "--fixture-python", path });
+    if (b.option([]const u8, "native-zig-recovery-parity-case", "Run one suite/case for signed consumer parity debugging")) |case|
+        recovery_parity.addArgs(&.{ "--case", case });
+    b.step("test-native-recovery-zig-parity", "Run 28 signed cases through real core, FAMILY, and dpkg consumers")
+        .dependOn(&recovery_parity.step);
+
+    const recovery_helper_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recovery_helper_module.addImport("debz", debz);
+    recovery_helper_module.addOptions("native_test_options", native_fixture_options);
+    const recovery_helper_executable = b.addExecutable(.{
+        .name = "native-recovery-helper-zig-acceptance",
+        .root_module = recovery_helper_module,
+    });
+    const recovery_helper = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    recovery_helper.addArtifactArg(recovery_helper_executable);
+    recovery_helper.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-helper-zig", "Run Zig-owned real-process crash and helper acceptance")
+        .dependOn(&recovery_helper.step);
+
+    const final_gaps_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_final_gaps.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    final_gaps_module.addImport("debz", debz);
+    final_gaps_module.addOptions("native_test_options", native_fixture_options);
+    const final_gaps_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-final-gaps",
+        .root_module = final_gaps_module,
+    });
+    const final_gaps = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    final_gaps.addArtifactArg(final_gaps_executable);
+    final_gaps.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-final-gaps", "Exercise bounded rollback/deadline transport guards and real recovery")
+        .dependOn(&final_gaps.step);
+
+    const recovery_bootstrap_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_bootstrap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recovery_bootstrap_module.addImport("debz", debz);
+    recovery_bootstrap_module.addOptions("native_test_options", native_fixture_options);
+    const recovery_bootstrap_executable = b.addExecutable(.{
+        .name = "native-recovery-bootstrap-zig-acceptance",
+        .root_module = recovery_bootstrap_module,
+    });
+    const recovery_bootstrap = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    recovery_bootstrap.addArtifactArg(recovery_bootstrap_executable);
+    recovery_bootstrap.addArtifactArg(native_lifecycle_tests);
+    recovery_bootstrap.addArtifactArg(native_trigger_helper);
+    if (b.option([]const u8, "native-zig-bootstrap-case", "Run one real fresh-helper bootstrap case")) |case|
+        recovery_bootstrap.addArgs(&.{ "--case", case });
+    b.step("test-native-recovery-zig-bootstrap", "Run real fresh-root helper publication and recovery with pinned dpkg")
+        .dependOn(&recovery_bootstrap.step);
+
+    const repository_recovery_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_repository.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    repository_recovery_module.addImport("debz", debz);
+    repository_recovery_module.addOptions("native_test_options", native_fixture_options);
+    const repository_recovery_unit = b.addTest(.{ .root_module = repository_recovery_module });
+    const run_repository_recovery_unit = b.addRunArtifact(repository_recovery_unit);
+    const repository_recovery_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-repository",
+        .root_module = repository_recovery_module,
+    });
+    const repository_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    repository_recovery.addArtifactArg(repository_recovery_executable);
+    repository_recovery.addArtifactArg(native_lifecycle_tests);
+    repository_recovery.addArtifactArg(cli);
+    if (b.option([]const u8, "native-repository-fixture-python", "Python with signed-repository fixture generator dependencies")) |python|
+        repository_recovery.addArgs(&.{ "--fixture-python", python });
+    if (b.option([]const u8, "native-zig-repository-case", "Run one Zig repository CLI scenario")) |case|
+        repository_recovery.addArgs(&.{ "--cli-scenario", case });
+    if (repository_projection_only) repository_recovery.addArg("--projection-only");
+    if (repository_execution_only) repository_recovery.addArg("--execution-only");
+    if (repository_cli_only) repository_recovery.addArg("--cli-only");
+    const repository_recovery_step = b.step("test-native-recovery-zig-repository", "Run Zig-owned private-root repository transport and CLI acceptance");
+    repository_recovery_step.dependOn(&run_repository_recovery_unit.step);
+    repository_recovery_step.dependOn(&repository_recovery.step);
+    test_step.dependOn(&run_repository_recovery_unit.step);
+    if (!native_core_only and !native_deadline_only and !native_script_failure_only and !native_parity_only and
+        !native_helper_only and !native_diversions_only)
+        native_recovery.step.dependOn(&repository_recovery.step);
+
+    const rollback_clock_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_rollback_clock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rollback_clock_module.addImport("debz", debz);
+    rollback_clock_module.addOptions("native_test_options", native_fixture_options);
+    const rollback_clock_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-rollback-clock",
+        .root_module = rollback_clock_module,
+    });
+    const rollback_clock = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    rollback_clock.addArtifactArg(rollback_clock_executable);
+    rollback_clock.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-rollback-clock", "Compare real failed-upgrade rollback clocks with pinned dpkg")
+        .dependOn(&rollback_clock.step);
+
+    const scriptless_recovery_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_scriptless.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scriptless_recovery_module.addImport("debz", debz);
+    scriptless_recovery_module.addOptions("native_test_options", native_fixture_options);
+    const scriptless_recovery_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-scriptless",
+        .root_module = scriptless_recovery_module,
+    });
+    const scriptless_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    scriptless_recovery.addArtifactArg(scriptless_recovery_executable);
+    scriptless_recovery.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-scriptless", "Run six real scriptless trigger crash/recovery cases")
+        .dependOn(&scriptless_recovery.step);
+
+    const statoverride_recovery_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_statoverride.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    statoverride_recovery_module.addImport("debz", debz);
+    statoverride_recovery_module.addOptions("native_test_options", native_fixture_options);
+    const statoverride_recovery_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-statoverride",
+        .root_module = statoverride_recovery_module,
+    });
+    const statoverride_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    statoverride_recovery.addArtifactArg(statoverride_recovery_executable);
+    statoverride_recovery.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-statoverride", "Run 17 real statoverride crash/recovery cases")
+        .dependOn(&statoverride_recovery.step);
+
+    const literal_recovery_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_literal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    literal_recovery_module.addImport("debz", debz);
+    literal_recovery_module.addOptions("native_test_options", native_fixture_options);
+    const literal_recovery_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-literal",
+        .root_module = literal_recovery_module,
+    });
+    const literal_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    literal_recovery.addArtifactArg(literal_recovery_executable);
+    literal_recovery.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-literal", "Run five real literal-path crash/recovery cases")
+        .dependOn(&literal_recovery.step);
+
+    const metadata_recovery_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_metadata.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    metadata_recovery_module.addImport("debz", debz);
+    metadata_recovery_module.addOptions("native_test_options", native_fixture_options);
+    const metadata_recovery_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-metadata",
+        .root_module = metadata_recovery_module,
+    });
+    const metadata_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    metadata_recovery.addArtifactArg(metadata_recovery_executable);
+    metadata_recovery.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-metadata", "Run eleven real retained-metadata crash/recovery cases")
+        .dependOn(&metadata_recovery.step);
+
+    const conffile_recovery_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_conffile.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    conffile_recovery_module.addImport("debz", debz);
+    conffile_recovery_module.addOptions("native_test_options", native_fixture_options);
+    const conffile_recovery_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-conffile",
+        .root_module = conffile_recovery_module,
+    });
+    const conffile_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    conffile_recovery.addArtifactArg(conffile_recovery_executable);
+    conffile_recovery.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-conffile", "Run twenty real conffile lifecycle crash/recovery cases")
+        .dependOn(&conffile_recovery.step);
+
+    const recovery_diversions_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_diversions.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    recovery_diversions_module.addImport("debz", debz);
+    recovery_diversions_module.addOptions("native_test_options", native_fixture_options);
+    const recovery_diversions_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-diversions",
+        .root_module = recovery_diversions_module,
+    });
+    const recovery_diversions = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    recovery_diversions.addArtifactArg(recovery_diversions_executable);
+    recovery_diversions.addArtifactArg(native_lifecycle_tests);
+    if (b.option([]const u8, "native-zig-recovery-diversion-case", "Run one numbered Python diversion recovery case")) |number|
+        recovery_diversions.addArgs(&.{ "--case", number });
+    b.step("test-native-recovery-zig-diversions", "Run counted real-process diversion crash/recovery cases against pinned dpkg")
+        .dependOn(&recovery_diversions.step);
+
+    if (native_diversions_only) {
         native_recovery.addArg("--diversions-only");
         for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, lifecycle_oracle_zig, trigger_oracle_zig }) |runner|
             runner.addArg("--diversions-only");
@@ -1103,6 +1447,11 @@ pub fn build(b: *std.Build) void {
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
         for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, settlement, lifecycle_oracle_zig, trigger_oracle_zig, settlement_oracle_zig }) |runner|
             runner.addArgs(&.{ "--reference-dpkg", path });
+        for ([_]*std.Build.Step.Run{
+            recovery_zig,       recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
+            recovery_bootstrap, repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
+            literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions,
+        }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
     }
     if (b.option(
         []const u8,

@@ -33,6 +33,28 @@ pub fn fixtureFile(fixture: *foundation.Fixture, relative: []const u8, content: 
     });
 }
 
+fn shebangInterpreter(prefix: []const u8) !?[]const u8 {
+    if (!std.mem.startsWith(u8, prefix, "#!")) return null;
+    const end = std.mem.indexOfScalar(u8, prefix, '\n') orelse return error.InvalidInterpreter;
+    var tokens = std.mem.tokenizeAny(u8, prefix[2..end], " \t");
+    const interpreter = tokens.next() orelse return error.InvalidInterpreter;
+    if (!std.fs.path.isAbsolute(interpreter)) return error.InvalidInterpreter;
+    return interpreter;
+}
+
+test "copyProgram recognizes a shebang interpreter with an argument" {
+    try std.testing.expectEqualStrings(
+        "/usr/bin/coreutils",
+        (try shebangInterpreter("#!/usr/bin/coreutils --coreutils-prog-shebang=sleep\n")).?,
+    );
+    try std.testing.expectEqualStrings(
+        "/bin/sh",
+        (try shebangInterpreter("#! /bin/sh -e\n")).?,
+    );
+    try std.testing.expect((try shebangInterpreter("plain executable")) == null);
+    try std.testing.expectError(error.InvalidInterpreter, shebangInterpreter("#! bin/sh\n"));
+}
+
 pub fn copyProgram(fixture: *foundation.Fixture, root: []const u8, source: []const u8, destination: []const u8) !void {
     if (!std.fs.path.isAbsolute(source) or !std.fs.path.isAbsolute(destination)) return error.InvalidProgramPath;
     const relative = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{ root, destination[1..] });
@@ -41,13 +63,33 @@ pub fn copyProgram(fixture: *foundation.Fixture, root: []const u8, source: []con
     var input = try std.Io.Dir.openFileAbsolute(fixture.io, source, .{});
     defer input.close(fixture.io);
     var reader = input.reader(fixture.io, &.{});
-    const bytes = try reader.interface.allocRemaining(fixture.allocator, .limited(32 * 1024 * 1024));
-    defer fixture.allocator.free(bytes);
-    try fixtureFile(fixture, relative, bytes, 0o755);
-    if (std.mem.startsWith(u8, bytes, "#!")) {
-        const end = std.mem.indexOfScalar(u8, bytes, '\n') orelse return error.InvalidInterpreter;
-        const interpreter = std.mem.trim(u8, bytes[2..end], " \t");
-        if (!std.fs.path.isAbsolute(interpreter)) return error.InvalidInterpreter;
+    const destination_path = try root_fs.Path.initPackage(relative);
+    if (destination_path.parent()) |parent_path|
+        try fixture.dir.createDirPath(fixture.io, parent_path.text);
+    var header: [4096]u8 = undefined;
+    var header_len: usize = 0;
+    {
+        var output = try fixture.dir.createFile(fixture.io, relative, .{
+            .truncate = true,
+            .permissions = .fromMode(0o755),
+        });
+        defer output.close(fixture.io);
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const count = reader.interface.readSliceShort(&buffer) catch return reader.err.?;
+            if (count == 0) break;
+            const prefix_len = @min(header.len - header_len, count);
+            @memcpy(header[header_len..][0..prefix_len], buffer[0..prefix_len]);
+            header_len += prefix_len;
+            try output.writeStreamingAll(fixture.io, buffer[0..count]);
+        }
+        try output.setPermissions(fixture.io, .fromMode(0o755));
+    }
+    try fixture.dir.setTimestamps(fixture.io, relative, .{
+        .modify_timestamp = .{ .new = .{ .nanoseconds = foundation.epoch * std.time.ns_per_s } },
+    });
+    const prefix = header[0..header_len];
+    if (try shebangInterpreter(prefix)) |interpreter| {
         try copyProgram(fixture, root, interpreter, interpreter);
         return;
     }
@@ -83,6 +125,7 @@ pub const ScriptOptions = struct {
     before_failure: []const u8 = "",
     after_failure: []const u8 = "",
     omit_postrm: bool = false,
+    only_postinst: bool = false,
 };
 
 pub fn scripts(fixture: *foundation.Fixture, source: []const u8, package: []const u8, version: []const u8) !void {
@@ -91,6 +134,7 @@ pub fn scripts(fixture: *foundation.Fixture, source: []const u8, package: []cons
 
 pub fn scriptsWith(fixture: *foundation.Fixture, source: []const u8, package: []const u8, version: []const u8, options: ScriptOptions) !void {
     for (kinds) |kind| {
+        if (options.only_postinst and !std.mem.eql(u8, kind, "postinst")) continue;
         if (options.omit_postrm and std.mem.eql(u8, kind, "postrm")) continue;
         const body = try std.fmt.allocPrint(fixture.allocator,
             \\#!/bin/sh
@@ -133,6 +177,7 @@ pub const PackageSpec = struct {
     postinst: bool = true,
     postinst_append: ?[]const u8 = null,
     preinst_append: ?[]const u8 = null,
+    config_content: ?[]const u8 = null,
     conffile_content: ?[]const u8 = null,
     conffile_path: []const u8 = "etc/debz-native.conf",
     extra_conffile: ?foundation.Fixture.ExtraFile = null,
@@ -209,6 +254,11 @@ pub fn makePackage(fixture: *foundation.Fixture, architecture: []const u8, versi
     }
     if (spec.bootstrap_shell) try copyProgram(fixture, source, "/bin/sh", "/bin/sh");
     if (!spec.no_scripts) try scriptsWith(fixture, source, name, version, spec.scripts);
+    if (spec.config_content) |configuration| {
+        const config = try path(fixture.allocator, source, "DEBIAN/config");
+        defer fixture.allocator.free(config);
+        try fixture.write(config, configuration, 0o755);
+    }
     if (spec.activation != null or spec.activations.len != 0) {
         if (!std.mem.eql(u8, spec.activation_kind, "postinst") and
             !std.mem.eql(u8, spec.activation_kind, "postrm")) return error.InvalidFixtureActivationKind;
