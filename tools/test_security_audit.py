@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import itertools
 import copy
+from collections import Counter
 import json
 import os
 import pathlib
@@ -459,7 +460,7 @@ class SecurityAuditTests(unittest.TestCase):
         )
 
     def test_workflows_pin_verified_ghr_zig_installation(self) -> None:
-        for workflow_name, expected_count in (("ci.yml", 11), ("release.yml", 1)):
+        for workflow_name, expected_count in (("ci.yml", 13), ("release.yml", 1)):
             workflow = (ROOT / ".github/workflows" / workflow_name).read_text()
             self.assertEqual(
                 [],
@@ -545,70 +546,126 @@ class SecurityAuditTests(unittest.TestCase):
     def test_native_recovery_keeps_existing_required_checks_fail_closed(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertEqual([], security_audit.native_recovery_ci_failures(workflow))
+        jobs = dict(re.findall(
+            r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+            workflow,
+        ))
+        recovery_jobs = ("native-recovery", *security_audit.RECOVERY_ZIG_SHARDS)
+        commands = []
+        for name in recovery_jobs:
+            body = jobs[name]
+            commands.extend(re.findall(
+                r"(?m)^          (zig build test-native-recovery[^\n]+)$", body,
+            ))
+            tokens = [
+                "    timeout-minutes: 35",
+                "      fail-fast: false",
+                "          - os: ubuntu-24.04",
+                "          - os: ubuntu-24.04-arm",
+                "      - name: Install Zig via ghr\n",
+                "      - name: Install metadata decompression and signed fixture dependencies\n",
+                "python3-cryptography python3-jsonschema",
+                'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+                *[f"          {command}" for command in re.findall(
+                    r"(?m)^          (zig build test-native-recovery[^\n]+)$", body,
+                )],
+            ]
+            if name == "native-recovery":
+                tokens.extend((
+                    "            optimize: Debug",
+                    "            optimize: ReleaseSafe",
+                    "        if: ${{ matrix.optimize == 'Debug' }}",
+                    "        if: ${{ matrix.optimize == 'ReleaseSafe' }}",
+                ))
+            for token in tokens:
+                with self.subTest(job=name, removed=token):
+                    self.assertIn(token, body)
+                    changed = workflow.replace(body, body.replace(token, "", 1), 1)
+                    self.assertTrue(security_audit.native_recovery_ci_failures(changed))
+            for step in re.findall(r"(?m)^      - name: (Exercise [^\n]+)$", body):
+                with self.subTest(job=name, skipped=step):
+                    changed = workflow.replace(
+                        body,
+                        body.replace(
+                            f"      - name: {step}\n",
+                            f"      - name: {step}\n        if: false\n",
+                            1,
+                        ),
+                        1,
+                    )
+                    self.assertTrue(security_audit.native_recovery_ci_failures(changed))
+        targets = {
+            "test-native-recovery", "test-native-recovery-zig-unit",
+            "test-native-recovery-zig", "test-native-recovery-zig-family",
+            "test-native-recovery-zig-repository", "test-native-recovery-helper-zig",
+            "test-native-recovery-zig-bootstrap", "test-native-recovery-zig-parity",
+            "test-native-recovery-zig-rollback-clock", "test-native-recovery-zig-scriptless",
+            "test-native-recovery-zig-statoverride", "test-native-recovery-zig-literal",
+            "test-native-recovery-zig-metadata", "test-native-recovery-zig-conffile",
+            "test-native-recovery-zig-final-gaps", "test-native-recovery-zig-diversions",
+        }
+        inventory = Counter(
+            (
+                command.split()[2],
+                "ReleaseSafe" if "-Doptimize=ReleaseSafe" in command else "Debug",
+            )
+            for command in commands
+        )
+        self.assertEqual(inventory, Counter({
+            (target, mode): 1 for target in targets for mode in ("Debug", "ReleaseSafe")
+        }))
+        for name in recovery_jobs:
+            body = jobs[name]
+            if "          zig build test-native-recovery" not in body:
+                continue
+            command = re.search(r"(?m)^          zig build test-native-recovery[^\n]+$", body)[0]
+            with self.subTest(job=name, duplicate=command):
+                changed = workflow.replace(body, body.replace(command, f"{command}\n{command}", 1), 1)
+                self.assertTrue(security_audit.native_recovery_ci_failures(changed))
+        gate = jobs["build-and-test"]
         for token in (
-            "    timeout-minutes: 180",
-            "    needs: [build-and-test-workload, native-recovery]",
+            "    needs: [build-and-test-workload, native-recovery, native-recovery-zig-workflows, native-recovery-zig-scenarios]",
             "    if: ${{ always() }}",
             "        name: [linux-x64, linux-arm64]",
             "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
             "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
+            "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
+            "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
             '          test "$BUILD_RESULT" = success',
             '          test "$RECOVERY_RESULT" = success',
-            '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-            '          zig build test-native-recovery-zig-unit -j2 --summary all',
-            '          zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-parity -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-parity -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-rollback-clock -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-rollback-clock -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-statoverride -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-statoverride -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-literal -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-literal -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            '          zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-            '          zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-            "          - os: ubuntu-24.04-arm",
+            '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
+            '          test "$RECOVERY_SCENARIOS_RESULT" = success',
         ):
-            with self.subTest(token=token):
-                self.assertTrue(security_audit.native_recovery_ci_failures(
-                    workflow.replace(token, ""),
-                ))
+            with self.subTest(gate=token):
+                self.assertIn(token, gate)
+                changed = workflow.replace(gate, gate.replace(token, "", 1), 1)
+                self.assertTrue(security_audit.native_recovery_ci_failures(changed))
         gate = re.search(
             r"(?ms)^  build-and-test:\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
             workflow,
         )
         self.assertIsNotNone(gate)
         script = gate[1].split("        run: |\n", 1)[1]
-        for build, recovery in itertools.product(
-            ("success", "failure", "cancelled", "skipped", "unknown"), repeat=2,
+        statuses = ("success", "failure", "cancelled", "skipped", "unknown")
+        for build, recovery, workflows, scenarios in itertools.product(
+            statuses, repeat=4,
         ):
-            with self.subTest(build=build, recovery=recovery):
+            with self.subTest(build=build, recovery=recovery, workflows=workflows, scenarios=scenarios):
                 result = subprocess.run(
                     ["bash", "-e", "-c", textwrap.dedent(script)],
-                    env={**os.environ, "BUILD_RESULT": build, "RECOVERY_RESULT": recovery},
+                    env={
+                        **os.environ,
+                        "BUILD_RESULT": build,
+                        "RECOVERY_RESULT": recovery,
+                        "RECOVERY_WORKFLOWS_RESULT": workflows,
+                        "RECOVERY_SCENARIOS_RESULT": scenarios,
+                    },
                     stdin=subprocess.DEVNULL, capture_output=True, check=False,
                 )
-                self.assertEqual(result.returncode == 0, build == recovery == "success")
+                self.assertEqual(
+                    result.returncode == 0,
+                    all(status == "success" for status in (build, recovery, workflows, scenarios)),
+                )
 
     def test_report_path_reader_refusals_are_mutation_enforced(self) -> None:
         paths = security_audit.REPORT_PATH_ORACLE_FILES

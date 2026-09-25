@@ -20,11 +20,30 @@ passed but before the required facade acceptance could complete. Every
 combination runs the complete build, test, fuzz, native differential, and
 private helper namespace targets with `-j2` and timing summaries. Debug jobs
 also run release packaging and privileged orchestration; ReleaseSafe jobs run
-installed-CLI facade acceptance and the download action fixture. Native crash
-recovery remains a separate required workload in both modes on both
-architectures. The existing `Build and test` checks require all four build
-jobs and both recovery jobs to succeed; failure, cancellation, or a skipped
-workload cannot make the aggregate pass.
+installed-CLI facade acceptance and the download action fixture.
+
+Native crash recovery has three required jobs on each architecture, each
+bounded to 35 minutes. `native-recovery` has four independent matrix rows:
+amd64/arm64 × Debug/ReleaseSafe. Debug runs the Python recovery gate plus both
+Zig unit modes; ReleaseSafe runs the other Python recovery gate. The two
+`native-recovery-zig-*` jobs each run all their targets in **both** modes on
+both architectures, with pinned dpkg and signed fixture dependencies:
+
+| Required job | Zig targets (prefix `test-native-recovery-` unless shown) |
+| --- | --- |
+| `native-recovery-zig-workflows` | `zig`, `zig-family`, `zig-repository`, `helper-zig`, `zig-bootstrap`, `zig-parity`, `zig-rollback-clock` |
+| `native-recovery-zig-scenarios` | `zig-scriptless`, `zig-statoverride`, `zig-literal`, `zig-metadata`, `zig-conffile`, `zig-final-gaps`, `zig-diversions` |
+
+On two x64 hosted runners the old serial job received a shutdown signal
+after about 40–42 minutes, after both Python modes and the core Zig target
+passed but before the FAMILY target completed. The Python modes alone took
+about 34 minutes on the second run; moving only the Zig targets would leave
+too little runner margin. Sharding **both** the legacy modes and Zig targets
+preserves every pre-retirement CI command exactly once per mode and architecture.
+The existing `Build and test` checks require all four build rows and all
+eight recovery rows to succeed; failure, cancellation, or a skipped row of
+any shard cannot make either architecture's aggregate pass. The hosted
+runner budget remains a measured risk until all shards complete in CI.
 
 Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
 commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned

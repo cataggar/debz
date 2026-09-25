@@ -1141,6 +1141,44 @@ def workflow_failure_handling_failures(text: str, label: str) -> list[str]:
     return failures
 
 
+RECOVERY_ZIG_SHARDS = {
+    "native-recovery-zig-workflows": (
+        "Native crash recovery Zig core and workflows (${{ matrix.name }})",
+        "Exercise Zig core, signed workflows, repository, and helper recovery",
+        (
+            "test-native-recovery-zig",
+            "test-native-recovery-zig-family",
+            "test-native-recovery-zig-repository",
+            "test-native-recovery-helper-zig",
+            "test-native-recovery-zig-bootstrap",
+            "test-native-recovery-zig-parity",
+            "test-native-recovery-zig-rollback-clock",
+        ),
+    ),
+    "native-recovery-zig-scenarios": (
+        "Native crash recovery Zig scenario matrices (${{ matrix.name }})",
+        "Exercise Zig recovery scenario and diversion matrices",
+        (
+            "test-native-recovery-zig-scriptless",
+            "test-native-recovery-zig-statoverride",
+            "test-native-recovery-zig-literal",
+            "test-native-recovery-zig-metadata",
+            "test-native-recovery-zig-conffile",
+            "test-native-recovery-zig-final-gaps",
+            "test-native-recovery-zig-diversions",
+        ),
+    ),
+}
+
+
+def recovery_zig_commands(targets: tuple[str, ...]) -> list[str]:
+    return [
+        f'zig build {target} -Dnative-reference-dpkg="$reference_dpkg"{mode} -j2 --summary all'
+        for target in targets
+        for mode in ("", " -Doptimize=ReleaseSafe")
+    ]
+
+
 def native_recovery_ci_failures(text: str) -> list[str]:
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
@@ -1149,7 +1187,6 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     failures = []
     timeout_lines = {
         "build-and-test-workload": "    timeout-minutes: 90",
-        "native-recovery": "    timeout-minutes: 180",
     }
     for name, timeout_line in timeout_lines.items():
         body = jobs.get(name, "")
@@ -1288,55 +1325,170 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             f"        if: ${{{{ matrix.optimize == '{mode}' }}}}", *commands,
         )):
             failures.append(f"ci.yml: {name} must remain required in {mode}")
-    recovery = jobs.get("native-recovery", "")
-    if any(line not in recovery.splitlines() for line in (
-        '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-        '          zig build test-native-recovery-zig-unit -j2 --summary all',
-        '          zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-parity -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-parity -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-rollback-clock -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-rollback-clock -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-scriptless -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-statoverride -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-statoverride -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-literal -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-literal -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-        '          zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-    )) or re.search(r"(?m)^        if:", recovery):
-        failures.append("ci.yml: native recovery and Zig acceptance must run the full Debug and ReleaseSafe targets")
+    architectures = (
+        "          - os: ubuntu-24.04\n"
+        "            name: linux-x64\n"
+        "          - os: ubuntu-24.04-arm\n"
+        "            name: linux-arm64\n"
+    )
+    legacy_matrix = (
+        "          - os: ubuntu-24.04\n"
+        "            name: linux-x64\n"
+        "            optimize: Debug\n"
+        "          - os: ubuntu-24.04\n"
+        "            name: linux-x64\n"
+        "            optimize: ReleaseSafe\n"
+        "          - os: ubuntu-24.04-arm\n"
+        "            name: linux-arm64\n"
+        "            optimize: Debug\n"
+        "          - os: ubuntu-24.04-arm\n"
+        "            name: linux-arm64\n"
+        "            optimize: ReleaseSafe\n"
+    )
+    legacy_steps = {
+        "Exercise Zig recovery units in both modes": (
+            "        if: ${{ matrix.optimize == 'Debug' }}",
+            [
+                "zig build test-native-recovery-zig-unit -j2 --summary all",
+                "zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all",
+            ],
+        ),
+        "Exercise legacy recovery in Debug": (
+            "        if: ${{ matrix.optimize == 'Debug' }}",
+            [
+                'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+                recovery_zig_commands(("test-native-recovery",))[0],
+            ],
+        ),
+        "Exercise legacy recovery in ReleaseSafe": (
+            "        if: ${{ matrix.optimize == 'ReleaseSafe' }}",
+            [
+                'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+                recovery_zig_commands(("test-native-recovery",))[1],
+            ],
+        ),
+    }
+    recovery_jobs = {
+        "native-recovery": (
+            "Native crash recovery legacy (${{ matrix.name }}, ${{ matrix.optimize }})",
+            legacy_matrix, legacy_steps,
+        ),
+    }
+    recovery_jobs.update({
+        name: (
+            display_name,
+            architectures,
+            {
+                step_name: (
+                    None,
+                    [
+                        'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+                        *recovery_zig_commands(targets),
+                    ],
+                ),
+            },
+        )
+        for name, (display_name, step_name, targets) in RECOVERY_ZIG_SHARDS.items()
+    })
+    expected_commands = []
+    shared_setup = None
+    for name, (display_name, matrix_rows, expected_steps) in recovery_jobs.items():
+        body = jobs.get(name, "")
+        strategy = (
+            "      fail-fast: false\n"
+            "      matrix:\n"
+            "        include:\n"
+            f"{matrix_rows}"
+        )
+        if (
+            f"    name: {display_name}" not in body.splitlines()
+            or "    runs-on: ${{ matrix.os }}" not in body.splitlines()
+            or "    timeout-minutes: 35" not in body.splitlines()
+            or body.count("    strategy:\n") != 1
+            or body.count("    steps:\n") != 1
+            or body.split("    strategy:\n", 1)[-1].split("    steps:\n", 1)[0] != strategy
+            or re.search(r"(?m)^    if:|^    continue-on-error:", body)
+            or "continue-on-error:" in body
+        ):
+            failures.append(f"ci.yml: {name} must require every reviewed architecture and mode within 35 minutes")
+        steps = dict(re.findall(
+            r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", body,
+        ))
+        first_step = next(iter(expected_steps))
+        setup = body.split("    steps:\n", 1)[-1].split(f"      - name: {first_step}\n", 1)[0]
+        if shared_setup is None:
+            shared_setup = setup
+        if setup != shared_setup or any(line not in setup for line in (
+            "      - name: Install Zig via ghr\n",
+            "      - name: Validate Zig version\n",
+            "      - name: Install metadata decompression and signed fixture dependencies\n",
+            "liblzma-dev libzstd-dev python3-cryptography python3-jsonschema",
+        )) or re.search(r"(?m)^        if:", setup):
+            failures.append(f"ci.yml: {name} must retain pinned Zig and signed fixture dependencies")
+        if len(steps) != len(expected_steps) + 3:
+            failures.append(f"ci.yml: {name} has an unreviewed recovery step")
+        for step_name, (condition, commands) in expected_steps.items():
+            step = steps.get(step_name, "")
+            lines = step.splitlines()
+            script = step.split("        run: |\n", 1)
+            actual = [
+                line.strip() for line in script[1].splitlines() if line.strip()
+            ] if len(script) == 2 else []
+            if (
+                [line for line in lines if line.startswith("        if:")]
+                != ([condition] if condition else [])
+                or actual != commands
+            ):
+                failures.append(f"ci.yml: {name} must execute {step_name} without skips or missing commands")
+            expected_commands.extend(commands)
+        actual_commands = re.findall(
+            r"(?m)^          (zig build test-native-recovery[^\n]+)$", body,
+        )
+        required_commands = [
+            line for _, commands in expected_steps.values()
+            for line in commands if line.startswith("zig build test-native-recovery")
+        ]
+        if actual_commands != required_commands:
+            failures.append(f"ci.yml: {name} must execute every recovery target exactly once per mode")
+    inventory_commands = [
+        command for command in expected_commands
+        if command.startswith("zig build test-native-recovery")
+    ]
+    if len(inventory_commands) != 32 or len(inventory_commands) != len(set(inventory_commands)):
+        failures.append("ci.yml: recovery command inventory contains duplicate targets")
     gate = jobs.get("build-and-test", "")
+    gate_steps = dict(re.findall(
+        r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", gate,
+    ))
+    gate_step = gate_steps.get("Require every build and native recovery shard", "")
+    gate_script = gate_step.split("        run: |\n", 1)
+    required_results = [
+        'test "$BUILD_RESULT" = success',
+        'test "$RECOVERY_RESULT" = success',
+        'test "$RECOVERY_WORKFLOWS_RESULT" = success',
+        'test "$RECOVERY_SCENARIOS_RESULT" = success',
+    ]
     if any(line not in gate.splitlines() for line in (
         "    name: Build and test (${{ matrix.name }})",
-        "    needs: [build-and-test-workload, native-recovery]",
+        "    needs: [build-and-test-workload, native-recovery, native-recovery-zig-workflows, native-recovery-zig-scenarios]",
         "    if: ${{ always() }}",
         "      fail-fast: false",
         "        name: [linux-x64, linux-arm64]",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
         "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
+        "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
+        "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
         '          test "$BUILD_RESULT" = success',
         '          test "$RECOVERY_RESULT" = success',
-    )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate):
+        '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
+        '          test "$RECOVERY_SCENARIOS_RESULT" = success',
+    )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate) or (
+        len(gate_steps) != 1
+        or len(gate_script) != 2
+        or [line.strip() for line in gate_script[-1].splitlines() if line.strip()]
+        != required_results
+        or len(re.findall(r"(?m)^    needs:", gate)) != 1
+    ):
         failures.append("ci.yml: existing required build checks must reject any incomplete workload")
     return failures
 
@@ -2000,7 +2152,7 @@ def audit_ci_pins() -> None:
         if workflow.name == "ci.yml":
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 11, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 13, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
