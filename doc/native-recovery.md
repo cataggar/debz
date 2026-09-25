@@ -1339,7 +1339,7 @@ full parity) are:
 | `lock_wait` | Held real flock, 75 ms deadline, `resource_limit_exceeded`, elapsed <3 s, unchanged status |
 | `lock_signal` | SIGTERM only after `/proc/<pid>/fd` proves lock wait, `recovery_required`, elapsed <3 s, no caller |
 | `unsafe_runtime` | World-writable runtime refused with `transaction_backend_unavailable` and `UnsafeRuntimeDirectory`, unchanged status |
-| `deadline` | Real blocked postinst, 3000 ms deadline, `resource_limit_exceeded`, elapsed <8 s |
+| `deadline` | Real blocked postinst, 15,000 ms deadline to leave room for signed acquisition, `resource_limit_exceeded`, elapsed <20 s |
 | `network` | Real signed HTTP acquisition, query-secret not retained, one descriptor request, both repository paths visited and three-call replay |
 
 This is **not** a claim of full #215 or upstream parity: the shared

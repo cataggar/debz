@@ -1140,8 +1140,14 @@ fn verifyCliScenario(
         for (results) |item| if (item.result.exit_status == .success)
             return error.RepositoryFailureReportedSuccess;
         if (std.mem.eql(u8, case, "lock_wait") or deadline) {
-            if (first.diagnostic_count == 0 or first.diagnostics[0].id != .resource_limit_exceeded)
+            if (first.diagnostic_count == 0 or first.diagnostics[0].id != .resource_limit_exceeded) {
+                std.debug.print("repository CLI {s}: exit={s}, diagnostic={s}; expected resource limit\n", .{
+                    case,
+                    @tagName(first.exit_status),
+                    if (first.diagnostic_count == 0) "none" else @tagName(first.diagnostics[0].id),
+                });
                 return error.InvalidRepositoryDeadlineDiagnostic;
+            }
         }
         if (std.mem.eql(u8, case, "lock_signal") and
             (first.exit_status != .recovery or first.diagnostic_count == 0 or
@@ -1327,7 +1333,7 @@ fn cliScenario(
         "repo",           "add",           "--url",                                                                                                      url,
         "--sha256",       hash,            "--root",                                                                                                     "/",
         "--architecture", arch,            "--transaction-backend",                                                                                      "native",
-        "--json",         "--deadline-ms", if (std.mem.eql(u8, case, "lock_wait")) "75" else if (std.mem.eql(u8, case, "deadline")) "3000" else "60000",
+        "--json",         "--deadline-ms", if (std.mem.eql(u8, case, "lock_wait")) "75" else if (std.mem.eql(u8, case, "deadline")) "15000" else "60000",
     });
     if (no_refresh) try arguments.append(fixture.allocator, "--no-refresh");
     if (std.mem.eql(u8, case, "lock_wait") or std.mem.eql(u8, case, "deadline"))
@@ -1359,7 +1365,7 @@ fn cliScenario(
         const elapsed_bytes = try support.read(fixture, elapsed_path, 32);
         const elapsed = try std.fmt.parseInt(u64, elapsed_bytes, 10);
         if (((std.mem.eql(u8, case, "lock_wait") or std.mem.eql(u8, case, "lock_signal")) and elapsed >= 3000) or
-            (std.mem.eql(u8, case, "deadline") and elapsed >= 8000))
+            (std.mem.eql(u8, case, "deadline") and elapsed >= 20000))
             return error.RepositoryCliExceededExpectedDeadline;
     }
     try verifyCliScenario(fixture, root, case, results[0..count], initial_status, if (server) |running|
@@ -1541,6 +1547,7 @@ test "repository transport rejects host roots modes and invalid watchdog before 
     }
     const args = [_][]const u8{ "repo", "add", "--deadline-ms", "60000" };
     try std.testing.expectEqual(@as(u64, 65), try cliWatchdog(&args, 1, "success"));
+    try std.testing.expectEqual(@as(u64, 20), try cliWatchdog(&.{ "--deadline-ms", "15000" }, 0, "deadline"));
     try std.testing.expectError(error.InvalidRepositoryInvocation, cliWatchdog(&args, -1, "success"));
     try std.testing.expectError(error.InvalidRepositoryInvocation, cliWatchdog(&args, 3, "success"));
     try std.testing.expectError(error.UnboundedRepositoryWatchdog, cliWatchdog(&.{ "--deadline-ms", "115000" }, 0, "success"));
