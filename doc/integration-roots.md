@@ -243,7 +243,7 @@ postinst outcomes exited 0. It then refused the authenticated
 interrupted root is retained, not reused. The successful account setup
 does not establish a completed closure or native/reference parity.
 
-With the local fresh-root account ordering and exact `less` preinst gate, a new
+With the merged fresh-root account ordering and exact `less` preinst gate, a new
 authenticated 175-package amd64 root completed `base-passwd.postinst` at
 step 830, `base-files.postinst` at step 862, and `less.preinst install` at
 step 878 (each with a persisted zero-exit outcome). It then refused
@@ -254,7 +254,7 @@ SHA-256 is
 its literal `--quiet --install` command is reviewed in the
 [alternatives reference](dpkg-alternatives-reference.md#native-admission).
 This failed root remains untouched. Authorization of the exact script
-requires another new authenticated root to identify any subsequent blocker;
+required another new authenticated root to identify any subsequent blocker;
 none of these intermediate successes establishes complete parity.
 
 A separate fresh-root replay, using a newly authenticated 175-package SHA-512
