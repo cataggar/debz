@@ -198,7 +198,7 @@ def archive_entries(archive_path: pathlib.Path) -> list[tuple[tarfile.TarInfo, b
                     validate_payload(path, data)
                 result.append((member, data))
             return result
-    except (tarfile.TarError, OSError) as error:
+    except (tarfile.TarError, OSError, EOFError, lzma.LZMAError, zlib.error) as error:
         raise ReleaseError(f"cannot read archive {archive_path}: {error}") from error
 
 
