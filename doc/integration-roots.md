@@ -116,6 +116,9 @@ regular, non-symlink Ubuntu archive keyring instead of installing trust material
 on the host. The authenticated lock must identify the reviewed Ubuntu 2018
 archive signer `F6ECB3762474EDA9D21B7022871920D1991BC93C`. Workspaces must be new;
 an existing root is never reused or reset by this script.
+Local candidate installation must run as UID 0: the private helper workspace
+is root-owned and a user-owned workspace fails its sealed bootstrap preflight.
+Availability of `sudo` alone does not elevate the acceptance runner.
 
 The native side begins with only an existing empty directory: no dpkg
 database, helper placeholder, package state, merged-/usr links, or private
@@ -533,6 +536,97 @@ The next refusal is the signed `keyboard-configuration:all` preinst at step
 with last durable database action step 1217, substep 0. This interrupted
 root is retained, **never** reused as a fresh trial. It proves the
 step-1173 transition, not completed closure or native/reference parity.
+
+The exact authenticated keyboard archive (SHA-512
+`e69402c6d44c6715e165868b1824da00485403b8157b18235945627fead82710e812c7d4b350e5a3d89444816e769ac5dc883886f905e446aecca123bb7b72db`)
+and pinned dpkg 1.22.22 were examined in an isolated disposable root with
+independently verified signed bootstrap tools. Pinned dpkg's unpack completed
+the keyboard preinst and registered `keyboard-configuration/toggle`; the
+single-package oracle used `--force-depends` **only** to isolate the preinst
+from packages missing in that oracle, not as a claim about full-closure
+dependency parity. In controlled chroot probes against the earlier native
+debconf database, the private preinst path without adjacent templates exited
+10; the installed-info path and the private path with the exact signed
+templates sibling both exited 0. The only staged addition is that authenticated
+templates member, tied to its exact preinst and bootstrapped installed owner;
+no arbitrary debconf frontend/config execution is admitted.
+
+A newly resolved and independently SHA-512-rehashed 175-package root,
+`.real-snapshot/amd64-keyboard-fresh-long-1`, confirmed the **first** staging
+attempt did not solve step 1217: the package's scripts had already been staged
+by its early bootstrap, so the later preinst staging call returned early and
+did not add its adjacent templates. Its preinst again exited 10; abort-install
+postrm exited 0. The failure-settlement database published
+`install reinstreq half-installed` with the package files still claimed, but
+the operation subsequently returned `native recovery_required:
+invalid_transition`. The retained trigger event includes
+`keyboard-configuration:all` activating `libc-upgrade` for `systemd`, which
+remains `unpacked`; its transition to `triggers-pending` is forbidden by the
+existing database state contract. Do not relax that transition to force a
+terminal failure receipt: this root is **interrupted**, not a fresh retry or
+a demonstration of full trigger-bearing failure parity. The corrected implementation
+stages the signed templates in a distinct journaled preinst phase even when
+other scripts were staged at bootstrap.
+
+A second independently planned, downloaded and SHA-512-rehashed **new**
+175-package root, `.real-snapshot/amd64-keyboard-fresh-long-2`, used the
+corrected template stage and completed the exact keyboard preinst at step
+1217 with exit 0 and zero output
+(`native-script-outcome-v1-script-1217-0-0.json`). Its keyboard status was
+`install ok installed`. This is **not** a full-root success: step 1230
+`iproute2:amd64` 6.19.0-1ubuntu2 postinst SHA-256
+`bb5318e85da2497d1b2b6fcdf2d612bd02ec54bc5d9f86005506d8e91bb79d3a`
+with `["configure", ""]` exited 10, zero output; the journal recorded
+`script completed failed` and the subsequent database action completed, but
+the operation returned `native recovery_required: invalid_transition`.
+The installed script has that exact hash, sources `confmodule` and calls
+`db_get iproute2/setcaps`; an installed `iproute2.templates` file exists.
+The precise cause of exit 10 and the secondary transition are not yet proven.
+Preserve this interrupted root; investigate that distinct script failure and
+secondary transition separately, not by replaying this root as fresh.
+
+After rebuilding the final ReleaseSafe candidate with the bootstrap-staged
+config integrity check restored, a **third** newly refreshed, planned,
+downloaded and independently SHA-512-rehashed 175-package root,
+`.real-snapshot/amd64-keyboard-fresh-long-3`, reproduced the result. Its
+signed lock matches the second root, and `evidence/identity.txt` records the
+final binary. Step 1217 again completed the exact keyboard preinst with exit
+0, zero output and `install ok installed` status; step 1230 again recorded
+the same `iproute2` postinst exit 10 and zero output, followed by a completed
+failure-state database action and `native recovery_required:
+invalid_transition`. Its `evidence/create.json`, script outcome files and
+execution journal are retained. This third root is **also interrupted**, not
+proof of completed amd64 installation; neither interrupted root is a fresh
+retry target.
+
+On the combined final #243 squash `7e03fa21bf55e966d4d0868cf05bba0353968644`
+and rebased keyboard change `a1dd73d1217cec5fdb34b5817e6b8d4a020b4cec`,
+a **new, elevated, unseeded** amd64 root,
+`.real-snapshot/amd64-keyboard-rebased-signed-2`, used ReleaseSafe executable
+SHA-256 `896463686f5efd99f2c082f767ef2b33e66a05a0f5b5e2df39ed81e6c6efe377`.
+The signed `stonking` lock digest was
+`3e7c89c8b70515b67e118db407530fff7bab538fc5fed46ebd57c4722ffb4c0d`;
+its reviewed signer was `f6ecb3762474eda9d21b7022871920d1991bc93c`.
+All 175 downloaded archives (67,976,788 bytes) were independently rehashed
+and size-checked against their SHA-512-primary signed lock identities.
+The exact installed keyboard preinst SHA-256
+`2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703`
+ran with `["install"]` at step **1217**, exited **0**, and emitted no output.
+Its authenticated adjacent templates member SHA-256 was
+`4fd265213c939f2b74618c997a3695b30ca9a0b9ee5439dcda4d1f0cc9d01328`;
+the retained keyboard status is `install ok installed`.
+The next signed script failure was `iproute2:amd64` postinst step **1230**,
+SHA-256 `bb5318e85da2497d1b2b6fcdf2d612bd02ec54bc5d9f86005506d8e91bb79d3a`,
+with `["configure", ""]`: it exited **10** without output, and the journal
+recorded a failed script and applied database state (`half-configured`).
+Unlike the earlier local roots, execution continued into deferred trigger
+step **1428**, then stopped with `InvalidAlternativesScriptAuthority` after
+three completed trigger invocations and a fourth prepared action.
+The operation is `recovery_required`, **not** a completed installation or a
+native/reference comparison. The first post-rebase trial was not reused
+after a non-elevated helper-bootstrap preflight refusal; neither
+interrupted root is a fresh retry target. The later iproute2 and alternatives
+failures require separate investigation, not broader keyboard admission.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
