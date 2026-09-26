@@ -1120,6 +1120,12 @@ const snapshot_less_postinst_sha256 = digestLiteral(
 const snapshot_bash_postinst_sha256 = digestLiteral(
     "e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff",
 );
+const snapshot_procps_postinst_sha256 = digestLiteral(
+    "7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
+);
+const snapshot_sudo_rs_postinst_sha256 = digestLiteral(
+    "a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17",
+);
 
 pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     var sha256: [32]u8 = undefined;
@@ -1147,6 +1153,26 @@ pub fn matchesSnapshotBashPostinst(bytes: []const u8) bool {
     return std.crypto.timing_safe.eql(
         [32]u8,
         snapshot_bash_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotProcpsPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_procps_postinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotSudoRsPostinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_sudo_rs_postinst_sha256,
         sha256,
     );
 }
@@ -1214,6 +1240,8 @@ pub const ScriptAuthority = struct {
     commands: []const ScriptCommand,
     paths: []const []const u8,
     immutable_targets: []const []const u8,
+    require_targets_absent: bool = false,
+    ctime_only_targets: []const []const u8 = &.{},
     arena: *std.heap.ArenaAllocator,
     backing_allocator: std.mem.Allocator,
 
@@ -1241,12 +1269,18 @@ pub const Topology = struct {
     slaves: []const Slave,
 };
 
+pub const StructuralLink = struct {
+    path: []const u8,
+    target: []const u8,
+};
+
 pub const GroupAuthority = struct {
     name: []const u8,
     topology: ?Topology = null,
     allow_slave_subset: bool = false,
     allow_absent: bool = false,
     mutable: bool = true,
+    structural_links: []const StructuralLink = &.{},
 };
 
 pub const Authority = struct {
@@ -1403,6 +1437,28 @@ pub fn discoverScriptAuthority(
         allocator.destroy(storage.arena);
     }
     const owned = storage.owned;
+    if (matchesSnapshotProcpsPostinst(bytes)) {
+        // The signed script's variable commands are unreachable when all four guards fail.
+        const targets = &[_][]const u8{
+            "/usr/bin/uptime.procps",
+            "/usr/bin/vmstat.procps",
+            "/usr/bin/w.procps",
+            "/bin/ps.procps",
+        };
+        for (targets) |target| {
+            if (!validAbsolutePath(target, limits))
+                return error.InvalidAlternativesScript;
+        }
+        return .{
+            .groups = &.{},
+            .commands = &.{},
+            .paths = &.{},
+            .immutable_targets = try owned.dupe([]const u8, targets),
+            .require_targets_absent = true,
+            .arena = storage.arena,
+            .backing_allocator = allocator,
+        };
+    }
     var normalized: std.ArrayList(u8) = .empty;
     defer normalized.deinit(owned);
     var index: usize = 0;
@@ -1657,6 +1713,27 @@ pub fn discoverScriptAuthority(
         } else return error.InvalidAlternativesScript;
     }
     if (!found) return error.InvalidAlternativesScript;
+    const signed_sudo_rs = matchesSnapshotSudoRsPostinst(bytes);
+    if (signed_sudo_rs) {
+        if (groups.items.len != 1 or commands.items.len != 1 or
+            !std.mem.eql(u8, groups.items[0].name, "sudo"))
+            return error.InvalidAlternativesScript;
+        groups.items[0].structural_links = try owned.dupe(StructuralLink, &.{
+            .{ .path = "usr/bin/sudoedit", .target = "sudo.ws" },
+            .{
+                .path = "usr/share/man/man8/sudoedit.8.gz",
+                .target = "sudo.ws.8.gz",
+            },
+        });
+        for ([_][]const u8{
+            "/usr/lib/cargo/bin/su",
+            "/var/lib/dpkg/info/sudo.list",
+            "/usr/bin/sudo.ws",
+            "/usr/share/man/man8/sudo.ws.8.gz",
+        }) |target| {
+            try immutable_targets.append(owned, target);
+        }
+    }
     if (groups.items.len > limits.max_groups)
         return error.AlternativesLimit;
     if (commands.items.len > limits.max_script_commands)
@@ -1683,6 +1760,10 @@ pub fn discoverScriptAuthority(
             []const u8,
             unique_targets.items,
         ),
+        .ctime_only_targets = if (signed_sudo_rs) &.{
+            "usr/lib/cargo/bin/sudo",
+            "usr/lib/cargo/bin/su",
+        } else &.{},
         .arena = storage.arena,
         .backing_allocator = allocator,
     };
@@ -2037,6 +2118,22 @@ fn entryFactEqual(left: EntryFact, right: EntryFact) bool {
     return true;
 }
 
+fn scriptInputFactEqual(script: ScriptAuthority, left: EntryFact, right: EntryFact) bool {
+    if (entryFactEqual(left, right)) return true;
+    for (script.ctime_only_targets) |path| {
+        if (!std.mem.eql(u8, left.path, path)) continue;
+        if (left.kind != .regular or right.kind != .regular or
+            left.uid != 0 or left.gid != 0 or left.mode != 0o4755 or
+            left.link_count != 1 or left.sha256 == null or
+            right.change_nanoseconds < left.change_nanoseconds)
+            return false;
+        var normalized = right;
+        normalized.change_nanoseconds = left.change_nanoseconds;
+        return entryFactEqual(left, normalized);
+    }
+    return false;
+}
+
 fn updateFactDigest(digest: *Sha256, fact: EntryFact) void {
     digest.update(fact.path);
     digest.update(&.{ 0, @intFromEnum(fact.kind) });
@@ -2167,6 +2264,12 @@ fn immutableDigest(facts: []const EntryFact) [32]u8 {
     return digest.finalResult();
 }
 
+fn requireNewAbsentTarget(facts: []const EntryFact, previous_count: usize) !void {
+    if (facts.len != previous_count + 1 or
+        facts[previous_count].kind != .absent)
+        return error.InvalidAlternativesScriptAuthority;
+}
+
 pub fn captureScriptInputs(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -2184,7 +2287,8 @@ pub fn captureScriptInputs(
     defer paths.deinit(owned);
     var facts: std.ArrayList(EntryFact) = .empty;
     defer facts.deinit(owned);
-    for (script.immutable_targets) |target|
+    for (script.immutable_targets) |target| {
+        const previous_count = facts.items.len;
         try observeTargetTopology(
             owned,
             root,
@@ -2193,6 +2297,9 @@ pub fn captureScriptInputs(
             &paths,
             &facts,
         );
+        if (script.require_targets_absent)
+            try requireNewAbsentTarget(facts.items, previous_count);
+    }
     for (before.groups) |group| {
         if (script.group(group.name) == null) continue;
         for (group.record.candidates) |candidate| {
@@ -2253,11 +2360,12 @@ pub fn validateScriptInputs(
         limits,
     );
     defer after.deinit();
-    if (!std.mem.eql(u8, &before.digest, &after.digest) or
-        before.facts.len != after.facts.len)
+    if (before.facts.len != after.facts.len or
+        (script.ctime_only_targets.len == 0 and
+            !std.mem.eql(u8, &before.digest, &after.digest)))
         return error.AlternativesInputChanged;
     for (before.facts, after.facts) |left, right| {
-        if (!entryFactEqual(left, right))
+        if (!scriptInputFactEqual(script, left, right))
             return error.AlternativesInputChanged;
     }
 }
@@ -2586,6 +2694,32 @@ fn requireAbsent(root: root_fs.Root, path: []const u8) !void {
         return error.PartialAlternativesState;
 }
 
+fn structuralLinkMatches(fact: EntryFact, expected: StructuralLink) bool {
+    return std.mem.eql(u8, fact.path, expected.path) and
+        fact.kind == .symlink and fact.mode == 0o777 and
+        fact.uid == 0 and fact.gid == 0 and fact.link_count == 1 and
+        fact.size == expected.target.len and
+        fact.link_target != null and
+        std.mem.eql(u8, fact.link_target.?, expected.target);
+}
+
+fn requireAbsentOrStructural(
+    owned: std.mem.Allocator,
+    root: root_fs.Root,
+    path: []const u8,
+    allowed: []const StructuralLink,
+) !void {
+    for (allowed) |expected| {
+        if (!std.mem.eql(u8, path, expected.path)) continue;
+        const fact = observeLink(owned, root, path) catch
+            return error.PartialAlternativesState;
+        if (!structuralLinkMatches(fact, expected))
+            return error.PartialAlternativesState;
+        return;
+    }
+    try requireAbsent(root, path);
+}
+
 fn validateAbsentGroup(
     owned: std.mem.Allocator,
     root: root_fs.Root,
@@ -2595,15 +2729,19 @@ fn validateAbsentGroup(
     try requireAbsent(root, try recordPath(owned, group.name));
     try requireAbsent(root, try selectorPath(owned, group.name));
     const topology = group.topology orelse return;
-    try requireAbsent(
+    try requireAbsentOrStructural(
+        owned,
         root,
         try physicalPath(owned, root, topology.master_link, limits),
+        group.structural_links,
     );
     for (topology.slaves) |slave| {
         try requireAbsent(root, try selectorPath(owned, slave.name));
-        try requireAbsent(
+        try requireAbsentOrStructural(
+            owned,
             root,
             try physicalPath(owned, root, slave.link, limits),
+            group.structural_links,
         );
     }
 }
@@ -3927,6 +4065,347 @@ test "native_alternatives.test.signed netcat install matches pinned sorted nc re
             );
         }
     }
+}
+
+test "native_alternatives.test.signed procps only admits absent providers and immutable groups" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
+    );
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    try testing.expectEqualSlices(
+        u8,
+        &digestLiteral(
+            "7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
+        ),
+        &sha256,
+    );
+    try testing.expect(matchesSnapshotProcpsPostinst(bytes));
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expect(script.require_targets_absent);
+    try testing.expectEqual(@as(usize, 0), script.groups.len);
+    try testing.expectEqual(@as(usize, 0), script.commands.len);
+    try testing.expectEqual(@as(usize, 0), script.paths.len);
+    try testing.expectEqual(@as(usize, 4), script.immutable_targets.len);
+    const targets = [_][]const u8{
+        "/usr/bin/uptime.procps",
+        "/usr/bin/vmstat.procps",
+        "/usr/bin/w.procps",
+        "/bin/ps.procps",
+    };
+    for (script.immutable_targets, &targets) |actual, expected|
+        try testing.expectEqualStrings(expected, actual);
+
+    const absent = [_]EntryFact{.{
+        .path = "usr/bin/uptime.procps",
+        .kind = .absent,
+    }};
+    try requireNewAbsentTarget(&absent, 0);
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        requireNewAbsentTarget(&.{}, 0),
+    );
+    for ([_]EntryKind{ .regular, .symlink }) |kind| {
+        var occupied = absent;
+        occupied[0].kind = kind;
+        try testing.expectError(
+            error.InvalidAlternativesScriptAuthority,
+            requireNewAbsentTarget(&occupied, 0),
+        );
+    }
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        requireNewAbsentTarget(&.{ absent[0], absent[0] }, 0),
+    );
+    const changed = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(changed);
+    changed[0] = ' ';
+    try testing.expect(!matchesSnapshotProcpsPostinst(changed));
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(testing.allocator, changed, .{}),
+    );
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(
+            testing.allocator,
+            bytes,
+            .{ .max_path_bytes = 12 },
+        ),
+    );
+
+    var parsed = try parse(
+        testing.allocator,
+        "unexpected",
+        "auto\n/usr/bin/unexpected\n\n/usr/bin/provider\n10\n\n",
+        .{},
+    );
+    defer parsed.deinit();
+    var group: GroupState = .{
+        .name = "unexpected",
+        .record = parsed.record,
+        .record_fact = .{
+            .path = "var/lib/dpkg/alternatives/unexpected",
+            .kind = .regular,
+        },
+        .selected = "/usr/bin/provider",
+        .links = &.{},
+        .missing_master_targets = &.{},
+        .facts = &.{},
+        .digest = undefined,
+    };
+    group.digest = groupStateDigest(group);
+    const before: Snapshot = .{
+        .groups = &.{},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{}),
+        .relationship_count = 0,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    const after: Snapshot = .{
+        .groups = &.{group},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{group}),
+        .relationship_count = 1,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    try testing.expectError(
+        error.UnsupportedAlternativesGroup,
+        validateScriptTransition(
+            testing.allocator,
+            before,
+            after,
+            script,
+            .{ .groups = &.{} },
+        ),
+    );
+    try validateScriptTransition(
+        testing.allocator,
+        after,
+        after,
+        script,
+        .{ .groups = &.{.{ .name = "unexpected", .mutable = false }} },
+    );
+    var changed_group = group;
+    changed_group.digest[0] ^= 1;
+    const changed_after: Snapshot = .{
+        .groups = &.{changed_group},
+        .paths = &.{},
+        .digest = snapshotDigest(&.{changed_group}),
+        .relationship_count = 1,
+        .parsed_records = &.{},
+        .arena = undefined,
+        .backing_allocator = testing.allocator,
+    };
+    try testing.expectError(
+        error.AlternativesStateChanged,
+        validateScriptTransition(
+            testing.allocator,
+            after,
+            changed_after,
+            script,
+            .{ .groups = &.{.{ .name = "unexpected", .mutable = false }} },
+        ),
+    );
+}
+
+test "native_alternatives.test.signed sudo-rs replaces only two owned structural links" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst",
+    );
+    try testing.expect(matchesSnapshotSudoRsPostinst(bytes));
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    try testing.expectEqualSlices(
+        u8,
+        &digestLiteral(
+            "a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17",
+        ),
+        &sha256,
+    );
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 1), script.commands.len);
+    try testing.expectEqualStrings("sudo", script.commands[0].name);
+    try testing.expectEqual(@as(usize, 2), script.groups[0].structural_links.len);
+    try testing.expectEqual(@as(usize, 2), script.ctime_only_targets.len);
+    switch (script.commands[0].command) {
+        .install => |install| {
+            try testing.expectEqualStrings("/usr/bin/sudo", install.master_link);
+            try testing.expectEqualStrings("/usr/lib/cargo/bin/sudo", install.path);
+            try testing.expectEqual(@as(i32, 50), install.priority);
+            try testing.expectEqual(@as(usize, 6), install.slaves.len);
+            try testing.expectEqualStrings("sudoedit", install.slaves[1].name);
+            try testing.expectEqualStrings("sudoedit.8.gz", install.slaves[4].name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const pinned =
+        "auto\n/usr/bin/sudo\n" ++
+        "sudo.8.gz\n/usr/share/man/man8/sudo.8.gz\n" ++
+        "sudoedit\n/usr/bin/sudoedit\n" ++
+        "sudoedit.8.gz\n/usr/share/man/man8/sudoedit.8.gz\n" ++
+        "sudoers.5.gz\n/usr/share/man/man5/sudoers.5.gz\n" ++
+        "visudo\n/usr/sbin/visudo\n" ++
+        "visudo.8.gz\n/usr/share/man/man8/visudo.8.gz\n\n" ++
+        "/usr/lib/cargo/bin/sudo\n50\n" ++
+        "/usr/share/man/man8/sudo-rs.8.gz\n" ++
+        "/usr/lib/cargo/bin/sudo\n" ++
+        "/usr/share/man/man8/sudo-rs.8.gz\n" ++
+        "/usr/share/man/man5/sudoers-rs.5.gz\n" ++
+        "/usr/lib/cargo/bin/visudo\n" ++
+        "/usr/share/man/man8/visudo-rs.8.gz\n\n";
+    var installed = try mutate(testing.allocator, .{
+        .name = script.commands[0].name,
+        .current = null,
+        .selected = null,
+        .command = script.commands[0].command,
+    });
+    defer installed.deinit();
+    const actual = try canonicalBytes(testing.allocator, installed.record.?);
+    defer testing.allocator.free(actual);
+    try testing.expectEqual(@as(usize, 464), actual.len);
+    try testing.expectEqualStrings(pinned, actual);
+    const expected = script.groups[0].structural_links[0];
+    const original: EntryFact = .{
+        .path = "usr/bin/sudoedit",
+        .kind = .symlink,
+        .mode = 0o777,
+        .uid = 0,
+        .gid = 0,
+        .link_count = 1,
+        .size = "sudo.ws".len,
+        .link_target = "sudo.ws",
+    };
+    try testing.expect(structuralLinkMatches(original, expected));
+    var bad = original;
+    bad.link_target = "/etc/alternatives/sudoedit";
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    bad = original;
+    bad.uid = 1000;
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    bad = original;
+    bad.gid = 1000;
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    bad = original;
+    bad.mode = 0o755;
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    bad = original;
+    bad.link_count = 2;
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    bad = original;
+    bad.size += 1;
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    bad = original;
+    bad.kind = .absent;
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    bad = original;
+    bad.path = "usr/bin/sudo";
+    try testing.expect(!structuralLinkMatches(bad, expected));
+    var changed = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(changed);
+    changed[changed.len - 1] = ' ';
+    try testing.expect(!matchesSnapshotSudoRsPostinst(changed));
+    var unsigned = try discoverScriptAuthority(testing.allocator, changed, .{});
+    defer unsigned.deinit();
+    try testing.expectEqual(@as(usize, 0), unsigned.groups[0].structural_links.len);
+    try testing.expectEqual(@as(usize, 0), unsigned.ctime_only_targets.len);
+    for ([_]struct { directory: []const u8, partial: []const u8 }{
+        .{
+            .directory = "var/lib/dpkg/alternatives",
+            .partial = "var/lib/dpkg/alternatives/sudo",
+        },
+        .{
+            .directory = "etc/alternatives",
+            .partial = "etc/alternatives/sudo",
+        },
+    }) |case| {
+        var temporary = testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        try root.createDirectoryPath(
+            try root_fs.Path.init(case.directory),
+            .fromMode(0o755),
+        );
+        try root.publishFile(try root_fs.Path.init(case.partial), "partial", .{});
+        var temporary_allocator = std.heap.ArenaAllocator.init(testing.allocator);
+        defer temporary_allocator.deinit();
+        try testing.expectError(
+            error.PartialAlternativesState,
+            validateAbsentGroup(temporary_allocator.allocator(), root, script.groups[0], .{}),
+        );
+    }
+}
+
+test "native_alternatives.test.signed sudo-rs permits only setuid target ctime" {
+    const testing = std.testing;
+    var script = try discoverScriptAuthority(
+        testing.allocator,
+        @embedFile("fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst"),
+        .{},
+    );
+    defer script.deinit();
+    const initial: EntryFact = .{
+        .path = "usr/lib/cargo/bin/sudo",
+        .kind = .regular,
+        .mode = 0o4755,
+        .uid = 0,
+        .gid = 0,
+        .device = 2,
+        .inode = 20,
+        .link_count = 1,
+        .size = 13,
+        .modified_nanoseconds = 30,
+        .change_nanoseconds = 40,
+        .sha256 = @splat(0x4a),
+    };
+    var changed = initial;
+    changed.change_nanoseconds += 1;
+    try testing.expect(scriptInputFactEqual(script, initial, changed));
+    changed.path = "usr/lib/cargo/bin/su";
+    var su = initial;
+    su.path = changed.path;
+    try testing.expect(scriptInputFactEqual(script, su, changed));
+    for ([_][]const u8{
+        "usr/lib/cargo/bin/visudo",
+        "usr/bin/sudo.ws",
+        "var/lib/dpkg/info/sudo.list",
+    }) |path| {
+        var other = initial;
+        other.path = path;
+        changed.path = path;
+        try testing.expect(!scriptInputFactEqual(script, other, changed));
+    }
+    changed = initial;
+    changed.change_nanoseconds -= 1;
+    try testing.expect(!scriptInputFactEqual(script, initial, changed));
+    changed = initial;
+    changed.change_nanoseconds += 1;
+    changed.sha256.?[0] ^= 1;
+    try testing.expect(!scriptInputFactEqual(script, initial, changed));
+    changed = initial;
+    changed.change_nanoseconds += 1;
+    changed.mode = 0o755;
+    try testing.expect(!scriptInputFactEqual(script, initial, changed));
+    changed = initial;
+    changed.change_nanoseconds += 1;
+    changed.inode += 1;
+    try testing.expect(!scriptInputFactEqual(script, initial, changed));
+    changed = initial;
+    changed.change_nanoseconds += 1;
+    changed.modified_nanoseconds += 1;
+    try testing.expect(!scriptInputFactEqual(script, initial, changed));
+    changed = initial;
+    changed.change_nanoseconds += 1;
+    changed.uid += 1;
+    try testing.expect(!scriptInputFactEqual(script, initial, changed));
 }
 
 test "native_alternatives.test.sorted new slave preserves existing provider targets" {
