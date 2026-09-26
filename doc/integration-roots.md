@@ -469,6 +469,71 @@ stable action. The interrupted root is retained, **not** reusable as a fresh
 trial. This establishes only the step-1145 transition, not full
 native/reference parity.
 
+Step 498 had already materialized the same
+signed artifact 89 and application digest
+`b75ab6b532a2b24afb44cb73d94f9968bc09ab27e730f8f506ed80f550e14a10`;
+the retained database marks `libpam-runtime` unpacked and assigns both
+spellings to it. The retained root has separate regular-file and symlink
+inodes under the modeled parent. In a separate disposable chroot, pinned
+dpkg 1.22.22 unpacked that authenticated archive twice, retaining both
+distinct spellings and their matching package ownership. The native planner
+now admits **only** this bounded bootstrap-to-dependent-re-unpack transition
+when both children still exactly match the signed content, link target and
+metadata, with the same sole owner and distinct inodes. It deduplicates
+repeated folded-pair sightings without admitting a third spelling; journaled
+parent/witness guards still precede each replacement and recovery.
+
+A **different fresh** amd64 root,
+`.real-snapshot/amd64-case-alias-late-fresh-long-3`, authenticated the same
+reviewed signer and separately rehashed all 175 SHA-512 package CAS objects.
+Its exact-lock file SHA-256 is
+`591146847e5659dbcc26cef3c3d9bffc7bdb4b40513f3474c0278dea26a34149`.
+With one 10,800,000-ms deadline for refresh, plan, download and install,
+all five durable substeps of `libpam-runtime` unpack step **1173** completed.
+The two PAM man-page entries still have distinct inodes (regular
+`1375536106`, symlink `1384285199`); the file's SHA-256 remains
+`29b81aafe87370274266fdc7c008ef09b799bd712f46c58b1e6c846cc46f6530`.
+The same root subsequently persisted `libpam-runtime.postinst` exit 0
+at step 1215 and its installed state at step 1216. The **next distinct
+blocker** is step 1217: authenticated `keyboard-configuration:all`
+1.248ubuntu3 preinst SHA-256
+`2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703`
+launched with `install`, exited 10 without output, and its `abort-install`
+postrm exited 0. The executor returned
+`native recovery_required: package_already_present` after the unwind. This
+root's last durable action is step 1217 database substep 0; step 1218 did not
+run. It is interrupted and retained for diagnosis/recovery, **not** reusable
+as a fresh installation. Neither full amd64 closure nor arm64/reference
+parity has passed.
+
+After #242 squash `c35c3387ac6568ee0a023c0428bdbe5eaf5882cc`,
+another **new** amd64 root,
+`.real-snapshot/amd64-case-alias-after-242-fresh-1`, ran the combined source
+`2a18571d6e08231d6f32abb5aba631b9597950af` (ReleaseSafe executable
+SHA-256
+`8a96b8002c18506c942a6fd8ec0432887e1c09b041c18959cdb1f5691be4516a`).
+Its prestate had no dpkg database, helper placeholders, or package state.
+The reviewed Ubuntu signer authenticated the 175-package amd64 exact lock
+(file SHA-256
+`591146847e5659dbcc26cef3c3d9bffc7bdb4b40513f3474c0278dea26a34149`);
+all 175 archive objects were independently rehashed against their signed
+SHA-512 identities. An untracked local runner copy kept a bounded 90-minute
+`create` timeout and the same 10,800,000-ms deadline across refresh, plan,
+download, and install; it was removed afterward. All five substeps of the
+signed `libpam-runtime:all` unpack at step **1173** completed. Its
+`PAM.7.gz` regular file and `pam.7.gz -> PAM.7.gz` symlink remain distinct
+inodes (respectively `288649674` and `328353104`), both owned by
+`libpam-runtime`; the regular file's SHA-256 is
+`29b81aafe87370274266fdc7c008ef09b799bd712f46c58b1e6c846cc46f6530`.
+The signed `libpam-runtime.postinst configure ""` then persisted exit 0
+at step 1215, and the package reached installed state at step 1216.
+The next refusal is the signed `keyboard-configuration:all` preinst at step
+1217: `install` exited 10 with no output; its `abort-install` postrm exited
+0. Install returned `native recovery_required: package_already_present`
+with last durable database action step 1217, substep 0. This interrupted
+root is retained, **never** reused as a fresh trial. It proves the
+step-1173 transition, not completed closure or native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
