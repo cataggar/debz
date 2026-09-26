@@ -195,8 +195,8 @@ control, rollback-list, upgrade-outcome and invocation-clock assertions as well
 as the production lowering of authenticated success and rollback profiles.
 Both Python trigger gates have been replaced by the executed Zig selector and
 unit-method inventory. The former Python trigger test entry point is absent;
-`tools/native-trigger-fixtures.py` is an import-only helper module for the
-separately gated recovery harness. The failed-postinst listener is covered in
+`tools/native-trigger-fixtures.py` remains import-only but is no longer loaded
+by the retired Python recovery harness. The failed-postinst listener is covered in
 Zig against dpkg **only**; lack of native parity for that program remains
 explicit.
 

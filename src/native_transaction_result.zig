@@ -969,6 +969,7 @@ fn verifyStateEvidence(
     try equalDigest(native_recovery.hexDigest(progress_summary.script_outcomes_sha256), proof.script_outcomes_sha256);
     if (progress_summary.recovered_phase_count != proof.recovered_phase_count)
         return error.InvalidRecoveryProgress;
+    try verifyRetainedScriptOutcomes(progress.document, proof);
     const trigger_bytes = try readEvidence(allocator, root, proof, .trigger_events, native_recovery.maximum_progress_bytes);
     defer allocator.free(trigger_bytes);
     var triggers = try native_recovery.decodeTriggerEvents(allocator, trigger_bytes);
@@ -996,6 +997,91 @@ fn verifyStateEvidence(
         .succeeded => try native_runtime.verifyCompletedState(allocator, root, authorized, proof),
         .failed => try native_runtime.verifyFailedState(allocator, root, authorized, proof),
     }
+}
+
+fn verifyRetainedScriptOutcomes(
+    progress: native_recovery.ProgressDocument,
+    receipt: native_provenance.Document,
+) !void {
+    var count: usize = 0;
+    for (progress.records) |record| {
+        if (record.stage != .outcome or
+            (record.action.kind != .script and record.action.kind != .compensation and
+                record.action.kind != .trigger)) continue;
+        count += 1;
+        if (count > receipt.evidence_files.len) return error.EvidenceMissing;
+        var matches: usize = 0;
+        for (receipt.evidence_files) |file| {
+            if (file.kind != .script_outcome or file.action == null) continue;
+            const action = file.action.?;
+            if (action.kind != record.action.kind or
+                action.program_step != record.action.program_step or
+                action.substep != record.action.substep or
+                action.ordinal != record.action.ordinal) continue;
+            matches += 1;
+            try equalDigest(
+                file.document_sha256 orelse return error.EvidenceMissing,
+                record.evidence_sha256 orelse return error.EvidenceMissing,
+            );
+        }
+        if (matches == 0) return error.EvidenceMissing;
+        if (matches != 1) return error.InvalidRecoveryProgress;
+    }
+    var retained: usize = 0;
+    for (receipt.evidence_files) |file|
+        if (file.kind == .script_outcome) {
+            retained += 1;
+        };
+    if (retained != count) return error.InvalidRecoveryProgress;
+}
+
+test "native_transaction_result.test.retained script outcomes bind every exact progress invocation" {
+    const testing = std.testing;
+    const action: native_recovery.Action = .{
+        .kind = .script,
+        .program_step = 1,
+        .substep = 0,
+        .ordinal = 0,
+    };
+    const records = [_]native_recovery.Record{.{
+        .sequence = 0,
+        .action = action,
+        .stage = .outcome,
+        .result = .exited,
+        .evidence_sha256 = @splat('b'),
+        .previous_sha256 = @splat('0'),
+        .digest_sha256 = @splat('c'),
+    }};
+    var progress: native_recovery.ProgressDocument = .{
+        .intent_sha256 = @splat('a'),
+        .records = &records,
+        .head_sha256 = @splat('c'),
+        .digest_sha256 = @splat('d'),
+    };
+    var receipt = native_provenance.testDocument();
+    try testing.expectError(error.EvidenceMissing, verifyRetainedScriptOutcomes(progress, receipt));
+    var files: [7]native_provenance.EvidenceFile = undefined;
+    @memcpy(files[0..6], receipt.evidence_files);
+    files[6] = .{
+        .kind = .script_outcome,
+        .path = "var/lib/debz/native-receipts-v1/" ++ ("1" ** 64) ++ "/scripts/script-1-0-0.json",
+        .sha256 = @splat('e'),
+        .document_sha256 = @splat('b'),
+        .action = .{ .kind = .script, .program_step = 1, .substep = 0, .ordinal = 0 },
+        .size = 1,
+    };
+    receipt.evidence_files = &files;
+    try verifyRetainedScriptOutcomes(progress, receipt);
+    files[6].document_sha256 = @splat('f');
+    try testing.expectError(error.EvidenceMismatch, verifyRetainedScriptOutcomes(progress, receipt));
+    files[6].document_sha256 = @splat('b');
+    files[6].action.?.ordinal = 2;
+    try testing.expectError(error.EvidenceMissing, verifyRetainedScriptOutcomes(progress, receipt));
+    files[6].action.?.ordinal = 0;
+    progress.records = &.{};
+    try testing.expectError(error.InvalidRecoveryProgress, verifyRetainedScriptOutcomes(progress, receipt));
+    progress.records = &.{ records[0], records[0] };
+    try testing.expectError(error.InvalidRecoveryProgress, verifyRetainedScriptOutcomes(progress, receipt));
 }
 
 fn verifyDiversionCacheEvidence(

@@ -769,9 +769,17 @@ pub const Store = struct {
         const bytes = try document.canonicalJson(allocator);
         defer allocator.free(bytes);
         if (bytes.len > maximum_document_bytes) return error.DocumentTooLarge;
-        if (self.readBytes(allocator) catch null) |existing| {
+        const prior = self.readBytes(allocator) catch |err| switch (err) {
+            error.NotRegularFile => null,
+            else => return err,
+        };
+        if (prior) |existing| {
             defer allocator.free(existing);
             if (std.mem.eql(u8, existing, bytes)) return;
+            var original = try decode(allocator, existing, maximum_document_bytes);
+            defer original.deinit();
+            if (std.mem.eql(u8, &original.document.attempt_id, &document.attempt_id))
+                return error.CompletionChanged;
         }
         const path = if (document.version == legacy_schema_version)
             legacy_document_path
@@ -1181,6 +1189,14 @@ test "root_operation_completion.test.store publishes atomically and idempotently
     const second = (try store.readBytes(testing.allocator)).?;
     defer testing.allocator.free(second);
     try testing.expectEqualStrings(first, second);
+    var changed_input = testInput(record.record);
+    changed_input.transaction_provenance.detail = "different retained evidence";
+    var changed = try create(testing.allocator, changed_input);
+    defer changed.deinit();
+    try testing.expectError(error.CompletionChanged, store.publish(testing.allocator, changed.document));
+    const unchanged = (try store.readBytes(testing.allocator)).?;
+    defer testing.allocator.free(unchanged);
+    try testing.expectEqualStrings(first, unchanged);
 
     var loaded = (try store.read(testing.allocator)).?;
     defer loaded.deinit();
@@ -1190,6 +1206,11 @@ test "root_operation_completion.test.store publishes atomically and idempotently
         &document.document.digest_sha256,
         &loaded.document.digest_sha256,
     );
+    try root.publishFile(try root_fs.Path.init(document_path), "{}", .{ .overwrite = .replace });
+    try testing.expectError(error.NonCanonicalDocument, store.publish(testing.allocator, document.document));
+    const corrupted = (try store.readBytes(testing.allocator)).?;
+    defer testing.allocator.free(corrupted);
+    try testing.expectEqualStrings("{}", corrupted);
 }
 
 test "root_operation_completion.test.store refuses a symbolic link at the document path" {

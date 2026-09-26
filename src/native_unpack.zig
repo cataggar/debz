@@ -21365,7 +21365,42 @@ fn finishLifecycleAttempt(
     });
     defer statement.deinit();
     const completion_store: root_operation_completion.Store = .init(root);
-    try completion_store.publish(allocator, statement.document);
+    var preexisting = try completion_store.read(allocator);
+    defer if (preexisting) |*value| value.deinit();
+    var retained_completion = false;
+    if (preexisting) |prior| {
+        const previous = prior.document;
+        if (std.mem.eql(u8, &previous.attempt_id, &statement.document.attempt_id) and
+            record.provenance == .published)
+        {
+            const published_digest = root_operation.provenanceDigest(record, .{
+                .outcome = record.outcome,
+                .document_sha256 = previous.digest_sha256,
+                .journal_archived = false,
+            });
+            const prior_evidence = try std.json.Stringify.valueAlloc(allocator, .{
+                .transaction_provenance = previous.transaction_provenance,
+                .journal = previous.journal,
+                .discharge = previous.discharge,
+            }, .{});
+            defer allocator.free(prior_evidence);
+            const current_evidence = try std.json.Stringify.valueAlloc(allocator, .{
+                .transaction_provenance = statement.document.transaction_provenance,
+                .journal = statement.document.journal,
+                .discharge = statement.document.discharge,
+            }, .{});
+            defer allocator.free(current_evidence);
+            if (!previous.bindsRecord(record) or
+                previous.record_generation >= record.generation or
+                record.generation - previous.record_generation != 1 or
+                record.provenance_sha256 == null or
+                !std.mem.eql(u8, &record.provenance_sha256.?, &published_digest) or
+                !std.mem.eql(u8, prior_evidence, current_evidence))
+                return error.CompletionChanged;
+            retained_completion = true;
+        }
+    }
+    if (!retained_completion) try completion_store.publish(allocator, statement.document);
     if (record.provenance == .pending) {
         try attempt.publishProvenance(
             allocator,

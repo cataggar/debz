@@ -2,10 +2,15 @@ const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 
-const name = "conffile-lifecycle";
-const paths = [_][]const u8{ "etc/debz-native.conf", "etc/conffile\\extra.conf" };
+pub const name = "conffile-lifecycle";
+pub const paths = [_][]const u8{ "etc/debz-native.conf", "etc/conffile\\extra.conf" };
+pub const trigger = "conffile-purge";
 
 fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, changed: bool) ![]u8 {
+    return archiveAt(fixture, arch, version, changed, if (changed) "packages/conffile-drift" else "packages/conffile-scripts");
+}
+
+pub fn archiveAt(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, changed: bool, workspace: []const u8) ![]u8 {
     const hook = try std.fmt.allocPrint(fixture.allocator,
         \\printf '%s' 'conffiles:{s}@{s}:'"$DPKG_MAINTSCRIPT_NAME" >> /{s}
         \\for path in /etc/debz-native.conf '/etc/conffile\extra.conf'; do
@@ -31,6 +36,9 @@ fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, 
         \\if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = purge ] && [ -f /conffile-recreate ]; then
         \\    /ln /administrator-configuration /etc/debz-native.conf || exit 24
         \\fi
+        \\if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = purge ] && [ -f /conffile-activate ]; then
+        \\    /usr/bin/dpkg-trigger --no-await conffile-purge || exit 25
+        \\fi
         \\
     , .{ name, version, support.trace, support.trace, name, support.trace, support.trace });
     defer fixture.allocator.free(hook);
@@ -40,7 +48,7 @@ fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, 
         "configuration 1\n"
     else
         "configuration 2\n";
-    return support.makePackage(fixture, arch, version, name, if (changed) "packages/conffile-drift" else "packages/conffile-scripts", .{
+    return support.makePackage(fixture, arch, version, name, workspace, .{
         .conffile_content = content,
         .extra_conffile = .{
             .path = paths[1],
@@ -50,7 +58,7 @@ fn archive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, 
     });
 }
 
-fn markers(case: *support.Scenario, failed: bool, version: []const u8) !void {
+pub fn markers(case: *support.Scenario, failed: bool, version: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
         const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, support.failure });
         defer case.fixture.allocator.free(relative);
@@ -69,7 +77,7 @@ fn markers(case: *support.Scenario, failed: bool, version: []const u8) !void {
     }
 }
 
-fn editBoth(case: *support.Scenario, relative: []const u8, content: []const u8) !void {
+pub fn editBoth(case: *support.Scenario, relative: []const u8, content: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
         const location = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, relative });
         defer case.fixture.allocator.free(location);

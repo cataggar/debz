@@ -2594,6 +2594,11 @@ pub fn validateScriptOutcome(outcome: ScriptOutcome) !void {
         &combined_sha256,
         &outcome.combined_sha256,
     )) return error.InvalidScriptOutcome;
+    if ((outcome.combined_hex.len != 0 and
+        (outcome.stdout_hex.len != 0 or outcome.stderr_hex.len != 0)) or
+        outcome.output_bytes != outcome.stdout_hex.len / 2 +|
+            outcome.stderr_hex.len / 2 +| outcome.combined_hex.len / 2)
+        return error.InvalidScriptOutcome;
     for (outcome.arguments) |argument|
         if (argument.len > 4096 or std.mem.indexOfScalar(u8, argument, 0) != null)
             return error.InvalidScriptOutcome;

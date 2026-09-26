@@ -2,9 +2,9 @@ const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 
-const metadata = "retained-metadata";
-const literal = "literal-paths";
-const literal_conf = "etc/literal\\config.conf";
+pub const metadata = "retained-metadata";
+pub const literal = "literal-paths";
+pub const literal_conf = "etc/literal\\config.conf";
 
 fn identity(name: []const u8, arch: []const u8) [1]foundation.PackageIdentity {
     return .{.{ .name = name, .architecture = arch }};
@@ -12,6 +12,10 @@ fn identity(name: []const u8, arch: []const u8) [1]foundation.PackageIdentity {
 
 fn metadataArchive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, qualified: bool, conffile: bool) ![]u8 {
     const workspace = if (qualified) "packages/metadata-qualified" else if (conffile) "packages/metadata" else "packages/metadata-data";
+    return metadataArchiveAt(fixture, arch, version, qualified, conffile, workspace);
+}
+
+pub fn metadataArchiveAt(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, qualified: bool, conffile: bool, workspace: []const u8) ![]u8 {
     const hook = try std.fmt.allocPrint(fixture.allocator,
         \\printf '%s' 'metadata:{s}@{s}:'"$DPKG_MAINTSCRIPT_NAME" >> /{s}
         \\for member in templates shlibs symbols; do
@@ -99,15 +103,19 @@ fn metadataFailures(case: *support.Scenario, identities: []const []const u8) !vo
 }
 
 fn literalArchive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8) ![]u8 {
+    return literalArchiveAt(fixture, arch, version, "packages/literal");
+}
+
+pub fn literalArchiveAt(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
     const conf = try std.fmt.allocPrint(fixture.allocator, "literal configuration {s}\n", .{version});
     defer fixture.allocator.free(conf);
-    const initial = try support.makePackage(fixture, arch, version, literal, "packages/literal", .{
+    const initial = try support.makePackage(fixture, arch, version, literal, workspace, .{
         .conffile_content = conf,
         .conffile_path = literal_conf,
         .extra_files = &.{.{ .path = "usr/lib/systemd/system/system-systemd\\x2dmute.slice", .content = if (std.mem.eql(u8, version, "1")) "literal unit 1\n" else "literal unit 2\n" }},
     });
     defer fixture.allocator.free(initial);
-    const source = try std.fmt.allocPrint(fixture.allocator, "packages/literal/{s}_{s}_data.source", .{ literal, version });
+    const source = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}_{s}_data.source", .{ workspace, literal, version });
     defer fixture.allocator.free(source);
     const base = try support.path(fixture.allocator, source, "usr/share/literal\\directory");
     defer fixture.allocator.free(base);
@@ -122,7 +130,7 @@ fn literalArchive(fixture: *foundation.Fixture, arch: []const u8, version: []con
     const symbolic = try support.path(fixture.allocator, base, "symbolic\\link");
     defer fixture.allocator.free(symbolic);
     try fixture.dir.symLink(fixture.io, "..\\literal", symbolic, .{});
-    const destination = try std.fmt.allocPrint(fixture.allocator, "packages/literal/{s}_{s}_data.deb", .{ literal, version });
+    const destination = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}_{s}_data.deb", .{ workspace, literal, version });
     defer fixture.allocator.free(destination);
     return fixture.buildPackage(source, destination, .{});
 }

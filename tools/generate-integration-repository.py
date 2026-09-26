@@ -350,6 +350,11 @@ def main() -> None:
     parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
     parser.add_argument("--descriptor-output", type=pathlib.Path)
     parser.add_argument("--descriptor-repository-url")
+    parser.add_argument(
+        "--descriptor-script-case",
+        choices=("default", "trace", "known_failure", "blocked"),
+        default="default",
+    )
     args = parser.parse_args()
     if not args.output.is_absolute():
         raise SystemExit("--output must be absolute")
@@ -357,14 +362,31 @@ def main() -> None:
         raise SystemExit("--descriptor-output and --descriptor-repository-url must be used together")
     if args.descriptor_output is not None and not args.descriptor_output.is_absolute():
         raise SystemExit("--descriptor-output must be absolute")
+    if args.descriptor_script_case != "default" and args.descriptor_output is None:
+        raise SystemExit("--descriptor-script-case requires --descriptor-output")
     write_repository(args.output, args.suite, args.architecture)
     if args.descriptor_output is not None:
+        scripts = None
+        if args.descriptor_script_case != "default":
+            postinst = b"#!/bin/sh\nprintf 'postinst\\n' >>/repository-trace\n"
+            if args.descriptor_script_case == "known_failure":
+                postinst += b"exit 42\n"
+            elif args.descriptor_script_case == "blocked":
+                postinst += (
+                    b"printf entered >/fixture/postinst-entered\n"
+                    b"while [ ! -f /fixture/finish-script ]; do /bin/sleep 0.02; done\n"
+                )
+            scripts = {
+                "preinst": b"#!/bin/sh\nprintf 'preinst\\n' >>/repository-trace\n",
+                "postinst": postinst,
+            }
         write_repository_descriptor(
             args.descriptor_output,
             args.descriptor_repository_url,
             args.suite,
             args.architecture,
             (args.output / "fixture-keyring.gpg").read_bytes(),
+            scripts=scripts,
         )
 
 

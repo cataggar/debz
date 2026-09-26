@@ -1141,6 +1141,48 @@ def workflow_failure_handling_failures(text: str, label: str) -> list[str]:
     return failures
 
 
+RECOVERY_ZIG_SHARDS = {
+    "native-recovery-zig-workflows": (
+        "Native crash recovery Zig core and repository (${{ matrix.name }})",
+        "Exercise Zig core, repository, and helper recovery",
+        (
+            "test-native-recovery-zig",
+            "test-native-recovery-zig-repository",
+            "test-native-recovery-helper-zig",
+            "test-native-recovery-zig-bootstrap",
+            "test-native-recovery-zig-parity",
+            "test-native-recovery-zig-rollback-clock",
+        ),
+    ),
+    "native-recovery-zig-family": (
+        "Native crash recovery Zig signed FAMILY (${{ matrix.name }})",
+        "Exercise Zig signed FAMILY recovery",
+        ("test-native-recovery-zig-family",),
+    ),
+    "native-recovery-zig-scenarios": (
+        "Native crash recovery Zig scenario matrices (${{ matrix.name }})",
+        "Exercise Zig recovery scenario and diversion matrices",
+        (
+            "test-native-recovery-zig-scriptless",
+            "test-native-recovery-zig-statoverride",
+            "test-native-recovery-zig-literal",
+            "test-native-recovery-zig-metadata",
+            "test-native-recovery-zig-conffile",
+            "test-native-recovery-zig-final-gaps",
+            "test-native-recovery-zig-diversions",
+        ),
+    ),
+}
+
+
+def recovery_zig_commands(targets: tuple[str, ...]) -> list[str]:
+    return [
+        f'zig build {target} -Dnative-reference-dpkg="$reference_dpkg"{mode} -j2 --summary all'
+        for target in targets
+        for mode in ("", " -Doptimize=ReleaseSafe")
+    ]
+
+
 def native_recovery_ci_failures(text: str) -> list[str]:
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
@@ -1149,7 +1191,6 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     failures = []
     timeout_lines = {
         "build-and-test-workload": "    timeout-minutes: 90",
-        "native-recovery": "    timeout-minutes: 180",
     }
     for name, timeout_line in timeout_lines.items():
         body = jobs.get(name, "")
@@ -1288,26 +1329,727 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             f"        if: ${{{{ matrix.optimize == '{mode}' }}}}", *commands,
         )):
             failures.append(f"ci.yml: {name} must remain required in {mode}")
-    recovery = jobs.get("native-recovery", "")
-    if any(line not in recovery.splitlines() for line in (
-        '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-        '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
-        '          zig build test-native-recovery -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
-    )) or re.search(r"(?m)^        if:", recovery):
-        failures.append("ci.yml: native recovery must run the full Debug and ReleaseSafe targets")
+    architectures = (
+        "          - os: ubuntu-24.04\n"
+        "            name: linux-x64\n"
+        "          - os: ubuntu-24.04-arm\n"
+        "            name: linux-arm64\n"
+    )
+    if "native-recovery" in jobs or re.search(
+        r"(?m)^\s+zig build test-native-recovery(?:\s|$)", text,
+    ):
+        failures.append("ci.yml: retired recovery job or duplicate complete aggregate is present")
+    recovery_jobs = {}
+    for name, (display_name, step_name, targets) in RECOVERY_ZIG_SHARDS.items():
+        expected_steps = {}
+        if name == "native-recovery-zig-workflows":
+            expected_steps["Exercise Zig recovery units in both modes"] = (
+                None,
+                [
+                    "mkdir -p .tmp",
+                    "zig build test-native-recovery-zig-unit -j2 --summary all",
+                    "zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all",
+                ],
+            )
+        expected_steps[step_name] = (
+            None,
+            [
+                *(["mkdir -p .tmp"] if name in (
+                    "native-recovery-zig-workflows",
+                    "native-recovery-zig-family",
+                ) else []),
+                'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+                *recovery_zig_commands(targets),
+            ],
+        )
+        recovery_jobs[name] = (display_name, architectures, expected_steps)
+    expected_commands = []
+    shared_setup = None
+    for name, (display_name, matrix_rows, expected_steps) in recovery_jobs.items():
+        body = jobs.get(name, "")
+        timeout_minutes = 75 if name == "native-recovery-zig-scenarios" else 35
+        strategy = (
+            "      fail-fast: false\n"
+            "      matrix:\n"
+            "        include:\n"
+            f"{matrix_rows}"
+        )
+        if (
+            f"    name: {display_name}" not in body.splitlines()
+            or "    runs-on: ${{ matrix.os }}" not in body.splitlines()
+            or f"    timeout-minutes: {timeout_minutes}" not in body.splitlines()
+            or body.count("    strategy:\n") != 1
+            or body.count("    steps:\n") != 1
+            or body.split("    strategy:\n", 1)[-1].split("    steps:\n", 1)[0] != strategy
+            or re.search(r"(?m)^    if:|^    continue-on-error:", body)
+            or "continue-on-error:" in body
+        ):
+            failures.append(f"ci.yml: {name} must require every reviewed architecture and mode within {timeout_minutes} minutes")
+        steps = dict(re.findall(
+            r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", body,
+        ))
+        first_step = next(iter(expected_steps))
+        setup = body.split("    steps:\n", 1)[-1].split(f"      - name: {first_step}\n", 1)[0]
+        if shared_setup is None:
+            shared_setup = setup
+        if setup != shared_setup or any(line not in setup for line in (
+            "      - name: Install Zig via ghr\n",
+            "      - name: Validate Zig version\n",
+            "      - name: Install metadata decompression and signed fixture dependencies\n",
+            "liblzma-dev libzstd-dev python3-cryptography python3-jsonschema",
+        )) or re.search(r"(?m)^        if:", setup):
+            failures.append(f"ci.yml: {name} must retain pinned Zig and signed fixture dependencies")
+        if len(steps) != len(expected_steps) + 3:
+            failures.append(f"ci.yml: {name} has an unreviewed recovery step")
+        for step_name, (condition, commands) in expected_steps.items():
+            step = steps.get(step_name, "")
+            lines = step.splitlines()
+            script = step.split("        run: |\n", 1)
+            actual = [
+                line.strip() for line in script[1].splitlines() if line.strip()
+            ] if len(script) == 2 else []
+            if (
+                [line for line in lines if line.startswith("        if:")]
+                != ([condition] if condition else [])
+                or actual != commands
+            ):
+                failures.append(f"ci.yml: {name} must execute {step_name} without skips or missing commands")
+            expected_commands.extend(commands)
+        actual_commands = re.findall(
+            r"(?m)^          (zig build test-native-recovery[^\n]+)$", body,
+        )
+        required_commands = [
+            line for _, commands in expected_steps.values()
+            for line in commands if line.startswith("zig build test-native-recovery")
+        ]
+        if actual_commands != required_commands:
+            failures.append(f"ci.yml: {name} must execute every recovery target exactly once per mode")
+    inventory_commands = [
+        command for command in expected_commands
+        if command.startswith("zig build test-native-recovery")
+    ]
+    if len(inventory_commands) != 30 or len(inventory_commands) != len(set(inventory_commands)):
+        failures.append("ci.yml: recovery command inventory contains duplicate targets")
+    actual_commands = re.findall(
+        r"(?m)^[ \t]+(zig build test-native-recovery[^\n]+)$", text,
+    )
+    if sorted(actual_commands) != sorted(inventory_commands):
+        failures.append("ci.yml: recovery targets must execute only in the two required Zig shards")
     gate = jobs.get("build-and-test", "")
+    gate_steps = dict(re.findall(
+        r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", gate,
+    ))
+    gate_step = gate_steps.get("Require every build and native recovery shard", "")
+    gate_script = gate_step.split("        run: |\n", 1)
+    required_results = [
+        'test "$BUILD_RESULT" = success',
+        'test "$RECOVERY_WORKFLOWS_RESULT" = success',
+        'test "$RECOVERY_FAMILY_RESULT" = success',
+        'test "$RECOVERY_SCENARIOS_RESULT" = success',
+    ]
     if any(line not in gate.splitlines() for line in (
         "    name: Build and test (${{ matrix.name }})",
-        "    needs: [build-and-test-workload, native-recovery]",
+        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]",
         "    if: ${{ always() }}",
         "      fail-fast: false",
         "        name: [linux-x64, linux-arm64]",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
-        "          RECOVERY_RESULT: ${{ needs.native-recovery.result }}",
+        "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
+        "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
+        "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
         '          test "$BUILD_RESULT" = success',
-        '          test "$RECOVERY_RESULT" = success',
-    )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate):
+        '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
+        '          test "$RECOVERY_FAMILY_RESULT" = success',
+        '          test "$RECOVERY_SCENARIOS_RESULT" = success',
+    )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate) or (
+        len(gate_steps) != 1
+        or len(gate_script) != 2
+        or [line.strip() for line in gate_script[-1].splitlines() if line.strip()]
+        != required_results
+        or len(re.findall(r"(?m)^    needs:", gate)) != 1
+    ):
         failures.append("ci.yml: existing required build checks must reject any incomplete workload")
+    return failures
+
+
+REPORT_PATH_ORACLE_FILES = (
+    "test/native_recovery_oracle.zig",
+    "test/native_recovery_unit.zig",
+    "test/native_recovery_acceptance.zig",
+    "test/native_recovery_scriptless.zig",
+    "test/native_recovery_conffile.zig",
+    "test/native_recovery_literal.zig",
+    "test/native_recovery_metadata.zig",
+    "test/native_recovery_statoverride.zig",
+)
+
+
+def native_report_path_wiring_failures(texts: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    required = {
+        "test/native_recovery_oracle.zig": (
+            ('pub fn reportProvenancePath(reported: []const u8, expected: []const u8) ![]const u8 {', 1),
+            ('if (!std.mem.eql(u8, reported, expected)) return error.UnboundRecoveryProof;', 1),
+            ("return expected;", 1),
+        ),
+        "test/native_recovery_acceptance.zig": (
+            ('_ = try oracle.reportProvenancePath(report.provenance_path orelse return error.MissingReportBinding, provenance_path);', 1),
+        ),
+        "test/native_recovery_scriptless.zig": (
+            ("pub fn reportProvenancePath(reported: ?[]const u8) ![]const u8 {", 1),
+            ("return oracle.reportProvenancePath(reported orelse return error.MissingRecoveryProof, provenance_path);", 1),
+            ("const proof_path = try reportProvenancePath(report.value.provenance_path);", 1),
+        ),
+        "test/native_recovery_conffile.zig": (
+            ("const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);", 2),
+        ),
+        "test/native_recovery_literal.zig": (
+            ("const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);", 1),
+        ),
+        "test/native_recovery_metadata.zig": (
+            ("const proof_path = try process.reportProvenancePath(recovered.value.provenance_path);", 1),
+        ),
+        "test/native_recovery_statoverride.zig": (
+            ("const proof_path = try process.reportProvenancePath(report.value.provenance_path);", 1),
+        ),
+    }
+    for path, tokens in required.items():
+        source = texts.get(path, "")
+        for token, count in tokens:
+            if source.count(token) < count:
+                failures.append(f"{path}: report provenance path is no longer bound before reading: {token}")
+    unit = texts.get("test/native_recovery_unit.zig", "")
+    case = unit.partition('test "recovery-unit.report path is bound before reading provenance" {')[2].partition('\ntest "')[0]
+    for token in (
+        '"/etc/passwd"', '"var/lib/debz/../../outside"',
+        '"var/lib/debz-other/proof.json"', '"var/lib/debz/proof.json"',
+        "provenance.document_path", "error.UnboundRecoveryProof",
+        'try sandbox.dir.symLink(sandbox.io, external, "var/lib/debz/proof.json", .{});',
+        "try std.testing.expect((try provenance.read(allocator, root)) == null);",
+    ):
+        if token not in case:
+            failures.append(f"test/native_recovery_unit.zig: missing report-path refusal: {token}")
+    return failures
+
+def native_recovery_gate_wiring_failures(
+    build: str, helper: str, family: str, projected: str, repository: str,
+) -> list[str]:
+    failures: list[str] = []
+    for path in ("tools/test-native-recovery.py", "tools/test_native_recovery.py"):
+        if f'"{path}"' in build:
+            failures.append(f"build.zig: retired Python recovery gate was restored: {path}")
+    start = 'const native_recovery = b.step("test-native-recovery",'
+    graph = build.partition(start)[2].partition('    if (b.option(\n        []const u8,\n        "native-reference-architecture"')[0]
+    if not graph:
+        return failures + ["build.zig: complete Zig recovery gate is missing"]
+    selectors = re.search(r"const selectors = \[_\]bool\{([^}]+)\};", graph)
+    if selectors is None or tuple(re.findall(r"[a-z_]+", selectors[1])) != (
+        "native_core_only", "native_deadline_only", "native_script_failure_only",
+        "repository_projection_only", "repository_execution_only", "repository_cli_only",
+        "native_parity_only", "native_helper_only", "native_diversions_only",
+    ):
+        failures.append("build.zig: nine public recovery workload selectors must remain exclusive")
+    for token in (
+        "native_recovery.dependOn(&run_native_recovery_tests.step);",
+        "native_recovery.dependOn(&run_recovery_unit_tests.step);",
+        "native_recovery.dependOn(&run_repository_recovery_unit.step);",
+        "if (selected > 1 or focused)",
+        "focused Zig case options cannot narrow the complete test-native-recovery gate",
+        "zig_core_only or zig_deadline_only or family_executed_only or",
+        "parity_case != null or bootstrap_case != null or repository_case != null or diversion_case != null",
+        'if (native_core_only or zig_core_only) recovery_zig.addArg("--core-only");',
+        'if (native_deadline_only or zig_deadline_only) recovery_zig.addArg("--deadline-only");',
+        'if (native_script_failure_only or native_core_only) recovery_helper.addArg("--script-failure-only");',
+        'if (repository_projection_only) recovery_family.addArg("--projection-only");',
+        'if (repository_projection_only) repository_recovery.addArg("--projection-only");',
+        'if (repository_execution_only) repository_recovery.addArg("--execution-only");',
+        'if (repository_cli_only) repository_recovery.addArg("--cli-only");',
+        'recovery_family.addArtifactArg(native_trigger_helper);',
+        'recovery_family.addArtifactArg(cli);',
+        'recovery_bootstrap.addArtifactArg(native_trigger_helper);',
+        'repository_recovery.addArtifactArg(cli);',
+        'const repository_fixture_parent = b.addSystemCommand(&.{ "mkdir", "-p", b.pathFromRoot(".tmp") });',
+        'run_repository_recovery_unit.step.dependOn(&repository_fixture_parent.step);',
+        'repository_recovery.step.dependOn(&repository_fixture_parent.step);',
+        'recovery_parity.addArtifactArg(cli);',
+        'recovery_parity.addArtifactArg(native_trigger_helper);',
+        '}) |runner| runner.addArgs(&.{ "--reference-dpkg", path });',
+    ):
+        if token not in graph:
+            failures.append(f"build.zig: complete Zig recovery gate lost {token}")
+    branch = graph.partition("if (selected > 1 or focused) {")[2].partition('    if (b.option([]const u8, "native-reference-dpkg"')[0]
+    for token in (
+        "if (native_deadline_only) {\n            native_recovery.dependOn(&recovery_zig.step);",
+        "if (native_script_failure_only) {\n            native_recovery.dependOn(&recovery_helper.step);",
+        "if (native_helper_only) {\n            native_recovery.dependOn(&recovery_bootstrap.step);",
+        "if (native_diversions_only) {\n            native_recovery.dependOn(&recovery_diversions.step);",
+        "if (repository_projection_only) {\n            native_recovery.dependOn(&recovery_family.step);\n            native_recovery.dependOn(&repository_recovery.step);",
+        "if (repository_execution_only or repository_cli_only) {\n            native_recovery.dependOn(&repository_recovery.step);",
+    ):
+        if token not in branch:
+            failures.append(f"build.zig: recovery selector graph lost {token}")
+    arrays = re.findall(
+        r"for \(\[_\]\*std\.Build\.Step\.Run\{([^}]+)\}\) \|runner\| native_recovery\.dependOn\(&runner\.step\);",
+        branch,
+    )
+    expected = (
+        ("recovery_parity", "recovery_diversions", "statoverride_recovery", "conffile_recovery",
+         "metadata_recovery", "literal_recovery", "scriptless_recovery"),
+        ("recovery_zig", "recovery_helper", "recovery_bootstrap", "recovery_family",
+         "recovery_diversions", "statoverride_recovery", "conffile_recovery",
+         "metadata_recovery", "literal_recovery"),
+        ("recovery_zig", "recovery_family", "recovery_parity", "recovery_helper",
+         "final_gaps", "recovery_bootstrap", "repository_recovery", "rollback_clock",
+         "scriptless_recovery", "statoverride_recovery", "literal_recovery",
+         "metadata_recovery", "conffile_recovery", "recovery_diversions"),
+    )
+    if tuple(tuple(re.findall(r"[a-z_]+", group)) for group in arrays) != expected:
+        failures.append("build.zig: parity, core, or default recovery workload lost an executed runner")
+    pinned = graph.partition('if (b.option([]const u8, "native-reference-dpkg",')[2]
+    pinned_runners = re.search(
+        r'for \(\[_\]\*std\.Build\.Step\.Run\{([^}]+)\}\) \|runner\| '
+        r'runner\.addArgs\(&\.\{ "--reference-dpkg", path \}\);',
+        pinned,
+    )
+    if pinned_runners is None or tuple(re.findall(r"[a-z_]+", pinned_runners[1])) != expected[-1]:
+        failures.append("build.zig: pinned dpkg must reach every default recovery acceptance runner")
+    for option, variable, runner in (
+        ("native-zig-recovery-family-fixture-python", "path", "recovery_family"),
+        ("native-zig-recovery-parity-fixture-python", "path", "recovery_parity"),
+        ("native-repository-fixture-python", "python", "repository_recovery"),
+    ):
+        handoff = re.search(
+            rf'if \(b\.option\(\[\]const u8, "{re.escape(option)}", [^\n]+\)\) \|{variable}\|\s*'
+            + re.escape(f'{runner}.addArgs(&.{{ "--fixture-python", {variable} }});'),
+            graph,
+        )
+        if handoff is None:
+            failures.append(f"build.zig: signed recovery fixture interpreter lost {option} handoff")
+    for source, tokens in (
+        (helper, ("if (script_failure_only) {", '"after_failure_outcome", "after_script_failure_state"')),
+        (family, ('if (projection_only) {', "try projected.runReadOnly(&fixture, self orelse return error.MissingSelf, driver, reference.architecture);")),
+        (projected, ("try readOnlyProjection(fixture, runner, driver, arch);",)),
+        (repository, ("const selected = try selectMode(false, projection_only, execution_only, cli_only);",
+                      "selected == null or selected == .projection or selected == .execution or selected == .cli")),
+    ):
+        for token in tokens:
+            if token not in source:
+                failures.append(f"Zig recovery selector lost an executed case: {token}")
+    script_branch = helper.partition("if (script_failure_only) {")[2].partition("\n    try crashTransport(")[0]
+    if "try knownScriptFailures(&fixture, driver, reference.executable, reference.architecture);" not in script_branch:
+        failures.append("Zig recovery script-failure selector lost both unowned postinst crashes")
+    return failures
+
+
+def native_core_completion_wiring_failures(
+    build: str, helper: str, support: str,
+) -> list[str]:
+    failures: list[str] = []
+    for token in (
+        'recovery_helper.addArtifactArg(recovery_helper_executable);',
+        'recovery_helper.addArtifactArg(native_lifecycle_tests);',
+        'b.step("test-native-recovery-helper-zig",',
+    ):
+        if token not in build:
+            failures.append(f"build.zig: required core completion target lost {token}")
+    for token in (
+        "try completedWithoutLiveHelper(&fixture, driver, reference.executable, reference.architecture);",
+        "try missingPackageOwnedHelper(&fixture, driver, reference.architecture);",
+        "try rehashedCallerPolicy(&fixture, driver, reference.architecture);",
+        "try afterActiveClearLegacyEvidence(&fixture, driver, reference.executable, reference.architecture);",
+        '"NativeHelperBootstrapOwnerMissing"',
+        '"RecoveryRequestBindingMismatch"',
+        '"after_active_clear"',
+        'try sealJsonDigest(fixture, &persisted.value, "debz-native-execution-request-v1\\x00");',
+        "debz.native_recovery.sealIntent(&altered_intent);",
+        'const orphaned = try projected.rootInventory(fixture, root, false);',
+        'try std.testing.expectEqualSlices(u8, orphaned, try projected.rootInventory(fixture, root, false));',
+        'try debz.native_provenance.verifyEvidence(fixture.allocator, debz.root_fs.Root.init(fixture.io, directory), old_proof.document);',
+        '.config_content = config,',
+        'const config = "#!/bin/sh\\n# config:1\\nprintf \'%s\\\\n\' \'config:1\' >> /config-invoked\\nexit 97\\n";',
+    ):
+        if token not in helper:
+            failures.append(f"native_recovery_helper.zig: required executed core completion lost {token}")
+    for token in (
+        "config_content: ?[]const u8 = null,",
+        'try fixture.write(config, configuration, 0o755);',
+    ):
+        if token not in support:
+            failures.append(f"native_lifecycle_support.zig: real staged config fixture lost {token}")
+    for token in (
+        'try std.testing.expectEqualSlices(u8, before, try projected.rootInventory(fixture, root, true));',
+        'try same(try bytes(fixture, root, "var/lib/dpkg/tmp.ci/config", 64 * 1024), config);',
+        'try missing(fixture, root, "var/lib/dpkg/info/" ++ foundation.package ++ ".config");',
+        'try missing(fixture, root, "config-invoked");',
+    ):
+        if helper.count(token) != 3:
+            failures.append(f"native_recovery_helper.zig: executed core checks lost {token}")
+    caller_case = helper.split("fn rehashedCallerPolicy(", 1)[-1].split(
+        "\nfn afterActiveClearLegacyEvidence(", 1,
+    )[0]
+    if caller_case.count(".isolated_helper = false,") != 2:
+        failures.append("native_recovery_helper.zig: rehashed caller refusal must run without isolated helper")
+    ordinary = helper.split("fn recoveredOrdinary(", 1)[-1].split("\nfn blockedUnknown(", 1)[0]
+    for token in (
+        "if (try invoke(fixture, driver, root, arch, crash_output, .{",
+        "try fixture.dir.deleteFile(fixture.io, archive_relative);",
+        "const request = try originalRequestFor(fixture, root, intent.intent, case.isolated_helper, case.caller_owned, archive);",
+        "if (reference_exit != (if (case.known_preinst_failure)",
+        "try foundation.compare(fixture.*, expected, root, comparison);",
+        "try verifyProofFor(fixture, root, repeated.value, intent.intent, request, proof_outcome, true, case.isolated_helper, case.caller_owned);",
+        "try std.testing.expectEqualSlices(u8, root_before, try projected.rootInventory(fixture, root, case.caller_owned));",
+        "try sameHelper(fixture, root, helper_before);",
+        ".acknowledge = true,",
+    ):
+        if token not in ordinary:
+            failures.append(f"native_recovery_helper.zig: ordinary real-process parity lost {token}")
+    for token in (
+        "try foundation.compare(fixture.*, expected, root, comparison);",
+        "try sameHelper(fixture, root, helper_before);",
+    ):
+        if ordinary.count(token) != 2:
+            failures.append(f"native_recovery_helper.zig: ordinary first/last checks lost {token}")
+    main = helper.split("pub fn main(", 1)[-1]
+    if main.count("try recoveredOrdinary(") != 4:
+        failures.append("native_recovery_helper.zig: ordinary caller, failure and crash matrices not all executed")
+    for token in (
+        '"after_execution_intent", "during_filesystem_publication",\n        "after_script_outcome",   "after_provenance",',
+        '"typed-runtime-known-failure" else "caller-known-failure"',
+        '"after_execution_intent", "during_filesystem_publication", "during_database_publication",\n        "after_script_prepared",  "after_script_outcome",          "after_provenance",',
+        '.name = "known-failure-compensation",',
+    ):
+        if token not in main:
+            failures.append(f"native_recovery_helper.zig: ordinary executed matrix lost {token}")
+    return failures
+
+
+def native_exercise_final_wiring_failures(
+    helper: str, support: str, unpack: str,
+) -> list[str]:
+    failures: list[str] = []
+    main = helper.split("pub fn main(", 1)[-1]
+    for token in (
+        "try blockedUnknown(&fixture, driver, reference.executable, reference.architecture, false);",
+        "try blockedUnknown(&fixture, driver, reference.executable, reference.architecture, true);",
+        "try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, false);",
+        "try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, true);",
+        "for ([_]Corruption{ .intent, .progress, .artifact, .managed_root, .completed_phase }) |which|",
+        "try corruptedOrdinary(&fixture, driver, reference.architecture, which);",
+    ):
+        if token not in main:
+            failures.append(f"native_recovery_helper.zig: final exercise matrix lost {token}")
+    if ('if (!claim.value.object.swapRemove(changing)) return error.InvalidRootClaim;' not in helper or
+        '"generation", "state", "phase", "step", "updated_unix", "digest_sha256"' not in helper):
+        failures.append("native_recovery_helper.zig: sticky root claim normalization lost")
+    for start, end, tokens in (
+        ("fn blockedUnknown(", "\nfn triggerOutcome(", (
+            "if (try invoke(fixture, driver, scenario.native_root, arch,",
+            '"after_upgrade_postrm_return_before_outcome" else "after_script_return_before_outcome"',
+            'try same(try text(script.value, "outcome"), "in_flight");',
+            "try verifyProofFor(fixture, scenario.native_root, refused.value, intent.intent, request, .recovery_required, false, false, false);",
+            "try std.testing.expectEqualSlices(u8, stable, try rootWithoutActiveClaim(fixture, scenario.native_root));",
+            "try same(try stickyActiveClaim(fixture, scenario.native_root), original_claim);",
+            "try unchanged(fixture, scenario.native_root, package_before);",
+            "try sameHelper(fixture, scenario.native_root, original_helper);",
+        )),
+        ("fn triggerOutcome(", "\nconst Corruption =", (
+            '"after_trigger_outcome"',
+            "try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);",
+            "if (events.value.events.len != 2) return error.IncorrectTriggerEventCount;",
+            "observed[0].origin != .automatic or observed[1].origin != .dynamic",
+            'try same(observed[0].trigger, "debz-a");',
+            'try same(observed[1].trigger, "debz-b");',
+            ".acknowledge = true,",
+        )),
+        ("fn corruptedOrdinary(", "\nfn caseRun(", (
+            '.no_scripts = corruption != .completed_phase,',
+            '.scripts = .{ .only_postinst = corruption == .completed_phase },',
+            "if (artifact != null) return error.DuplicateRetainedArtifact;",
+            'raw[0] = \'X\';',
+            '"corrupt\\n"',
+            '"external replacement\\n"',
+            "try std.testing.expectEqualSlices(u8, stable, try rootWithoutActiveClaim(fixture, root));",
+            "try same(try stickyActiveClaim(fixture, root), original_claim);",
+            "try unchanged(fixture, root, package_before);",
+            "try sameHelper(fixture, root, helper_before);",
+        )),
+    ):
+        body = helper.split(start, 1)[-1].split(end, 1)[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"native_recovery_helper.zig: final real-process case lost {token}")
+        if start in ("fn blockedUnknown(", "fn corruptedOrdinary("):
+            root = "scenario.native_root" if start == "fn blockedUnknown(" else "root"
+            sticky = f"try same(try stickyActiveClaim(fixture, {root}), original_claim);"
+            if body.count(sticky) != 3:
+                failures.append(f"native_recovery_helper.zig: initial, repeat and blocked sticky claim checks lost {sticky}")
+    for token in (
+        "only_postinst: bool = false,",
+        'if (options.only_postinst and !std.mem.eql(u8, kind, "postinst")) continue;',
+    ):
+        if token not in support:
+            failures.append(f"native_lifecycle_support.zig: postinst-only corruption fixture lost {token}")
+    if "var preexisting = try completion_store.read(allocator);" not in unpack:
+        failures.append("native_unpack.zig: proof-bound completion must read the original receipt")
+    production = unpack.split("var preexisting = try completion_store.read(allocator);", 1)[-1].split(
+        "if (record.provenance == .pending)", 1,
+    )[0]
+    for token in (
+        "previous.bindsRecord(record)",
+        "record.provenance == .published",
+        "record.generation - previous.record_generation != 1",
+        "record.provenance_sha256 == null",
+        "root_operation.provenanceDigest(record, .{",
+        ".document_sha256 = previous.digest_sha256,",
+        "!std.mem.eql(u8, &record.provenance_sha256.?, &published_digest)",
+        "!std.mem.eql(u8, prior_evidence, current_evidence)",
+        "if (!retained_completion) try completion_store.publish(allocator, statement.document);",
+    ):
+        if token not in production:
+            failures.append(f"native_unpack.zig: proof-bound post-provenance completion lost {token}")
+    return failures
+
+
+def native_entry_point_shape_failures(core: str, projected: str, ci: str) -> list[str]:
+    failures: list[str] = []
+    for token in (
+        'const archive = try support.makePackage(fixture, arch, "1", foundation.package, packages, .{});',
+        'const archive = try support.makePackage(fixture, arch, "1", foundation.package, "deadline-startup/packages", .{});',
+        'const archive = try support.makePackage(fixture, arch, "1", foundation.package, "deadline-persisted/packages", .{});',
+        'try support.scripts(fixture, source, foundation.package, "1");',
+        'try rootAbsent(fixture, root, "config-invoked");',
+        'try debz.native_provenance.verifyEvidence(fixture.allocator, debz.root_fs.Root.init(fixture.io, guarded), typed_proof.document);',
+        'var request = try debz.native_execution_request.decodePersisted(fixture.allocator, request_bytes);',
+        'if (scripts == 0) return error.MissingCoreScriptOutcome;',
+        'try debz.native_recovery.validateScriptOutcome(outcome.value);',
+        'try oracle.validateHelperInvocation(fixture.allocator, root, helper.source_path, helper.target_path, helper.sha256,',
+        'try oracle.validateScriptTrace(fixture.allocator, trace, &invocations);',
+        'if (!std.mem.eql(u8, before, try evidenceInventory(fixture, root, true)))',
+    ):
+        source = projected if "evidenceInventory" in token else core
+        doubled = (
+            'foundation.package, packages, .{});',
+            'var request = try debz.native_execution_request.decodePersisted(fixture.allocator, request_bytes);',
+            'try debz.native_recovery.validateScriptOutcome(outcome.value);',
+            'try oracle.validateHelperInvocation(fixture.allocator, root, helper.source_path, helper.target_path, helper.sha256,',
+        )
+        if source.count(token) < (2 if any(token.endswith(item) for item in doubled) else 1):
+            failures.append(f"Zig recovery entry point: required executed shape check lost {token}")
+    for token in (
+        "try readOnlyProjection(fixture, runner, driver, arch);",
+        "DEBZ_NATIVE_PROJECTION_FIXTURE=1",
+        "native_transaction_result.test.projected root external fixture...OK",
+        "apt_system_orchestrator.test.projected native dispatch external fixture...OK",
+    ):
+        if token not in projected:
+            failures.append(f"projected recovery entry point: read-only child lost {token}")
+    for command in recovery_zig_commands(("test-native-recovery-zig",)):
+        if len(re.findall(r"(?m)^          " + re.escape(command) + r"$", ci)) != 1:
+            failures.append("ci.yml: both sharded core recovery entry-point modes must execute exactly once")
+    return failures
+
+
+def native_consumer_receipt_wiring_failures(parity: str, evidence: str) -> list[str]:
+    failures: list[str] = []
+    for token in (
+        'const retained = @import("native_recovery_parity_evidence.zig");',
+        "try retained.verify(fixture, root, arch, digest, case.exit_status != 0);",
+        "try support.absent(fixture, try relative(fixture, root, completion_path));",
+        "return error.HeldConsumerMutatedRoot;",
+    ):
+        if token not in parity:
+            failures.append(f"native_recovery_parity.zig: required per-case receipt check lost {token}")
+    for token in (
+        "try debz.native_provenance.verifyEvidence(allocator, root, proof);",
+        "try manifestDocument(entry, intent.?.intent.digest_sha256);",
+        "try manifestDocument(entry, progress.?.document.digest_sha256);",
+        "try manifestDocument(entry, managed.?.document.digest_sha256);",
+        "try manifestDocument(entry, triggers.?.document.digest_sha256);",
+        "try manifestDocument(entry, script.digest_sha256);",
+        "try equal(&proof.request_sha256, &caller.caller.request_sha256);",
+        "try oracle.validateHelperInvocation(",
+        "try scriptTrace(allocator, root, scripts.items);",
+        "try finalDatabase(allocator, root, architecture, proof);",
+        "const generation = try database.generation(allocator, snapshot);",
+        "try equal(&std.fmt.bytesToHex(sink.hasher.finalResult(), .lower), &proof.final_state_sha256);",
+    ):
+        if token not in evidence:
+            failures.append(f"native_recovery_parity_evidence.zig: required retained evidence check lost {token}")
+    return failures
+
+
+def native_repository_evidence_wiring_failures(source: str) -> list[str]:
+    failures: list[str] = []
+    for token in (
+        "try terminalEvidence(fixture, root, relative, case, resuming, logical, retained_bytes, helper_before.?);",
+        "try parity_evidence.verifyProjected(fixture, root, debz.live_root.logical_root_path, state.state.architecture,",
+        "try managedFiles(fixture, root, state.state, manifest.manifest);",
+        "completion.discharge.request_sha256, &expected_discharge",
+        "try oracle.validateHelperInvocation(",
+        "if (script_count != 2) return error.MissingRepositoryScripts;",
+        "if (preserved.value.len != 8) return error.RepositoryHistoryEvidenceChanged;",
+        "try unchangedBindings(fixture, root, state.state, abandoned.record, publisher.record);",
+        "try unchangedEvidence(fixture, bytes);",
+        "try checkpointAt(fixture, root, checkpoint);",
+        "try checkHelper(fixture, root, original_helper orelse return error.MissingRepositoryHelper);",
+        "lock.lock.packages.len != 1 or !lock.lock.packages[0].dpkg_selection_hold",
+        "if (first.exit_status == .success) return error.RepositoryDispatchIgnoredInterruption;",
+        "try scanQuerySecret(fixture.io, fixture.dir, path);",
+        "const count = reader.interface.readSliceShort(buffer[overlap .. overlap + 64 * 1024]) catch return reader.err.?;",
+        "if (std.mem.indexOf(u8, buffer[0 .. overlap + count], secret) != null)",
+        "std.mem.copyForwards(u8, buffer[0..next_overlap], buffer[end - next_overlap .. end]);",
+        "if (scanned != before.size or before.size != after.size or before.inode != after.inode)",
+        'test "repository network evidence scans large files and split secrets"',
+        "for ([_]usize{ 64 * 1024 - 7, 2 * 1024 * 1024 + 64 * 1024 - 7 }) |offset|",
+        "try std.testing.expectError(error.NetworkFixtureLeakedCredential, assertNoQuerySecret(&fixture, root));",
+    ):
+        if token not in source:
+            failures.append(f"native_recovery_repository.zig: required executed repository evidence lost {token}")
+    return failures
+
+
+def native_workflow_acceptance_wiring_failures(
+    build: str, family: str, projected: str,
+) -> list[str]:
+    failures: list[str] = []
+    for token in (
+        'recovery_family.addArtifactArg(recovery_family_executable);',
+        'recovery_family.addArg("--self");',
+        'recovery_family.addArtifactArg(native_lifecycle_tests);',
+        'recovery_family.addArg("--cli");',
+        'recovery_family.addArtifactArg(cli);',
+    ):
+        if token not in build:
+            failures.append(f"build.zig: required signed workflow acceptance lost {token}")
+    for token in (
+        'if (std.mem.eql(u8, driver, "--inside-projected"))',
+        "return projected.inside(init, allocator, root);",
+        "try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, false);",
+        "try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, true);",
+        "try ordinaryFamilyTimeline(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        'try verificationRefusals(fixture, driver, request, returned, original_summary, "executed");',
+        "try verificationRefusals(fixture, driver, original, first_completion, summary, name);",
+        'const no_result_path = try support.path(fixture.allocator, name, "verify-first-without-result");',
+        'const equivalent_path = try support.path(fixture.allocator, name, "verify-create-as-customize");',
+        'try assertFamilySummary(fixture, driver, original, first_completion, summary, try support.path(fixture.allocator, name, "verify-final"));',
+        "try batchWorkflow(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);",
+        "try ownedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ordinaryKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        'try publicVerify(fixture, cli, scenario.native_root, lock, arch, "executed/workflow-batch/verify-after-refusals", true);',
+        "try reconciliation(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        "try ordinaryRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);",
+        'try publicVerify(fixture, cli, scenario.native_root, lock, arch, try support.path(fixture.allocator, name, "verify-public-recovered"), true);',
+        "try ownedRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedFinalizationBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try projected.run(&fixture, self orelse return error.MissingSelf, driver, reference.executable, reference.architecture);",
+        'try assertFamilySummary(fixture, driver, request, completion, summary, try support.path(fixture.allocator, prefix, "refuse-unsettled-verified-again"));',
+        "const root_before = try projected.rootInventory(fixture, request.root, true);",
+        "const pending_evidence = try projected.rootInventory(fixture, scenario.native_root, true);",
+        "const before_evidence = try projected.rootInventory(fixture, update.native_root, true);",
+        '"executed/{s}-verify-without-result"',
+        '"executed/{s}-verify-as-install"',
+        "const failed_evidence = try projected.rootInventory(fixture, scenario.native_root, true);",
+        ".force = invocation.force,",
+        '"wrong-conffile"',
+        '"{s}/replacement-{s}"',
+        '"changed-request"',
+        '"verify-damaged-{s}"',
+        '"verify-unresolved-{s}"',
+        '"verify-partial-acknowledgment"',
+        '"acknowledge-damaged-receipt"',
+        '"verify-public-owner-retained"',
+        '"verify-terminal-foreign-attempt"',
+        '"verify-public-pending"',
+        '"verify-public-native-acknowledged"',
+        '"verify-public-pending-failure"',
+        '"verify-public-failed-acknowledgment"',
+        '"verify-public-final-failure"',
+        '"verify-success-as-failure"',
+        '"verify-pending-as-released"',
+        '"executed/workflow-owned-success/verify-finalized-as-released"',
+        'try inspectInstalledFamily(fixture, driver, scenario.native_root, arch, "executed/inspect-initial", "essential-core", true, false);',
+        '"executed/inspect-while-root-lock-held"',
+        '"executed/inspect-failed-same-root"',
+        '"executed/missing-helper-inspection"',
+        'const reference_failure = "executed/same-root-failure-reference";',
+        "linux.flock(holder.handle, 2 | 4)",
+        '"verify-before-execution"',
+        '"verify-failed-result"',
+        '"verify-relabeled-failure"',
+        '"verify-failed-without-result"',
+        '"ordinary-to-FAMILY same-root timeline: signed success, full verification refusals, failed install and clean recovery matched pinned dpkg',
+        '"semantic request") == null',
+        'try std.testing.expectEqual(@as(i64, 3), (try field(update_lock_document.value, "version")).integer);',
+        "try std.testing.expectEqual(@as(usize, 24), parsed.value.object.count());",
+        "try std.testing.expectEqual(@as(usize, 13), capability.value.object.count());",
+        "try std.testing.expectEqual(@as(usize, 24), verified.report.value.object.count());",
+        "try std.testing.expectEqual(@as(i64, 3), (try field(install_lock.value, \"version\")).integer);",
+    ):
+        if token not in family:
+            failures.append(f"native_recovery_family.zig: required signed workflow acceptance lost {token}")
+    for token in (
+        'const source = try fixture.absolute("executed/workflow.sources");\n    const keyring = try fixture.absolute("executed/repository/fixture-keyring.gpg");\n    var phase_arena: std.heap.ArenaAllocator = .init(init.gpa);',
+        "fixture.allocator = phase_arena.allocator();",
+        "defer fixture.allocator = allocator;",
+        'const lock = try persistent_allocator.dupe(u8, try fixture.absolute("executed/lock.json"));',
+        "first_completion = try std.json.parseFromSlice(std.json.Value, persistent_allocator,",
+        "    for ([_]bool{ true, false }) |selected| {\n        _ = phase_arena.reset(.free_all);",
+    ):
+        if token not in family:
+            failures.append(f"native_recovery_family.zig: bounded signed workflow allocation lost {token}")
+    for token in (
+        "try refusals(&fixture, reference.architecture);",
+        "try transport(&fixture, driver, reference.architecture);",
+        "try planning(&fixture, driver);",
+        "try activeInspection(&fixture, driver, reference.architecture);",
+        "try archiveExecution(&fixture, allocator, &phase_arena, driver, helper orelse return error.MissingHelper, reference.executable, reference.architecture, python, source, keyring);",
+        "try ordinaryFamilyTimeline(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        "try batchWorkflow(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);",
+        "try ownedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try reconciliation(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        "try ordinaryRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);",
+        "try ordinaryKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedAbandon(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);",
+        "try ownedRecoveryBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedKnownFailure(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try ownedFinalizationBoundaries(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
+        "try projected.run(&fixture, self orelse return error.MissingSelf, driver, reference.executable, reference.architecture);",
+        "try missingHelper(&fixture, driver, reference.executable, reference.architecture);",
+        "try failedTransaction(&fixture, driver, reference.executable, reference.architecture, false);",
+    ):
+        if token + "\n    _ = phase_arena.reset(.free_all);" not in family and token + "\n        _ = phase_arena.reset(.free_all);" not in family:
+            failures.append(f"native_recovery_family.zig: scenario allocations retained after {token}")
+    for token in (
+        "    }\n    _ = phase_arena.reset(.free_all);\n    try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, false);",
+        "try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, false);\n    _ = phase_arena.reset(.free_all);\n    try interruptedFamilyRecovery(fixture, driver, helper, reference, arch, source, keyring, first_completion.?.value, true);",
+    ):
+        if token not in family:
+            failures.append(f"native_recovery_family.zig: interrupted signed workflow allocations retained after {token}")
+    if family.count("try referenceSingleFailure(fixture, reference, scenario.reference_root, arch, name)") != 2:
+        failures.append("native_recovery_family.zig: both failed workflows require single-invocation pinned dpkg parity")
+    if family.count('"verify-public-finalized"') != 2:
+        failures.append("native_recovery_family.zig: pending recovery and terminal-owner finalization require public CLI proof")
+    if family.count('try support.compare(fixture, scenario.reference_root, scenario.native_root, "executed/same-root-failure-comparison", true);') != 2:
+        failures.append("native_recovery_family.zig: same-root failed customize must preserve pinned dpkg parity through recovery")
+    for token in (
+        'for ([_][]const u8{ "success", "recovered", "failed" }) |outcome|',
+        '"/usr/bin/unshare", "--mount", "--pid", "--fork"',
+        'if (linux.errno(linux.execve("/fixture/native-test", &argv, envp.ptr)) != .SUCCESS)',
+        '.prepare_acknowledged_review = .{ .lock_sha256 = lock_digest, .generation = 6 },',
+        '.prepare_cleared_review = .{ .lock_sha256 = lock_digest, .receipt_sha256 = receipt_digest, .generation = 8 },',
+        "const evidence_before = if (step.verification) |check|",
+        "const review_baseline = try evidenceInventory(fixture, scenario.native_root, false);",
+        "return inventory(fixture, root, \".\", include_metadata);",
+        "const damaged_state = try evidenceInventory(fixture, scenario.native_root, true);",
+        "const orphan_state = try evidenceInventory(fixture, scenario.native_root, true);",
+        "try std.testing.expectEqual(@as(i64, 2), (try field(owner_v2.value, \"version\")).integer);",
+        'try support.absent(fixture, withheld_operation);',
+    ):
+        if token not in projected:
+            failures.append(f"native_recovery_projected_workflows.zig: private projected workflow execution lost {token}")
+    if projected.count('"/usr/bin/unshare", "--mount", "--pid", "--fork"') != 2:
+        failures.append("native_recovery_projected_workflows.zig: read-only and signed workflow children both require private PID/mount projections")
     return failures
 
 
@@ -1424,6 +2166,8 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
         "tools/test_native_lifecycle.py",
         "tools/test-native-triggers.py",
         "tools/test_native_triggers.py",
+        "tools/test-native-recovery.py",
+        "tools/test_native_recovery.py",
     )
     for relative in retired:
         if relative in texts:
@@ -1442,7 +2186,6 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
             failures.append(f"{relative}: fixture module restored a Python CLI entry point")
     for consumer, fixture in (
         ("tools/native-trigger-fixtures.py", "native-lifecycle-fixtures.py"),
-        ("tools/test-native-recovery.py", "native-trigger-fixtures.py"),
         ("tools/dpkg-config-reference.py", "native-lifecycle-fixtures.py"),
         ("actions/install/__tests__/integration.test.ts", "native-lifecycle-fixtures.py"),
     ):
@@ -1452,6 +2195,51 @@ def native_lifecycle_fixture_failures(texts: dict[str, str]) -> list[str]:
 
 
 def audit_ci_pins() -> None:
+    for failure in native_exercise_final_wiring_failures(
+        (ROOT / "test/native_recovery_helper.zig").read_text(),
+        (ROOT / "test/native_lifecycle_support.zig").read_text(),
+        (ROOT / "src/native_unpack.zig").read_text(),
+    ):
+        fail(failure)
+    for failure in native_core_completion_wiring_failures(
+        (ROOT / "build.zig").read_text(),
+        (ROOT / "test/native_recovery_helper.zig").read_text(),
+        (ROOT / "test/native_lifecycle_support.zig").read_text(),
+    ):
+        fail(failure)
+    for failure in native_entry_point_shape_failures(
+        (ROOT / "test/native_recovery_acceptance.zig").read_text(),
+        (ROOT / "test/native_recovery_projected_workflows.zig").read_text(),
+        (ROOT / ".github/workflows/ci.yml").read_text(),
+    ):
+        fail(failure)
+    for failure in native_consumer_receipt_wiring_failures(
+        (ROOT / "test/native_recovery_parity.zig").read_text(),
+        (ROOT / "test/native_recovery_parity_evidence.zig").read_text(),
+    ):
+        fail(failure)
+    for failure in native_repository_evidence_wiring_failures(
+        (ROOT / "test/native_recovery_repository.zig").read_text(),
+    ):
+        fail(failure)
+    for failure in native_workflow_acceptance_wiring_failures(
+        (ROOT / "build.zig").read_text(),
+        (ROOT / "test/native_recovery_family.zig").read_text(),
+        (ROOT / "test/native_recovery_projected_workflows.zig").read_text(),
+    ):
+        fail(failure)
+    for failure in native_report_path_wiring_failures({
+        path: (ROOT / path).read_text() for path in REPORT_PATH_ORACLE_FILES
+    }):
+        fail(failure)
+    for failure in native_recovery_gate_wiring_failures(
+        (ROOT / "build.zig").read_text(),
+        (ROOT / "test/native_recovery_helper.zig").read_text(),
+        (ROOT / "test/native_recovery_family.zig").read_text(),
+        (ROOT / "test/native_recovery_projected_workflows.zig").read_text(),
+        (ROOT / "test/native_recovery_repository.zig").read_text(),
+    ):
+        fail(failure)
     for failure in native_lifecycle_migration_failures(
         (ROOT / "build.zig").read_text(),
         (ROOT / "test/native_trigger_acceptance.zig").read_text(),
@@ -1462,9 +2250,10 @@ def audit_ci_pins() -> None:
         "tools/test_native_lifecycle.py",
         "tools/test-native-triggers.py",
         "tools/test_native_triggers.py",
+        "tools/test-native-recovery.py",
+        "tools/test_native_recovery.py",
         "tools/native-lifecycle-fixtures.py",
         "tools/native-trigger-fixtures.py",
-        "tools/test-native-recovery.py",
         "tools/dpkg-config-reference.py",
         "actions/install/__tests__/integration.test.ts",
     )
@@ -1473,12 +2262,12 @@ def audit_ci_pins() -> None:
         for relative in fixture_paths
         if (path := ROOT / relative).exists() and path.is_file() and not path.is_symlink()
     }
-    for relative in fixture_paths[:4]:
+    for relative in fixture_paths[:6]:
         if (ROOT / relative).is_symlink() or (ROOT / relative).is_dir():
             fixture_texts[relative] = ""
     for failure in native_lifecycle_fixture_failures(fixture_texts):
         fail(failure)
-    for relative in fixture_paths[4:6]:
+    for relative in fixture_paths[6:8]:
         path = ROOT / relative
         if path.is_symlink() or (path.is_file() and path.stat().st_mode & 0o111):
             fail(f"{relative}: import-only fixture must not be executable or a symlink")
@@ -1495,7 +2284,7 @@ def audit_ci_pins() -> None:
         if workflow.name == "ci.yml":
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 11, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 13, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
