@@ -51,64 +51,23 @@ cmp "$release_prefix/share/debz/digest-cutover-policy.json" \
   "$release_prefix/share/doc/debz/digest-cutover-policy.json"
 cmp "$release_prefix/share/debz/legacy-cutover-policy.json" \
   "$release_prefix/share/doc/debz/legacy-cutover-policy.json"
-for schema in \
-  apt-config-snapshot-v1.json \
-  apt-config-snapshot-v2.json \
-  apt-system-cli-diagnostic-v1.json \
-  apt-system-operation-state-v1.json \
-  apt-system-request-v1.json \
-  apt-system-result-v1.json \
-  apt-system-result-v2.json \
-  apt-system-result-v3.json \
-  command-result-v1.json \
-  exact-closure-lock-v1.json \
-  exact-closure-lock-v2.json \
-  exact-closure-lock-v3.json \
-  native-execution-request-v1.json \
-  native-execution-request-v2.json \
-  native-execution-request-v3.json \
-  native-execution-request-v4.json \
-  native-execution-intent-v2.json \
-  native-execution-progress-v3.json \
-  native-execution-progress-v4.json \
-  native-transaction-authorization-v2.json \
-  native-transaction-program-v2.json \
-  native-transaction-provenance-v2.json \
-  native-diversion-cache-v1.json \
-  native-unpack-diversion-v1.json \
-  native-unpack-route-settlement-v1.json \
-  package-cache-error-v1.json \
-  package-cache-fingerprint-v1.json \
-  package-cache-fingerprint-v2.json \
-  package-cache-fingerprint-v3.json \
-  package-cache-fingerprint-v4.json \
-  package-cache-fingerprint-v5.json \
-  package-cache-result-v1.json \
-  package-cache-result-v2.json \
-  package-cache-result-v3.json \
-  package-cache-result-v4.json \
-  package-cache-result-v5.json \
-  repository-add-state-v1.json \
-  repository-operation-result-v1.json \
-  root-operation-completion-v1.json \
-  root-operation-completion-v2.json \
-  root-operation-record-v1.json \
-  system-profile-v1.json \
-  system-profile-v2.json \
-  transaction-plan-v1.json \
-  transaction-plan-v2.json \
-  transaction-plan-v3.json \
-  transaction-plan-v4.json \
-  transaction-result-v1.json \
-  transaction-result-v2.json \
-  transaction-result-v3.json \
-  transaction-result-summary-v2.json \
-  transaction-result-capability-v1.json \
-  native-install-capability-v1.json \
-  native-install-result-v1.json
+source_schemas=$(cd schema && ls -- *.json | sort)
+for destination in "$release_prefix/share/debz" "$release_prefix/share/doc/debz"
 do
-  test -f "$release_prefix/share/debz/schema/$schema"
-  test -f "$release_prefix/share/doc/debz/schema/$schema"
+  installed_schemas=$(cd "$destination/schema" && ls -- *.json | sort)
+  if [ "$source_schemas" != "$installed_schemas" ]
+  then
+    echo "installed schemas differ from schema/*.json: $destination" >&2
+    exit 1
+  fi
+  for schema in schema/*.json
+  do
+    test -f "$schema"
+    test ! -L "$schema"
+    test -f "$destination/$schema"
+    test ! -L "$destination/$schema"
+    cmp "$schema" "$destination/$schema"
+  done
 done
 for prefix in "$gnu_prefix" "$release_prefix"
 do

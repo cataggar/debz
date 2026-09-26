@@ -23,8 +23,7 @@
     ],
     "excluded_finding_paths": [
       "security/digest-cutover-policy.json",
-      "tools/security-audit.py",
-      "tools/test_security_audit.py"
+      "tools/security-audit.py"
     ],
     "exclusion_rationale": "The repository manifest includes tracked and non-ignored untracked files so pre-commit audit results remain stable after commit. The policy and its audit/canary implementation are excluded from token findings to avoid recursive self-classification; they do not define repository digest authority."
   },
@@ -38,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 461,
-      "sha512": "2540f5111a6a5184f865406450d2c311904f1af4ee173527eaecbc9588db9e62d296e60883baae06a16d64fa0c3bb1eaa56c47e5d1b17117956ed192ca4bf072"
+      "count": 464,
+      "sha512": "0b814099b8d3a4a33f65de80abb36918d3ba449d98850929a79b260409c3d10deef3a79e925a26533fdf83c9efd5085566eb1e7f259888f74b512cabe229b505"
     },
     "findings": {
-      "count": 20847,
+      "count": 20866,
       "counts": {
         "cas_layout": 193,
-        "digest_version": 104,
+        "digest_version": 103,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1150,
-        "sha256_token": 19223
+        "raw_32_byte": 1152,
+        "sha256_token": 19241
       },
-      "sha512": "6c4ff57d17738d0a7f03935313a4f2707cda0b0690fa635266ff9146bbe76cad1981a60552b7e5912409d051d0f3587775ca64535c05c6cd00a7d4d9f100f3fa"
+      "sha512": "82485d53948bc53cfcb4d1a0e7a30600a3562faca094e80b6991a625d3145080638dee946e2b32d788231a534a71554e440b18e93eb477000a1c5dc2a7f23eb3"
     },
     "classifications": [
       {
@@ -99,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 199,
+        "count": 201,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 168
+          "sha256_token": 170
         },
-        "sha512": "34f86156f7236755f1bf272c8d52f71f060b33fcfc8334d1f9ae8fb110ecf502dedd9d17c96107d3945b6c734224a4109e3f74db58adfae3026d5a97b8b8fa90"
+        "sha512": "f876a24bb0f5c2806a4bbc254ba6f19567fd8aeceb87f3d872018368b64094e3cef79ee4b3140dedb6b901259edce1c880f3898586b84abfc8f9a6317de420a1"
       },
       {
         "scope": "fuzz",
@@ -169,29 +168,29 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 789,
+        "count": 815,
         "counts": {
-          "cas_layout": 3,
+          "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 6,
-          "raw_32_byte": 67,
-          "sha256_token": 713
+          "raw_32_byte": 69,
+          "sha256_token": 736
         },
-        "sha512": "3a3b90ad7c94315a75e502a6c44810e3101da1735a8a1db1a52c3b0534223e29e0a9bba8d5264dc37f5004dbb6915afc585dbee7ae83da811fd3b6ca0649b712"
+        "sha512": "c9781558b5db0ea140aad280905162027bb5971c6d77796e3ed1081bb4462250704670b8418ff55372d559d92a286cbc59bc099746be8438b33342d139bf4eaf"
       },
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
         "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes; production authorities remain typed and versioned.",
-        "count": 5044,
+        "count": 5035,
         "counts": {
-          "cas_layout": 20,
-          "digest_version": 2,
+          "cas_layout": 19,
+          "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5018
+          "sha256_token": 5011
         },
-        "sha512": "412aa4622e33063ca6c428acb64e2c5e06068e1a397765bf09fe1e1b8271ff556d3ef44d261d940aaed9ede19e4fdbe1758a3434c15a445a3399f70d6e8e4de4"
+        "sha512": "b371b07710c8c2f0d49221f0ae04754cf29e9ae01c2fa45d25325701b3cb6b5cc656b68e7daacc9380946083e9e0cb0cdeee53fa6d92e8607e091574f0ba61d3"
       }
     ]
   },

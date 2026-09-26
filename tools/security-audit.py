@@ -7,6 +7,8 @@ import pathlib
 import re
 import hashlib
 import json
+import os
+import stat
 import subprocess
 import sys
 from datetime import date
@@ -38,7 +40,11 @@ DIGEST_FINDING_KINDS = (
 DIGEST_POLICY_EXCLUDED_FINDINGS = {
     DIGEST_POLICY_PATH.as_posix(),
     "tools/security-audit.py",
+}
+REMOVED_TEST_ENTRY_POINTS = {
+    "tools/test_release.py",
     "tools/test_security_audit.py",
+    "tools/test_real_snapshot_acceptance.py",
 }
 
 SHA256_TOKEN = re.compile(
@@ -148,12 +154,13 @@ def tracked_files() -> list[pathlib.Path]:
         check=True,
         stdout=subprocess.PIPE,
     )
+    paths = [ROOT / item.decode() for item in result.stdout.split(b"\0") if item]
+    # Unstaged deleted tests remain in the index; other missing tracked files must still fail audit.
     return [
-        path
-        for item in result.stdout.split(b"\0")
-        if item
-        for path in (ROOT / item.decode(),)
-        if path.exists() or path.is_symlink()
+        path for path in paths
+        if path.exists()
+        or path.is_symlink()
+        or path.relative_to(ROOT).as_posix() not in REMOVED_TEST_ENTRY_POINTS
     ]
 
 
@@ -1377,7 +1384,8 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         if (
             f"    name: {display_name}" not in body.splitlines()
             or "    runs-on: ${{ matrix.os }}" not in body.splitlines()
-            or f"    timeout-minutes: {timeout_minutes}" not in body.splitlines()
+            or re.findall(r"(?m)^    timeout-minutes:[^\n]*$", body)
+            != [f"    timeout-minutes: {timeout_minutes}"]
             or body.count("    strategy:\n") != 1
             or body.count("    steps:\n") != 1
             or body.split("    strategy:\n", 1)[-1].split("    steps:\n", 1)[0] != strategy
@@ -1434,7 +1442,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         r"(?m)^[ \t]+(zig build test-native-recovery[^\n]+)$", text,
     )
     if sorted(actual_commands) != sorted(inventory_commands):
-        failures.append("ci.yml: recovery targets must execute only in the two required Zig shards")
+        failures.append("ci.yml: recovery targets must execute only in the three required Zig shards")
     gate = jobs.get("build-and-test", "")
     gate_steps = dict(re.findall(
         r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", gate,
@@ -1905,6 +1913,23 @@ def native_repository_evidence_wiring_failures(source: str) -> list[str]:
     ):
         if token not in source:
             failures.append(f"native_recovery_repository.zig: required executed repository evidence lost {token}")
+    deadline_case = source.partition("fn cliScenario(")[2].partition("\nfn cliCase(")[0]
+    for token in (
+        'else if (std.mem.eql(u8, case, "deadline")) "15000" else "60000"',
+        '(std.mem.eql(u8, case, "deadline") and elapsed >= 20000)',
+    ):
+        if token not in deadline_case:
+            failures.append(f"native_recovery_repository.zig: bounded blocked-postinst deadline lost {token}")
+    diagnostic = source.partition("fn verifyCliScenario(")[2].partition("\nfn cliScenario(")[0]
+    for token in (
+        "if (first.diagnostic_count == 0 or first.diagnostics[0].id != .resource_limit_exceeded)",
+        'std.debug.print("repository CLI {s}: exit={s}, diagnostic={s}; expected resource limit\\n", .{',
+        "return error.InvalidRepositoryDeadlineDiagnostic;",
+    ):
+        if token not in diagnostic:
+            failures.append(f"native_recovery_repository.zig: deadline refusal diagnostic lost {token}")
+    if 'try std.testing.expectEqual(@as(u64, 20), try cliWatchdog(&.{ "--deadline-ms", "15000" }, 0, "deadline"));' not in source:
+        failures.append("native_recovery_repository.zig: deadline watchdog regression lost")
     return failures
 
 
@@ -2118,16 +2143,17 @@ def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
     required = (
         "for ([_]bool{ false, true }) |awaiting|",
         ".no_scripts = true",
-        "support.reference(fixture, dpkg, root",
         "Status: install ok unpacked",
         "Status: install ok half-configured",
         "Triggers-Pending:",
         "Triggers-Awaited:",
         "queue.len != 0",
-        "activation-returned",
         "exit 1",
     )
-    if not body or any(value not in body for value in required) or "support.native(" in body:
+    if (not body or any(value not in body for value in required)
+        or body.count("support.reference(fixture, dpkg, root") != 2
+        or body.count("activation-returned") != 2
+        or "support.native(" in body):
         failures.append(
             "native_trigger_acceptance.zig: keep both failed-postinst "
             "unconfigured-listener cases as reference-only observations"
@@ -2142,9 +2168,11 @@ def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
         "for ([_]bool{ false, true }) |awaiting|",
         "case.seedWith(handler, false)",
         'report.value.detail, "program_compile_rejected"',
-        "foundation.captureRealRoot(",
         "support.assertNoActiveEvidence(",
-    )) or "refuseUnconfiguredListenerProgram(&fixture, native_driver, selected, reference.executable, reference.architecture)" not in trigger:
+    )) or refusal.count("foundation.captureRealRoot(") != 2 or (
+        "refuseUnconfiguredListenerProgram(&fixture, native_driver, selected, reference.executable, reference.architecture)"
+        not in trigger
+    ):
         failures.append(
             "native_trigger_acceptance.zig: both unsupported listener programs "
             "must refuse before mutation and leave no active authority"
@@ -3094,5 +3122,216 @@ def main() -> int:
     return 0
 
 
+def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
+    """Apply a production policy validator to one bounded, external input."""
+    limit = 2 * 1024 * 1024 if kind == "native-final" else 1024 * 1024
+    try:
+        descriptor = os.open(input_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("not a regular file")
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("too large")
+        text = data.decode("utf-8")
+    except (OSError, UnicodeError, ValueError):
+        print(f"security-audit: check input must be a regular file of at most {limit // (1024 * 1024)} MiB", file=sys.stderr)
+        return 2
+    if kind == "action-pin":
+        failures = action_pin_failures(text, "action.yml")
+    elif kind == "ghr-ci":
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 13)
+    elif kind == "ghr-release":
+        failures = ghr_zig_workflow_failures(text, "release.yml", 1)
+    elif kind == "workflow-failure":
+        failures = workflow_failure_handling_failures(text, "ci.yml")
+    elif kind == "ci-recovery":
+        failures = native_recovery_ci_failures(text)
+    elif kind in {
+        "native-core", "native-final", "native-entry", "native-consumer",
+        "native-repository", "native-workflow", "native-report",
+        "native-lifecycle", "native-fixtures", "native-gate",
+    }:
+        sources = {
+            "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
+            "native-final": ("test/native_recovery_helper.zig", "test/native_lifecycle_support.zig", "src/native_unpack.zig"),
+            "native-entry": ("test/native_recovery_acceptance.zig", "test/native_recovery_projected_workflows.zig", ".github/workflows/ci.yml"),
+            "native-consumer": ("test/native_recovery_parity.zig", "test/native_recovery_parity_evidence.zig"),
+            "native-repository": ("test/native_recovery_repository.zig",),
+            "native-workflow": ("build.zig", "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig"),
+            "native-report": REPORT_PATH_ORACLE_FILES,
+            "native-lifecycle": ("build.zig", "test/native_trigger_acceptance.zig"),
+            "native-gate": (
+                "build.zig", "test/native_recovery_helper.zig",
+                "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
+                "test/native_recovery_repository.zig",
+            ),
+            "native-fixtures": (
+                "tools/native-lifecycle-fixtures.py", "tools/native-trigger-fixtures.py",
+                "tools/dpkg-config-reference.py",
+                "actions/install/__tests__/integration.test.ts",
+                "tools/test-native-lifecycle.py", "tools/test_native_lifecycle.py",
+                "tools/test-native-triggers.py", "tools/test_native_triggers.py",
+                "tools/test-native-recovery.py", "tools/test_native_recovery.py",
+            ),
+        }
+        fixture = json.loads(text)
+        paths = sources[kind]
+        if (
+            not isinstance(fixture, dict) or set(fixture) != {"path", "text"}
+            or fixture["path"] not in paths
+            or (fixture["text"] is not None and not isinstance(fixture["text"], str))
+        ):
+            print("security-audit: invalid native wiring input", file=sys.stderr)
+            return 2
+        texts = {
+            path: (ROOT / path).read_text()
+            for path in paths if (ROOT / path).is_file()
+        }
+        if fixture["text"] is None:
+            texts.pop(fixture["path"], None)
+        else:
+            texts[fixture["path"]] = fixture["text"]
+        if kind == "native-core":
+            failures = native_core_completion_wiring_failures(*(texts[path] for path in paths))
+        elif kind == "native-final":
+            failures = native_exercise_final_wiring_failures(*(texts[path] for path in paths))
+        elif kind == "native-entry":
+            failures = native_entry_point_shape_failures(*(texts[path] for path in paths))
+        elif kind == "native-consumer":
+            failures = native_consumer_receipt_wiring_failures(*(texts[path] for path in paths))
+        elif kind == "native-repository":
+            failures = native_repository_evidence_wiring_failures(texts[paths[0]])
+        elif kind == "native-workflow":
+            failures = native_workflow_acceptance_wiring_failures(*(texts[path] for path in paths))
+        elif kind == "native-report":
+            failures = native_report_path_wiring_failures(texts)
+        elif kind == "native-lifecycle":
+            failures = native_lifecycle_migration_failures(*(texts[path] for path in paths))
+        elif kind == "native-gate":
+            failures = native_recovery_gate_wiring_failures(*(texts[path] for path in paths))
+        else:
+            failures = native_lifecycle_fixture_failures(texts)
+    elif kind == "release-install-metadata":
+        failures = release_install_metadata_failures(text)
+    elif kind == "dependency-zstd":
+        failures = dependency_option_failures(text, "zstd", {
+            "target": "target",
+            "optimize": "optimize",
+            "shared": "false",
+            "tools": "false",
+            "multithread": "false",
+        })
+    elif kind == "runtime-metadata":
+        policy = json.loads((ROOT / "security/dependency-policy.json").read_text())
+        dependencies = {item["name"]: item for item in policy["production_dependencies"]}
+        failures = runtime_metadata_failures(json.loads(text), dependencies)
+    elif kind == "digest-semantic":
+        fixture = json.loads(text)
+        if not isinstance(fixture, dict) or set(fixture) != {"path", "text"} or not isinstance(fixture["path"], str) or not isinstance(fixture["text"], str):
+            print("security-audit: invalid digest semantic input", file=sys.stderr)
+            return 2
+        policy = json.loads((ROOT / DIGEST_POLICY_PATH).read_text())
+        files = repository_digest_files(tracked_files())
+        if len(files) > 1024 or any(path.is_symlink() or path.stat().st_size > 16 * 1024 * 1024 for path in files):
+            print("security-audit: digest check input exceeds repository bounds", file=sys.stderr)
+            return 2
+        texts = tracked_digest_texts(tracked_files())
+        texts[fixture["path"]] = fixture["text"]
+        candidates = digest_semantic_candidates(texts)
+        failures = semantic_allowlist_failures(candidates, policy)
+    elif kind == "digest-inventory":
+        fixture = json.loads(text)
+        if not isinstance(fixture, dict) or set(fixture) != {"path", "append"} or not isinstance(fixture["path"], str) or not isinstance(fixture["append"], str) or len(fixture["append"]) > 4096:
+            print("security-audit: invalid digest inventory input", file=sys.stderr)
+            return 2
+        policy = json.loads((ROOT / DIGEST_POLICY_PATH).read_text())
+        texts = tracked_digest_texts(tracked_files())
+        if fixture["path"] not in texts:
+            print("security-audit: digest inventory path is not audited", file=sys.stderr)
+            return 2
+        texts[fixture["path"]] += fixture["append"]
+        failures = digest_inventory_failures(texts, policy)
+    elif kind == "digest-allowlist":
+        policy = json.loads(text)
+        texts = tracked_digest_texts(tracked_files())
+        failures = semantic_allowlist_failures(digest_semantic_candidates(texts), policy)
+    elif kind == "digest-untracked":
+        fixture = json.loads(text)
+        if not isinstance(fixture, dict) or set(fixture) != {"root"} or not isinstance(fixture["root"], str):
+            print("security-audit: invalid untracked fixture", file=sys.stderr)
+            return 2
+        root = pathlib.Path(fixture["root"]).resolve()
+        try:
+            root.relative_to(ROOT / ".zig-cache/tmp")
+        except ValueError:
+            print("security-audit: untracked fixture must be in the repository test cache", file=sys.stderr)
+            return 2
+        if not (root / ".git").is_dir():
+            print("security-audit: untracked fixture needs its own Git root", file=sys.stderr)
+            return 2
+        count = 0
+        for directory, directories, files in os.walk(root, followlinks=False):
+            directories[:] = [name for name in directories if name != ".git"]
+            count += len(directories) + len(files)
+            if count > 128 or len(pathlib.Path(directory).relative_to(root).parts) > 8:
+                print("security-audit: untracked fixture exceeds traversal bounds", file=sys.stderr)
+                return 2
+        original_root = ROOT
+        try:
+            globals()["ROOT"] = root
+            paths = repository_digest_files([])
+        finally:
+            globals()["ROOT"] = original_root
+        if len(paths) > 128:
+            print("security-audit: untracked fixture exceeds file bounds", file=sys.stderr)
+            return 2
+        print("\n".join(path.relative_to(root).as_posix() for path in paths))
+        failures = []
+    elif kind == "docs-links":
+        fixture = json.loads(text)
+        if not isinstance(fixture, dict) or set(fixture) != {"root"} or not isinstance(fixture["root"], str):
+            print("security-audit: invalid docs fixture", file=sys.stderr)
+            return 2
+        root = pathlib.Path(fixture["root"]).resolve()
+        try:
+            root.relative_to(ROOT / ".zig-cache/tmp")
+        except ValueError:
+            print("security-audit: docs fixture must be in the repository test cache", file=sys.stderr)
+            return 2
+        if not root.is_dir():
+            print("security-audit: docs fixture root is not a directory", file=sys.stderr)
+            return 2
+        count = 0
+        for directory, directories, files in os.walk(root, followlinks=False):
+            count += len(directories) + len(files)
+            if count > 256 or len(pathlib.Path(directory).relative_to(root).parts) > 16:
+                print("security-audit: docs fixture exceeds traversal bounds", file=sys.stderr)
+                return 2
+            if any((pathlib.Path(directory) / name).is_symlink() for name in directories + files):
+                print("security-audit: docs fixture contains a symlink", file=sys.stderr)
+                return 2
+            if any((pathlib.Path(directory) / name).stat().st_size > 1024 * 1024 for name in files):
+                print("security-audit: docs fixture file is too large", file=sys.stderr)
+                return 2
+        original_root = ROOT
+        try:
+            globals()["ROOT"] = root
+            FAILURES.clear()
+            audit_docs()
+            failures = list(FAILURES)
+        finally:
+            globals()["ROOT"] = original_root
+            FAILURES.clear()
+    else:
+        print(f"security-audit: unknown check kind: {kind}", file=sys.stderr)
+        return 2
+    for failure in failures:
+        print(f"security-audit: {failure}", file=sys.stderr)
+    return int(bool(failures))
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "check":
+        raise SystemExit(check_policy_input(sys.argv[2], pathlib.Path(sys.argv[3])))
     raise SystemExit(main())

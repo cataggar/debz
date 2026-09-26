@@ -30,8 +30,10 @@ python3 tools/release.py verify --tag v0.3.0 --assets dist \
   --policy security/dependency-policy.json --smoke
 ```
 
-Run the tooling tests with `python3 -m unittest tools/test_release.py` or
-`zig build test-release`. Packaging the same inputs twice in one controlled
+Run the Zig-owned tooling tests with `zig build test-release` (or
+`zig build test-release -Doptimize=ReleaseSafe`). The
+[test inventory](tooling-test-inventory.md) maps the former Python cases to
+their Zig assertions. Packaging the same inputs twice in one controlled
 build environment produces byte-identical gzip and xz assets. Portable audit
 does not assume that different zlib, liblzma, or Python versions emit identical
 compressed bytes: it validates container integrity and canonical stable headers,
