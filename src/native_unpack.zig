@@ -2524,6 +2524,7 @@ const FoldedPath = struct {
     /// Null for installed, reserved, cross-package, or ancestor evidence.
     fresh_package: ?u32 = null,
     collisions: usize = 0,
+    second_spelling: ?[]const u8 = null,
 };
 
 /// Exact live-allocation budget used only for rebuilt archive models and
@@ -7200,6 +7201,12 @@ fn recordCasePath(
         found.requires_directory = found.requires_directory or requires_directory;
         return;
     }
+    if (found.second_spelling) |second| {
+        if (std.mem.eql(u8, second, path)) {
+            found.collisions += 1;
+            return;
+        }
+    }
     if (builder.case_aliases.items.len >= builder.limits.max_case_aliases)
         return builder.fail(.{
             .surface = .alias,
@@ -7212,6 +7219,7 @@ fn recordCasePath(
         .second = path,
     });
     found.collisions += 1;
+    if (found.second_spelling == null) found.second_spelling = path;
 }
 
 /// Only fresh, distinct leaf claims of one signed archive can use the
@@ -7234,6 +7242,8 @@ fn proveCaseEvidence(builder: *Builder) PlanError!void {
         const folded = scratch[0..pair.first.len];
         for (pair.first, 0..) |byte, index| folded[index] = std.ascii.toLower(byte);
         const indexed = builder.folded.get(folded) orelse return builder.fail(refusal);
+        if (indexed.collisions == 2 and indexed.fresh_package == null and
+            try proveBootstrappedCasePair(builder, pair)) continue;
         if (indexed.collisions != 1) return builder.fail(refusal);
         const package_index = indexed.fresh_package orelse {
             try proveInstalledCasePair(builder, pair, refusal);
@@ -7283,6 +7293,120 @@ fn proveInstalledCasePair(
         !(left.isRegularFile() or left.isSymbolicLink()) or
         !(right.isRegularFile() or right.isSymbolicLink()))
         return builder.fail(refusal);
+}
+
+fn proveBootstrappedCasePair(builder: *Builder, pair: CaseAlias) PlanError!bool {
+    if (!builder.request.lifecycle_execution or
+        builder.request.lifecycle_sequences.len != 1)
+        return false;
+    const first = builder.ownership.ownersOf(pair.first);
+    const second = builder.ownership.ownersOf(pair.second);
+    if (first.len != 1 or second.len != 1 or first[0].owner != second[0].owner)
+        return false;
+    const package_index = builder.owner_work.get(first[0].owner) orelse return false;
+    const item = &builder.work.items[package_index];
+    if (!item.bootstrapped or item.operation != .reinstall or
+        item.prior == null or item.prior.?.status.current != .unpacked or
+        !std.mem.eql(u8, item.prior.?.version, item.identity.version) or
+        item.owner_index == null or item.owner_index.? != first[0].owner)
+        return false;
+    for ([_][]const u8{ pair.first, pair.second }) |path| {
+        const claims = builder.transaction_claims.get(path) orelse return false;
+        if (claims.count != 1 or !claims.by_package.contains(package_index))
+            return false;
+    }
+
+    var unpack_step: ?native_program.Step = null;
+    var bootstrap_step: ?native_program.Step = null;
+    for (builder.request.program.steps) |step| {
+        switch (step.operation) {
+            .materialize_bootstrap_payload => |bootstrap| {
+                if (!samePackageIdentity(
+                    bootstrap.package,
+                    item.identity.name,
+                    item.identity.version,
+                    item.identity.architecture,
+                )) continue;
+                if (bootstrap_step != null or bootstrap.artifact != item.artifact or
+                    !std.mem.eql(u8, &bootstrap.application_sha256, &hex(32, item.application_sha256)))
+                    return false;
+                bootstrap_step = step;
+            },
+            .unpack_package => |unpack| {
+                if (!samePackageIdentity(
+                    unpack.package,
+                    item.identity.name,
+                    item.identity.version,
+                    item.identity.architecture,
+                )) continue;
+                if (unpack_step != null or !unpack.bootstrapped or
+                    unpack.prior_version != null or unpack.artifact != item.artifact or
+                    !std.mem.eql(u8, &unpack.application_sha256, &hex(32, item.application_sha256)))
+                    return false;
+                unpack_step = step;
+            },
+            else => {},
+        }
+    }
+    const bootstrap = bootstrap_step orelse return false;
+    const unpack = unpack_step orelse return false;
+    if (unpack.sequence != builder.request.lifecycle_sequences[0] or
+        bootstrap.sequence >= unpack.sequence or
+        std.mem.indexOfScalar(u32, unpack.requires, bootstrap.sequence) == null)
+        return false;
+
+    const separator = std.mem.lastIndexOfScalar(u8, pair.first, '/') orelse return false;
+    const parent = builder.request.root.entry(
+        root_fs.Path.initPackage(pair.first[0..separator]) catch return false,
+    ) catch return false;
+    if (!parent.isDirectory() or !parent.modeled or parent.inode == 0)
+        return false;
+    var sibling_inodes: [2]u64 = undefined;
+    for ([_][]const u8{ pair.first, pair.second }, 0..) |path, index| {
+        const claim = for (item.claims) |candidate| {
+            if (std.mem.eql(u8, candidate.path, path)) break candidate;
+        } else return false;
+        if (!std.mem.eql(u8, claim.archive_path, path) or
+            (claim.kind != .regular and claim.kind != .symlink))
+            return false;
+        const expected = try describeTransactionClaim(builder, item, package_index, claim);
+        const resolved = root_fs.Path.initPackage(path) catch return false;
+        const entry = builder.request.root.entry(resolved) catch return false;
+        if (claim.kind == .regular and entry.size > 1024 * 1024) return false;
+        var observation = (try observeRootState(
+            builder,
+            path,
+            item.identity.name,
+            false,
+            true,
+        )) orelse return false;
+        defer observation.deinit();
+        const actual = observation.state;
+        if (!actual.owned or !actual.modeled or actual.kind != claim.kind or
+            actual.mode != expected.mode or actual.uid != expected.uid or
+            actual.gid != expected.gid or
+            actual.modified_nanoseconds != expected.modified_nanoseconds or
+            actual.device != parent.device or actual.inode == 0 or
+            actual.link_count != 1)
+            return false;
+        switch (claim.kind) {
+            .regular => {
+                if (actual.size > 1024 * 1024 or expected.sha256 == null or
+                    actual.content_sha256 == null or
+                    !std.mem.eql(u8, &actual.content_sha256.?, &expected.sha256.?))
+                    return false;
+            },
+            .symlink => {
+                const target = expected.link_target orelse return false;
+                if (actual.size != target.len or actual.link_target == null or
+                    !std.mem.eql(u8, actual.link_target.?, target))
+                    return false;
+            },
+            else => unreachable,
+        }
+        sibling_inodes[index] = actual.inode;
+    }
+    return sibling_inodes[0] != sibling_inodes[1];
 }
 
 // ---------------------------------------------------------------------------
@@ -34920,6 +35044,241 @@ test "native_unpack.test.unchanged installed case pair never authorizes another 
         &new_program,
         &.{.{ .artifact = 0, .bytes = new_bytes }},
     ), .case_alias);
+}
+
+test "native_unpack.test.late bootstrap re-unpack binds exact signed case siblings" {
+    const status =
+        \\Package: demo
+        \\Status: install ok unpacked
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: bootstrap owner
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{.{
+        .name = "demo.list",
+        .bytes = "/.\n/usr/share/man/man7/PAM.7.gz\n/usr/share/man/man7/pam.7.gz\n",
+    }};
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedFile(root, "usr/share/man/man7/PAM.7.gz", "manual\n");
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"),
+        .{
+            .mode = 0o644,
+            .uid = currentUid(),
+            .gid = currentGid(),
+            .modified_nanoseconds = test_mtime_ns,
+        },
+    );
+    try root.createSymbolicLink(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        "PAM.7.gz",
+    );
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        .{ .modified_nanoseconds = test_mtime_ns },
+    );
+    try seedFile(root, "usr/share/man/man7/witness.7.gz", "witness\n");
+    var data = [_]Entry{
+        .{ .path = "usr/share/man/man7/PAM.7.gz", .content = "manual\n" },
+        .{ .path = "usr/share/man/man7/pam.7.gz", .kind = '2', .mode = 0o777, .link = "PAM.7.gz" },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "demo", .version = "1" }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    var steps = [_]native_program.Step{
+        bootstrapStep(0, &model, 0),
+        unpackStep(1, &model, 0, null, true),
+    };
+    steps[1].requires = &.{0};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    var program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    const archives = [_]ArchiveInput{.{ .artifact = 0, .bytes = bytes }};
+    const request: Request = .{
+        .program = &program,
+        .snapshot = fixture.snapshot(),
+        .archives = &archives,
+        .root = root,
+        .interoperability = .isolated_root,
+        .lifecycle_execution = true,
+        .lifecycle_sequences = &.{1},
+    };
+    var planned = try expectPlan(try plan(testing.allocator, request));
+    defer planned.deinit();
+    try testing.expectEqual(@as(usize, 1), planned.case_aliases.len);
+    try testing.expectEqualStrings(
+        "usr/share/man/man7/PAM.7.gz",
+        planned.case_aliases[0].first,
+    );
+    for (planned.packages[0].paths) |path| {
+        if (!std.mem.eql(u8, path.path, planned.case_aliases[0].first) and
+            !std.mem.eql(u8, path.path, planned.case_aliases[0].second)) continue;
+        try testing.expectEqual(Disposition.replace_same_package, path.disposition);
+        try testing.expect(path.publish);
+        try testing.expect(path.previous != null);
+    }
+    var bound_model = try modelOf(bytes);
+    defer bound_model.deinit();
+    var bound_archive = [_]BoundArchive{.{
+        .artifact = 0,
+        .bytes = bytes,
+        .model = bound_model,
+        .binding = try root_mutation.bindArchive(&bound_model, bytes, 0, model.digest),
+    }};
+    const bound: BoundArchives = .{ .items = &bound_archive, .allocator = testing.allocator };
+    var lowered = try lowerMaterializationIntents(
+        testing.allocator,
+        root,
+        planned,
+        &bound,
+        false,
+        false,
+    );
+    defer lowered.deinit();
+    var guards: usize = 0;
+    for (lowered.intents.items, 0..) |intent, index| {
+        if (intent != .case_sensitive) continue;
+        guards += 1;
+        try testing.expectEqualStrings("usr/share/man/man7", intent.case_sensitive.path);
+        try testing.expectEqualStrings(
+            "usr/share/man/man7/witness.7.gz",
+            intent.case_sensitive.witness,
+        );
+        try testing.expect(index + 1 < lowered.intents.items.len);
+        try testing.expect(lowered.intents.items[index + 1] == .file or
+            lowered.intents.items[index + 1] == .symlink);
+    }
+    try testing.expectEqual(@as(usize, 2), guards);
+
+    try expectRefusal(try planFor(
+        &fixture,
+        &program,
+        &archives,
+    ), .case_alias);
+    var wrong_request = request;
+    wrong_request.lifecycle_sequences = &.{0};
+    try expectRefusal(try plan(testing.allocator, wrong_request), .case_alias);
+    wrong_request = request;
+    steps[1].requires = &.{};
+    try expectRefusal(try plan(testing.allocator, wrong_request), .case_alias);
+    steps[1].requires = &.{0};
+    steps[0].operation.materialize_bootstrap_payload.application_sha256[0] ^= 1;
+    try expectRefusal(try plan(testing.allocator, request), .case_alias);
+    steps[0].operation.materialize_bootstrap_payload.application_sha256[0] ^= 1;
+
+    try root.publishFile(
+        try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"),
+        "forged\n",
+        .{ .overwrite = .replace },
+    );
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"),
+        .{ .modified_nanoseconds = test_mtime_ns },
+    );
+    try expectRefusal(try plan(testing.allocator, request), .case_alias);
+    try root.publishFile(
+        try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"),
+        "manual\n",
+        .{ .overwrite = .replace },
+    );
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"),
+        .{ .modified_nanoseconds = test_mtime_ns },
+    );
+    try root.removeFile(try root_fs.Path.init("usr/share/man/man7/pam.7.gz"));
+    try root.createSymbolicLink(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        "wrong.7.gz",
+    );
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        .{ .modified_nanoseconds = test_mtime_ns },
+    );
+    try expectRefusal(try plan(testing.allocator, request), .case_alias);
+    try root.removeFile(try root_fs.Path.init("usr/share/man/man7/pam.7.gz"));
+    try root.createSymbolicLink(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        "PAM.7.gz",
+    );
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        .{ .modified_nanoseconds = test_mtime_ns + std.time.ns_per_s },
+    );
+    try expectRefusal(try plan(testing.allocator, request), .case_alias);
+    try root.removeFile(try root_fs.Path.init("usr/share/man/man7/pam.7.gz"));
+    try root.removeFile(try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"));
+    try root.removeFile(try root_fs.Path.init("usr/share/man/man7/witness.7.gz"));
+    try root.removeDirectory(try root_fs.Path.init("usr/share/man/man7"));
+    try expectRefusal(try plan(testing.allocator, request), .case_alias);
+}
+
+test "native_unpack.test.late case pair refuses split installed ownership" {
+    const status =
+        \\Package: demo
+        \\Status: install ok unpacked
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: bootstrap owner
+        \\
+        \\Package: other
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: other owner
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "demo.list", .bytes = "/.\n/usr/share/man/man7/PAM.7.gz\n" },
+        .{ .name = "other.list", .bytes = "/usr/share/man/man7/pam.7.gz\n" },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedFile(root, "usr/share/man/man7/PAM.7.gz", "manual\n");
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/PAM.7.gz"),
+        .{ .modified_nanoseconds = test_mtime_ns },
+    );
+    try root.createSymbolicLink(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        "PAM.7.gz",
+    );
+    try root.applyMetadata(
+        try root_fs.Path.init("usr/share/man/man7/pam.7.gz"),
+        .{ .modified_nanoseconds = test_mtime_ns },
+    );
+    var data = [_]Entry{
+        .{ .path = "usr/share/man/man7/PAM.7.gz", .content = "manual\n" },
+        .{ .path = "usr/share/man/man7/pam.7.gz", .kind = '2', .mode = 0o777, .link = "PAM.7.gz" },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "demo", .version = "1" }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    var steps = [_]native_program.Step{
+        bootstrapStep(0, &model, 0),
+        unpackStep(1, &model, 0, null, true),
+    };
+    steps[1].requires = &.{0};
+    var artifacts: [1]native_program.ProgramArtifact = undefined;
+    var program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+    const archives = [_]ArchiveInput{.{ .artifact = 0, .bytes = bytes }};
+    try expectRefusal(try plan(testing.allocator, .{
+        .program = &program,
+        .snapshot = fixture.snapshot(),
+        .archives = &archives,
+        .root = root,
+        .interoperability = .isolated_root,
+        .lifecycle_execution = true,
+        .lifecycle_sequences = &.{1},
+    }), .case_alias);
 }
 
 test "native_unpack.test.removal triggers preserve every interested identity" {

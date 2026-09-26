@@ -548,6 +548,18 @@ or an upgrade of either member. Cross-package, ancestor, third-spelling,
 non-ASCII, and database-namespace aliases remain refused. Typed prefix
 requirements also reject an exact non-directory where another final path
 requires a directory.
+One bounded exception permits the **same** signed bootstrap payload to be
+unpacked later in its lifecycle after its first materialization: the selected
+unpack must directly depend on the sole matching bootstrap step, name that
+same artifact and application digest, and match the sole database owner,
+unpacked version, and transaction claimant. Both exact archive spellings must
+still exist as distinct regular-file/symlink inodes under one modeled parent,
+with their signed content or link target, mode, owner, and modification time
+unchanged. Repeated sightings of that one pair are indexed once; a third
+spelling, different owner, changed child, missing parent, or unbounded file
+refuses. This does not bypass the same journaled exact-parent witness before
+**each** replacement or the existing crash/recovery assertions.
+
 Folded keys are produced in bounded scratch storage, looked up before
 allocation, and retained only once in planner-owned temporary memory. Repeated
 shared prefixes therefore consume fixed case-index memory rather than growing

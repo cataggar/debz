@@ -42,15 +42,15 @@
       "sha512": "2540f5111a6a5184f865406450d2c311904f1af4ee173527eaecbc9588db9e62d296e60883baae06a16d64fa0c3bb1eaa56c47e5d1b17117956ed192ca4bf072"
     },
     "findings": {
-      "count": 20789,
+      "count": 20806,
       "counts": {
         "cas_layout": 193,
         "digest_version": 104,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1149,
-        "sha256_token": 19166
+        "raw_32_byte": 1150,
+        "sha256_token": 19182
       },
-      "sha512": "9ad9e31d07e1f2e7b73b96413425831ed98bdd3a689845ea04155bca8dca9b56c9854c9fba931e0a0bc766d9b809790965d9c7ff1b7c44f86d17a33bc66d61ac"
+      "sha512": "fee5cf71840d8b48d0af357e5f52c3770ea9b0127ce41135f2cc5d198e7a432cfb248ea55f0f5d0bf659bc1f5549e200d0279b93a2b24832b5a3510b98cb3b55"
     },
     "classifications": [
       {
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 188,
+        "count": 194,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 157
+          "sha256_token": 163
         },
-        "sha512": "1793c9e054ba8ec63ea914d21f5b07dfa41fa2b3a81bf824ac6036b8684fbf9173b225dbf99a3a5b72358601b1c0229ec3c9bfbe85f7612c3e7f2397ce31df69"
+        "sha512": "d56a8d54f9c8824f0dabf47e07865ff194970b8af9d097b74fb13f09a8f7d6ae53ab6118a1d34b51214745de4404816c2a8815148547c3f15ec3a801cc8a7c6a"
       },
       {
         "scope": "fuzz",
@@ -155,15 +155,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, and sudo-rs maintainer-script gates, signed sudo ownership and netcat regressions, and versioned compatibility readers.",
-        "count": 12092,
+        "count": 12103,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1077,
-          "sha256_token": 10868
+          "raw_32_byte": 1078,
+          "sha256_token": 10878
         },
-        "sha512": "90ede75aefe9f8f75a31185275681ee0c781102afed29721f5537e3b37b848ed0e13422d076c45fbcb7d1193c66700570718fa518bfbe44243623626873642e6"
+        "sha512": "5a3c567c18e37b2fb339190f1d7849c1ce383842f285c435ab752df32f8fbb57e0734216f70d486265d795e6d6db0dc00ec2e89f7bc59444ffa918bf99d5dd47"
       },
       {
         "scope": "test",
