@@ -823,8 +823,9 @@ reference records. The generic `/etc/vtrgb` link targets
 `/etc/console-setup/vtrgb` provider.
 
 This is **not** a completed install. The separate `console-setup:all`
-postinst at step 1297 exited 10 under its existing failure-settlement
-contract. During deferred trigger processing at step 1428, libc-bin,
+postinst at step 1297 exited 10 and left it `install ok half-configured`;
+its recorded failure did not become a successful configuration. During
+deferred trigger processing at step 1428, libc-bin,
 debianutils, and libselinux1 callbacks spawned and persisted exit 0.
 The next callback, ordinal 3, has only a `prepared` record and **no**
 outcome; native install exited 8 with `InvalidAlternativesScriptAuthority`.
@@ -835,6 +836,86 @@ has a separately bound configure-only admission, not authorization for
 `["triggered", "/usr/lib/sysctl.d"]`. That callback refused before launch.
 Preserve this interrupted root for recovery; it is never a fresh retry or
 proof of full native/reference snapshot parity.
+
+A separate, earlier diagnostic root from the **unmerged local
+procps-trigger branch** had also persisted this same signed
+`console-setup:all` postinst's exit 10 and half-configured state. Its
+subsequent trigger admission and terminal failed receipt are **not** part
+of this console-only change. The signed `console-setup` archive
+(108150 bytes, SHA-512
+`2ea052bd7c02091ce7afea7262e2340fdaeb9f362af79e4a1b42265ad98ace237b10770275970f89c81acf2c57bc2cc50234c2357adb167e84041c1c5479a330`)
+was independently rehashed and its control members compared with the installed
+copies in the retained root. On disposable **copies** only, pinned dpkg
+1.22.22 `--configure console-setup:all` exited 0 after running the installed
+`info/console-setup.config` (SHA-256
+`9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8`),
+which registered `console-setup/codesetcode=guess`; the signed postinst then
+exited 0. Running that postinst directly from `info/` also exited 0. Running
+the **same signed postinst** without sidecars from dpkg's `tmp.ci/` path in a
+separate copy reproduced exit 10: debconf reported `GET
+console-setup/codesetcode` -> `10 ... doesn't exist`. The original root
+lacked that question, and that staged path has no adjacent templates; removing
+only the installed config in another copy did **not** reproduce the failure.
+The installed templates (174753 bytes, SHA-256
+`dbddc3ff45db9d1417abff0f21eef1aba5fbd1f1bc0cdb15eba4e3f86f2e1b81`)
+are necessary to match debconf's signed input. The exact
+archive/script/package/amd64/`["configure", ""]` exception selects `info/`
+only after confirming the original staged candidate and all three installed
+control files are unchanged root-owned regular files. Other scripts and all
+failure/recovery outcomes remain unchanged. The earlier failed root is
+retained, **never** retried as a fresh installation.
+
+The following three local console-postinst trials also precede #248's final
+squash and include the unpublished trigger change; none proves the outcome
+on final main plus this console-only delta. A first new authenticated root,
+`.real-snapshot/amd64-console-postinst-fresh-long-1`, rehashed all 175
+archives but was stopped at step 659 before its standard runner's 30-minute
+timeout; it never reached this postinst and is retained as an interrupted
+root, never reused. A second **independently authenticated** root,
+`.real-snapshot/amd64-console-postinst-fresh-long-2`, verified the same Ubuntu
+signer and separately rehashed 175 SHA-512 archive objects against a new lock
+(file SHA-256
+`0bb4f952343052efc85f61d2344358ce24742f140afe13e80f1e941d3d0dc9c0`).
+It stopped before launching step 1297 with
+`InvalidConsoleSetupPostinstControl` (exit 8), having completed unpack and
+left `console-setup` unpacked. The initial guard mistakenly expected the
+staged postinst under `var/lib/dpkg/tmp.ci/`; native actually stages it under
+`var/lib/debz-lifecycle-scripts/`. The staged file, installed postinst,
+config, and templates in that retained root all have the exact signed bytes
+and root-owned metadata. In a disposable **copy** of this second root,
+execution of the exact native private staged postinst reproduced exit 10 and
+debconf's missing-`codesetcode` response. The guard is now bound to the
+actual private stage path; the second root remains interrupted and cannot
+prove success or be reused as fresh.
+
+The third **new** local diagnostic root,
+`.real-snapshot/amd64-console-postinst-fresh-long-3`,
+independently authenticated that signer, resolved its own 175-package lock
+(the immutable snapshot yields the same lock file SHA-256
+`0bb4f952343052efc85f61d2344358ce24742f140afe13e80f1e941d3d0dc9c0`),
+and separately rehashed all 175 SHA-512 CAS objects. Its ReleaseSafe
+candidate has SHA-256
+`779b486a1a5b36f67c213cb7a454bff2e6ec19ce69b121142d1db4e65b44a9ad`.
+The terminal receipt archives the exact signed `console-setup:all`
+`postinst ["configure", ""]` at step 1297 (SHA-256
+`e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d`):
+it spawned, exited **0** with zero output bytes, and reached `install ok
+installed`. Debconf recorded `console-setup/codesetcode=guess`, the installed
+postinst/config/templates still match their signed metadata, and the earlier
+`vtrgb` alternatives record remains byte-identical to pinned dpkg. This
+proves this console-setup correction, **not** full 175-package parity.
+
+In that local root, the next distinct failure is at step 1328: signed
+`systemd:amd64` 261.2-1ubuntu2 `postinst ["configure", ""]` (SHA-256
+`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`)
+launched and exited **1** with 1702 stderr bytes. Its retained outcome
+reports that `/proc/` is not mounted and is required for `systemd-tmpfiles`;
+`systemd` remains `install ok half-configured`. The deferred trigger callbacks
+later exited 0, but the transaction published a terminal
+`failed_after_mutation` receipt (CLI exit 7). This failed root is retained;
+neither it nor the earlier interrupted roots are reusable as fresh. The
+systemd environment and pinned-reference parity require a separate
+investigation, not an inferred success or a broadened console authorization.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
