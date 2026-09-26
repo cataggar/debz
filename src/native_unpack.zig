@@ -13265,9 +13265,32 @@ fn materializeFreshFailureRecord(
         .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
     };
     defer database.deinit();
-    if (database.model.find(package.name, package.architecture) != null)
-        return .{ .outcome = .refused, .detail = "package_already_present" };
-
+    if (database.model.find(package.name, package.architecture) != null) {
+        const execution = request.execution orelse
+            return .{ .outcome = .refused, .detail = "package_already_present" };
+        const authorization = request.planning.authorization orelse
+            return .{ .outcome = .refused, .detail = "package_already_present" };
+        if (!(try provenBootstrappedPreinstRecord(
+            execution,
+            allocator,
+            request.root,
+            request.planning.program.*,
+            authorization.*,
+            package,
+        ))) return .{ .outcome = .refused, .detail = "package_already_present" };
+        // The signed bootstrap payload was already published and is still
+        // claimed. Keep that ownership when the later preinst fails, instead
+        // of manufacturing an absent package record over live files.
+        return materializeDetailedState(
+            allocator,
+            request,
+            package,
+            .install,
+            .reinst_required,
+            .half_installed,
+            null,
+        );
+    }
     const status = if (unwind_succeeded)
         try std.fmt.allocPrint(
             allocator,
@@ -16242,6 +16265,8 @@ fn lifecycleFreshFailure(
     package: native_program.PackageIdentity,
     unwind_succeeded: bool,
 ) !MaterializationResult {
+    if (try consumeRecoveredDatabasePhase(execution))
+        return .{ .outcome = .applied, .detail = "recovered_fresh_failure" };
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
@@ -17777,6 +17802,175 @@ fn lifecyclePackageKey(
     );
 }
 
+fn bootstrappedFreshPreinst(
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    sequence: u32,
+    package: native_program.PackageIdentity,
+) ?u32 {
+    if (sequence >= program.steps.len) return null;
+    const step = program.steps[sequence];
+    if (step.sequence != sequence or step.phase != .unpack) return null;
+    const call = switch (step.operation) {
+        .run_maintainer_script => |value| value,
+        else => return null,
+    };
+    if (call.kind != .preinst or call.source != .new_package or
+        call.arguments.len != 1 or
+        !std.mem.eql(u8, call.arguments[0], "install") or
+        !samePackageIdentity(
+            call.package,
+            package.name,
+            package.version,
+            package.architecture,
+        ))
+        return null;
+    const action = authorization.findAction(package.name, package.architecture) orelse
+        return null;
+    if (action.kind != .install or action.prior_version != null or
+        !std.mem.eql(u8, action.version, package.version))
+        return null;
+    const next = std.math.add(u32, sequence, 1) catch return null;
+    if (next >= program.steps.len) return null;
+    const unpack_step = program.steps[next];
+    if (unpack_step.sequence != next or unpack_step.phase != .unpack)
+        return null;
+    const unpack = switch (unpack_step.operation) {
+        .unpack_package => |value| value,
+        else => return null,
+    };
+    if (!unpack.bootstrapped or unpack.prior_version != null or
+        !samePackageIdentity(
+            unpack.package,
+            package.name,
+            package.version,
+            package.architecture,
+        ) or
+        std.mem.indexOfScalar(u32, unpack_step.requires, sequence) == null)
+        return null;
+    var found: ?u32 = null;
+    for (program.steps) |candidate| {
+        const bootstrap = switch (candidate.operation) {
+            .materialize_bootstrap_payload => |value| value,
+            else => continue,
+        };
+        if (!samePackageIdentity(
+            bootstrap.package,
+            package.name,
+            package.version,
+            package.architecture,
+        )) continue;
+        if (found != null or candidate.sequence >= sequence or
+            bootstrap.artifact != unpack.artifact or
+            !std.mem.eql(u8, &bootstrap.application_sha256, &unpack.application_sha256) or
+            std.mem.indexOfScalar(u32, unpack_step.requires, candidate.sequence) == null)
+            return null;
+        found = candidate.sequence;
+    }
+    return found;
+}
+
+const keyboard_preinst_sha256 =
+    "2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703";
+const keyboard_templates_sha256 =
+    "4fd265213c939f2b74618c997a3695b30ca9a0b9ee5439dcda4d1f0cc9d01328";
+
+fn keyboardPreinstTemplates(
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    sequence: u32,
+    package: native_program.PackageIdentity,
+    model: *const archive_application.Model,
+) ?archive_application.MetadataMember {
+    if (!std.mem.eql(u8, package.name, "keyboard-configuration") or
+        !std.mem.eql(u8, package.version, "1.248ubuntu3") or
+        !std.mem.eql(u8, package.architecture, "all") or
+        !std.mem.eql(u8, model.facts.package, package.name) or
+        !std.mem.eql(u8, model.facts.version, package.version) or
+        !std.mem.eql(u8, model.facts.architecture, package.architecture) or
+        bootstrappedFreshPreinst(program, authorization, sequence, package) == null)
+        return null;
+    const call = program.steps[sequence].operation.run_maintainer_script;
+    const expected_script = parseHex(32, keyboard_preinst_sha256) orelse unreachable;
+    if (!std.mem.eql(u8, &call.script_sha256, keyboard_preinst_sha256) or
+        model.script(.preinst) == null or
+        !std.mem.eql(u8, &model.script(.preinst).?.sha256, &expected_script))
+        return null;
+    const expected = parseHex(32, keyboard_templates_sha256) orelse unreachable;
+    for (model.metadata) |member| {
+        if (std.mem.eql(u8, member.name, "templates") and
+            member.mode == 0o644 and member.size == 576415 and
+            std.mem.eql(u8, &member.sha256, &expected))
+            return member;
+    }
+    return null;
+}
+
+fn provenBootstrappedPreinstRecord(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    package: native_program.PackageIdentity,
+) !bool {
+    const bootstrap = bootstrappedFreshPreinst(
+        program,
+        authorization,
+        execution.program_step,
+        package,
+    ) orelse return false;
+    const runtime = execution.recovery orelse return false;
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var imported = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return false,
+    };
+    defer imported.deinit();
+    const record = imported.model.find(package.name, package.architecture) orelse return false;
+    const has_config = record.metadataMember(.config) != null;
+    const actions: []const native_recovery.Action = if (has_config)
+        &.{
+            nativeAction(.database, bootstrap, 0, 0),
+            nativeAction(.filesystem, bootstrap, 1, 0),
+            nativeAction(.database, bootstrap, 2, 0),
+        }
+    else
+        &.{nativeAction(.filesystem, bootstrap, 0, 0)};
+    for (actions) |action| {
+        const completed = try runtime.latest(action) orelse return false;
+        if (completed.stage != .completed or
+            (completed.result != .applied and completed.result != .recovered))
+            return false;
+    }
+    const call = program.steps[execution.program_step].operation.run_maintainer_script;
+    const script = record.script(.preinst) orelse return false;
+    const digest = parseHex(32, &call.script_sha256) orelse return false;
+    if (std.mem.eql(u8, package.name, "keyboard-configuration") and
+        std.mem.eql(u8, package.version, "1.248ubuntu3") and
+        std.mem.eql(u8, package.architecture, "all") and
+        std.mem.eql(u8, &call.script_sha256, keyboard_preinst_sha256))
+    {
+        const template = record.metadataMember(.templates) orelse return false;
+        const expected = parseHex(32, keyboard_templates_sha256) orelse unreachable;
+        if (template.size != 576415 or template.mode != 0o644 or
+            template.uid != 0 or template.gid != 0 or
+            !std.mem.eql(u8, &template.sha256, &expected))
+            return false;
+    }
+    return record.status.want == .install and record.status.error_state == .ok and
+        record.status.current == .unpacked and record.paths != null and
+        std.mem.eql(u8, record.version, package.version) and
+        std.mem.eql(u8, record.info_stem, package.name) and
+        std.mem.eql(u8, &script.sha256, &digest);
+}
+
 fn configFileMatches(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -17939,6 +18133,109 @@ fn clearLifecycleConfig(
     return result;
 }
 
+fn stageKeyboardPreinstTemplates(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    model: *const archive_application.Model,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageIdentity,
+    staging: *LifecycleStaging,
+) !MaterializationResult {
+    const step = program.steps[execution.program_step];
+    const member = keyboardPreinstTemplates(
+        program.*,
+        authorization.*,
+        step.sequence,
+        package,
+        model,
+    ) orelse return .{ .outcome = .refused, .detail = "keyboard_template_authority" };
+    if (!(try provenBootstrappedPreinstRecord(
+        execution,
+        allocator,
+        root,
+        program.*,
+        authorization.*,
+        package,
+    ))) return .{ .outcome = .refused, .detail = "keyboard_bootstrap_state" };
+    const installed_path = "var/lib/dpkg/info/keyboard-configuration.templates";
+    const installed = (try root.entryIfExists(
+        try root_fs.Path.init(installed_path),
+    )) orelse return .{ .outcome = .refused, .detail = "keyboard_templates_missing" };
+    if (!installed.isRegularFile() or !installed.modeled or
+        installed.link_count != 1 or installed.mode != member.mode or
+        installed.uid != 0 or installed.gid != 0 or
+        installed.size != member.size or
+        !std.mem.eql(
+            u8,
+            &(rootFileSha256(
+                allocator,
+                root,
+                installed_path,
+                1024 * 1024,
+            ) catch return .{ .outcome = .refused, .detail = "keyboard_templates_changed" }),
+            &member.sha256,
+        ))
+        return .{ .outcome = .refused, .detail = "keyboard_templates_changed" };
+    const staged_path = lifecycle_tmp_ci ++ "/keyboard-configuration.templates";
+    var intents: std.ArrayList(root_mutation.Intent) = .empty;
+    defer intents.deinit(allocator);
+    if (try root.entryIfExists(try root_fs.Path.init(staged_path))) |entry| {
+        const runtime = execution.recovery orelse
+            return .{ .outcome = .refused, .detail = "keyboard_templates_collision" };
+        if (!runtime.recovering or
+            try runtime.latest(nativeAction(
+                .database,
+                execution.program_step,
+                execution.phase_ordinal,
+                0,
+            )) == null or
+            !entry.isRegularFile() or !entry.modeled or entry.link_count != 1 or
+            entry.mode != member.mode or entry.uid != 0 or
+            entry.gid != 0 or entry.size != member.size)
+            return .{ .outcome = .refused, .detail = "keyboard_templates_collision" };
+        const staged_digest = rootFileSha256(
+            allocator,
+            root,
+            staged_path,
+            1024 * 1024,
+        ) catch return .{ .outcome = .refused, .detail = "keyboard_templates_changed" };
+        if (!std.mem.eql(u8, &staged_digest, &member.sha256))
+            return .{ .outcome = .refused, .detail = "keyboard_templates_changed" };
+    } else try intents.append(allocator, .{ .file = .{
+        .path = staged_path,
+        .bytes = model.metadataBytes(member),
+        .mode = member.mode,
+        .uid = 0,
+        .gid = 0,
+        .overwrite = .require_absent,
+        .expected_sha256 = member.sha256,
+    } });
+    const result = try lifecycleAuxiliary(
+        execution,
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        locks,
+        attempt,
+        operation,
+        policy,
+        intents.items,
+        "stage-keyboard-templates",
+    );
+    if (result.outcome == .applied)
+        try staging.paths.append(allocator, staged_path);
+    return result;
+}
+
 fn stageLifecycleScripts(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -17958,6 +18255,12 @@ fn stageLifecycleScripts(
     staging: *LifecycleStaging,
 ) !MaterializationResult {
     const key = try lifecyclePackageKey(scratch, package);
+    const step = program.steps[execution.program_step];
+    const keyboard_preinst = std.mem.eql(u8, package.name, "keyboard-configuration") and
+        std.mem.eql(u8, package.version, "1.248ubuntu3") and
+        std.mem.eql(u8, package.architecture, "all") and
+        step.operation == .run_maintainer_script and
+        step.operation.run_maintainer_script.kind == .preinst;
     if (staging.packages.contains(key)) {
         if (stage_config) if (lifecycleArchiveIndex(models, package)) |model_index| {
             if (models[model_index].script(.config)) |config| {
@@ -17979,8 +18282,29 @@ fn stageLifecycleScripts(
                 };
             }
         };
+        if (keyboard_preinst) {
+            const model_index = lifecycleArchiveIndex(models, package) orelse
+                return .{ .outcome = .refused, .detail = "keyboard_archive_missing" };
+            return stageKeyboardPreinstTemplates(
+                execution,
+                allocator,
+                root,
+                install_root,
+                program,
+                authorization,
+                &models[model_index],
+                locks,
+                attempt,
+                operation,
+                policy,
+                package,
+                staging,
+            );
+        }
         return .{ .outcome = .applied, .detail = "already_staged" };
     }
+    if (keyboard_preinst)
+        return .{ .outcome = .refused, .detail = "keyboard_scripts_not_staged" };
 
     var intents: std.ArrayList(root_mutation.Intent) = .empty;
     defer intents.deinit(allocator);
@@ -35279,6 +35603,238 @@ test "native_unpack.test.late case pair refuses split installed ownership" {
         .lifecycle_execution = true,
         .lifecycle_sequences = &.{1},
     }), .case_alias);
+}
+
+test "native_unpack.test.keyboard signed templates bind only the dependent bootstrap preinst" {
+    const control = [_]Entry{
+        .{ .path = "preinst", .mode = 0o755, .content = "#!/bin/sh\nexit 0\n" },
+        .{ .path = "templates", .content = "Template: keyboard-configuration/toggle\nType: select\n" },
+    };
+    const bytes = try archive_application.test_fixtures.build(testing.allocator, .{
+        .package = "keyboard-configuration",
+        .version = "1.248ubuntu3",
+        .architecture = "all",
+        .control = &control,
+    });
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const identity: native_program.PackageIdentity = .{
+        .name = "keyboard-configuration",
+        .version = "1.248ubuntu3",
+        .architecture = "all",
+    };
+    var steps = [_]native_program.Step{
+        bootstrapStep(0, &model, 0),
+        .{
+            .sequence = 1,
+            .phase = .unpack,
+            .requires = &.{},
+            .operation = .{ .run_maintainer_script = .{
+                .package = identity,
+                .kind = .preinst,
+                .source = .new_package,
+                .script_sha256 = keyboard_preinst_sha256.*,
+                .arguments = &.{"install"},
+                .environment_policy_sha256 = zeroDigest(),
+                .failure = .{ .state = .half_installed, .unwind = null, .recovery_required = false },
+            } },
+        },
+        unpackStep(2, &model, 0, null, true),
+    };
+    steps[2].requires = &.{ 0, 1 };
+    var program: native_program.Program = undefined;
+    program.steps = &steps;
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .install,
+        .package = identity.name,
+        .version = identity.version,
+        .architecture = identity.architecture,
+        .prior_version = null,
+        .artifact = null,
+    }};
+    var authorization: native_authorization.Authorization = undefined;
+    authorization.actions = &actions;
+    try testing.expectEqual(
+        @as(?u32, 0),
+        bootstrappedFreshPreinst(program, authorization, 1, identity),
+    );
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) == null);
+    const expected_script = parseHex(32, keyboard_preinst_sha256).?;
+    model.scripts[0].sha256 = expected_script;
+    model.metadata[0].sha256 = parseHex(32, keyboard_templates_sha256).?;
+    model.metadata[0].size = 576415;
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) != null);
+    var altered_identity = identity;
+    altered_identity.architecture = "amd64";
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, altered_identity, &model) == null);
+    altered_identity = identity;
+    altered_identity.version = "1.248ubuntu4";
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, altered_identity, &model) == null);
+
+    steps[2].requires = &.{1};
+    try testing.expect(bootstrappedFreshPreinst(program, authorization, 1, identity) == null);
+    steps[2].requires = &.{ 0, 1 };
+    steps[0].operation.materialize_bootstrap_payload.artifact = 1;
+    try testing.expect(bootstrappedFreshPreinst(program, authorization, 1, identity) == null);
+    steps[0].operation.materialize_bootstrap_payload.artifact = 0;
+    steps[1].operation.run_maintainer_script.arguments = &.{ "install", "" };
+    try testing.expect(bootstrappedFreshPreinst(program, authorization, 1, identity) == null);
+    steps[1].operation.run_maintainer_script.arguments = &.{"install"};
+    steps[1].operation.run_maintainer_script.source = .installed_package;
+    try testing.expect(bootstrappedFreshPreinst(program, authorization, 1, identity) == null);
+    steps[1].operation.run_maintainer_script.source = .new_package;
+    steps[2].operation.unpack_package.prior_version = "0";
+    try testing.expect(bootstrappedFreshPreinst(program, authorization, 1, identity) == null);
+    steps[2].operation.unpack_package.prior_version = null;
+    var wrong_authorization = authorization;
+    const wrong_actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .reinstall,
+        .package = identity.name,
+        .version = identity.version,
+        .architecture = identity.architecture,
+        .prior_version = "1.248ubuntu3",
+        .artifact = null,
+    }};
+    wrong_authorization.actions = &wrong_actions;
+    try testing.expect(bootstrappedFreshPreinst(program, wrong_authorization, 1, identity) == null);
+    const wrong_owner: native_program.PackageIdentity = .{
+        .name = "other",
+        .version = identity.version,
+        .architecture = identity.architecture,
+    };
+    try testing.expect(bootstrappedFreshPreinst(program, authorization, 1, wrong_owner) == null);
+    model.metadata[0].sha256[0] ^= 1;
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) == null);
+    model.metadata[0].sha256[0] ^= 1;
+    model.metadata[0].size -= 1;
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) == null);
+    model.metadata[0].size += 1;
+    model.metadata[0].mode = 0o755;
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) == null);
+    model.metadata[0].mode = 0o644;
+    model.scripts[0].sha256[0] ^= 1;
+    try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) == null);
+}
+
+test "native_unpack.test.failed bootstrap preinst requires journaled payload and installed owner" {
+    const script = "#!/bin/sh\nexit 23\n";
+    const status =
+        \\Package: bootstrap-test
+        \\Status: install ok unpacked
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: signed bootstrap
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "bootstrap-test.list", .bytes = "/.\n/usr/share/bootstrap-test/data\n" },
+        .{ .name = "bootstrap-test.preinst", .bytes = script, .mode = 0o755 },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedFile(root, "usr/share/bootstrap-test/data", "signed\n");
+    try root.ensureDirectory(
+        try root_fs.Path.init("var/lib/debz"),
+        root_fs.default_directory_permissions,
+    );
+    const control = [_]Entry{.{ .path = "preinst", .content = script, .mode = 0o755 }};
+    const bytes = try archive_application.test_fixtures.build(testing.allocator, .{
+        .package = "bootstrap-test",
+        .version = "1",
+        .architecture = "amd64",
+        .control = &control,
+    });
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const identity: native_program.PackageIdentity = .{
+        .name = "bootstrap-test",
+        .version = "1",
+        .architecture = "amd64",
+    };
+    var steps = [_]native_program.Step{
+        bootstrapStep(0, &model, 0),
+        .{
+            .sequence = 1,
+            .phase = .unpack,
+            .requires = &.{},
+            .operation = .{ .run_maintainer_script = .{
+                .package = identity,
+                .kind = .preinst,
+                .source = .new_package,
+                .script_sha256 = hex(32, model.script(.preinst).?.sha256),
+                .arguments = &.{"install"},
+                .environment_policy_sha256 = zeroDigest(),
+                .failure = .{ .state = .half_installed, .unwind = null, .recovery_required = false },
+            } },
+        },
+        unpackStep(2, &model, 0, null, true),
+    };
+    steps[2].requires = &.{ 0, 1 };
+    var program: native_program.Program = undefined;
+    program.steps = &steps;
+    program.target_architecture = "amd64";
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .install,
+        .package = identity.name,
+        .version = identity.version,
+        .architecture = identity.architecture,
+        .prior_version = null,
+        .artifact = null,
+    }};
+    var authorization: native_authorization.Authorization = undefined;
+    authorization.actions = &actions;
+    const intent = zeroDigest();
+    try native_recovery.initializeProgress(testing.allocator, root, intent);
+    var runtime: native_recovery.Runtime = .{
+        .allocator = testing.allocator,
+        .root = root,
+        .intent_sha256 = intent,
+    };
+    var execution: ExecutionState = .{ .program_step = 1, .recovery = &runtime };
+    try testing.expect(!(try provenBootstrappedPreinstRecord(
+        &execution,
+        testing.allocator,
+        root,
+        program,
+        authorization,
+        identity,
+    )));
+    const publication = nativeAction(.filesystem, 0, 0, 0);
+    try runtime.append(publication, .prepared, .none, null);
+    try testing.expect(!(try provenBootstrappedPreinstRecord(
+        &execution,
+        testing.allocator,
+        root,
+        program,
+        authorization,
+        identity,
+    )));
+    try runtime.append(publication, .completed, .applied, null);
+    try testing.expect(try provenBootstrappedPreinstRecord(
+        &execution,
+        testing.allocator,
+        root,
+        program,
+        authorization,
+        identity,
+    ));
+    try writeInfo(root, "bootstrap-test.preinst", "#!/bin/sh\nexit 0\n", 0o755);
+    try testing.expect(!(try provenBootstrappedPreinstRecord(
+        &execution,
+        testing.allocator,
+        root,
+        program,
+        authorization,
+        identity,
+    )));
 }
 
 test "native_unpack.test.removal triggers preserve every interested identity" {

@@ -42,15 +42,15 @@
       "sha512": "2540f5111a6a5184f865406450d2c311904f1af4ee173527eaecbc9588db9e62d296e60883baae06a16d64fa0c3bb1eaa56c47e5d1b17117956ed192ca4bf072"
     },
     "findings": {
-      "count": 20806,
+      "count": 20847,
       "counts": {
         "cas_layout": 193,
         "digest_version": 104,
         "fixed_64_hex": 177,
         "raw_32_byte": 1150,
-        "sha256_token": 19182
+        "sha256_token": 19223
       },
-      "sha512": "fee5cf71840d8b48d0af357e5f52c3770ea9b0127ce41135f2cc5d198e7a432cfb248ea55f0f5d0bf659bc1f5549e200d0279b93a2b24832b5a3510b98cb3b55"
+      "sha512": "6c4ff57d17738d0a7f03935313a4f2707cda0b0690fa635266ff9146bbe76cad1981a60552b7e5912409d051d0f3587775ca64535c05c6cd00a7d4d9f100f3fa"
     },
     "classifications": [
       {
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 194,
+        "count": 199,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 163
+          "sha256_token": 168
         },
-        "sha512": "d56a8d54f9c8824f0dabf47e07865ff194970b8af9d097b74fb13f09a8f7d6ae53ab6118a1d34b51214745de4404816c2a8815148547c3f15ec3a801cc8a7c6a"
+        "sha512": "34f86156f7236755f1bf272c8d52f71f060b33fcfc8334d1f9ae8fb110ecf502dedd9d17c96107d3945b6c734224a4109e3f74db58adfae3026d5a97b8b8fa90"
       },
       {
         "scope": "fuzz",
@@ -154,16 +154,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, and sudo-rs maintainer-script gates, signed sudo ownership and netcat regressions, and versioned compatibility readers.",
-        "count": 12103,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, and keyboard maintainer-script/template gates, signed sudo and bootstrap ownership and netcat regressions, and versioned compatibility readers.",
+        "count": 12139,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
           "raw_32_byte": 1078,
-          "sha256_token": 10878
+          "sha256_token": 10914
         },
-        "sha512": "5a3c567c18e37b2fb339190f1d7849c1ce383842f285c435ab752df32f8fbb57e0734216f70d486265d795e6d6db0dc00ec2e89f7bc59444ffa918bf99d5dd47"
+        "sha512": "9d4657f2b1831b19eae76e5c1344b8aed5024279d292b0f030bd86953a361b92cc5e24be022e35cd5e7f861fbdcaf6bb03b32904a12725877f9f334a3beaec27"
       },
       {
         "scope": "test",

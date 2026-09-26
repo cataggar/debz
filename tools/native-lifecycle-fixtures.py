@@ -166,6 +166,7 @@ def native(
     policy: str = "keep_existing",
     ordered_actions: list[dict] | None = None,
     fault: str | None = None,
+    recovery: bool = False,
 ) -> dict:
     request_path = destination / "native.request.json"
     report_path = destination / "native.report.json"
@@ -178,6 +179,8 @@ def native(
         request["ordered_actions"] = ordered_actions
     if fault is not None:
         request["fault"] = fault
+    if recovery:
+        request["recovery"] = True
     m.write(request_path, json.dumps(request).encode())
     m.run(
         [str(executable)],
@@ -1830,6 +1833,174 @@ def exercise(
         ]),
     )
     current.complete()
+
+    if executable:
+        current = Scenario(
+            workspace, "essential-bootstrap-preinst-failure",
+            executable, architecture, environment, bootstrap=True,
+        )
+        for root in current.roots:
+            m.reference_command(root)
+            m.run(
+                ["dpkg-deb", "--extract", str(bootstrap_archive), str(root)],
+                environment, current.directory / f"{root.name}-bootstrap.log",
+            )
+        current.fail(f"{bootstrap}@1:preinst:install")
+        destination = current.directory / "failure"
+        destination.mkdir()
+        reference_result = reference_phase(
+            current.expected, [bootstrap_archive], "install",
+            environment, destination, packages=current.identities((bootstrap,)),
+        )
+        if reference_result == 0:
+            raise AssertionError("pinned dpkg did not observe the failed bootstrap preinst")
+        report = native(
+            executable, current.candidate, [bootstrap_archive], "install",
+            architecture, environment, destination,
+            packages=current.identities((bootstrap,)),
+            ordered_actions=ordered(architecture, [
+                ("bootstrap_extract", bootstrap), ("unpack", bootstrap),
+                ("configure_pending", bootstrap),
+            ]),
+            recovery=True,
+        )
+        if report["outcome"] != "script_failed":
+            raise AssertionError(f"bootstrap preinst failure lost its exact outcome: {report}")
+        traces = (m.snapshot(current.expected)["trace"], m.snapshot(current.candidate)["trace"])
+        wanted_trace = (
+            f"{bootstrap}@1:preinst",
+            f"{bootstrap}@1:postrm",
+        )
+        if any(
+            len(trace) != 2
+            or any(not trace[index].startswith(identity) for index, identity in enumerate(wanted_trace))
+            for trace in traces
+        ):
+            raise AssertionError("failed bootstrap did not run the exact preinst and abort-install postrm")
+        status = (current.candidate / "var/lib/dpkg/status").read_text()
+        record = next(
+            (block for block in status.split("\n\n")
+             if f"Package: {bootstrap}\n" in block + "\n"),
+            "",
+        )
+        if (
+            "Status: install reinstreq half-installed" not in record
+            or "Version: 1" not in record
+            or not (current.candidate / f"var/lib/dpkg/info/{bootstrap}.list").is_file()
+            or not (current.candidate / "bin/sh").is_file()
+            or (current.candidate / "var/lib/debz/root-operation-v1.json").exists()
+            or (current.candidate / "var/lib/debz-lifecycle-scripts").exists()
+        ):
+            raise AssertionError("failed bootstrap lost file claims or left an unresolved journal")
+        print("essential-bootstrap-preinst-failure: bounded native failure state passed", flush=True)
+
+        config_owner = "debz-lifecycle-essential-config"
+        def prepare_config_bootstrap(source: Path) -> None:
+            runtime.copy_program(source, Path("/bin/sh"), "/bin/sh")
+            (source / "DEBIAN/config").chmod(0o755)
+
+        config_archive = m.make_package(
+            workspace / "packages/bootstrap-config", environment, architecture, "1",
+            package=config_owner, scripts=scripts(config_owner, "1"),
+            control_fields={"Essential": "yes"},
+            extra_files={
+                "DEBIAN/config": b"#!/bin/sh\nexit 97\n",
+                "DEBIAN/templates": b"Template: debz-lifecycle-essential-config/test\nType: select\nDescription: inert signed fixture\n",
+            },
+            prepare_payload=prepare_config_bootstrap,
+            compression="none",
+        )
+        current = Scenario(
+            workspace, "essential-config-bootstrap-preinst-failure",
+            executable, architecture, environment, bootstrap=True,
+        )
+        for root in current.roots:
+            m.reference_command(root)
+            m.run(
+                ["dpkg-deb", "--extract", str(config_archive), str(root)],
+                environment, current.directory / f"{root.name}-bootstrap.log",
+            )
+        current.fail(f"{config_owner}@1:preinst:install")
+        destination = current.directory / "failure"
+        destination.mkdir()
+        if reference_phase(
+            current.expected, [config_archive], "install",
+            environment, destination, packages=current.identities((config_owner,)),
+        ) == 0:
+            raise AssertionError("config-bearing bootstrap preinst unexpectedly succeeded in dpkg")
+        report = native(
+            executable, current.candidate, [config_archive], "install",
+            architecture, environment, destination,
+            packages=current.identities((config_owner,)),
+            ordered_actions=ordered(architecture, [
+                ("bootstrap_extract", config_owner), ("unpack", config_owner),
+                ("configure_pending", config_owner),
+            ]),
+            recovery=True,
+        )
+        if report["outcome"] != "script_failed":
+            raise AssertionError(f"config-bearing bootstrap failure was not settled: {report}")
+        status = (current.candidate / "var/lib/dpkg/status").read_text()
+        if (
+            "Status: install reinstreq half-installed" not in status
+            or not (current.candidate / f"var/lib/dpkg/info/{config_owner}.list").is_file()
+            or not (current.candidate / f"var/lib/dpkg/info/{config_owner}.templates").is_file()
+            or not (current.candidate / "bin/sh").is_file()
+            or (current.candidate / "var/lib/debz/root-operation-v1.json").exists()
+        ):
+            raise AssertionError("config-bearing bootstrap lost its signed ownership")
+        print("essential-config-bootstrap-preinst-failure: bounded failure state passed", flush=True)
+
+        current = Scenario(
+            workspace, "essential-bootstrap-preinst-unknown-outcome",
+            executable, architecture, environment, bootstrap=True,
+        )
+        for root in current.roots:
+            m.reference_command(root)
+            m.run(
+                ["dpkg-deb", "--extract", str(bootstrap_archive), str(root)],
+                environment, current.directory / f"{root.name}-bootstrap.log",
+            )
+        current.fail(f"{bootstrap}@1:preinst:install")
+        interrupted = current.directory / "interrupted"
+        interrupted.mkdir()
+        actions = ordered(architecture, [
+            ("bootstrap_extract", bootstrap), ("unpack", bootstrap),
+            ("configure_pending", bootstrap),
+        ])
+        report = native(
+            executable, current.candidate, [bootstrap_archive], "install",
+            architecture, environment, interrupted,
+            packages=current.identities((bootstrap,)),
+            ordered_actions=actions, recovery=True,
+            fault="after_script_before_record",
+        )
+        script_record = json.loads(
+            (current.candidate / "var/lib/debz/native-lifecycle-script-v1.json").read_text()
+        )
+        if (
+            report["outcome"] != "recovery_required"
+            or script_record["outcome"] != "in_flight"
+            or script_record["kind"] != "preinst"
+            or script_record["arguments"] != ["install"]
+            or "Status: install ok unpacked"
+            not in (current.candidate / "var/lib/dpkg/status").read_text()
+        ):
+            raise AssertionError("unknown bootstrap preinst was falsely settled")
+        before = m.snapshot(current.candidate)
+        retry = current.directory / "blocked-retry"
+        retry.mkdir()
+        report = native(
+            executable, current.candidate, [bootstrap_archive], "install",
+            architecture, environment, retry,
+            packages=current.identities((bootstrap,)),
+            ordered_actions=actions, recovery=True,
+        )
+        if report["outcome"] != "recovery_required":
+            raise AssertionError(f"unknown bootstrap script permitted re-execution: {report}")
+        if m.oracle.differences(before, m.snapshot(current.candidate), maximum=20):
+            raise AssertionError("retry altered an unknown-outcome bootstrap root")
+        print("essential-bootstrap-preinst-unknown-outcome: immutable recovery passed", flush=True)
 
     for name, operation, version, fault, kind, source, arguments, trace_count in (
         ("script-outcome-unknown", "install", "1", "after_script_before_record",
