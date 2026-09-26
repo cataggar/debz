@@ -670,6 +670,30 @@ its authorization and reference behavior require separate investigation.
 Both interrupted roots and their durable claims are retained; neither is
 reusable as a fresh root, and neither proves full amd64 parity.
 
+A **new**, empty, elevated amd64 root on final #245 squash
+`93bda9b00723f04d0b4d6ac6658708b6cb5952a7` plus rebased iproute
+change `042b0176b242a85f6e1d0fff707717b328da32f3`,
+`.real-snapshot/amd64-iproute-rebased-signed-1`, used the ReleaseSafe binary
+SHA-256 `0872869b17441b72c3306a9a56ee5dd859ce16bce4a67f882a85235acf5ee35d`.
+The reviewed signer was `f6ecb3762474eda9d21b7022871920d1991bc93c`;
+the authenticated `stonking` lock digest was
+`04d152c28b5e02652dcd00b5d62ac770488c32439948899c994a0583b2b3fe98`.
+All 175 downloaded SHA-512-primary archive objects (67,976,788 bytes) were
+independently rehashed and size-checked against that lock. The exact signed
+`iproute2:amd64` postinst SHA-256
+`bb5318e85da2497d1b2b6fcdf2d612bd02ec54bc5d9f86005506d8e91bb79d3a`
+spawned at step **1230** with `["configure", ""]`, exited **0**, and produced
+no output; installed `iproute2.templates` matches its signed SHA-256
+`33e0ed65a34dbb3a951613c64ac9a71b268eaa2b3827cdd6378875e54112bf46`.
+The retained iproute2 status is `install ok installed`. The next refusal
+is the signed `util-linux:amd64` postinst SHA-256
+`31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9`
+at step **1243**, `["configure", ""]`: `InvalidAlternativesScript`
+before launch, with only `script prepared` in the journal and **no** script
+outcome. The overall operation remains `recovery_required`. Preserve this
+interrupted root; it is not a retry target or proof of full snapshot parity.
+Util-linux admission is a separate signed-authority problem.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
