@@ -317,6 +317,26 @@ pub fn build(b: *std.Build) void {
     );
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
     audit_step.dependOn(&audit.step);
+    const security_policy_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/security-policy.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_security_policy_tests = b.addRunArtifact(security_policy_tests);
+    run_security_policy_tests.setCwd(b.path("."));
+    audit_step.dependOn(&run_security_policy_tests.step);
+    const snapshot_policy_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/real-snapshot-policy.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_snapshot_policy_tests = b.addRunArtifact(snapshot_policy_tests);
+    run_snapshot_policy_tests.setCwd(b.path("."));
+    audit_step.dependOn(&run_snapshot_policy_tests.step);
     const audit_tests = b.addSystemCommand(
         &.{
             "env",
@@ -324,8 +344,6 @@ pub fn build(b: *std.Build) void {
             "python3",
             "-m",
             "unittest",
-            "tools/test_security_audit.py",
-            "tools/test_real_snapshot_acceptance.py",
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
@@ -334,8 +352,16 @@ pub fn build(b: *std.Build) void {
     audit_step.dependOn(&audit_tests.step);
 
     const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
-    const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });
-    release_test_step.dependOn(&release_tests.step);
+    const release_policy_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/release-tooling.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_release_policy_tests = b.addRunArtifact(release_policy_tests);
+    run_release_policy_tests.setCwd(b.path("."));
+    release_test_step.dependOn(&run_release_policy_tests.step);
     const apt_schema_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-schema-tests.zig"),
         .target = target,
@@ -1753,6 +1779,7 @@ fn installReleaseFiles(
         "transaction-executor.md",
         "transaction-recovery.md",
         "target-apt-config.md",
+        "tooling-test-inventory.md",
         "zvmi-package-family.md",
     };
     const schemas = [_][]const u8{
@@ -1782,6 +1809,7 @@ fn installReleaseFiles(
         "native-execution-request-v3.json",
         "native-execution-request-v4.json",
         "native-managed-state-v1.json",
+        "native-repository-unchanged-v1.json",
         "native-diversion-cache-v1.json",
         "native-unpack-diversion-v1.json",
         "native-unpack-route-settlement-v1.json",
@@ -1809,6 +1837,7 @@ fn installReleaseFiles(
         "root-operation-completion-v1.json",
         "root-operation-completion-v2.json",
         "root-operation-record-v1.json",
+        "root-mutation-journal-v1.json",
         "system-profile-v1.json",
         "system-profile-v2.json",
         "transaction-plan-v1.json",

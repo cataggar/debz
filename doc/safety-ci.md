@@ -122,6 +122,11 @@ exception, hostname inference, or unbounded immutable exemption exists.
   fixture-key generator;
 - tracked build, coverage or generated binary artifacts.
 
+The required audit step runs Zig-owned policy mutations and offline snapshot
+workflow tests alongside the production Python audit utility. It does not
+download or execute the live snapshot; see the
+[test inventory](tooling-test-inventory.md) for the preserved negative cases.
+
 Zig's Debug and ReleaseSafe modes provide bounds, overflow and safety checks.
 The repository does not claim a C sanitizer gate: libsolv and libzstd are
 built by separately pinned packages and liblzma by the repository-local Zig

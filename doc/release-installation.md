@@ -13,7 +13,11 @@ packaging graph. It includes the ordinary tree plus
 `share/debz/runtime-dependencies.json`. GNU and other ordinary target installs
 do not receive that release-only manifest and therefore do not claim the
 static-musl runtime model; attempting `release-install` for a non-Linux-musl
-target fails. Documentation, notices, metadata, and schemas are installed with
+target fails. All source schemas, including the journal referenced by
+`doc/root-mutation.md`, ship in both `share/debz/schema` and
+`share/doc/debz/schema`. The release-install test compares each installed schema
+byte-for-byte against its source and refuses missing, extra, or symlinked copies.
+Documentation, notices, metadata, and schemas are installed with
 mode `0644`; the built CLI is installed with mode `0755`.
 
 The release version defaults to the `build.zig.zon` package version. Override
