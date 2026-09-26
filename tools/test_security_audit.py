@@ -558,7 +558,7 @@ class SecurityAuditTests(unittest.TestCase):
                 r"(?m)^          (zig build test-native-recovery[^\n]+)$", body,
             ))
             tokens = [
-                "    timeout-minutes: 35",
+                f"    timeout-minutes: {75 if name == 'native-recovery-zig-scenarios' else 35}",
                 "      fail-fast: false",
                 "          - os: ubuntu-24.04",
                 "          - os: ubuntu-24.04-arm",

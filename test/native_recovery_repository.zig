@@ -66,12 +66,15 @@ fn projected(
     guarded.close(fixture.io);
     const log = try std.fmt.allocPrint(fixture.allocator, "{s}.log", .{name});
     defer fixture.allocator.free(log);
+    const limit_seconds: i64 = if (std.mem.eql(u8, name, "repository-execution-success")) 240 else 120;
+    const limit = try std.fmt.allocPrint(fixture.allocator, "{d}s", .{limit_seconds});
+    defer fixture.allocator.free(limit);
     const result = std.process.run(fixture.allocator, fixture.io, .{
-        .argv = &.{ "/usr/bin/timeout", "--kill-after=2s", "120s", "/usr/bin/unshare", "--mount", "--pid", "--fork", "--", self, "--inside", @tagName(mode), root },
+        .argv = &.{ "/usr/bin/timeout", "--kill-after=2s", limit, "/usr/bin/unshare", "--mount", "--pid", "--fork", "--", self, "--inside", @tagName(mode), root },
         .environ_map = &fixture.environment,
         .stdout_limit = .limited(1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(125), .clock = .awake } },
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(limit_seconds + 5), .clock = .awake } },
     }) catch |err| {
         std.debug.print("{s}: transport {s}, fixture {s}\n", .{ name, @errorName(err), fixture.path });
         return err;

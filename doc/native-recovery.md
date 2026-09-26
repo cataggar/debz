@@ -1303,7 +1303,7 @@ execution plus CLI, and the CLI-only selector runs CLI alone, matching the
 former Python selector hierarchy. Without a selector the Zig repository
 target runs all three. The complete `test-native-recovery` gate includes
 repository execution when the selected workload calls for it; the two
-Python test entry points are retired only on the isolated transition branch.
+Python test entry points have been retired from this Zig-only gate.
 Unprivileged Zig transport negatives also run under
 the repository target and the standard `zig build test` target. A pinned
 `-Dnative-reference-dpkg=...` is forwarded without changing its existing
@@ -1314,6 +1314,10 @@ selects **fixture generation only**, not the acceptance runner. For a
 focused CLI run, combine `-Dnative-repository-cli-only=true` with
 `-Dnative-zig-repository-case=known_failure` (or another case in the table
 below); the default still runs all cases.
+The `repository-execution-success` projected invocation allows 240 seconds
+for its signed first execution under concurrent CI load, with a 245-second
+awake ceiling. Every other projected invocation, including CLI, retains its
+120-second external timeout and 125-second awake ceiling.
 
 Executed Zig-owned private-root acceptance now covers the repository
 projection; all **11** normal/resumed typed execution cases; both additional
@@ -1345,8 +1349,7 @@ projection-mode pairs, host-root rejection for all three transports,
 incorrect marker, PID and UID are checked before entering/mounting; focused
 transport tests also assert a host-root refusal leaves no process log.
 
-The transport methods now exercised by Zig (publication still awaits both
-pre- and post-retirement matrices) are:
+The transport methods exercised by the required Zig-only gate are:
 
 | Python `test_` method | Zig execution or exact refusal |
 | --- | --- |
@@ -1750,19 +1753,22 @@ The Zig recovery `-Dnative-script-failure-only=true` selector runs both
 unowned postinst boundaries. The Zig trigger gates keep the separate two reference-only
 cases on both architectures and in both optimization modes.
 
-### Recovery entry-point selector reconciliation (#215; gate transition prepared)
+### Recovery entry-point selector reconciliation (#215; Zig-only gate)
 
 This is an inventory of **executed processes**, not of unit tests or fixture
 constants. Each Zig target below is required by one of the three
-`native-recovery-zig-*` CI shards in Debug and ReleaseSafe on amd64/arm64;
-the public aggregate offers the same default and focused selectors without
+`native-recovery-zig-*` CI shards in Debug and ReleaseSafe on amd64/arm64.
+The scenario shard, including its 100-case diversion matrix, has a 75-minute
+job limit to tolerate slow x64 runners; the core/repository and FAMILY shards
+retain 35-minute limits. The public aggregate offers the same default and
+focused selectors without
 duplicating the complete suite in CI. `-Dnative-reference-dpkg=...` selects pinned
 dpkg 1.22.22. "Executed" means that the named case reaches the driver or
 public binary in a disposable root; **partial** means that some Python
 assertions about the resulting evidence are still not checked by Zig.
 Neither Python test entry point was removed on the strength of matching
 names alone; the unit and selector-ledger observations were reconciled
-before this local, still-unpublished transition.
+before retiring the Python entry points from the required gate.
 
 | Python selector and complete case inventory | Required Zig target / actual observation | Status |
 | --- | --- | --- |

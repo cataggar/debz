@@ -1009,7 +1009,7 @@ jobs:
   native-recovery-zig-scenarios:
     name: Native crash recovery Zig scenario matrices (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:

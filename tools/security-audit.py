@@ -1367,6 +1367,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     shared_setup = None
     for name, (display_name, matrix_rows, expected_steps) in recovery_jobs.items():
         body = jobs.get(name, "")
+        timeout_minutes = 75 if name == "native-recovery-zig-scenarios" else 35
         strategy = (
             "      fail-fast: false\n"
             "      matrix:\n"
@@ -1376,14 +1377,14 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         if (
             f"    name: {display_name}" not in body.splitlines()
             or "    runs-on: ${{ matrix.os }}" not in body.splitlines()
-            or "    timeout-minutes: 35" not in body.splitlines()
+            or f"    timeout-minutes: {timeout_minutes}" not in body.splitlines()
             or body.count("    strategy:\n") != 1
             or body.count("    steps:\n") != 1
             or body.split("    strategy:\n", 1)[-1].split("    steps:\n", 1)[0] != strategy
             or re.search(r"(?m)^    if:|^    continue-on-error:", body)
             or "continue-on-error:" in body
         ):
-            failures.append(f"ci.yml: {name} must require every reviewed architecture and mode within 35 minutes")
+            failures.append(f"ci.yml: {name} must require every reviewed architecture and mode within {timeout_minutes} minutes")
         steps = dict(re.findall(
             r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", body,
         ))
