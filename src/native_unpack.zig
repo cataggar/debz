@@ -17874,6 +17874,10 @@ const keyboard_preinst_sha256 =
     "2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703";
 const keyboard_templates_sha256 =
     "4fd265213c939f2b74618c997a3695b30ca9a0b9ee5439dcda4d1f0cc9d01328";
+const iproute_postinst_sha256 =
+    "bb5318e85da2497d1b2b6fcdf2d612bd02ec54bc5d9f86005506d8e91bb79d3a";
+const iproute_templates_sha256 =
+    "33e0ed65a34dbb3a951613c64ac9a71b268eaa2b3827cdd6378875e54112bf46";
 
 fn keyboardPreinstTemplates(
     program: native_program.Program,
@@ -17900,6 +17904,109 @@ fn keyboardPreinstTemplates(
     for (model.metadata) |member| {
         if (std.mem.eql(u8, member.name, "templates") and
             member.mode == 0o644 and member.size == 576415 and
+            std.mem.eql(u8, &member.sha256, &expected))
+            return member;
+    }
+    return null;
+}
+
+fn iproutePostinstUnpack(
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    sequence: u32,
+    package: native_program.PackageIdentity,
+) ?u32 {
+    if (sequence >= program.steps.len or
+        !std.mem.eql(u8, program.target_architecture, "amd64"))
+        return null;
+    const step = program.steps[sequence];
+    if (step.sequence != sequence or step.phase != .configure) return null;
+    const call = switch (step.operation) {
+        .run_maintainer_script => |value| value,
+        else => return null,
+    };
+    if (call.kind != .postinst or call.source != .new_package or
+        call.arguments.len != 2 or
+        !std.mem.eql(u8, call.arguments[0], "configure") or
+        call.arguments[1].len != 0 or
+        !samePackageIdentity(
+            call.package,
+            package.name,
+            package.version,
+            package.architecture,
+        ))
+        return null;
+    const action = authorization.findAction(package.name, package.architecture) orelse
+        return null;
+    if (action.kind != .install or action.prior_version != null or
+        !std.mem.eql(u8, action.version, package.version))
+        return null;
+    var found: ?u32 = null;
+    for (program.steps) |candidate| {
+        const unpack = switch (candidate.operation) {
+            .unpack_package => |value| value,
+            else => continue,
+        };
+        if (!samePackageIdentity(
+            unpack.package,
+            package.name,
+            package.version,
+            package.architecture,
+        )) continue;
+        const preinst = std.math.sub(u32, candidate.sequence, 1) catch return null;
+        const state_sequence = std.math.add(u32, candidate.sequence, 1) catch return null;
+        if (found != null or candidate.sequence >= sequence or
+            candidate.phase != .unpack or !unpack.bootstrapped or
+            unpack.prior_version != null or state_sequence >= program.steps.len or
+            std.mem.indexOfScalar(u32, step.requires, candidate.sequence) == null or
+            bootstrappedFreshPreinst(program, authorization, preinst, package) == null)
+            return null;
+        const state_step = program.steps[state_sequence];
+        if (state_step.sequence != state_sequence or state_step.phase != .unpack or
+            std.mem.indexOfScalar(u32, state_step.requires, candidate.sequence) == null)
+            return null;
+        const state = switch (state_step.operation) {
+            .record_package_state => |value| value,
+            else => return null,
+        };
+        if (state.state != .unpacked or state.remove_entry or
+            !samePackageIdentity(
+                state.package,
+                package.name,
+                package.version,
+                package.architecture,
+            ))
+            return null;
+        found = candidate.sequence;
+    }
+    return found;
+}
+
+fn iproutePostinstTemplates(
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    sequence: u32,
+    package: native_program.PackageIdentity,
+    model: *const archive_application.Model,
+) ?archive_application.MetadataMember {
+    if (!std.mem.eql(u8, package.name, "iproute2") or
+        !std.mem.eql(u8, package.version, "6.19.0-1ubuntu2") or
+        !std.mem.eql(u8, package.architecture, "amd64") or
+        !std.mem.eql(u8, model.facts.package, package.name) or
+        !std.mem.eql(u8, model.facts.version, package.version) or
+        !std.mem.eql(u8, model.facts.architecture, package.architecture) or
+        iproutePostinstUnpack(program, authorization, sequence, package) == null)
+        return null;
+    const call = program.steps[sequence].operation.run_maintainer_script;
+    const expected_script = parseHex(32, iproute_postinst_sha256) orelse unreachable;
+    if (!std.mem.eql(u8, &call.script_sha256, iproute_postinst_sha256) or
+        model.script(.postinst) == null or
+        !std.mem.eql(u8, &model.script(.postinst).?.sha256, &expected_script))
+        return null;
+    const expected = parseHex(32, iproute_templates_sha256) orelse unreachable;
+    for (model.metadata) |member| {
+        if (std.mem.eql(u8, member.name, "templates") and
+            member.mode == 0o644 and member.size == 15912 and
             std.mem.eql(u8, &member.sha256, &expected))
             return member;
     }
@@ -17969,6 +18076,66 @@ fn provenBootstrappedPreinstRecord(
         std.mem.eql(u8, record.version, package.version) and
         std.mem.eql(u8, record.info_stem, package.name) and
         std.mem.eql(u8, &script.sha256, &digest);
+}
+
+fn provenIpRoutePostinstRecord(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: native_program.Program,
+    authorization: native_authorization.Authorization,
+    package: native_program.PackageIdentity,
+) !bool {
+    const unpack = iproutePostinstUnpack(
+        program,
+        authorization,
+        execution.program_step,
+        package,
+    ) orelse return false;
+    const runtime = execution.recovery orelse return false;
+    const preinst = nativeAction(.script, unpack - 1, 0, 0);
+    const completed_preinst = try runtime.latest(preinst) orelse return false;
+    if (completed_preinst.stage != .completed or completed_preinst.result != .succeeded)
+        return false;
+    const actions = [_]native_recovery.Action{
+        nativeAction(.database, unpack, 0, 0),
+        nativeAction(.filesystem, unpack, 1, 0),
+        nativeAction(.database, unpack, 2, 0),
+        nativeAction(.database, unpack, 3, 0),
+        nativeAction(.database, unpack, 4, 0),
+        nativeAction(.database, unpack + 1, 0, 0),
+    };
+    for (actions) |journal_action| {
+        const completed = try runtime.latest(journal_action) orelse return false;
+        if (completed.stage != .completed or
+            (completed.result != .applied and completed.result != .recovered))
+            return false;
+    }
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return false,
+    };
+    defer database.deinit();
+    const record = database.model.find(package.name, package.architecture) orelse return false;
+    const script = record.script(.postinst) orelse return false;
+    const template = record.metadataMember(.templates) orelse return false;
+    const expected_script = parseHex(32, iproute_postinst_sha256) orelse unreachable;
+    const expected_template = parseHex(32, iproute_templates_sha256) orelse unreachable;
+    return record.status.want == .install and record.status.error_state == .ok and
+        record.status.current == .unpacked and record.paths != null and
+        std.mem.eql(u8, record.version, package.version) and
+        std.mem.eql(u8, record.info_stem, package.name) and
+        std.mem.eql(u8, &script.sha256, &expected_script) and
+        template.size == 15912 and template.mode == 0o644 and
+        template.uid == 0 and template.gid == 0 and
+        std.mem.eql(u8, &template.sha256, &expected_template);
 }
 
 fn configFileMatches(
@@ -18133,7 +18300,16 @@ fn clearLifecycleConfig(
     return result;
 }
 
-fn stageKeyboardPreinstTemplates(
+const SignedDebconfTemplateStage = struct {
+    installed_path: []const u8,
+    staged_path: []const u8,
+    label: []const u8,
+    missing: []const u8,
+    changed: []const u8,
+    collision: []const u8,
+};
+
+fn stageSignedDebconfTemplates(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -18141,33 +18317,17 @@ fn stageKeyboardPreinstTemplates(
     program: *const native_program.Program,
     authorization: *const native_authorization.Authorization,
     model: *const archive_application.Model,
+    member: archive_application.MetadataMember,
+    stage: SignedDebconfTemplateStage,
     locks: root_operation.LockBackend,
     attempt: *root_operation.Attempt,
     operation: product_api.Operation,
     policy: transaction_executor.ConffilePolicy,
-    package: native_program.PackageIdentity,
     staging: *LifecycleStaging,
 ) !MaterializationResult {
-    const step = program.steps[execution.program_step];
-    const member = keyboardPreinstTemplates(
-        program.*,
-        authorization.*,
-        step.sequence,
-        package,
-        model,
-    ) orelse return .{ .outcome = .refused, .detail = "keyboard_template_authority" };
-    if (!(try provenBootstrappedPreinstRecord(
-        execution,
-        allocator,
-        root,
-        program.*,
-        authorization.*,
-        package,
-    ))) return .{ .outcome = .refused, .detail = "keyboard_bootstrap_state" };
-    const installed_path = "var/lib/dpkg/info/keyboard-configuration.templates";
     const installed = (try root.entryIfExists(
-        try root_fs.Path.init(installed_path),
-    )) orelse return .{ .outcome = .refused, .detail = "keyboard_templates_missing" };
+        try root_fs.Path.init(stage.installed_path),
+    )) orelse return .{ .outcome = .refused, .detail = stage.missing };
     if (!installed.isRegularFile() or !installed.modeled or
         installed.link_count != 1 or installed.mode != member.mode or
         installed.uid != 0 or installed.gid != 0 or
@@ -18177,18 +18337,17 @@ fn stageKeyboardPreinstTemplates(
             &(rootFileSha256(
                 allocator,
                 root,
-                installed_path,
+                stage.installed_path,
                 1024 * 1024,
-            ) catch return .{ .outcome = .refused, .detail = "keyboard_templates_changed" }),
+            ) catch return .{ .outcome = .refused, .detail = stage.changed }),
             &member.sha256,
         ))
-        return .{ .outcome = .refused, .detail = "keyboard_templates_changed" };
-    const staged_path = lifecycle_tmp_ci ++ "/keyboard-configuration.templates";
+        return .{ .outcome = .refused, .detail = stage.changed };
     var intents: std.ArrayList(root_mutation.Intent) = .empty;
     defer intents.deinit(allocator);
-    if (try root.entryIfExists(try root_fs.Path.init(staged_path))) |entry| {
+    if (try root.entryIfExists(try root_fs.Path.init(stage.staged_path))) |entry| {
         const runtime = execution.recovery orelse
-            return .{ .outcome = .refused, .detail = "keyboard_templates_collision" };
+            return .{ .outcome = .refused, .detail = stage.collision };
         if (!runtime.recovering or
             try runtime.latest(nativeAction(
                 .database,
@@ -18199,17 +18358,17 @@ fn stageKeyboardPreinstTemplates(
             !entry.isRegularFile() or !entry.modeled or entry.link_count != 1 or
             entry.mode != member.mode or entry.uid != 0 or
             entry.gid != 0 or entry.size != member.size)
-            return .{ .outcome = .refused, .detail = "keyboard_templates_collision" };
+            return .{ .outcome = .refused, .detail = stage.collision };
         const staged_digest = rootFileSha256(
             allocator,
             root,
-            staged_path,
+            stage.staged_path,
             1024 * 1024,
-        ) catch return .{ .outcome = .refused, .detail = "keyboard_templates_changed" };
+        ) catch return .{ .outcome = .refused, .detail = stage.changed };
         if (!std.mem.eql(u8, &staged_digest, &member.sha256))
-            return .{ .outcome = .refused, .detail = "keyboard_templates_changed" };
+            return .{ .outcome = .refused, .detail = stage.changed };
     } else try intents.append(allocator, .{ .file = .{
-        .path = staged_path,
+        .path = stage.staged_path,
         .bytes = model.metadataBytes(member),
         .mode = member.mode,
         .uid = 0,
@@ -18229,11 +18388,126 @@ fn stageKeyboardPreinstTemplates(
         operation,
         policy,
         intents.items,
-        "stage-keyboard-templates",
+        stage.label,
     );
     if (result.outcome == .applied)
-        try staging.paths.append(allocator, staged_path);
+        try staging.paths.append(allocator, stage.staged_path);
     return result;
+}
+
+fn stageKeyboardPreinstTemplates(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    model: *const archive_application.Model,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageIdentity,
+    staging: *LifecycleStaging,
+) !MaterializationResult {
+    const member = keyboardPreinstTemplates(
+        program.*,
+        authorization.*,
+        execution.program_step,
+        package,
+        model,
+    ) orelse return .{ .outcome = .refused, .detail = "keyboard_template_authority" };
+    if (!(try provenBootstrappedPreinstRecord(
+        execution,
+        allocator,
+        root,
+        program.*,
+        authorization.*,
+        package,
+    ))) return .{ .outcome = .refused, .detail = "keyboard_bootstrap_state" };
+    return stageSignedDebconfTemplates(
+        execution,
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        model,
+        member,
+        .{
+            .installed_path = "var/lib/dpkg/info/keyboard-configuration.templates",
+            .staged_path = lifecycle_tmp_ci ++ "/keyboard-configuration.templates",
+            .label = "stage-keyboard-templates",
+            .missing = "keyboard_templates_missing",
+            .changed = "keyboard_templates_changed",
+            .collision = "keyboard_templates_collision",
+        },
+        locks,
+        attempt,
+        operation,
+        policy,
+        staging,
+    );
+}
+
+fn stageIpRoutePostinstTemplates(
+    execution: *ExecutionState,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    program: *const native_program.Program,
+    authorization: *const native_authorization.Authorization,
+    model: *const archive_application.Model,
+    locks: root_operation.LockBackend,
+    attempt: *root_operation.Attempt,
+    operation: product_api.Operation,
+    policy: transaction_executor.ConffilePolicy,
+    package: native_program.PackageIdentity,
+    staging: *LifecycleStaging,
+) !MaterializationResult {
+    const member = iproutePostinstTemplates(
+        program.*,
+        authorization.*,
+        execution.program_step,
+        package,
+        model,
+    ) orelse return .{ .outcome = .refused, .detail = "iproute_template_authority" };
+    if (!(try provenIpRoutePostinstRecord(
+        execution,
+        allocator,
+        root,
+        program.*,
+        authorization.*,
+        package,
+    ))) return .{ .outcome = .refused, .detail = "iproute_unpack_state" };
+    if (model.script(.config)) |config| {
+        if (!(installedConfigMatches(allocator, root, package, config.*) catch
+            return .{ .outcome = .refused, .detail = "iproute_config_changed" }))
+            return .{ .outcome = .refused, .detail = "iproute_config_missing" };
+    }
+    return stageSignedDebconfTemplates(
+        execution,
+        allocator,
+        root,
+        install_root,
+        program,
+        authorization,
+        model,
+        member,
+        .{
+            .installed_path = "var/lib/dpkg/info/iproute2.templates",
+            .staged_path = lifecycle_tmp_ci ++ "/iproute2.templates",
+            .label = "stage-iproute-templates",
+            .missing = "iproute_templates_missing",
+            .changed = "iproute_templates_changed",
+            .collision = "iproute_templates_collision",
+        },
+        locks,
+        attempt,
+        operation,
+        policy,
+        staging,
+    );
 }
 
 fn stageLifecycleScripts(
@@ -18261,6 +18535,11 @@ fn stageLifecycleScripts(
         std.mem.eql(u8, package.architecture, "all") and
         step.operation == .run_maintainer_script and
         step.operation.run_maintainer_script.kind == .preinst;
+    const iproute_postinst = std.mem.eql(u8, package.name, "iproute2") and
+        std.mem.eql(u8, package.version, "6.19.0-1ubuntu2") and
+        std.mem.eql(u8, package.architecture, "amd64") and
+        step.operation == .run_maintainer_script and
+        step.operation.run_maintainer_script.kind == .postinst;
     if (staging.packages.contains(key)) {
         if (stage_config) if (lifecycleArchiveIndex(models, package)) |model_index| {
             if (models[model_index].script(.config)) |config| {
@@ -18301,10 +18580,31 @@ fn stageLifecycleScripts(
                 staging,
             );
         }
+        if (iproute_postinst) {
+            const model_index = lifecycleArchiveIndex(models, package) orelse
+                return .{ .outcome = .refused, .detail = "iproute_archive_missing" };
+            return stageIpRoutePostinstTemplates(
+                execution,
+                allocator,
+                root,
+                install_root,
+                program,
+                authorization,
+                &models[model_index],
+                locks,
+                attempt,
+                operation,
+                policy,
+                package,
+                staging,
+            );
+        }
         return .{ .outcome = .applied, .detail = "already_staged" };
     }
     if (keyboard_preinst)
         return .{ .outcome = .refused, .detail = "keyboard_scripts_not_staged" };
+    if (iproute_postinst)
+        return .{ .outcome = .refused, .detail = "iproute_scripts_not_staged" };
 
     var intents: std.ArrayList(root_mutation.Intent) = .empty;
     defer intents.deinit(allocator);
@@ -35717,6 +36017,246 @@ test "native_unpack.test.keyboard signed templates bind only the dependent boots
     model.metadata[0].mode = 0o644;
     model.scripts[0].sha256[0] ^= 1;
     try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) == null);
+}
+
+test "native_unpack.test.iproute postinst templates require exact signed bootstrap and configure" {
+    const control = [_]Entry{
+        .{ .path = "preinst", .mode = 0o755, .content = "#!/bin/sh\nexit 0\n" },
+        .{ .path = "postinst", .mode = 0o755, .content = "#!/bin/sh\nexit 0\n" },
+        .{ .path = "templates", .content = "Template: iproute2/setcaps\nType: boolean\n" },
+    };
+    const bytes = try archive_application.test_fixtures.build(testing.allocator, .{
+        .package = "iproute2",
+        .version = "6.19.0-1ubuntu2",
+        .architecture = "amd64",
+        .control = &control,
+    });
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const identity: native_program.PackageIdentity = .{
+        .name = "iproute2",
+        .version = "6.19.0-1ubuntu2",
+        .architecture = "amd64",
+    };
+    var steps = [_]native_program.Step{
+        bootstrapStep(0, &model, 0),
+        .{
+            .sequence = 1,
+            .phase = .unpack,
+            .requires = &.{},
+            .operation = .{ .run_maintainer_script = .{
+                .package = identity,
+                .kind = .preinst,
+                .source = .new_package,
+                .script_sha256 = hex(32, model.script(.preinst).?.sha256),
+                .arguments = &.{"install"},
+                .environment_policy_sha256 = zeroDigest(),
+                .failure = .{ .state = .half_installed, .unwind = null, .recovery_required = false },
+            } },
+        },
+        unpackStep(2, &model, 0, null, true),
+        .{
+            .sequence = 3,
+            .phase = .unpack,
+            .requires = &.{2},
+            .operation = .{ .record_package_state = .{
+                .package = identity,
+                .state = .unpacked,
+                .hold = false,
+                .remove_entry = false,
+            } },
+        },
+        .{
+            .sequence = 4,
+            .phase = .configure,
+            .requires = &.{ 2, 3 },
+            .operation = .{ .run_maintainer_script = .{
+                .package = identity,
+                .kind = .postinst,
+                .source = .new_package,
+                .script_sha256 = iproute_postinst_sha256.*,
+                .arguments = &.{ "configure", "" },
+                .environment_policy_sha256 = zeroDigest(),
+                .failure = .{ .state = .half_configured, .unwind = null, .recovery_required = false },
+            } },
+        },
+    };
+    steps[2].requires = &.{ 0, 1 };
+    var program: native_program.Program = undefined;
+    program.steps = &steps;
+    program.target_architecture = "amd64";
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .install,
+        .package = identity.name,
+        .version = identity.version,
+        .architecture = identity.architecture,
+        .prior_version = null,
+        .artifact = null,
+    }};
+    var authorization: native_authorization.Authorization = undefined;
+    authorization.actions = &actions;
+    try testing.expectEqual(@as(?u32, 2), iproutePostinstUnpack(program, authorization, 4, identity));
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
+    model.scripts[1].sha256 = parseHex(32, iproute_postinst_sha256).?;
+    model.metadata[0].sha256 = parseHex(32, iproute_templates_sha256).?;
+    model.metadata[0].size = 15912;
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) != null);
+
+    program.target_architecture = "arm64";
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
+    program.target_architecture = "amd64";
+    var wrong = identity;
+    wrong.version = "6.19.0-1ubuntu3";
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, wrong, &model) == null);
+    wrong = identity;
+    wrong.architecture = "arm64";
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, wrong, &model) == null);
+    steps[4].operation.run_maintainer_script.arguments = &.{"configure"};
+    try testing.expect(iproutePostinstUnpack(program, authorization, 4, identity) == null);
+    steps[4].operation.run_maintainer_script.arguments = &.{ "configure", "" };
+    steps[4].operation.run_maintainer_script.source = .installed_package;
+    try testing.expect(iproutePostinstUnpack(program, authorization, 4, identity) == null);
+    steps[4].operation.run_maintainer_script.source = .new_package;
+    steps[4].requires = &.{3};
+    try testing.expect(iproutePostinstUnpack(program, authorization, 4, identity) == null);
+    steps[4].requires = &.{ 2, 3 };
+    steps[3].requires = &.{1};
+    try testing.expect(iproutePostinstUnpack(program, authorization, 4, identity) == null);
+    steps[3].requires = &.{2};
+    steps[2].operation.unpack_package.prior_version = "old";
+    try testing.expect(iproutePostinstUnpack(program, authorization, 4, identity) == null);
+    steps[2].operation.unpack_package.prior_version = null;
+    steps[0].operation.materialize_bootstrap_payload.artifact = 1;
+    try testing.expect(iproutePostinstUnpack(program, authorization, 4, identity) == null);
+    steps[0].operation.materialize_bootstrap_payload.artifact = 0;
+    var wrong_authorization = authorization;
+    const wrong_actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .reinstall,
+        .package = identity.name,
+        .version = identity.version,
+        .architecture = identity.architecture,
+        .prior_version = identity.version,
+        .artifact = null,
+    }};
+    wrong_authorization.actions = &wrong_actions;
+    try testing.expect(iproutePostinstUnpack(program, wrong_authorization, 4, identity) == null);
+    model.metadata[0].sha256[0] ^= 1;
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
+    model.metadata[0].sha256[0] ^= 1;
+    model.metadata[0].size -= 1;
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
+    model.metadata[0].size += 1;
+    model.metadata[0].mode = 0o755;
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
+    model.metadata[0].mode = 0o644;
+    model.scripts[1].sha256[0] ^= 1;
+    try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
+}
+
+test "native_unpack.test.failed iproute postinst cannot schedule unpacked systemd" {
+    const Record = struct {
+        fn make(name: []const u8, state: package_database.CurrentState) !package_database.PackageRecord {
+            return .{
+                .name = name,
+                .architecture = "amd64",
+                .version = "1",
+                .parsed_version = try version_module.DebianVersion.parse("1"),
+                .status = .{ .want = .install, .error_state = .ok, .current = state },
+                .multi_arch = null,
+                .essential = false,
+                .protected = false,
+                .fields = &.{},
+                .conffiles = &.{},
+                .triggers_pending = &.{},
+                .triggers_awaited = &.{},
+                .info_stem = name,
+                .paths = &.{},
+                .md5sums = null,
+                .declared_conffiles = null,
+                .trigger_declarations = null,
+                .scripts = &.{},
+            };
+        }
+    };
+    var records = [_]package_database.PackageRecord{
+        try Record.make("systemd", .unpacked),
+        try Record.make("iproute2", .half_configured),
+    };
+    var database: package_database.Model = .{
+        .native_architecture = "amd64",
+        .status = .{ .sha256 = @splat(0), .size = 0, .package_count = records.len },
+        .packages = &records,
+    };
+    const listeners = [_]package_database.TriggerInterest{.{
+        .trigger = "libc-upgrade",
+        .package = .{ .name = "systemd", .architecture = "" },
+        .await_mode = .noawait,
+    }};
+    const event: RuntimeTriggerEvent = .{
+        .origin = .dynamic,
+        .source = .{ .name = "iproute2", .architecture = "amd64" },
+        .trigger = "libc-upgrade",
+        .activation_awaits = false,
+        .listeners = &listeners,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var pending: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    var awaited: std.ArrayList(SimulatedTriggerPackage) = .empty;
+    var pending_index: std.StringHashMapUnmanaged(usize) = .empty;
+    var awaited_index: std.StringHashMapUnmanaged(usize) = .empty;
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        event,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 0), pending.items.len);
+    records[0].status.current = .half_configured;
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        event,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 0), pending.items.len);
+    records[0].status.current = .installed;
+    try incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        event,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    );
+    try testing.expectEqual(@as(usize, 1), pending.items.len);
+    try testing.expectEqualStrings("libc-upgrade", pending.items[0].values.items[0]);
+    try testing.expectEqual(@as(usize, 0), awaited.items.len);
+    database.packages = &.{};
+    try testing.expectError(error.TriggerPackageMissing, incorporateTriggerEvent(
+        allocator,
+        database,
+        "amd64",
+        event,
+        &pending,
+        &pending_index,
+        &awaited,
+        &awaited_index,
+    ));
 }
 
 test "native_unpack.test.failed bootstrap preinst requires journaled payload and installed owner" {
