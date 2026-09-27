@@ -607,6 +607,22 @@ general variable substitution. The [alternatives
 reference](dpkg-alternatives-reference.md#native-admission) records the
 independent pinned-dpkg and pinned-tool probes.
 
+The separately signed `console-setup:all` 1.248ubuntu3 postinst needs its
+installed `var/lib/dpkg/info/console-setup.postinst` path for debconf. The
+native staged `var/lib/debz-lifecycle-scripts/console-setup.postinst` has the
+same bytes but lacks adjacent templates: direct execution from that exact
+private path in a disposable copy reproduces debconf's first `GET
+console-setup/codesetcode` returning 10 and the script exiting 10. Pinned
+dpkg 1.22.22 configures the package successfully from `info/` and runs its
+installed config first. Only the new-package amd64 postinst `["configure",
+""]` with the exact authenticated archive and script digests may select the
+installed path; the private staged candidate (if present), installed
+postinst, config, and templates must each match exact signed bytes, mode,
+and root-owned regular-file metadata. Missing or altered control files
+refuse before launch. All other scripts keep the staged-first rule; this
+does not reinterpret a nonzero outcome, bypass script journaling, or
+generalize debconf authority.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and
