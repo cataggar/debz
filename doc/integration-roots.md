@@ -732,6 +732,31 @@ The earlier `.real-snapshot/amd64-util-linux-fresh-long-1` stopped after
 authenticated refresh because a diagnostic invocation used an unsupported
 `resolve-lock` command; it never planned or executed a package.
 
+On the final #246 squash `e77f6641227e8f4552ad22cfd987142def8dfdfb`
+plus rebased util-linux change `73b008c6f8a649f9bbc8ef46708a149c41a882dc`,
+a **new, empty, elevated** amd64 root,
+`.real-snapshot/amd64-util-linux-rebased-signed-1`, used ReleaseSafe binary
+SHA-256 `49c9c3f875a0fe233164b6f925e87696ed7b80bde1de9a16861628f790aecb8c`.
+The reviewed signer was `f6ecb3762474eda9d21b7022871920d1991bc93c`;
+the independent authenticated `stonking` lock digest was
+`fa0952903605b2e94a2f1630aacda471c5db1b79ac1af90f792651ab7d45f636`.
+All 175 downloaded SHA-512-primary archives (67,976,788 bytes) were
+independently rehashed and size-checked against that lock. The exact signed
+`util-linux:amd64` postinst SHA-256
+`31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9`
+**spawned** at step **1243** with `["configure", ""]`, persisted exit **0**
+and 297 output bytes, and left util-linux `install ok installed`. The
+154-byte root-owned `pager` record SHA-256
+`efb067c8704b11530e836705a78bbfdacbe298b9d13df3a01e1f84ca794747a9`
+is byte-identical to the prior pinned dpkg/tool reference record; both
+selector links still choose `/usr/bin/less` and its manpage. The next
+refusal is the signed `console-setup-linux:all` postinst step **1292**,
+SHA-256 `5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`,
+with `["configure", ""]`: `InvalidAlternativesScript` **before launch**,
+only `script prepared` in the journal and no outcome file. The operation
+remains `recovery_required`; preserve the interrupted root, not a fresh
+retry or proof of full snapshot parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

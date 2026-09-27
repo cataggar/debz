@@ -483,6 +483,14 @@ script uses two variable-expanded `update-alternatives --install` candidates.
 This admission does not establish full-root parity; the newly interrupted
 root is retained for recovery.
 
+The independent fresh-root replay on final #246 plus the rebased util-linux
+change reproduced the same 154-byte pinned pager record **byte-for-byte**
+and kept both less selectors. Its signed postinst exited 0 at step 1243;
+console-setup-linux.postinst was then refused before launch at step 1292.
+The complete lock, executable, journal and interrupted-root evidence are
+recorded in the [integration roots](integration-roots.md); no full-closure
+parity follows from this bounded comparison.
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is
