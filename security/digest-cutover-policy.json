@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 468,
-      "sha512": "72b518471e7b1f691a7c2ed72553ca6946446bea86a06e2d703f25be32f5ec32f3a8561a2c5657dd913f9b1360e5e2d7ec6cd0c30f48bcb583818f1577db02e3"
+      "count": 469,
+      "sha512": "94208f48441e7b46a6e947587df8f6e0ccb2dcc92e92f7b92204b0c2732eff8d0760fa2c4233b35003fa8b6c604e9f159b60805c8a1a8fe4c489f7f55f0c6f2d"
     },
     "findings": {
-      "count": 21122,
+      "count": 21124,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
         "raw_32_byte": 1177,
-        "sha256_token": 19472
+        "sha256_token": 19474
       },
-      "sha512": "eb6b34f905379518cac8d6d54f740e51016b520e2b78593961820e292c815f6e8a0da5e20b3f8dbbc31c5777145d11f36f4a6202887cba60813c2091d12e6a69"
+      "sha512": "ae2ca5a189600529e28918ca51901b91c65cce2b6fbac4cdbe42faa9aa9e0ae8af99fdca6753992dbd74390d97f12ab1376bc0fd4a02d48b1cd840248d7fbd36"
     },
     "classifications": [
       {
@@ -181,16 +181,16 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc and signed chrony reference harnesses; production authorities remain typed and versioned.",
-        "count": 5039,
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc, signed chrony, and PID-only udev reference harnesses; production authorities remain typed and versioned.",
+        "count": 5041,
         "counts": {
           "cas_layout": 19,
           "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5015
+          "sha256_token": 5017
         },
-        "sha512": "50b31116514cf93dcb13958f728b069ef7a31e5c39c01f9c1fd831e51b53ef16ab72b66ad9da2b4b4ac74a6d716b23a8430cafdbe962c17433085194c92969d1"
+        "sha512": "9ee6db2eb8284121e85001df2a0f42be12a29e2a100132ae822b9325248b2aa24433704646be91aaa09051d117a722b8b5cfd01f84835b5aa27f9a51d4db8ba1"
       }
     ]
   },

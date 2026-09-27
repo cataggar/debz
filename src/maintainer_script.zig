@@ -1778,7 +1778,7 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
             observed.dev_minor != proc.root_stat.dev_minor or
             observed.ino != proc.root_stat.ino)
             return .STALE;
-        return restrictSnapshotProcPrivileges();
+        return restrictSnapshotProcPrivileges(failure_stage);
     }
     const boot_id = proc.view.systemd;
     const masked = linux.errno(linux.mount(

@@ -913,7 +913,7 @@ def audit_production_sources() -> None:
         '"etc/tmpfiles.d/static-nodes-permissions.conf"',
         '"etc/sysusers.d/debian-udev.conf"',
         '"usr/sbin/systemd-tmpfiles"',
-        "return restrictSnapshotProcPrivileges();",
+        "return restrictSnapshotProcPrivileges(failure_stage);",
     ):
         if required not in runner:
             fail(f"reviewed exact-script proc isolation changed: {required}")
