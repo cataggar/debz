@@ -75,6 +75,7 @@ pub const Policy = struct {
     capture: Capture = .separate,
     descendants: DescendantPolicy = .terminate,
     snapshot_systemd_proc: bool = false,
+    snapshot_udev_proc: bool = false,
     limits: Limits = .{},
     script_directories: []const []const u8 = &default_script_directories,
 };
@@ -93,6 +94,25 @@ fn snapshotSystemdIdentity(identity: Identity, arguments: []const []const u8) bo
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/systemd.postinst") and
         std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_systemd_sha256) and
+        arguments.len == 2 and
+        std.mem.eql(u8, arguments[0], "configure") and
+        arguments[1].len == 0;
+}
+
+const snapshot_udev_sha256: [32]u8 = .{
+    0x86, 0x1b, 0xa5, 0x7c, 0xdb, 0x3f, 0x94, 0xba,
+    0xe9, 0x4a, 0xf2, 0x37, 0xb9, 0x28, 0x4b, 0x01,
+    0xbc, 0xeb, 0x95, 0x6e, 0xe6, 0x9b, 0xb0, 0x9d,
+    0x3b, 0x54, 0xe3, 0x81, 0x56, 0x73, 0x36, 0xee,
+};
+
+fn snapshotUdevIdentity(identity: Identity, arguments: []const []const u8) bool {
+    return std.mem.eql(u8, identity.package, "udev") and
+        std.mem.eql(u8, identity.version, "261.2-1ubuntu2") and
+        std.mem.eql(u8, identity.architecture, "amd64") and
+        identity.kind == .postinst and
+        std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/udev.postinst") and
+        std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_udev_sha256) and
         arguments.len == 2 and
         std.mem.eql(u8, arguments[0], "configure") and
         arguments[1].len == 0;
@@ -280,6 +300,172 @@ pub const SnapshotSystemdProc = struct {
     }
 };
 
+const SnapshotUdevInput = struct {
+    path: []const u8,
+    size: u64,
+    mode: u16,
+    sha256: []const u8,
+};
+
+const snapshot_udev_inputs = [_]SnapshotUdevInput{
+    .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
+    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f" },
+    .{ .path = "usr/bin/systemd-hwdb", .size = 19448, .mode = 0o755, .sha256 = "71a197d9d0211bc8617280eef163d921fbed9648fc5b29a5a38f1bc0692ca6d8" },
+    .{ .path = "usr/bin/systemd-sysusers", .size = 73048, .mode = 0o755, .sha256 = "2f4e1f47cd486e8797f8874c6e61f80411c05f01bfe58e84b9811eea6fa97411" },
+    .{ .path = "usr/bin/systemd-tmpfiles", .size = 131024, .mode = 0o755, .sha256 = "8de8ec082f8e887f345c355201c8907ab311960301254e17e96f558798d6d621" },
+    .{ .path = "usr/bin/dpkg-maintscript-helper", .size = 21123, .mode = 0o755, .sha256 = "1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d" },
+    .{ .path = "usr/bin/deb-systemd-helper", .size = 24358, .mode = 0o755, .sha256 = "a895d5f077651960b6ca4ed9c53f8b36eae422ae170f61c972d0c6579e9f8732" },
+    .{ .path = "usr/sbin/update-rc.d", .size = 18147, .mode = 0o755, .sha256 = "9a85792c1ee2714d34ad2f0dac9becd987cbaedbfe25519dede7378e6c9ebbf1" },
+    .{ .path = "usr/bin/systemctl", .size = 303976, .mode = 0o755, .sha256 = "c51cb41312b3ad45ae4275179d501db82d150f7541ec95e5942f0094f2ffb00a" },
+    .{ .path = "usr/bin/deb-systemd-invoke", .size = 7135, .mode = 0o755, .sha256 = "92eadae89f4df4cd6088f6316f5390b685faf8d0e312a4e5af3a507caaf81bdb" },
+    .{ .path = "usr/lib/tmpfiles.d/static-nodes-permissions.conf", .size = 798, .mode = 0o644, .sha256 = "ca4849c27428fd648f6377dd51a3ab0eb79de69fce1bdc910670012c0cf26f85" },
+    .{ .path = "usr/lib/sysusers.d/debian-udev.conf", .size = 143, .mode = 0o644, .sha256 = "e9493928a4ed5399c5619cee0559644099f0625075606baca35b40533286b5e0" },
+};
+
+const snapshot_udev_overrides = [_][]const u8{
+    "etc/tmpfiles.d/static-nodes-permissions.conf",
+    "run/tmpfiles.d/static-nodes-permissions.conf",
+    "usr/local/lib/tmpfiles.d/static-nodes-permissions.conf",
+    "etc/sysusers.d/debian-udev.conf",
+    "run/sysusers.d/debian-udev.conf",
+    "usr/local/lib/sysusers.d/debian-udev.conf",
+};
+
+const snapshot_udev_path_shadows = [_][]const u8{
+    "usr/sbin/dpkg",
+    "usr/sbin/systemd-hwdb",
+    "usr/sbin/systemd-sysusers",
+    "usr/sbin/systemd-tmpfiles",
+    "usr/sbin/dpkg-maintscript-helper",
+    "usr/sbin/deb-systemd-helper",
+    "usr/sbin/systemctl",
+    "usr/sbin/deb-systemd-invoke",
+};
+
+pub const SnapshotUdevProc = struct {
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    root_path: []u8,
+    directory: root_fs.PinnedDirectory,
+    script: root_fs.PinnedRegularFile,
+    bin: root_fs.PinnedSymbolicLink,
+    shell: root_fs.PinnedSymbolicLink,
+    inputs: [snapshot_udev_inputs.len]root_fs.PinnedRegularFile,
+    root_stat: std.os.linux.Statx,
+    directory_stat: std.os.linux.Statx,
+
+    pub fn init(allocator: std.mem.Allocator, root: root_fs.Root) !SnapshotUdevProc {
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path_length = try root.dir.realPath(root.io, &path_buffer);
+        const root_path = try allocator.dupe(u8, path_buffer[0..path_length]);
+        errdefer allocator.free(root_path);
+        var directory = try root.pinDirectory(try root_fs.Path.init("proc"));
+        errdefer directory.close();
+        var contents = try directory.observeAlloc(allocator, 0, 0);
+        contents.deinit();
+        var script = try root.pinRegularFile(
+            try root_fs.Path.init("var/lib/dpkg/info/udev.postinst"),
+        );
+        errdefer script.close();
+        var bin = try root.pinSymbolicLink(try root_fs.Path.init("bin"));
+        errdefer bin.close();
+        var shell = try root.pinSymbolicLink(try root_fs.Path.init("usr/bin/sh"));
+        errdefer shell.close();
+        var inputs: [snapshot_udev_inputs.len]root_fs.PinnedRegularFile = undefined;
+        var count: usize = 0;
+        errdefer for (inputs[0..count]) |*input| input.close();
+        for (snapshot_udev_inputs, &inputs) |binding, *slot| {
+            slot.* = try root.pinRegularFile(try root_fs.Path.init(binding.path));
+            count += 1;
+        }
+        var result: SnapshotUdevProc = .{
+            .allocator = allocator,
+            .root = root,
+            .root_path = root_path,
+            .directory = directory,
+            .script = script,
+            .bin = bin,
+            .shell = shell,
+            .inputs = inputs,
+            .root_stat = undefined,
+            .directory_stat = undefined,
+        };
+        try result.verify(allocator);
+        if (helperStat(root.dir.handle, &result.root_stat) != .SUCCESS or
+            helperStat(directory.dir.handle, &result.directory_stat) != .SUCCESS or
+            result.root_stat.uid != 0 or result.root_stat.gid != 0 or
+            result.root_stat.mode != 0o40700)
+            return error.InvalidSnapshotUdevRoot;
+        return result;
+    }
+
+    pub fn verify(self: *const SnapshotUdevProc, allocator: std.mem.Allocator) !void {
+        const entry = (try self.directory.metadata()).entry;
+        if (!entry.modeled or entry.uid != 0 or entry.gid != 0 or
+            entry.mode != 0o755 or entry.kind != .directory)
+            return error.InvalidSnapshotUdevMountpoint;
+        var contents = try self.directory.observeAlloc(allocator, 0, 0);
+        contents.deinit();
+        for (snapshot_udev_overrides) |path| {
+            if (try self.root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return error.InvalidSnapshotUdevControl;
+        }
+        for (snapshot_udev_path_shadows) |path| {
+            if (try self.root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return error.InvalidSnapshotUdevTool;
+        }
+        const observed = try self.script.observeStableAlloc(allocator, 2533);
+        defer allocator.free(observed.bytes);
+        if (observed.entry.uid != 0 or observed.entry.gid != 0 or
+            observed.entry.mode != 0o755 or observed.entry.link_count != 1 or
+            observed.entry.size != 2533 or
+            !std.crypto.timing_safe.eql(
+                [32]u8,
+                hashBytes(observed.bytes),
+                snapshot_udev_sha256,
+            )) return error.InvalidSnapshotUdevScript;
+        var bin_target: [16]u8 = undefined;
+        const bin = try self.bin.observe(&bin_target);
+        if (bin.entry.uid != 0 or bin.entry.gid != 0 or
+            bin.entry.mode != 0o777 or bin.entry.link_count != 1 or
+            !std.mem.eql(u8, bin.target, "usr/bin"))
+            return error.InvalidSnapshotUdevTool;
+        var shell_target: [16]u8 = undefined;
+        const shell = try self.shell.observe(&shell_target);
+        if (shell.entry.uid != 0 or shell.entry.gid != 0 or
+            shell.entry.mode != 0o777 or shell.entry.link_count != 1 or
+            !std.mem.eql(u8, shell.target, "dash"))
+            return error.InvalidSnapshotUdevTool;
+        for (snapshot_udev_inputs, &self.inputs) |binding, *file| {
+            const input = try file.observeStableAlloc(allocator, @intCast(binding.size));
+            defer allocator.free(input.bytes);
+            var expected: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&expected, binding.sha256) catch unreachable;
+            if (input.entry.uid != 0 or input.entry.gid != 0 or
+                input.entry.mode != binding.mode or input.entry.link_count != 1 or
+                input.entry.size != binding.size or
+                !std.crypto.timing_safe.eql([32]u8, hashBytes(input.bytes), expected))
+                return error.InvalidSnapshotUdevTool;
+        }
+    }
+
+    pub fn deinit(self: *SnapshotUdevProc) void {
+        for (&self.inputs) |*input| input.close();
+        self.shell.close();
+        self.bin.close();
+        self.script.close();
+        self.directory.close();
+        self.allocator.free(self.root_path);
+        self.* = undefined;
+    }
+};
+
+const SnapshotProcMode = enum { systemd, udev };
+pub const SnapshotProcBinding = union(SnapshotProcMode) {
+    systemd: *const SnapshotSystemdProc,
+    udev: *const SnapshotUdevProc,
+};
+
 fn readKernelBootId() ![37]u8 {
     const flags: linux.O = .{
         .ACCMODE = .RDONLY,
@@ -337,7 +523,7 @@ pub const Request = struct {
     variables: []const Variable = &.{},
     policy: Policy = .{},
     helper_mount: ?*const HelperMount = null,
-    snapshot_proc: ?*const SnapshotSystemdProc = null,
+    snapshot_proc: ?SnapshotProcBinding = null,
 };
 
 pub const Isolation = enum {
@@ -478,7 +664,7 @@ pub const Invocation = struct {
     limits: Limits,
     cancellation: Cancellation,
     helper_mount: ?*const HelperMount = null,
-    snapshot_proc: ?*const SnapshotSystemdProc = null,
+    snapshot_proc: ?SnapshotProcBinding = null,
     identity: ?Identity = null,
 };
 
@@ -688,15 +874,24 @@ pub fn run(
 pub fn validate(request: Request) ?RejectionReason {
     const policy = request.policy;
     if (!absolute_path.root(request.root)) return .invalid_root;
-    const snapshot = policy.snapshot_systemd_proc and
-        snapshotSystemdIdentity(request.identity, request.arguments);
-    if (snapshot != (request.snapshot_proc != null))
-        return .invalid_snapshot_proc;
+    const expected_proc: ?SnapshotProcMode =
+        if (policy.snapshot_systemd_proc and
+        snapshotSystemdIdentity(request.identity, request.arguments))
+            .systemd
+        else if (policy.snapshot_udev_proc and
+        snapshotUdevIdentity(request.identity, request.arguments))
+            .udev
+        else
+            null;
     if (request.snapshot_proc) |proc| {
-        if (!std.mem.eql(u8, request.root, proc.root_path) or
-            policy.allow_host_root or policy.descendants != .terminate)
+        if (expected_proc == null or std.meta.activeTag(proc) != expected_proc.? or
+            policy.allow_host_root or policy.descendants != .terminate or
+            !std.mem.eql(u8, request.root, switch (proc) {
+                .systemd => |binding| binding.root_path,
+                .udev => |binding| binding.root_path,
+            }))
             return .invalid_snapshot_proc;
-    }
+    } else if (expected_proc != null) return .invalid_snapshot_proc;
     if (request.helper_mount) |mount| {
         if (!std.mem.eql(u8, request.root, mount.root_path))
             return .invalid_root;
@@ -754,13 +949,17 @@ pub fn validate(request: Request) ?RejectionReason {
 
 pub fn policyDigest(policy: Policy) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(if (policy.snapshot_systemd_proc)
+    hash.update(if (policy.snapshot_udev_proc)
+        "debz-maintainer-script-policy-v3\x00"
+    else if (policy.snapshot_systemd_proc)
         "debz-maintainer-script-policy-v2\x00"
     else
         "debz-maintainer-script-policy-v1\x00");
     hash.update(if (policy.allow_host_root) "host-root\x00" else "root\x00");
     if (policy.snapshot_systemd_proc)
         hash.update("exact-systemd-boot-id-v1\x00");
+    if (policy.snapshot_udev_proc)
+        hash.update("exact-udev-pid-only-v1\x00");
     hashString(&hash, @tagName(policy.capture));
     hashString(&hash, @tagName(policy.descendants));
     hashNumber(&hash, policy.limits.timeout_ms);
@@ -870,11 +1069,22 @@ fn digests(
         hashString(&hash, mount.evidence.target_path);
         hash.update(&mount.evidence.sha256);
     }
-    if (request.snapshot_proc) |proc| {
-        hash.update("debz-maintainer-script-systemd-boot-id-v1\x00");
-        hashString(&hash, "proc/sys/kernel/random/boot_id");
-        hash.update(&hashBytes(&proc.boot_id));
-    }
+    if (request.snapshot_proc) |proc| switch (proc) {
+        .systemd => |binding| {
+            hash.update("debz-maintainer-script-systemd-boot-id-v1\x00");
+            hashString(&hash, "proc/sys/kernel/random/boot_id");
+            hash.update(&hashBytes(&binding.boot_id));
+        },
+        .udev => {
+            hash.update("debz-maintainer-script-udev-pid-only-v1\x00");
+            for (snapshot_udev_inputs) |input| {
+                hashString(&hash, input.path);
+                hashString(&hash, input.sha256);
+            }
+            for (snapshot_udev_overrides) |path| hashString(&hash, path);
+            for (snapshot_udev_path_shadows) |path| hashString(&hash, path);
+        },
+    };
     return .{
         .script_sha256 = request.identity.script_sha256,
         .argv_sha256 = argv_sha256,
@@ -1073,14 +1283,24 @@ fn launchConfigured(
     }
     if (invocation.snapshot_proc) |proc| {
         const identity = invocation.identity orelse return setupFailure(.snapshot_proc, 0);
+        const bound = switch (proc) {
+            .systemd => |binding| snapshotSystemdIdentity(identity, invocation.argv[1..]) and
+                std.mem.eql(u8, invocation.program, "/var/lib/dpkg/info/systemd.postinst") and
+                std.mem.eql(u8, invocation.root, binding.root_path),
+            .udev => |binding| snapshotUdevIdentity(identity, invocation.argv[1..]) and
+                std.mem.eql(u8, invocation.program, "/var/lib/dpkg/info/udev.postinst") and
+                std.mem.eql(u8, invocation.root, binding.root_path),
+        };
         if (invocation.isolation != .chroot or invocation.descendants != .terminate or
-            !snapshotSystemdIdentity(identity, invocation.argv[1..]) or
-            !std.mem.eql(u8, invocation.program, "/var/lib/dpkg/info/systemd.postinst") or
-            !std.mem.eql(u8, invocation.root, proc.root_path))
+            !bound)
             return setupFailure(.snapshot_proc, 0);
-        proc.verify(allocator) catch |err| {
+        const verified = switch (proc) {
+            .systemd => |binding| binding.verify(allocator),
+            .udev => |binding| binding.verify(allocator),
+        };
+        verified catch |err| {
             if (err == error.OutOfMemory) return err;
-            std.log.err("signed systemd proc binding changed before launch: {s}", .{
+            std.log.err("signed proc binding changed before launch: {s}", .{
                 @errorName(err),
             });
             return setupFailure(.snapshot_proc, @intFromEnum(switch (err) {
@@ -1088,6 +1308,11 @@ fn launchConfigured(
                 error.SnapshotBootIdChanged,
                 error.InvalidSnapshotSystemdScript,
                 error.InvalidSnapshotProcMountpoint,
+                error.InvalidSnapshotUdevScript,
+                error.InvalidSnapshotUdevTool,
+                error.InvalidSnapshotUdevControl,
+                error.InvalidSnapshotUdevMountpoint,
+                error.InvalidSnapshotUdevRoot,
                 error.PathChanged,
                 => linux.E.STALE,
                 else => linux.E.IO,
@@ -1150,10 +1375,17 @@ fn launchConfigured(
         .setup_only = setup_only,
         .control_read = control_pipe[0],
         .control_write = control_pipe[1],
-        .proc = if (invocation.snapshot_proc) |proc| .{
-            .root_stat = proc.root_stat,
-            .directory_stat = proc.directory_stat,
-            .boot_id = proc.boot_id,
+        .proc = if (invocation.snapshot_proc) |proc| switch (proc) {
+            .systemd => |binding| .{
+                .root_stat = binding.root_stat,
+                .directory_stat = binding.directory_stat,
+                .view = .{ .systemd = binding.boot_id },
+            },
+            .udev => |binding| .{
+                .root_stat = binding.root_stat,
+                .directory_stat = binding.directory_stat,
+                .view = .udev,
+            },
         } else null,
     };
 
@@ -1354,7 +1586,10 @@ const ChildDescriptor = struct {
 const ProcDescriptor = struct {
     root_stat: linux.Statx,
     directory_stat: linux.Statx,
-    boot_id: [37]u8,
+    view: union(SnapshotProcMode) {
+        systemd: [37]u8,
+        udev: void,
+    },
 };
 
 /// Child half of the fork. Only async-signal-safe raw syscalls run here; no
@@ -1506,10 +1741,46 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
         "/proc",
         "proc",
         proc_mount_flags,
-        @intFromPtr("hidepid=2"),
+        @intFromPtr(switch (proc.view) {
+            .systemd => @as([*:0]const u8, "hidepid=2"),
+            .udev => @as([*:0]const u8, "hidepid=2,subset=pid"),
+        }),
     ));
     if (mounted != .SUCCESS) return mounted;
     if (failure_stage) |stage| stage.* = 3;
+    if (proc.view == .udev) {
+        for ([_][*:0]const u8{
+            "/proc/sys",
+            "/proc/sys/kernel/random/boot_id",
+        }) |path| {
+            const unexpected = linux.open(
+                path,
+                .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true },
+                0,
+            );
+            if (linux.errno(unexpected) == .SUCCESS) {
+                _ = linux.close(@intCast(unexpected));
+                return .EXIST;
+            }
+            if (linux.errno(unexpected) != .NOENT) return linux.errno(unexpected);
+        }
+        const visible = linux.open(
+            "/proc/1/root",
+            .{ .PATH = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(visible) != .SUCCESS) return linux.errno(visible);
+        var observed: linux.Statx = undefined;
+        const checked = helperStat(@intCast(visible), &observed);
+        _ = linux.close(@intCast(visible));
+        if (checked != .SUCCESS) return checked;
+        if (observed.dev_major != proc.root_stat.dev_major or
+            observed.dev_minor != proc.root_stat.dev_minor or
+            observed.ino != proc.root_stat.ino)
+            return .STALE;
+        return restrictSnapshotProcPrivileges(failure_stage);
+    }
+    const boot_id = proc.view.systemd;
     const masked = linux.errno(linux.mount(
         "tmpfs",
         "/proc/sys",
@@ -1543,8 +1814,8 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
     if (linux.errno(created) != .SUCCESS) return linux.errno(created);
     const file: i32 = @intCast(created);
     var offset: usize = 0;
-    while (offset < proc.boot_id.len) {
-        const count = linux.write(file, proc.boot_id[offset..].ptr, proc.boot_id.len - offset);
+    while (offset < boot_id.len) {
+        const count = linux.write(file, boot_id[offset..].ptr, boot_id.len - offset);
         switch (linux.errno(count)) {
             .SUCCESS => {
                 if (count == 0) {
@@ -1584,8 +1855,8 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
     const count = linux.read(read_fd, &bytes, bytes.len);
     _ = linux.close(read_fd);
     if (linux.errno(count) != .SUCCESS) return linux.errno(count);
-    if (count != proc.boot_id.len or
-        !std.mem.eql(u8, bytes[0..proc.boot_id.len], &proc.boot_id))
+    if (count != boot_id.len or
+        !std.mem.eql(u8, bytes[0..boot_id.len], &boot_id))
         return .STALE;
     if (failure_stage) |stage| stage.* = 8;
     for ([_][*:0]const u8{
@@ -3561,7 +3832,7 @@ test "maintainer_script.test.snapshot systemd proc is bound to the exact signed 
     request.arguments = &.{ "configure", "" };
     request.policy.snapshot_systemd_proc = true;
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
-    request.snapshot_proc = &binding;
+    request.snapshot_proc = .{ .systemd = &binding };
     try testing.expect(validate(request) == null);
     var launcher: RecordingLauncher = .{};
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
@@ -3618,6 +3889,99 @@ test "maintainer_script.test.capability header matches the kernel ABI" {
         @intFromPtr(&header),
         @intFromPtr(&data[0]),
     )));
+}
+
+test "maintainer_script.test.udev PID-only proc rejects unrelated and altered invocations" {
+    const hex = std.fmt.bytesToHex(snapshot_udev_sha256, .lower);
+    try testing.expectEqualStrings(
+        "861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee",
+        &hex,
+    );
+    var binding: SnapshotUdevProc = .{
+        .allocator = testing.allocator,
+        .root = undefined,
+        .root_path = @constCast("/srv/roots/target"),
+        .directory = undefined,
+        .script = undefined,
+        .bin = undefined,
+        .shell = undefined,
+        .inputs = undefined,
+        .root_stat = undefined,
+        .directory_stat = undefined,
+    };
+    var request = testRequest();
+    request.identity = .{
+        .package = "udev",
+        .version = "261.2-1ubuntu2",
+        .architecture = "amd64",
+        .kind = .postinst,
+        .script_path = "var/lib/dpkg/info/udev.postinst",
+        .script_sha256 = snapshot_udev_sha256,
+    };
+    request.arguments = &.{ "configure", "" };
+    request.policy.snapshot_udev_proc = true;
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.snapshot_proc = .{ .udev = &binding };
+    try testing.expect(validate(request) == null);
+    var launcher: RecordingLauncher = .{};
+    var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    try testing.expect(report.succeeded());
+    try testing.expectEqual(SnapshotProcMode.udev, std.meta.activeTag(launcher.invocation.?.snapshot_proc.?));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &policyDigest(.{ .snapshot_systemd_proc = true }),
+        &policyDigest(request.policy),
+    ));
+
+    request.arguments = &.{ "triggered", "/dev" };
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.arguments = &.{ "configure", "" };
+    request.identity.script_sha256 = @splat(0);
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.script_sha256 = snapshot_udev_sha256;
+    request.identity.script_path = "var/lib/debz-lifecycle-scripts/udev.postinst";
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.script_path = "var/lib/dpkg/info/udev.postinst";
+    request.identity.package = "other";
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.package = "udev";
+    request.identity.version = "261.2-1ubuntu3";
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.version = "261.2-1ubuntu2";
+    request.identity.architecture = "arm64";
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.architecture = "amd64";
+    request.identity.kind = .preinst;
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.identity.kind = .postinst;
+    request.policy.descendants = .detach;
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.policy.descendants = .terminate;
+    request.root = "/";
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.root = "/srv/roots/target";
+    request.snapshot_proc = null;
+    request.identity.package = "demo";
+    request.identity.script_path = "var/lib/dpkg/info/demo.postinst";
+    try testing.expect(validate(request) == null);
+    request.snapshot_proc = .{ .udev = &binding };
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    _ = &binding;
+}
+
+test "maintainer_script.test.udev PID-only proc rejects occupied mountpoint" {
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDir(testing.io, "proc", .default_dir);
+    try writeExecutableScript(&directory, "proc/occupied", "not empty");
+    try testing.expectError(
+        error.DirectoryTooLarge,
+        SnapshotUdevProc.init(
+            testing.allocator,
+            root_fs.Root.init(testing.io, directory.dir),
+        ),
+    );
 }
 
 test "maintainer_script.test.private PID1 mounts masked read-only boot ID and tears down" {
@@ -3678,7 +4042,7 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
         const setup = setupSnapshotProc(.{
             .root_stat = root_stat,
             .directory_stat = directory_stat,
-            .boot_id = boot_id,
+            .view = .{ .systemd = boot_id },
         }, &setup_stage);
         if (setup != .SUCCESS) testSnapshotProcFailure(status[1], 20 + setup_stage, setup);
         const present = linux.open(
@@ -3729,6 +4093,116 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
         std.debug.print("snapshot proc PID1 stage={d} errno={d} bytes={d}\n", .{ result[1], result[2], received });
     try testing.expectEqual(@as(usize, result.len), received);
     try testing.expectEqual(@as(u8, 1), result[0]);
+    try testing.expect(linux.W.IFEXITED(waited));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+    try testing.expect((try root.entryIfExists(try root_fs.Path.init("proc/sys"))) == null);
+}
+
+test "maintainer_script.test.private PID1 udev proc hides all sysctl and tears down" {
+    if (builtin.os.tag != .linux) return;
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDir(testing.io, "proc", .default_dir);
+    const path = try absoluteTempPath(testing.allocator, &directory, "");
+    defer testing.allocator.free(path);
+    const root_path = try testing.allocator.dupeZ(u8, std.mem.trimEnd(u8, path, "/"));
+    defer testing.allocator.free(root_path);
+    const root = root_fs.Root.init(testing.io, directory.dir);
+    var mountpoint = try root.pinDirectory(try root_fs.Path.init("proc"));
+    defer mountpoint.close();
+    var descriptor: ProcDescriptor = .{
+        .root_stat = undefined,
+        .directory_stat = undefined,
+        .view = .udev,
+    };
+    try testing.expectEqual(linux.E.SUCCESS, helperStat(directory.dir.handle, &descriptor.root_stat));
+    try testing.expectEqual(linux.E.SUCCESS, helperStat(mountpoint.dir.handle, &descriptor.directory_stat));
+    var status: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
+    const forked = linux.clone2(
+        linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
+        0,
+    );
+    if (linux.errno(forked) != .SUCCESS) {
+        _ = linux.close(status[0]);
+        _ = linux.close(status[1]);
+        if (linux.errno(forked) == .PERM and
+            std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") == null)
+            return;
+        return error.NativeHelperNamespaceRequired;
+    }
+    if (forked == 0) {
+        _ = linux.close(status[0]);
+        var result: [1]u8 = .{1};
+        if (linux.getpid() == 1 and
+            linux.errno(linux.prctl(
+                @intFromEnum(linux.PR.SET_PDEATHSIG),
+                @intFromEnum(linux.SIG.KILL),
+                0,
+                0,
+                0,
+            )) == .SUCCESS and
+            linux.errno(linux.mount(
+                null,
+                "/",
+                null,
+                linux.MS.REC | linux.MS.PRIVATE,
+                0,
+            )) == .SUCCESS and
+            linux.errno(linux.chdir(root_path.ptr)) == .SUCCESS and
+            linux.errno(linux.chroot(".")) == .SUCCESS and
+            linux.errno(linux.chdir("/")) == .SUCCESS and
+            setupSnapshotProc(descriptor, null) == .SUCCESS)
+        {
+            const sysctl = linux.open(
+                "/proc/sys",
+                .{ .PATH = true, .CLOEXEC = true },
+                0,
+            );
+            const boot_id = linux.open(
+                "/proc/sys/kernel/random/boot_id",
+                .{ .PATH = true, .CLOEXEC = true },
+                0,
+            );
+            const visible = linux.open(
+                "/proc/1/root",
+                .{ .PATH = true, .CLOEXEC = true },
+                0,
+            );
+            if (linux.errno(visible) == .SUCCESS) {
+                var observed: linux.Statx = undefined;
+                if (helperStat(@intCast(visible), &observed) == .SUCCESS and
+                    observed.ino == descriptor.root_stat.ino and
+                    observed.dev_major == descriptor.root_stat.dev_major and
+                    observed.dev_minor == descriptor.root_stat.dev_minor and
+                    linux.errno(sysctl) == .NOENT and
+                    linux.errno(boot_id) == .NOENT and
+                    linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.SYS_ADMIN, 0, 0, 0) == 0 and
+                    linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) == 1 and
+                    linux.errno(linux.mount(
+                        null,
+                        "/proc",
+                        null,
+                        linux.MS.REMOUNT | proc_mount_flags,
+                        0,
+                    )) == .PERM)
+                    result[0] = 0;
+                _ = linux.close(@intCast(visible));
+            }
+            if (linux.errno(sysctl) == .SUCCESS) _ = linux.close(@intCast(sysctl));
+            if (linux.errno(boot_id) == .SUCCESS) _ = linux.close(@intCast(boot_id));
+        }
+        _ = linux.write(status[1], &result, 1);
+        linux.exit(result[0]);
+    }
+    _ = linux.close(status[1]);
+    var result: [1]u8 = undefined;
+    const received = linux.read(status[0], &result, 1);
+    _ = linux.close(status[0]);
+    var waited: u32 = 0;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
+    try testing.expectEqual(@as(usize, 1), received);
+    try testing.expectEqual(@as(u8, 0), result[0]);
     try testing.expect(linux.W.IFEXITED(waited));
     try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
     try testing.expect((try root.entryIfExists(try root_fs.Path.init("proc/sys"))) == null);
@@ -3790,7 +4264,7 @@ test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
         },
         .arguments = &.{ "configure", "" },
         .policy = .{ .snapshot_systemd_proc = true },
-        .snapshot_proc = &proc,
+        .snapshot_proc = .{ .systemd = &proc },
     }, .{ .launcher = launcher.interface() });
     defer report.deinit();
     if (!report.succeeded())
@@ -3804,6 +4278,105 @@ test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
         try root_fs.Path.init("proc/sys"),
     )) == null);
     try proc.verify(testing.allocator);
+}
+
+test "maintainer_script.test.signed udev postinst uses only PID proc and applies static permissions" {
+    if (builtin.os.tag != .linux) return;
+    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_UDEV_PROC_ROOT") orelse return;
+    const root_path = std.mem.span(configured);
+    var root = try root_fs.openAbsoluteRoot(testing.io, root_path);
+    defer root.close();
+    var proc = try SnapshotUdevProc.init(testing.allocator, root.root);
+    defer proc.deinit();
+    var launcher: SystemLauncher = .{};
+    var report = try run(testing.allocator, .{
+        .root = root_path,
+        .identity = .{
+            .package = "udev",
+            .version = "261.2-1ubuntu2",
+            .architecture = "amd64",
+            .kind = .postinst,
+            .script_path = "var/lib/dpkg/info/udev.postinst",
+            .script_sha256 = snapshot_udev_sha256,
+        },
+        .arguments = &.{ "configure", "" },
+        .policy = .{ .snapshot_udev_proc = true },
+        .snapshot_proc = .{ .udev = &proc },
+    }, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    if (!report.succeeded())
+        std.debug.print("signed udev proc outcome={any} stderr={s}\n", .{
+            report.outcome,
+            report.stderr,
+        });
+    try testing.expect(report.succeeded());
+    try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    try testing.expect((try root.root.entryIfExists(
+        try root_fs.Path.init("proc/sys"),
+    )) == null);
+    const kvm = try root.root.entry(try root_fs.Path.init("dev/kvm"));
+    try testing.expectEqual(@as(u16, 0o660), kvm.mode);
+    try testing.expectEqual(@as(u32, 992), kvm.gid);
+    const fuse = try root.root.entry(try root_fs.Path.init("dev/fuse"));
+    try testing.expectEqual(@as(u16, 0o666), fuse.mode);
+    try testing.expectEqual(@as(u32, 0), fuse.uid);
+    try proc.verify(testing.allocator);
+}
+
+test "maintainer_script.test.signed udev proc rejects altered tools and controls" {
+    if (builtin.os.tag != .linux) return;
+    for ([_][]const u8{
+        "DEBZ_REQUIRE_SIGNED_UDEV_PROC_BAD_TOOL_ROOT",
+        "DEBZ_REQUIRE_SIGNED_UDEV_PROC_BAD_CONTROL_ROOT",
+    }) |variable| {
+        const name = try testing.allocator.dupeZ(u8, variable);
+        defer testing.allocator.free(name);
+        const configured = std.c.getenv(name) orelse continue;
+        var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(configured));
+        defer root.close();
+        try testing.expectError(
+            error.InvalidSnapshotUdevTool,
+            SnapshotUdevProc.init(testing.allocator, root.root),
+        );
+    }
+}
+
+test "maintainer_script.test.signed udev proc rejects shadowing sidecars" {
+    if (builtin.os.tag != .linux) return;
+    for ([_]struct {
+        variable: [:0]const u8,
+        reason: anyerror,
+    }{
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_UDEV_PROC_OVERRIDE_ROOT", .reason = error.InvalidSnapshotUdevControl },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_UDEV_PROC_PATH_SHADOW_ROOT", .reason = error.InvalidSnapshotUdevTool },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_UDEV_PROC_BAD_BIN_ROOT", .reason = error.InvalidSnapshotUdevTool },
+    }) |case| {
+        const configured = std.c.getenv(case.variable) orelse continue;
+        var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(configured));
+        defer root.close();
+        try testing.expectError(
+            case.reason,
+            SnapshotUdevProc.init(testing.allocator, root.root),
+        );
+    }
+}
+
+test "maintainer_script.test.signed udev tool changed after binding fails verification" {
+    if (builtin.os.tag != .linux) return;
+    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_UDEV_PROC_CHANGED_ROOT") orelse return;
+    const root_path = std.mem.span(configured);
+    var root = try root_fs.openAbsoluteRoot(testing.io, root_path);
+    defer root.close();
+    var proc = try SnapshotUdevProc.init(testing.allocator, root.root);
+    defer proc.deinit();
+    try root.root.dir.writeFile(testing.io, .{
+        .sub_path = "usr/bin/systemd-tmpfiles",
+        .data = "changed after binding",
+    });
+    try testing.expectError(error.PathChanged, proc.verify(testing.allocator));
+    try testing.expect((try root.root.entryIfExists(
+        try root_fs.Path.init("usr/lib/udev/hwdb.bin"),
+    )) == null);
 }
 
 test "maintainer_script.test.snapshot proc rejects an occupied mountpoint before launch" {
@@ -3864,7 +4437,7 @@ fn testMaskedProcWorker(
     linux.exit(0);
 }
 
-test "maintainer_script.test.masked proc dies on deadline and parent crash" {
+test "maintainer_script.test.both private proc views die on deadline and parent crash" {
     if (builtin.os.tag != .linux) return;
     var directory = testing.tmpDir(.{});
     defer directory.cleanup();
@@ -3877,72 +4450,79 @@ test "maintainer_script.test.masked proc dies on deadline and parent crash" {
         try root_fs.Path.init("proc"),
     );
     defer mountpoint.close();
+    const boot_id = readKernelBootId() catch {
+        if (std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
+            return error.NativeHelperNamespaceRequired;
+        return;
+    };
     var descriptor: ProcDescriptor = .{
         .root_stat = undefined,
         .directory_stat = undefined,
-        .boot_id = readKernelBootId() catch {
-            if (std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
-                return error.NativeHelperNamespaceRequired;
-            return;
-        },
+        .view = .{ .systemd = boot_id },
     };
     try testing.expectEqual(linux.E.SUCCESS, helperStat(directory.dir.handle, &descriptor.root_stat));
     try testing.expectEqual(linux.E.SUCCESS, helperStat(mountpoint.dir.handle, &descriptor.directory_stat));
-    for ([_]bool{ false, true }) |parent_crash| {
-        var status: [2]i32 = undefined;
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
-        const owner = if (parent_crash)
-            linux.fork()
-        else
-            linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD), 0);
-        if (linux.errno(owner) != .SUCCESS) {
-            _ = linux.close(status[0]);
+    for ([_]SnapshotProcMode{ .systemd, .udev }) |mode| {
+        descriptor.view = switch (mode) {
+            .systemd => .{ .systemd = boot_id },
+            .udev => .udev,
+        };
+        for ([_]bool{ false, true }) |parent_crash| {
+            var status: [2]i32 = undefined;
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
+            const owner = if (parent_crash)
+                linux.fork()
+            else
+                linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD), 0);
+            if (linux.errno(owner) != .SUCCESS) {
+                _ = linux.close(status[0]);
+                _ = linux.close(status[1]);
+                if (linux.errno(owner) == .PERM and
+                    std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") == null)
+                    return;
+                return error.NativeHelperNamespaceRequired;
+            }
+            if (owner == 0) {
+                _ = linux.close(status[0]);
+                if (!parent_crash)
+                    testMaskedProcWorker(root_path, descriptor, status[1], true);
+                const worker = linux.clone2(
+                    linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
+                    0,
+                );
+                if (linux.errno(worker) != .SUCCESS)
+                    testSnapshotProcFailure(status[1], 9, linux.errno(worker));
+                if (worker == 0)
+                    testMaskedProcWorker(root_path, descriptor, status[1], false);
+                var child_status: u32 = 0;
+                _ = linux.waitpid(@intCast(worker), &child_status, 0);
+                linux.exit(0);
+            }
             _ = linux.close(status[1]);
-            if (linux.errno(owner) == .PERM and
-                std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") == null)
-                return;
-            return error.NativeHelperNamespaceRequired;
-        }
-        if (owner == 0) {
-            _ = linux.close(status[0]);
-            if (!parent_crash)
-                testMaskedProcWorker(root_path, descriptor, status[1], true);
-            const worker = linux.clone2(
-                linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
-                0,
-            );
-            if (linux.errno(worker) != .SUCCESS)
-                testSnapshotProcFailure(status[1], 9, linux.errno(worker));
-            if (worker == 0)
-                testMaskedProcWorker(root_path, descriptor, status[1], false);
-            var child_status: u32 = 0;
-            _ = linux.waitpid(@intCast(worker), &child_status, 0);
-            linux.exit(0);
-        }
-        _ = linux.close(status[1]);
-        var ready: [3]u8 = .{ 0, 0, 0 };
-        const received = linux.read(status[0], &ready, ready.len);
-        if (received != ready.len or ready[0] != 1) {
+            var ready: [3]u8 = .{ 0, 0, 0 };
+            const received = linux.read(status[0], &ready, ready.len);
+            if (received != ready.len or ready[0] != 1) {
+                _ = linux.kill(@intCast(owner), .KILL);
+                var abandoned: u32 = 0;
+                _ = linux.waitpid(@intCast(owner), &abandoned, 0);
+                _ = linux.close(status[0]);
+                std.debug.print("snapshot proc teardown stage={d} errno={d} bytes={d}\n", .{ ready[1], ready[2], received });
+                return error.NativeHelperNamespaceRequired;
+            }
             _ = linux.kill(@intCast(owner), .KILL);
-            var abandoned: u32 = 0;
-            _ = linux.waitpid(@intCast(owner), &abandoned, 0);
+            var waited: u32 = 0;
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(owner), &waited, 0)));
+            try testing.expect(linux.W.IFSIGNALED(waited));
+            var pollfd: [1]linux.pollfd = .{.{ .fd = status[0], .events = linux.POLL.IN, .revents = 0 }};
+            const drained = linux.poll(&pollfd, pollfd.len, 5_000);
+            try testing.expectEqual(linux.E.SUCCESS, linux.errno(drained));
+            try testing.expectEqual(@as(usize, 1), drained);
+            var exhausted: [1]u8 = undefined;
+            try testing.expectEqual(@as(usize, 0), linux.read(status[0], &exhausted, 1));
             _ = linux.close(status[0]);
-            std.debug.print("snapshot proc teardown stage={d} errno={d} bytes={d}\n", .{ ready[1], ready[2], received });
-            return error.NativeHelperNamespaceRequired;
+            try testing.expect((try root_fs.Root.init(testing.io, directory.dir).entryIfExists(
+                try root_fs.Path.init("proc/sys"),
+            )) == null);
         }
-        _ = linux.kill(@intCast(owner), .KILL);
-        var waited: u32 = 0;
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(owner), &waited, 0)));
-        try testing.expect(linux.W.IFSIGNALED(waited));
-        var pollfd: [1]linux.pollfd = .{.{ .fd = status[0], .events = linux.POLL.IN, .revents = 0 }};
-        const drained = linux.poll(&pollfd, pollfd.len, 5_000);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(drained));
-        try testing.expectEqual(@as(usize, 1), drained);
-        var exhausted: [1]u8 = undefined;
-        try testing.expectEqual(@as(usize, 0), linux.read(status[0], &exhausted, 1));
-        _ = linux.close(status[0]);
-        try testing.expect((try root_fs.Root.init(testing.io, directory.dir).entryIfExists(
-            try root_fs.Path.init("proc/sys"),
-        )) == null);
     }
 }

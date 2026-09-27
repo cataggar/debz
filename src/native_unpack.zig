@@ -17657,7 +17657,18 @@ fn lifecycleScriptPolicy() maintainer_script.Policy {
     return .{
         .script_directories = &lifecycle_script_directories,
         .snapshot_systemd_proc = true,
+        .snapshot_udev_proc = true,
     };
+}
+
+fn lifecycleInvocationPolicy(
+    snapshot_systemd_proc: bool,
+    snapshot_udev_proc: bool,
+) maintainer_script.Policy {
+    var policy = lifecycleScriptPolicy();
+    if (snapshot_systemd_proc) policy.snapshot_udev_proc = false;
+    if (snapshot_udev_proc) policy.snapshot_systemd_proc = false;
+    return policy;
 }
 
 const snapshot_systemd_postinst_sha256 =
@@ -17695,6 +17706,48 @@ fn verifySnapshotSystemdPostinstPaths(
         (!std.mem.eql(u8, candidate, installed) and
             !std.mem.eql(u8, candidate, lifecycle_tmp_ci ++ "/systemd.postinst")))
         return error.InvalidSnapshotSystemdScript;
+    for ([_][]const u8{ candidate, installed }) |path| {
+        const observed = try rootFileSha256(allocator, root, path, 8192);
+        if (!std.crypto.timing_safe.eql([32]u8, observed, expected))
+            return error.InstalledScriptMismatch;
+    }
+}
+
+const snapshot_udev_postinst_sha256 =
+    "861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee";
+
+fn snapshotUdevProcIsBound(
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    action_kind: native_recovery.ActionKind,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) bool {
+    return std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.name, "udev") and
+        std.mem.eql(u8, package.version, "261.2-1ubuntu2") and
+        std.mem.eql(u8, package.architecture, "amd64") and
+        kind == .postinst and source == .new_package and
+        action_kind == .script and
+        std.mem.eql(u8, &script_sha256, snapshot_udev_postinst_sha256) and
+        arguments.len == 2 and
+        std.mem.eql(u8, arguments[0], "configure") and
+        arguments[1].len == 0;
+}
+
+fn verifySnapshotUdevPostinstPaths(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    candidate: []const u8,
+    installed: []const u8,
+    expected: [32]u8,
+) !void {
+    if (!std.mem.eql(u8, installed, "var/lib/dpkg/info/udev.postinst") or
+        (!std.mem.eql(u8, candidate, installed) and
+            !std.mem.eql(u8, candidate, lifecycle_tmp_ci ++ "/udev.postinst")))
+        return error.InvalidSnapshotUdevScript;
     for ([_][]const u8{ candidate, installed }) |path| {
         const observed = try rootFileSha256(allocator, root, path, 8192);
         if (!std.crypto.timing_safe.eql([32]u8, observed, expected))
@@ -17788,6 +17841,95 @@ test "native_unpack.test.signed systemd configure uses only matching staged and 
     try testing.expectError(
         error.InstalledScriptMismatch,
         verifySnapshotSystemdPostinstPaths(testing.allocator, root, staged, installed, expected),
+    );
+}
+
+test "native_unpack.test.signed udev PID-only proc requires exact configure and installed controls" {
+    const package: native_program.PackageIdentity = .{
+        .name = "udev",
+        .version = "261.2-1ubuntu2",
+        .architecture = "amd64",
+    };
+    const digest: native_program.Digest = snapshot_udev_postinst_sha256.*;
+    const args: []const []const u8 = &.{ "configure", "" };
+    try testing.expect(snapshotUdevProcIsBound(
+        "amd64",
+        package,
+        .postinst,
+        .new_package,
+        .script,
+        digest,
+        args,
+    ));
+    for ([_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = package,
+        kind: maintainer_script.Kind = .postinst,
+        source: native_program.ScriptSource = .new_package,
+        action_kind: native_recovery.ActionKind = .script,
+        digest: native_program.Digest = digest,
+        arguments: []const []const u8 = args,
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = .{ .name = "other", .version = package.version, .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "261.2-1ubuntu3", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
+        .{ .kind = .preinst },
+        .{ .source = .installed_package },
+        .{ .action_kind = .trigger },
+        .{ .digest = @splat('0') },
+        .{ .arguments = &.{"configure"} },
+        .{ .arguments = &.{ "configure", "old-version" } },
+        .{ .arguments = &.{ "triggered", "/dev" } },
+    }) |case| try testing.expect(!snapshotUdevProcIsBound(
+        case.architecture,
+        case.package,
+        case.kind,
+        case.source,
+        case.action_kind,
+        case.digest,
+        case.arguments,
+    ));
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = root_fs.Root.init(testing.io, tmp.dir);
+    for ([_][]const u8{
+        "var", "var/lib", "var/lib/dpkg", "var/lib/dpkg/info", lifecycle_tmp_ci,
+    }) |name| try root.ensureDirectory(
+        try root_fs.Path.init(name),
+        root_fs.default_directory_permissions,
+    );
+    const installed = "var/lib/dpkg/info/udev.postinst";
+    const staged = lifecycle_tmp_ci ++ "/udev.postinst";
+    const bytes = "#!/bin/sh\nexit 0\n";
+    var expected: [32]u8 = undefined;
+    Sha256.hash(bytes, &expected, .{});
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = staged, .data = bytes });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = installed, .data = bytes });
+    try verifySnapshotUdevPostinstPaths(testing.allocator, root, staged, installed, expected);
+    try verifySnapshotUdevPostinstPaths(testing.allocator, root, installed, installed, expected);
+    for ([_][]const u8{
+        "var/lib/dpkg/tmp.ci/udev.postinst",
+        lifecycle_tmp_ci ++ "/other.postinst",
+    }) |wrong| try testing.expectError(
+        error.InvalidSnapshotUdevScript,
+        verifySnapshotUdevPostinstPaths(testing.allocator, root, wrong, installed, expected),
+    );
+    try testing.expectError(
+        error.InvalidSnapshotUdevScript,
+        verifySnapshotUdevPostinstPaths(testing.allocator, root, staged, staged, expected),
+    );
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = staged, .data = "altered" });
+    try testing.expectError(
+        error.InstalledScriptMismatch,
+        verifySnapshotUdevPostinstPaths(testing.allocator, root, staged, installed, expected),
+    );
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = staged, .data = bytes });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = installed, .data = "altered" });
+    try testing.expectError(
+        error.InstalledScriptMismatch,
+        verifySnapshotUdevPostinstPaths(testing.allocator, root, staged, installed, expected),
     );
 }
 
@@ -21649,7 +21791,16 @@ fn runLifecycleScript(
         script_sha256,
         arguments,
     );
-    const info_path = if (snapshot_systemd_proc)
+    const snapshot_udev_proc = snapshotUdevProcIsBound(
+        program.target_architecture,
+        package,
+        kind,
+        source,
+        recovery_action.kind,
+        script_sha256,
+        arguments,
+    );
+    const info_path = if (snapshot_systemd_proc or snapshot_udev_proc)
         try lifecycleInstalledScriptPath(
             allocator,
             root,
@@ -21692,6 +21843,14 @@ fn runLifecycleScript(
         return error.InvalidLifecycleProgram;
     if (snapshot_systemd_proc)
         try verifySnapshotSystemdPostinstPaths(
+            allocator,
+            root,
+            candidate_path,
+            path,
+            expected,
+        );
+    if (snapshot_udev_proc)
+        try verifySnapshotUdevPostinstPaths(
             allocator,
             root,
             candidate_path,
@@ -21936,10 +22095,22 @@ fn runLifecycleScript(
 
     var helper_mount: ?maintainer_script.HelperMount = null;
     defer if (helper_mount) |*mount| mount.deinit();
-    var snapshot_proc: ?maintainer_script.SnapshotSystemdProc = null;
-    defer if (snapshot_proc) |*proc| proc.deinit();
+    var snapshot_systemd_binding: ?maintainer_script.SnapshotSystemdProc = null;
+    defer if (snapshot_systemd_binding) |*proc| proc.deinit();
+    var snapshot_udev_binding: ?maintainer_script.SnapshotUdevProc = null;
+    defer if (snapshot_udev_binding) |*proc| proc.deinit();
     if (snapshot_systemd_proc) {
-        snapshot_proc = maintainer_script.SnapshotSystemdProc.init(
+        snapshot_systemd_binding = maintainer_script.SnapshotSystemdProc.init(
+            allocator,
+            root,
+        ) catch |err| {
+            if (attempt.record().mutation_started)
+                try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+    }
+    if (snapshot_udev_proc) {
+        snapshot_udev_binding = maintainer_script.SnapshotUdevProc.init(
             allocator,
             root,
         ) catch |err| {
@@ -22005,9 +22176,14 @@ fn runLifecycleScript(
             .script_sha256 = expected,
         },
         .arguments = arguments,
-        .policy = lifecycleScriptPolicy(),
+        .policy = lifecycleInvocationPolicy(snapshot_systemd_proc, snapshot_udev_proc),
         .helper_mount = if (helper_mount) |*mount| mount else null,
-        .snapshot_proc = if (snapshot_proc) |*proc| proc else null,
+        .snapshot_proc = if (snapshot_systemd_binding) |*proc|
+            .{ .systemd = proc }
+        else if (snapshot_udev_binding) |*proc|
+            .{ .udev = proc }
+        else
+            null,
     }, .{
         .launcher = launcher.interface(),
         .cancellation = if (execution.bounds) |bounds| bounds.cancellation() else .never(),

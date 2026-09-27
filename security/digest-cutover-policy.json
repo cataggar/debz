@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 468,
-      "sha512": "72b518471e7b1f691a7c2ed72553ca6946446bea86a06e2d703f25be32f5ec32f3a8561a2c5657dd913f9b1360e5e2d7ec6cd0c30f48bcb583818f1577db02e3"
+      "count": 469,
+      "sha512": "94208f48441e7b46a6e947587df8f6e0ccb2dcc92e92f7b92204b0c2732eff8d0760fa2c4233b35003fa8b6c604e9f159b60805c8a1a8fe4c489f7f55f0c6f2d"
     },
     "findings": {
-      "count": 21075,
+      "count": 21131,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1169,
-        "sha256_token": 19433
+        "raw_32_byte": 1177,
+        "sha256_token": 19481
       },
-      "sha512": "a8405cb1cd4b80fb795893c16e17c4a1e3f98c094b8ab94a3a06b61c0c048ca6f79443c1e35d511d0a8fdfd29b0f374b5c6121466099a03a718413172fabaddc"
+      "sha512": "1ebd35e4371fdb19d76730b180bd530c60e5dc91adda2d72565ff46814254e4f5f52b7d375e55875f350854b066f18844a4d59de136a57525103ac510f938758"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 272,
+        "count": 283,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 241
+          "sha256_token": 252
         },
-        "sha512": "0c818ec1b0da8545582ba5522c4896add6a62785560d91e18a73304eff4a2f00515b33325ba6619b465811cd38ae5f7e8121d8b5da6205f3ec247e2e2350bffb"
+        "sha512": "5cd159f3509cd48f314e80f3e0ff99afb5193a58eb159486757575fc14bfbe81d4cdb5aa492f60ae05fab053b286d319b29428640888a28dc47938981eeb7dc6"
       },
       {
         "scope": "fuzz",
@@ -153,16 +153,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12273,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only and udev PID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "count": 12316,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1095,
-          "sha256_token": 11031
+          "raw_32_byte": 1103,
+          "sha256_token": 11066
         },
-        "sha512": "6137decb6c664e4639db4f498a0b1ab99b70d808bbd0864f09a330031b3749cb36360fd6dfd7fbe08d8ccf7f77a7587ce1a232c01a28d5cdefbc4111104a377d"
+        "sha512": "a663abd63978a77254d3701376c00db6d8d8d2765cffa2ef05ef1068f289e8f59f1ee1d755735db2dbfd25cea7753173c178372929ba2309d056d479688c8e15"
       },
       {
         "scope": "test",
@@ -181,16 +181,16 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc and signed chrony reference harnesses; production authorities remain typed and versioned.",
-        "count": 5039,
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc, signed chrony, and PID-only udev reference harnesses; production authorities remain typed and versioned.",
+        "count": 5041,
         "counts": {
           "cas_layout": 19,
           "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5015
+          "sha256_token": 5017
         },
-        "sha512": "50b31116514cf93dcb13958f728b069ef7a31e5c39c01f9c1fd831e51b53ef16ab72b66ad9da2b4b4ac74a6d716b23a8430cafdbe962c17433085194c92969d1"
+        "sha512": "9ee6db2eb8284121e85001df2a0f42be12a29e2a100132ae822b9325248b2aa24433704646be91aaa09051d117a722b8b5cfd01f84835b5aa27f9a51d4db8ba1"
       }
     ]
   },

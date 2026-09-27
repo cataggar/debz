@@ -1191,6 +1191,148 @@ exit **8**). The interrupted native root is retained read-only and is
 never retried as a fresh run. This proves chrony's bounded configure path,
 not udev authority, successful completion, or full snapshot parity.
 
+A separate protected, proof-only amd64 run at combined local commit `89675bd`
+used a root-owned checkout beneath `/root` and a root-owned, mode-0700
+`.real-snapshot`. Its **new** 175-package signed lock identified signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C`; all 175 downloaded archives
+were independently rehashed against their locked SHA-512 digests. In
+`amd64-udev-proof-new-3`, a traced exec stop copied the root **before** the
+exact signed staged udev postinst SHA-256
+`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`
+ran with `["configure", ""]`. Its durable lifecycle record identified
+step 1357 as `in_flight`; `/proc` was empty. The source run deliberately
+stopped with exit 88 and is interrupted, not a completed installation or
+a reusable fresh root.
+
+Six independent disposable copies of that protected prestate compared
+pinned dpkg 1.22.22 and the signed script under no `/proc` and a private
+PID+mount namespace with `ro,nosuid,nodev,noexec,hidepid=2,subset=pid`
+procfs, chrooted PID 1, no `/proc/sys`, dropped `CAP_SYS_ADMIN`, and
+no-new-privileges. Native records udev as `installed` before its postinst;
+to make `dpkg --configure udev` execute, **four copies only** changed its
+dpkg status to `half-configured`, identically for the reference and direct
+script cases. Two direct-script copies preserved the actual `installed`
+prestate. With no `/proc`, dpkg and both direct-script cases failed with
+the same tmpfiles requirement (script exit 1); with restricted procfs,
+dpkg and both direct-script cases exited 0 with identical script stderr.
+Both successful environments registered `input:995`, `sgx:994`,
+`clock:993`, `kvm:992`, and `render:991`; `/etc/group`, the generated
+root-owned mode-0444 hwdb, `/dev`, and service-helper content and metadata
+matched the pinned reference. All nine signed static-node permission
+targets were absent before and after, so this proof establishes **no**
+permission or ownership change for existing device nodes. Each private
+`/proc` mount was gone afterward. The udev callback required no boot ID
+or other `/proc/sys` entry in this prestate, but this **does not** authorize
+udev to use systemd's exact-script proc mechanism or prove a completed
+175-package replay. Protected checkout provisioning and namespace/mount
+capabilities remain unproven on CI arm64 and WSL.
+
+The separately authorized udev implementation at protected source snapshot
+`38ddbca3bdcd67418cad5ea61c1903699130afa7` admits only that signed
+new-package `udev:amd64` `261.2-1ubuntu2` postinst with
+`["configure", ""]`, from its verified installed dpkg-info path. Its
+PID-only private procfs has no `/proc/sys` or boot ID; the signed script,
+required tools and sidecars, path resolution, root and empty mountpoint are
+pinned before launch. Systemd's separate boot-ID view is unchanged. In
+protected disposable pre-udev copies, pinned dpkg 1.22.22 and the signed
+script each exited 1 without `/proc` and 0 with the PID-only view. Three
+additional **regular files**, not host devices, started root:root mode 0600
+at `/dev/kvm`, `/dev/fuse`, and `/dev/snd/seq`. Both pinned dpkg and the
+signed script changed them to root:kvm (GID 992) mode 0660, root:root
+mode 0666, and root:audio (GID 29) mode 0660, respectively. The direct
+script comparison also retained the native `installed` prestate; only the
+disposable dpkg comparison set udev to `half-configured` so that dpkg would
+execute it. No real device node was exposed or altered.
+
+A **new**, independent 175-package amd64 root,
+`amd64-udev-proc-fresh-long-3`, ran under the protected root-owned checkout
+and mode-0700 `.real-snapshot`. It reauthenticated signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C` and all 175 signed-lock
+archive SHA-512 identities (67,976,788 download bytes), using the
+ReleaseSafe binary SHA-256
+`8cf3fee176ead7323076acaa83951acf3c44e66ac60c99959705b0082d0042c2`.
+The durable outcome for the signed udev postinst at step 1357 records
+`spawned=true`, `exit_code=0`, 182 stderr bytes and zero stdout bytes;
+the progress ledger marks it **completed/succeeded**. Udev is `install ok
+installed`, the five expected groups have GIDs 995 through 991, and the
+root-owned mode-0444 `/usr/lib/udev/hwdb.bin` was generated. `/proc` was
+empty and no private mount survived the callback.
+
+The installation did **not** complete. Its first subsequent blocker was
+`sudo:amd64` `1.9.17p2-7ubuntu3` postinst at step 1376, SHA-256
+`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`:
+the action remained **prepared**, without a sudo script outcome or launch.
+The ReleaseSafe process aborted (exit 134) inside
+`native_alternatives.capture` while preparing the alternatives boundary;
+the stack reports `OwnedRecord.deinit` through the parsed-record `errdefer`.
+The underlying capture error has not been established. `create.json` is
+empty because the process aborted; this interrupted root is **not** reusable
+as a fresh root or proof of full native/reference parity. Earlier
+`amd64-udev-proc-fresh-long-{1,2}` runs were also stopped before udev while
+tightening provider and path guards; neither was reused.
+
+On final #251 squash `06e84cbb155c300cd11ba6ab44a3be72775babda`
+plus the isolated udev source at `b5053574751eff4bcc5b90117f68edeb668594cd`,
+a root-owned checkout at `/var/lib/debz-udev-reference-251/checkout`
+repeated the pinned dpkg **1.22.22** comparison from a mode-0700
+`.real-snapshot`. The diagnostic source is an independently copied,
+half-configured udev root from the protected failed chrony run; it is
+**not** retried as a fresh native installation. The checkout-local
+`tools/real-snapshot-udev-reference.sh` rejects writable ancestry and
+changed signed controls, verifies the pinned executable and receipt, and
+copies the diagnostic source into a **new** disposable proof root. Pinned
+dpkg runs from `/usr/local/sbin` without replacing the signed Ubuntu
+`/usr/bin/dpkg` used by the postinst. Its private PID and mount namespace
+exposes only `ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs, with
+no `/proc/sys`; `CAP_SYS_ADMIN` is dropped before configure. The pinned
+`--no-triggers --configure udev` exited **0**, left udev `install ok
+installed`, and generated root-owned mode-0444
+`/usr/lib/udev/hwdb.bin` (13,735,371 bytes). The source remained
+half-configured; neither private `/proc` nor `/proc/sys` survived in the
+proof root. This is a protected **diagnostic comparison**, not new-root
+evidence or authority for any other signed script.
+
+The **genuinely new** authenticated amd64 workspace
+`/var/lib/debz-udev-reference-251/checkout/.real-snapshot/amd64-udev-251-protected-signed-1`
+used that same protected checkout and an empty root. Its reviewed signer
+was `f6ecb3762474eda9d21b7022871920d1991bc93c`, keyring SHA-256
+`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`,
+and ReleaseSafe candidate SHA-256
+`0646ef35175e782efc3ecd82052e5efd4db74a7cfc1283535a5775ccd9e5991a`.
+The immutable 175-package lock SHA-256 was
+`811baa788bdd44c8d9cf517b117c7270353885b45813d85399cb2944e947327c`;
+all 175 downloaded SHA-512-primary CAS objects (67,976,788 bytes) were
+independently size-checked and rehashed against its **exact** object set,
+recorded in `evidence/cas-rehash.tsv` (SHA-256
+`4b0501bcb7f26f2be2dfead5176a38e01643b08ee295d2f8cd2c2ff2e4191d54`).
+The protected runner's two bounded timeout substitutions have SHA-256
+`cfa860317c8844ed0aba0503b3db7b36594327099c141cc4a0d4b4d80884f666`.
+
+The exact signed `udev:amd64` postinst SHA-256
+`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`
+**spawned** at step **1357** with `["configure", ""]` and durably exited
+**0** (182 stderr bytes, no stdout). Step **1358** completed its
+`installed` transition with result `applied`; final udev status remains
+`install ok installed`. The generated root-owned mode-0444
+`/usr/lib/udev/hwdb.bin` is 13,735,371 bytes with SHA-256
+`d9800b3cbbe2f7b120c04fc83042f7538c858b615907cf71b913c0b0ad395e10`,
+byte-identical to the new protected pinned-dpkg proof. No `/proc/sys` or
+private `/proc` mount remained. Protected root-owned Debug and ReleaseSafe
+Zig namespace runs each executed **40/40** tests, including signed udev,
+both private proc views and teardown, without skips.
+
+The **first later blocker** is `sudo:amd64` `1.9.17p2-7ubuntu3`
+postinst at step **1376**: its action is only `prepared`, with **no
+postinst launch or outcome**. The ReleaseSafe process aborted (exit
+**134**, `General protection exception`) in
+`native_alternatives.capture`, through `OwnedRecord.deinit` on the
+parsed-record `errdefer`, before the sudo script boundary was admitted.
+`create.json` is empty; the underlying capture error remains unknown.
+The source and proof copies and this interrupted native root are retained
+read-only, never retried as a fresh root. Neither sudo capture nor any
+other signed script is authorized here, and full native/reference parity
+is **not** established.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

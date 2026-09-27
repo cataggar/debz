@@ -907,9 +907,16 @@ def audit_production_sources() -> None:
         '@offsetOf(KernelCapabilityHeader, "pid")',
         "linux.MS.REMOUNT | proc_mount_flags",
         "linux.syscall3(\n        .close_range,",
+        'snapshotUdevIdentity(identity, invocation.argv[1..])',
+        '"hidepid=2,subset=pid"',
+        '"/proc/sys/kernel/random/boot_id"',
+        '"etc/tmpfiles.d/static-nodes-permissions.conf"',
+        '"etc/sysusers.d/debian-udev.conf"',
+        '"usr/sbin/systemd-tmpfiles"',
+        "return restrictSnapshotProcPrivileges(failure_stage);",
     ):
         if required not in runner:
-            fail(f"reviewed systemd proc isolation changed: {required}")
+            fail(f"reviewed exact-script proc isolation changed: {required}")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")
