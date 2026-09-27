@@ -376,6 +376,10 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIn("linux.PR.SET_PDEATHSIG", runner)
         self.assertIn("linux.capset(", runner)
         self.assertIn("linux.syscall3(\n        .close_range,", runner)
+        self.assertIn('"hidepid=2,subset=pid"', runner)
+        self.assertIn("snapshotUdevIdentity(identity, invocation.argv[1..])", runner)
+        self.assertIn('"etc/tmpfiles.d/static-nodes-permissions.conf"', runner)
+        self.assertIn('"usr/sbin/systemd-tmpfiles"', runner)
         capability_owners = sorted({
             relative
             for relative, text in sources.items()

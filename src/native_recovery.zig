@@ -3823,41 +3823,43 @@ test "native_recovery.test.script outcome rejects changed disposition evidence" 
     try checkScriptOutcomeBinding();
 }
 
-test "native_recovery.test.snapshot proc setup failure is durable and never spawned" {
+test "native_recovery.test.exact proc setup failures are durable and never spawned" {
     const testing = std.testing;
-    var temporary = testing.tmpDir(.{});
-    defer temporary.cleanup();
-    const root = root_fs.Root.init(testing.io, temporary.dir);
-    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
-        try root.ensureDirectory(
-            try root_fs.Path.init(path),
-            root_fs.default_directory_permissions,
-        );
-    var outcome = testScriptOutcome();
-    outcome.package = "systemd";
-    outcome.package_version = "261.2-1ubuntu2";
-    outcome.arguments = &.{ "configure", "" };
-    outcome.disposition = .setup_failed;
-    outcome.exit_code = null;
-    outcome.setup_stage = .snapshot_proc;
-    outcome.setup_errno = @intFromEnum(std.os.linux.E.PERM);
-    outcome.spawned = false;
-    outcome.issued_descendant_sweep = false;
-    sealScriptOutcome(&outcome);
-    try publishScriptOutcome(testing.allocator, root, outcome);
-    var retained = (try readScriptOutcome(
-        testing.allocator,
-        root,
-        outcome.action,
-    )).?;
-    defer retained.deinit();
-    try testing.expectEqual(ScriptDisposition.setup_failed, retained.outcome.disposition);
-    try testing.expectEqual(maintainer_script.SetupStage.snapshot_proc, retained.outcome.setup_stage.?);
-    try testing.expect(!retained.outcome.spawned);
-    try testing.expect(retained.outcome.exit_code == null);
-    try testing.expectEqual(outcome.digest_sha256, retained.outcome.digest_sha256);
-    outcome.setup_errno = @intFromEnum(std.os.linux.E.IO);
-    try testing.expectError(error.DigestMismatch, validateScriptOutcome(outcome));
+    for ([_][]const u8{ "systemd", "udev" }) |package| {
+        var temporary = testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+            try root.ensureDirectory(
+                try root_fs.Path.init(path),
+                root_fs.default_directory_permissions,
+            );
+        var outcome = testScriptOutcome();
+        outcome.package = package;
+        outcome.package_version = "261.2-1ubuntu2";
+        outcome.arguments = &.{ "configure", "" };
+        outcome.disposition = .setup_failed;
+        outcome.exit_code = null;
+        outcome.setup_stage = .snapshot_proc;
+        outcome.setup_errno = @intFromEnum(std.os.linux.E.PERM);
+        outcome.spawned = false;
+        outcome.issued_descendant_sweep = false;
+        sealScriptOutcome(&outcome);
+        try publishScriptOutcome(testing.allocator, root, outcome);
+        var retained = (try readScriptOutcome(
+            testing.allocator,
+            root,
+            outcome.action,
+        )).?;
+        defer retained.deinit();
+        try testing.expectEqual(ScriptDisposition.setup_failed, retained.outcome.disposition);
+        try testing.expectEqual(maintainer_script.SetupStage.snapshot_proc, retained.outcome.setup_stage.?);
+        try testing.expect(!retained.outcome.spawned);
+        try testing.expect(retained.outcome.exit_code == null);
+        try testing.expectEqual(outcome.digest_sha256, retained.outcome.digest_sha256);
+        outcome.setup_errno = @intFromEnum(std.os.linux.E.IO);
+        try testing.expectError(error.DigestMismatch, validateScriptOutcome(outcome));
+    }
 }
 
 test "native_recovery.test.trigger events bind ordered activation evidence" {

@@ -78,6 +78,16 @@ tears down without publishing anything into the caller's root. This exception
 is bound to the script SHA-256 and exact package and argument identity, not a
 general proc, syscall, or mount grant.
 
+The independently authenticated udev postinst has a distinct exact-script
+exception: it uses the same chrooted PID-1 and private teardown mechanism,
+but mounts procfs with `subset=pid`, making **all** `/proc/sys` paths absent.
+The installed and staged script digests, signed tool and configuration
+bytes, root and empty mountpoint identities, and exact arguments are checked
+before launch. The child seals descriptors and loses remount authority
+before exec. A failed setup cannot turn into a successful package outcome;
+deferred procps callbacks still see no `/proc/sys`. This is not a shared
+proc grant to any other package or script.
+
 The future `debz apt` facade has a separate Linux-only live-root boundary
 (`src/live_root.zig`). It never weakens the product backend's host-root denial:
 the backend still receives `allow_host_root = false` and the stable alternate
