@@ -153,7 +153,7 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup debconf script-path and sidecar, keyboard and iproute2 maintainer-script/template gates, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup debconf script-path and sidecar, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
         "count": 12225,
         "counts": {
           "cas_layout": 75,
@@ -181,7 +181,7 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes; production authorities remain typed and versioned.",
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including the disposable pinned systemd proc reference harness; production authorities remain typed and versioned.",
         "count": 5035,
         "counts": {
           "cas_layout": 19,

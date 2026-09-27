@@ -711,7 +711,8 @@ test "security: apt import and native child-process owners retain explicit bound
         try testing.expectEqual(expected_owner, owns_child);
         if (owns_child) found += 1;
         if (!std.mem.eql(u8, entry.name, "apt_system_orchestrator.zig")) {
-            const owns_namespace = std.mem.indexOf(u8, source, "linux.unshare(") != null or
+            const owns_namespace = std.mem.indexOf(u8, source, "linux.clone2(") != null or
+                std.mem.indexOf(u8, source, "linux.unshare(") != null or
                 std.mem.indexOf(u8, source, "linux.setns(") != null or
                 std.mem.indexOf(u8, source, "linux.mount(") != null or
                 std.mem.indexOf(u8, source, "linux.move_mount(") != null or
@@ -719,6 +720,10 @@ test "security: apt import and native child-process owners retain explicit bound
             try testing.expectEqual(std.mem.eql(u8, entry.name, "live_root.zig") or
                 std.mem.eql(u8, entry.name, "maintainer_script.zig"), owns_namespace);
         }
+        const owns_capability = std.mem.indexOf(u8, source, "linux.capget(") != null or
+            std.mem.indexOf(u8, source, "linux.capset(") != null or
+            std.mem.indexOf(u8, source, "linux.prctl(") != null;
+        try testing.expectEqual(std.mem.eql(u8, entry.name, "maintainer_script.zig"), owns_capability);
     }
     try testing.expectEqual(owners.len, found);
     for ([_][]const u8{ "apt_system_command.zig", "native_unpack.zig", "production_backend.zig" }) |name| {
@@ -739,6 +744,9 @@ test "security: apt import and native child-process owners retain explicit bound
     for ([_][]const u8{
         "linux.open(\"/dev/null\"",        "linux.chroot(\".\")",           "linux.unshare(linux.CLONE.NEWNS)",
         "live_root.cloneMountDescriptor(", "live_root.setMountAttributes(", "linux.move_mount(",
+        "linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID",
+        "linux.PR.CAPBSET_DROP", "linux.PR.SET_NO_NEW_PRIVS", "linux.PR.SET_PDEATHSIG",
+        "linux.capset(", "linux.syscall3(\n        .close_range,",
     }) |marker| try support.contains(runner, marker);
     const live = try f.source("src/live_root.zig");
     try testing.expect(std.mem.indexOf(u8, live, "std.process.run(") == null);
