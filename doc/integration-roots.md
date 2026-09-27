@@ -1014,6 +1014,49 @@ reached in this root. This interrupted root cannot be reused as fresh; the
 chrony failure requires independent investigation, not another systemd
 exception or a claim of completed native/reference parity.
 
+On final #249 squash `6300f3913f78d246ed286377fa35d8ac6efc6097`
+plus only the isolated systemd-proc delta (combined source
+`1c78761305642d2844de8967cf1e516d416c7780`), a separate root-owned
+checkout at `/var/lib/debz-systemd-reference-249/checkout` first repeated
+the pinned dpkg **1.22.22** comparison. Its root-owned mode-0700
+`.real-snapshot` contains an independently copied, checked half-configured
+diagnostic source with empty `/proc`, a separately pinned reference binary,
+and a new disposable proof root. The protected harness exited **0**,
+recorded `systemd` `install ok installed`, and left no `/proc/sys` in the
+proof root. The earlier writable-checkout reference remains provisional;
+neither reference copy is a new native installation trial.
+
+The genuinely **new**, empty, elevated amd64 workspace
+`.real-snapshot/amd64-systemd-249-combined-signed-1` authenticated the
+reviewed Ubuntu signer
+`f6ecb3762474eda9d21b7022871920d1991bc93c` and keyring SHA-256
+`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`.
+Its 175-package immutable `stonking` lock SHA-256 was
+`655cb3f7ab9b8e1ef1e7868710eaf81d3dd6023486e6aee1f6b11767b57b6f81`;
+all 175 downloaded SHA-512-primary CAS archives (67,976,788 bytes) were
+independently rehashed and size-checked against that signed lock, with an
+exact object-set match (`evidence/cas-rehash.tsv` SHA-256
+`5a3b8d0d146264631f88ed39cb79bcc8960225b4526d67a1a7c6bdfad2db0487`).
+The ReleaseSafe candidate SHA-256 was
+`9d3228b0b19c421ec1fb9b1d141cc31e0ef4c697ac1001f99f2f953827b2c1c4`.
+The retained signed `systemd:amd64` postinst SHA-256
+`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+**spawned** at step **1328** with `["configure", ""]`, durably exited **0**
+with 748 captured output bytes, and step **1329** durably recorded
+`installed`. No `/proc/sys` remains in the host-visible root.
+
+The **first later signed script failure** was `chrony:amd64` postinst
+SHA-256 `bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`
+at step **1344**, which spawned, exited **10** with zero output, and remained
+half-configured. Deferred trigger processing later reached the **separately
+unauthorized** procps callback at step **1428** ordinal 3, refused before
+launch with `InvalidAlternativesScriptAuthority`, and caused install exit
+**8** with recovery required, not a successful completion receipt. Systemd
+ended `triggers-pending` after the later activations, despite its durable
+installed configure transition; do not misreport the final status as
+`installed`. This interrupted root is retained read-only, never retried as
+fresh, and proves neither the chrony/procps fixes nor full snapshot parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
