@@ -1191,6 +1191,42 @@ exit **8**). The interrupted native root is retained read-only and is
 never retried as a fresh run. This proves chrony's bounded configure path,
 not udev authority, successful completion, or full snapshot parity.
 
+A separate protected, proof-only amd64 run at combined local commit `89675bd`
+used a root-owned checkout beneath `/root` and a root-owned, mode-0700
+`.real-snapshot`. Its **new** 175-package signed lock identified signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C`; all 175 downloaded archives
+were independently rehashed against their locked SHA-512 digests. In
+`amd64-udev-proof-new-3`, a traced exec stop copied the root **before** the
+exact signed staged udev postinst SHA-256
+`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`
+ran with `["configure", ""]`. Its durable lifecycle record identified
+step 1357 as `in_flight`; `/proc` was empty. The source run deliberately
+stopped with exit 88 and is interrupted, not a completed installation or
+a reusable fresh root.
+
+Six independent disposable copies of that protected prestate compared
+pinned dpkg 1.22.22 and the signed script under no `/proc` and a private
+PID+mount namespace with `ro,nosuid,nodev,noexec,hidepid=2,subset=pid`
+procfs, chrooted PID 1, no `/proc/sys`, dropped `CAP_SYS_ADMIN`, and
+no-new-privileges. Native records udev as `installed` before its postinst;
+to make `dpkg --configure udev` execute, **four copies only** changed its
+dpkg status to `half-configured`, identically for the reference and direct
+script cases. Two direct-script copies preserved the actual `installed`
+prestate. With no `/proc`, dpkg and both direct-script cases failed with
+the same tmpfiles requirement (script exit 1); with restricted procfs,
+dpkg and both direct-script cases exited 0 with identical script stderr.
+Both successful environments registered `input:995`, `sgx:994`,
+`clock:993`, `kvm:992`, and `render:991`; `/etc/group`, the generated
+root-owned mode-0444 hwdb, `/dev`, and service-helper content and metadata
+matched the pinned reference. All nine signed static-node permission
+targets were absent before and after, so this proof establishes **no**
+permission or ownership change for existing device nodes. Each private
+`/proc` mount was gone afterward. The udev callback required no boot ID
+or other `/proc/sys` entry in this prestate, but this **does not** authorize
+udev to use systemd's exact-script proc mechanism or prove a completed
+175-package replay. Protected checkout provisioning and namespace/mount
+capabilities remain unproven on CI arm64 and WSL.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
