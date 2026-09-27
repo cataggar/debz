@@ -799,6 +799,43 @@ launch** with `InvalidAlternativesScriptAuthority`; no other pending
 postinst contains an alternatives command. The root and all its durable
 trigger claims are retained for recovery, **never** reused as fresh.
 
+On final #247 squash `94e21f7e2c602649abd7aa7447aa79a54b97a408`
+plus rebased console source `2c534a042d4550e730b40ff97cb7d192f1ea8263`,
+a **different new**, empty, elevated amd64 root,
+`.real-snapshot/amd64-console-setup-247-combined-signed-1`, used ReleaseSafe
+binary SHA-256 `489d31526aa888d158d98743bf5d57f3dd8ee07a602b73df6689e614105dafe1`.
+The reviewed signer was `f6ecb3762474eda9d21b7022871920d1991bc93c`;
+the authenticated `stonking` lock file SHA-256 was
+`02d84b6867204a7a4c28402f30909bb42dd60f3df411f8db918555d1da03a3d6`.
+All **175** downloaded SHA-512-primary archive objects (67,976,788
+bytes) were independently rehashed, size-checked against the lock, and
+matched against the exact CAS object set; the report is
+`evidence/cas-rehash.tsv`. The signed
+`console-setup-linux:all` postinst SHA-256
+`5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`
+**spawned** at step **1292** with `["configure", ""]`, durably exited **0**
+with 1,038 output bytes, and left its package `install ok installed`.
+The root-owned, 78-byte `vtrgb` record SHA-256
+`1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`
+is byte-identical to both pinned dpkg and pinned update-alternatives
+reference records. The generic `/etc/vtrgb` link targets
+`/etc/alternatives/vtrgb`, whose selector targets the signed priority-50
+`/etc/console-setup/vtrgb` provider.
+
+This is **not** a completed install. The separate `console-setup:all`
+postinst at step 1297 exited 10 under its existing failure-settlement
+contract. During deferred trigger processing at step 1428, libc-bin,
+debianutils, and libselinux1 callbacks spawned and persisted exit 0.
+The next callback, ordinal 3, has only a `prepared` record and **no**
+outcome; native install exited 8 with `InvalidAlternativesScriptAuthority`.
+`procps:amd64` remains `triggers-pending` for `/usr/lib/sysctl.d`; its
+installed postinst SHA-256
+`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+has a separately bound configure-only admission, not authorization for
+`["triggered", "/usr/lib/sysctl.d"]`. That callback refused before launch.
+Preserve this interrupted root for recovery; it is never a fresh retry or
+proof of full native/reference snapshot parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

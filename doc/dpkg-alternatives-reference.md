@@ -542,6 +542,18 @@ deferred trigger processing at step 1428: the existing exact procps
 configure-only admission rejects those triggered arguments. No full-root
 parity is inferred, and that newly interrupted root remains retained.
 
+After #247 squash `94e21f7e2c602649abd7aa7447aa79a54b97a408`,
+another **new**, elevated, signed amd64 root ran the rebased console
+admission at source commit `2c534a042d4550e730b40ff97cb7d192f1ea8263`.
+The exact postinst at step 1292 spawned, durably exited 0, and left
+`console-setup-linux:all` installed. Its 78-byte `vtrgb` record is
+byte-identical to **both** pinned references, and its generic and selector
+links select `/etc/console-setup/vtrgb`. A later, separate procps triggered
+callback refused before launch at step 1428; this root remains interrupted
+and supplies no full-closure parity claim. The signed lock, independent
+175-archive rehash and next refusal are recorded in the
+[integration roots](integration-roots.md).
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is
