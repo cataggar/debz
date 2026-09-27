@@ -105,15 +105,21 @@ require_protected_file "$source_root/var/lib/dpkg/alternatives/sudo"
   -f='${Version} ${Status}' sudo) == '1.9.17p2-7ubuntu3 install ok unpacked' ]]
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
   -f='${Version} ${Status}' sudo-rs) == '0.2.14-1ubuntu2 install ok installed' ]]
-for link in 'usr/bin/sudoedit:sudo.ws' \
-  'usr/share/man/man8/sudoedit.8.gz:sudo.ws.8.gz'; do
-  IFS=: read -r name target <<<"$link"
+for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit:sudo.ws' \
+  'usr/share/man/man8/sudoedit.8.gz:/etc/alternatives/sudoedit.8.gz:sudo.ws.8.gz'; do
+  IFS=: read -r name target payload_target <<<"$link"
   [[ -L "$source_root/$name" && $(readlink -- "$source_root/$name") == "$target" ]]
   [[ $(stat -c '%u:%g:%a:%h' -- "$source_root/$name") == 0:0:777:1 ]]
 done
 python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
 
 cp -a --reflink=auto -- "$source_root" "$proof_root"
+for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit:sudo.ws' \
+  'usr/share/man/man8/sudoedit.8.gz:/etc/alternatives/sudoedit.8.gz:sudo.ws.8.gz'; do
+  IFS=: read -r name target payload_target <<<"$link"
+  ln -sfn -- "$payload_target" "$proof_root/$name"
+  [[ $(readlink -- "$proof_root/$name") == "$payload_target" ]]
+done
 [[ -d "$proof_root/usr/local/sbin" && ! -L "$proof_root/usr/local/sbin" ]]
 install -o root -g root -m 0755 "$pinned" "$proof_root/usr/local/sbin/dpkg"
 [[ $(sha256sum "$proof_root/usr/local/sbin/dpkg" | cut -d' ' -f1) == \

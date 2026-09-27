@@ -488,9 +488,11 @@ combined-tree publication proof. `tools/real-snapshot-sudo-reference.sh`
 repeats the pinned dpkg 1.22.22 comparison from a root-owned checkout,
 mode-0700 fixture directory and independently copied authenticated
 pre-sudo diagnostic source. It refuses writable or symlinked ancestry,
-changed signed controls and unpinned dpkg, then executes only in a fresh
-disposable copy with private PID-only procfs and no `/proc/sys`. Neither
-the diagnostic source nor a failed native installation is retried.
+changed signed controls and unpinned dpkg, then restores only the two
+literal signed sudo payload links in a **new disposable diagnostic copy**,
+matching the pre-postinst unpack state. It executes only that copy with
+private PID-only procfs and no `/proc/sys`. The diagnostic source is
+unchanged and no failed native installation is retried.
 
 The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
 `4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)
