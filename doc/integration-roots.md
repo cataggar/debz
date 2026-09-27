@@ -917,6 +917,43 @@ neither it nor the earlier interrupted roots are reusable as fresh. The
 systemd environment and pinned-reference parity require a separate
 investigation, not an inferred success or a broadened console authorization.
 
+On final #248 squash `6e0c6b06a0deba3622079687952cb536a7d971f0`
+plus the **console-only** rebased source
+`56b037992af04b622c8dd151565beab7c3843612`, a different new,
+empty, elevated amd64 root,
+`.real-snapshot/amd64-console-postinst-248-combined-signed-1`, used
+ReleaseSafe binary SHA-256
+`67a230ded926b4766affa9475fdd1c5c590d9ee1d19d10786acd7efccbb41f17`.
+The reviewed Ubuntu signer was
+`f6ecb3762474eda9d21b7022871920d1991bc93c`; its authenticated
+175-package `stonking` lock file SHA-256 was
+`0bb4f952343052efc85f61d2344358ce24742f140afe13e80f1e941d3d0dc9c0`.
+All 175 downloaded SHA-512-primary archives (67,976,788 bytes) were
+independently rehashed, size-checked against the lock and matched
+against the exact object set in `evidence/cas-rehash.tsv`.
+
+The exact signed `console-setup:all` postinst SHA-256
+`e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d`
+**spawned** at step **1297** with `["configure", ""]`, durably exited
+**0** with zero output bytes, and left `console-setup` `install ok
+installed`. Debconf recorded `console-setup/codesetcode=guess`; the
+installed postinst, config and templates were byte-identical to the
+pinned dpkg 1.22.22 reference, and the 78-byte `vtrgb` record remained
+byte-identical to its pinned reference (SHA-256
+`1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`).
+The **first later signed failure** was `systemd:amd64` 261.2-1ubuntu2
+postinst SHA-256
+`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+at step **1328**: it spawned, exited **1** with 1,702 stderr bytes,
+reported that `/proc/` was not mounted but required for
+`systemd-tmpfiles`, and left systemd `install ok half-configured`.
+Deferred processing later reached the separately unauthorized procps
+trigger at step 1428 ordinal 3, which refused **before launch** with
+`InvalidAlternativesScriptAuthority`; the install command exited **8**
+and requires recovery, not a successful transaction receipt. Neither
+later issue is admitted by this console-only delta. The interrupted root
+is retained, never retried as fresh, and proves no full snapshot parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
