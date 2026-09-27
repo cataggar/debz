@@ -89,7 +89,8 @@ deferred procps callbacks still see no `/proc/sys`. This is not a shared
 proc grant to any other package or script.
 
 The signed sudo postinst has its own exact-package, version, digest and
-argument binding to the PID-only view. Its signed tools, tmpfiles sidecar,
+argument binding to the PID-only view. Its signed tools, the dpkg helper's
+sourced shell fragment, tmpfiles sidecar,
 aliases, executable PATH resolution, two sudo-owned structural links, and
 both authenticated sudo providers are checked before launch. This does
 not give sudo the systemd boot-ID view or extend proc authority to any

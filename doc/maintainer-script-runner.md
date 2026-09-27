@@ -245,7 +245,8 @@ Only the authenticated new-package `sudo:amd64` `1.9.17p2-7ubuntu3`
 can select the separately bound sudo view. The staged script must match the
 root-owned 1,927-byte installed dpkg-info script; the root is mode 0700 and
 its root-owned `/proc` mountpoint is an empty real directory. The pinned
-tools include `dash`, dpkg and its helper, the snapshot `update-alternatives`,
+tools include `dash`, dpkg and its helper's sourced
+`/usr/share/dpkg/sh/dpkg-error.sh` fragment, the snapshot `update-alternatives`,
 `systemd-tmpfiles`, and the exact GNU `rm`, `chown`, and `chmod` symlink
 targets. Their `/usr/sbin` shadows, higher-priority `sudo.conf` tmpfiles
 overrides, changed `/bin`, `/sbin`, shell or GNU command aliases, and changed

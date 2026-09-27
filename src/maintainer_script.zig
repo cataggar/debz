@@ -334,6 +334,7 @@ const snapshot_udev_inputs = [_]SnapshotUdevInput{
     .{ .path = "usr/bin/systemd-sysusers", .size = 73048, .mode = 0o755, .sha256 = "2f4e1f47cd486e8797f8874c6e61f80411c05f01bfe58e84b9811eea6fa97411" },
     .{ .path = "usr/bin/systemd-tmpfiles", .size = 131024, .mode = 0o755, .sha256 = "8de8ec082f8e887f345c355201c8907ab311960301254e17e96f558798d6d621" },
     .{ .path = "usr/bin/dpkg-maintscript-helper", .size = 21123, .mode = 0o755, .sha256 = "1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d" },
+    .{ .path = "usr/share/dpkg/sh/dpkg-error.sh", .size = 3228, .mode = 0o644, .sha256 = "d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528" },
     .{ .path = "usr/bin/deb-systemd-helper", .size = 24358, .mode = 0o755, .sha256 = "a895d5f077651960b6ca4ed9c53f8b36eae422ae170f61c972d0c6579e9f8732" },
     .{ .path = "usr/sbin/update-rc.d", .size = 18147, .mode = 0o755, .sha256 = "9a85792c1ee2714d34ad2f0dac9becd987cbaedbfe25519dede7378e6c9ebbf1" },
     .{ .path = "usr/bin/systemctl", .size = 303976, .mode = 0o755, .sha256 = "c51cb41312b3ad45ae4275179d501db82d150f7541ec95e5942f0094f2ffb00a" },
@@ -4695,6 +4696,9 @@ test "maintainer_script.test.signed sudo proc refuses tool alias and tmpfiles ov
     if (builtin.os.tag != .linux) return;
     for ([_]struct { variable: [:0]const u8, reason: anyerror }{
         .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_BAD_TOOL_ROOT", .reason = error.InvalidSnapshotSudoTool },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_BAD_FRAGMENT_ROOT", .reason = error.InvalidSnapshotSudoTool },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_MISSING_FRAGMENT_ROOT", .reason = error.FileNotFound },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_REDIRECTED_FRAGMENT_ROOT", .reason = error.NotRegularFile },
         .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_BAD_ALIAS_ROOT", .reason = error.InvalidSnapshotSudoTool },
         .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_OVERRIDE_ROOT", .reason = error.InvalidSnapshotSudoControl },
         .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_SHADOW_ROOT", .reason = error.InvalidSnapshotSudoTool },
@@ -4718,6 +4722,20 @@ test "maintainer_script.test.signed sudo tool changed after binding fails verifi
     defer proc.deinit();
     try root.root.dir.writeFile(testing.io, .{
         .sub_path = "usr/bin/systemd-tmpfiles",
+        .data = "changed after binding",
+    });
+    try testing.expectError(error.PathChanged, proc.verify(testing.allocator));
+}
+
+test "maintainer_script.test.signed sudo sourced fragment changed after binding fails verification" {
+    if (builtin.os.tag != .linux) return;
+    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_PROC_CHANGED_FRAGMENT_ROOT") orelse return;
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(configured));
+    defer root.close();
+    var proc = try SnapshotSudoProc.init(testing.allocator, root.root);
+    defer proc.deinit();
+    try root.root.dir.writeFile(testing.io, .{
+        .sub_path = "usr/share/dpkg/sh/dpkg-error.sh",
         .data = "changed after binding",
     });
     try testing.expectError(error.PathChanged, proc.verify(testing.allocator));
