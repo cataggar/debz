@@ -623,6 +623,22 @@ refuse before launch. All other scripts keep the staged-first rule; this
 does not reinterpret a nonzero outcome, bypass script journaling, or
 generalize debconf authority.
 
+The signed `chrony:amd64` `4.8-4ubuntu2` new-package postinst configure uses
+the same **path** distinction, under its own immutable archive SHA-512,
+postinst SHA-256, package/architecture/arguments, and exact installed
+`config` and `templates` digests and metadata. The staged postinst, if
+present, must independently match the signed bytes; the package database
+must resolve precisely `var/lib/dpkg/info/chrony.postinst`. Running that
+installed path lets debconf load its adjacent controls and register the one
+`chrony/configure_ubuntu_pools_in_sourcesd` question. Missing, symlinked,
+non-root-owned, multiply linked, or changed control files refuse before
+launch. The normal script outcome and recovery rules stay authoritative;
+no service status, debconf result, or proc mount is forged. An independently
+authenticated fresh root persisted chrony's zero exit and its installed
+status before the separate signed udev postinst failed for lack of `/proc`;
+that later failure neither alters chrony's outcome nor grants udev the
+systemd-specific isolated proc view.
+
 The exact signed `systemd:amd64` `261.2-1ubuntu2` postinst gets a distinct
 boot-ID-only, read-only `/proc/sys` view inside its own private PID and mount
 namespaces. The compiled lifecycle policy, verified script SHA-256, package,

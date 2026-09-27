@@ -153,7 +153,7 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup debconf script-path and sidecar, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
         "count": 12253,
         "counts": {
           "cas_layout": 75,
@@ -229,7 +229,7 @@
       "id": "raw-control-and-compatibility-fields",
       "kind": "raw_32_byte_field",
       "classification": "fixed_control_and_versioned_compatibility",
-      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, or protocol controls, or fields inside frozen version-specific compatibility structures; current content authority is typed.",
+      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony control verifier), or protocol controls, or fields inside frozen version-specific compatibility structures; current package content authority is typed.",
       "paths": [
         "src/apt_system_api.zig",
         "src/apt_system_cli.zig",
@@ -271,8 +271,8 @@
         "src/transaction_provenance_v3.zig",
         "src/transaction_result_summary.zig"
       ],
-      "count": 357,
-      "sha512": "8ab9327c3eff7efc27d5ca5eb17df90a9063131b0acb1671c3acf2cdb35be15283b36c13013d1607040471db7133330eadd8b6149a908caaf16f9aa86d3c47d4"
+      "count": 358,
+      "sha512": "c413851ada2cfda71eba195e0fdf690798c8c1d8f0db458ed403f0b4071a275644acda817d73d642c91b8183288ba4e11e66787732d3338d9e4d8765bf4cdb55"
     },
     {
       "id": "schema-historical-authority-fields",
