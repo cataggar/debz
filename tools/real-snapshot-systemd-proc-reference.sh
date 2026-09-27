@@ -1,22 +1,84 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 [[ $# == 3 ]] || {
   echo "usage: $0 PINNED_DPKG DISPOSABLE_SOURCE_ROOT NEW_PROOF_ROOT" >&2
   exit 2
 }
+[[ $(id -u) == 0 ]] || {
+  echo "the pinned reference requires root" >&2
+  exit 2
+}
+
+require_protected_path() {
+  local path=$1 current=/ remainder=${1#/} component owner mode metadata
+  [[ "$path" == /* ]] || return 2
+  while :; do
+    [[ -d "$current" && ! -L "$current" ]] || {
+      echo "reference path is not a real directory: $current" >&2
+      return 2
+    }
+    metadata=$(stat -c '%u:%a' -- "$current")
+    owner=${metadata%%:*}
+    mode=${metadata#*:}
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] &&
+      (( (8#$mode & 022) == 0 )) || {
+      echo "reference path is writable by an unprivileged user: $current" >&2
+      return 2
+    }
+    [[ -n "$remainder" ]] || break
+    component=${remainder%%/*}
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 2
+    current="${current%/}/$component"
+    if [[ "$remainder" == "$component" ]]; then
+      remainder=
+    else
+      remainder=${remainder#*/}
+    fi
+  done
+}
+
+require_protected_file() {
+  local path=$1 metadata owner mode
+  require_protected_path "$(dirname -- "$path")"
+  [[ -f "$path" && ! -L "$path" ]] || return 2
+  metadata=$(stat -c '%u:%a' -- "$path")
+  owner=${metadata%%:*}
+  mode=${metadata#*:}
+  [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] &&
+    (( (8#$mode & 022) == 0 )) || {
+    echo "reference program is writable by an unprivileged user: $path" >&2
+    return 2
+  }
+}
+
 repository_root=$(pwd -P)
+script_path=$(realpath -- "${BASH_SOURCE[0]}")
+[[ "$script_path" == "$repository_root/tools/real-snapshot-systemd-proc-reference.sh" ]] || {
+  echo "run the protected reference script from its checkout root" >&2
+  exit 2
+}
+require_protected_file "$script_path"
+require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
+require_protected_path "$repository_root/.real-snapshot"
+[[ $(stat -c '%u:%a' "$repository_root/.real-snapshot") == 0:700 ]] || {
+  echo "the reference fixture directory must be root-owned and mode 0700" >&2
+  exit 2
+}
 pinned=$(realpath "$1")
 source_root=$(realpath "$2")
 proof_root=$(realpath -m "$3")
+require_protected_path "$source_root"
+require_protected_path "$(dirname -- "$proof_root")"
 for path in "$source_root" "$proof_root"; do
   case "$path" in
     "$repository_root"/.real-snapshot/*) ;;
     *) echo "proof roots must be beneath this worktree's .real-snapshot" >&2; exit 2 ;;
   esac
 done
-[[ $(id -u) == 0 && "$source_root" != "$proof_root" ]]
+[[ "$source_root" != "$proof_root" ]]
 [[ -d "$source_root" && ! -L "$2" && ! -e "$proof_root" && ! -L "$proof_root" ]]
 [[ $(stat -c '%u:%g:%a' "$source_root") == 0:0:700 ]]
 [[ $(stat -c '%u:%g:%a' "$source_root/proc") == 0:0:755 ]]
