@@ -752,6 +752,49 @@ reached in this root. This interrupted root cannot be reused as fresh; the
 chrony failure requires independent investigation, not another systemd
 exception or a claim of completed native/reference parity.
 
+The authenticated `chrony:amd64` archive is SHA-512
+`5265963d95267643abec7fbadb5c76ae39a1a940e2b12a48d685c6859bcf44fa318c0f48c509b3c19811cc877b450a92c9fcad5a3212e7b78f441234d54cdcd9`
+(333,804 bytes). Its exact postinst, config, and templates have SHA-256
+`bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`,
+`77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0`,
+and `1f0ffe9e66ddc6593446ef924cf6dc80a445b161f0e1876ffac417f0a32841cf`.
+The failed root has no debconf row for
+`chrony/configure_ubuntu_pools_in_sourcesd`; its retained invocation digest
+selects the private staged `chrony.postinst`, which lacks adjacent config
+and templates. In separate disposable copies of that interrupted root with
+empty `/proc` and the native replacement environment, the exact signed
+staged path exited 10 with zero output and left the question absent; the
+byte-identical installed dpkg-info path exited 0 and registered the signed
+boolean default `true`. Pinned dpkg **1.22.22**
+(`0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5`)
+also configured chrony successfully from another disposable copy with
+empty `/proc`. This distinguishes the adjacent-control lookup from service
+or proc-mount behavior; the diagnostic copies are not fresh parity evidence.
+Only the exact authenticated new-package chrony postinst configure action
+may select the installed dpkg-info path, after pinning the archive identity
+and verifying both staged and installed scripts plus the installed config
+and templates as exact root-owned signed control files. No exit is masked,
+and no general debconf, service, or `/proc` authority is added. A **new**
+authenticated root must still prove step 1344 and identify the next blocker.
+
+A **new** independently authenticated 175-package amd64 root,
+`amd64-chrony-fresh-long-1`, used the reviewed signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C` and ReleaseSafe binary
+SHA-256 `9b2286d4c0c73531440cec7121fc1a6899252f4968ade28e3142d962f5726278`.
+It persisted signed systemd postinst step 1328 exit 0, then the exact
+signed chrony postinst step 1344 with `["configure", ""]`, `spawned=true`,
+**exit 0**, and 846 bytes of captured output. `chrony` is now `install ok
+installed`; debconf registered the signed boolean default `true`, and
+`/proc/sys` is still absent outside the invocation. The **first subsequent
+failure** is signed `udev:amd64` `261.2-1ubuntu2` postinst SHA-256
+`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`:
+it exited 1 at step 1357 with 349 stderr bytes stating that `/proc/` is
+required for `systemd-tmpfiles`. The native operation recorded
+`failed_after_mutation` (exit 7); the deferred procps trigger did not run.
+This interrupted root cannot be reused as fresh. Diagnosing udev's
+separate proc requirement must not infer authority from chrony's path fix,
+and this run does not establish complete native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

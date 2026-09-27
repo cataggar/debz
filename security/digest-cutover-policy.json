@@ -42,15 +42,15 @@
       "sha512": "e7a2f7013541ddd55ed4bd78389d5d24fa7e9a187cd4d2e615a7173cfc9f894f939a03f4082ea8e2f6d02558bbef4309a306a8adda71c0ebb05c2436cc03ecf4"
     },
     "findings": {
-      "count": 20614,
+      "count": 20638,
       "counts": {
         "cas_layout": 195,
         "digest_version": 104,
         "fixed_64_hex": 171,
-        "raw_32_byte": 1102,
-        "sha256_token": 19042
+        "raw_32_byte": 1103,
+        "sha256_token": 19065
       },
-      "sha512": "1b25ae99fafb1c2c9a53e762fb95170ed3c02b3021f5613a3d95a187c7dbb152b763d386df2fbc17bc967f682232ac017784aad8ca0b8fcc046d44882c79382d"
+      "sha512": "19749578acdd96f92245d0ac33c706ad40a8c3cb98c18236fe62e6e2cdee46bcc35a6ba4c1871430a40ebe3f5373eacffaed563010e35c5a07d39a6b11bc6549"
     },
     "classifications": [
       {
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 219,
+        "count": 223,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 188
+          "sha256_token": 192
         },
-        "sha512": "09d15fafd135c6ffb62098ddff9e68525855f3f781a2506a8c83301515e6a57320efa0fab9406d8f083a25ccc6f1debd3eae7ec5beb65febf8ec904df65fdd24"
+        "sha512": "ccd43875e132747ba68fc0f2ed646b737ec9399e0907ad700ec627323db728b16a315687f099ee1c3dbef67594687cdb2c99137887765ef4eea71c972bfc27de"
       },
       {
         "scope": "fuzz",
@@ -154,16 +154,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs, util-linux, console-setup-linux, console-setup debconf script-path and sidecar gate, keyboard and iproute2 maintainer-script/template gates, exact signed systemd boot-ID-only proc isolation, signed bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12248,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs, util-linux, console-setup-linux, console-setup and chrony exact debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, exact signed systemd boot-ID-only proc isolation, signed bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "count": 12268,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1096,
-          "sha256_token": 11005
+          "raw_32_byte": 1097,
+          "sha256_token": 11024
         },
-        "sha512": "2dbc9932de824e9d4221355367f39683c4afbb0b227f77ac407016c1b1efcffa63b6a838768740c4926c4b4527c0ee9a807eecfbd9cc0ed9ef00bb8cc74c9680"
+        "sha512": "eceec8fee0b1115e468c104d87f1985c82fcdfb62d83200e6189877791664ea0daaf480b37ec9f179245da15e2e6405ba6832bb1d4eb4c477a43fec894b8eeb8"
       },
       {
         "scope": "test",
@@ -230,7 +230,7 @@
       "id": "raw-control-and-compatibility-fields",
       "kind": "raw_32_byte_field",
       "classification": "fixed_control_and_versioned_compatibility",
-      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool, or protocol controls, or fields inside frozen version-specific compatibility structures; current package content authority is typed.",
+      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony control verifier), or protocol controls, or fields inside frozen version-specific compatibility structures; current package content authority is typed.",
       "paths": [
         "src/apt_system_api.zig",
         "src/apt_system_cli.zig",
@@ -272,8 +272,8 @@
         "src/transaction_provenance_v3.zig",
         "src/transaction_result_summary.zig"
       ],
-      "count": 357,
-      "sha512": "8ab9327c3eff7efc27d5ca5eb17df90a9063131b0acb1671c3acf2cdb35be15283b36c13013d1607040471db7133330eadd8b6149a908caaf16f9aa86d3c47d4"
+      "count": 358,
+      "sha512": "c413851ada2cfda71eba195e0fdf690798c8c1d8f0db458ed403f0b4071a275644acda817d73d642c91b8183288ba4e11e66787732d3338d9e4d8765bf4cdb55"
     },
     {
       "id": "schema-historical-authority-fields",

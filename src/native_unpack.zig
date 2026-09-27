@@ -19047,6 +19047,10 @@ const console_setup_postinst_sha256 =
     "e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d";
 const console_setup_archive_sha512 =
     "2ea052bd7c02091ce7afea7262e2340fdaeb9f362af79e4a1b42265ad98ace237b10770275970f89c81acf2c57bc2cc50234c2357adb167e84041c1c5479a330";
+const chrony_postinst_sha256 =
+    "bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935";
+const chrony_archive_sha512 =
+    "5265963d95267643abec7fbadb5c76ae39a1a940e2b12a48d685c6859bcf44fa318c0f48c509b3c19811cc877b450a92c9fcad5a3212e7b78f441234d54cdcd9";
 
 fn snapshotConsoleSetupPostinstUsesInfo(
     architecture: []const u8,
@@ -19069,49 +19073,90 @@ fn snapshotConsoleSetupPostinstUsesInfo(
         arguments[1].len == 0;
 }
 
-fn verifySnapshotConsoleSetupArtifact(
+fn snapshotChronyPostinstUsesInfo(
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    action_kind: native_recovery.ActionKind,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) bool {
+    return std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.name, "chrony") and
+        std.mem.eql(u8, package.version, "4.8-4ubuntu2") and
+        std.mem.eql(u8, package.architecture, "amd64") and
+        kind == .postinst and source == .new_package and
+        action_kind == .script and
+        std.mem.eql(u8, &script_sha256, chrony_postinst_sha256) and
+        arguments.len == 2 and
+        std.mem.eql(u8, arguments[0], "configure") and
+        arguments[1].len == 0;
+}
+
+const SnapshotDebconfControlError =
+    error{ InvalidConsoleSetupPostinstControl, InvalidChronyPostinstControl };
+
+fn verifyAuthenticatedSnapshotArtifact(
     artifacts: []const native_program.ProgramArtifact,
+    package: native_program.PackageIdentity,
+    expected_size: u64,
+    sha512: []const u8,
+    invalid: SnapshotDebconfControlError,
 ) !void {
     const expected = (try content_digest.Value.parse(
         .sha512,
-        console_setup_archive_sha512,
+        sha512,
     )).sha512;
     var found = false;
     for (artifacts) |artifact| {
-        if (!std.mem.eql(u8, artifact.package.name, "console-setup") or
-            !std.mem.eql(u8, artifact.package.architecture, "all"))
+        if (!std.mem.eql(u8, artifact.package.name, package.name) or
+            !std.mem.eql(u8, artifact.package.architecture, package.architecture))
             continue;
         const identity = artifact.identity() orelse
-            return error.InvalidConsoleSetupPostinstControl;
+            return invalid;
         const digest = identity.digests.sha512 orelse
-            return error.InvalidConsoleSetupPostinstControl;
+            return invalid;
         const origin = artifact.origin_v2 orelse
-            return error.InvalidConsoleSetupPostinstControl;
+            return invalid;
         const authenticated = switch (origin) {
             .authenticated_repository => true,
             else => false,
         };
-        if (found or !std.mem.eql(u8, artifact.package.version, "1.248ubuntu3") or
-            artifact.size != 108150 or identity.primary != .sha512 or
+        if (found or !std.mem.eql(u8, artifact.package.version, package.version) or
+            artifact.size != expected_size or identity.primary != .sha512 or
             !std.crypto.timing_safe.eql([64]u8, digest, expected) or
             !authenticated)
-            return error.InvalidConsoleSetupPostinstControl;
+            return invalid;
         found = true;
     }
-    if (!found) return error.InvalidConsoleSetupPostinstControl;
+    if (!found) return invalid;
 }
 
-const ConsoleSetupControlFile = struct {
+fn verifySnapshotConsoleSetupArtifact(
+    artifacts: []const native_program.ProgramArtifact,
+) !void {
+    return verifyAuthenticatedSnapshotArtifact(
+        artifacts,
+        .{ .name = "console-setup", .version = "1.248ubuntu3", .architecture = "all" },
+        108150,
+        console_setup_archive_sha512,
+        error.InvalidConsoleSetupPostinstControl,
+    );
+}
+
+const SignedDebconfControlFile = struct {
     path: []const u8,
     size: u64,
     mode: u16,
     sha256: []const u8,
 };
+const ConsoleSetupControlFile = SignedDebconfControlFile;
 
-fn matchesConsoleSetupControlFile(
+fn matchesSignedDebconfControlFile(
     entry: root_fs.Entry,
     digest: [32]u8,
-    binding: ConsoleSetupControlFile,
+    binding: SignedDebconfControlFile,
 ) bool {
     const expected = parseHex(32, binding.sha256) orelse return false;
     return entry.modeled and entry.kind == .file and
@@ -19121,10 +19166,19 @@ fn matchesConsoleSetupControlFile(
         std.crypto.timing_safe.eql([32]u8, digest, expected);
 }
 
-fn verifyConsoleSetupControlFile(
+fn matchesConsoleSetupControlFile(
+    entry: root_fs.Entry,
+    digest: [32]u8,
+    binding: ConsoleSetupControlFile,
+) bool {
+    return matchesSignedDebconfControlFile(entry, digest, binding);
+}
+
+fn verifySignedDebconfControlFile(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
-    binding: ConsoleSetupControlFile,
+    binding: SignedDebconfControlFile,
+    invalid: SnapshotDebconfControlError,
 ) !void {
     var pinned = try root.pinRegularFile(try root_fs.Path.init(binding.path));
     defer pinned.close();
@@ -19132,11 +19186,25 @@ fn verifyConsoleSetupControlFile(
     defer allocator.free(observed.bytes);
     var digest: [32]u8 = undefined;
     Sha256.hash(observed.bytes, &digest, .{});
-    if (!matchesConsoleSetupControlFile(observed.entry, digest, binding))
-        return error.InvalidConsoleSetupPostinstControl;
+    if (!matchesSignedDebconfControlFile(observed.entry, digest, binding))
+        return invalid;
 }
 
-const ConsoleSetupPostinstCandidate = enum { installed, staged };
+fn verifyConsoleSetupControlFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    binding: ConsoleSetupControlFile,
+) !void {
+    return verifySignedDebconfControlFile(
+        allocator,
+        root,
+        binding,
+        error.InvalidConsoleSetupPostinstControl,
+    );
+}
+
+const SignedDebconfPostinstCandidate = enum { installed, staged };
+const ConsoleSetupPostinstCandidate = SignedDebconfPostinstCandidate;
 
 fn snapshotConsoleSetupPostinstCandidate(
     candidate: []const u8,
@@ -19182,6 +19250,62 @@ fn snapshotConsoleSetupPostinstInfoPath(
         .{ .path = "var/lib/dpkg/info/console-setup.config", .size = 32119, .mode = 0o755, .sha256 = "9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8" },
         .{ .path = "var/lib/dpkg/info/console-setup.templates", .size = 174753, .mode = 0o644, .sha256 = "dbddc3ff45db9d1417abff0f21eef1aba5fbd1f1bc0cdb15eba4e3f86f2e1b81" },
     }) |binding| try verifyConsoleSetupControlFile(allocator, root, binding);
+    return installed;
+}
+
+fn snapshotChronyPostinstCandidate(
+    candidate: []const u8,
+    installed: []const u8,
+) ?SignedDebconfPostinstCandidate {
+    if (!std.mem.eql(u8, installed, "var/lib/dpkg/info/chrony.postinst"))
+        return null;
+    if (std.mem.eql(u8, candidate, installed)) return .installed;
+    if (std.mem.eql(u8, candidate, lifecycle_tmp_ci ++ "/chrony.postinst"))
+        return .staged;
+    return null;
+}
+
+fn snapshotChronyPostinstInfoPath(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+    package: native_program.PackageIdentity,
+    candidate: []const u8,
+) ![]const u8 {
+    try verifyAuthenticatedSnapshotArtifact(
+        program.artifacts,
+        .{ .name = "chrony", .version = "4.8-4ubuntu2", .architecture = "amd64" },
+        333804,
+        chrony_archive_sha512,
+        error.InvalidChronyPostinstControl,
+    );
+    const installed = try lifecycleInstalledScriptPath(
+        allocator,
+        root,
+        program.target_architecture,
+        package,
+        .postinst,
+    );
+    errdefer allocator.free(installed);
+    const selected = snapshotChronyPostinstCandidate(candidate, installed) orelse
+        return error.InvalidChronyPostinstControl;
+    if (selected == .staged)
+        try verifySignedDebconfControlFile(allocator, root, .{
+            .path = candidate,
+            .size = 6993,
+            .mode = 0o755,
+            .sha256 = chrony_postinst_sha256,
+        }, error.InvalidChronyPostinstControl);
+    for ([_]SignedDebconfControlFile{
+        .{ .path = "var/lib/dpkg/info/chrony.postinst", .size = 6993, .mode = 0o755, .sha256 = chrony_postinst_sha256 },
+        .{ .path = "var/lib/dpkg/info/chrony.config", .size = 204, .mode = 0o755, .sha256 = "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0" },
+        .{ .path = "var/lib/dpkg/info/chrony.templates", .size = 698, .mode = 0o644, .sha256 = "1f0ffe9e66ddc6593446ef924cf6dc80a445b161f0e1876ffac417f0a32841cf" },
+    }) |binding| try verifySignedDebconfControlFile(
+        allocator,
+        root,
+        binding,
+        error.InvalidChronyPostinstControl,
+    );
     return installed;
 }
 
@@ -20778,6 +20902,196 @@ test "native_unpack.test.signed console-setup debconf sidecars require unchanged
     try testing.expect(!matchesConsoleSetupControlFile(entry, altered_digest, binding));
 }
 
+test "native_unpack.test.signed chrony postinst selects installed info only for exact configure" {
+    const package: native_program.PackageIdentity = .{
+        .name = "chrony",
+        .version = "4.8-4ubuntu2",
+        .architecture = "amd64",
+    };
+    const digest: native_program.Digest = chrony_postinst_sha256.*;
+    const arguments: []const []const u8 = &.{ "configure", "" };
+    try testing.expect(snapshotChronyPostinstUsesInfo(
+        "amd64",
+        package,
+        .postinst,
+        .new_package,
+        .script,
+        digest,
+        arguments,
+    ));
+    for ([_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = package,
+        kind: maintainer_script.Kind = .postinst,
+        source: native_program.ScriptSource = .new_package,
+        action_kind: native_recovery.ActionKind = .script,
+        digest: native_program.Digest = digest,
+        arguments: []const []const u8 = arguments,
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = .{ .name = "other", .version = package.version, .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "4.8-4ubuntu3", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
+        .{ .kind = .preinst },
+        .{ .source = .installed_package },
+        .{ .action_kind = .trigger },
+        .{ .digest = @splat('0') },
+        .{ .arguments = &.{"configure"} },
+        .{ .arguments = &.{ "configure", "old-version" } },
+        .{ .arguments = &.{ "configure", "", "extra" } },
+        .{ .arguments = &.{ "triggered", "/usr/lib/sysctl.d" } },
+    }) |case| try testing.expect(!snapshotChronyPostinstUsesInfo(
+        case.architecture,
+        case.package,
+        case.kind,
+        case.source,
+        case.action_kind,
+        case.digest,
+        case.arguments,
+    ));
+
+    const installed = "var/lib/dpkg/info/chrony.postinst";
+    const staged = lifecycle_tmp_ci ++ "/chrony.postinst";
+    try testing.expectEqual(
+        SignedDebconfPostinstCandidate.installed,
+        snapshotChronyPostinstCandidate(installed, installed).?,
+    );
+    try testing.expectEqual(
+        SignedDebconfPostinstCandidate.staged,
+        snapshotChronyPostinstCandidate(staged, installed).?,
+    );
+    for ([_]struct { candidate: []const u8, info: []const u8 }{
+        .{ .candidate = staged, .info = "var/lib/dpkg/info/other.postinst" },
+        .{ .candidate = installed, .info = "var/lib/dpkg/info/other.postinst" },
+        .{ .candidate = "var/lib/dpkg/tmp.ci/chrony.postinst", .info = installed },
+        .{ .candidate = lifecycle_tmp_ci ++ "/other.postinst", .info = installed },
+        .{ .candidate = "var/lib/dpkg/info/other.postinst", .info = installed },
+    }) |case| try testing.expect(
+        snapshotChronyPostinstCandidate(case.candidate, case.info) == null,
+    );
+
+    const sha512 = (try content_digest.Value.parse(.sha512, chrony_archive_sha512)).sha512;
+    const identity = try content_digest.Identity.init(.{ .sha512 = sha512 }, .sha512);
+    const artifact: native_program.ProgramArtifact = .{
+        .index = 7,
+        .package = package,
+        .archive_identity = content_digest.JsonIdentity.init(identity),
+        .size = 333804,
+        .application_sha256 = @splat('0'),
+        .origin_v2 = .{ .authenticated_repository = .{
+            .repository_id = @splat('0'),
+            .repository_snapshot_sha256 = @splat('0'),
+        } },
+    };
+    try verifyAuthenticatedSnapshotArtifact(
+        &.{artifact},
+        package,
+        333804,
+        chrony_archive_sha512,
+        error.InvalidChronyPostinstControl,
+    );
+    for ([_][]const native_program.ProgramArtifact{
+        &.{},
+        &.{ artifact, artifact },
+    }) |invalid_artifacts| try testing.expectError(
+        error.InvalidChronyPostinstControl,
+        verifyAuthenticatedSnapshotArtifact(
+            invalid_artifacts,
+            package,
+            333804,
+            chrony_archive_sha512,
+            error.InvalidChronyPostinstControl,
+        ),
+    );
+    var changed = artifact;
+    changed.package.version = "4.8-4ubuntu3";
+    try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
+        &.{changed},
+        package,
+        333804,
+        chrony_archive_sha512,
+        error.InvalidChronyPostinstControl,
+    ));
+    changed = artifact;
+    changed.size += 1;
+    try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
+        &.{changed},
+        package,
+        333804,
+        chrony_archive_sha512,
+        error.InvalidChronyPostinstControl,
+    ));
+    changed = artifact;
+    changed.origin_v2 = null;
+    try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
+        &.{changed},
+        package,
+        333804,
+        chrony_archive_sha512,
+        error.InvalidChronyPostinstControl,
+    ));
+    changed = artifact;
+    var wrong_sha512 = sha512;
+    wrong_sha512[0] ^= 1;
+    changed.archive_identity = content_digest.JsonIdentity.init(
+        try content_digest.Identity.init(.{ .sha512 = wrong_sha512 }, .sha512),
+    );
+    try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
+        &.{changed},
+        package,
+        333804,
+        chrony_archive_sha512,
+        error.InvalidChronyPostinstControl,
+    ));
+}
+
+test "native_unpack.test.signed chrony debconf controls reject metadata or byte changes" {
+    for ([_]SignedDebconfControlFile{
+        .{ .path = "var/lib/dpkg/info/chrony.postinst", .size = 6993, .mode = 0o755, .sha256 = chrony_postinst_sha256 },
+        .{ .path = "var/lib/dpkg/info/chrony.config", .size = 204, .mode = 0o755, .sha256 = "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0" },
+        .{ .path = "var/lib/dpkg/info/chrony.templates", .size = 698, .mode = 0o644, .sha256 = "1f0ffe9e66ddc6593446ef924cf6dc80a445b161f0e1876ffac417f0a32841cf" },
+    }) |binding| {
+        const digest = parseHex(32, binding.sha256).?;
+        var entry: root_fs.Entry = .{
+            .kind = .file,
+            .size = binding.size,
+            .mode = binding.mode,
+            .uid = 0,
+            .gid = 0,
+            .device = 1,
+            .inode = 2,
+            .link_count = 1,
+            .modified_nanoseconds = 0,
+            .modeled = true,
+        };
+        try testing.expect(matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.uid = 1;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.uid = 0;
+        entry.gid = 1;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.gid = 0;
+        entry.mode = 0o666;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.mode = binding.mode;
+        entry.link_count = 2;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.link_count = 1;
+        entry.kind = .sym_link;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.kind = .file;
+        entry.size += 1;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.size = binding.size;
+        entry.modeled = false;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.modeled = true;
+        var altered = digest;
+        altered[0] ^= 1;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, altered, binding));
+    }
+}
+
 test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
@@ -21573,6 +21887,20 @@ fn runLifecycleScript(
         script_sha256,
         arguments,
     )) try snapshotConsoleSetupPostinstInfoPath(
+        allocator,
+        root,
+        program,
+        package,
+        candidate_path,
+    ) else if (snapshotChronyPostinstUsesInfo(
+        program.target_architecture,
+        package,
+        kind,
+        source,
+        recovery_action.kind,
+        script_sha256,
+        arguments,
+    )) try snapshotChronyPostinstInfoPath(
         allocator,
         root,
         program,
