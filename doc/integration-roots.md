@@ -770,6 +770,17 @@ boolean default `true`. Pinned dpkg **1.22.22**
 also configured chrony successfully from another disposable copy with
 empty `/proc`. This distinguishes the adjacent-control lookup from service
 or proc-mount behavior; the diagnostic copies are not fresh parity evidence.
+
+These root-privileged comparisons ran beneath a shared writable checkout
+with a user-owned `.real-snapshot`, before the protected-ancestry reference
+harness in local `aaabc66`. Their observed results diagnose the path-dependent
+script behavior, but do **not** satisfy that harness's race-resistant
+source/proof-root requirement. The fresh native replay below also used the
+shared checkout; its authenticated archive and recorded script outcomes do
+not establish a hostile-writer-resistant root-path proof. Repeat privileged
+reference and native proof in a protected checkout after the required serial
+rebase before asserting parity against adversarial path swaps.
+
 Only the exact authenticated new-package chrony postinst configure action
 may select the installed dpkg-info path, after pinning the archive identity
 and verifying both staged and installed scripts plus the installed config
