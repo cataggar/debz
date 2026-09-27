@@ -491,6 +491,69 @@ The complete lock, executable, journal and interrupted-root evidence are
 recorded in the [integration roots](integration-roots.md); no full-closure
 parity follows from this bounded comparison.
 
+The signed `console-setup-linux:all` 1.248ubuntu3 archive (SHA-512
+`b5ad0ebf1b9a526b5af67422b720b29b4e2738ebd945871223bef8241e59b47558f51a31e9638b8e5ce84ea1b42334682f86f9c3d62de224e7c55caa7a5e0f14`,
+6,207,548 bytes) ships the exact 6,448-byte postinst (SHA-256
+`5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`).
+Its only alternatives-related assignment is the literal
+`CONFIGDIR=/etc/console-setup`; the next two unconditional commands register
+`"$CONFIGDIR/vtrgb"` at priority 50 and `"$CONFIGDIR/vtrgb.vga"` at priority
+20 in the same `/etc/vtrgb` group. The signed archive owns both root-owned,
+0644, single-link provider files: the 158-byte `vtrgb` SHA-256 is
+`684cd905549f78e025870dd5c8a3835e49f79f2bb08952eb7424537f6df5fa13`,
+and the 155-byte `vtrgb.vga` SHA-256 is
+`1018702de86f8c570d097eadda5c2ec807375beb663e3a7afeec2cd1cd3e8f76`.
+The exact root-owned `console-setup-linux.list` (41,489 bytes, SHA-256
+`fcbd5a4757d10f8e93472331cff45fd91667dad80b16e6e3dffd4a550097c79f`)
+claims both. Before launch, the record, selector, and generic link are absent;
+the installed tool matches the snapshot amd64 digest and executable metadata.
+
+In a disposable copy of the interrupted root, pinned dpkg 1.22.22
+re-unpacked the separately rehashed signed archive, then configured the
+signed postinst with exit 0. Its snapshot-pinned alternatives tool created
+the 78-byte `vtrgb` record (SHA-256
+`1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`),
+selected the priority-50 provider, and linked
+`/etc/vtrgb -> /etc/alternatives/vtrgb ->
+/etc/console-setup/vtrgb`. An independent copy, given only the two
+literal commands with pinned `update-alternatives` 1.22.22, produced
+byte-identical record and link targets. These are disposable reference
+observations, **not** native fresh-root success.
+
+Native admission does not interpret `CONFIGDIR` or other shell variables.
+Only the complete signed script digest maps those two exact command lines
+to their literal operands and delegates parsing to the existing bounded
+grammar. Admission binds the **new** `console-setup-linux:all` postinst,
+version 1.248ubuntu3, target amd64, exact `["configure", ""]`, authenticated
+archive identity, both signed providers and ownership list, and the snapshot
+amd64 alternatives tool. The `vtrgb` group and generic/selector links must
+start absent. Provider bytes, metadata, ownership list, and tool are checked
+before launch and remain immutable through the managed checkpoint. A
+zero-exit script must produce **both** registrations, in source order, with
+the exact typed record and links; a real nonzero exit is not converted to
+success and retains the normal bounded failure and recovery path. Other
+groups, commands, scripts, variables, preexisting `vtrgb` state, and
+unknown outcomes remain fail-closed. The predecessor interrupted root is
+never retried as fresh. A new independently authenticated 175-package root
+persisted exit 0 for the exact console-setup postinst at step 1292, with
+the same 78-byte record and both pinned links. It later refused **before**
+the unrelated `procps.postinst triggered /usr/lib/sysctl.d` callback in
+deferred trigger processing at step 1428: the existing exact procps
+configure-only admission rejects those triggered arguments. No full-root
+parity is inferred, and that newly interrupted root remains retained.
+
+After #247 squash `94e21f7e2c602649abd7aa7447aa79a54b97a408`,
+another **new**, elevated, signed amd64 root ran the rebased console
+admission at source commit `2c534a042d4550e730b40ff97cb7d192f1ea8263`.
+The exact postinst at step 1292 spawned, durably exited 0, and left
+`console-setup-linux:all` installed. Its 78-byte `vtrgb` record is
+byte-identical to **both** pinned references, and its generic and selector
+links select `/etc/console-setup/vtrgb`. A later, separate procps triggered
+callback refused before launch at step 1428; this root remains interrupted
+and supplies no full-closure parity claim. The signed lock, independent
+175-archive rehash and next refusal are recorded in the
+[integration roots](integration-roots.md).
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is
