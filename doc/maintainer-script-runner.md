@@ -194,6 +194,13 @@ machine-width PID to offset 8, which can send an uninitialized PID and yield
 and verifies that `CAP_SYS_ADMIN` is absent after dropping it. These
 requirements passed on the local Linux 6.18.31 privileged runner. Missing
 support refuses the exact invocation without a proc or mount fallback.
+Workflow-dispatch CI run
+[`36322419073`](https://github.com/cataggar/debz/actions/runs/36322419073)
+at ABI-corrected source `692c85a8bc3ac57653db7acc65e9687403c4d177`
+also executed the mandatory privileged namespace step on hosted amd64 and
+arm64, in both Debug and ReleaseSafe; the 33-test target includes PID 1
+mount/mask/teardown and parent-crash regressions, not a capability skip.
+WSL capability availability remains unverified.
 
 ## Outcome taxonomy
 

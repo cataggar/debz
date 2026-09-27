@@ -1057,6 +1057,34 @@ installed configure transition; do not misreport the final status as
 `installed`. This interrupted root is retained read-only, never retried as
 fresh, and proves neither the chrony/procps fixes nor full snapshot parity.
 
+Hosted arm64 Debug exposed a kernel capability-header ABI mismatch: Zig's
+`linux.cap_user_header_t` places its machine-width PID at offset 8, but
+`capget`/`capset` require a 32-bit PID at offset 4. Padding supplied an
+invalid PID (`ESRCH`) during the private proc privilege drop. The signed
+systemd-only runner now uses the exact 8-byte kernel header through those
+two raw syscalls, retains the capability-drop checks, and tests the ABI
+directly. The prior ReleaseSafe root is not substituted for testing this
+changed binary.
+
+At ABI-corrected source `692c85a8bc3ac57653db7acc65e9687403c4d177`,
+the protected root-owned checkout was fast-forwarded to the same commit and
+the hardened pinned dpkg 1.22.22 harness configured a **new** disposable
+proof (`proof-systemd-dpkg-abi-2`) from its protected diagnostic source:
+exit **0**, `install ok installed`, no retained `/proc/sys`. A genuinely
+**new** authenticated amd64 workspace,
+`.real-snapshot/amd64-systemd-249-abi-signed-2`, used ReleaseSafe binary
+SHA-256 `564ab245ec411811e8f1292af84e6e9b79a455169a0ee41ee21f85cde9fcb04c`
+and the same reviewed signer, keyring, immutable 175-package lock and
+independently verified 67,976,788 archive bytes. Its signed systemd
+postinst again spawned and durably exited **0** with 748 output bytes at
+step **1328**; step **1329** applied `installed`, with no `/proc/sys`
+remaining. The **first subsequent signed failure** was chrony postinst
+step **1344** (exit **10**, half-configured), followed by the independent
+procps trigger prelaunch refusal at step **1428** ordinal 3; the operation
+ended with recovery-required exit **8** and systemd `triggers-pending`.
+This second interrupted root is retained read-only and does not prove a
+successful installation or full native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
