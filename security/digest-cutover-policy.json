@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 467,
-      "sha512": "8dee6f02a032a9a2fcf2d59207aa761a8ff67fd95ec43a34d44b71a1ca7e7fa078e36abb9507a0bc2da00081830240e3ecd9d8c1017a624eb09d56f6672d5803"
+      "count": 468,
+      "sha512": "72b518471e7b1f691a7c2ed72553ca6946446bea86a06e2d703f25be32f5ec32f3a8561a2c5657dd913f9b1360e5e2d7ec6cd0c30f48bcb583818f1577db02e3"
     },
     "findings": {
-      "count": 21042,
+      "count": 21075,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1168,
-        "sha256_token": 19401
+        "raw_32_byte": 1169,
+        "sha256_token": 19433
       },
-      "sha512": "0a4de1c67d86a64c14b7b993d4d25f26823b2111d6a172b5614da4e632268489bebeb66909f36e453dfa6b27558a98fc8cca80fac7cc4373025c87f18b1ce097"
+      "sha512": "a8405cb1cd4b80fb795893c16e17c4a1e3f98c094b8ab94a3a06b61c0c048ca6f79443c1e35d511d0a8fdfd29b0f374b5c6121466099a03a718413172fabaddc"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 261,
+        "count": 272,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 230
+          "sha256_token": 241
         },
-        "sha512": "6fbbb7cce886a9f3b64d64f0769501f07c2d60cdc42a472d5c547f27cd8374b878220b4367943e07c2e02a61886f59016c1966cfaa59457510335e5b7ce740a8"
+        "sha512": "0c818ec1b0da8545582ba5522c4896add6a62785560d91e18a73304eff4a2f00515b33325ba6619b465811cd38ae5f7e8121d8b5da6205f3ec247e2e2350bffb"
       },
       {
         "scope": "fuzz",
@@ -153,16 +153,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup debconf script-path and sidecar, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12253,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "count": 12273,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1094,
-          "sha256_token": 11012
+          "raw_32_byte": 1095,
+          "sha256_token": 11031
         },
-        "sha512": "9be61541af80aa3e890b9bb818acb34660a4c3eb0e540cce0dee5c9fad458d44167cfad7e32d1d7e811ec9cbf3ee1e5a3f3a0636bbaa9269c130a589de54a9d3"
+        "sha512": "6137decb6c664e4639db4f498a0b1ab99b70d808bbd0864f09a330031b3749cb36360fd6dfd7fbe08d8ccf7f77a7587ce1a232c01a28d5cdefbc4111104a377d"
       },
       {
         "scope": "test",
@@ -181,16 +181,16 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including the disposable pinned systemd proc reference harness; production authorities remain typed and versioned.",
-        "count": 5037,
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc and signed chrony reference harnesses; production authorities remain typed and versioned.",
+        "count": 5039,
         "counts": {
           "cas_layout": 19,
           "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5013
+          "sha256_token": 5015
         },
-        "sha512": "17860edcf9d7076cbeb4d210d23e4b336d84f3d6868433c80b23358d04089a5d1b04ee1e66e66434cc3e725a363e5e8dc67d1979d0e81d9138d6557968b8495b"
+        "sha512": "50b31116514cf93dcb13958f728b069ef7a31e5c39c01f9c1fd831e51b53ef16ab72b66ad9da2b4b4ac74a6d716b23a8430cafdbe962c17433085194c92969d1"
       }
     ]
   },
@@ -229,7 +229,7 @@
       "id": "raw-control-and-compatibility-fields",
       "kind": "raw_32_byte_field",
       "classification": "fixed_control_and_versioned_compatibility",
-      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, or protocol controls, or fields inside frozen version-specific compatibility structures; current content authority is typed.",
+      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony control verifier), or protocol controls, or fields inside frozen version-specific compatibility structures; current package content authority is typed.",
       "paths": [
         "src/apt_system_api.zig",
         "src/apt_system_cli.zig",
@@ -271,8 +271,8 @@
         "src/transaction_provenance_v3.zig",
         "src/transaction_result_summary.zig"
       ],
-      "count": 357,
-      "sha512": "8ab9327c3eff7efc27d5ca5eb17df90a9063131b0acb1671c3acf2cdb35be15283b36c13013d1607040471db7133330eadd8b6149a908caaf16f9aa86d3c47d4"
+      "count": 358,
+      "sha512": "c413851ada2cfda71eba195e0fdf690798c8c1d8f0db458ed403f0b4071a275644acda817d73d642c91b8183288ba4e11e66787732d3338d9e4d8765bf4cdb55"
     },
     {
       "id": "schema-historical-authority-fields",
