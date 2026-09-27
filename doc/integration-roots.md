@@ -1108,8 +1108,8 @@ These root-privileged comparisons ran beneath a shared writable checkout
 with a user-owned `.real-snapshot`, before the protected-ancestry reference
 harness in local `aaabc66`. Their observed results diagnose the path-dependent
 script behavior, but do **not** satisfy that harness's race-resistant
-source/proof-root requirement. The fresh native replay below also used the
-shared checkout; its authenticated archive and recorded script outcomes do
+source/proof-root requirement. The historical fresh native replay below
+also used the shared checkout; its authenticated archive and recorded script outcomes do
 not establish a hostile-writer-resistant root-path proof. Repeat privileged
 reference and native proof in a protected checkout after the required serial
 rebase before asserting parity against adversarial path swaps.
@@ -1118,8 +1118,9 @@ Only the exact authenticated new-package chrony postinst configure action
 may select the installed dpkg-info path, after pinning the archive identity
 and verifying both staged and installed scripts plus the installed config
 and templates as exact root-owned signed control files. No exit is masked,
-and no general debconf, service, or `/proc` authority is added. A **new**
-authenticated root must still prove step 1344 and identify the next blocker.
+and no general debconf, service, or `/proc` authority is added. At this
+point, a protected **new** authenticated root still had to prove step 1344
+and identify the next blocker.
 
 A **new** independently authenticated 175-package amd64 root,
 `amd64-chrony-fresh-long-1`, used the reviewed signer
@@ -1138,6 +1139,57 @@ required for `systemd-tmpfiles`. The native operation recorded
 This interrupted root cannot be reused as fresh. Diagnosing udev's
 separate proc requirement must not infer authority from chrony's path fix,
 and this run does not establish complete native/reference parity.
+
+On final #250 squash `b833d79ea5c57fd17a61cde1ca61a3d9a0e273ae`
+plus the chrony-only source at `278857f3c82af364aaeee974a65458dc303d724a`,
+the pinned dpkg comparison was repeated from root-owned
+`/var/lib/debz-chrony-reference-250/checkout` with a mode-0700
+`.real-snapshot`. The protected
+`tools/real-snapshot-chrony-reference.sh` rejects writable ancestry and
+changed chrony controls before copying an independently retained,
+half-configured diagnostic source into a **new** proof root. The pinned dpkg
+**1.22.22** receipt verified; `--no-triggers --configure chrony` exited
+**0**, left `chrony` `install ok installed`, and registered
+`chrony/configure_ubuntu_pools_in_sourcesd` with value `true`. The source
+remained half-configured, and the proof has no retained `/proc/sys`. This is
+a protected **diagnostic comparison**, not a fresh native installation or
+authorization for udev.
+
+The **genuinely new**, empty authenticated amd64 workspace
+`/var/lib/debz-chrony-reference-250/checkout/.real-snapshot/amd64-chrony-250-protected-signed-1`
+used that same protected checkout and root-owned candidate. The reviewed
+signer was `f6ecb3762474eda9d21b7022871920d1991bc93c`, the keyring
+SHA-256 was
+`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`,
+and the ReleaseSafe binary SHA-256 was
+`0cd7ae62568d10e1cc8875a9d5912dd71cfc646f56c2155936dad0a3e32ce85c`.
+The immutable 175-package lock SHA-256 was
+`938a76de43cd1af9d8d286ec35f149845520aa216eb3ce417b7a89827604f3e7`;
+all 175 downloaded SHA-512-primary CAS objects (67,976,788 bytes) were
+independently rehashed and size-checked against its **exact** object set,
+recorded in `evidence/cas-rehash.tsv` (SHA-256
+`4b0501bcb7f26f2be2dfead5176a38e01643b08ee295d2f8cd2c2ff2e4191d54`).
+The protected runner retained only the two reviewed bounded timeout
+substitutions, with SHA-256
+`cfa860317c8844ed0aba0503b3db7b36594327099c141cc4a0d4b4d80884f666`.
+
+The exact signed `chrony:amd64` postinst SHA-256
+`bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`
+**spawned** at step **1344**, ran `["configure", ""]`, and durably exited
+**0** with 846 output bytes. Step **1345** completed its `installed`
+transition with result `applied`; final `chrony` status remains
+`install ok installed` and debconf records the signed boolean value
+`true`. No `/proc/sys` remains in the host-visible root. The **first
+subsequent signed script failure** was `udev:amd64` postinst SHA-256
+`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`
+at step **1357**: it spawned, exited **1**, and emitted 349 stderr bytes
+requiring `/proc/` for `systemd-tmpfiles`; `udev` is half-configured.
+Later, the separately unauthorized procps deferred trigger at step **1428**
+ordinal 3 refused before launch with
+`InvalidAlternativesScriptAuthority`, leaving recovery required (install
+exit **8**). The interrupted native root is retained read-only and is
+never retried as a fresh run. This proves chrony's bounded configure path,
+not udev authority, successful completion, or full snapshot parity.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

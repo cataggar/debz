@@ -633,11 +633,21 @@ installed path lets debconf load its adjacent controls and register the one
 `chrony/configure_ubuntu_pools_in_sourcesd` question. Missing, symlinked,
 non-root-owned, multiply linked, or changed control files refuse before
 launch. The normal script outcome and recovery rules stay authoritative;
-no service status, debconf result, or proc mount is forged. An independently
-authenticated fresh root persisted chrony's zero exit and its installed
-status before the separate signed udev postinst failed for lack of `/proc`;
-that later failure neither alters chrony's outcome nor grants udev the
-systemd-specific isolated proc view.
+no service status, debconf result, or proc mount is forged. An earlier
+authenticated root from writable checkout ancestry persisted chrony's zero
+exit and its installed status before the separate signed udev
+postinst failed for lack of `/proc`; this evidence is provisional as a
+protected root-path proof. A root-owned protected checkout and mode-0700
+fixture independently repeated the signed chrony configuration with pinned
+dpkg 1.22.22: exit 0, installed status, and the signed debconf default
+`true`, without retaining `/proc/sys`. That diagnostic reference does not
+grant udev the systemd-specific isolated proc view. A distinct genuinely
+new authenticated root under the same protected checkout durably recorded
+chrony's signed postinst step 1344 exit 0, an applied `installed` transition
+at step 1345, and the signed debconf default. Signed udev postinst was the
+first subsequent script failure (step 1357 exit 1 without `/proc`);
+the later procps deferred trigger was independently refused before launch.
+Neither failure is changed or authorized by the chrony path correction.
 
 The exact signed `systemd:amd64` `261.2-1ubuntu2` postinst gets a distinct
 boot-ID-only, read-only `/proc/sys` view inside its own private PID and mount
