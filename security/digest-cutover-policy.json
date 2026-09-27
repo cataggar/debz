@@ -41,15 +41,15 @@
       "sha512": "94208f48441e7b46a6e947587df8f6e0ccb2dcc92e92f7b92204b0c2732eff8d0760fa2c4233b35003fa8b6c604e9f159b60805c8a1a8fe4c489f7f55f0c6f2d"
     },
     "findings": {
-      "count": 21124,
+      "count": 21131,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
         "raw_32_byte": 1177,
-        "sha256_token": 19474
+        "sha256_token": 19481
       },
-      "sha512": "ae2ca5a189600529e28918ca51901b91c65cce2b6fbac4cdbe42faa9aa9e0ae8af99fdca6753992dbd74390d97f12ab1376bc0fd4a02d48b1cd840248d7fbd36"
+      "sha512": "1ebd35e4371fdb19d76730b180bd530c60e5dc91adda2d72565ff46814254e4f5f52b7d375e55875f350854b066f18844a4d59de136a57525103ac510f938758"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 276,
+        "count": 283,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 245
+          "sha256_token": 252
         },
-        "sha512": "369f4210391d03c9c14fd12c23e8c08d8b0d1d50a2d5c733c52d5faabebc05395c95a213a3083320d22a907d9a49dc0b6bb960ac082ec6c28e2232dd81b2bd12"
+        "sha512": "5cd159f3509cd48f314e80f3e0ff99afb5193a58eb159486757575fc14bfbe81d4cdb5aa492f60ae05fab053b286d319b29428640888a28dc47938981eeb7dc6"
       },
       {
         "scope": "fuzz",

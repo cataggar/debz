@@ -675,7 +675,12 @@ mount, descriptor seal or privilege drop records the same typed
 PID 1 and its descendants are reaped and private mounts disappear.
 Ordinary durable script outcomes and unknown-outcome recovery remain in
 force; this does not change systemd's boot-ID policy or the absent-sysctl
-guard on the later procps trigger.
+guard on the later procps trigger. A genuinely new 175-package authenticated
+root under a protected checkout durably recorded signed udev postinst
+step 1357 exit 0 and step 1358 applied `installed`, with no `/proc/sys`
+retained. Its first later blocker was a distinct alternatives capture
+abort while preparing sudo step 1376, before any sudo postinst launch;
+that failure does not expand udev's proc authority or prove full parity.
 
 ### Experimental typed runtime API
 
