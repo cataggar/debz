@@ -1477,7 +1477,7 @@ fn childMain(child: ChildDescriptor) noreturn {
     if (helper_root >= 0) _ = linux.close(helper_root);
     if (proc_root >= 0) _ = linux.close(proc_root);
     if (child.proc) |proc| {
-        const setup = setupSnapshotProc(proc);
+        const setup = setupSnapshotProc(proc, null);
         if (setup != .SUCCESS)
             childFail(streams.status, .snapshot_proc, setup);
         const sealed = sealSnapshotProcDescriptors();
@@ -1490,7 +1490,8 @@ fn childMain(child: ChildDescriptor) noreturn {
     childFail(streams.status, .execute, executed);
 }
 
-fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
+fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
+    if (failure_stage) |stage| stage.* = 1;
     const directory = reopenMountPath(
         linux.AT.FDCWD,
         "/proc",
@@ -1499,6 +1500,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
     );
     if (directory.err != .SUCCESS) return directory.err;
     _ = linux.close(directory.root);
+    if (failure_stage) |stage| stage.* = 2;
     const mounted = linux.errno(linux.mount(
         "proc",
         "/proc",
@@ -1507,6 +1509,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
         @intFromPtr("hidepid=2"),
     ));
     if (mounted != .SUCCESS) return mounted;
+    if (failure_stage) |stage| stage.* = 3;
     const masked = linux.errno(linux.mount(
         "tmpfs",
         "/proc/sys",
@@ -1515,6 +1518,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
         @intFromPtr("mode=0700,size=65536"),
     ));
     if (masked != .SUCCESS) return masked;
+    if (failure_stage) |stage| stage.* = 4;
     for ([_][*:0]const u8{
         "/proc/sys/kernel",
         "/proc/sys/kernel/random",
@@ -1524,6 +1528,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
         const restricted = linux.errno(linux.chmod(path, 0o555));
         if (restricted != .SUCCESS) return restricted;
     }
+    if (failure_stage) |stage| stage.* = 5;
     const created = linux.open(
         "/proc/sys/kernel/random/boot_id",
         .{
@@ -1558,6 +1563,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
     const mode = linux.errno(linux.fchmod(file, 0o444));
     _ = linux.close(file);
     if (mode != .SUCCESS) return mode;
+    if (failure_stage) |stage| stage.* = 6;
     const protected = linux.errno(linux.mount(
         null,
         "/proc/sys",
@@ -1566,6 +1572,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
         0,
     ));
     if (protected != .SUCCESS) return protected;
+    if (failure_stage) |stage| stage.* = 7;
     const observed = linux.open(
         "/proc/sys/kernel/random/boot_id",
         .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true },
@@ -1580,6 +1587,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
     if (count != proc.boot_id.len or
         !std.mem.eql(u8, bytes[0..proc.boot_id.len], &proc.boot_id))
         return .STALE;
+    if (failure_stage) |stage| stage.* = 8;
     for ([_][*:0]const u8{
         "/proc/sys/kernel/random/uuid",
         "/proc/sys/kernel/pid_max",
@@ -1597,6 +1605,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
         }
         if (linux.errno(unexpected) != .NOENT) return linux.errno(unexpected);
     }
+    if (failure_stage) |stage| stage.* = 9;
     const writable = linux.open(
         "/proc/sys/extra",
         .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true },
@@ -1607,6 +1616,7 @@ fn setupSnapshotProc(proc: ProcDescriptor) linux.E {
         return .EXIST;
     }
     if (linux.errno(writable) != .ROFS) return linux.errno(writable);
+    if (failure_stage) |stage| stage.* = 10;
     return restrictSnapshotProcPrivileges();
 }
 
@@ -3625,12 +3635,13 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
         if (chrooted != .SUCCESS) testSnapshotProcFailure(status[1], 5, chrooted);
         const at_root = linux.errno(linux.chdir("/"));
         if (at_root != .SUCCESS) testSnapshotProcFailure(status[1], 6, at_root);
+        var setup_stage: u8 = 0;
         const setup = setupSnapshotProc(.{
             .root_stat = root_stat,
             .directory_stat = directory_stat,
             .boot_id = boot_id,
-        });
-        if (setup != .SUCCESS) testSnapshotProcFailure(status[1], 7, setup);
+        }, &setup_stage);
+        if (setup != .SUCCESS) testSnapshotProcFailure(status[1], 20 + setup_stage, setup);
         const present = linux.open(
             "/proc/sys/kernel/random/boot_id",
             .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
@@ -3793,8 +3804,9 @@ fn testMaskedProcWorker(
     if (chrooted != .SUCCESS) testSnapshotProcFailure(status_fd, 5, chrooted);
     const at_root = linux.errno(linux.chdir("/"));
     if (at_root != .SUCCESS) testSnapshotProcFailure(status_fd, 6, at_root);
-    const setup = setupSnapshotProc(descriptor);
-    if (setup != .SUCCESS) testSnapshotProcFailure(status_fd, 7, setup);
+    var setup_stage: u8 = 0;
+    const setup = setupSnapshotProc(descriptor, &setup_stage);
+    if (setup != .SUCCESS) testSnapshotProcFailure(status_fd, 20 + setup_stage, setup);
     if (escape_group) {
         const descendant = linux.fork();
         if (linux.errno(descendant) != .SUCCESS)
