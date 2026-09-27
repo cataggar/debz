@@ -351,7 +351,7 @@ class SecurityAuditTests(unittest.TestCase):
             all(
                 match.start() > first_orchestrator_test
                 for match in re.finditer(
-                    r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(",
+                    r"\blinux\.(?:clone2|unshare|setns|mount|move_mount|umount2)\s*\(",
                     orchestrator,
                 )
             )
@@ -370,6 +370,18 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIn("live_root.cloneMountDescriptor(", runner)
         self.assertIn("live_root.setMountAttributes(", runner)
         self.assertIn("linux.move_mount(", runner)
+        self.assertIn("linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID", runner)
+        self.assertIn("linux.PR.CAPBSET_DROP", runner)
+        self.assertIn("linux.PR.SET_NO_NEW_PRIVS", runner)
+        self.assertIn("linux.PR.SET_PDEATHSIG", runner)
+        self.assertIn("linux.capset(", runner)
+        self.assertIn("linux.syscall3(\n        .close_range,", runner)
+        capability_owners = sorted({
+            relative
+            for relative, text in sources.items()
+            if re.search(r"\blinux\.(?:capget|capset|prctl)\s*\(", text)
+        })
+        self.assertEqual(["src/maintainer_script.zig"], capability_owners)
 
     def test_composite_action_pin_audit_rejects_movable_refs(self) -> None:
         self.assertEqual(

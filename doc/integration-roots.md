@@ -692,6 +692,60 @@ neither it nor the earlier interrupted roots are reusable as fresh. The
 systemd environment and pinned-reference parity require a separate
 investigation, not an inferred success or a broadened console authorization.
 
+The subsequent isolated systemd-proc investigation reproduced the exit 1 with
+no `/proc` under pinned dpkg 1.22.22 and reproduced five `%b` boot-ID failures
+with a private `subset=pid` procfs. Separate disposable copies of the
+diagnostic root (which inherits some prior failure effects, and is **not** a
+fresh-root parity proof) then used a private PID/mount namespace with a
+root-owned `/proc`, full **read-only** procfs and an immediate tmpfs mask of
+all `/proc/sys` except a read-only copy of the actual kernel boot ID. The
+chrooted PID 1 had only standard descriptors; `CAP_SYS_ADMIN` was removed and
+`no_new_privs` set before either signed script launched. Pinned dpkg 1.22.22
+configured signed systemd to `install ok installed` (exit 0), and the same
+postinst digest with the native runner's exact replacement environment
+separately exited 0. `tools/real-snapshot-systemd-proc-reference.sh` repeats
+the pinned dpkg comparison on a **new** explicitly named disposable copy,
+not on the interrupted source root. A separate Zig signed-root runner test
+also exited 0 with no mount retained outside its invocation. None of these
+diagnostic copies establishes a successful new 175-package authenticated
+replay. An initial new-root trial was deliberately stopped before systemd to
+enforce close-on-exec on all inherited descriptors; its interrupted root is
+not reusable. A second **new** 175-archive authenticated amd64 root,
+`amd64-systemd-proc-fresh-long-2`, used the reviewed signer and final sealed
+launcher (binary SHA-256
+`ddc5ef4db8c05ad8f995c393a464e16ed6e6c1bfd2c45bfb437ce87efe41ceed`).
+It persisted zero-exit `console-setup` at step 1297, but **refused systemd
+before launch** at step 1328: `invalid_snapshot_proc`, with a durable
+`spawned=false` script outcome and no retained `/proc/sys`. The retained
+invocation SHA-256
+`7ec5bdf0304f05c008b053e1cbddd1ef8f0c85` independently matches the
+*staged* private `systemd.postinst` pathname plus the pinned helper and
+boot-ID evidence; it does not match the installed dpkg-info pathname. Native
+script selection had preferred this staged copy during configure, while the
+scoped proc admission correctly required the installed path. The exact
+signed `systemd` configure path now verifies both aliases against the signed
+SHA-256 and executes the installed path, as pinned dpkg does. Neither
+interrupted root is reused.
+
+An independently authenticated third 175-package amd64 root,
+`amd64-systemd-proc-fresh-long-3`, used the same pinned snapshot and signer
+with ReleaseSafe binary SHA-256
+`da698f05b1e6b6cb1c8d7f115d4740d8795ff8b9bd4aaca6d4a361d2a6afbc47`.
+Its durable receipt records signed `systemd:amd64` `261.2-1ubuntu2`
+postinst SHA-256
+`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+at step 1328 with `["configure", ""]`, `spawned=true`, exit 0 and 748
+bytes of captured output. `systemd` is `install ok installed`, and no
+`/proc/sys` remains in the host-visible root. The **next** signed script,
+`chrony:amd64` `4.8-4ubuntu2` postinst SHA-256
+`bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`,
+exited 10 at step 1344 with `["configure", ""]` and zero output.
+`chrony` remains half-configured; the operation recorded
+`failed_after_mutation` (exit 7), and the deferred procps trigger was not
+reached in this root. This interrupted root cannot be reused as fresh; the
+chrony failure requires independent investigation, not another systemd
+exception or a claim of completed native/reference parity.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

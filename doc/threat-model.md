@@ -64,6 +64,20 @@ rolled back, a `detach` descendant policy deliberately leaves survivors
 running, and process-group termination cannot reach descendants that already
 left the group.
 
+One exact authenticated systemd postinst has a narrower exception: PID 1 is
+itself chrooted to the pinned selected root before its private procfs is
+mounted, and `/proc/sys` is immediately covered with a remounted read-only
+tmpfs holding only the observed kernel boot ID. No other script runs during
+setup or in that namespace. The signed script cannot remount it after the
+runner removes `CAP_SYS_ADMIN` and sets `no_new_privs`; a rejected setup does
+not launch the script. The runner also requires a successful close-on-exec seal
+of all nonstandard descriptors, so no inherited host-root descriptor reaches
+the signed script. Parent death kills namespace PID 1, whose exit kills
+descendants outside its process group; the mount namespace is private and
+tears down without publishing anything into the caller's root. This exception
+is bound to the script SHA-256 and exact package and argument identity, not a
+general proc, syscall, or mount grant.
+
 The future `debz apt` facade has a separate Linux-only live-root boundary
 (`src/live_root.zig`). It never weakens the product backend's host-root denial:
 the backend still receives `allow_host_root = false` and the stable alternate
