@@ -21649,6 +21649,7 @@ fn prepareAlternativesScriptBoundary(
     package: native_program.PackageIdentity,
     kind: maintainer_script.Kind,
     source: native_program.ScriptSource,
+    action_kind: native_recovery.ActionKind,
     arguments: []const []const u8,
 ) !?AlternativesScriptBoundary {
     if (!native_alternatives.scriptMayInvoke(script_bytes)) return null;
@@ -22287,6 +22288,7 @@ fn runLifecycleScript(
         package,
         kind,
         source,
+        recovery_action.kind,
         arguments,
     ) catch |err| {
         if (attempt.record().mutation_started)

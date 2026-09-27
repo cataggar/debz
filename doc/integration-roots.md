@@ -1379,6 +1379,9 @@ left the action **prepared**, with no python3 script outcome or launch.
 The native operation returned `recovery_required` (exit 8), not a complete
 installation. This root is interrupted and must **never** be reused as
 fresh; python3 requires a separate exact signed-script investigation.
+This earlier local run predates the final #252 squash and the sourced
+`dpkg-error.sh` pin. It is retained only as diagnostic evidence, not as
+the combined-tree fresh-root publication proof.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

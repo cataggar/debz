@@ -917,6 +917,8 @@ def audit_production_sources() -> None:
         '"usr/sbin/systemd-tmpfiles"',
         '"usr/sbin/update-alternatives"',
         '"usr/bin/gnuchmod"',
+        '"usr/share/dpkg/sh/dpkg-error.sh"',
+        '"d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528"',
         "return restrictSnapshotProcPrivileges(failure_stage);",
     ):
         if required not in runner:
