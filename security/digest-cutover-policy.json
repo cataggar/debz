@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 467,
-      "sha512": "8dee6f02a032a9a2fcf2d59207aa761a8ff67fd95ec43a34d44b71a1ca7e7fa078e36abb9507a0bc2da00081830240e3ecd9d8c1017a624eb09d56f6672d5803"
+      "count": 468,
+      "sha512": "72b518471e7b1f691a7c2ed72553ca6946446bea86a06e2d703f25be32f5ec32f3a8561a2c5657dd913f9b1360e5e2d7ec6cd0c30f48bcb583818f1577db02e3"
     },
     "findings": {
-      "count": 21042,
+      "count": 21068,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1168,
-        "sha256_token": 19401
+        "raw_32_byte": 1169,
+        "sha256_token": 19426
       },
-      "sha512": "0a4de1c67d86a64c14b7b993d4d25f26823b2111d6a172b5614da4e632268489bebeb66909f36e453dfa6b27558a98fc8cca80fac7cc4373025c87f18b1ce097"
+      "sha512": "70aae98482507aa2b6c267bc37ade8dbf1e16fbe2feef6026c1d33ac75ad786513f07c279cd2fa5539e9e133ea37d6ac08b154fa94cf06f818f1bb6c5dd2d0a3"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 261,
+        "count": 265,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 230
+          "sha256_token": 234
         },
-        "sha512": "6fbbb7cce886a9f3b64d64f0769501f07c2d60cdc42a472d5c547f27cd8374b878220b4367943e07c2e02a61886f59016c1966cfaa59457510335e5b7ce740a8"
+        "sha512": "64871c6d4d456a5c0e2eba804dd3dd0328c8508832f668d2a1684e2cd2b74300d24833583fa24d10ad13f3ba9441b288ef609e68d31593fb46eac3fe3b159a5f"
       },
       {
         "scope": "fuzz",
@@ -154,15 +154,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12253,
+        "count": 12273,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1094,
-          "sha256_token": 11012
+          "raw_32_byte": 1095,
+          "sha256_token": 11031
         },
-        "sha512": "9be61541af80aa3e890b9bb818acb34660a4c3eb0e540cce0dee5c9fad458d44167cfad7e32d1d7e811ec9cbf3ee1e5a3f3a0636bbaa9269c130a589de54a9d3"
+        "sha512": "6137decb6c664e4639db4f498a0b1ab99b70d808bbd0864f09a330031b3749cb36360fd6dfd7fbe08d8ccf7f77a7587ce1a232c01a28d5cdefbc4111104a377d"
       },
       {
         "scope": "test",
@@ -181,16 +181,16 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including the disposable pinned systemd proc reference harness; production authorities remain typed and versioned.",
-        "count": 5037,
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc and signed chrony reference harnesses; production authorities remain typed and versioned.",
+        "count": 5039,
         "counts": {
           "cas_layout": 19,
           "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5013
+          "sha256_token": 5015
         },
-        "sha512": "17860edcf9d7076cbeb4d210d23e4b336d84f3d6868433c80b23358d04089a5d1b04ee1e66e66434cc3e725a363e5e8dc67d1979d0e81d9138d6557968b8495b"
+        "sha512": "50b31116514cf93dcb13958f728b069ef7a31e5c39c01f9c1fd831e51b53ef16ab72b66ad9da2b4b4ac74a6d716b23a8430cafdbe962c17433085194c92969d1"
       }
     ]
   },
