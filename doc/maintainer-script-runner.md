@@ -267,6 +267,15 @@ invocation uses a separate v4 policy digest; the earlier systemd v2 and
 udev v3 invocation digests remain unchanged. This is no grant to sudo
 triggers, other scripts or package versions, and does not establish
 CI arm64 or WSL namespace capability.
+From the root-owned protected checkout on final #252 squash plus sudo-only
+source `898d81e`, the Debug and ReleaseSafe privileged suites each ran
+46/46 tests, including the signed sudo script and four distinct sourced
+fragment refusals. Pinned dpkg 1.22.22 and the isolated signed-script
+runs produced byte-identical sudo alternatives records; a separate new
+authenticated root persisted sudo step 1376 exit 0 and installed. The
+next refusal was python3 preinst at step 1383, before its script launched.
+This local proof does not substitute for hosted arm64 namespace coverage
+or authorize python3.
 
 ## Outcome taxonomy
 

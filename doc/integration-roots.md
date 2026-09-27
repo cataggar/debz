@@ -1383,6 +1383,58 @@ This earlier local run predates the final #252 squash and the sourced
 `dpkg-error.sh` pin. It is retained only as diagnostic evidence, not as
 the combined-tree fresh-root publication proof.
 
+On the final #252 squash `c73669e6cf4a36de25937f3063fbc0585f58f288`
+plus the isolated sudo-only source `898d81ebee16c2cf879a669e525043f330e0d8d2`,
+the root-owned checkout `/var/lib/debz-sudo-reference-252/checkout` repeated
+the pinned dpkg **1.22.22** comparison from its mode-0700 `.real-snapshot`.
+`tools/real-snapshot-sudo-reference.sh` rejected writable ancestry and
+changed signed controls before copying an independent authenticated
+pre-sudo diagnostic source. Only the two literal sudo-owned payload links
+were restored in the **new disposable proof copy**, not in the source or
+the native installation. Pinned dpkg configured sudo with private
+`ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs, no `/proc/sys`, and
+`CAP_SYS_ADMIN` dropped. It exited **0**, left sudo `install ok installed`
+and generated the reference-exact 658-byte record (SHA-256
+`c583a377d2d7bc241422c91f43738f8e278e159e8e3bb2aa53d5bdeaf782e845`).
+The protected signed-script Debug and ReleaseSafe tests produced
+byte-identical records; each ran **46/46** mandatory namespace tests and
+the altered, missing, redirected and post-binding-drift fragment refusals.
+The source is unchanged and no private proc mount survived in the proof.
+
+A **genuinely new**, empty amd64 root at
+`/var/lib/debz-sudo-reference-252/checkout/.real-snapshot/amd64-sudo-252-protected-signed-1`
+independently authenticated signer
+`f6ecb3762474eda9d21b7022871920d1991bc93c`, keyring SHA-256
+`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`,
+and ReleaseSafe binary SHA-256
+`5a90838763721b07343212d5d62fcfd8fa32c92d1577550e84473ea930734e4b`.
+Its signed 175-package lock has SHA-256
+`cd8bdea91cf657c2c6b209d2d1e55dc35a7d251e088151ac380371eee20244e6`;
+all 175 SHA-512 CAS objects (67,976,788 bytes) were independently
+size-checked and rehashed against the **exact** object set. The sorted
+`evidence/cas-rehash.tsv` has SHA-256
+`4b0501bcb7f26f2be2dfead5176a38e01643b08ee295d2f8cd2c2ff2e4191d54`.
+
+The exact signed `sudo:amd64` postinst SHA-256
+`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`
+**spawned** at step **1376** with `["configure", ""]`, durably exited
+**0** (zero stdout, 126 stderr bytes), and completed `succeeded`.
+Step **1377** applied the installed transition: sudo is `install ok
+installed`. Its root-owned mode-0644 six-slave record is 658 bytes and
+byte-identical to the protected pinned-dpkg proof; both `sudoedit` links
+point into `/etc/alternatives`. The authenticated 3,228-byte sourced
+`dpkg-error.sh` fragment retained SHA-256
+`d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528`.
+The private `/proc` disappeared, and `/proc/sys` was not retained.
+
+The **first subsequent refusal** was signed `python3:amd64` preinst at
+step **1383**: only `prepared` is durable, with **no python3 launch or
+script outcome**. `create.json` reports `recovery_required` (exit **8**,
+`InvalidAlternativesScript`), not a successful installation. This root
+is interrupted and is retained for read-only evidence, never reused as
+a fresh trial. Neither python3 admission nor full native/reference
+parity follows from sudo's successful step.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

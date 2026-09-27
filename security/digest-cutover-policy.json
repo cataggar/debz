@@ -41,15 +41,15 @@
       "sha512": "f13fa0c911437187312a4e20945d466730f9fbfd75453471d3f4da57446847efe342db1e34deea720a9631faec2ecbe88942de7f51480cfc906cb53bfba2bdb2"
     },
     "findings": {
-      "count": 21198,
+      "count": 21205,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
         "raw_32_byte": 1189,
-        "sha256_token": 19536
+        "sha256_token": 19543
       },
-      "sha512": "20af150ae0916d0890e8c0bf6e2ae5d81d37faee13d736aca53d8d6df271d02c7dd73ea25bed99d97fd2369ae75914b7ab513ac207b733f30fe1da8b7e1a9c06"
+      "sha512": "d90dff0f37834bf0c45f4b2c100c07efe20c6b2f176b60fe5e8fcc9e793022f897a7dbea49898425244f045cc14dd32d01477ac07cf6986be0d36c287eb9e384"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 289,
+        "count": 296,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 258
+          "sha256_token": 265
         },
-        "sha512": "9711a590a44b85eb112e6a6d3aa799151ad162320df453222034f3f130f665472c7ae8f9c3e5b32f86d2b835655f135f71aadc49fe9249711a7125eff937a1ca"
+        "sha512": "30aaf7c4a75986a9a19415de61ee101a7ca9284a00abcdb7a4b00780036ca2f9fad6326b41383ca6504ac0f633c4cf5944a305dc6d1e50a640b28833bc928b02"
       },
       {
         "scope": "fuzz",
@@ -181,7 +181,7 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc, signed chrony, and PID-only udev reference harnesses; production authorities remain typed and versioned.",
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc, signed chrony, PID-only udev and signed sudo reference harnesses; production authorities remain typed and versioned.",
         "count": 5047,
         "counts": {
           "cas_layout": 19,
