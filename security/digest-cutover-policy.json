@@ -41,15 +41,15 @@
       "sha512": "72b518471e7b1f691a7c2ed72553ca6946446bea86a06e2d703f25be32f5ec32f3a8561a2c5657dd913f9b1360e5e2d7ec6cd0c30f48bcb583818f1577db02e3"
     },
     "findings": {
-      "count": 21075,
+      "count": 21122,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1169,
-        "sha256_token": 19433
+        "raw_32_byte": 1177,
+        "sha256_token": 19472
       },
-      "sha512": "a8405cb1cd4b80fb795893c16e17c4a1e3f98c094b8ab94a3a06b61c0c048ca6f79443c1e35d511d0a8fdfd29b0f374b5c6121466099a03a718413172fabaddc"
+      "sha512": "eb6b34f905379518cac8d6d54f740e51016b520e2b78593961820e292c815f6e8a0da5e20b3f8dbbc31c5777145d11f36f4a6202887cba60813c2091d12e6a69"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 272,
+        "count": 276,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 241
+          "sha256_token": 245
         },
-        "sha512": "0c818ec1b0da8545582ba5522c4896add6a62785560d91e18a73304eff4a2f00515b33325ba6619b465811cd38ae5f7e8121d8b5da6205f3ec247e2e2350bffb"
+        "sha512": "369f4210391d03c9c14fd12c23e8c08d8b0d1d50a2d5c733c52d5faabebc05395c95a213a3083320d22a907d9a49dc0b6bb960ac082ec6c28e2232dd81b2bd12"
       },
       {
         "scope": "fuzz",
@@ -153,16 +153,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12273,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only and udev PID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "count": 12316,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1095,
-          "sha256_token": 11031
+          "raw_32_byte": 1103,
+          "sha256_token": 11066
         },
-        "sha512": "6137decb6c664e4639db4f498a0b1ab99b70d808bbd0864f09a330031b3749cb36360fd6dfd7fbe08d8ccf7f77a7587ce1a232c01a28d5cdefbc4111104a377d"
+        "sha512": "a663abd63978a77254d3701376c00db6d8d8d2765cffa2ef05ef1068f289e8f59f1ee1d755735db2dbfd25cea7753173c178372929ba2309d056d479688c8e15"
       },
       {
         "scope": "test",

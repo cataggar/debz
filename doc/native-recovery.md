@@ -665,6 +665,18 @@ next lifecycle script. In particular, this does not create `/proc/sys` in the
 root seen by the later deferred procps trigger; its exact absent-input guard
 above remains unchanged.
 
+The independent exact signed udev configure action has a separate
+PID-only private proc view: no `/proc/sys`, no boot ID, and no host-proc
+mount. The installed and staged scripts and the required signed tools and
+control files are pinned and rechecked before launch. A wrong digest,
+version, argument, script source or action refuses; a missing namespace,
+mount, descriptor seal or privilege drop records the same typed
+`snapshot_proc` non-launch outcome. After exit, timeout or parent crash,
+PID 1 and its descendants are reaped and private mounts disappear.
+Ordinary durable script outcomes and unknown-outcome recovery remain in
+force; this does not change systemd's boot-ID policy or the absent-sysctl
+guard on the later procps trigger.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and

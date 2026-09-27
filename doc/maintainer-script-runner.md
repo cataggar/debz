@@ -202,6 +202,41 @@ arm64, in both Debug and ReleaseSafe; the 33-test target includes PID 1
 mount/mask/teardown and parent-crash regressions, not a capability skip.
 WSL capability availability remains unverified.
 
+## Exact signed udev postinst PID-only proc view
+
+The separate udev admission is limited to `udev:amd64` `261.2-1ubuntu2`,
+new-package `postinst ["configure", ""]`, signed SHA-256
+`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`.
+Only the root-owned, mode-0755, 2,533-byte installed dpkg-info script may
+execute. The staged new-package copy, if present, must match its signed
+digest; unexpected aliases refuse. The runner pins the mode-0700 root,
+empty root-owned `/proc` mountpoint, installed script, exact `/bin`-to-`usr/bin`
+and `sh`-to-`dash`
+link, and signed tool and sidecar bytes needed by the script (including
+`systemd-tmpfiles`, `systemd-sysusers`, `systemd-hwdb`, dpkg and both udev
+configuration files). The higher-priority `/etc`, `/run`, and
+`/usr/local/lib` names that could shadow either sidecar must be absent.
+Higher-priority `/usr/sbin` names for the exact `/usr/bin` commands must
+also be absent, so the script cannot silently resolve a different provider.
+Replaced, differently owned or multiply linked inputs refuse before
+launch. This does not admit udev triggers, other
+scripts, other architectures, or other package versions.
+
+The child reuses the isolated PID-1/chroot boundary, descriptor seal,
+private mount propagation, privilege drop, no-new-privileges setting,
+supervision and teardown described above, but mounts a fresh
+`ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs. It never mounts
+the broader procfs or creates a boot-ID mask: `/proc/sys` and its boot-ID
+path must both be absent before exec. PID 1's proc-visible root must
+match the pinned fixture. The script cannot remount proc after
+`CAP_SYS_ADMIN` is dropped, and a failed setup records the existing typed
+non-spawned `snapshot_proc` outcome. The policy has its own v3 digest
+domain and pins the exact provider paths and hashes; systemd's v2
+boot-ID admission and its one-file `/proc/sys` representation remain
+separate. This environment passed protected amd64 pinned-dpkg and
+signed-script comparisons; it does not authorize a broader proc view
+or establish arm64/WSL namespace support.
+
 ## Outcome taxonomy
 
 `MaintainerScriptOutcome` keeps every result exactly distinguishable:

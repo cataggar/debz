@@ -1227,6 +1227,50 @@ udev to use systemd's exact-script proc mechanism or prove a completed
 175-package replay. Protected checkout provisioning and namespace/mount
 capabilities remain unproven on CI arm64 and WSL.
 
+The separately authorized udev implementation at protected source snapshot
+`38ddbca3bdcd67418cad5ea61c1903699130afa7` admits only that signed
+new-package `udev:amd64` `261.2-1ubuntu2` postinst with
+`["configure", ""]`, from its verified installed dpkg-info path. Its
+PID-only private procfs has no `/proc/sys` or boot ID; the signed script,
+required tools and sidecars, path resolution, root and empty mountpoint are
+pinned before launch. Systemd's separate boot-ID view is unchanged. In
+protected disposable pre-udev copies, pinned dpkg 1.22.22 and the signed
+script each exited 1 without `/proc` and 0 with the PID-only view. Three
+additional **regular files**, not host devices, started root:root mode 0600
+at `/dev/kvm`, `/dev/fuse`, and `/dev/snd/seq`. Both pinned dpkg and the
+signed script changed them to root:kvm (GID 992) mode 0660, root:root
+mode 0666, and root:audio (GID 29) mode 0660, respectively. The direct
+script comparison also retained the native `installed` prestate; only the
+disposable dpkg comparison set udev to `half-configured` so that dpkg would
+execute it. No real device node was exposed or altered.
+
+A **new**, independent 175-package amd64 root,
+`amd64-udev-proc-fresh-long-3`, ran under the protected root-owned checkout
+and mode-0700 `.real-snapshot`. It reauthenticated signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C` and all 175 signed-lock
+archive SHA-512 identities (67,976,788 download bytes), using the
+ReleaseSafe binary SHA-256
+`8cf3fee176ead7323076acaa83951acf3c44e66ac60c99959705b0082d0042c2`.
+The durable outcome for the signed udev postinst at step 1357 records
+`spawned=true`, `exit_code=0`, 182 stderr bytes and zero stdout bytes;
+the progress ledger marks it **completed/succeeded**. Udev is `install ok
+installed`, the five expected groups have GIDs 995 through 991, and the
+root-owned mode-0444 `/usr/lib/udev/hwdb.bin` was generated. `/proc` was
+empty and no private mount survived the callback.
+
+The installation did **not** complete. Its first subsequent blocker was
+`sudo:amd64` `1.9.17p2-7ubuntu3` postinst at step 1376, SHA-256
+`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`:
+the action remained **prepared**, without a sudo script outcome or launch.
+The ReleaseSafe process aborted (exit 134) inside
+`native_alternatives.capture` while preparing the alternatives boundary;
+the stack reports `OwnedRecord.deinit` through the parsed-record `errdefer`.
+The underlying capture error has not been established. `create.json` is
+empty because the process aborted; this interrupted root is **not** reusable
+as a fresh root or proof of full native/reference parity. Earlier
+`amd64-udev-proc-fresh-long-{1,2}` runs were also stopped before udev while
+tightening provider and path guards; neither was reused.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
