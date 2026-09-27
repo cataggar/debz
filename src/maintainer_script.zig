@@ -1617,10 +1617,16 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
     }
     if (linux.errno(writable) != .ROFS) return linux.errno(writable);
     if (failure_stage) |stage| stage.* = 10;
-    return restrictSnapshotProcPrivileges();
+    return restrictSnapshotProcPrivileges(failure_stage);
 }
 
-fn restrictSnapshotProcPrivileges() linux.E {
+// Zig's linux.cap_user_header_t pads pid to offset 8; the kernel ABI uses offset 4.
+const KernelCapabilityHeader = extern struct {
+    version: u32,
+    pid: i32,
+};
+
+fn restrictSnapshotProcPrivileges(failure_stage: ?*u8) linux.E {
     const dropped = linux.errno(linux.prctl(
         @intFromEnum(linux.PR.CAPBSET_DROP),
         linux.CAP.SYS_ADMIN,
@@ -1629,6 +1635,7 @@ fn restrictSnapshotProcPrivileges() linux.E {
         0,
     ));
     if (dropped != .SUCCESS) return dropped;
+    if (failure_stage) |stage| stage.* = 11;
     const ambient = linux.errno(linux.prctl(
         @intFromEnum(linux.PR.CAP_AMBIENT),
         4,
@@ -1637,6 +1644,7 @@ fn restrictSnapshotProcPrivileges() linux.E {
         0,
     ));
     if (ambient != .SUCCESS) return ambient;
+    if (failure_stage) |stage| stage.* = 12;
     const no_new_privs = linux.errno(linux.prctl(
         @intFromEnum(linux.PR.SET_NO_NEW_PRIVS),
         1,
@@ -1645,22 +1653,39 @@ fn restrictSnapshotProcPrivileges() linux.E {
         0,
     ));
     if (no_new_privs != .SUCCESS) return no_new_privs;
-    var header: linux.cap_user_header_t = .{ .version = 0x20080522, .pid = 0 };
+    if (failure_stage) |stage| stage.* = 13;
+    var header: KernelCapabilityHeader = .{ .version = 0x20080522, .pid = 0 };
     var data: [2]linux.cap_user_data_t = undefined;
-    const captured = linux.errno(linux.capget(&header, &data[0]));
+    const captured = linux.errno(linux.syscall2(
+        .capget,
+        @intFromPtr(&header),
+        @intFromPtr(&data[0]),
+    ));
     if (captured != .SUCCESS) return captured;
+    if (failure_stage) |stage| stage.* = 14;
     const bit = linux.CAP.TO_MASK(linux.CAP.SYS_ADMIN);
     data[0].effective &= ~bit;
     data[0].permitted &= ~bit;
     data[0].inheritable &= ~bit;
-    const removed = linux.errno(linux.capset(&header, &data[0]));
+    const removed = linux.errno(linux.syscall2(
+        .capset,
+        @intFromPtr(&header),
+        @intFromPtr(&data[0]),
+    ));
     if (removed != .SUCCESS) return removed;
-    const checked = linux.errno(linux.capget(&header, &data[0]));
+    if (failure_stage) |stage| stage.* = 15;
+    const checked = linux.errno(linux.syscall2(
+        .capget,
+        @intFromPtr(&header),
+        @intFromPtr(&data[0]),
+    ));
     if (checked != .SUCCESS) return checked;
+    if (failure_stage) |stage| stage.* = 16;
     if (((data[0].effective | data[0].permitted | data[0].inheritable) & bit) != 0 or
         linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.SYS_ADMIN, 0, 0, 0) != 0 or
         linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1)
         return .PERM;
+    if (failure_stage) |stage| stage.* = 17;
     var parent_signal: u32 = 0;
     const death = linux.errno(linux.prctl(
         @intFromEnum(linux.PR.GET_PDEATHSIG),
@@ -3579,6 +3604,20 @@ fn testSnapshotProcFailure(status_fd: i32, stage: u8, err: linux.E) noreturn {
     const failure = [_]u8{ 0, stage, @intCast(@intFromEnum(err)) };
     _ = linux.write(status_fd, &failure, failure.len);
     linux.exit(2);
+}
+
+test "maintainer_script.test.capability header matches the kernel ABI" {
+    if (builtin.os.tag != .linux) return;
+    try testing.expectEqual(@as(usize, 8), @sizeOf(KernelCapabilityHeader));
+    try testing.expectEqual(@as(usize, 4), @offsetOf(KernelCapabilityHeader, "pid"));
+    try testing.expectEqual(@as(usize, 12), @sizeOf(linux.cap_user_data_t));
+    var header: KernelCapabilityHeader = .{ .version = 0x20080522, .pid = 0 };
+    var data: [2]linux.cap_user_data_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(
+        .capget,
+        @intFromPtr(&header),
+        @intFromPtr(&data[0]),
+    )));
 }
 
 test "maintainer_script.test.private PID1 mounts masked read-only boot ID and tears down" {

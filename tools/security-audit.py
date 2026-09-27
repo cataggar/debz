@@ -869,7 +869,11 @@ def audit_production_sources() -> None:
             namespace_calls.append(
                 f"{relative}:{text.count(chr(10), 0, match.start()) + 1}"
             )
-        for match in re.finditer(r"\blinux\.(?:capget|capset|prctl)\s*\(", text):
+        for match in re.finditer(
+            r"\blinux\.(?:capget|capset|prctl)\s*\("
+            r"|\blinux\.syscall2\s*\(\s*\.(?:capget|capset)\s*,",
+            text,
+        ):
             capability_calls.append(
                 f"{relative}:{text.count(chr(10), 0, match.start()) + 1}"
             )
@@ -898,7 +902,9 @@ def audit_production_sources() -> None:
         "linux.PR.SET_PDEATHSIG",
         "linux.PR.CAPBSET_DROP",
         "linux.PR.SET_NO_NEW_PRIVS",
-        "linux.capset(",
+        "linux.syscall2(\n        .capget,",
+        "linux.syscall2(\n        .capset,",
+        '@offsetOf(KernelCapabilityHeader, "pid")',
         "linux.MS.REMOUNT | proc_mount_flags",
         "linux.syscall3(\n        .close_range,",
     ):

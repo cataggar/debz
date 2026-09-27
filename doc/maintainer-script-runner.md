@@ -187,10 +187,13 @@ requires an explicitly supplied disposable
 The parent needs namespace/mount privileges (`CAP_SYS_ADMIN`), and the child
 needs `CAP_SYS_CHROOT` and `CAP_SETPCAP` to enter the pinned root and drop its
 remount authority; `openat2`, `statx`, and `close_range(CLOEXEC)` must work.
-These requirements passed on the local Linux 6.18.31 privileged runner.
-Availability on WSL and the opt-in Ubuntu CI runners has not yet been
-established; missing support refuses the exact invocation without a proc or
-mount fallback.
+The capability syscall header uses the kernel's 8-byte layout with its
+32-bit PID at offset 4; Zig's `linux.cap_user_header_t` instead pads a
+machine-width PID to offset 8, which can send an uninitialized PID and yield
+`ESRCH` in Debug builds. The scoped runner checks the exact header layout
+and verifies that `CAP_SYS_ADMIN` is absent after dropping it. These
+requirements passed on the local Linux 6.18.31 privileged runner. Missing
+support refuses the exact invocation without a proc or mount fallback.
 
 ## Outcome taxonomy
 
