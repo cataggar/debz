@@ -3565,6 +3565,12 @@ test "maintainer_script.test.snapshot systemd proc is bound to the exact signed 
     _ = &binding;
 }
 
+fn testSnapshotProcFailure(status_fd: i32, stage: u8, err: linux.E) noreturn {
+    const failure = [_]u8{ 0, stage, @intCast(@intFromEnum(err)) };
+    _ = linux.write(status_fd, &failure, failure.len);
+    linux.exit(2);
+}
+
 test "maintainer_script.test.private PID1 mounts masked read-only boot ID and tears down" {
     if (builtin.os.tag != .linux) return;
     var directory = testing.tmpDir(.{});
@@ -3602,75 +3608,77 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
     }
     if (forked == 0) {
         _ = linux.close(status[0]);
-        var result: [1]u8 = .{1};
-        if (linux.getpid() == 1 and
-            linux.errno(linux.prctl(
-                @intFromEnum(linux.PR.SET_PDEATHSIG),
-                @intFromEnum(linux.SIG.KILL),
-                0,
-                0,
-                0,
-            )) == .SUCCESS and
-            linux.errno(linux.mount(
-                null,
-                "/",
-                null,
-                linux.MS.REC | linux.MS.PRIVATE,
-                0,
-            )) == .SUCCESS and
-            linux.errno(linux.chdir(root_path.ptr)) == .SUCCESS and
-            linux.errno(linux.chroot(".")) == .SUCCESS and
-            linux.errno(linux.chdir("/")) == .SUCCESS)
-        {
-            const setup = setupSnapshotProc(.{
-                .root_stat = root_stat,
-                .directory_stat = directory_stat,
-                .boot_id = boot_id,
-            });
-            if (setup == .SUCCESS) {
-                const present = linux.open(
-                    "/proc/sys/kernel/random/boot_id",
-                    .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
-                    0,
-                );
-                if (linux.errno(present) == .SUCCESS) {
-                    _ = linux.close(@intCast(present));
-                    const hidden = linux.open(
-                        "/proc/sys/kernel/random/uuid",
-                        .{ .PATH = true, .CLOEXEC = true },
-                        0,
-                    );
-                    const visible = linux.open(
-                        "/proc/1/root",
-                        .{ .PATH = true, .CLOEXEC = true },
-                        0,
-                    );
-                    if (linux.errno(visible) == .SUCCESS) {
-                        var observed: linux.Statx = undefined;
-                        if (helperStat(@intCast(visible), &observed) == .SUCCESS and
-                            observed.ino == root_stat.ino and
-                            observed.dev_major == root_stat.dev_major and
-                            observed.dev_minor == root_stat.dev_minor and
-                            linux.errno(hidden) == .NOENT)
-                            result[0] = 0;
-                        _ = linux.close(@intCast(visible));
-                    }
-                    if (linux.errno(hidden) == .SUCCESS)
-                        _ = linux.close(@intCast(hidden));
-                }
-            }
+        if (linux.getpid() != 1) testSnapshotProcFailure(status[1], 1, .CHILD);
+        const death = linux.errno(linux.prctl(
+            @intFromEnum(linux.PR.SET_PDEATHSIG),
+            @intFromEnum(linux.SIG.KILL),
+            0,
+            0,
+            0,
+        ));
+        if (death != .SUCCESS) testSnapshotProcFailure(status[1], 2, death);
+        const private = linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
+        if (private != .SUCCESS) testSnapshotProcFailure(status[1], 3, private);
+        const entered = linux.errno(linux.chdir(root_path.ptr));
+        if (entered != .SUCCESS) testSnapshotProcFailure(status[1], 4, entered);
+        const chrooted = linux.errno(linux.chroot("."));
+        if (chrooted != .SUCCESS) testSnapshotProcFailure(status[1], 5, chrooted);
+        const at_root = linux.errno(linux.chdir("/"));
+        if (at_root != .SUCCESS) testSnapshotProcFailure(status[1], 6, at_root);
+        const setup = setupSnapshotProc(.{
+            .root_stat = root_stat,
+            .directory_stat = directory_stat,
+            .boot_id = boot_id,
+        });
+        if (setup != .SUCCESS) testSnapshotProcFailure(status[1], 7, setup);
+        const present = linux.open(
+            "/proc/sys/kernel/random/boot_id",
+            .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(present) != .SUCCESS)
+            testSnapshotProcFailure(status[1], 8, linux.errno(present));
+        _ = linux.close(@intCast(present));
+        const hidden = linux.open(
+            "/proc/sys/kernel/random/uuid",
+            .{ .PATH = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(hidden) == .SUCCESS) {
+            _ = linux.close(@intCast(hidden));
+            testSnapshotProcFailure(status[1], 9, .EXIST);
         }
-        _ = linux.write(status[1], &result, 1);
-        linux.exit(result[0]);
+        if (linux.errno(hidden) != .NOENT)
+            testSnapshotProcFailure(status[1], 9, linux.errno(hidden));
+        const visible = linux.open(
+            "/proc/1/root",
+            .{ .PATH = true, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(visible) != .SUCCESS)
+            testSnapshotProcFailure(status[1], 10, linux.errno(visible));
+        var observed: linux.Statx = undefined;
+        const verified = helperStat(@intCast(visible), &observed);
+        if (verified != .SUCCESS) testSnapshotProcFailure(status[1], 11, verified);
+        if (observed.ino != root_stat.ino or
+            observed.dev_major != root_stat.dev_major or
+            observed.dev_minor != root_stat.dev_minor)
+            testSnapshotProcFailure(status[1], 11, .STALE);
+        _ = linux.close(@intCast(visible));
+        const result = [_]u8{ 1, 0, 0 };
+        _ = linux.write(status[1], &result, result.len);
+        linux.exit(0);
     }
     _ = linux.close(status[1]);
-    var result: [1]u8 = undefined;
-    const received = linux.read(status[0], &result, 1);
+    var result: [3]u8 = .{ 0, 0, 0 };
+    const received = linux.read(status[0], &result, result.len);
     _ = linux.close(status[0]);
     var waited: u32 = 0;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
-    try testing.expectEqual(@as(usize, 1), received);
-    try testing.expectEqual(@as(u8, 0), result[0]);
+    if (received != result.len or result[0] != 1)
+        std.debug.print("snapshot proc PID1 stage={d} errno={d} bytes={d}\n", .{ result[1], result[2], received });
+    try testing.expectEqual(@as(usize, result.len), received);
+    try testing.expectEqual(@as(u8, 1), result[0]);
     try testing.expect(linux.W.IFEXITED(waited));
     try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
     try testing.expect((try root.entryIfExists(try root_fs.Path.init("proc/sys"))) == null);
@@ -3768,33 +3776,29 @@ fn testMaskedProcWorker(
     status_fd: i32,
     escape_group: bool,
 ) noreturn {
-    if (linux.getpid() != 1 or
-        linux.errno(linux.prctl(
-            @intFromEnum(linux.PR.SET_PDEATHSIG),
-            @intFromEnum(linux.SIG.KILL),
-            0,
-            0,
-            0,
-        )) != .SUCCESS or
-        linux.errno(linux.mount(
-            null,
-            "/",
-            null,
-            linux.MS.REC | linux.MS.PRIVATE,
-            0,
-        )) != .SUCCESS or
-        linux.errno(linux.chdir(root_path.ptr)) != .SUCCESS or
-        linux.errno(linux.chroot(".")) != .SUCCESS or
-        linux.errno(linux.chdir("/")) != .SUCCESS or
-        setupSnapshotProc(descriptor) != .SUCCESS)
-    {
-        const failed = [_]u8{0};
-        _ = linux.write(status_fd, &failed, 1);
-        linux.exit(2);
-    }
+    if (linux.getpid() != 1) testSnapshotProcFailure(status_fd, 1, .CHILD);
+    const death = linux.errno(linux.prctl(
+        @intFromEnum(linux.PR.SET_PDEATHSIG),
+        @intFromEnum(linux.SIG.KILL),
+        0,
+        0,
+        0,
+    ));
+    if (death != .SUCCESS) testSnapshotProcFailure(status_fd, 2, death);
+    const private = linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
+    if (private != .SUCCESS) testSnapshotProcFailure(status_fd, 3, private);
+    const entered = linux.errno(linux.chdir(root_path.ptr));
+    if (entered != .SUCCESS) testSnapshotProcFailure(status_fd, 4, entered);
+    const chrooted = linux.errno(linux.chroot("."));
+    if (chrooted != .SUCCESS) testSnapshotProcFailure(status_fd, 5, chrooted);
+    const at_root = linux.errno(linux.chdir("/"));
+    if (at_root != .SUCCESS) testSnapshotProcFailure(status_fd, 6, at_root);
+    const setup = setupSnapshotProc(descriptor);
+    if (setup != .SUCCESS) testSnapshotProcFailure(status_fd, 7, setup);
     if (escape_group) {
         const descendant = linux.fork();
-        if (linux.errno(descendant) != .SUCCESS) linux.exit(3);
+        if (linux.errno(descendant) != .SUCCESS)
+            testSnapshotProcFailure(status_fd, 8, linux.errno(descendant));
         if (descendant == 0) {
             _ = linux.setsid();
             const sleep: linux.timespec = .{ .sec = 10, .nsec = 0 };
@@ -3802,8 +3806,8 @@ fn testMaskedProcWorker(
             linux.exit(0);
         }
     }
-    const ready = [_]u8{1};
-    _ = linux.write(status_fd, &ready, 1);
+    const ready = [_]u8{ 1, 0, 0 };
+    _ = linux.write(status_fd, &ready, ready.len);
     const sleep: linux.timespec = .{ .sec = 10, .nsec = 0 };
     _ = linux.nanosleep(&sleep, null);
     linux.exit(0);
@@ -3856,7 +3860,8 @@ test "maintainer_script.test.masked proc dies on deadline and parent crash" {
                 linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
                 0,
             );
-            if (linux.errno(worker) != .SUCCESS) linux.exit(4);
+            if (linux.errno(worker) != .SUCCESS)
+                testSnapshotProcFailure(status[1], 9, linux.errno(worker));
             if (worker == 0)
                 testMaskedProcWorker(root_path, descriptor, status[1], false);
             var child_status: u32 = 0;
@@ -3864,13 +3869,14 @@ test "maintainer_script.test.masked proc dies on deadline and parent crash" {
             linux.exit(0);
         }
         _ = linux.close(status[1]);
-        var ready: [1]u8 = undefined;
-        const received = linux.read(status[0], &ready, 1);
-        if (received != 1 or ready[0] != 1) {
+        var ready: [3]u8 = .{ 0, 0, 0 };
+        const received = linux.read(status[0], &ready, ready.len);
+        if (received != ready.len or ready[0] != 1) {
             _ = linux.kill(@intCast(owner), .KILL);
             var abandoned: u32 = 0;
             _ = linux.waitpid(@intCast(owner), &abandoned, 0);
             _ = linux.close(status[0]);
+            std.debug.print("snapshot proc teardown stage={d} errno={d} bytes={d}\n", .{ ready[1], ready[2], received });
             return error.NativeHelperNamespaceRequired;
         }
         _ = linux.kill(@intCast(owner), .KILL);
