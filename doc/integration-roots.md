@@ -966,11 +966,15 @@ chrooted PID 1 had only standard descriptors; `CAP_SYS_ADMIN` was removed and
 configured signed systemd to `install ok installed` (exit 0), and the same
 postinst digest with the native runner's exact replacement environment
 separately exited 0. Those early pinned comparisons ran from writable
-checkout ancestry and are provisional; the hardened
-`tools/real-snapshot-systemd-proc-reference.sh` requires a root-owned,
-non-writable checkout, source, and proof ancestry. A separate Zig signed-root
-runner test also exited 0 with no mount retained outside its invocation.
-None of these diagnostic copies establishes a successful new 175-package
+checkout ancestry and are provisional. For a repeatable pinned comparison,
+run `tools/real-snapshot-systemd-proc-reference.sh` only from a root-owned
+checkout beneath root-owned, non-group/world-writable ancestors, with a
+verified source and a new proof destination under its root-owned mode-0700
+`.real-snapshot` directory. The harness refuses a shared writable checkout
+or proof path before copying or chrooting, since an unprivileged writer could
+otherwise swap a previously checked root. A separate Zig signed-root runner
+test also exited 0 with no mount retained outside its invocation. None of
+these diagnostic copies establishes a successful new 175-package
 authenticated replay. An initial new-root trial was deliberately stopped
 before systemd to enforce close-on-exec on all inherited descriptors; its
 interrupted root is not reusable. A second **new** 175-archive authenticated
