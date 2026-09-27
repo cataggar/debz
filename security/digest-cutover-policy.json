@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 466,
-      "sha512": "482fc74fa1632fef2a4fafeff474a4060fa2e2da22d1258ea5f4be343a399473dc8d30b58399ffe0da328f11f3540b857dd431a14311c31797e7bc4aacd54fd0"
+      "count": 467,
+      "sha512": "8dee6f02a032a9a2fcf2d59207aa761a8ff67fd95ec43a34d44b71a1ca7e7fa078e36abb9507a0bc2da00081830240e3ecd9d8c1017a624eb09d56f6672d5803"
     },
     "findings": {
-      "count": 20994,
+      "count": 21035,
       "counts": {
         "cas_layout": 193,
         "digest_version": 103,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1162,
-        "sha256_token": 19359
+        "raw_32_byte": 1168,
+        "sha256_token": 19394
       },
-      "sha512": "8b2c2029f6b1cde0519296564fd2836ddb1c85df53264a33e65ce646df27f54184b0cccd1c5f80ac52a031c5bf9b59ccc49f59a9f34084715a40fe37b8ac2103"
+      "sha512": "8b184cc1e6746ef99b62574b750c539bad9e2a86bb7431ddd05f8024b323676b143ae707d1374ba4ab82c76bf8ebdb848f36b56db5e1b834e836c812dcb46c59"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 243,
+        "count": 254,
         "counts": {
           "cas_layout": 23,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 212
+          "sha256_token": 223
         },
-        "sha512": "e4962e78e6516c051fa9ecb902e1369d79c9fb15a6eb25dab0b0a8477bd81249c7568be8f908f105e8aa99ef32a40e9c0b4202a360f4c4f8253a24f339808212"
+        "sha512": "5aac384c6d878d12bc4701afc9abf5781740c475b0511be7b59136f70c727ce270f5def381e0de8ed41e488b8f3afd022e7f2a0a16225f9047f934b790080831"
       },
       {
         "scope": "fuzz",
@@ -154,15 +154,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup debconf script-path and sidecar, keyboard and iproute2 maintainer-script/template gates, signed systemd boot-ID-only proc isolation, signed sudo and bootstrap ownership, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12225,
+        "count": 12253,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1088,
-          "sha256_token": 10990
+          "raw_32_byte": 1094,
+          "sha256_token": 11012
         },
-        "sha512": "51f6fdfd08c8bcd4bffa7477fb192c86e39bbc67986b9ac70c888efd8f01d8582a502375ea8426f12be24e4832c42c863aef6e27c433609ca9ef5da5fd28a750"
+        "sha512": "9be61541af80aa3e890b9bb818acb34660a4c3eb0e540cce0dee5c9fad458d44167cfad7e32d1d7e811ec9cbf3ee1e5a3f3a0636bbaa9269c130a589de54a9d3"
       },
       {
         "scope": "test",
@@ -182,15 +182,15 @@
         "scope": "tools",
         "classification": "release_and_reference_tooling",
         "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including the disposable pinned systemd proc reference harness; production authorities remain typed and versioned.",
-        "count": 5035,
+        "count": 5037,
         "counts": {
           "cas_layout": 19,
           "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5011
+          "sha256_token": 5013
         },
-        "sha512": "b371b07710c8c2f0d49221f0ae04754cf29e9ae01c2fa45d25325701b3cb6b5cc656b68e7daacc9380946083e9e0cb0cdeee53fa6d92e8607e091574f0ba61d3"
+        "sha512": "17860edcf9d7076cbeb4d210d23e4b336d84f3d6868433c80b23358d04089a5d1b04ee1e66e66434cc3e725a363e5e8dc67d1979d0e81d9138d6557968b8495b"
       }
     ]
   },

@@ -742,11 +742,10 @@ test "security: apt import and native child-process owners retain explicit bound
     const runner = try f.source("src/maintainer_script.zig");
     try testing.expect(std.mem.indexOf(u8, runner, "std.process.run(") == null);
     for ([_][]const u8{
-        "linux.open(\"/dev/null\"",        "linux.chroot(\".\")",           "linux.unshare(linux.CLONE.NEWNS)",
-        "live_root.cloneMountDescriptor(", "live_root.setMountAttributes(", "linux.move_mount(",
-        "linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID",
-        "linux.PR.CAPBSET_DROP", "linux.PR.SET_NO_NEW_PRIVS", "linux.PR.SET_PDEATHSIG",
-        "linux.capset(", "linux.syscall3(\n        .close_range,",
+        "linux.open(\"/dev/null\"",                            "linux.chroot(\".\")",           "linux.unshare(linux.CLONE.NEWNS)",
+        "live_root.cloneMountDescriptor(",                     "live_root.setMountAttributes(", "linux.move_mount(",
+        "linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID", "linux.PR.CAPBSET_DROP",         "linux.PR.SET_NO_NEW_PRIVS",
+        "linux.PR.SET_PDEATHSIG",                              "linux.capset(",                 "linux.syscall3(\n        .close_range,",
     }) |marker| try support.contains(runner, marker);
     const live = try f.source("src/live_root.zig");
     try testing.expect(std.mem.indexOf(u8, live, "std.process.run(") == null);
