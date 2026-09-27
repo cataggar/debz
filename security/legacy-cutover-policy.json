@@ -474,6 +474,11 @@
       "cutover": "retain_guard"
     },
     {
+      "path": "src/maintainer_script.zig",
+      "role": "native_signed_sudo_script_pins_dpkg_query_tool_without_legacy_execution",
+      "cutover": "retain_native_exact_script_guard"
+    },
+    {
       "path": "src/native_unpack.zig",
       "role": "native_runtime_rejects_legacy_capability",
       "cutover": "retain_guard"

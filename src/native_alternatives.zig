@@ -1300,6 +1300,14 @@ pub const StructuralLink = struct {
     target: []const u8,
 };
 
+pub const snapshot_sudo_structural_links = [_]StructuralLink{
+    .{ .path = "usr/bin/sudoedit", .target = "sudo.ws" },
+    .{
+        .path = "usr/share/man/man8/sudoedit.8.gz",
+        .target = "sudo.ws.8.gz",
+    },
+};
+
 pub const GroupAuthority = struct {
     name: []const u8,
     topology: ?Topology = null,
@@ -1766,13 +1774,10 @@ pub fn discoverScriptAuthority(
         if (groups.items.len != 1 or commands.items.len != 1 or
             !std.mem.eql(u8, groups.items[0].name, "sudo"))
             return error.InvalidAlternativesScript;
-        groups.items[0].structural_links = try owned.dupe(StructuralLink, &.{
-            .{ .path = "usr/bin/sudoedit", .target = "sudo.ws" },
-            .{
-                .path = "usr/share/man/man8/sudoedit.8.gz",
-                .target = "sudo.ws.8.gz",
-            },
-        });
+        groups.items[0].structural_links = try owned.dupe(
+            StructuralLink,
+            &snapshot_sudo_structural_links,
+        );
         for ([_][]const u8{
             "/usr/lib/cargo/bin/su",
             "/var/lib/dpkg/info/sudo.list",
@@ -2625,7 +2630,8 @@ fn captureGroup(
                 "/etc/alternatives/{s}",
                 .{slave.name},
             );
-            if (!std.mem.eql(u8, fact.link_target.?, expected))
+            if (!std.mem.eql(u8, fact.link_target.?, expected) and
+                !matchesStructuralLink(fact, authority.structural_links))
                 return error.InvalidAlternativesSelection;
         }
         try appendFact(owned, &facts, fact);
@@ -2749,6 +2755,13 @@ fn structuralLinkMatches(fact: EntryFact, expected: StructuralLink) bool {
         fact.size == expected.target.len and
         fact.link_target != null and
         std.mem.eql(u8, fact.link_target.?, expected.target);
+}
+
+fn matchesStructuralLink(fact: EntryFact, allowed: []const StructuralLink) bool {
+    for (allowed) |expected| {
+        if (structuralLinkMatches(fact, expected)) return true;
+    }
+    return false;
 }
 
 fn requireAbsentOrStructural(
@@ -2925,9 +2938,10 @@ pub fn capture(
             );
             var record_sha256: [32]u8 = undefined;
             Sha256.hash(bytes, &record_sha256, .{});
-            errdefer parsed.deinit();
-            try parsed_records.append(allocator, parsed);
-            parsed = undefined;
+            parsed_records.append(allocator, parsed) catch |err| {
+                parsed.deinit();
+                return err;
+            };
             try groups.append(
                 owned,
                 try captureGroup(
@@ -4766,6 +4780,88 @@ test "native_alternatives.test.signed sudo-rs replaces only two owned structural
             validateAbsentGroup(temporary_allocator.allocator(), root, script.groups[0], .{}),
         );
     }
+}
+
+test "native_alternatives.test.signed sudo overwrite is scoped and capture errors do not crash" {
+    const testing = std.testing;
+    const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_ALTERNATIVES_BEFORE") orelse return;
+    const after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_ALTERNATIVES_AFTER") orelse return;
+    var before_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
+    defer before_root.close();
+    var after_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
+    defer after_root.close();
+    const bytes = try before_root.root.readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/info/sudo.postinst"),
+        8192,
+    );
+    defer testing.allocator.free(bytes);
+    var observed: [32]u8 = undefined;
+    Sha256.hash(bytes, &observed, .{});
+    try testing.expectEqualSlices(
+        u8,
+        &digestLiteral("e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8"),
+        &observed,
+    );
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 1), script.groups.len);
+    try testing.expectEqualStrings("sudo", script.groups[0].name);
+    var listed = try listGroups(testing.allocator, before_root.root, .{});
+    defer listed.deinit();
+    const strict = try testing.allocator.alloc(GroupAuthority, listed.names.len);
+    defer testing.allocator.free(strict);
+    const scoped = try testing.allocator.alloc(GroupAuthority, listed.names.len);
+    defer testing.allocator.free(scoped);
+    for (listed.names, strict, scoped) |name, *plain, *allowed| {
+        plain.* = .{ .name = name };
+        allowed.* = .{
+            .name = name,
+            .structural_links = if (std.mem.eql(u8, name, "sudo"))
+                &snapshot_sudo_structural_links
+            else
+                &.{},
+        };
+    }
+    try testing.expectError(
+        error.InvalidAlternativesSelection,
+        capture(testing.allocator, before_root.root, .{ .groups = strict }),
+    );
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_ALTERNATIVES_CHANGED")) |path| {
+        var changed_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+        defer changed_root.close();
+        try testing.expectError(
+            error.InvalidAlternativesSelection,
+            capture(testing.allocator, changed_root.root, .{ .groups = scoped }),
+        );
+    }
+    var before = try capture(testing.allocator, before_root.root, .{ .groups = scoped });
+    defer before.deinit();
+    var after = try capture(testing.allocator, after_root.root, .{ .groups = strict });
+    defer after.deinit();
+    try validateScriptTransition(
+        testing.allocator,
+        before,
+        after,
+        script,
+        .{ .groups = strict },
+    );
+    const group = after.group("sudo") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), group.record.candidates.len);
+    const updated = try after_root.root.readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/alternatives/sudo"),
+        1024,
+    );
+    defer testing.allocator.free(updated);
+    try testing.expectEqual(@as(usize, 658), updated.len);
+    var record_hash: [32]u8 = undefined;
+    Sha256.hash(updated, &record_hash, .{});
+    const hex = std.fmt.bytesToHex(record_hash, .lower);
+    try testing.expectEqualStrings(
+        "c583a377d2d7bc241422c91f43738f8e278e159e8e3bb2aa53d5bdeaf782e845",
+        &hex,
+    );
 }
 
 test "native_alternatives.test.signed sudo-rs permits only setuid target ctime" {

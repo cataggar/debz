@@ -227,6 +227,36 @@ separate. This environment passed protected amd64 pinned-dpkg and
 signed-script comparisons; it does not authorize a broader proc view
 or establish arm64/WSL namespace support.
 
+## Exact signed sudo postinst PID-only proc view
+
+Only the authenticated new-package `sudo:amd64` `1.9.17p2-7ubuntu3`
+`postinst ["configure", ""]`, SHA-256
+`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`,
+can select the separately bound sudo view. The staged script must match the
+root-owned 1,927-byte installed dpkg-info script; the root is mode 0700 and
+its root-owned `/proc` mountpoint is an empty real directory. The pinned
+tools include `dash`, dpkg and its helper, the snapshot `update-alternatives`,
+`systemd-tmpfiles`, and the exact GNU `rm`, `chown`, and `chmod` symlink
+targets. Their `/usr/sbin` shadows, higher-priority `sudo.conf` tmpfiles
+overrides, changed `/bin`, `/sbin`, shell or GNU command aliases, and changed
+signed `sudo.conf`, `sudo.list`, or `sudo.ws` providers refuse before launch.
+The corresponding program pins both authenticated `sudo` and `sudo-rs`
+archives and the two exact root-owned, single-link `sudoedit` symlinks
+restored by sudo unpack.
+
+The namespace helper uses the same fresh, private
+`ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs as the udev mode,
+without granting either script the other's identity. PID 1 and its
+descendants stay in the same pinned chroot; `/proc/sys` and boot ID are
+absent, inherited host-root descriptors are sealed, and `CAP_SYS_ADMIN`
+and remount authority are dropped before the script runs. Setup failure
+records a typed non-spawned result; exit, deadline, crash and recovery
+preserve ordinary durable outcomes and private mount teardown. The
+invocation uses a separate v4 policy digest; the earlier systemd v2 and
+udev v3 invocation digests remain unchanged. This is no grant to sudo
+triggers, other scripts or package versions, and does not establish
+CI arm64 or WSL namespace capability.
+
 ## Outcome taxonomy
 
 `MaintainerScriptOutcome` keeps every result exactly distinguishable:

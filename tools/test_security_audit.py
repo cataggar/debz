@@ -378,8 +378,24 @@ class SecurityAuditTests(unittest.TestCase):
         self.assertIn("linux.syscall3(\n        .close_range,", runner)
         self.assertIn('"hidepid=2,subset=pid"', runner)
         self.assertIn("snapshotUdevIdentity(identity, invocation.argv[1..])", runner)
+        self.assertIn("snapshotSudoIdentity(identity, invocation.argv[1..])", runner)
         self.assertIn('"etc/tmpfiles.d/static-nodes-permissions.conf"', runner)
+        self.assertIn('"etc/tmpfiles.d/sudo.conf"', runner)
         self.assertIn('"usr/sbin/systemd-tmpfiles"', runner)
+        self.assertIn('"usr/sbin/update-alternatives"', runner)
+        self.assertIn('"usr/bin/gnuchmod"', runner)
+        self.assertIn(
+            "matchesStructuralLink(fact, authority.structural_links)",
+            sources["src/native_alternatives.zig"],
+        )
+        self.assertIn(
+            "parsed_records.append(allocator, parsed) catch |err|",
+            sources["src/native_alternatives.zig"],
+        )
+        self.assertIn(
+            "verifySnapshotSudoStructuralOwner(allocator, root, program)",
+            sources["src/native_unpack.zig"],
+        )
         capability_owners = sorted({
             relative
             for relative, text in sources.items()

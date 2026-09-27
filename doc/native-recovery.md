@@ -669,6 +669,19 @@ Ordinary durable script outcomes and unknown-outcome recovery remain in
 force; this does not change systemd's boot-ID policy or the absent-sysctl
 guard on the later procps trigger.
 
+The exact signed sudo configure action has a third, independently
+bound PID-only proc view. Its `sudo-rs` alternatives group must retain the
+exact selected provider and signed record, while only the two signed
+sudo-owned `sudoedit` generic symlinks may have been restored by unpack.
+The before checkpoint admits those two links only for this invocation;
+the after checkpoint requires normal selector-linked generics and a
+reachable typed registration. Missing/changed links or providers refuse
+before launch. The parsed-record ownership handoff now returns a typed
+capture error rather than deinitializing a moved record on refusal.
+Private-proc setup failures are non-spawned, and unknown script outcomes
+remain recoverable claims, never inferred successes. Neither the
+systemd boot-ID view nor the procps absent-`/proc/sys` guard changes.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and
