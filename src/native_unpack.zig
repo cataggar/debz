@@ -17658,16 +17658,28 @@ fn lifecycleScriptPolicy() maintainer_script.Policy {
         .script_directories = &lifecycle_script_directories,
         .snapshot_systemd_proc = true,
         .snapshot_udev_proc = true,
+        .snapshot_sudo_proc = true,
     };
 }
 
 fn lifecycleInvocationPolicy(
     snapshot_systemd_proc: bool,
     snapshot_udev_proc: bool,
+    snapshot_sudo_proc: bool,
 ) maintainer_script.Policy {
     var policy = lifecycleScriptPolicy();
-    if (snapshot_systemd_proc) policy.snapshot_udev_proc = false;
-    if (snapshot_udev_proc) policy.snapshot_systemd_proc = false;
+    if (snapshot_systemd_proc) {
+        policy.snapshot_udev_proc = false;
+        policy.snapshot_sudo_proc = false;
+    }
+    if (snapshot_udev_proc) {
+        policy.snapshot_systemd_proc = false;
+        policy.snapshot_sudo_proc = false;
+    }
+    if (snapshot_sudo_proc) {
+        policy.snapshot_systemd_proc = false;
+        policy.snapshot_udev_proc = false;
+    }
     return policy;
 }
 
@@ -17715,6 +17727,48 @@ fn verifySnapshotSystemdPostinstPaths(
 
 const snapshot_udev_postinst_sha256 =
     "861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee";
+
+const snapshot_sudo_postinst_sha256 =
+    "e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8";
+
+fn snapshotSudoProcIsBound(
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    action_kind: native_recovery.ActionKind,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) bool {
+    return std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.name, "sudo") and
+        std.mem.eql(u8, package.version, "1.9.17p2-7ubuntu3") and
+        std.mem.eql(u8, package.architecture, "amd64") and
+        kind == .postinst and source == .new_package and
+        action_kind == .script and
+        std.mem.eql(u8, &script_sha256, snapshot_sudo_postinst_sha256) and
+        arguments.len == 2 and
+        std.mem.eql(u8, arguments[0], "configure") and
+        arguments[1].len == 0;
+}
+
+fn verifySnapshotSudoPostinstPaths(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    candidate: []const u8,
+    installed: []const u8,
+    expected: [32]u8,
+) !void {
+    if (!std.mem.eql(u8, installed, "var/lib/dpkg/info/sudo.postinst") or
+        (!std.mem.eql(u8, candidate, installed) and
+            !std.mem.eql(u8, candidate, lifecycle_tmp_ci ++ "/sudo.postinst")))
+        return error.InvalidSnapshotSudoScript;
+    for ([_][]const u8{ candidate, installed }) |path| {
+        const observed = try rootFileSha256(allocator, root, path, 8192);
+        if (!std.crypto.timing_safe.eql([32]u8, observed, expected))
+            return error.InstalledScriptMismatch;
+    }
+}
 
 fn snapshotUdevProcIsBound(
     architecture: []const u8,
@@ -17930,6 +17984,100 @@ test "native_unpack.test.signed udev PID-only proc requires exact configure and 
     try testing.expectError(
         error.InstalledScriptMismatch,
         verifySnapshotUdevPostinstPaths(testing.allocator, root, staged, installed, expected),
+    );
+}
+
+test "native_unpack.test.signed sudo PID-only proc requires exact configure and installed controls" {
+    const package: native_program.PackageIdentity = .{
+        .name = "sudo",
+        .version = "1.9.17p2-7ubuntu3",
+        .architecture = "amd64",
+    };
+    const digest: native_program.Digest = snapshot_sudo_postinst_sha256.*;
+    const args: []const []const u8 = &.{ "configure", "" };
+    try testing.expect(snapshotSudoProcIsBound(
+        "amd64",
+        package,
+        .postinst,
+        .new_package,
+        .script,
+        digest,
+        args,
+    ));
+    for ([_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = package,
+        kind: maintainer_script.Kind = .postinst,
+        source: native_program.ScriptSource = .new_package,
+        action_kind: native_recovery.ActionKind = .script,
+        digest: native_program.Digest = digest,
+        arguments: []const []const u8 = args,
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = .{ .name = "sudo-rs", .version = package.version, .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "1.9.17p2-7ubuntu4", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
+        .{ .kind = .preinst },
+        .{ .source = .installed_package },
+        .{ .action_kind = .trigger },
+        .{ .digest = @splat('0') },
+        .{ .arguments = &.{"configure"} },
+        .{ .arguments = &.{ "configure", "old-version" } },
+        .{ .arguments = &.{ "abort-upgrade", "" } },
+    }) |case| try testing.expect(!snapshotSudoProcIsBound(
+        case.architecture,
+        case.package,
+        case.kind,
+        case.source,
+        case.action_kind,
+        case.digest,
+        case.arguments,
+    ));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &maintainer_script.policyDigest(lifecycleInvocationPolicy(true, false, false)),
+        &maintainer_script.policyDigest(lifecycleInvocationPolicy(false, false, true)),
+    ));
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = root_fs.Root.init(testing.io, tmp.dir);
+    for ([_][]const u8{
+        "var", "var/lib", "var/lib/dpkg", "var/lib/dpkg/info", lifecycle_tmp_ci,
+    }) |name| try root.ensureDirectory(
+        try root_fs.Path.init(name),
+        root_fs.default_directory_permissions,
+    );
+    const installed = "var/lib/dpkg/info/sudo.postinst";
+    const staged = lifecycle_tmp_ci ++ "/sudo.postinst";
+    const bytes = "#!/bin/sh\nexit 0\n";
+    var expected: [32]u8 = undefined;
+    Sha256.hash(bytes, &expected, .{});
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = staged, .data = bytes });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = installed, .data = bytes });
+    try verifySnapshotSudoPostinstPaths(testing.allocator, root, staged, installed, expected);
+    try verifySnapshotSudoPostinstPaths(testing.allocator, root, installed, installed, expected);
+    for ([_][]const u8{
+        "var/lib/dpkg/tmp.ci/sudo.postinst",
+        lifecycle_tmp_ci ++ "/other.postinst",
+    }) |wrong| try testing.expectError(
+        error.InvalidSnapshotSudoScript,
+        verifySnapshotSudoPostinstPaths(testing.allocator, root, wrong, installed, expected),
+    );
+    try testing.expectError(
+        error.InvalidSnapshotSudoScript,
+        verifySnapshotSudoPostinstPaths(testing.allocator, root, staged, staged, expected),
+    );
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = staged, .data = "altered" });
+    try testing.expectError(
+        error.InstalledScriptMismatch,
+        verifySnapshotSudoPostinstPaths(testing.allocator, root, staged, installed, expected),
+    );
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = staged, .data = bytes });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = installed, .data = "altered" });
+    try testing.expectError(
+        error.InstalledScriptMismatch,
+        verifySnapshotSudoPostinstPaths(testing.allocator, root, staged, installed, expected),
     );
 }
 
@@ -20504,6 +20652,25 @@ fn verifySudoRsStructuralOwner(
     }
 }
 
+fn verifySnapshotSudoStructuralOwner(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+) !void {
+    try verifySudoRsStructuralOwner(allocator, root, program);
+    for (native_alternatives.snapshot_sudo_structural_links) |expected| {
+        var link = try root.pinSymbolicLink(try root_fs.Path.init(expected.path));
+        defer link.close();
+        var buffer: [64]u8 = undefined;
+        const observed = try link.observe(&buffer);
+        if (observed.entry.uid != 0 or observed.entry.gid != 0 or
+            observed.entry.mode != 0o777 or observed.entry.link_count != 1 or
+            observed.entry.size != expected.target.len or
+            !std.mem.eql(u8, observed.target, expected.target))
+            return error.InvalidAlternativesScriptAuthority;
+    }
+}
+
 test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst",
@@ -21526,6 +21693,19 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    var signed_sudo_sha256: [32]u8 = undefined;
+    Sha256.hash(script_bytes, &signed_sudo_sha256, .{});
+    const signed_sudo_digest: native_program.Digest =
+        std.fmt.bytesToHex(signed_sudo_sha256, .lower);
+    const snapshot_sudo_postinst = snapshotSudoProcIsBound(
+        architecture,
+        package,
+        kind,
+        source,
+        action_kind,
+        signed_sudo_digest,
+        arguments,
+    );
     const snapshot_util_linux_postinst = try snapshotUtilLinuxPostinstIsBound(
         script_bytes,
         architecture,
@@ -21559,7 +21739,8 @@ fn prepareAlternativesScriptBoundary(
         architecture,
     );
     if ((inert or snapshot_postinst or snapshot_bash_postinst or
-        snapshot_sudo_rs_postinst or snapshot_util_linux_postinst or
+        snapshot_sudo_rs_postinst or snapshot_sudo_postinst or
+        snapshot_util_linux_postinst or
         snapshot_console_setup_postinst) and
         !native_alternatives.matchesSnapshotTool(
             architecture,
@@ -21567,6 +21748,22 @@ fn prepareAlternativesScriptBoundary(
         )) return error.InvalidAlternativesTool;
     if (snapshot_sudo_rs_postinst)
         try verifySudoRsStructuralOwner(allocator, root, program);
+    if (snapshot_sudo_postinst) {
+        try verifySnapshotSudoStructuralOwner(allocator, root, program);
+        if (script.groups.len != 1 or script.commands.len != 1 or
+            !std.mem.eql(u8, script.groups[0].name, "sudo") or
+            !std.mem.eql(u8, script.commands[0].name, "sudo"))
+            return error.InvalidAlternativesScriptAuthority;
+        switch (script.commands[0].command) {
+            .install => |install| {
+                if (!std.mem.eql(u8, install.master_link, "/usr/bin/sudo") or
+                    !std.mem.eql(u8, install.path, "/usr/bin/sudo.ws") or
+                    install.priority != 40 or install.slaves.len != 6)
+                    return error.InvalidAlternativesScriptAuthority;
+            },
+            else => return error.InvalidAlternativesScriptAuthority,
+        }
+    }
     if (snapshot_console_setup_postinst)
         try verifyConsoleSetupProviders(allocator, root, program);
     var listed = try native_alternatives.listGroups(
@@ -21594,6 +21791,11 @@ fn prepareAlternativesScriptBoundary(
         before_groups[before_count] = .{
             .name = name,
             .mutable = !inert and alternativesScriptGroupMutable(script, name),
+            .structural_links = if (snapshot_sudo_postinst and
+                std.mem.eql(u8, name, "sudo"))
+                &native_alternatives.snapshot_sudo_structural_links
+            else
+                &.{},
         };
         before_count += 1;
     }
@@ -21800,7 +22002,17 @@ fn runLifecycleScript(
         script_sha256,
         arguments,
     );
-    const info_path = if (snapshot_systemd_proc or snapshot_udev_proc)
+    const snapshot_sudo_proc = snapshotSudoProcIsBound(
+        program.target_architecture,
+        package,
+        kind,
+        source,
+        recovery_action.kind,
+        script_sha256,
+        arguments,
+    );
+    const info_path = if (snapshot_systemd_proc or snapshot_udev_proc or
+        snapshot_sudo_proc)
         try lifecycleInstalledScriptPath(
             allocator,
             root,
@@ -21851,6 +22063,14 @@ fn runLifecycleScript(
         );
     if (snapshot_udev_proc)
         try verifySnapshotUdevPostinstPaths(
+            allocator,
+            root,
+            candidate_path,
+            path,
+            expected,
+        );
+    if (snapshot_sudo_proc)
+        try verifySnapshotSudoPostinstPaths(
             allocator,
             root,
             candidate_path,
@@ -22099,6 +22319,8 @@ fn runLifecycleScript(
     defer if (snapshot_systemd_binding) |*proc| proc.deinit();
     var snapshot_udev_binding: ?maintainer_script.SnapshotUdevProc = null;
     defer if (snapshot_udev_binding) |*proc| proc.deinit();
+    var snapshot_sudo_binding: ?maintainer_script.SnapshotSudoProc = null;
+    defer if (snapshot_sudo_binding) |*proc| proc.deinit();
     if (snapshot_systemd_proc) {
         snapshot_systemd_binding = maintainer_script.SnapshotSystemdProc.init(
             allocator,
@@ -22111,6 +22333,16 @@ fn runLifecycleScript(
     }
     if (snapshot_udev_proc) {
         snapshot_udev_binding = maintainer_script.SnapshotUdevProc.init(
+            allocator,
+            root,
+        ) catch |err| {
+            if (attempt.record().mutation_started)
+                try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+    }
+    if (snapshot_sudo_proc) {
+        snapshot_sudo_binding = maintainer_script.SnapshotSudoProc.init(
             allocator,
             root,
         ) catch |err| {
@@ -22176,12 +22408,18 @@ fn runLifecycleScript(
             .script_sha256 = expected,
         },
         .arguments = arguments,
-        .policy = lifecycleInvocationPolicy(snapshot_systemd_proc, snapshot_udev_proc),
+        .policy = lifecycleInvocationPolicy(
+            snapshot_systemd_proc,
+            snapshot_udev_proc,
+            snapshot_sudo_proc,
+        ),
         .helper_mount = if (helper_mount) |*mount| mount else null,
         .snapshot_proc = if (snapshot_systemd_binding) |*proc|
             .{ .systemd = proc }
         else if (snapshot_udev_binding) |*proc|
             .{ .udev = proc }
+        else if (snapshot_sudo_binding) |*proc|
+            .{ .sudo = proc }
         else
             null,
     }, .{

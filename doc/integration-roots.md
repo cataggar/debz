@@ -1333,6 +1333,53 @@ read-only, never retried as a fresh root. Neither sudo capture nor any
 other signed script is authorized here, and full native/reference parity
 is **not** established.
 
+The separate protected sudo investigation used root-owned checkout
+`/root/debz-issue-86-sudo-alternatives` with a mode-0700
+`.real-snapshot`. Its source was an **independent** authenticated pre-udev
+copy, not the aborted `amd64-udev-proc-fresh-long-3` root. After matching
+all 14 alternatives records, selectors, signed sudo files and the two
+sudo-owned links against the read-only aborted evidence, disposable copies
+recreated just those signed payload links. Pinned dpkg 1.22.22 and the
+signed sudo postinst each exited 1 without `/proc`, leaving the group
+untouched; under equivalent private PID-only procfs with no `/proc/sys`,
+both exited 0 and produced the reference-exact 658-byte `sudo` group
+with repaired generic links. A third signed-script disposable copy with
+sudo's actual native `installed` prestate produced the same exit 0 and
+record. The original process abort was caused by
+a parsed-record cleanup after ownership transfer on the strict capture
+refusal; the narrowly bound sudo repair instead requires a typed
+before/after alternatives transition and separately pinned PID-only
+namespace. This protected comparison alone does not prove the 175-package
+install or authorize other scripts.
+
+A **new** protected amd64 175-package root,
+`/root/debz-issue-86-sudo-alternatives/.real-snapshot/amd64-sudo-alt-fresh-long-1`,
+started without a dpkg database and independently reauthenticated signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C` plus all 175
+signed-lock SHA-512 archive identities (67,976,788 bytes). It used the
+root-owned ReleaseSafe binary SHA-256
+`280635b4083bd3868a6045f4805a71fc5cfa86b63333b7fb7ad7d68e13fcc94e`
+from protected production-code snapshot
+`96c05241ad077ffea28f6a8867e35d6a1cbc9afa`. The signed udev postinst
+again completed step 1357 with exit 0. The exact signed `sudo:amd64`
+`1.9.17p2-7ubuntu3` postinst at step 1376 then **launched**, durably
+recorded `spawned=true`, exit **0**, and completed successfully. Sudo is
+`install ok installed`; the six-slave 658-byte `sudo` alternatives record
+has reference SHA-256
+`c583a377d2d7bc241422c91f43738f8e278e159e8e3bb2aa53d5bdeaf782e845`,
+and both package-owned `sudoedit` links now point into `/etc/alternatives`.
+`/proc` is empty after the script and the private mount is gone.
+
+The **first subsequent refusal** is signed `python3:amd64` `3.14.7-3`
+new-package preinst `["install"]` at step 1383, SHA-256
+`115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f`.
+Its `update-alternatives --auto /usr/bin/python3 >/dev/null 2>&1 || true`
+line is outside the admitted command grammar: `InvalidAlternativesScript`
+left the action **prepared**, with no python3 script outcome or launch.
+The native operation returned `recovery_required` (exit 8), not a complete
+installation. This root is interrupted and must **never** be reused as
+fresh; python3 requires a separate exact signed-script investigation.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
