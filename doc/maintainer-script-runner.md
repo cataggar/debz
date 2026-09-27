@@ -134,6 +134,74 @@ The privileged `test-native-helper-namespace` target requires the positive
 mount path, proves named and absolute helper execution, rejects writes through
 the mount, preserves the original target, and proves alternate-root isolation.
 
+## Exact signed systemd postinst proc view
+
+The native lifecycle policy permits a separate, invocation-scoped view only
+for `systemd:amd64` `261.2-1ubuntu2`, new-package `postinst
+["configure", ""]`, signed script SHA-256
+`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+at `var/lib/dpkg/info/systemd.postinst`. The lifecycle rechecks its bytes and
+pins the root-owned, mode-0755 *empty* `/proc` directory. The runner verifies
+the exact 4,942-byte script again and obtains the kernel's current boot ID
+from one host proc file, never by binding the host proc tree. Wrong identity,
+script bytes, arguments, path, mountpoint, or `detach` descendant policy cannot
+request this view; other invocations retain the previous launcher.
+The native lifecycle may still hold a private staged
+`var/lib/debz-lifecycle-scripts/systemd.postinst` copy at configure time.
+For this one signed action, it resolves the installed path from the package
+database, verifies **both** permitted copies against the signed script digest,
+and executes only the installed dpkg-info path, matching pinned dpkg. An
+unexpected alias or changed copy refuses before launch; there is no generic
+script-path redirection.
+
+Only this child is cloned into new mount and PID namespaces. Namespace PID 1
+enters the same pinned chroot before mounting anything: its own root is the
+selected root, not a supervisor's host root. With private propagation, it
+mounts a fresh read-only, nosuid, nodev, noexec procfs with `hidepid=2`,
+*immediately* covers its entire `/proc/sys` with a private tmpfs, publishes a
+single read-only copy of the actual kernel boot ID at
+`/proc/sys/kernel/random/boot_id`, then remounts the mask read-only. No
+maintainer script runs between the first mount and the completed mask; the
+other sysctl entries remain absent. Before `execve`, the child drops
+`CAP_SYS_ADMIN` from bounding, effective, permitted, inheritable and ambient
+sets and sets `no_new_privs`; it cannot unmount the mask. Every descriptor
+above the standard streams is marked close-on-exec (including any inherited
+host-root descriptor); if the kernel rejects this seal, the script does not
+launch. A parent-death signal is established before setup with a control-pipe
+check for the clone/race window. The script receives only its normal standard
+streams, not root or
+host-proc descriptors. Namespace PID 1 exit kills all descendants, even those
+that leave its process group, so the private mounts disappear before another
+script or the deferred procps trigger can run. A setup failure is a typed
+non-spawned `snapshot_proc` outcome, never a successful script exit. Helper overlay
+setup retains its own existing `root_isolation` stage and failure claim.
+
+The opt-in uses a distinct v2 policy domain and exact invocation digest
+extension containing the SHA-256 of the kernel boot ID; default requests keep
+their v1 policy digest. Native program and script-outcome recovery retain
+their existing program-policy and unknown-outcome claims. Synthetic positive
+and negative namespace tests run in the privileged
+`test-native-helper-namespace` target; the signed postinst test additionally
+requires an explicitly supplied disposable
+`DEBZ_REQUIRE_SIGNED_SYSTEMD_PROC_ROOT`.
+The parent needs namespace/mount privileges (`CAP_SYS_ADMIN`), and the child
+needs `CAP_SYS_CHROOT` and `CAP_SETPCAP` to enter the pinned root and drop its
+remount authority; `openat2`, `statx`, and `close_range(CLOEXEC)` must work.
+The capability syscall header uses the kernel's 8-byte layout with its
+32-bit PID at offset 4; Zig's `linux.cap_user_header_t` instead pads a
+machine-width PID to offset 8, which can send an uninitialized PID and yield
+`ESRCH` in Debug builds. The scoped runner checks the exact header layout
+and verifies that `CAP_SYS_ADMIN` is absent after dropping it. These
+requirements passed on the local Linux 6.18.31 privileged runner. Missing
+support refuses the exact invocation without a proc or mount fallback.
+Workflow-dispatch CI run
+[`36322419073`](https://github.com/cataggar/debz/actions/runs/36322419073)
+at ABI-corrected source `692c85a8bc3ac57653db7acc65e9687403c4d177`
+also executed the mandatory privileged namespace step on hosted amd64 and
+arm64, in both Debug and ReleaseSafe; the 33-test target includes PID 1
+mount/mask/teardown and parent-crash regressions, not a capability skip.
+WSL capability availability remains unverified.
+
 ## Outcome taxonomy
 
 `MaintainerScriptOutcome` keeps every result exactly distinguishable:

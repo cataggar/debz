@@ -623,6 +623,22 @@ refuse before launch. All other scripts keep the staged-first rule; this
 does not reinterpret a nonzero outcome, bypass script journaling, or
 generalize debconf authority.
 
+The exact signed `systemd:amd64` `261.2-1ubuntu2` postinst gets a distinct
+boot-ID-only, read-only `/proc/sys` view inside its own private PID and mount
+namespaces. The compiled lifecycle policy, verified script SHA-256, package,
+arguments and root-owned empty mountpoint bind this one admission; its
+invocation digest also binds the SHA-256 of the actual kernel boot ID. A
+private staged control copy, if present at configure, must hash identically
+to the signed installed dpkg-info script; only that installed path executes.
+A mismatched alias refuses without a script launch. A
+pre-launch namespace, mount, masking, or capability failure records
+`snapshot_proc` setup failure with `spawned=false`, not an inferred exit. A
+crash after launch still requires the regular durable script-outcome claim.
+Namespace PID 1 exit tears down all its descendants and mounts before the
+next lifecycle script. In particular, this does not create `/proc/sys` in the
+root seen by the later deferred procps trigger; its exact absent-input guard
+above remains unchanged.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and

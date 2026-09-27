@@ -795,6 +795,7 @@ def audit_production_sources() -> None:
     process_calls: list[str] = []
     child_calls: list[str] = []
     namespace_calls: list[str] = []
+    capability_calls: list[str] = []
     for path in sorted((ROOT / "src").rglob("*.zig")):
         text = path.read_text(errors="strict")
         relative = str(path.relative_to(ROOT))
@@ -831,7 +832,7 @@ def audit_production_sources() -> None:
                 fail(f"{relative}:{line}: forbidden {reason}")
         for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
-        for match in re.finditer(r"\blinux\.(?:fork|execve|chroot)\s*\(", text):
+        for match in re.finditer(r"\blinux\.(?:fork|clone2|execve|chroot)\s*\(", text):
             if relative == "src/native_unpack.zig" and match.group() == "linux.fork(":
                 helper_start = text.find("fn testFreshDatabaseInstall(")
                 helper_end = text.find(
@@ -857,7 +858,7 @@ def audit_production_sources() -> None:
                 continue
             child_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(
-            r"\blinux\.(?:unshare|setns|mount|move_mount|umount2)\s*\(", text
+            r"\blinux\.(?:clone2|unshare|setns|mount|move_mount|umount2)\s*\(", text
         ):
             if (
                 relative == "src/apt_system_orchestrator.zig"
@@ -866,6 +867,14 @@ def audit_production_sources() -> None:
             ):
                 continue
             namespace_calls.append(
+                f"{relative}:{text.count(chr(10), 0, match.start()) + 1}"
+            )
+        for match in re.finditer(
+            r"\blinux\.(?:capget|capset|prctl)\s*\("
+            r"|\blinux\.syscall2\s*\(\s*\.(?:capget|capset)\s*,",
+            text,
+        ):
+            capability_calls.append(
                 f"{relative}:{text.count(chr(10), 0, match.start()) + 1}"
             )
     process_paths = [call.rsplit(":", 1)[0] for call in process_calls]
@@ -883,6 +892,24 @@ def audit_production_sources() -> None:
     namespace_paths = sorted({call.rsplit(":", 1)[0] for call in namespace_calls})
     if namespace_paths not in ([], ["src/live_root.zig", "src/maintainer_script.zig"]):
         fail(f"native namespace boundary changed: {namespace_calls!r}")
+    if {call.rsplit(":", 1)[0] for call in capability_calls} - {
+        "src/maintainer_script.zig",
+    }:
+        fail(f"native capability boundary changed: {capability_calls!r}")
+    runner = (ROOT / "src/maintainer_script.zig").read_text(errors="strict")
+    for required in (
+        "linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID",
+        "linux.PR.SET_PDEATHSIG",
+        "linux.PR.CAPBSET_DROP",
+        "linux.PR.SET_NO_NEW_PRIVS",
+        "linux.syscall2(\n        .capget,",
+        "linux.syscall2(\n        .capset,",
+        '@offsetOf(KernelCapabilityHeader, "pid")',
+        "linux.MS.REMOUNT | proc_mount_flags",
+        "linux.syscall3(\n        .close_range,",
+    ):
+        if required not in runner:
+            fail(f"reviewed systemd proc isolation changed: {required}")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")
