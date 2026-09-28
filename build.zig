@@ -1716,6 +1716,59 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-helper-namespace", "Require private helper mounts without changing package-owned files")
         .dependOn(&native_helper_namespace_tests.step);
 
+    const signed_proc_step = b.step(
+        "test-native-signed-proc",
+        "Require real signed systemd, udev, and sudo replay in separately supplied protected amd64 roots",
+    );
+    const systemd_root = b.option([]const u8, "signed-systemd-proc-root", "Fresh protected pre-systemd root");
+    const udev_root = b.option([]const u8, "signed-udev-proc-root", "Fresh protected pre-udev root");
+    const sudo_root = b.option([]const u8, "signed-sudo-proc-root", "Fresh protected pre-sudo root");
+    if (systemd_root != null and udev_root != null and sudo_root != null) {
+        const roots = [_][]const u8{ systemd_root.?, udev_root.?, sudo_root.? };
+        if (@import("builtin").cpu.arch != .x86_64 or target.result.cpu.arch != .x86_64) {
+            signed_proc_step.dependOn(&b.addFail(
+                "the existing exact signed systemd/udev/sudo proc profiles are amd64-only; do not run them as arm64 scripts",
+            ).step);
+        } else if (!std.fs.path.isAbsolute(roots[0]) or
+            !std.fs.path.isAbsolute(roots[1]) or
+            !std.fs.path.isAbsolute(roots[2]) or
+            std.mem.eql(u8, roots[0], roots[1]) or
+            std.mem.eql(u8, roots[0], roots[2]) or
+            std.mem.eql(u8, roots[1], roots[2]))
+        {
+            signed_proc_step.dependOn(&b.addFail(
+                "signed proc replay requires three distinct absolute disposable root paths",
+            ).step);
+        } else {
+            const signed_proc_tests = b.addTest(.{
+                .root_module = debz,
+                .filters = &.{
+                    "maintainer_script.test.signed systemd postinst uses scoped masked proc",
+                    "maintainer_script.test.signed udev postinst uses only PID proc",
+                    "maintainer_script.test.signed sudo postinst repairs only pinned alternatives",
+                },
+            });
+            const signed_proc_run = b.addSystemCommand(&.{
+                "sudo",
+                "-n",
+                "env",
+                "DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1",
+                "DEBZ_REQUIRE_SIGNED_PROC_ROOTS=1",
+                b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}),
+                b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+                b.fmt("DEBZ_REQUIRE_SIGNED_SYSTEMD_PROC_ROOT={s}", .{roots[0]}),
+                b.fmt("DEBZ_REQUIRE_SIGNED_UDEV_PROC_ROOT={s}", .{roots[1]}),
+                b.fmt("DEBZ_REQUIRE_SIGNED_SUDO_PROC_ROOT={s}", .{roots[2]}),
+            });
+            signed_proc_run.addArtifactArg(signed_proc_tests);
+            signed_proc_step.dependOn(&signed_proc_run.step);
+        }
+    } else {
+        signed_proc_step.dependOn(&b.addFail(
+            "signed proc replay requires -Dsigned-systemd-proc-root, -Dsigned-udev-proc-root, and -Dsigned-sudo-proc-root",
+        ).step);
+    }
+
     const archive_application_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{"archive_application.test."},

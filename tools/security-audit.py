@@ -929,9 +929,22 @@ def audit_production_sources() -> None:
         "linux.SECCOMP.RET.KILL_PROCESS",
         "linux.CLONE.NEWNET",
         "if (count == 64) return .RANGE;",
+        "if (required) return error.SignedProcRootRequired;",
+        "return error.SkipZigTest;",
     ):
         if required not in runner:
             fail(f"reviewed exact-script proc isolation changed: {required}")
+    build = (ROOT / "build.zig").read_text(errors="strict")
+    for required in (
+        '"test-native-signed-proc"',
+        '"DEBZ_REQUIRE_SIGNED_PROC_ROOTS=1"',
+        '"signed-systemd-proc-root"',
+        '"signed-udev-proc-root"',
+        '"signed-sudo-proc-root"',
+        "signed_proc_run.addArtifactArg(signed_proc_tests);",
+    ):
+        if required not in build:
+            fail(f"required signed proc fixture gate changed: {required}")
     alternatives = (ROOT / "src/native_alternatives.zig").read_text(errors="strict")
     unpack = (ROOT / "src/native_unpack.zig").read_text(errors="strict")
     for required in (
