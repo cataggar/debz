@@ -774,6 +774,8 @@ pub const SetupStage = enum {
     launcher,
     /// The child could not be observed or reaped.
     wait,
+    /// The child could not prove its capability and syscall restrictions.
+    capability_policy,
 };
 
 pub const SetupFailure = struct {
@@ -828,6 +830,7 @@ pub const Outcome = union(enum) {
                 => true,
                 .network_namespace,
                 .snapshot_proc,
+                .capability_policy,
                 .pipe,
                 .stdin_device,
                 .fork,
@@ -1169,13 +1172,14 @@ pub fn validate(request: Request) ?RejectionReason {
 pub fn policyDigest(policy: Policy) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update(if (policy.snapshot_sudo_proc)
-        "debz-maintainer-script-policy-v4\x00"
+        "debz-maintainer-script-policy-v5\x00"
     else if (policy.snapshot_udev_proc)
-        "debz-maintainer-script-policy-v3\x00"
+        "debz-maintainer-script-policy-v4\x00"
     else if (policy.snapshot_systemd_proc)
-        "debz-maintainer-script-policy-v2\x00"
+        "debz-maintainer-script-policy-v3\x00"
     else
-        "debz-maintainer-script-policy-v1\x00");
+        "debz-maintainer-script-policy-v2\x00");
+    hash.update("script-capability-seccomp-v1\x00");
     hash.update(if (policy.allow_host_root) "host-root\x00" else "root\x00");
     if (policy.snapshot_systemd_proc)
         hash.update("exact-systemd-boot-id-v1\x00");
@@ -1971,6 +1975,10 @@ fn childMain(child: ChildDescriptor) noreturn {
         const setup = setupSnapshotProc(proc, null);
         if (setup != .SUCCESS)
             childFail(streams.status, .snapshot_proc, setup);
+    } else {
+        const restricted = restrictScriptPrivileges(null, false);
+        if (restricted != .SUCCESS)
+            childFail(streams.status, .capability_policy, restricted);
     }
     const sealed = sealInheritedDescriptors();
     if (sealed != .SUCCESS)
@@ -2038,7 +2046,7 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
             observed.dev_minor != proc.root_stat.dev_minor or
             observed.ino != proc.root_stat.ino)
             return .STALE;
-        return restrictSnapshotProcPrivileges(failure_stage);
+        return restrictScriptPrivileges(failure_stage, true);
     }
     const boot_id = proc.view.systemd;
     const masked = linux.errno(linux.mount(
@@ -2148,7 +2156,7 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
     }
     if (linux.errno(writable) != .ROFS) return linux.errno(writable);
     if (failure_stage) |stage| stage.* = 10;
-    return restrictSnapshotProcPrivileges(failure_stage);
+    return restrictScriptPrivileges(failure_stage, true);
 }
 
 // Zig's linux.cap_user_header_t pads pid to offset 8; the kernel ABI uses offset 4.
@@ -2157,16 +2165,130 @@ const KernelCapabilityHeader = extern struct {
     pid: i32,
 };
 
-fn restrictSnapshotProcPrivileges(failure_stage: ?*u8) linux.E {
-    const dropped = linux.errno(linux.prctl(
-        @intFromEnum(linux.PR.CAPBSET_DROP),
-        linux.CAP.SYS_ADMIN,
-        0,
-        0,
-        0,
+comptime {
+    std.debug.assert(@sizeOf(KernelCapabilityHeader) == 8);
+    std.debug.assert(@offsetOf(KernelCapabilityHeader, "pid") == 4);
+    std.debug.assert(@sizeOf(linux.cap_user_data_t) == 12);
+}
+
+const script_capabilities = .{
+    linux.CAP.CHOWN,   linux.CAP.DAC_OVERRIDE, linux.CAP.FOWNER,
+    linux.CAP.FSETID,  linux.CAP.SETGID,       linux.CAP.SETUID,
+    linux.CAP.SETFCAP,
+};
+
+fn scriptCapabilityAllowed(capability: usize) bool {
+    inline for (script_capabilities) |allowed| {
+        if (capability == allowed) return true;
+    }
+    return false;
+}
+
+fn scriptCapabilityMask(word: usize) u32 {
+    var mask: u32 = 0;
+    inline for (script_capabilities) |capability| {
+        if (capability / 32 == word) mask |= linux.CAP.TO_MASK(capability);
+    }
+    return mask;
+}
+
+fn maskScriptCapabilities(data: *[2]linux.cap_user_data_t) void {
+    for (data, 0..) |*word, index| {
+        const mask = scriptCapabilityMask(index);
+        word.effective &= mask;
+        word.permitted &= mask;
+        word.inheritable &= mask;
+    }
+}
+
+const ScriptBpf = extern struct { code: u16, jt: u8 = 0, jf: u8 = 0, k: u32 };
+const ScriptBpfProgram = extern struct { len: u16, filter: [*]const ScriptBpf };
+const denied_script_syscalls = [_]linux.SYS{
+    .mount,             .umount2,       .pivot_root,        .unshare,     .setns,
+    .fsopen,            .fsconfig,      .fsmount,           .open_tree,   .move_mount,
+    .mount_setattr,     .mknodat,       .open_by_handle_at, .chroot,      .init_module,
+    .finit_module,      .delete_module, .kexec_load,        .reboot,      .swapon,
+    .swapoff,           .bpf,           .perf_event_open,   .userfaultfd, .ptrace,
+    .process_vm_writev,
+} ++ (if (builtin.cpu.arch == .x86_64)
+    [_]linux.SYS{ .mknod, .kexec_file_load }
+else
+    [_]linux.SYS{});
+
+fn scriptSeccompFilter() [6 + denied_script_syscalls.len * 3 + 3 + 5 + 1]ScriptBpf {
+    const arch: u32 = switch (builtin.cpu.arch) {
+        .x86_64 => 0xc000003e,
+        .aarch64 => 0xc00000b7,
+        else => @compileError("native script capability policy supports only amd64 and arm64"),
+    };
+    var filter: [6 + denied_script_syscalls.len * 3 + 3 + 5 + 1]ScriptBpf = undefined;
+    var i: usize = 0;
+    filter[i] = .{ .code = 0x20, .k = 4 }; // seccomp_data.arch
+    i += 1;
+    filter[i] = .{ .code = 0x15, .jt = 1, .k = arch };
+    i += 1;
+    filter[i] = .{ .code = 0x06, .k = linux.SECCOMP.RET.KILL_PROCESS };
+    i += 1;
+    filter[i] = .{ .code = 0x20, .k = 0 }; // seccomp_data.nr
+    i += 1;
+    filter[i] = .{ .code = 0x35, .jf = 1, .k = 0x40000000 };
+    i += 1;
+    filter[i] = .{ .code = 0x06, .k = linux.SECCOMP.RET.KILL_PROCESS }; // x32 syscall aliases
+    i += 1;
+    inline for (denied_script_syscalls) |syscall| {
+        filter[i] = .{ .code = 0x20, .k = 0 };
+        i += 1;
+        filter[i] = .{ .code = 0x15, .jf = 1, .k = @intFromEnum(syscall) };
+        i += 1;
+        filter[i] = .{ .code = 0x06, .k = @as(u32, linux.SECCOMP.RET.ERRNO) | @intFromEnum(linux.E.PERM) };
+        i += 1;
+    }
+    filter[i] = .{ .code = 0x20, .k = 0 };
+    i += 1;
+    filter[i] = .{ .code = 0x15, .jf = 1, .k = @intFromEnum(linux.SYS.clone3) };
+    i += 1;
+    filter[i] = .{ .code = 0x06, .k = @as(u32, linux.SECCOMP.RET.ERRNO) | @intFromEnum(linux.E.NOSYS) };
+    i += 1;
+    filter[i] = .{ .code = 0x20, .k = 0 };
+    i += 1;
+    filter[i] = .{ .code = 0x15, .jf = 3, .k = @intFromEnum(linux.SYS.clone) };
+    i += 1;
+    filter[i] = .{ .code = 0x20, .k = 16 }; // clone flags, first syscall argument
+    i += 1;
+    filter[i] = .{ .code = 0x45, .jf = 1, .k = linux.CLONE.NEWUSER | linux.CLONE.NEWNS |
+        linux.CLONE.NEWPID | linux.CLONE.NEWNET | linux.CLONE.NEWIPC |
+        linux.CLONE.NEWUTS | linux.CLONE.NEWCGROUP | linux.CLONE.NEWTIME };
+    i += 1;
+    filter[i] = .{ .code = 0x06, .k = @as(u32, linux.SECCOMP.RET.ERRNO) | @intFromEnum(linux.E.PERM) };
+    i += 1;
+    filter[i] = .{ .code = 0x06, .k = linux.SECCOMP.RET.ALLOW };
+    return filter;
+}
+
+const script_seccomp_filter = scriptSeccompFilter();
+
+fn restrictScriptPrivileges(failure_stage: ?*u8, check_parent: bool) linux.E {
+    var header: KernelCapabilityHeader = .{ .version = 0x20080522, .pid = 0 };
+    var data: [2]linux.cap_user_data_t = undefined;
+    const captured = linux.errno(linux.syscall2(
+        .capget,
+        @intFromPtr(&header),
+        @intFromPtr(&data[0]),
     ));
-    if (dropped != .SUCCESS) return dropped;
-    if (failure_stage) |stage| stage.* = 11;
+    if (captured != .SUCCESS) return captured;
+    // An unprivileged parent cannot drop its bounding set. The exception is
+    // safe only when it has no current or inheritable capability and NNP
+    // prevents either setuid or file capabilities on later exec.
+    const unprivileged = for (data) |word| {
+        if (word.effective != 0 or word.permitted != 0 or word.inheritable != 0) break false;
+    } else true;
+    var count: usize = 0;
+    while (count < 64) : (count += 1) {
+        const present = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), count, 0, 0, 0);
+        if (linux.errno(present) == .INVAL and count != 0) break;
+        if (linux.errno(present) != .SUCCESS or present > 1) return .INVAL;
+    }
+    if (count == 64) return .RANGE; // The v3 capget ABI covers exactly two words.
     const ambient = linux.errno(linux.prctl(
         @intFromEnum(linux.PR.CAP_AMBIENT),
         4,
@@ -2175,6 +2297,20 @@ fn restrictSnapshotProcPrivileges(failure_stage: ?*u8) linux.E {
         0,
     ));
     if (ambient != .SUCCESS) return ambient;
+    if (!unprivileged) {
+        for (0..count) |capability| {
+            if (scriptCapabilityAllowed(capability)) continue;
+            const dropped = linux.errno(linux.prctl(
+                @intFromEnum(linux.PR.CAPBSET_DROP),
+                capability,
+                0,
+                0,
+                0,
+            ));
+            if (dropped != .SUCCESS) return dropped;
+        }
+    }
+    if (failure_stage) |stage| stage.* = 11;
     if (failure_stage) |stage| stage.* = 12;
     const no_new_privs = linux.errno(linux.prctl(
         @intFromEnum(linux.PR.SET_NO_NEW_PRIVS),
@@ -2185,19 +2321,14 @@ fn restrictSnapshotProcPrivileges(failure_stage: ?*u8) linux.E {
     ));
     if (no_new_privs != .SUCCESS) return no_new_privs;
     if (failure_stage) |stage| stage.* = 13;
-    var header: KernelCapabilityHeader = .{ .version = 0x20080522, .pid = 0 };
-    var data: [2]linux.cap_user_data_t = undefined;
-    const captured = linux.errno(linux.syscall2(
+    const refreshed = linux.errno(linux.syscall2(
         .capget,
         @intFromPtr(&header),
         @intFromPtr(&data[0]),
     ));
-    if (captured != .SUCCESS) return captured;
+    if (refreshed != .SUCCESS) return refreshed;
     if (failure_stage) |stage| stage.* = 14;
-    const bit = linux.CAP.TO_MASK(linux.CAP.SYS_ADMIN);
-    data[0].effective &= ~bit;
-    data[0].permitted &= ~bit;
-    data[0].inheritable &= ~bit;
+    maskScriptCapabilities(&data);
     const removed = linux.errno(linux.syscall2(
         .capset,
         @intFromPtr(&header),
@@ -2212,21 +2343,39 @@ fn restrictSnapshotProcPrivileges(failure_stage: ?*u8) linux.E {
     ));
     if (checked != .SUCCESS) return checked;
     if (failure_stage) |stage| stage.* = 16;
-    if (((data[0].effective | data[0].permitted | data[0].inheritable) & bit) != 0 or
-        linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.SYS_ADMIN, 0, 0, 0) != 0 or
-        linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1)
+    for (data, 0..) |word, index| {
+        if (((word.effective | word.permitted | word.inheritable) &
+            ~scriptCapabilityMask(index)) != 0) return .PERM;
+    }
+    for (0..count) |capability| {
+        const bounded = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), capability, 0, 0, 0);
+        if (linux.errno(bounded) != .SUCCESS or bounded > 1 or
+            (!unprivileged and !scriptCapabilityAllowed(capability) and bounded != 0)) return .PERM;
+        const raised = linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), 1, capability, 0, 0);
+        if (linux.errno(raised) != .SUCCESS or raised != 0) return .PERM;
+    }
+    if (linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1)
         return .PERM;
     if (failure_stage) |stage| stage.* = 17;
-    var parent_signal: u32 = 0;
-    const death = linux.errno(linux.prctl(
-        @intFromEnum(linux.PR.GET_PDEATHSIG),
-        @intFromPtr(&parent_signal),
-        0,
-        0,
-        0,
-    ));
-    if (death != .SUCCESS) return death;
-    if (parent_signal != @intFromEnum(linux.SIG.KILL)) return .PERM;
+    if (check_parent) {
+        var parent_signal: u32 = 0;
+        const death = linux.errno(linux.prctl(
+            @intFromEnum(linux.PR.GET_PDEATHSIG),
+            @intFromPtr(&parent_signal),
+            0,
+            0,
+            0,
+        ));
+        if (death != .SUCCESS) return death;
+        if (parent_signal != @intFromEnum(linux.SIG.KILL)) return .PERM;
+    }
+    const filter: ScriptBpfProgram = .{
+        .len = script_seccomp_filter.len,
+        .filter = &script_seccomp_filter,
+    };
+    const installed = linux.errno(linux.seccomp(linux.SECCOMP.SET_MODE_FILTER, 0, &filter));
+    if (installed != .SUCCESS) return installed;
+    if (failure_stage) |stage| stage.* = 18;
     return .SUCCESS;
 }
 
@@ -3768,7 +3917,8 @@ test "maintainer_script.test.repeated private netns launches do not leak parent 
         });
         defer output.close(testing.io);
         var buffer: [256]u8 = undefined;
-        const line = try std.fmt.bufPrint(&buffer,
+        const line = try std.fmt.bufPrint(
+            &buffer,
             "script-netns launches={d} elapsed_ms={d} per_launch_us={d} unique_netns={d} reused_netns={d} parent_fds={d}\n",
             .{
                 launches,
@@ -4596,6 +4746,270 @@ test "maintainer_script.test.capability header matches the kernel ABI" {
         @intFromPtr(&header),
         @intFromPtr(&data[0]),
     )));
+    try testing.expectEqual(@as(u32, 0x20080522), header.version);
+    try testing.expectEqual(@as(u32, 0), scriptCapabilityMask(1));
+}
+
+test "maintainer_script.test.capability masks cover both kernel words" {
+    var words: [2]linux.cap_user_data_t = .{
+        .{ .effective = std.math.maxInt(u32), .permitted = std.math.maxInt(u32), .inheritable = std.math.maxInt(u32) },
+        .{ .effective = std.math.maxInt(u32), .permitted = std.math.maxInt(u32), .inheritable = std.math.maxInt(u32) },
+    };
+    maskScriptCapabilities(&words);
+    const allowed = scriptCapabilityMask(0);
+    try testing.expectEqual(linux.CAP.TO_MASK(linux.CAP.CHOWN) |
+        linux.CAP.TO_MASK(linux.CAP.DAC_OVERRIDE) | linux.CAP.TO_MASK(linux.CAP.FOWNER) |
+        linux.CAP.TO_MASK(linux.CAP.FSETID) | linux.CAP.TO_MASK(linux.CAP.SETGID) |
+        linux.CAP.TO_MASK(linux.CAP.SETUID) | linux.CAP.TO_MASK(linux.CAP.SETFCAP), allowed);
+    try testing.expectEqual(allowed, words[0].effective);
+    try testing.expectEqual(allowed, words[0].permitted);
+    try testing.expectEqual(allowed, words[0].inheritable);
+    try testing.expectEqual(@as(u32, 0), words[1].effective);
+    try testing.expectEqual(@as(u32, 0), words[1].permitted);
+    try testing.expectEqual(@as(u32, 0), words[1].inheritable);
+    for ([_]usize{
+        linux.CAP.NET_ADMIN,          linux.CAP.NET_RAW, linux.CAP.SYS_MODULE,
+        linux.CAP.SYS_ADMIN,          linux.CAP.MKNOD,   linux.CAP.BPF,
+        linux.CAP.CHECKPOINT_RESTORE,
+    }) |capability| try testing.expect(!scriptCapabilityAllowed(capability));
+}
+
+fn evaluateScriptFilter(architecture: u32, number: usize, flags: u32) !u32 {
+    var pc: usize = 0;
+    var value: u32 = 0;
+    while (pc < script_seccomp_filter.len) {
+        const instruction = script_seccomp_filter[pc];
+        switch (instruction.code) {
+            0x20 => value = switch (instruction.k) {
+                0 => @truncate(number),
+                4 => architecture,
+                16 => flags,
+                else => return error.InvalidFilterLoad,
+            },
+            0x15 => pc += if (value == instruction.k) instruction.jt else instruction.jf,
+            0x35 => pc += if (value >= instruction.k) instruction.jt else instruction.jf,
+            0x45 => pc += if (value & instruction.k != 0) instruction.jt else instruction.jf,
+            0x06 => return instruction.k,
+            else => return error.InvalidFilterOperation,
+        }
+        pc += 1;
+    }
+    return error.MissingFilterVerdict;
+}
+
+test "maintainer_script.test.seccomp denies kernel mount and namespace syscalls on both ABIs" {
+    const arch: u32 = switch (builtin.cpu.arch) {
+        .x86_64 => 0xc000003e,
+        .aarch64 => 0xc00000b7,
+        else => return error.SkipZigTest,
+    };
+    const denied = @as(u32, linux.SECCOMP.RET.ERRNO) | @intFromEnum(linux.E.PERM);
+    try testing.expectEqual(linux.SECCOMP.RET.KILL_PROCESS, try evaluateScriptFilter(0, @intFromEnum(linux.SYS.write), 0));
+    try testing.expectEqual(linux.SECCOMP.RET.KILL_PROCESS, try evaluateScriptFilter(arch, 0x40000000, 0));
+    for (denied_script_syscalls) |syscall| {
+        try testing.expectEqual(denied, try evaluateScriptFilter(arch, @intFromEnum(syscall), 0));
+    }
+    try testing.expectEqual(
+        @as(u32, linux.SECCOMP.RET.ERRNO) | @intFromEnum(linux.E.NOSYS),
+        try evaluateScriptFilter(arch, @intFromEnum(linux.SYS.clone3), 0),
+    );
+    for ([_]u32{
+        linux.CLONE.NEWUSER,   linux.CLONE.NEWNS,   linux.CLONE.NEWPID,
+        linux.CLONE.NEWNET,    linux.CLONE.NEWIPC,  linux.CLONE.NEWUTS,
+        linux.CLONE.NEWCGROUP, linux.CLONE.NEWTIME,
+    }) |flag| try testing.expectEqual(denied, try evaluateScriptFilter(arch, @intFromEnum(linux.SYS.clone), flag));
+    for ([_]linux.SYS{ .write, .fchown, .fchmod, .setresuid, .setresgid, .execve, .socket, .connect, .clone }) |syscall| {
+        try testing.expectEqual(linux.SECCOMP.RET.ALLOW, try evaluateScriptFilter(arch, @intFromEnum(syscall), 0));
+    }
+}
+
+test "maintainer_script.test.elevated script child loses host capabilities and keeps file account operations" {
+    if (builtin.os.tag != .linux) return;
+    var header: KernelCapabilityHeader = .{ .version = 0x20080522, .pid = 0 };
+    var original: [2]linux.cap_user_data_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(
+        .capget,
+        @intFromPtr(&header),
+        @intFromPtr(&original[0]),
+    )));
+    const privileged = original[0].effective & linux.CAP.TO_MASK(linux.CAP.SETPCAP) != 0;
+    if (!privileged and std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
+        return error.NativeHelperNamespaceRequired;
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(testing.io, .{ .sub_path = "file", .data = "protected" });
+    const file_path = try absoluteTempPath(testing.allocator, &directory, "file");
+    defer testing.allocator.free(file_path);
+    const path = try testing.allocator.dupeZ(u8, file_path);
+    defer testing.allocator.free(path);
+    var status: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
+    const forked = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(forked));
+    if (forked == 0) {
+        _ = linux.close(status[0]);
+        if (privileged and original[0].permitted & linux.CAP.TO_MASK(linux.CAP.NET_ADMIN) != 0) {
+            original[0].inheritable |= linux.CAP.TO_MASK(linux.CAP.NET_ADMIN);
+            if (linux.errno(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&original[0]))) != .SUCCESS or
+                linux.errno(linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), 2, linux.CAP.NET_ADMIN, 0, 0)) != .SUCCESS or
+                linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), 1, linux.CAP.NET_ADMIN, 0, 0) != 1)
+                testSnapshotProcFailure(status[1], 11, .PERM);
+        }
+        const restricted = restrictScriptPrivileges(null, false);
+        if (restricted != .SUCCESS) testSnapshotProcFailure(status[1], 1, restricted);
+        var current: [2]linux.cap_user_data_t = undefined;
+        if (linux.errno(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&current[0]))) != .SUCCESS)
+            testSnapshotProcFailure(status[1], 2, .IO);
+        for (current, 0..) |word, index| {
+            if ((word.effective | word.permitted | word.inheritable) & ~scriptCapabilityMask(index) != 0)
+                testSnapshotProcFailure(status[1], 3, .PERM);
+        }
+        for (0..41) |capability| {
+            const bound = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), capability, 0, 0, 0);
+            if (linux.errno(bound) != .SUCCESS or
+                (privileged and !scriptCapabilityAllowed(capability) and bound != 0) or
+                linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), 1, capability, 0, 0) != 0)
+                testSnapshotProcFailure(status[1], 4, .PERM);
+        }
+        if (linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1 or
+            linux.prctl(@intFromEnum(linux.PR.GET_SECCOMP), 0, 0, 0, 0) != 2)
+            testSnapshotProcFailure(status[1], 5, .PERM);
+        if (linux.errno(linux.mount(null, "/", null, 0, 0)) != .PERM or
+            linux.errno(linux.unshare(linux.CLONE.NEWNET)) != .PERM or
+            linux.errno(linux.syscall3(.finit_module, std.math.maxInt(usize), 0, 0)) != .PERM)
+            testSnapshotProcFailure(status[1], 6, .PERM);
+        if (privileged and linux.errno(linux.socket(linux.AF.PACKET, linux.SOCK.RAW, 0)) != .PERM)
+            testSnapshotProcFailure(status[1], 12, .PERM);
+        const fd = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+        if (linux.errno(fd) != .SUCCESS) testSnapshotProcFailure(status[1], 7, linux.errno(fd));
+        if (linux.errno(linux.fchmod(@intCast(fd), 0o640)) != .SUCCESS)
+            testSnapshotProcFailure(status[1], 8, .PERM);
+        if (privileged) {
+            if (linux.errno(linux.fchown(@intCast(fd), 32000, 32001)) != .SUCCESS)
+                testSnapshotProcFailure(status[1], 9, .PERM);
+            if (linux.errno(linux.setresgid(0, 32001, 0)) != .SUCCESS or linux.getegid() != 32001 or
+                linux.errno(linux.setresgid(0, 0, 0)) != .SUCCESS or
+                linux.errno(linux.setresuid(0, 32000, 0)) != .SUCCESS or linux.geteuid() != 32000)
+                testSnapshotProcFailure(status[1], 10, .PERM);
+        }
+        _ = linux.close(@intCast(fd));
+        const success = [_]u8{ 1, 0, 0 };
+        _ = linux.write(status[1], &success, success.len);
+        linux.exit(0);
+    }
+    _ = linux.close(status[1]);
+    var result: [3]u8 = undefined;
+    const received = linux.read(status[0], &result, result.len);
+    _ = linux.close(status[0]);
+    var waited: u32 = 0;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
+    if (received != result.len or result[0] != 1)
+        std.debug.print("script capability probe stage={d} errno={d} bytes={d}\n", .{ result[1], result[2], received });
+    try testing.expectEqual(@as(usize, result.len), received);
+    try testing.expectEqual(@as(u8, 1), result[0]);
+    try testing.expect(linux.W.IFEXITED(waited));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+    const fd = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(fd));
+    defer _ = linux.close(@intCast(fd));
+    var file: linux.Statx = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, helperStat(@intCast(fd), &file));
+    try testing.expectEqual(@as(u16, 0o640), file.mode & 0o777);
+    if (privileged) {
+        try testing.expectEqual(@as(u32, 32000), file.uid);
+        try testing.expectEqual(@as(u32, 32001), file.gid);
+    }
+}
+
+test "maintainer_script.test.partially privileged parent without SETPCAP refuses script" {
+    if (builtin.os.tag != .linux) return;
+    var header: KernelCapabilityHeader = .{ .version = 0x20080522, .pid = 0 };
+    var original: [2]linux.cap_user_data_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(
+        .capget,
+        @intFromPtr(&header),
+        @intFromPtr(&original[0]),
+    )));
+    if (original[0].effective & linux.CAP.TO_MASK(linux.CAP.SETPCAP) == 0) {
+        if (std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
+            return error.NativeHelperNamespaceRequired;
+        return;
+    }
+    var status: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
+    const forked = linux.fork();
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(forked));
+    if (forked == 0) {
+        _ = linux.close(status[0]);
+        original[0].effective &= ~linux.CAP.TO_MASK(linux.CAP.SETPCAP);
+        if (linux.errno(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&original[0]))) != .SUCCESS)
+            testSnapshotProcFailure(status[1], 1, .IO);
+        const refused = restrictScriptPrivileges(null, false);
+        if (refused != .PERM) testSnapshotProcFailure(status[1], 2, refused);
+        const success = [_]u8{ 1, 0, 0 };
+        _ = linux.write(status[1], &success, success.len);
+        linux.exit(0);
+    }
+    _ = linux.close(status[1]);
+    var result: [3]u8 = undefined;
+    const received = linux.read(status[0], &result, result.len);
+    _ = linux.close(status[0]);
+    var waited: u32 = 0;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.waitpid(@intCast(forked), &waited, 0)));
+    if (received != result.len or result[0] != 1)
+        std.debug.print("partial privilege probe stage={d} errno={d} bytes={d}\n", .{ result[1], result[2], received });
+    try testing.expectEqual(@as(usize, result.len), received);
+    try testing.expectEqual(@as(u8, 1), result[0]);
+    try testing.expect(linux.W.IFEXITED(waited));
+    try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
+}
+
+test "maintainer_script.test.production script inherits only narrowed capability policy" {
+    try skipUnlessPosixShell();
+    var header: KernelCapabilityHeader = .{ .version = 0x20080522, .pid = 0 };
+    var original: [2]linux.cap_user_data_t = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.syscall2(
+        .capget,
+        @intFromPtr(&header),
+        @intFromPtr(&original[0]),
+    )));
+    const privileged = original[0].effective & linux.CAP.TO_MASK(linux.CAP.SETPCAP) != 0;
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\grep -E '^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):' /proc/self/status
+        \\
+    );
+    defer script.deinit(testing.allocator);
+    var launcher: SystemLauncher = .{};
+    var report = try run(testing.allocator, script.request(&.{"configure"}), .{
+        .launcher = launcher.interface(),
+    });
+    defer report.deinit();
+    try testing.expect(report.succeeded());
+    var seen: usize = 0;
+    var lines = std.mem.splitScalar(u8, report.stdout, '\n');
+    while (lines.next()) |line| {
+        const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = line[0..separator];
+        const value = std.mem.trim(u8, line[separator + 1 ..], " \t");
+        if (std.mem.startsWith(u8, name, "Cap")) {
+            const observed = try std.fmt.parseInt(u64, value, 16);
+            if (!std.mem.eql(u8, name, "CapBnd") or privileged) {
+                const allowed: u64 = if (std.mem.eql(u8, name, "CapAmb"))
+                    0
+                else
+                    scriptCapabilityMask(0);
+                try testing.expect(observed & ~allowed == 0);
+            }
+            seen += 1;
+        } else if (std.mem.eql(u8, name, "NoNewPrivs") or std.mem.eql(u8, name, "Seccomp")) {
+            try testing.expectEqualStrings(if (name[0] == 'N') "1" else "2", value);
+            seen += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 7), seen);
 }
 
 test "maintainer_script.test.udev PID-only proc rejects unrelated and altered invocations" {

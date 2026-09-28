@@ -1415,6 +1415,7 @@ test "security: apt import and native child-process owners retain explicit bound
         "\"private-network-loopback-v1\\x00\"",                "fn sealInheritedDescriptors() linux.E",      "linux.PR.CAPBSET_DROP",
         "linux.PR.SET_NO_NEW_PRIVS",
         "linux.PR.SET_PDEATHSIG",                              "linux.syscall2(\n        .capget,",          "linux.syscall2(\n        .capset,",
+        "linux.SECCOMP.SET_MODE_FILTER",                       "restrictScriptPrivileges(null, false)",      "restrictScriptPrivileges(failure_stage, true)",
         "linux.syscall3(\n        .close_range,",              "@offsetOf(KernelCapabilityHeader, \"pid\")",
     }) |marker| try support.contains(runner, marker);
     const live = try f.source("src/live_root.zig");

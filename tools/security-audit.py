@@ -1577,7 +1577,16 @@ def audit_production_sources() -> None:
         '"usr/bin/gnuchmod"',
         '"usr/share/dpkg/sh/dpkg-error.sh"',
         '"d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528"',
-        "return restrictSnapshotProcPrivileges(failure_stage);",
+        "return restrictScriptPrivileges(failure_stage, true);",
+        "const restricted = restrictScriptPrivileges(null, false);",
+        "childFail(streams.status, .capability_policy, restricted);",
+        "maskScriptCapabilities(&data);",
+        "scriptCapabilityAllowed(capability)",
+        "linux.PR.CAP_AMBIENT",
+        "linux.SECCOMP.SET_MODE_FILTER",
+        "linux.SECCOMP.RET.KILL_PROCESS",
+        "linux.CLONE.NEWNET",
+        "if (count == 64) return .RANGE;",
     ):
         if required not in runner:
             fail(f"reviewed exact-script proc isolation changed: {required}")
