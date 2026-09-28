@@ -27892,12 +27892,12 @@ fn verifyNativeHelperBootstrapBeforeRecovery(
     const target_present = try root.entryIfExists(
         try root_fs.Path.init(native_helper.target_path),
     ) != null;
-    const target_action = nativeAction(
-        .filesystem,
-        bootstrap.owner.program_step,
-        0,
-        0,
-    );
+    // Config staging owns database substep 0 before publishing the helper in filesystem substep 1.
+    const staged_config = native_recovery.latest(
+        progress.document,
+        nativeAction(.database, bootstrap.owner.program_step, 0, 0),
+    ) != null;
+    const target_action = nativeAction(.filesystem, bootstrap.owner.program_step, if (staged_config) 1 else 0, 0);
     const target_record = native_recovery.latest(
         progress.document,
         target_action,
