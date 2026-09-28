@@ -2865,6 +2865,87 @@ def audit_install_action() -> None:
         fail("transaction-result summary schema is missing")
 
 
+def actions_native_only_candidate_failures(action: str, texts: dict[str, str]) -> list[str]:
+    """Opt-in pre-cutover contract; never used by the shipped legacy-capable audit."""
+    base = f"actions/{action}/"
+    manifest = texts[base + "action.yml"]
+    inputs = texts[base + "src/inputs.ts"]
+    runtime = texts[base + "src/action.ts"]
+    bundle = texts[base + "dist/index.js"]
+    runner = texts[base + "src/runner.ts"]
+    failures: list[str] = []
+    section = re.search(r"(?m)^  transaction-backend:\n((?:    [^\n]*\n)+)", manifest)
+    if section is None or not re.search(r"(?m)^    default: native$", section.group(1)):
+        failures.append(f"{action} action.yml: candidate transaction-backend default must be native")
+    if "backend-capability:" not in manifest:
+        failures.append(f"{action} action.yml: candidate must publish backend-capability")
+    if not re.search(
+        r"(?:optionalScalar|exactScalar)\(\s*environment,\s*'TRANSACTION_BACKEND'\s*\)"
+        r"\s*(?:\?\?|\|\|)\s*'native'", inputs
+    ):
+        failures.append(f"{action} inputs.ts: candidate omitted backend must select native")
+    guard = re.search(r"if\s*\(\s*transactionBackend\s*!==\s*'native'\s*\)", inputs)
+    lock = inputs.find("const lockInput =")
+    if guard is None or lock < 0 or guard.start() > lock:
+        failures.append(f"{action} inputs.ts: candidate must refuse legacy before reading lock or preparing roots/cache")
+    if ">=0.3.0,<0.4.0" not in inputs:
+        failures.append(f"{action} inputs.ts: candidate legacy refusal needs versioned recovery guidance")
+    bundled_defaults = re.findall(
+        r'(?:optionalScalar|exactScalar)\([^)]*"TRANSACTION_BACKEND"\)'
+        r'\s*(?:\?\?|\|\|)"([^"]+)"', bundle
+    )
+    if bundled_defaults != ["native"] or not re.search(
+        r'(?:optionalScalar|exactScalar)\([^)]*"TRANSACTION_BACKEND"\)'
+        r'\s*(?:\?\?|\|\|)"native";if\([A-Za-z_$][\w$]*!=="native"\)', bundle
+    ):
+        failures.append(f"{action} dist/index.js: checked-in bundle is stale or accepts legacy")
+    if "backend-capability" not in runtime or "native-transaction-execution-v1" not in runtime:
+        failures.append(f"{action} action.ts: native backend-capability output is missing")
+    action_guard = runtime.find("if (inputs.transactionBackend !== 'native')")
+    first_work = runtime.find(
+        "const executable = await findDebz()" if action == "download" else "const protectedFiles ="
+    )
+    if action_guard < 0 or first_work < 0 or action_guard > first_work:
+        failures.append(f"{action} action.ts: candidate must reject a forged legacy input before work")
+    if "backend-capability" not in bundle or "native-transaction-execution-v1" not in bundle:
+        failures.append(f"{action} dist/index.js: native backend-capability evidence is missing")
+
+    if action == "download":
+        for token in (
+            "exact-closure-lock-v3", "package-cache-v5", "debz-package-cas-v5-",
+            "validateFingerprint(expected, inputs, version)", "validatePrepare(",
+        ):
+            if token not in runner:
+                failures.append(f"download runner.ts: native lock/fingerprint/cache contract is missing: {token}")
+        if runtime.find("fingerprintCache(") > runtime.find("cache.restore(") or "restoredCacheState(" not in runtime:
+            failures.append("download action.ts: fingerprint must bind cache restore before preparation")
+    else:
+        child = texts[base + "src/subprocess.ts"]
+        if "DEBZ_DOWNLOAD_TRANSACTION_BACKEND: this.inputs.transactionBackend" not in child:
+            failures.append("install subprocess.ts: selected backend is not handed to download")
+        if "requiredOutput(outputs, 'backend-capability')" not in child or (
+            "backendCapability !== expectedBackendCapability" not in child
+        ) or not re.search(
+            r"const expectedBackendCapability\s*=\s*'native-transaction-execution-v1'", child
+        ):
+            failures.append("install subprocess.ts: missing or foreign download capability must refuse")
+        if "debz-package-cas-v5-" not in child or "lockDigest" not in child:
+            failures.append("install subprocess.ts: native cache key and lock digest handoff is missing")
+        probe = runtime.find("buildNativeCapabilityArguments()")
+        download = runtime.find("const download = await composition.download")
+        if probe < 0 or download < 0 or probe > download:
+            failures.append("install action.ts: native CLI capability must precede download")
+        for token in (
+            "validateNativeInstallResult(", "validateTransactionSummary(",
+            "nativeResult.changed", "download.lockDigest", "outputs.changed",
+        ):
+            if token not in runtime:
+                failures.append(f"install action.ts: native receipt/completion/unchanged binding is missing: {token}")
+        if "receipt_evidence" not in runner or "completion_digest_sha256" not in runner:
+            failures.append("install runner.ts: verified native receipt/completion binding is missing")
+    return failures
+
+
 def audit_legacy_cutover_policy() -> None:
     policy_path = ROOT / "security/legacy-cutover-policy.json"
     schema_path = ROOT / "schema/legacy-compatibility-policy-v1.json"
@@ -3223,6 +3304,32 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         return 2
     if kind == "action-pin":
         failures = action_pin_failures(text, "action.yml")
+    elif kind == "actions-native-only":
+        try:
+            fixture = json.loads(text)
+            if not isinstance(fixture, dict) or set(fixture) != {"action", "overrides"}:
+                raise ValueError("invalid fixture")
+            action = fixture["action"]
+            overrides = fixture["overrides"]
+            if action not in ("download", "install") or not isinstance(overrides, dict):
+                raise ValueError("invalid action")
+            paths = tuple(
+                f"actions/{action}/{relative}" for relative in (
+                    "action.yml", "src/inputs.ts", "src/action.ts",
+                    "src/runner.ts", "dist/index.js",
+                    *(("src/subprocess.ts",) if action == "install" else ()),
+                )
+            )
+            if any(key not in paths or not isinstance(value, str) for key, value in overrides.items()):
+                raise ValueError("invalid override")
+            texts = {
+                path: overrides.get(path, (ROOT / path).read_text(errors="strict"))
+                for path in paths
+            }
+        except (ValueError, TypeError, KeyError, UnicodeError, OSError):
+            print("security-audit: invalid Actions native-only candidate fixture", file=sys.stderr)
+            return 2
+        failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
         failures = ghr_zig_workflow_failures(text, "ci.yml", 13)
     elif kind == "ghr-release":

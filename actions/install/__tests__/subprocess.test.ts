@@ -53,6 +53,12 @@ test('nested download handoff accepts only the explicitly selected cache key dom
   const validated = validateDownloadOutputs(outputs, inputs);
   assert.equal(validated.reusedCount, 4);
   assert.equal(validated.backendCapability, 'native-transaction-execution-v1');
+  outputs.delete('backend-capability');
+  assert.throws(() => validateDownloadOutputs(outputs, inputs), /backend-capability.*invalid/u);
+  outputs.set('backend-capability', 'native-transaction-execution-v1');
+  outputs.set('lock-digest', 'not-a-native-lock');
+  assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache or lock identity/u);
+  outputs.set('lock-digest', 'a'.repeat(64));
   outputs.set('cache-matched-key', outputs.get('cache-matched-key')!.replace('-v5-', '-v3-'));
   assert.throws(() => validateDownloadOutputs(outputs, inputs), /cache-hit evidence/u);
 });

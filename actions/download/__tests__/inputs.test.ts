@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 
 import { environment } from './helpers.js';
+import { runAction } from '../src/action.js';
 import { findDebz, readInputs } from '../src/inputs.js';
 
 const testRoot = path.resolve(process.cwd(), '../../.tmp/download-action-tests/inputs');
@@ -58,6 +59,52 @@ test('native selection is explicit and permits repository-free closures without 
     await assert.rejects(readInputs(values), /transaction-backend|TRANSACTION_BACKEND|one line|multiline/);
   }
 });
+
+if (process.env.DEBZ_ACTIONS_NATIVE_ONLY_CANDIDATE === '1') {
+  test('native-only candidate selects native when backend is omitted', async () => {
+    const values = environment(workspace, runnerTemp);
+    delete values.DEBZ_DOWNLOAD_TRANSACTION_BACKEND;
+    await writeFile(
+      path.join(workspace, 'lock.json'),
+      await readFile(path.resolve(process.cwd(), '../../fuzz/corpus/state/lock-v3.json')),
+    );
+    assert.equal((await readInputs(values)).transactionBackend, 'native');
+  });
+
+  test('native-only candidate refuses legacy selection and v1 locks before CLI or cache work', async () => {
+    const values = environment(workspace, runnerTemp);
+    const previous = { ...process.env };
+    const output = path.join(testRoot, 'candidate-output');
+    await writeFile(output, '');
+    const cache = {
+      isFeatureAvailable() { assert.fail('candidate refusal must precede cache access'); },
+      async restore(): Promise<undefined> { assert.fail('candidate refusal must precede cache restore'); },
+      async save(): Promise<void> { assert.fail('candidate refusal must precede cache save'); },
+    };
+    values.PATH = '/no/debz/here';
+    values.GITHUB_OUTPUT = output;
+    try {
+      Object.assign(process.env, values);
+      await assert.rejects(runAction(cache), /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u);
+      assert.equal(await readFile(output, 'utf8'), '');
+      await assert.rejects(lstat(path.join(runnerTemp, 'debz-package-cache')), /ENOENT/u);
+
+      delete process.env.DEBZ_DOWNLOAD_TRANSACTION_BACKEND;
+      await writeFile(
+        path.join(workspace, 'lock.json'),
+        '{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1}\n',
+      );
+      await assert.rejects(runAction(cache), /exact-closure-lock-v1|legacy|unsupported/u);
+      assert.equal(await readFile(output, 'utf8'), '');
+      await assert.rejects(lstat(path.join(runnerTemp, 'debz-package-cache')), /ENOENT/u);
+    } finally {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in previous)) delete process.env[key];
+      }
+      Object.assign(process.env, previous);
+    }
+  });
+}
 
 test('reads standard JavaScript-action INPUT_* environment names', async () => {
   const values = environment(workspace, runnerTemp);
