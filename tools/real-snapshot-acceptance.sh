@@ -185,10 +185,20 @@ run() {
 verify_result() {
   local name=$1 lock_input=$2
   run_candidate "$name-summary" 10m "$debz" transaction-result verify \
-    --transaction-backend native --install-root "$root" --state-path "$state" \
-    --lock-input "$lock_input" --architecture "$architecture" --json
-  [[ ! -s "$evidence/$name-summary.stderr" ]]
-  jq -e '.outcome == "succeeded"' "$evidence/$name-summary.json" >/dev/null
+    --transaction-backend native --install-root "$root" \
+    --lock-input "$lock_input" --architecture "$architecture" --json || {
+      local status=$?
+      echo "native $name transaction-result verification failed (exit $status)" >&2
+      return "$status"
+    }
+  [[ ! -s "$evidence/$name-summary.stderr" ]] &&
+    jq -e '.backend == "native" and .outcome == "succeeded" and
+      .final_verification_status == "exact_match" and
+      .lock_evidence == "exact_match" and .receipt_evidence == "exact_match" and
+      .root_operation_status == "cleared"' "$evidence/$name-summary.json" >/dev/null || {
+    echo "native $name transaction-result verification did not report exact success" >&2
+    return 1
+  }
 }
 
 review_lock() {

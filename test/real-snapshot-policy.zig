@@ -279,9 +279,13 @@ test "snapshot: offline native creation and zero-action update preserve evidence
         const args = parsed.value;
         if (std.mem.eql(u8, args[0], "transaction-result")) {
             verifications += 1;
-            try testing.expect(args.len > 1 and std.mem.eql(u8, args[1], "verify"));
-            try testing.expect(hasArgument(args, install_lock));
-            try testing.expect(hasArgument(args, "--transaction-backend") and hasArgument(args, "native"));
+            const root = try f.work.path(".real-snapshot/fresh/root");
+            defer support.allocator.free(root);
+            try expectArguments(args, &.{
+                "transaction-result", "verify", "--transaction-backend", "native",
+                "--install-root", root, "--lock-input", install_lock,
+                "--architecture", f.arch, "--json",
+            });
         }
         if (std.mem.eql(u8, args[0], "plan") and hasArgument(args, update_lock)) {
             update_plans += 1;
@@ -296,6 +300,11 @@ test "snapshot: offline native creation and zero-action update preserve evidence
     try testing.expectEqual(@as(usize, 1), verifications);
     try testing.expectEqual(@as(usize, 1), update_plans);
     try testing.expectEqual(@as(usize, 2), mutating);
+}
+
+fn expectArguments(actual: []const []const u8, expected: []const []const u8) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try testing.expectEqualStrings(want, got);
 }
 
 fn hasArgument(args: []const []const u8, value: []const u8) bool {
@@ -334,15 +343,64 @@ test "snapshot: unreviewed initial signer refuses before any download" {
     try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/download.json"));
 }
 
-test "snapshot: failed receipt and unreviewed update signer refuse before update" {
-    {
+test "snapshot: native verification refusal preserves installed evidence and stops before update" {
+    for ([_]struct { scenario: []const u8, exit_code: u8 }{
+        .{ .scenario = "failed-verification", .exit_code = 7 },
+        .{ .scenario = "failed-outcome", .exit_code = 1 },
+    }) |scenario| {
         var f = try Driver.initOffline();
         defer f.deinit();
-        const refused = try f.offline(.{ .name = "failed-verification" });
+        const refused = try f.offline(.{ .name = scenario.scenario });
         defer refused.deinit();
-        try testing.expect(refused.code != 0);
-        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-transaction-result.json"));
+        try testing.expectEqual(scenario.exit_code, refused.code);
+        try support.contains(refused.stderr, "native create transaction-result verification");
+        try expectOperations(&f, &.{ "refresh", "plan", "download", "install", "transaction-result" });
+        const provenance = try f.work.read(".real-snapshot/fresh/root/var/lib/debz/native-transaction-provenance-v2.json");
+        defer support.allocator.free(provenance);
+        try support.contains(provenance, "\"outcome\":\"succeeded\"");
+        const status = try f.work.read(".real-snapshot/fresh/root/var/lib/dpkg/status");
+        defer support.allocator.free(status);
+        try support.contains(status, "Status: install ok installed");
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/update.json"));
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/update-zero-actions.txt"));
     }
+}
+
+test "snapshot: legacy verification requires state path, native rejects it" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const accepted = try f.offline(.{});
+    defer accepted.deinit();
+    try accepted.ok();
+    const calls = try f.work.path("calls.jsonl");
+    defer support.allocator.free(calls);
+    const env_calls = try std.fmt.allocPrint(support.allocator, "SNAPSHOT_TEST_CALLS={s}", .{calls});
+    defer support.allocator.free(env_calls);
+    const lock = try f.work.path(".real-snapshot/fresh/evidence/ubuntu-minimal.lock.json");
+    defer support.allocator.free(lock);
+    const update_lock = try f.work.path(".real-snapshot/fresh/evidence/ubuntu-minimal.update.lock.json");
+    defer support.allocator.free(update_lock);
+    const root = try f.work.path(".real-snapshot/fresh/root");
+    defer support.allocator.free(root);
+    const state = try f.work.path(".real-snapshot/fresh/state");
+    defer support.allocator.free(state);
+    const legacy = try support.run(&.{
+        "env", env_calls, f.executable, "transaction-result", "verify",
+        "--state-path", state, "--lock-input", update_lock, "--architecture", f.arch, "--json",
+    });
+    defer legacy.deinit();
+    try legacy.ok();
+    const native_with_state = try support.run(&.{
+        "env", env_calls, f.executable, "transaction-result", "verify",
+        "--transaction-backend", "native", "--install-root", root, "--state-path", state,
+        "--lock-input", lock, "--architecture", f.arch, "--json",
+    });
+    defer native_with_state.deinit();
+    try testing.expect(native_with_state.code != 0);
+    try support.contains(native_with_state.stderr, "NativeVerificationDoesNotUseStatePath");
+}
+
+test "snapshot: unreviewed update signer refuses before update" {
     {
         var f = try Driver.initOffline();
         defer f.deinit();

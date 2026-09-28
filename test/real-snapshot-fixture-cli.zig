@@ -131,17 +131,30 @@ pub fn main(init: std.process.Init) !void {
     }
     if (equals(operation, "transaction-result")) {
         if (args.len < 2 or !equals(args[1], "verify") or digest == null) return error.InvalidVerification;
-        const state_path = option(args, "--state-path") orelse return error.MissingState;
-        const receipt_path = try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{state_path});
+        const native = equals(option(args, "--transaction-backend") orelse "legacy_dpkg", "native");
+        const receipt_path = if (native) path: {
+            if (option(args, "--state-path") != null) return error.NativeVerificationDoesNotUseStatePath;
+            const install_root = option(args, "--install-root") orelse return error.MissingRoot;
+            if (option(args, "--architecture") == null) return error.MissingArchitecture;
+            break :path try std.fmt.allocPrint(allocator, "{s}/var/lib/debz/native-transaction-provenance-v2.json", .{install_root});
+        } else path: {
+            if (option(args, "--install-root") != null) return error.LegacyVerificationDoesNotUseInstallRoot;
+            const state_path = option(args, "--state-path") orelse return error.MissingState;
+            break :path try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{state_path});
+        };
         const receipt = try read(io, allocator, receipt_path);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{});
         defer parsed.deinit();
         if (!equals(parsed.value.object.get("fixture_lock_digest").?.string, digest.?))
             return error.MismatchedReceipt;
-        try std.Io.File.stdout().writeStreamingAll(io, if (equals(scenario, "failed-verification"))
-            "{\"outcome\":\"failed\"}\n"
+        if (equals(scenario, "failed-verification")) {
+            try std.Io.File.stdout().writeStreamingAll(io, "{\"backend\":\"native\",\"outcome\":\"failed\"}\n");
+            std.process.exit(7);
+        }
+        try std.Io.File.stdout().writeStreamingAll(io, if (equals(scenario, "failed-outcome"))
+            "{\"backend\":\"native\",\"outcome\":\"failed\"}\n"
         else
-            "{\"outcome\":\"succeeded\"}\n");
+            "{\"backend\":\"native\",\"outcome\":\"succeeded\",\"final_verification_status\":\"exact_match\",\"lock_evidence\":\"exact_match\",\"receipt_evidence\":\"exact_match\",\"root_operation_status\":\"cleared\"}\n");
     } else {
         const changed = !equals(operation, "refresh") and !equals(operation, "plan") and
             !equals(operation, "download") and !equals(operation, "upgrade-all");
