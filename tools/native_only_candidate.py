@@ -30,7 +30,7 @@ CUTOVER_ROUTES = {
     "src/package_cache_workflow.zig": (r"pub fn createFingerprint\s*\(|pub fn prepare\s*\(", "stop creating legacy cache v1 contracts; retain historical verification (#282)"),
     "src/transaction_result_summary.zig": (r"pub fn canonicalJson\s*\(", "stop creating legacy result summary v1; retain historical verification (#282)"),
     "src/system_profile.zig": (r"transaction_backend:\s*TransactionBackend\s*=\s*\.legacy_dpkg", "stop executing profile v1/default; retain exact-byte decoder (#282)"),
-    "src/main.zig": (r"var transaction_backend:\s*debz\.transaction_engine\.Kind\s*=\s*\.legacy_dpkg", "remove CLI legacy selection/default (#283)"),
+    "src/main.zig": (r"var transaction_backend:\s*debz\.transaction_engine\.Kind\s*=\s*\.legacy_dpkg|return if\s*\(native_only_rehearsal\)\s*\.native_only\s*else\s*\.legacy_capable", "remove CLI legacy selection/default and rehearsal-only runtime mode (#283)"),
     "src/repository_cli.zig": (r"transaction_backend:\s*debz\.transaction_engine\.Kind\s*=\s*\.legacy_dpkg", "remove repository CLI legacy default (#280/#283)"),
     "src/apt_system_orchestrator.zig": (r"transaction_backend:\s*system_profile\.TransactionBackend\s*=\s*\.legacy_dpkg|\.legacy_capable\s*,\s*switch\s*\(loaded\.profile\.transaction_backend\)", "remove apt/root legacy profile execution (#280)"),
     "src/target_apt_config.zig": (r'const argv\s*=\s*\[_\]\[\]const u8\{\s*"/usr/bin/dpkg",\s*"--print-architecture"\s*\}', "replace host-root dpkg architecture probe (#280)"),
@@ -46,13 +46,18 @@ CUTOVER_ROUTES = {
     "actions/install/action.yml": (r"(?m)^\s+default:\s*legacy_dpkg\s*$", "change install Action shipped default (#283)"),
 }
 GUARD_CUTOVER_ROUTES = {
+    "src/cli_backend_policy.zig": (
+        r"\.legacy_capable\s*=>\s*debz\.transaction_engine\.Kind\.legacy_dpkg",
+        "remove new-execution CLI legacy fallback; retain completed historical verification (#283)",
+    ),
     "src/root_operation.zig": (
         r"legacy_execution_capable:\s*bool\s*=\s*true",
         "remove root-operation active legacy publication default; retain historical decoder and typed refusal (#279/#285)",
     ),
 }
 GUARD_PATHS = {
-    "src/legacy_compat.zig", "src/native_authorization.zig",
+    "src/legacy_compat.zig", "src/cli_backend_policy.zig",
+    "src/native_authorization.zig",
     "src/exact_lock_v2.zig", "src/exact_lock_v3.zig",
     "src/native_transaction_result.zig", "src/native_execution_request.zig",
     "src/native_program.zig", "src/maintainer_script.zig",
@@ -157,6 +162,8 @@ def candidate_failures(
         return [*failures, "candidate inventories must be objects"]
     if inventory.get("schema") != "https://debz.dev/schema/native-only-production-candidate-v1" or inventory.get("issue") != 276:
         failures.append(f"{INVENTORY}: candidate identity changed")
+    if inventory.get("cli_build_path") != "build.zig":
+        failures.append(f"{INVENTORY}: missing exact CLI release build-mode path")
     removed = inventory.get("removed_production_paths")
     if not isinstance(removed, list) or not all(isinstance(path, str) for path in removed) or len(removed) != len(set(removed)):
         return [*failures, f"{INVENTORY}: missing/malformed cutover deletion inventory"]
@@ -206,7 +213,9 @@ def candidate_failures(
         entry for entry in policy.get("artifact_policy", [])
         if isinstance(entry, dict) and entry.get("schema") == "debz:transaction-journal"
     ] if isinstance(policy.get("artifact_policy"), list) else []
-    if len(journal) != 1 or journal[0].get("versions") != [1, 2, 3, 4] or journal[0].get("backend") != "legacy_dpkg":
+    if (len(journal) != 1 or journal[0].get("versions") != [1, 2, 3, 4]
+            or journal[0].get("backend") != "legacy_dpkg"
+            or journal[0].get("new_execution") != "version_4_only"):
         failures.append(f"{LEGACY_POLICY}: journal v1-v4 historical legacy decoding is unclassified")
     if production_paths & removed_paths or production_paths | removed_paths != set(CUTOVER_ROUTES) or guard_paths != GUARD_PATHS or reference_paths != {
         "tools/native-differential.py", "tools/prepare-native-dpkg.py",
@@ -231,12 +240,13 @@ def candidate_failures(
         ):
             failures.append(f"{path}: unreviewed child-process operator; no indirect execveat or dpkg basename allowance")
     required_hashes = production_paths | guard_paths | reference_paths | contract_paths | {
-        "src/live_root.zig", "actions/setup/src/runner.ts",
+        "src/live_root.zig", "actions/setup/src/runner.ts", "build.zig",
     }
     if set(fingerprints) != required_hashes:
         failures.append(f"{INVENTORY}: missing/stale fingerprint path classification: {sorted(set(fingerprints) ^ required_hashes)}")
     allowed_paths = production_paths | guard_paths | reference_paths | contract_paths | {
-        "actions/setup/src/runner.ts", "src/live_root.zig", LEGACY_POLICY, INVENTORY,
+        "actions/setup/src/runner.ts", "src/live_root.zig", "build.zig",
+        LEGACY_POLICY, INVENTORY,
     }
     if any(path not in allowed_paths for path in overrides):
         failures.append(f"candidate fixture has unknown override path: {sorted(set(overrides) - allowed_paths)}")
@@ -306,6 +316,9 @@ def candidate_failures(
     for relative, (pattern, task) in GUARD_CUTOVER_ROUTES.items():
         if relative in texts and re.search(pattern, production_part(relative, texts[relative])):
             failures.append(f"{relative}: candidate cutover task: {task}")
+    build = texts.get("build.zig", "")
+    if re.search(r'release_cli_options\.addOption\(\s*bool\s*,\s*"native_only"\s*,\s*false\s*\)', build):
+        failures.append("build.zig: candidate cutover task: change CLI shipped native-only mode, not only rehearsal (#283)")
     for action in ("download", "install"):
         paths = [
             f"actions/{action}/{item}" for item in (

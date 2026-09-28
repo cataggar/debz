@@ -236,6 +236,8 @@ test "security: native-only production candidate refuses shipped routes and exac
     defer baseline.deinit();
     for ([_][]const u8{
         "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
+        "src/cli_backend_policy.zig: candidate cutover task: remove new-execution CLI legacy fallback",
+        "build.zig: candidate cutover task: change CLI shipped native-only mode",
         "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains",
         "src/transaction_executor.zig: active legacy journal recovery still launches dpkg",
         "src/transaction_recovery.zig: candidate cutover task: remove active legacy journal v4 publication/replay; retain v1-v4 decode",
@@ -253,6 +255,8 @@ test "security: native-only production candidate refuses shipped routes and exac
 
     for ([_]struct { path: []const u8, from: []const u8, to: []const u8, message: []const u8 }{
         .{ .path = "src/main.zig", .from = "var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;", .to = "var transaction_backend: debz.transaction_engine.Kind = .native;", .message = "src/main.zig: stale reviewed inventory fingerprint" },
+        .{ .path = "src/cli_backend_policy.zig", .from = ".legacy_capable => debz.transaction_engine.Kind.legacy_dpkg,", .to = ".legacy_capable => debz.transaction_engine.Kind.native,", .message = "src/cli_backend_policy.zig: stale reviewed inventory fingerprint" },
+        .{ .path = "build.zig", .from = "release_cli_options.addOption(bool, \"native_only\", false);", .to = "release_cli_options.addOption(bool, \"native_only\", true);", .message = "build.zig: stale reviewed inventory fingerprint" },
         .{ .path = "actions/download/src/inputs.ts", .from = "?? 'legacy_dpkg';", .to = "?? 'native';", .message = "download inputs.ts: candidate must refuse legacy before reading lock" },
         .{ .path = "actions/install/src/inputs.ts", .from = "|| 'legacy_dpkg';", .to = "|| 'native';", .message = "install inputs.ts: candidate must refuse legacy before reading lock" },
         .{ .path = "actions/download/dist/index.js", .from = "legacy-dpkg-execution-deprecated-v1", .to = "forged-legacy-capability", .message = "actions/download/dist/index.js: stale reviewed inventory fingerprint" },

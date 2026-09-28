@@ -160,6 +160,13 @@ paths under `tools/` are reference-only and may not migrate into production.
 Journals v1–v4 remain distinct read-only historical decode formats; active
 legacy journal publication/replay is a separate cutover blocker.
 
+The #279 CLI/root rehearsal is opt-in, not a changed release mode. The
+candidate also pins `build.zig`'s shipped CLI mode, the exact
+`src/cli_backend_policy.zig` selector, and the CLI/root operation wiring. The
+native-only cutover must remove the legacy new-execution fallback without
+removing completed historical verification or enabling the rehearsal as a
+success-shaped substitute for changing the shipped default.
+
 After integrating #274, update fingerprints and allowances only with a review
 of the changed paths, run this candidate, both Actions' candidate contracts
 and bundle reproducibility checks, and the production install/remove/reinstall/
