@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 473,
-      "sha512": "545a85814afd6dafb0b5dcd2e15c8e489f07e4974e5e444f2a610f9d3d6f91f8da2fd297e10910b03c01c1fc06bf9a157cb7d587d0ec7fba6aa90fcdbd442f88"
+      "count": 475,
+      "sha512": "9e6651b96f9784376fb5409d38774b558faef595327ff11d13af5d6ce100ed520680364205b86cdce1c32e8137ab25176b57296cfba6b846ee3e0324eb518a12"
     },
     "findings": {
-      "count": 21320,
+      "count": 21321,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 177,
         "raw_32_byte": 1196,
-        "sha256_token": 19650
+        "sha256_token": 19651
       },
-      "sha512": "f1b1b4f44186bd9c2a054bd9c8c0536e626c9dbd92805eb837f07d7637d191c57f0d0a41e583e3ff66809f07d4547faff3829defde4878c37c30f0c93cf6b82f"
+      "sha512": "bfb299f2cc25ea027f043ccad8b541296a85676d64668a8cfea562fc3b58e9bd0f8fb4edfdf5408be417ccc90dbcfc94418784c3c17db478bd155ca1f61ddb48"
     },
     "classifications": [
       {
@@ -154,15 +154,15 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs and python3 install-only invalid-name and redirected-tool witness, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded glib automatic file-trigger self-interest exclusion, failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12417,
+        "count": 12418,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
           "raw_32_byte": 1121,
-          "sha256_token": 11149
+          "sha256_token": 11150
         },
-        "sha512": "36197da32e90d8886b8d2a727c05bfea89dcf4cb487b55527e7e991e06aa95a30bfdfd53dde12ae1f71169fac8a24d7d8c7f820f779d4ebe990d62e0325f09b1"
+        "sha512": "2df799df43739a02f97f6436898178ea1e59db1930687a2b65826f4c01b88662bf0383a086d826cad22d3f9b86bf10d180b266b9b2c83ff28740808aedccaff4"
       },
       {
         "scope": "test",

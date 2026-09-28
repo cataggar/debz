@@ -34,6 +34,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const absolute_path = @import("absolute_path.zig");
+const legacy_compat = @import("legacy_compat.zig");
 const live_root = @import("live_root.zig");
 const product_api = @import("product_api.zig");
 const repository_api = @import("repository_api.zig");
@@ -3067,6 +3068,26 @@ pub fn recoveryReportWitness(report: transaction_executor.RecoveryReport) Witnes
     return observedMutation(report.state, report.commands.len);
 }
 
+fn requireRootBackend(
+    capable: bool,
+    backend: Backend,
+    lifecycle: legacy_compat.Lifecycle,
+) Error!void {
+    const compatible: legacy_compat.Backend = switch (backend) {
+        .legacy_dpkg => .legacy_dpkg,
+        .native => .native,
+    };
+    _ = legacy_compat.decide(
+        if (capable) .legacy_capable else .native_only,
+        compatible,
+        lifecycle,
+        .{ .schema = schema_id, .version = schema_version, .backend = compatible },
+    ) catch |err| switch (err) {
+        error.LegacyCapabilityRequired => return error.LegacyCapabilityRequired,
+        else => return error.RecordCorrupt,
+    };
+}
+
 /// Owns the root mutation lock and the active record for one root.
 pub const Coordinator = struct {
     io: std.Io,
@@ -3138,7 +3159,22 @@ pub const Coordinator = struct {
         allocator: std.mem.Allocator,
         request: Request,
     ) Error!Attempt {
+        try requireRootBackend(
+            self.legacy_execution_capable,
+            request.backend,
+            if (request.intent == .recovery) .active_recovery else .new_execution,
+        );
         try self.validateProjection();
+        if (!self.legacy_execution_capable) {
+            var observed = self.store().read(allocator) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.RecordCorrupt,
+            };
+            defer if (observed) |*value| value.deinit();
+            if (observed) |value|
+                if (value.record.backend == .legacy_dpkg)
+                    return error.LegacyCapabilityRequired;
+        }
         const token = try self.locks.acquire(.{
             .rank = .root_operation,
             .root = self.root,
@@ -3153,6 +3189,23 @@ pub const Coordinator = struct {
         try self.validateProjection();
 
         const store_handle = self.store();
+        var prior: ?OwnedRecord = store_handle.read(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.RecordCorrupt,
+        };
+        errdefer if (prior) |*value| value.deinit();
+        if (prior) |value| {
+            if (!std.mem.eql(
+                u8,
+                &value.record.root_identity_sha256,
+                &self.identity.install_root_sha256,
+            )) return error.RootIdentityMismatch;
+            if (value.record.backend == .legacy_dpkg) {
+                try requireRootBackend(self.legacy_execution_capable, .legacy_dpkg, .active_recovery);
+                if (request.backend != .legacy_dpkg)
+                    return error.LegacyRecoveryRequired;
+            }
+        }
         var recovery_review = store_handle.readRecoveryReviewClaim(
             allocator,
         ) catch |err|
@@ -3182,28 +3235,6 @@ pub const Coordinator = struct {
                 cleanup_forwarder = .{ .observer = observer };
                 break :blk cleanup_forwarder.interface();
             } else null;
-        var prior: ?OwnedRecord = store_handle.read(allocator) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.RecordCorrupt,
-        };
-        errdefer if (prior) |*value| value.deinit();
-
-        if (!self.legacy_execution_capable and request.backend == .legacy_dpkg)
-            return error.LegacyCapabilityRequired;
-        if (prior) |value| {
-            if (!std.mem.eql(
-                u8,
-                &value.record.root_identity_sha256,
-                &self.identity.install_root_sha256,
-            )) return error.RootIdentityMismatch;
-            if (value.record.backend == .legacy_dpkg) {
-                if (!self.legacy_execution_capable)
-                    return error.LegacyCapabilityRequired;
-                if (request.backend != .legacy_dpkg)
-                    return error.LegacyRecoveryRequired;
-            }
-        }
-
         const continuing_native = request.intent == .same_operation and prior != null and
             prior.?.record.backend == .native and !prior.?.record.clearable() and
             bindsSameOperation(prior.?.record, request);
@@ -3268,6 +3299,7 @@ pub const Coordinator = struct {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.StoreFailed,
                 };
+
                 deferred = bindDeferredAcknowledgmentToRecoveryReview(
                     deferred.?,
                     review,
@@ -5815,6 +5847,108 @@ test "root_operation.test.legacy compatibility native-only coordinator refuses a
         coordinator.acquire(testing.allocator, packageRequest()),
     );
     try testing.expect((try coordinator.store().read(testing.allocator)) == null);
+}
+
+test "root_operation.test.native-only rehearsal refuses before lock acquisition and retains one shared namespace" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+    coordinator.legacy_execution_capable = false;
+
+    for ([_]Request{ packageRequest(), repositoryRequest() }) |request| {
+        try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, request));
+    }
+    try testing.expectEqual(@as(usize, 0), locks.acquisitions);
+    try testing.expect((try coordinator.store().read(testing.allocator)) == null);
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, lock_path, .{}));
+
+    var native = packageRequest();
+    native.backend = .native;
+    var attempt = try coordinator.acquire(testing.allocator, native);
+    defer attempt.release();
+    try testing.expectEqual(Backend.native, attempt.record().backend);
+}
+
+test "root_operation.test.native-only rehearsal preserves legacy root bytes through a second mutation" {
+    const cases = [_]struct {
+        state: State,
+        phase: Phase,
+        mutation_started: bool = false,
+        outcome: Outcome = .pending,
+        deferred: bool = false,
+    }{
+        .{ .state = .reserved, .phase = .reserved },
+        .{ .state = .mutation_pending, .phase = .mutation },
+        .{ .state = .recovery_required, .phase = .mutation, .mutation_started = true },
+        .{ .state = .completed, .phase = .provenance, .mutation_started = true, .outcome = .failed_after_mutation },
+        .{ .state = .completed, .phase = .provenance, .mutation_started = true, .outcome = .succeeded, .deferred = true },
+    };
+    for (cases) |case| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var locks: TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+        var input = testInput();
+        input.state = case.state;
+        input.phase = case.phase;
+        input.mutation_started = case.mutation_started;
+        input.outcome = case.outcome;
+        if (case.deferred) {
+            input.provenance = .published;
+            input.provenance_sha256 = @splat(0x9a);
+        }
+        var record = try create(testing.allocator, input);
+        defer record.deinit();
+        try coordinator.store().writeAtomic(testing.allocator, record.record);
+        const before = try tmp.dir.readFileAlloc(testing.io, record_path, testing.allocator, .limited(maximum_document_bytes));
+        defer testing.allocator.free(before);
+        if (case.deferred)
+            try tmp.dir.writeFile(testing.io, .{ .sub_path = deferred_ack_path, .data = "unacknowledged legacy owner\n" });
+
+        coordinator.legacy_execution_capable = false;
+        var native = repositoryRequest();
+        native.backend = .native;
+        const before_acquisitions = locks.acquisitions;
+        for ([_]Request{ native, packageRequest(), native }) |request| {
+            try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, request));
+            try testing.expectEqual(before_acquisitions, locks.acquisitions);
+            const after = try tmp.dir.readFileAlloc(testing.io, record_path, testing.allocator, .limited(maximum_document_bytes));
+            defer testing.allocator.free(after);
+            try testing.expectEqualStrings(before, after);
+            if (case.deferred) {
+                const marker = try tmp.dir.readFileAlloc(testing.io, deferred_ack_path, testing.allocator, .limited(128));
+                defer testing.allocator.free(marker);
+                try testing.expectEqualStrings("unacknowledged legacy owner\n", marker);
+            } else {
+                try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, deferred_ack_path, .{}));
+            }
+        }
+        try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, lock_path, .{}));
+        try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, native_intent_path, .{}));
+    }
+}
+
+test "root_operation.test.native-only rehearsal leaves the system lock absent for active legacy ownership" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var locks: SystemLockBackend = .{ .allocator = testing.allocator, .io = testing.io };
+    var coordinator = try openTestCoordinator(&tmp, locks.interface(), test_root);
+    var legacy = try create(testing.allocator, testInput());
+    defer legacy.deinit();
+    try coordinator.store().writeAtomic(testing.allocator, legacy.record);
+    const before = try tmp.dir.readFileAlloc(testing.io, record_path, testing.allocator, .limited(maximum_document_bytes));
+    defer testing.allocator.free(before);
+    coordinator.legacy_execution_capable = false;
+    var native = repositoryRequest();
+    native.backend = .native;
+    try testing.expectError(error.LegacyCapabilityRequired, coordinator.acquire(testing.allocator, native));
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile(testing.io, lock_path, .{}));
+    const after = try tmp.dir.readFileAlloc(testing.io, record_path, testing.allocator, .limited(maximum_document_bytes));
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
 }
 
 test "root_operation.test.different roots proceed independently" {

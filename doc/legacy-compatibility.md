@@ -68,6 +68,28 @@ preserve canonical bytes, signature inputs, document digests, repository
 snapshot identity, exact package/version/architecture spelling, and recorded
 backend. Historical verification never grants mutation authority.
 
+## Opt-in native-only rehearsal
+
+`zig build test-native-only-rehearsal` builds an uninstalled test-only CLI and
+exercises typed `native_only` selection
+for product and repository CLI backends and transaction-result verification,
+plus root-operation/product/repository pre-mutation refusal. An omitted
+backend selects native **in the test policy only**; the released CLI, dpkg
+executor, and both Actions still default to `legacy_dpkg`. Explicit new legacy
+requests refuse with `LegacyCapabilityRequired` and the versioned guidance
+above, before creating locks, results, sidecars, or root mutation records.
+Native v3 inputs remain backend/profile/capability-bound; completed legacy
+results remain independently read-only through exact version-specific
+verification. An active legacy root, including a pre-mutation or terminal
+unacknowledged record, is not cleared to make room for a second mutation on
+either product or repository surfaces.
+
+This is not the native-only release gate: package-family, apt/system, cache,
+refresh/clean, and other unexercised selectors remain explicit #284/#280 and
+final #283/#274 work. The rehearsal binary rejects those unexercised selectors
+instead of advertising success-shaped defaults. No readiness policy or release
+default changes here.
+
 ## Digest compatibility inventory
 
 The tracked repository digest inventory is

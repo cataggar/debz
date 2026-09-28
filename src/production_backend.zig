@@ -249,6 +249,9 @@ pub const Backend = struct {
     }
 
     pub fn execute(self: *Backend, allocator: std.mem.Allocator, request: api.Request) !api.Result {
+        if (!self.legacy_execution_capable and self.transaction_backend == .legacy_dpkg and
+            (request.operation.mutates() or request.operation == .plan or request.operation == .download))
+            return mapRootOperationError(request.operation, error.LegacyCapabilityRequired);
         return self.route(allocator, request) catch |err|
             mapRuntimeError(request.operation, err);
     }
@@ -266,6 +269,8 @@ pub const Backend = struct {
         workflow: WorkflowRequest,
     ) !api.Result {
         const operation = workflowSurfaceOperation(workflow.operation, workflow.mode);
+        if (!self.legacy_execution_capable and self.transaction_backend == .legacy_dpkg)
+            return mapRootOperationError(operation, error.LegacyCapabilityRequired);
         const count_valid = switch (workflow.operation) {
             .install, .remove, .upgrade => workflow.selectors.len != 0,
             .upgrade_all => workflow.selectors.len == 0,
@@ -7547,6 +7552,53 @@ test "production legacy compatibility maps active legacy refusal to stable versi
         result.diagnostics[0].message,
         legacy_compat.recovery_guidance,
     ) != null);
+}
+
+test "production native-only rehearsal refuses new legacy locks and results before touching the root" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "sentinel", .data = "original\n" });
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try directory.dir.realPath(std.testing.io, &path_buffer);
+    const base = path_buffer[0..length];
+    const install_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/root", .{base});
+    defer std.testing.allocator.free(install_root);
+    const lock_output = try std.fmt.allocPrint(std.testing.allocator, "{s}/new-lock.json", .{base});
+    defer std.testing.allocator.free(lock_output);
+    var backend: Backend = .{ .io = std.testing.io, .legacy_execution_capable = false };
+    const options: api.CommonOptions = .{
+        .install_root = install_root,
+        .cache_path = install_root,
+        .state_path = install_root,
+        .architecture = "amd64",
+        .lock_output_path = lock_output,
+        .assume_yes = true,
+        .conffile = .keep_existing,
+    };
+    for ([_]api.Operation{ .install, .plan, .recover }) |operation| {
+        const result = try backend.execute(std.testing.allocator, .{
+            .operation = operation,
+            .packages = if (operation == .recover) &.{} else &.{"demo"},
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+        try std.testing.expectEqual(api.ErrorId.legacy_recovery_release_required, result.diagnostics[0].id);
+        try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, legacy_compat.recovery_guidance) != null);
+    }
+    const workflow = try backend.executeWorkflow(std.testing.allocator, .{
+        .operation = .install,
+        .mode = .plan_only,
+        .selectors = &.{.{ .name = "demo" }},
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.recovery, workflow.exit_status);
+    try std.testing.expectEqual(api.ErrorId.legacy_recovery_release_required, workflow.diagnostics[0].id);
+    try std.testing.expectError(error.FileNotFound, directory.dir.openFile(std.testing.io, "new-lock.json", .{}));
+    try std.testing.expectError(error.FileNotFound, directory.dir.openDir(std.testing.io, "root/var", .{}));
+    const sentinel = try directory.dir.readFileAlloc(std.testing.io, "sentinel", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(sentinel);
+    try std.testing.expectEqualStrings("original\n", sentinel);
 }
 
 fn expectLegacyCapabilitySidecar(
