@@ -378,11 +378,24 @@ the ReleaseSafe run. The build target rejects missing, relative, duplicate
 or wrong-architecture root paths and runs only the three positive signed
 tests as root with `DEBZ_REQUIRE_SIGNED_PROC_ROOTS=1`; a missing environment
 binding is an error, not a skip. Check each outcome and the retained root
-bytes against a **separate** pinned-dpkg proof copy produced by the existing
-`tools/real-snapshot-{systemd-proc,udev,sudo}-reference.sh` procedures in
-the same protected checkout. These reference procedures also require
-protected pre-script sources, a pinned dpkg 1.22.22 binary and a new proof
-root; they do not manufacture those prestates.
+bytes against a **separate** pinned-dpkg proof copy. From the root of a
+**root-owned, non-group-writable checkout** with root-owned mode-0700
+`.real-snapshot`, where `PINNED_DPKG`, all three `PRE_*` sources and
+the new `*_PROOF` destinations are beneath that `.real-snapshot`, run
+before mutating the native replay copies:
+
+```sh
+sudo -n tools/real-snapshot-systemd-proc-reference.sh \
+  "$PINNED_DPKG" "$PRE_SYSTEMD" "$SYSTEMD_PROOF"
+sudo -n tools/real-snapshot-udev-reference.sh \
+  "$PINNED_DPKG" "$PRE_UDEV" "$UDEV_PROOF"
+sudo -n tools/real-snapshot-sudo-reference.sh \
+  "$PINNED_DPKG" "$PRE_SUDO" "$SUDO_PROOF"
+```
+
+Prepare and verify the pinned dpkg 1.22.22 and its receipt in the protected
+checkout; these procedures verify the paths and signed source identity and
+create proof roots, but do **not** manufacture the before-script sources.
 
 To replay **ordinary** signed lifecycle fixtures on either native
 architecture, the existing CI uses
