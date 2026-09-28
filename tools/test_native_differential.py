@@ -127,6 +127,28 @@ class NativeDifferentialTests(unittest.TestCase):
         )
         self.assertEqual(entries["usr/lib/escape"]["target"], "../../outside")
 
+    def test_database_symlink_ancestor_refuses_before_host_read(self) -> None:
+        root = self.root("root")
+        outside = self.workspace / "outside"
+        outside.mkdir()
+        (outside / "status").write_text("host data must not be captured\n")
+        (root / "var/lib/dpkg").rename(root / "var/lib/original")
+        (root / "var/lib/dpkg").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(
+            native_differential.SnapshotError, "unsafe directory ancestor"
+        ):
+            native_differential.capture(root)
+
+    def test_missing_database_remains_distinct_from_broken_symlink(self) -> None:
+        root = self.workspace / "root"
+        root.mkdir()
+        self.assertFalse(native_differential.capture(root)["dpkg"]["present"])
+        (root / "var").symlink_to(self.workspace / "missing", target_is_directory=True)
+        with self.assertRaisesRegex(
+            native_differential.SnapshotError, "unsafe directory ancestor"
+        ):
+            native_differential.capture(root)
+
     def test_limits_fail_closed(self) -> None:
         root = self.root("root")
         payload = root / "large"

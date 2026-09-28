@@ -38,19 +38,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 436,
-      "sha512": "acdc52f6c784f07cf076a62d80bde7c1e6e9e80e564406d4fc67b61cc52934e9832abe135bf44e38d342154b540b32c6712688409e89bf05b1b856cce4ec7f58"
+      "count": 440,
+      "sha512": "dd8959d9e422ad83982357ef9fb72e8bae317e293a51b0526bb044892915ee49c3930836b96fbea53d21a82ecad430cfb945d4196921196e0a7071128503d823"
     },
     "findings": {
-      "count": 20793,
+      "count": 20804,
       "counts": {
-        "cas_layout": 195,
+        "cas_layout": 197,
         "digest_version": 104,
         "fixed_64_hex": 171,
         "raw_32_byte": 1127,
-        "sha256_token": 19196
+        "sha256_token": 19205
       },
-      "sha512": "4f045bac0eb202b54737e434e5909980d5443df9fe29175176a3032897dcdd92c5de38186221be1b07462fb37673d415bb5a45eeab896cd3a41ba9f143a3b6d9"
+      "sha512": "7b2c7f73e0a23e3536fd3e04db0a43d0fe3822016df9b549bb5b6c7b46b90990012b7b6360190cd311c539269a0b49000f24c4baeb841c33f19391ba2d2e70ce"
     },
     "classifications": [
       {
@@ -99,15 +99,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 247,
+        "count": 250,
         "counts": {
-          "cas_layout": 23,
+          "cas_layout": 24,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 216
+          "sha256_token": 218
         },
-        "sha512": "707d81bccd31d68dfdc0946341b1ff90b8df718a38ef6a6f33a4f39e385788625afc729a8f5d13d54cbe294b58a847640ec694b7a98d36391a531020a993b91e"
+        "sha512": "9fee38250af77478c4fbc4e6cf6c7523f4e4347facd600ce996ed0e2e90f10b362aafa7ee40deae8390f8fe4d777088e45a293b00f0aeebff37905c5385648bc"
       },
       {
         "scope": "fuzz",
@@ -182,16 +182,16 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including the disposable pinned systemd proc reference harness; production authorities remain typed and versioned.",
-        "count": 5458,
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including exact reference-only dpkg and signed script pins; production authorities remain typed and versioned.",
+        "count": 5466,
         "counts": {
-          "cas_layout": 25,
+          "cas_layout": 26,
           "digest_version": 2,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5427
+          "sha256_token": 5434
         },
-        "sha512": "66bc5410047a8a90522c51dc16d1650e1877b7ef0d25dd8f47c035bf115057156aaf46408dc5fb70e1a4e7ba56ed573d18936bc53f320daa8e0d81a80479d1d6"
+        "sha512": "b3d2601aeaa35a45f3c13466cd2c58d6d1111bd852bb22e16967c6bc8e2b827cb01cf1bdd9aba77c5811e750c418fec9626ce681a29ec06fa950dcaf9dc69a73"
       }
     ]
   },

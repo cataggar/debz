@@ -313,12 +313,24 @@ pub fn build(b: *std.Build) void {
             "unittest",
             "tools/test_security_audit.py",
             "tools/test_real_snapshot_acceptance.py",
+            "tools/test_real_snapshot_reference_launcher.py",
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
         },
     );
     audit_step.dependOn(&audit_tests.step);
+    const reference_launcher_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-launcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_launcher_module.link_libc = true;
+    const reference_launcher_tests = b.addTest(.{ .root_module = reference_launcher_module });
+    const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);
+    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation and syscall filters")
+        .dependOn(&run_reference_launcher_tests.step);
+    audit_step.dependOn(&run_reference_launcher_tests.step);
 
     const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
     const release_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "tools/test_release.py" });

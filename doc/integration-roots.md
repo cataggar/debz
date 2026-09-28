@@ -132,12 +132,140 @@ the separate oracle's dpkg database, stages exact-lock interpreter/tool
 payloads for the chroot, attempts to install the closure with the pinned dpkg,
 and captures its root only on success. The candidate root is never seeded from
 the reference. The pinned dpkg reference probes prerequisite and configuration
-readiness before each package phase, without `--force-depends`; at a stall,
-it lets dpkg configure a dependency cycle together, accepting only deferred
-dependency failures and checking the resulting database state. Maintainer
-scripts see `/proc` mounted only in a private mount namespace, which is gone
-before capture. A fresh amd64 rehearsal configured all 175 packages, processed
-pending triggers, and captured the healthy reference root. The reference-only
+readiness before each package phase, without `--force-depends`. The earlier
+reference runner configured dependency cycles together, processed pending
+triggers and captured a healthy 175-package amd64 root, but used unrestricted
+procfs with the host PID view. That rehearsal does **not** establish parity
+with the native invocation-scoped proc environment and must not be replayed
+as a full privileged comparison.
+
+The bounded reference-only launcher in
+`tools/real-snapshot-reference-launcher.zig` now accepts only single-package
+unpack/configure operations and their dry-run probes. It pins the exact dpkg
+executable, SHA512 archive/size and, for an amd64 configure requiring proc,
+the signed systemd, udev or sudo postinst SHA256/size and package selector.
+It runs pinned dpkg as chrooted PID 1 in private mount and PID namespaces,
+with a file-only read-only archive mount and private mount propagation.
+Only exact systemd configure receives the kernel's actual boot ID in a
+read-only mask of `/proc/sys`; exact udev/sudo configure receive read-only
+PID-only procfs without `/proc/sys`; all other operations receive no procfs.
+The launcher verifies PID 1's root, retains only `CAP_CHOWN`,
+`CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`, `CAP_SETGID`, `CAP_SETUID`
+and `CAP_SETFCAP` for dpkg's filesystem/account work, and drops all other
+supported capabilities from its bounding, effective, permitted and
+inheritable sets (including the second 32-bit capability word). It clears
+and verifies ambient capabilities, sets no-new-privileges, and denies module
+loading and subsequent namespace/chroot changes in seccomp. An unknown
+capability beyond the two-word kernel interface, or failure to drop/verify
+any capability, aborts before dpkg launch. The reference uses the kernel's
+8-byte capability header (`pid` at offset 4): Zig 0.16's
+`linux.cap_user_header_t` instead pads its `usize pid` to offset 8 on
+64-bit hosts, which made even unprivileged capget probes fail unpredictably.
+It closes host descriptors on
+exec and reports setup failure separately from dpkg's exit. The driver checks
+root-owned, non-writable ancestry and mode-0700 workspaces before root
+mutation; host-side status and snapshot reads refuse symlink ancestors.
+Inherited stdin must be read-only `/dev/null`; stdout and stderr must be
+root-owned, non-writable-by-others, write-only append regular files, with
+the dry-run transport reopening only its protected scratch output as such a
+writer. The launcher checks all three descriptors before any root access
+and again in the child before exec; every other inherited descriptor is
+close-on-exec. Exact proc-configure profiles recheck the installed package's
+status (`install ok unpacked`), amd64 architecture, pinned version and signed
+postinst bytes within the chroot before mounting proc or launching dpkg.
+These offline checks are not a privileged isolation proof.
+
+This reference-only capability reduction is deliberately **stricter** than
+the existing native script runner, which currently drops `CAP_SYS_ADMIN`
+but not `CAP_SYS_MODULE` or all high-numbered capabilities. If a signed
+script needs a capability outside the reference allowlist, the reference
+must refuse rather than borrow the native authority. Such a refusal is
+not proof of a package-state mismatch or permission to expand the
+reference allowlist: native hardening and any resulting behavior change
+need a separate decision and equivalent protected script proofs. Native's
+existing capability syscall also uses the padded Zig header; its correction
+needs independent review in the native worktree, not a silent change to this
+reference-only delta. The
+shared host network view described below also remains under review.
+
+The native exact systemd mode (`src/maintainer_script.zig`) and reference
+mode both clone **mount and PID**, not network, namespaces; mount a fresh
+`ro,nosuid,nodev,noexec,hidepid=2` procfs; and cover `/proc/sys` with a
+read-only boot-ID-only mask before executing a script. Native udev/sudo and
+the reference use the separate `subset=pid` mode without `/proc/sys`.
+Both chroot their PID 1; the reference verifies `/proc/1/root` against its
+pinned root. This matches the native proc **mount flags and mask**, not a
+proof that the resulting script environment is safe or identical: native
+executes the signed script as PID 1, while reference executes pinned dpkg
+as PID 1 and the script as its child.
+
+Without a separate network namespace, `/proc/net` resolves to
+`/proc/self/net` and reports the task's network namespace (see Linux
+[`proc_pid_net(5)`](https://man7.org/linux/man-pages/man5/proc_pid_net.5.html)
+and [`network_namespaces(7)`](https://man7.org/linux/man-pages/man7/network_namespaces.7.html)).
+Masking `/proc/sys` does not hide that network view, and hiding the top-level
+`/proc/net` alone would leave per-PID `/proc/1/net` to assess. Native and
+reference both inherit the host network namespace under the reviewed modes;
+equivalent exposure is **not** evidence of harmless exposure. A proposed
+reference-only refusal for `/proc/net` was removed because it would make
+the reference proc mode narrower than the already approved native mode;
+neither mode now adds a network namespace or a proc-network mask. These
+shared network surfaces need separate native-and-reference hardening review,
+including per-PID views under udev/sudo's PID-only procfs, not a unilateral
+reference change.
+Neither a private PID namespace nor a read-only proc mount isolates network
+syscalls or proves the retained network capabilities harmless.
+
+A disposable **unprivileged** user+network-namespace probe on this host
+changed the visible `/proc/self/net/dev` interface count from three to one.
+Thus adding `CLONE_NEWNET` to the reference alone cannot be called
+behavior-preserving, even if it avoids host network visibility. Any private
+network view would require an explicit reviewed contract for native and
+reference, equivalent pinned-dpkg/signed-script results, and runner-capability
+proof. Existing host sysfs mounts can also retain an old network view; do
+not substitute a host bind mount or assume hiding `/proc/net` removes every
+network surface. The shared view reflects the approved native profile but
+does not establish full parity or resolve future network hardening. The
+signed-lock bindings of dpkg's in-root dynamic loader and runtime libraries
+remain unverified;
+no privileged reference run is authorized on this delta.
+
+This is **not yet an executable full parity gate**: the closed launcher
+refuses `--configure --pending`, `--triggers-only --pending` and **also**
+single-package trigger actions. A disposable unprivileged dpkg 1.22.22
+two-listener fixture shows `--no-triggers --triggers-only listener-a` runs
+only A and leaves B pending; `--no-triggers --configure seed` runs only
+seed. Without `--no-triggers`, configuring seed also runs an unrelated
+pending listener. Even with `--no-triggers`, configuring a selector that is
+itself triggers-pending executes its `triggered` postinst, so the driver must
+check its exact unpacked status and version before any configure. A selected
+listener's attempted recursive dpkg call failed visibly on the frontend
+lock, but a selected fixture postinst directly executed B's postinst
+*despite* `--no-triggers`; B remained triggers-pending in dpkg's database.
+Thus selector isolation applies only to dpkg's own scheduler, not to commands
+inside an authorized maintainer script. These disposable fixtures do not
+authorize arbitrary signed scripts.
+`tools/test_real_snapshot_reference_triggers.py` requires an explicitly
+selected, SHA256-checked pinned dpkg fixture and never runs as root.
+
+A safe later single-listener operation would have to bind the selected
+listener's **triggered** script bytes to the exact authenticated archive,
+verify the pinned installed script, status/trigger queue and version again
+in the launcher before exec, establish that no other script is invoked, and
+compare per-listener ordering and state with pinned dpkg. The current
+launcher has only `configure`/`probe_configure` and an exact
+`["configure", ""]` proc profile for systemd/udev/sudo, not a `triggered`
+profile for any of them. The Python command builder refuses all trigger
+verbs, including attempts to reuse those configure-only profiles. Until
+these distinct identities and closure ordering are proved, finalization
+refuses rather than silently changing `--pending` behavior. Privileged
+namespace/archive-mount, death/timeout cleanup and
+exact result equivalence still require independently protected small-root
+proof and review before any 175-package comparison. The current CI checkout
+and cleanup are not root-owned protected ancestry; arm64 signed script
+profiles are unproved. Running the manual full-reference step there must
+fail closed until the runner's staging and cleanup contract is redesigned.
+The reference-only
 `dev/null` chroot device is excluded from both bounded captures only when no
 package claims it; no package payload path is excluded.
 `test/real-snapshot-comparator.zig` is the equality authority for the bounded
