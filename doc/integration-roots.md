@@ -87,6 +87,13 @@ all four suite/architecture combinations in full mode on native amd64 and arm64
 runners, including mandatory dpkg-root transactions. Scheduled/manual CI adds
 foreign arm64 roots on amd64.
 
+The separate [Debian stable signed-input readiness
+inventory](debian-stable-readiness.md) records a real, authenticated Debian 13
+stable snapshot and its current SHA256-only index/archive metadata. It does
+not satisfy Debian vendor-closure acceptance; the hermetic `debian-stable`
+fixture remains synthetic, not a substitute for a published SHA512-primary
+Debian lock on both architectures.
+
 The repository exercises dependencies and Pre-Depends, alternatives,
 versioned virtual Provides, Conflicts/Breaks/Replaces, Recommends policy,
 Essential and Protected metadata, Multi-Arch, cycles, conffiles, triggers, and

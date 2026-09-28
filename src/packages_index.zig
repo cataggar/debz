@@ -32,7 +32,11 @@ pub const Limits = struct {
     max_field_bytes: usize = 1024 * 1024,
     max_unknown_fields_per_record: usize = 512,
     max_filename_bytes: usize = 4096,
-    relation: @import("relation.zig").Limits = .{},
+    relation: @import("relation.zig").Limits = .{
+        .max_input_bytes = 128 * 1024,
+        .max_groups = 2048,
+        .max_total_alternatives = 8192,
+    },
 };
 
 test "default input bound is 256 MiB" {
@@ -591,6 +595,35 @@ test "accepts SHA512-only and binds both package digests without downgrade" {
         .{},
     );
     try std.testing.expectEqual(DiagnosticCode.invalid_sha512, rejected.diagnostic.code);
+}
+
+test "bounded Packages parser accepts large Debian Provides without relaxing caller limits" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try input.writer.writeAll(
+        "Package: large-provides\nVersion: 1\nArchitecture: amd64\nProvides: ",
+    );
+    for (0..1604) |index| {
+        if (index != 0) try input.writer.writeAll(", ");
+        try input.writer.print("virtual-feature-{d:0>5} (= 1.2-3)", .{index});
+    }
+    try input.writer.writeAll(
+        "\nFilename: pool/main/l/large-provides.deb\nSize: 1\n" ++
+            "SHA256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+    );
+    const parsed = try parseBorrowed(std.testing.allocator, input.written(), testContext("amd64"), .{});
+    var index = switch (parsed) {
+        .index => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer index.deinit();
+    try std.testing.expectEqual(@as(usize, 1604), index.records[0].control.provides.?.value.groups.len);
+
+    const restricted = try parseBorrowed(std.testing.allocator, input.written(), testContext("amd64"), .{
+        .limits = .{ .relation = .{ .max_groups = 1024 } },
+    });
+    try std.testing.expectEqual(DiagnosticCode.control_record, restricted.diagnostic.code);
+    try std.testing.expectEqual(@import("relation.zig").DiagnosticCode.too_many_groups, restricted.diagnostic.control_diagnostic.?.relation_kind.?);
 }
 
 test "duplicate identity policy is deterministic" {

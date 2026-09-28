@@ -1915,6 +1915,7 @@ fn installReleaseFiles(
         "authenticated-refresh.md",
         "deb-payload-validation.md",
         "dpkg-alternatives-reference.md",
+        "debian-stable-readiness.md",
         "exact-locks-and-provenance.md",
         "github-actions.md",
         "integration-roots.md",

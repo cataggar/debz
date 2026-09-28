@@ -1,0 +1,33 @@
+{
+  "schema": "https://debz.dev/test/debian-stable-readiness-v1",
+  "snapshot_uri": "https://snapshot.debian.org/archive/debian/20260928T000000Z",
+  "suite": "trixie",
+  "component": "main",
+  "release": {
+    "inrelease_sha256": "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+    "date": "Sat, 12 Sep 2026 07:55:41 UTC",
+    "valid_until": null,
+    "freshness_mode": "allow_missing_valid_until_with_max_age_seconds",
+    "maximum_release_age_seconds": 2678400
+  },
+  "signer": {
+    "url": "https://ftp-master.debian.org/keys/release-13.asc",
+    "armor_sha256": "4d097bb93f83d731f475c5b92a0c2fcf108cfce1d4932792fca72d00b48d198b",
+    "binary_sha256": "abced156a22aa8683b228299ac35c1ea51515eef900cec0e562f56716dfe3915",
+    "primary_fingerprint": "41587f7db8c774bccf131416762f67a0b2c39de4"
+  },
+  "architectures": {
+    "amd64": {
+      "index_path": "main/binary-amd64/Packages.xz",
+      "index_size": 9678380,
+      "index_sha256": "7778d3e3f303b7ddb8ce0fe7c8d57473a076c6bf2e8f241f75421d2396352498",
+      "package_records": 68825
+    },
+    "arm64": {
+      "index_path": "main/binary-arm64/Packages.xz",
+      "index_size": 9614192,
+      "index_sha256": "be16b37b2f740f066ea93d35d56f04f94d63693e5a3eb421b052bf86fae75bcd",
+      "package_records": 68196
+    }
+  }
+}
