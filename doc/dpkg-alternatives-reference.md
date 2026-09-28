@@ -582,6 +582,47 @@ refused with `final_closure_mismatch` (exit 8). This is a later distinct
 blocker on that local combined branch, not a prediction for final main plus
 python3 alone, completed installation, or authority for trigger changes.
 
+On the final #253 sudo squash plus **only** the python3 delta, a separate
+root-owned protected checkout at
+`/var/lib/debz-python3-reference-253/checkout` repeated the pinned dpkg
+1.22.22 comparison with `tools/real-snapshot-python3-reference.sh`. Its
+independently copied pre-sudo diagnostic source, not a fresh native trial,
+had the signed 856-byte preinst and root-owned empty regular `/dev/null`.
+The reference helper checks protected ancestry, pinned dpkg's receipt,
+the SHA-512 python3 archive against the newly signed 175-package lock,
+signed installed script and minimal-list bytes, the pinned alternatives
+tool and minimal symlink, and a previously absent HTML target. Separate
+disposable copies with `/dev/null` modes 0600 and 0644 each showed the
+signed script's `install` exit 0 and pinned dpkg's no-force archive
+unpack after fixture-only purge. Both retained the same 14 alternatives
+records and 76 selectors (combined fingerprint SHA-256
+`9f7ace1de86e778a42d5f69175689429211c72e442447c367e79f718443da3be`)
+and the same 96-byte diagnostic SHA-256
+`3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc`.
+The independent reference copies do not establish a fresh native outcome.
+
+The **new** protected native root
+`/var/lib/debz-python3-reference-253/checkout/.real-snapshot/amd64-python3-253-protected-signed-2`
+used ReleaseSafe binary SHA-256
+`e25deea6be146c5c112167c8ec5293b2e6cee50daf708140ae0973d5010a0265`.
+The newly authenticated lock SHA-256 was
+`b1019563797b699ae30b07b625166f42624ccb056f06e0f62d62e6ec0b060bc5`;
+all 175 SHA-512 archive objects (67,976,788 bytes) were independently
+size/digest-checked against it, with exact-object-set `cas-rehash.tsv`
+SHA-256 `0e3f2a55adb3d91d60b216f9af8c61c5785e05ab8266b4f0fee220464558a7c1`.
+The signed python3 preinst at step **1383** ran with `["install"]`,
+`spawned=true`, exit **0**, zero output and a durable `succeeded` record;
+the package finished `install ok installed`. The first later refusal
+was **not** the earlier local branch's final closure mismatch: after three
+successful deferred callbacks, ordinal 3 at step **1428** remained
+`prepared` with **no script outcome**. The signed configure-only procps
+postinst SHA-256
+`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+was pending `/usr/lib/sysctl.d`; its separate `triggered` admission is
+unpublished. Native execution returned `InvalidAlternativesScriptAuthority`
+(exit 8). This root is retained for read-only evidence, never resumed as
+a fresh trial, and does not establish full snapshot parity.
+
 The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
 `4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)
 ships the exact 2,112-byte `postinst` (SHA-256

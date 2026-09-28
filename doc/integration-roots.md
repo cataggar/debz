@@ -1514,6 +1514,53 @@ plus python3 alone; no complete 175-package parity is established. This second
 interrupted root is retained for evidence and must never be reused as
 fresh or resumed by this investigation.
 
+On final #253 sudo squash `c7e9b55631d4c415a43dd9b2ca49819266d3c7ec`
+plus **only** python3, a new protected checkout
+`/var/lib/debz-python3-reference-253/checkout` at python3-only source
+`ac240570ef6d6555c1a10bf5092b783eff2881d0` used root-owned
+mode-0700 `.real-snapshot` and a separate empty native root. Pinned dpkg
+1.22.22 and signed preinst comparisons on *independent protected
+diagnostic copies*, in both empty regular `/dev/null` modes 0600 and
+0644, returned exit 0, retained all 14 alternatives records and 76
+selectors, and produced the same exact 96-byte output. Those copies
+were never used as a new native installation. The first new native
+workspace `amd64-python3-253-protected-signed-1` stopped during
+acquisition-only evidence checks: the download itself returned 0 but
+emitted one `error=NameServerFailure` retry, which the strict diagnostic
+runner rejected. Its root remained empty, with no install or script
+outcome, and was **not** reused.
+
+The independently refreshed **second** workspace,
+`.real-snapshot/amd64-python3-253-protected-signed-2`, reauthenticated
+Ubuntu signer `f6ecb3762474eda9d21b7022871920d1991bc93c`. Its
+175-package lock SHA-256 was
+`b1019563797b699ae30b07b625166f42624ccb056f06e0f62d62e6ec0b060bc5`;
+all **175/175** SHA-512 archive objects (67,976,788 bytes) independently
+matched their signed digests and sizes, with an exact object set and
+`evidence/cas-rehash.tsv` SHA-256
+`0e3f2a55adb3d91d60b216f9af8c61c5785e05ab8266b4f0fee220464558a7c1`.
+The ReleaseSafe binary SHA-256 was
+`e25deea6be146c5c112167c8ec5293b2e6cee50daf708140ae0973d5010a0265`.
+The exact signed python3:amd64 `3.14.7-3` preinst SHA-256
+`115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f`
+**spawned** at step **1383** with `["install"]`, durably exited **0**
+with zero output, and completed `succeeded`; `python3` ended `install
+ok installed`. The diagnostic `/dev/null` witness is checked *at the
+preinst outcome*, not inferred from its final contents after later
+scripts. No `/proc/sys` was left visible.
+
+The first subsequent refusal was deferred callback ordinal **3** at
+step **1428**, **prepared only**, with no spawn or outcome; the three
+preceding callbacks completed successfully. `procps:amd64` remained
+`triggers-pending` for `/usr/lib/sysctl.d`; its exact signed postinst
+SHA-256 `7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+has configure-only admission on this branch, not an authorized
+`["triggered", "/usr/lib/sysctl.d"]` callback. `create.json` recorded
+`InvalidAlternativesScriptAuthority` and exit **8**. The earlier
+`final_closure_mismatch` result belongs only to the separate unpublished
+trigger-admission branch. No full install/parity claim follows from
+python3's success; this root is retained read-only, never reused.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
