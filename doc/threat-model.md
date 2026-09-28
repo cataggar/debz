@@ -88,6 +88,16 @@ before exec. A failed setup cannot turn into a successful package outcome;
 deferred procps callbacks still see no `/proc/sys`. This is not a shared
 proc grant to any other package or script.
 
+The signed sudo postinst has its own exact-package, version, digest and
+argument binding to the PID-only view. Its signed tools, the dpkg helper's
+sourced shell fragment, tmpfiles sidecar,
+aliases, executable PATH resolution, two sudo-owned structural links, and
+both authenticated sudo providers are checked before launch. This does
+not give sudo the systemd boot-ID view or extend proc authority to any
+other script. A broken or substituted alternatives link still refuses;
+normal script failure remains a failure, and a crash cannot turn an
+unknown outcome into success.
+
 The future `debz apt` facade has a separate Linux-only live-root boundary
 (`src/live_root.zig`). It never weakens the product backend's host-root denial:
 the backend still receives `allow_host_root = false` and the stable alternate

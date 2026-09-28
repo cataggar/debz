@@ -76,6 +76,7 @@ pub const Policy = struct {
     descendants: DescendantPolicy = .terminate,
     snapshot_systemd_proc: bool = false,
     snapshot_udev_proc: bool = false,
+    snapshot_sudo_proc: bool = false,
     limits: Limits = .{},
     script_directories: []const []const u8 = &default_script_directories,
 };
@@ -113,6 +114,25 @@ fn snapshotUdevIdentity(identity: Identity, arguments: []const []const u8) bool 
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/udev.postinst") and
         std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_udev_sha256) and
+        arguments.len == 2 and
+        std.mem.eql(u8, arguments[0], "configure") and
+        arguments[1].len == 0;
+}
+
+const snapshot_sudo_sha256: [32]u8 = .{
+    0xe7, 0x66, 0x40, 0x7b, 0xf7, 0x0a, 0xd0, 0x3d,
+    0x80, 0x06, 0xde, 0x9f, 0x3f, 0x87, 0x00, 0xf7,
+    0xed, 0x22, 0xb5, 0x32, 0xd8, 0xe2, 0x99, 0xac,
+    0x88, 0xe5, 0x22, 0xe2, 0xc8, 0x0a, 0x2c, 0xb8,
+};
+
+fn snapshotSudoIdentity(identity: Identity, arguments: []const []const u8) bool {
+    return std.mem.eql(u8, identity.package, "sudo") and
+        std.mem.eql(u8, identity.version, "1.9.17p2-7ubuntu3") and
+        std.mem.eql(u8, identity.architecture, "amd64") and
+        identity.kind == .postinst and
+        std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/sudo.postinst") and
+        std.crypto.timing_safe.eql([32]u8, identity.script_sha256, snapshot_sudo_sha256) and
         arguments.len == 2 and
         std.mem.eql(u8, arguments[0], "configure") and
         arguments[1].len == 0;
@@ -460,10 +480,168 @@ pub const SnapshotUdevProc = struct {
     }
 };
 
-const SnapshotProcMode = enum { systemd, udev };
+const snapshot_sudo_inputs = [_]SnapshotUdevInput{
+    .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
+    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f" },
+    .{ .path = "usr/bin/dpkg-query", .size = 142160, .mode = 0o755, .sha256 = "fdab8a6105db8c97503ee3c35c4f686e677adc396b8bb56ead161e122fd9c232" },
+    .{ .path = "usr/bin/systemd-tmpfiles", .size = 131024, .mode = 0o755, .sha256 = "8de8ec082f8e887f345c355201c8907ab311960301254e17e96f558798d6d621" },
+    .{ .path = "usr/bin/dpkg-maintscript-helper", .size = 21123, .mode = 0o755, .sha256 = "1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d" },
+    .{ .path = "usr/share/dpkg/sh/dpkg-error.sh", .size = 3228, .mode = 0o644, .sha256 = "d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528" },
+    .{ .path = "usr/bin/update-alternatives", .size = 59864, .mode = 0o755, .sha256 = "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d" },
+    .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "c734a13ce654834fad2af9066cc637e25e6228daa6a9b8ee247bd7d67382e61e" },
+    .{ .path = "usr/bin/gnuchown", .size = 68176, .mode = 0o755, .sha256 = "c80e98d639a25bec6c2b20c38301eb2719317426520a6cf2d6c165acb7dc45fb" },
+    .{ .path = "usr/bin/gnuchmod", .size = 60016, .mode = 0o755, .sha256 = "8038bd44296384090d0ff82dcf4dae77e9915c3d2e68e40f04ab545c0daea580" },
+    .{ .path = "usr/lib/tmpfiles.d/sudo.conf", .size = 27, .mode = 0o644, .sha256 = "eed7eb9d7ddaccb3ae13d3225de1302a96754938fea4dc305c43b64cbcb5d0bc" },
+    .{ .path = "var/lib/dpkg/info/sudo.list", .size = 2376, .mode = 0o644, .sha256 = "92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f" },
+    .{ .path = "usr/bin/sudo.ws", .size = 282080, .mode = 0o4755, .sha256 = "6937a49a2396307d74c575c4066a8db8bcea21bbc6fa4dc01cadc724e586d4aa" },
+    .{ .path = "usr/share/man/man8/sudo.ws.8.gz", .size = 12804, .mode = 0o644, .sha256 = "43b6a4b66f9eb6a430f64e2b25084a100b2e152cfd8896cb83f9ced170793d75" },
+};
+
+const snapshot_sudo_overrides = [_][]const u8{
+    "etc/tmpfiles.d/sudo.conf",
+    "run/tmpfiles.d/sudo.conf",
+    "usr/local/lib/tmpfiles.d/sudo.conf",
+};
+
+const snapshot_sudo_shadows = [_][]const u8{
+    "usr/sbin/dpkg",
+    "usr/sbin/dpkg-query",
+    "usr/sbin/systemd-tmpfiles",
+    "usr/sbin/dpkg-maintscript-helper",
+    "usr/sbin/update-alternatives",
+    "usr/sbin/rm",
+    "usr/sbin/chown",
+    "usr/sbin/chmod",
+};
+
+const snapshot_sudo_aliases = [_]struct { path: []const u8, target: []const u8 }{
+    .{ .path = "bin", .target = "usr/bin" },
+    .{ .path = "sbin", .target = "usr/sbin" },
+    .{ .path = "usr/bin/sh", .target = "dash" },
+    .{ .path = "usr/bin/rm", .target = "gnurm" },
+    .{ .path = "usr/bin/chown", .target = "gnuchown" },
+    .{ .path = "usr/bin/chmod", .target = "gnuchmod" },
+};
+
+pub const SnapshotSudoProc = struct {
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    root_path: []u8,
+    directory: root_fs.PinnedDirectory,
+    script: root_fs.PinnedRegularFile,
+    aliases: [snapshot_sudo_aliases.len]root_fs.PinnedSymbolicLink,
+    inputs: [snapshot_sudo_inputs.len]root_fs.PinnedRegularFile,
+    root_stat: std.os.linux.Statx,
+    directory_stat: std.os.linux.Statx,
+
+    pub fn init(allocator: std.mem.Allocator, root: root_fs.Root) !SnapshotSudoProc {
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path_length = try root.dir.realPath(root.io, &path_buffer);
+        const root_path = try allocator.dupe(u8, path_buffer[0..path_length]);
+        errdefer allocator.free(root_path);
+        var directory = try root.pinDirectory(try root_fs.Path.init("proc"));
+        errdefer directory.close();
+        var contents = try directory.observeAlloc(allocator, 0, 0);
+        contents.deinit();
+        var script = try root.pinRegularFile(
+            try root_fs.Path.init("var/lib/dpkg/info/sudo.postinst"),
+        );
+        errdefer script.close();
+        var aliases: [snapshot_sudo_aliases.len]root_fs.PinnedSymbolicLink = undefined;
+        var alias_count: usize = 0;
+        errdefer for (aliases[0..alias_count]) |*alias| alias.close();
+        for (snapshot_sudo_aliases, &aliases) |binding, *slot| {
+            slot.* = try root.pinSymbolicLink(try root_fs.Path.init(binding.path));
+            alias_count += 1;
+        }
+        var inputs: [snapshot_sudo_inputs.len]root_fs.PinnedRegularFile = undefined;
+        var input_count: usize = 0;
+        errdefer for (inputs[0..input_count]) |*input| input.close();
+        for (snapshot_sudo_inputs, &inputs) |binding, *slot| {
+            slot.* = try root.pinRegularFile(try root_fs.Path.init(binding.path));
+            input_count += 1;
+        }
+        var result: SnapshotSudoProc = .{
+            .allocator = allocator,
+            .root = root,
+            .root_path = root_path,
+            .directory = directory,
+            .script = script,
+            .aliases = aliases,
+            .inputs = inputs,
+            .root_stat = undefined,
+            .directory_stat = undefined,
+        };
+        try result.verify(allocator);
+        if (helperStat(root.dir.handle, &result.root_stat) != .SUCCESS or
+            helperStat(directory.dir.handle, &result.directory_stat) != .SUCCESS or
+            result.root_stat.uid != 0 or result.root_stat.gid != 0 or
+            result.root_stat.mode != 0o40700)
+            return error.InvalidSnapshotSudoRoot;
+        return result;
+    }
+
+    pub fn verify(self: *const SnapshotSudoProc, allocator: std.mem.Allocator) !void {
+        const entry = (try self.directory.metadata()).entry;
+        if (!entry.modeled or entry.uid != 0 or entry.gid != 0 or
+            entry.mode != 0o755 or entry.kind != .directory)
+            return error.InvalidSnapshotSudoMountpoint;
+        var contents = try self.directory.observeAlloc(allocator, 0, 0);
+        contents.deinit();
+        for (snapshot_sudo_overrides) |path| {
+            if (try self.root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return error.InvalidSnapshotSudoControl;
+        }
+        for (snapshot_sudo_shadows) |path| {
+            if (try self.root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return error.InvalidSnapshotSudoTool;
+        }
+        const observed = try self.script.observeStableAlloc(allocator, 1927);
+        defer allocator.free(observed.bytes);
+        if (observed.entry.uid != 0 or observed.entry.gid != 0 or
+            observed.entry.mode != 0o755 or observed.entry.link_count != 1 or
+            observed.entry.size != 1927 or
+            !std.crypto.timing_safe.eql(
+                [32]u8,
+                hashBytes(observed.bytes),
+                snapshot_sudo_sha256,
+            )) return error.InvalidSnapshotSudoScript;
+        for (snapshot_sudo_aliases, &self.aliases) |binding, *alias| {
+            var target_buffer: [64]u8 = undefined;
+            const link = try alias.observe(&target_buffer);
+            if (link.entry.uid != 0 or link.entry.gid != 0 or
+                link.entry.mode != 0o777 or link.entry.link_count != 1 or
+                !std.mem.eql(u8, link.target, binding.target))
+                return error.InvalidSnapshotSudoTool;
+        }
+        for (snapshot_sudo_inputs, &self.inputs) |binding, *file| {
+            const input = try file.observeStableAlloc(allocator, @intCast(binding.size));
+            defer allocator.free(input.bytes);
+            var expected: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&expected, binding.sha256) catch unreachable;
+            if (input.entry.uid != 0 or input.entry.gid != 0 or
+                input.entry.mode != binding.mode or input.entry.link_count != 1 or
+                input.entry.size != binding.size or
+                !std.crypto.timing_safe.eql([32]u8, hashBytes(input.bytes), expected))
+                return error.InvalidSnapshotSudoTool;
+        }
+    }
+
+    pub fn deinit(self: *SnapshotSudoProc) void {
+        for (&self.inputs) |*input| input.close();
+        for (&self.aliases) |*alias| alias.close();
+        self.script.close();
+        self.directory.close();
+        self.allocator.free(self.root_path);
+        self.* = undefined;
+    }
+};
+
+const SnapshotProcMode = enum { systemd, udev, sudo };
 pub const SnapshotProcBinding = union(SnapshotProcMode) {
     systemd: *const SnapshotSystemdProc,
     udev: *const SnapshotUdevProc,
+    sudo: *const SnapshotSudoProc,
 };
 
 fn readKernelBootId() ![37]u8 {
@@ -881,6 +1059,9 @@ pub fn validate(request: Request) ?RejectionReason {
         else if (policy.snapshot_udev_proc and
         snapshotUdevIdentity(request.identity, request.arguments))
             .udev
+        else if (policy.snapshot_sudo_proc and
+        snapshotSudoIdentity(request.identity, request.arguments))
+            .sudo
         else
             null;
     if (request.snapshot_proc) |proc| {
@@ -889,6 +1070,7 @@ pub fn validate(request: Request) ?RejectionReason {
             !std.mem.eql(u8, request.root, switch (proc) {
                 .systemd => |binding| binding.root_path,
                 .udev => |binding| binding.root_path,
+                .sudo => |binding| binding.root_path,
             }))
             return .invalid_snapshot_proc;
     } else if (expected_proc != null) return .invalid_snapshot_proc;
@@ -949,7 +1131,9 @@ pub fn validate(request: Request) ?RejectionReason {
 
 pub fn policyDigest(policy: Policy) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(if (policy.snapshot_udev_proc)
+    hash.update(if (policy.snapshot_sudo_proc)
+        "debz-maintainer-script-policy-v4\x00"
+    else if (policy.snapshot_udev_proc)
         "debz-maintainer-script-policy-v3\x00"
     else if (policy.snapshot_systemd_proc)
         "debz-maintainer-script-policy-v2\x00"
@@ -960,6 +1144,8 @@ pub fn policyDigest(policy: Policy) [32]u8 {
         hash.update("exact-systemd-boot-id-v1\x00");
     if (policy.snapshot_udev_proc)
         hash.update("exact-udev-pid-only-v1\x00");
+    if (policy.snapshot_sudo_proc)
+        hash.update("exact-sudo-pid-only-v1\x00");
     hashString(&hash, @tagName(policy.capture));
     hashString(&hash, @tagName(policy.descendants));
     hashNumber(&hash, policy.limits.timeout_ms);
@@ -1083,6 +1269,19 @@ fn digests(
             }
             for (snapshot_udev_overrides) |path| hashString(&hash, path);
             for (snapshot_udev_path_shadows) |path| hashString(&hash, path);
+        },
+        .sudo => {
+            hash.update("debz-maintainer-script-sudo-pid-only-v1\x00");
+            for (snapshot_sudo_inputs) |input| {
+                hashString(&hash, input.path);
+                hashString(&hash, input.sha256);
+            }
+            for (snapshot_sudo_aliases) |alias| {
+                hashString(&hash, alias.path);
+                hashString(&hash, alias.target);
+            }
+            for (snapshot_sudo_overrides) |path| hashString(&hash, path);
+            for (snapshot_sudo_shadows) |path| hashString(&hash, path);
         },
     };
     return .{
@@ -1290,6 +1489,9 @@ fn launchConfigured(
             .udev => |binding| snapshotUdevIdentity(identity, invocation.argv[1..]) and
                 std.mem.eql(u8, invocation.program, "/var/lib/dpkg/info/udev.postinst") and
                 std.mem.eql(u8, invocation.root, binding.root_path),
+            .sudo => |binding| snapshotSudoIdentity(identity, invocation.argv[1..]) and
+                std.mem.eql(u8, invocation.program, "/var/lib/dpkg/info/sudo.postinst") and
+                std.mem.eql(u8, invocation.root, binding.root_path),
         };
         if (invocation.isolation != .chroot or invocation.descendants != .terminate or
             !bound)
@@ -1297,6 +1499,7 @@ fn launchConfigured(
         const verified = switch (proc) {
             .systemd => |binding| binding.verify(allocator),
             .udev => |binding| binding.verify(allocator),
+            .sudo => |binding| binding.verify(allocator),
         };
         verified catch |err| {
             if (err == error.OutOfMemory) return err;
@@ -1313,6 +1516,11 @@ fn launchConfigured(
                 error.InvalidSnapshotUdevControl,
                 error.InvalidSnapshotUdevMountpoint,
                 error.InvalidSnapshotUdevRoot,
+                error.InvalidSnapshotSudoScript,
+                error.InvalidSnapshotSudoTool,
+                error.InvalidSnapshotSudoControl,
+                error.InvalidSnapshotSudoMountpoint,
+                error.InvalidSnapshotSudoRoot,
                 error.PathChanged,
                 => linux.E.STALE,
                 else => linux.E.IO,
@@ -1385,6 +1593,11 @@ fn launchConfigured(
                 .root_stat = binding.root_stat,
                 .directory_stat = binding.directory_stat,
                 .view = .udev,
+            },
+            .sudo => |binding| .{
+                .root_stat = binding.root_stat,
+                .directory_stat = binding.directory_stat,
+                .view = .sudo,
             },
         } else null,
     };
@@ -1589,6 +1802,7 @@ const ProcDescriptor = struct {
     view: union(SnapshotProcMode) {
         systemd: [37]u8,
         udev: void,
+        sudo: void,
     },
 };
 
@@ -1743,12 +1957,12 @@ fn setupSnapshotProc(proc: ProcDescriptor, failure_stage: ?*u8) linux.E {
         proc_mount_flags,
         @intFromPtr(switch (proc.view) {
             .systemd => @as([*:0]const u8, "hidepid=2"),
-            .udev => @as([*:0]const u8, "hidepid=2,subset=pid"),
+            .udev, .sudo => @as([*:0]const u8, "hidepid=2,subset=pid"),
         }),
     ));
     if (mounted != .SUCCESS) return mounted;
     if (failure_stage) |stage| stage.* = 3;
-    if (proc.view == .udev) {
+    if (proc.view == .udev or proc.view == .sudo) {
         for ([_][*:0]const u8{
             "/proc/sys",
             "/proc/sys/kernel/random/boot_id",
@@ -3984,6 +4198,101 @@ test "maintainer_script.test.udev PID-only proc rejects occupied mountpoint" {
     );
 }
 
+test "maintainer_script.test.sudo PID-only proc requires exact signed identity" {
+    const hex = std.fmt.bytesToHex(snapshot_sudo_sha256, .lower);
+    try testing.expectEqualStrings(
+        "e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8",
+        &hex,
+    );
+    var binding: SnapshotSudoProc = .{
+        .allocator = testing.allocator,
+        .root = undefined,
+        .root_path = @constCast("/srv/roots/target"),
+        .directory = undefined,
+        .script = undefined,
+        .aliases = undefined,
+        .inputs = undefined,
+        .root_stat = undefined,
+        .directory_stat = undefined,
+    };
+    var request = testRequest();
+    request.identity = .{
+        .package = "sudo",
+        .version = "1.9.17p2-7ubuntu3",
+        .architecture = "amd64",
+        .kind = .postinst,
+        .script_path = "var/lib/dpkg/info/sudo.postinst",
+        .script_sha256 = snapshot_sudo_sha256,
+    };
+    request.arguments = &.{ "configure", "" };
+    request.policy.snapshot_sudo_proc = true;
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.snapshot_proc = .{ .sudo = &binding };
+    try testing.expect(validate(request) == null);
+    var launcher: RecordingLauncher = .{};
+    var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    try testing.expect(report.succeeded());
+    try testing.expectEqual(SnapshotProcMode.sudo, std.meta.activeTag(launcher.invocation.?.snapshot_proc.?));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &policyDigest(.{ .snapshot_udev_proc = true }),
+        &policyDigest(request.policy),
+    ));
+    for ([_]struct {
+        package: []const u8 = "sudo",
+        version: []const u8 = "1.9.17p2-7ubuntu3",
+        architecture: []const u8 = "amd64",
+        kind: Kind = .postinst,
+        path: []const u8 = "var/lib/dpkg/info/sudo.postinst",
+        digest: [32]u8 = snapshot_sudo_sha256,
+        arguments: []const []const u8 = &.{ "configure", "" },
+    }{
+        .{ .package = "sudo-rs" },
+        .{ .version = "1.9.17p2-7ubuntu4" },
+        .{ .architecture = "arm64" },
+        .{ .kind = .preinst },
+        .{ .path = "var/lib/debz-lifecycle-scripts/sudo.postinst" },
+        .{ .digest = @splat(0) },
+        .{ .arguments = &.{ "configure", "old-version" } },
+        .{ .arguments = &.{ "triggered", "/proc/sys" } },
+    }) |case| {
+        request.identity.package = case.package;
+        request.identity.version = case.version;
+        request.identity.architecture = case.architecture;
+        request.identity.kind = case.kind;
+        request.identity.script_path = case.path;
+        request.identity.script_sha256 = case.digest;
+        request.arguments = case.arguments;
+        try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    }
+    request.snapshot_proc = null;
+    request.identity.package = "demo";
+    request.identity.script_path = "var/lib/dpkg/info/demo.postinst";
+    request.identity.script_sha256 = snapshot_sudo_sha256;
+    request.arguments = &.{ "configure", "" };
+    try testing.expect(validate(request) == null);
+    request.snapshot_proc = .{ .sudo = &binding };
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    request.snapshot_proc = .{ .udev = undefined };
+    try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
+    _ = &binding;
+}
+
+test "maintainer_script.test.sudo PID-only proc rejects occupied mountpoint" {
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDir(testing.io, "proc", .default_dir);
+    try writeExecutableScript(&directory, "proc/occupied", "not empty");
+    try testing.expectError(
+        error.DirectoryTooLarge,
+        SnapshotSudoProc.init(
+            testing.allocator,
+            root_fs.Root.init(testing.io, directory.dir),
+        ),
+    );
+}
+
 test "maintainer_script.test.private PID1 mounts masked read-only boot ID and tears down" {
     if (builtin.os.tag != .linux) return;
     var directory = testing.tmpDir(.{});
@@ -4323,6 +4632,115 @@ test "maintainer_script.test.signed udev postinst uses only PID proc and applies
     try proc.verify(testing.allocator);
 }
 
+test "maintainer_script.test.signed sudo postinst repairs only pinned alternatives with PID-only proc" {
+    if (builtin.os.tag != .linux) return;
+    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_PROC_ROOT") orelse return;
+    const root_path = std.mem.span(configured);
+    var root = try root_fs.openAbsoluteRoot(testing.io, root_path);
+    defer root.close();
+    var proc = try SnapshotSudoProc.init(testing.allocator, root.root);
+    defer proc.deinit();
+    var launcher: SystemLauncher = .{};
+    var report = try run(testing.allocator, .{
+        .root = root_path,
+        .identity = .{
+            .package = "sudo",
+            .version = "1.9.17p2-7ubuntu3",
+            .architecture = "amd64",
+            .kind = .postinst,
+            .script_path = "var/lib/dpkg/info/sudo.postinst",
+            .script_sha256 = snapshot_sudo_sha256,
+        },
+        .arguments = &.{ "configure", "" },
+        .policy = .{ .snapshot_sudo_proc = true },
+        .snapshot_proc = .{ .sudo = &proc },
+    }, .{ .launcher = launcher.interface() });
+    defer report.deinit();
+    if (!report.succeeded())
+        std.debug.print("signed sudo proc outcome={any} stderr={s}\n", .{
+            report.outcome,
+            report.stderr,
+        });
+    try testing.expect(report.succeeded());
+    try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    try testing.expect((try root.root.entryIfExists(
+        try root_fs.Path.init("proc/sys"),
+    )) == null);
+    const record = try root.root.readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/alternatives/sudo"),
+        1024,
+    );
+    defer testing.allocator.free(record);
+    const record_hex = std.fmt.bytesToHex(hashBytes(record), .lower);
+    try testing.expectEqualStrings(
+        "c583a377d2d7bc241422c91f43738f8e278e159e8e3bb2aa53d5bdeaf782e845",
+        &record_hex,
+    );
+    for ([_]struct { path: []const u8, target: []const u8 }{
+        .{ .path = "usr/bin/sudoedit", .target = "/etc/alternatives/sudoedit" },
+        .{ .path = "usr/share/man/man8/sudoedit.8.gz", .target = "/etc/alternatives/sudoedit.8.gz" },
+    }) |expected| {
+        var link = try root.root.pinSymbolicLink(try root_fs.Path.init(expected.path));
+        defer link.close();
+        var buffer: [64]u8 = undefined;
+        const observed = try link.observe(&buffer);
+        try testing.expectEqualStrings(expected.target, observed.target);
+    }
+    const sudo_dir = try root.root.entry(try root_fs.Path.init("run/sudo"));
+    try testing.expectEqual(@as(u16, 0o711), sudo_dir.mode);
+    try proc.verify(testing.allocator);
+}
+
+test "maintainer_script.test.signed sudo proc refuses tool alias and tmpfiles overrides" {
+    if (builtin.os.tag != .linux) return;
+    for ([_]struct { variable: [:0]const u8, reason: anyerror }{
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_BAD_TOOL_ROOT", .reason = error.InvalidSnapshotSudoTool },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_BAD_FRAGMENT_ROOT", .reason = error.InvalidSnapshotSudoTool },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_MISSING_FRAGMENT_ROOT", .reason = error.FileNotFound },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_REDIRECTED_FRAGMENT_ROOT", .reason = error.NotRegularFile },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_BAD_ALIAS_ROOT", .reason = error.InvalidSnapshotSudoTool },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_OVERRIDE_ROOT", .reason = error.InvalidSnapshotSudoControl },
+        .{ .variable = "DEBZ_REQUIRE_SIGNED_SUDO_PROC_SHADOW_ROOT", .reason = error.InvalidSnapshotSudoTool },
+    }) |case| {
+        const configured = std.c.getenv(case.variable) orelse continue;
+        var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(configured));
+        defer root.close();
+        try testing.expectError(
+            case.reason,
+            SnapshotSudoProc.init(testing.allocator, root.root),
+        );
+    }
+}
+
+test "maintainer_script.test.signed sudo tool changed after binding fails verification" {
+    if (builtin.os.tag != .linux) return;
+    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_PROC_CHANGED_ROOT") orelse return;
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(configured));
+    defer root.close();
+    var proc = try SnapshotSudoProc.init(testing.allocator, root.root);
+    defer proc.deinit();
+    try root.root.dir.writeFile(testing.io, .{
+        .sub_path = "usr/bin/systemd-tmpfiles",
+        .data = "changed after binding",
+    });
+    try testing.expectError(error.PathChanged, proc.verify(testing.allocator));
+}
+
+test "maintainer_script.test.signed sudo sourced fragment changed after binding fails verification" {
+    if (builtin.os.tag != .linux) return;
+    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_PROC_CHANGED_FRAGMENT_ROOT") orelse return;
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(configured));
+    defer root.close();
+    var proc = try SnapshotSudoProc.init(testing.allocator, root.root);
+    defer proc.deinit();
+    try root.root.dir.writeFile(testing.io, .{
+        .sub_path = "usr/share/dpkg/sh/dpkg-error.sh",
+        .data = "changed after binding",
+    });
+    try testing.expectError(error.PathChanged, proc.verify(testing.allocator));
+}
+
 test "maintainer_script.test.signed udev proc rejects altered tools and controls" {
     if (builtin.os.tag != .linux) return;
     for ([_][]const u8{
@@ -4437,7 +4855,7 @@ fn testMaskedProcWorker(
     linux.exit(0);
 }
 
-test "maintainer_script.test.both private proc views die on deadline and parent crash" {
+test "maintainer_script.test.private proc views die on deadline and parent crash" {
     if (builtin.os.tag != .linux) return;
     var directory = testing.tmpDir(.{});
     defer directory.cleanup();
@@ -4462,10 +4880,11 @@ test "maintainer_script.test.both private proc views die on deadline and parent 
     };
     try testing.expectEqual(linux.E.SUCCESS, helperStat(directory.dir.handle, &descriptor.root_stat));
     try testing.expectEqual(linux.E.SUCCESS, helperStat(mountpoint.dir.handle, &descriptor.directory_stat));
-    for ([_]SnapshotProcMode{ .systemd, .udev }) |mode| {
+    for ([_]SnapshotProcMode{ .systemd, .udev, .sudo }) |mode| {
         descriptor.view = switch (mode) {
             .systemd => .{ .systemd = boot_id },
             .udev => .udev,
+            .sudo => .sudo,
         };
         for ([_]bool{ false, true }) |parent_crash| {
             var status: [2]i32 = undefined;

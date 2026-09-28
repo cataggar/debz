@@ -3831,7 +3831,11 @@ test "native_recovery.test.script outcome rejects changed disposition evidence" 
 
 test "native_recovery.test.exact proc setup failures are durable and never spawned" {
     const testing = std.testing;
-    for ([_][]const u8{ "systemd", "udev" }) |package| {
+    for ([_]struct { package: []const u8, version: []const u8 }{
+        .{ .package = "systemd", .version = "261.2-1ubuntu2" },
+        .{ .package = "udev", .version = "261.2-1ubuntu2" },
+        .{ .package = "sudo", .version = "1.9.17p2-7ubuntu3" },
+    }) |case| {
         var temporary = testing.tmpDir(.{});
         defer temporary.cleanup();
         const root = root_fs.Root.init(testing.io, temporary.dir);
@@ -3841,8 +3845,8 @@ test "native_recovery.test.exact proc setup failures are durable and never spawn
                 root_fs.default_directory_permissions,
             );
         var outcome = testScriptOutcome();
-        outcome.package = package;
-        outcome.package_version = "261.2-1ubuntu2";
+        outcome.package = case.package;
+        outcome.package_version = case.version;
         outcome.arguments = &.{ "configure", "" };
         outcome.disposition = .setup_failed;
         outcome.exit_code = null;

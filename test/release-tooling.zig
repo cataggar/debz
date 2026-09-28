@@ -424,7 +424,9 @@ test "release: archive container corruption, trailing bytes, and noncanonical gz
         try f.work.write(corrupt, bytes);
         const invalid = try f.audit(try f.path(corrupt), "linux-x64");
         defer invalid.deinit();
-        try invalid.failsWith(if (std.mem.eql(u8, suffix, "tar.gz"))
+        // XZ footer corruption can fail either in preflight decompression or tar reading.
+        const xz_preflight_failed = std.mem.indexOf(u8, invalid.stderr, "invalid compressed archive") != null;
+        try invalid.failsWith(if (std.mem.eql(u8, suffix, "tar.gz") or xz_preflight_failed)
             "invalid compressed archive"
         else
             "cannot read archive");

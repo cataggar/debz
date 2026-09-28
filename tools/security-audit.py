@@ -908,15 +908,33 @@ def audit_production_sources() -> None:
         "linux.MS.REMOUNT | proc_mount_flags",
         "linux.syscall3(\n        .close_range,",
         'snapshotUdevIdentity(identity, invocation.argv[1..])',
+        'snapshotSudoIdentity(identity, invocation.argv[1..])',
         '"hidepid=2,subset=pid"',
         '"/proc/sys/kernel/random/boot_id"',
         '"etc/tmpfiles.d/static-nodes-permissions.conf"',
+        '"etc/tmpfiles.d/sudo.conf"',
         '"etc/sysusers.d/debian-udev.conf"',
         '"usr/sbin/systemd-tmpfiles"',
+        '"usr/sbin/update-alternatives"',
+        '"usr/bin/gnuchmod"',
+        '"usr/share/dpkg/sh/dpkg-error.sh"',
+        '"d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528"',
         "return restrictSnapshotProcPrivileges(failure_stage);",
     ):
         if required not in runner:
             fail(f"reviewed exact-script proc isolation changed: {required}")
+    alternatives = (ROOT / "src/native_alternatives.zig").read_text(errors="strict")
+    unpack = (ROOT / "src/native_unpack.zig").read_text(errors="strict")
+    for required in (
+        "matchesStructuralLink(fact, authority.structural_links)",
+        "parsed_records.append(allocator, parsed) catch |err|",
+        ".structural_links = if (snapshot_sudo_postinst and",
+        "verifySnapshotSudoStructuralOwner(allocator, root, program)",
+        "verifySnapshotSudoPostinstPaths(",
+        ".snapshot_sudo_proc = true",
+    ):
+        if required not in alternatives and required not in unpack:
+            fail(f"reviewed signed sudo alternatives admission changed: {required}")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")

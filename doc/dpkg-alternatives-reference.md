@@ -439,6 +439,72 @@ step 1173, documented in the [integration root
 log](integration-roots.md#hermetic-debian-family-integration-roots).
 The new failed root is retained for recovery.
 
+The later signed `sudo:amd64` `1.9.17p2-7ubuntu3` postinst (1,927 bytes,
+SHA-256
+`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`)
+encounters a different boundary. Its previously registered 464-byte
+priority-50 `sudo-rs` group and selectors still exist, but signed sudo
+unpack restores `/usr/bin/sudoedit -> sudo.ws` and
+`/usr/share/man/man8/sudoedit.8.gz -> sudo.ws.8.gz`; the record still selects
+`/usr/lib/cargo/bin/sudo`. Both links are authenticated sudo-owned,
+root-owned mode-0777 single-link symlinks. The before-capture therefore
+admits **only these two exact structural links** for the exact new-package
+sudo configure script, after pinning the already reviewed sudo and sudo-rs
+archive identities and signed sudo provider bytes. Its after-capture uses
+the strict ordinary generic-link rules, and the normal transition checker
+must prove the literal priority-40 sudo candidate with all six slaves;
+other groups and records remain immutable. The former parsed-record
+`errdefer` after transfer caused a general-protection exception when a
+capture rejected the structural link. Its ownership is now transferred
+once, so rejection remains a typed error and never silently succeeds.
+
+Independent root-owned disposable copies of an authenticated pre-udev
+capture were aligned **only** by restoring the two exact signed sudo
+payload links; the separately aborted step-1376 root was read but never
+copied or reused. All 14 alternatives record hashes, selectors, signed
+postinst and `sudo.conf` matched the retained pre-sudo evidence. Pinned
+dpkg 1.22.22 and the exact signed script both exited 1 with no `/proc`,
+before invoking `update-alternatives`, due to `systemd-tmpfiles`. On two
+new copies with private chrooted PID 1 and read-only
+`nosuid,nodev,noexec,hidepid=2,subset=pid` procfs, `/proc/sys` absent
+and `CAP_SYS_ADMIN` dropped, each exited 0. Both installed the same
+658-byte `sudo` record, SHA-256
+`c583a377d2d7bc241422c91f43738f8e278e159e8e3bb2aa53d5bdeaf782e845`,
+retained priority-50 `sudo-rs` as selected, repaired both generic links
+into `/etc/alternatives`, and created root-owned mode-0711 `/run/sudo`.
+An additional signed-script copy normalized only sudo's status to the
+native `installed` prestate and produced the same exit 0, record and links.
+Each private mount disappeared on exit. This independently verifies
+the state repair and the *separate* exact sudo proc requirement; it is
+not evidence for borrowing a host proc or admitting arbitrary commands.
+A newly authenticated protected 175-package root subsequently persisted
+signed sudo.postinst step 1376 exit 0 and installed status with that exact
+record and both repaired generic links. It later refused the unrelated
+python3 preinst before launch at step 1383 with `InvalidAlternativesScript`;
+the failed root is retained, never reused for a second installation.
+These local diagnostic results predate the final #252 squash and the
+subsequently pinned sourced `dpkg-error.sh` fragment; they are not the
+combined-tree publication proof. `tools/real-snapshot-sudo-reference.sh`
+repeats the pinned dpkg 1.22.22 comparison from a root-owned checkout,
+mode-0700 fixture directory and independently copied authenticated
+pre-sudo diagnostic source. It refuses writable or symlinked ancestry,
+changed signed controls and unpinned dpkg, then restores only the two
+literal signed sudo payload links in a **new disposable diagnostic copy**,
+matching the pre-postinst unpack state. It executes only that copy with
+private PID-only procfs and no `/proc/sys`. The diagnostic source is
+unchanged and no failed native installation is retried.
+On final #252 squash plus sudo-only source `898d81e`, the protected
+disposable pinned-dpkg proof exited 0 and installed sudo. Independent
+protected Debug and ReleaseSafe signed-script tests generated the same
+658-byte record **byte-for-byte** and refused all four altered, missing,
+symlinked or post-binding-changed sourced-fragment fixtures. A separate
+new authenticated 175-package native root then recorded signed sudo
+step 1376 exit 0 and installed with the same record and repaired links;
+the first later refusal was python3 preinst step 1383 before launch.
+The exact root paths, lock and CAS rehash are in
+[integration roots](integration-roots.md#hermetic-debian-family-integration-roots).
+This verifies only sudo's signed transition, not full installation parity.
+
 The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
 `4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)
 ships the exact 2,112-byte `postinst` (SHA-256
