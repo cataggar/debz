@@ -133,9 +133,9 @@ def build_deb(
     )
 
 
-def package_specs(suite: str, architecture: str):
+def package_specs(suite: str, architecture: str, *, signed_parity: bool = False):
     suite_version = "1.0-1debian1" if suite == "debian-stable" else "1.0-1ubuntu1"
-    return [
+    specs = [
         ("ca-certificates", "20240203", "all", {}, {}),
         ("base-dep", "1.0-1", architecture, {}, {}),
         ("native-helper-target", "1.0-1", architecture, {}, {"helper_target": True}),
@@ -179,9 +179,12 @@ def package_specs(suite: str, architecture: str):
             {},
         ),
     ]
+    if signed_parity:
+        specs.append(("pre-fail-app", "1.0-1", architecture, {"Pre-Depends": "fail-script"}, {}))
+    return specs
 
 
-def write_repository(output: pathlib.Path, suite: str, architecture: str) -> None:
+def write_repository(output: pathlib.Path, suite: str, architecture: str, *, signed_parity: bool = False) -> None:
     if output.exists():
         shutil.rmtree(output)
     packages_dir = output / "dists" / suite / "main" / f"binary-{architecture}"
@@ -190,7 +193,7 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str) -> Non
     pool.mkdir(parents=True)
 
     paragraphs: list[bytes] = []
-    for package, version, package_arch, fields, options in package_specs(suite, architecture):
+    for package, version, package_arch, fields, options in package_specs(suite, architecture, signed_parity=signed_parity):
         deb = build_deb(package, version, package_arch, fields, **options)
         filename = f"pool/main/{package}_{version}_{package_arch}.deb"
         path = output / filename
@@ -207,6 +210,7 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str) -> Non
             "Filename": filename,
             "Size": str(len(deb)),
             "SHA256": digest,
+            **({"SHA512": hashlib.sha512(deb).hexdigest()} if signed_parity else {}),
             "Description": f"debz hermetic fixture {package}",
         }
         paragraphs.append("".join(f"{key}: {value}\n" for key, value in paragraph.items()).encode() + b"\n")
@@ -348,6 +352,7 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--suite", required=True, choices=("debian-stable", "ubuntu-26.04"))
     parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
+    parser.add_argument("--signed-parity", action="store_true")
     parser.add_argument("--descriptor-output", type=pathlib.Path)
     parser.add_argument("--descriptor-repository-url")
     parser.add_argument(
@@ -364,7 +369,7 @@ def main() -> None:
         raise SystemExit("--descriptor-output must be absolute")
     if args.descriptor_script_case != "default" and args.descriptor_output is None:
         raise SystemExit("--descriptor-script-case requires --descriptor-output")
-    write_repository(args.output, args.suite, args.architecture)
+    write_repository(args.output, args.suite, args.architecture, signed_parity=args.signed_parity)
     if args.descriptor_output is not None:
         scripts = None
         if args.descriptor_script_case != "default":

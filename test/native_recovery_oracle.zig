@@ -184,6 +184,7 @@ pub const parity_cases = [_]ParityCase{
     .{ .id = "conffile-keep", .package = "conffile-pkg", .archives = &.{"conffile-pkg"}, .conffile = "keep_existing" },
     .{ .id = "conffile-replace", .package = "conffile-pkg", .archives = &.{"conffile-pkg"}, .conffile = "use_package_version" },
     .{ .id = "known-script-failure", .package = "fail-script", .archives = &.{"fail-script"}, .exit_status = 7 },
+    .{ .id = "pre-depends-known-failure", .package = "pre-fail-app", .archives = &.{ "fail-script", "pre-fail-app" }, .reference_phases = &.{&.{"fail-script"}}, .exit_status = 7 },
 };
 
 pub const ParityRow = struct {

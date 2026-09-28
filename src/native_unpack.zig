@@ -29614,7 +29614,12 @@ fn executeLifecycleProgramWithRequest(
                     };
                 }
             }
-            if (lifecycleMaterializationFailure(result)) |failure| return failure;
+            if (lifecycleMaterializationFailure(result)) |failure| {
+                if (failure.outcome == .refused and borrowed_attempt == null and
+                    attempt.record().state.provenPreMutation())
+                    try attempt.abandonIfPreMutation(allocator);
+                return failure;
+            }
             const cleared_config = try clearLifecycleConfig(
                 execution,
                 allocator,
@@ -33316,19 +33321,38 @@ test "native_unpack.test.lifecycle external fixture" {
             .{},
         )) {
             .model => |value| value,
-            .diagnostic => return error.InvalidExternalArchive,
+            .diagnostic => |diagnostic| {
+                if (diagnostic.code == .out_of_memory) return error.OutOfMemory;
+                const code = if (diagnostic.payload) |payload|
+                    @tagName(payload.code)
+                else
+                    @tagName(diagnostic.code);
+                const detail = try std.fmt.allocPrint(
+                    testing.allocator,
+                    "archive_{s}_{s}",
+                    .{ @tagName(diagnostic.stage), code },
+                );
+                defer testing.allocator.free(detail);
+                try writeLifecycleReport(testing.allocator, testing.io, external.report, .{
+                    .outcome = .refused,
+                    .detail = detail,
+                });
+                testing.allocator.free(bytes);
+                return;
+            },
         };
         errdefer model.deinit();
         if ((!external.triggers and model.triggers.len != 0) or
             !supportedArchiveMetadata(&model))
         {
-            model.deinit();
             try writeLifecycleReport(
                 testing.allocator,
                 testing.io,
                 external.report,
                 .{ .outcome = .handoff, .detail = "unsupported_archive_metadata" },
             );
+            model.deinit();
+            testing.allocator.free(bytes);
             return;
         }
         models[index] = model;

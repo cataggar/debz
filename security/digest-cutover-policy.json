@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 472,
-      "sha512": "766f9f27c572ea4c50cbaf53cb923292c68b927e0a78df725a34eadc7125b5ba2c5f22b91124fe127197e3d617ff2e444dc5a7e6c6ecd37d94db62f91b4ea2ca"
+      "count": 473,
+      "sha512": "545a85814afd6dafb0b5dcd2e15c8e489f07e4974e5e444f2a610f9d3d6f91f8da2fd297e10910b03c01c1fc06bf9a157cb7d587d0ec7fba6aa90fcdbd442f88"
     },
     "findings": {
-      "count": 21300,
+      "count": 21305,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 177,
         "raw_32_byte": 1195,
-        "sha256_token": 19631
+        "sha256_token": 19636
       },
-      "sha512": "82182683f8ee047c12d576d27ac044424e847dddf43eaf8020d6d0385a219948117e0127ff2c89319c57323884e71366fd15b7fa9fc00e298681b6d2b8f923e4"
+      "sha512": "b85571696ebe6aa90c2edefd6a3c9efe2fed30c84a2cb7fcfc1e973d985f7e21d9903d03153091ec352f9349b9840f9ff8e3934a43e37b610ade986456c693b8"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 337,
+        "count": 341,
         "counts": {
           "cas_layout": 24,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 305
+          "sha256_token": 309
         },
-        "sha512": "14a2ea4a3d28e78119476ac88abb745f63bfca5680ca0403e6c41c5c0d9dbdb49b3163d90d421f4f153ba5188d477831ac50db2952ccfcc72cecc98bffc8759a"
+        "sha512": "465d90e5e49e5a2aa878dc34ab38f750e25643e9e309b1ea0c217f60e561ddf6c04bd7ffeacbd6a41b84b52f4363d787a6eeb747d714406d4d8fa74eca69f92e"
       },
       {
         "scope": "fuzz",
@@ -168,15 +168,15 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 815,
+        "count": 816,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 6,
           "raw_32_byte": 69,
-          "sha256_token": 736
+          "sha256_token": 737
         },
-        "sha512": "c9781558b5db0ea140aad280905162027bb5971c6d77796e3ed1081bb4462250704670b8418ff55372d559d92a286cbc59bc099746be8438b33342d139bf4eaf"
+        "sha512": "d892c337ca8c187b3b14b7e0074296b6f917ad23a7346018ced73f7ba79fc05df82f3861c05bf6f974b768aa702259d6a0d81662846328edccd8d7c6f7611ea4"
       },
       {
         "scope": "tools",

@@ -1032,8 +1032,9 @@ pub fn build(b: *std.Build) void {
     settlement_oracle_zig.step.dependOn(&run_trigger_zig_tests.step);
     b.step("test-native-triggers-zig-settlement-reference", "Run only 24 upgrades and 16 follow-ups against two pinned dpkg roots")
         .dependOn(&settlement_oracle_zig.step);
-    const install_acceptance = b.step("build-native-acceptance-zig", "Install the standalone lifecycle and trigger Zig selector executables");
+    const install_acceptance = b.step("build-native-acceptance-zig", "Install lifecycle/trigger selectors and the focused fixture driver");
     install_acceptance.dependOn(&b.addInstallArtifact(lifecycle_zig_executable, .{}).step);
+    install_acceptance.dependOn(&b.addInstallArtifact(native_lifecycle_tests, .{ .dest_sub_path = "native-lifecycle-fixture-driver" }).step);
     install_acceptance.dependOn(&b.addInstallArtifact(trigger_zig_executable, .{}).step);
 
     const settlement_module = b.createModule(.{
@@ -1190,7 +1191,7 @@ pub fn build(b: *std.Build) void {
     const parity_case = b.option([]const u8, "native-zig-recovery-parity-case", "Run one suite/case for signed consumer parity debugging");
     if (parity_case) |case|
         recovery_parity.addArgs(&.{ "--case", case });
-    b.step("test-native-recovery-zig-parity", "Run 28 signed cases through real core, FAMILY, and dpkg consumers")
+    b.step("test-native-recovery-zig-parity", "Run 30 signed cases through real core, FAMILY, and dpkg consumers")
         .dependOn(&recovery_parity.step);
 
     const recovery_helper_module = b.createModule(.{
