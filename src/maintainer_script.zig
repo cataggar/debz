@@ -5464,10 +5464,24 @@ test "maintainer_script.test.exec boundary seals inherited host-root descriptors
     try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(waited));
 }
 
+fn signedProcFixture(value: ?[*:0]const u8, required: bool) ![]const u8 {
+    if (value) |path| return std.mem.span(path);
+    if (required) return error.SignedProcRootRequired;
+    return error.SkipZigTest;
+}
+
+test "maintainer_script.test.required signed proc fixture never silently skips" {
+    try testing.expectError(error.SkipZigTest, signedProcFixture(null, false));
+    try testing.expectError(error.SignedProcRootRequired, signedProcFixture(null, true));
+    try testing.expectEqualStrings("/protected/prestate", try signedProcFixture("/protected/prestate", true));
+}
+
 test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
     if (builtin.os.tag != .linux) return;
-    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_SYSTEMD_PROC_ROOT") orelse return;
-    const root_path = std.mem.span(configured);
+    const root_path = try signedProcFixture(
+        std.c.getenv("DEBZ_REQUIRE_SIGNED_SYSTEMD_PROC_ROOT"),
+        std.c.getenv("DEBZ_REQUIRE_SIGNED_PROC_ROOTS") != null,
+    );
     var root = try root_fs.openAbsoluteRoot(testing.io, root_path);
     defer root.close();
     var proc = try SnapshotSystemdProc.init(testing.allocator, root.root);
@@ -5503,8 +5517,10 @@ test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
 
 test "maintainer_script.test.signed udev postinst uses only PID proc and applies static permissions" {
     if (builtin.os.tag != .linux) return;
-    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_UDEV_PROC_ROOT") orelse return;
-    const root_path = std.mem.span(configured);
+    const root_path = try signedProcFixture(
+        std.c.getenv("DEBZ_REQUIRE_SIGNED_UDEV_PROC_ROOT"),
+        std.c.getenv("DEBZ_REQUIRE_SIGNED_PROC_ROOTS") != null,
+    );
     var root = try root_fs.openAbsoluteRoot(testing.io, root_path);
     defer root.close();
     var proc = try SnapshotUdevProc.init(testing.allocator, root.root);
@@ -5546,8 +5562,10 @@ test "maintainer_script.test.signed udev postinst uses only PID proc and applies
 
 test "maintainer_script.test.signed sudo postinst repairs only pinned alternatives with PID-only proc" {
     if (builtin.os.tag != .linux) return;
-    const configured = std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_PROC_ROOT") orelse return;
-    const root_path = std.mem.span(configured);
+    const root_path = try signedProcFixture(
+        std.c.getenv("DEBZ_REQUIRE_SIGNED_SUDO_PROC_ROOT"),
+        std.c.getenv("DEBZ_REQUIRE_SIGNED_PROC_ROOTS") != null,
+    );
     var root = try root_fs.openAbsoluteRoot(testing.io, root_path);
     defer root.close();
     var proc = try SnapshotSudoProc.init(testing.allocator, root.root);

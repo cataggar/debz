@@ -377,6 +377,78 @@ capability words and readbacks, and permitted ownership, file-mode and
 UID/GID changes on a disposable test file; it never attempts a real host
 mutation.
 
+### Non-skipped signed replay prerequisite
+
+The ordinary required CI matrix (`build-and-test-workload`, native lifecycle
+and recovery shards, and required disposable roots) builds **repository-local
+signed synthetic packages**, not the exact snapshot systemd, udev or sudo
+scripts. `test-native-helper-namespace` also runs the three signed tests
+without roots, so those individual tests are reported as **SKIP**. Its
+other passing results are capability/proc probe coverage, **not**
+signed-script parity.
+`ubuntu-real-snapshot` is an opt-in `workflow_dispatch` job (`run_native_real_snapshot
+= true`) on amd64 and arm64, currently ReleaseSafe only. It performs a fresh,
+authenticated snapshot install, but does not publish independently reusable
+**pre-script** roots or run the three direct-script tests in Debug and
+ReleaseSafe. A failed/interrupted install cannot be retried as fresh.
+
+On an **amd64** runner, prepare three *independent*, protected, root-owned,
+mode-0700 disposable copies from authenticated snapshot prestates, with
+empty root-owned `/proc` directories and the exact pinned signed inputs.
+The systemd copy must be before its configure; the udev copy must include
+the signed sidecars and the expected regular-file `/dev` test targets; the
+sudo copy must retain the pre-repair alternatives record and signed links.
+The three `Snapshot*Proc.init` bindings revalidate exact bytes, owners,
+paths and proc mountpoints before execution. Do not pass the historical
+interrupted sources to the test, use the same copy for two variants, or
+copy from a writable checkout as protected evidence. On each **new** set
+of copies (Debug and ReleaseSafe separately), run:
+
+```sh
+zig build test-native-signed-proc -Doptimize=Debug -j2 \
+  -Dsigned-systemd-proc-root=/root/protected/fixture/debug-systemd-before \
+  -Dsigned-udev-proc-root=/root/protected/fixture/debug-udev-before \
+  -Dsigned-sudo-proc-root=/root/protected/fixture/debug-sudo-before
+```
+
+Use `-Doptimize=ReleaseSafe` and *different fresh prestate copies* for
+the ReleaseSafe run. The build target rejects missing, relative, duplicate
+or wrong-architecture root paths and runs only the three positive signed
+tests as root with `DEBZ_REQUIRE_SIGNED_PROC_ROOTS=1`; a missing environment
+binding is an error, not a skip. Check each outcome and the retained root
+bytes against a **separate** pinned-dpkg proof copy produced by the existing
+`tools/real-snapshot-{systemd-proc,udev,sudo}-reference.sh` procedures in
+the same protected checkout. These reference procedures also require
+protected pre-script sources, a pinned dpkg 1.22.22 binary and a new proof
+root; they do not manufacture those prestates.
+
+To replay **ordinary** signed lifecycle fixtures on either native
+architecture, the existing CI uses
+`zig build test-native-lifecycle-zig -Dnative-reference-dpkg=PATH
+-Doptimize=Debug -j2` and its ReleaseSafe variant; `PATH` is prepared
+with `python3 tools/prepare-native-dpkg.py --architecture amd64` or
+`--architecture arm64` in that runner's worktree. These fixtures prove
+script execution and pinned-dpkg parity for the selected native architecture
+but **cannot** substitute for exact Ubuntu signed systemd/udev/sudo bytes.
+Those three native proc identities and their pinned sidecars are deliberately
+**amd64-only** in the current admission; no arm64 signed proc replay is
+possible without a separately reviewed arm64 identity/profile and protected
+arm64 inputs. Do not weaken the amd64 identity checks or use emulation as
+native-arm64 proof. The opt-in snapshot job may be invoked with:
+
+```sh
+gh workflow run ci.yml --repo cataggar/debz \
+  --ref copilot/issue-257-fleet-capabilities \
+  -f run_native_real_snapshot=true \
+  -f ubuntu_snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z \
+  -f ubuntu_snapshot_suite=stonking
+```
+
+This dispatch can provide fresh-root ReleaseSafe observations but does
+**not** automatically satisfy the direct signed prestate replay gate; absent
+prestate fixtures or non-zero script outcomes remain explicit blockers.
+The shared network boundary still belongs to #278.
+
 **Separate network boundary (#278):** dropping `CAP_NET_ADMIN` and
 `CAP_NET_RAW` does *not* disable ordinary socket or host-network access.
 The current `/proc/net` view and inherited socket/namespace boundary must
