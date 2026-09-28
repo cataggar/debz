@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 470,
-      "sha512": "f13fa0c911437187312a4e20945d466730f9fbfd75453471d3f4da57446847efe342db1e34deea720a9631faec2ecbe88942de7f51480cfc906cb53bfba2bdb2"
+      "count": 472,
+      "sha512": "766f9f27c572ea4c50cbaf53cb923292c68b927e0a78df725a34eadc7125b5ba2c5f22b91124fe127197e3d617ff2e444dc5a7e6c6ecd37d94db62f91b4ea2ca"
     },
     "findings": {
-      "count": 21205,
+      "count": 21265,
       "counts": {
-        "cas_layout": 193,
+        "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 177,
-        "raw_32_byte": 1189,
-        "sha256_token": 19543
+        "raw_32_byte": 1192,
+        "sha256_token": 19599
       },
-      "sha512": "d90dff0f37834bf0c45f4b2c100c07efe20c6b2f176b60fe5e8fcc9e793022f897a7dbea49898425244f045cc14dd32d01477ac07cf6986be0d36c287eb9e384"
+      "sha512": "1716f3c75a20c9a28e3fb6a5d34d64815bc11298c7b40af87cf684bc191337acdf6cca2ed88fe255e7486db739d3c7f573a929bf309ca50c54fdf468f5fe17a2"
     },
     "classifications": [
       {
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 296,
+        "count": 318,
         "counts": {
-          "cas_layout": 23,
+          "cas_layout": 24,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 265
+          "sha256_token": 286
         },
-        "sha512": "30aaf7c4a75986a9a19415de61ee101a7ca9284a00abcdb7a4b00780036ca2f9fad6326b41383ca6504ac0f633c4cf5944a305dc6d1e50a640b28833bc928b02"
+        "sha512": "05c65e6570e9bd4f46a343980bbcf3df8e3431628e18f34223583dc8deddb87feceb91b01d4c491500a386bd52cf29f23bf8534c34634976f5eb38780ca76894"
       },
       {
         "scope": "fuzz",
@@ -153,16 +153,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps, sudo-rs, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12371,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure-only, sudo-rs and python3 install-only invalid-name and redirected-tool witness, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "count": 12401,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1115,
-          "sha256_token": 11109
+          "raw_32_byte": 1118,
+          "sha256_token": 11136
         },
-        "sha512": "cbb6ed1feae9ab13ab88df02b19b73ecd9b0d5108f77a29f9df0e7d92711bc8fdaf1870dea053effdafd1f2566e345a37ad0dc3d2567a9315aae2c8b845546d0"
+        "sha512": "9122e74432ff676fcebd1636eb905b0a798fa193b274a5ff81f61edd7273482974e677856efe8739a08f539af5e9cfb9364a8321ba56cb564d83ba3b7b83ae52"
       },
       {
         "scope": "test",
@@ -181,16 +181,16 @@
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
-        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc, signed chrony, PID-only udev and signed sudo reference harnesses; production authorities remain typed and versioned.",
-        "count": 5047,
+        "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc, signed chrony, PID-only udev, signed sudo and python3 preinst reference harnesses; production authorities remain typed and versioned.",
+        "count": 5055,
         "counts": {
           "cas_layout": 19,
           "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5023
+          "sha256_token": 5031
         },
-        "sha512": "c09e43d42f98c5901a0e8e4754fb82eebe4fd6f723246572651e81605301965360b919a799c252a85d2babfa7a8a3c285239352f0db47c0957e4dabdca2326fd"
+        "sha512": "dbba72aa48be7793bbbaa99f6c1bafcc9c88761933ce2d99820f46c7b5c61e58a8fb3551895fbbfb54264c77dca3e63cf54614b9ea5b18a51e6fdd93285ac0c9"
       }
     ]
   },
@@ -229,7 +229,7 @@
       "id": "raw-control-and-compatibility-fields",
       "kind": "raw_32_byte_field",
       "classification": "fixed_control_and_versioned_compatibility",
-      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony and signed sudo control verifiers), or protocol controls, or fields inside frozen version-specific compatibility structures; current package content authority is typed.",
+      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony, signed sudo and signed python3 control verifiers), or protocol controls, or fields inside frozen version-specific compatibility structures; current package content authority is typed.",
       "paths": [
         "src/apt_system_api.zig",
         "src/apt_system_cli.zig",

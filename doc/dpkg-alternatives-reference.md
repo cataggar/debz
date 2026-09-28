@@ -505,6 +505,124 @@ The exact root paths, lock and CAS rehash are in
 [integration roots](integration-roots.md#hermetic-debian-family-integration-roots).
 This verifies only sudo's signed transition, not full installation parity.
 
+The separate signed `python3:amd64` `3.14.7-3` archive (SHA-512
+`1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6`)
+ships an 856-byte preinst (SHA-256
+`115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f`).
+For exactly `["install"]` its alternatives line is
+`update-alternatives --auto /usr/bin/python3 >/dev/null 2>&1 || true`;
+the `upgrade)` hooks are unreachable. The `/usr/bin/python3 -> python3.14`
+link belongs instead to signed `python3-minimal:amd64` `3.14.7-3` (archive
+SHA-512
+`3a23950e7a9bb65cf6e40a97bb05f7a7402c04d7167f2bc4d152c05ff8abaee45cbdbc298e937d3a0ff5c49758537e92a4f8880a1aec7629274a4790eae38bdf`).
+There is no `python3` alternatives record or selector, and
+`/usr/share/doc/python3/html` is absent. Both pinned dpkg 1.22.22 and
+snapshot 1.23.7ubuntu2 `update-alternatives`, invoked with `--root` on a
+protected disposable root, return **2** with `alternative name
+(/usr/bin/python3) must not contain '/' and spaces`, without touching that
+root. This is an invalid *name*, not a valid `--auto python3` transition.
+
+Independent protected copies of the authenticated prestate, never of the
+interrupted step-1383 root, proved the exact signed script `install` exits
+**0** and pinned dpkg 1.22.22 invokes its signed preinst with exactly
+`( install )` and unpacks successfully. For the pinned-dpkg probe only,
+`--force-depends --purge python3` first removed that package in its own
+disposable copy; the subsequent signed-archive unpack used no force option.
+The 14 alternatives records and 76 selectors remained byte-for-byte
+identical on both copies (record inventory SHA-256
+`0c962b7820400c8c06efe34493c58c04925d87a5ee556fe8cc4a4be93d81a99c`).
+The signed minimal link and absent HTML path remained unchanged. Since
+this fixture's `/dev/null` is a root-owned mode-0600 empty **regular file**
+instead of a device, the signed script's redirection produces the same
+96-byte diagnostic in both independent copies (SHA-256
+`3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc`).
+The refused root had the exact empty-file prestate.
+
+A first separately authenticated fresh 175-package root reached
+python3 step 1383 and refused before launch: its empty, root-owned
+regular `/dev/null` was mode **0644**, not the 0600 of the earlier
+proof and refused roots. Its action stayed `prepared`, with no outcome.
+Independent protected 0644 disposable copies (never of the interrupted
+root) established that the signed script `["install"]` and pinned dpkg
+1.22.22 signed-archive unpack both exit 0 and preserve that mode, all
+14 alternatives records and all 76 selectors, and yield the same
+96-byte diagnostic. The pinned-dpkg copy required fixture-only python3
+purge before no-force unpack; the script copy did not. A read-only
+guard test also accepts the interrupted root's actual 0644 prestate
+without executing its pending script. Only those two proved file modes,
+0600 and 0644, are admitted; 0640 and 0666 are explicitly rejected.
+
+Native admission models **no alternatives command** for only this complete
+signed script's new-package amd64 `preinst ["install"]`. It binds both signed
+archive identities, the installed and any staged script, signed ownership
+lists and minimal link, root and doc-directory identities, exact shell/GNU
+`rm` aliases and bytes, absent `/usr/sbin` shadows, absent HTML target,
+empty `/proc`, empty guarded regular `/dev/null` at mode 0600 or 0644,
+and the snapshot-pinned `update-alternatives` binary. All preexisting
+groups are immutable across
+the normal managed before/after checkpoints. An exit-0 script must also
+leave the reference-exact 96-byte diagnostic in `/dev/null` before its
+outcome can be persisted; a mismatch requires recovery after mutation,
+never a success-shaped fallback. No generic redirect, `|| true`,
+absolute-name, or upgrade grammar is added. The script's own exit remains
+authoritative.
+
+An earlier newly authenticated protected 175-package root from a local
+branch **also containing unpublished procps-trigger admission** used the
+corrected ReleaseSafe binary (SHA-256
+`9a0c3641daa87f832233b0e6913f2cbf7a25a0fda9fed47aa91ee4cde163fa61`)
+durably persisted the exact signed python3 preinst at step 1383 with
+`spawned=true`, exit 0, no output and `succeeded`; python3 is installed.
+Later scripts changed the `/dev/null` file again, so its *final* bytes
+are not evidence for the preinst witness; admission checked its contents
+before persisting that signed outcome. All seven deferred trigger scripts
+also exited 0, but `libglib2.0-0t64:amd64` remained self
+`triggers-awaited` for its schema trigger. Final closure verification
+refused with `final_closure_mismatch` (exit 8). This is a later distinct
+blocker on that local combined branch, not a prediction for final main plus
+python3 alone, completed installation, or authority for trigger changes.
+
+On the final #253 sudo squash plus **only** the python3 delta, a separate
+root-owned protected checkout at
+`/var/lib/debz-python3-reference-253/checkout` repeated the pinned dpkg
+1.22.22 comparison with `tools/real-snapshot-python3-reference.sh`. Its
+independently copied pre-sudo diagnostic source, not a fresh native trial,
+had the signed 856-byte preinst and root-owned empty regular `/dev/null`.
+The reference helper checks protected ancestry, pinned dpkg's receipt,
+the SHA-512 python3 archive against the newly signed 175-package lock,
+signed installed script and minimal-list bytes, the pinned alternatives
+tool and minimal symlink, and a previously absent HTML target. Separate
+disposable copies with `/dev/null` modes 0600 and 0644 each showed the
+signed script's `install` exit 0 and pinned dpkg's no-force archive
+unpack after fixture-only purge. Both retained the same 14 alternatives
+records and 76 selectors (combined fingerprint SHA-256
+`9f7ace1de86e778a42d5f69175689429211c72e442447c367e79f718443da3be`)
+and the same 96-byte diagnostic SHA-256
+`3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc`.
+The independent reference copies do not establish a fresh native outcome.
+
+The **new** protected native root
+`/var/lib/debz-python3-reference-253/checkout/.real-snapshot/amd64-python3-253-protected-signed-2`
+used ReleaseSafe binary SHA-256
+`e25deea6be146c5c112167c8ec5293b2e6cee50daf708140ae0973d5010a0265`.
+The newly authenticated lock SHA-256 was
+`b1019563797b699ae30b07b625166f42624ccb056f06e0f62d62e6ec0b060bc5`;
+all 175 SHA-512 archive objects (67,976,788 bytes) were independently
+size/digest-checked against it, with exact-object-set `cas-rehash.tsv`
+SHA-256 `0e3f2a55adb3d91d60b216f9af8c61c5785e05ab8266b4f0fee220464558a7c1`.
+The signed python3 preinst at step **1383** ran with `["install"]`,
+`spawned=true`, exit **0**, zero output and a durable `succeeded` record;
+the package finished `install ok installed`. The first later refusal
+was **not** the earlier local branch's final closure mismatch: after three
+successful deferred callbacks, ordinal 3 at step **1428** remained
+`prepared` with **no script outcome**. The signed configure-only procps
+postinst SHA-256
+`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+was pending `/usr/lib/sysctl.d`; its separate `triggered` admission is
+unpublished. Native execution returned `InvalidAlternativesScriptAuthority`
+(exit 8). This root is retained for read-only evidence, never resumed as
+a fresh trial, and does not establish full snapshot parity.
+
 The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
 `4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)
 ships the exact 2,112-byte `postinst` (SHA-256

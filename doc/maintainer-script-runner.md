@@ -277,6 +277,37 @@ next refusal was python3 preinst at step 1383, before its script launched.
 This local proof does not substitute for hosted arm64 namespace coverage
 or authorize python3.
 
+## Exact signed python3 preinst inert alternatives call
+
+The separate new-package `python3:amd64` `3.14.7-3`
+`preinst ["install"]` (signed SHA-256
+`115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f`)
+does not receive proc, mount, or general shell authority. The exact
+installed and any staged script must match, as must authenticated python3
+and python3-minimal archives, their dpkg ownership lists, the
+`/usr/bin/python3 -> python3.14` link, signed `dash` and GNU `rm` bytes,
+their aliases, the snapshot-pinned alternatives tool, and the root-owned
+mode-0700 fixture root. `/proc` must be empty, `/usr/sbin` tool shadows
+and the HTML cleanup target absent, and `/dev/null` must be a root-owned,
+mode-0600 or mode-0644, empty regular file. Both modes were separately
+proved against pinned dpkg 1.22.22 and the signed script in protected
+disposable roots; 0640 and 0666 refuse. Other tool, root, alias,
+script, argument, package, or architecture identities refuse before launch.
+
+On this branch, the tool rejects the script's literal
+`--auto /usr/bin/python3` operand before alternatives state changes.
+The signed script still runs **unmodified**, including its `|| true`,
+`[ -L ... ]` and `rm -rf` lines; the existing launcher records its real
+exit, limits and output. All 14 alternatives groups remain immutable.
+Successful completion additionally requires the 96-byte
+snapshot-tool diagnostic to have been redirected into `/dev/null`
+with SHA-256
+`3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc`.
+A different exit or redirected witness cannot be converted into success;
+post-launch proof failure requires durable recovery. The managed checkpoint
+includes that one changed file. This does not admit `--auto` with an
+absolute name elsewhere or the signed script's upgrade branch.
+
 ## Outcome taxonomy
 
 `MaintainerScriptOutcome` keeps every result exactly distinguishable:
