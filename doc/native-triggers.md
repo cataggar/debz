@@ -181,6 +181,25 @@ each operation. Cases include:
   malformed-queue refusal, and unexpected unrelated selection changes during
   deferred execution.
 
+`native_trigger_removal.zig` additionally isolates removal-activated named
+triggers for both `interest-await` and `interest-noawait` using
+`--removal-only` and a `postrm remove` **noawait activation**. A real postrm
+invokes the authenticated in-root helper, and the separate pinned-dpkg/native
+roots agree after deferred
+removal, a failing triggered callback, explicit configuration of the
+half-configured receiver, and purge. The checks require one failing
+`postinst triggered` call with the exact argument and a second **configure**
+call after clearing the marker; they never treat a missing callback or a
+refused trigger-only retry as success. The existing self/two-package
+no-progress fixtures now also require actual callbacks with exact trigger arguments,
+in addition to their exact terminal root and script-trace comparison.
+The separate `removal-activate-await-refusal` fixture does **not** claim
+parity for an awaited postrm activation: dpkg queues the receiver, while
+native reports `invalid_transition` after source removal and retains a
+`mutating` operation journal. Both re-entry and journal overwrite are
+blocked; [#301](https://github.com/cataggar/debz/issues/301) tracks the
+missing settlement.
+
 Reference roots use the real `dpkg-trigger`; candidate execution uses a
 separately compiled native helper installed at the same in-root path.
 Reference-only seeding is separate from candidate execution. The candidate

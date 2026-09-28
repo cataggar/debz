@@ -2,6 +2,7 @@ const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const scripts = @import("native_lifecycle_scripts.zig");
+const removal = @import("native_lifecycle_removal.zig");
 const install_boundaries = @import("native_lifecycle_install_boundaries.zig");
 const conffile_scripts = @import("native_lifecycle_conffile_scripts.zig");
 const statoverride = @import("native_lifecycle_statoverride.zig");
@@ -159,6 +160,7 @@ pub fn main(init: std.process.Init) !void {
     var oracle_only = false;
     var diversions_only = false;
     var install_boundaries_only = false;
+    var removal_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
@@ -175,12 +177,17 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--install-boundaries-only")) {
             if (install_boundaries_only) return error.DuplicateSelector;
             install_boundaries_only = true;
+        } else if (std.mem.eql(u8, option, "--removal-only")) {
+            if (removal_only) return error.DuplicateSelector;
+            removal_only = true;
         } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
             driver = option;
         }
     }
     try validateSelection(driver, oracle_only);
-    if (diversions_only and install_boundaries_only) return error.InvalidArguments;
+    if (@as(u8, @intFromBool(diversions_only)) +
+        @as(u8, @intFromBool(install_boundaries_only)) +
+        @as(u8, @intFromBool(removal_only)) > 1) return error.InvalidArguments;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
@@ -188,6 +195,15 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     fixture.oracle_only = oracle_only;
     const selected = driver orelse "";
+    if (removal_only) {
+        try removal.run(&fixture, selected, reference.executable, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
+    if (!diversions_only) removal.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
     if (!diversions_only) install_boundaries.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
