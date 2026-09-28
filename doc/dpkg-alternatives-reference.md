@@ -618,10 +618,26 @@ successful deferred callbacks, ordinal 3 at step **1428** remained
 `prepared` with **no script outcome**. The signed configure-only procps
 postinst SHA-256
 `7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
-was pending `/usr/lib/sysctl.d`; its separate `triggered` admission is
-unpublished. Native execution returned `InvalidAlternativesScriptAuthority`
+was pending `/usr/lib/sysctl.d`; its separate `triggered` admission was
+not present in #254. Native execution returned `InvalidAlternativesScriptAuthority`
 (exit 8). This root is retained for read-only evidence, never resumed as
 a fresh trial, and does not establish full snapshot parity.
+
+On #254's final squash plus only this procps-trigger admission, a
+separate new root-owned protected 175-package amd64 workspace
+`/var/lib/debz-procps-reference-254/checkout/.real-snapshot/amd64-procps-254-protected-signed-1`
+authenticated the signer and independently checked every SHA-512
+archive and the exact object set. Signed procps postinst step **1428**,
+ordinal **3**, spawned with `["triggered", "/usr/lib/sysctl.d"]`,
+durably exited **0** with zero output and completed `succeeded`;
+procps ended installed. The 78-byte `vtrgb` record retained reference
+SHA-256 `1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`.
+The seven deferred callbacks exited 0, but
+`libglib2.0-0t64` remained self `triggers-awaited`: final closure
+refused with `final_closure_mismatch`, exit **8**. This independently
+authenticated native outcome does not establish pinned-reference
+parity or authorize the separate glib settlement; the interrupted
+root is never reused.
 
 The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
 `4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)
@@ -737,6 +753,39 @@ callback refused before launch at step 1428; this root remains interrupted
 and supplies no full-closure parity claim. The signed lock, independent
 175-archive rehash and next refusal are recorded in the
 [integration roots](integration-roots.md).
+
+The same signed `procps` archive's postinst is pending with
+`["triggered", "/usr/lib/sysctl.d"]`. That exact branch shifts its arguments,
+dispatches `/usr/lib/sysctl.d` to `_update_sysctl`, and exits 0 **before**
+the parameterized `check_alternatives` function can run. `_update_sysctl`
+cannot invoke `sysctl` when `/proc/sys` is absent. In a disposable copy of
+the interrupted root with that path absent, pinned dpkg 1.22.22
+`--triggers-only procps:amd64` exited 0, cleared the pending trigger and
+left both the alternatives-record inventory (SHA-256
+`892dd4d64385f38db6abcdefc197440d1c7cc79441675f2d0072fdf4f435217d`)
+and selector inventory (SHA-256
+`12b2a9e513aec2ff3a1dd768cdd48ae4f9ab1bafed82df02fd68629bdfd2ebe1`)
+unchanged. No `uptime`, `vmstat`, `w`, or `ps` group appeared.
+
+The additional native admission is restricted to a **trigger** action,
+the new-package `procps:amd64` 2:4.0.6-3ubuntu1 postinst with the exact
+script bytes, bound trigger handler and arguments above, and the snapshot
+amd64 `update-alternatives` tool. It still requires all four `.procps`
+providers absent and every group immutable; it also refuses an occupied
+`/proc/sys` before launch and checkpoints that absence through post-exit
+validation. This is not a general trigger or shell-variable allowance:
+different triggers, arguments, scripts, actions, handlers, tools, or
+observed alternatives mutations fail closed. The script's actual outcome
+and unknown-outcome recovery remain unchanged.
+
+An independently authenticated new 175-package root persisted this exact
+procps callback at step 1428, ordinal 3, with exit 0 and zero output;
+its immutable alternatives checkpoint passed and `procps` reached
+`install ok installed`. The overall install nevertheless failed: an earlier
+`console-setup:all postinst configure` at step 1297 exited 10 and left that
+package half-configured. Its later failed receipt is not a procps or
+full-root parity claim. The console-setup failure was addressed separately
+in the subsequent signed script-path admission.
 
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link

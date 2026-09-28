@@ -706,6 +706,17 @@ Private-proc setup failures are non-spawned, and unknown script outcomes
 remain recoverable claims, never inferred successes. Neither the
 systemd boot-ID view nor the procps absent-`/proc/sys` guard changes.
 
+The same exact signed `procps:amd64` postinst admits the single deferred
+`["triggered", "/usr/lib/sysctl.d"]` callback only under its compiled
+new-package handler binding and trigger action. The script exits its
+triggered branch before any alternatives registration; its conditional
+`sysctl` path is ruled out by an absent `/proc/sys`. That absence joins
+the four missing `.procps` providers, the pinned tool, and all immutable
+alternatives records and links in the before/after checkpoint. An occupied
+`/proc/sys`, wrong handler or argument, changed script/tool or alternatives
+state refuses without an inferred successful outcome. The normal journal,
+failure, and unknown-outcome recovery rules still apply.
+
 ### Experimental typed runtime API
 
 `debz.native_runtime` exposes `execute`, `recover`, `recoverWithDeadline`, `readCompletion`, and
