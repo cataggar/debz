@@ -106,6 +106,32 @@ fn archive(fixture: *foundation.Fixture, suite: []const u8, arch: []const u8, se
     }));
 }
 
+fn verifyLockedArchives(fixture: *foundation.Fixture, suite: []const u8, arch: []const u8, lock: debz.exact_lock_v3.Lock) !void {
+    if (lock.repositories.len != 1) return error.UnexpectedSignedRepository;
+    var authenticated: usize = 0;
+    for (lock.packages) |entry| {
+        if (entry.origin != .authenticated_repository) continue;
+        if (entry.archive_identity.primary != .sha512 or entry.archive_identity.digests.sha512 == null or
+            entry.archive_identity.digests.sha256 == null) return error.MissingSignedArchiveIdentity;
+        const selector = try std.fmt.allocPrint(fixture.allocator, "{s}={s}", .{ entry.name, entry.version });
+        defer fixture.allocator.free(selector);
+        const path = try archive(fixture, suite, arch, selector);
+        defer fixture.allocator.free(path);
+        var file = try std.Io.Dir.openFileAbsolute(fixture.io, path, .{
+            .follow_symlinks = false,
+            .allow_directory = false,
+        });
+        defer file.close(fixture.io);
+        var reader = file.reader(fixture.io, &.{});
+        const bytes = try reader.interface.allocRemaining(fixture.allocator, .limited(8 * 1024 * 1024));
+        defer fixture.allocator.free(bytes);
+        if (entry.declared_size != bytes.len) return error.SignedArchiveSizeMismatch;
+        try entry.archive_identity.verify(bytes);
+        authenticated += 1;
+    }
+    if (authenticated == 0) return error.MissingSignedArchiveIdentity;
+}
+
 fn setHold(fixture: *foundation.Fixture, reference: []const u8, root: []const u8, package: []const u8, destination: []const u8) !void {
     const input = try std.fmt.allocPrint(fixture.allocator, "{s}/selection", .{destination});
     try fixture.write(input, try std.fmt.allocPrint(fixture.allocator, "{s} hold\n", .{package}), 0o644);
@@ -282,6 +308,7 @@ fn execute(
     if (!std.mem.eql(u8, core_lock_bytes, family_lock_bytes)) return error.ConsumerLockMismatch;
     var lock = try debz.exact_lock_v3.decode(fixture.allocator, core_lock_bytes, 1024 * 1024);
     defer lock.deinit();
+    try verifyLockedArchives(fixture, suite, arch, lock.lock);
     var lock_doc = try family.parse(fixture, try support.path(fixture.allocator, name, "core.lock.json"), 1024 * 1024);
     defer lock_doc.deinit();
     const digest = try family.string(lock_doc.value, "digest_sha256");

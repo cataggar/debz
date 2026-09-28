@@ -143,6 +143,7 @@ def package_specs(suite: str, architecture: str):
         ("literal-paths-pkg", "1.0-1", architecture, {}, {"literal_paths": True}),
         ("retained-metadata-pkg", "1.0-1", architecture, {"Multi-Arch": "same"}, {"retained_metadata": True}),
         ("pre-app", "1.0-1", architecture, {"Pre-Depends": "base-dep"}, {}),
+        ("pre-fail-app", "1.0-1", architecture, {"Pre-Depends": "fail-script"}, {}),
         ("alt-a", "1.0-1", architecture, {}, {}),
         ("alt-b", "2.0-1", architecture, {}, {}),
         ("alt-consumer", "1.0-1", architecture, {"Depends": "alt-a | alt-b"}, {}),
@@ -207,6 +208,7 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str) -> Non
             "Filename": filename,
             "Size": str(len(deb)),
             "SHA256": digest,
+            "SHA512": hashlib.sha512(deb).hexdigest(),
             "Description": f"debz hermetic fixture {package}",
         }
         paragraphs.append("".join(f"{key}: {value}\n" for key, value in paragraph.items()).encode() + b"\n")

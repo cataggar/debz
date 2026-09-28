@@ -171,6 +171,7 @@ pub const ParityCase = struct {
 
 pub const parity_cases = [_]ParityCase{
     .{ .id = "pre-depends", .package = "pre-app", .archives = &.{ "base-dep", "pre-app" }, .reference_phases = &.{ &.{"base-dep"}, &.{"pre-app"} } },
+    .{ .id = "pre-depends-known-failure", .package = "pre-fail-app", .archives = &.{ "fail-script", "pre-fail-app" }, .reference_phases = &.{&.{"fail-script"}}, .exit_status = 7 },
     .{ .id = "virtual-provides", .package = "virtual-consumer", .archives = &.{ "virtual-provider=2.0-1", "virtual-consumer" } },
     .{ .id = "dependency-cycle", .package = "cycle-a", .archives = &.{ "cycle-a", "cycle-b" } },
     .{ .id = "without-recommends", .package = "scenario-main", .archives = &.{ "base-dep", "scenario-main" } },

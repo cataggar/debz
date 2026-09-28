@@ -396,6 +396,46 @@ Advanced fixtures exercise:
   recovery evidence rather than accepting the changed database as its own
   expected result.
 
+### Install-side differential inventory (#266)
+
+These are executed fixture cases, not corpus labels or program-only checks.
+`test-native-lifecycle-zig` uses independently initialized, guarded roots,
+the hash-pinned dpkg reference and exact `status`/`status-old`, `info`,
+filesystem and length-prefixed script-trace snapshots. The signed consumer
+cases additionally compare core and FAMILY to pinned dpkg on distinct roots,
+using identical authenticated v3 locks. Every signed repository archive now
+publishes SHA-256, SHA-512 and Size; the Zig runner independently rehashes both
+digests and checks the declared byte count for every locked repository archive.
+The pinned reference's executable SHA-256 and version remain checked before
+each run.
+
+| Boundary | Executed evidence and result |
+| --- | --- |
+| Fresh install, unpack/configure and configure retry | `fresh-install`, `script-upgrade-unconfigured`, `fresh-postinst-failure/configure`, and signed `pre-depends` and `known-script-failure`: real dpkg/native roots and exact script/data/database captures match. |
+| Nonzero scripts and dependency failure | `fresh-preinst-failure`, `fresh-postinst-failure`, `pre-depends-provider-{preinst,postinst}-failure`: provider failure stops before the consumer preinst on both roots, with exact exit outcome, status, files and trace equality. Signed `pre-depends-known-failure` runs in both Debian-stable and Ubuntu-26.04 suites: public CLI exits 7, FAMILY reports `transaction`, dpkg exits 1, and failed roots/receipts match. |
+| Conffile conflict decisions | `script-conffile-{keep_existing,use_package_version}`, `conffile-configure-retry-*` and signed `conffile-{keep,replace}`: edited conffiles, `.dpkg-*` companions, statuses and script trace are compared under both policies. |
+| `Pre-Depends` barrier and dependency cycle | `script-pre-depends-barrier`, `script-dependency-cycle`, signed `pre-depends` and `dependency-cycle`: script order/arguments and final root captures match. |
+| Competing ownership | `replaces-competing-file-owner` matches dpkg's displacement and installed database. In `unreplaced-competing-file-owner`, dpkg exits 1 with the actual path/owner diagnostic; native refuses `ownership_conflict` before mutation, clears its preflight operation record and runs no script. This unsupported failure is **not** claimed as dpkg-root parity. |
+| Unsupported archive path | `unsupported-fifo-payload` builds a real FIFO-bearing archive. Pinned dpkg exits 0 and installs a FIFO; native refuses `archive_payload_unsupported_file_type` before any root mutation/script. This is a measured difference, **not** normalized parity; FIFO support is tracked in [#288](https://github.com/cataggar/debz/issues/288) before any FIFO-bearing #270–#273 claim. |
+| Unknown script return | `script-outcome-unknown` and `core-unknown-script-return` retain in-flight script identity/recovery ownership and refuse a second mutation; the known nonzero outcome above has dpkg parity. A pinned dpkg *post-return/pre-outcome-record* root is not a comparable dpkg terminal state, so unknown-outcome roots are not represented as parity matches; the transition inventory remains [#267](https://github.com/cataggar/debz/issues/267). |
+
+For a focused local run of the new lifecycle family:
+
+```sh
+reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+zig build build-native-acceptance-zig -j2
+sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" \
+  zig-out/bin/native-lifecycle-zig-acceptance \
+  zig-out/bin/native-lifecycle-fixture-driver --install-boundaries-only \
+  --reference-dpkg "$reference_dpkg"
+```
+
+Add `--oracle-only` and omit the driver to compare two pinned-dpkg roots.
+The standard `test-native-lifecycle-zig` and
+`test-native-recovery-zig-parity` targets keep these cases in the full gate;
+the focused selector never counts as that gate. No unsupported result is
+retried against a failed root as if fresh.
+
 Two clock exceptions are bounded and retain raw snapshots. During
 double-postrm upgrade failure, only an explicitly selected recreated symlink
 may have its original mtime or a timestamp inside the measured operation
