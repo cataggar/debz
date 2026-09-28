@@ -45,6 +45,53 @@ awaited state rather than claim that every package is installed. Dynamic
 script activations are constrained by bound trigger-handler identity and
 script evidence; they are not a free-form script-execution capability.
 
+## Automatic file interests owned by the source
+
+The signed `libglib2.0-0t64:amd64` `2.90.0-1` archive (SHA-512
+`1ce37ac69b92ea9521c93f76aed4ba1a28962abf10481d474ee909ed5d2649596e8e059efcb9f938b97ecea451828274dbb61651c7d014fe1a6a028ce046e79c`)
+owns empty `/usr/share/glib-2.0/schemas` and
+`/usr/lib/x86_64-linux-gnu/gio/modules` directories. Its signed
+124-byte `.triggers` (SHA-256
+`7ad0cfea75305b62f9ac8daf97f4304d922a54afb9713b7493aeb285336b9a91`)
+registers awaited interest in the first and no-await interest in the
+second. A fresh authenticated native 175-package run incorrectly emitted
+both as *automatic self* activations. After its signed
+`postinst triggered` callback exited 0, an own-name awaited edge remained
+in status; final closure refused rather than silently accepting it.
+
+Pinned dpkg 1.22.22 on protected disposable copies of an independently
+authenticated prestate established the distinction. After a fixture-only
+forced purge removed glib and both directories, no-force unpack and
+configure of the signed glib archive succeeded with **no** self pending
+or awaited edge. Re-unpack after removing the empty schema directory
+with glib's interest already registered also produced no self edge.
+Conversely, a separate directory-only package recreating the directory,
+and a separate regular-file package installing a schema there, each
+made glib `triggers-pending`. The latter package became
+`triggers-awaited`; pinned dpkg's exact glib callback exited 0 and
+settled both statuses to installed. Thus directory activations are real;
+neither suppressing directory triggers nor waiving self-await at closure
+matches the reference.
+
+Only *automatic file-trigger* emission excludes the source package's
+own listener with the same normalized architecture. Other listeners on
+that path, including distinct architectures, still receive events.
+Explicit named package activations, helper-queued dynamic activations,
+handler execution, and awaited-settlement rules are unchanged.
+The exclusion applies before the bound activation journal is published;
+recovery must restore its exact prefix and reject a forged self event.
+Interrupted roots that already recorded a self event are not silently
+reinterpreted or retried as fresh.
+
+An independently refreshed, SHA-512-rehashed 175-package amd64 root
+subsequently completed with all packages installed and an exact-match
+native receipt. Its sealed 81-event journal contained no automatic file
+self listener; the glib source retained its separate `ldconfig` event.
+Five real deferred callbacks succeeded, and the package trigger queue
+was empty. The earlier pinned dpkg proof establishes the glib-specific
+semantics; a full bounded native/reference root comparison remains
+separate work.
+
 An interested package need not ship `postinst`. Native authorization, compiled
 programs and helper authority represent its observed absence with an explicit
 `postinst_sha256: null`, still binding package/version/architecture, source and

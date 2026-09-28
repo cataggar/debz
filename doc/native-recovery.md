@@ -323,6 +323,14 @@ Absent-postinst handlers journal only their database transition, never a
 fabricated script outcome. Restart continues the remaining handler database
 phases without reusing completed phase identities.
 
+Automatic file activations omit an interested package acting on its own
+files *before* their trigger-event journal is published. Other listeners
+remain in that same bound event. A resumed run restores exactly the
+persisted listener set and source identity; substituting a self listener
+in an already recorded activation fails the append-only prefix check.
+This does not rewrite older interrupted roots or erase a genuine dynamic
+self activation.
+
 ## Provenance and completion
 
 ### Private v1 operation ownership

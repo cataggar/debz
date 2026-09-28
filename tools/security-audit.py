@@ -932,6 +932,18 @@ def audit_production_sources() -> None:
     ):
         if required not in unpack:
             fail(f"reviewed signed python3 root and output proof changed: {required}")
+    for required in (
+        "fn appendAutomaticFileTriggerEvent(",
+        "std.mem.eql(u8, interest.package.name, source.name)",
+        "interest.package.architecture.len == 0 and",
+        "std.mem.eql(u8, source.architecture, native_architecture)",
+        "try eligible.append(allocator, interest);",
+        "appendAutomaticFileTriggerEvent(\n            event_allocator,",
+        "appendAutomaticFileTriggerEvent(\n            allocator,\n            sink.events,",
+        "persistRuntimeTriggerEvents(&resumed, testing.allocator, root, &.{forged})",
+    ):
+        if required not in unpack:
+            fail(f"reviewed automatic file-trigger self-interest boundary changed: {required}")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")

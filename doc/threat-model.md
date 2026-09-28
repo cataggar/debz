@@ -111,6 +111,14 @@ signed-minimal link,
 nonempty HTML cleanup target or live `/proc` refuses before launch.
 After-launch divergence requires recovery, not a successful return.
 
+Automatic file-trigger collection excludes only the listener matching
+the source package and normalized architecture. This mirrors pinned dpkg
+for signed glib's own schema and module directories; external listeners
+on the same path and dynamic or explicitly declared activations remain
+authorized. The exclusion occurs before event-journal publication, so
+recovery cannot silently reinterpret or remove an existing activation.
+Final closure still rejects unmatched pending or awaited edges.
+
 The future `debz apt` facade has a separate Linux-only live-root boundary
 (`src/live_root.zig`). It never weakens the product backend's host-root denial:
 the backend still receives `allow_host_root = false` and the stable alternate

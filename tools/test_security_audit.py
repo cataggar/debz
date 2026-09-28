@@ -416,6 +416,18 @@ class SecurityAuditTests(unittest.TestCase):
             "observed.entry.mode != 0o600 and observed.entry.mode != 0o644",
             sources["src/native_unpack.zig"],
         )
+        self.assertIn(
+            "fn appendAutomaticFileTriggerEvent(",
+            sources["src/native_unpack.zig"],
+        )
+        self.assertIn(
+            "appendAutomaticFileTriggerEvent(\n            allocator,\n            sink.events,",
+            sources["src/native_unpack.zig"],
+        )
+        self.assertIn(
+            "persistRuntimeTriggerEvents(&resumed, testing.allocator, root, &.{forged})",
+            sources["src/native_unpack.zig"],
+        )
         capability_owners = sorted({
             relative
             for relative, text in sources.items()
