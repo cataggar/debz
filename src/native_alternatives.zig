@@ -1132,6 +1132,9 @@ const snapshot_util_linux_postinst_sha256 = digestLiteral(
 const snapshot_console_setup_linux_postinst_sha256 = digestLiteral(
     "5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a",
 );
+const snapshot_python3_preinst_sha256 = digestLiteral(
+    "115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f",
+);
 
 pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     var sha256: [32]u8 = undefined;
@@ -1139,6 +1142,16 @@ pub fn matchesSnapshotLessPreinst(bytes: []const u8) bool {
     return std.crypto.timing_safe.eql(
         [32]u8,
         snapshot_less_preinst_sha256,
+        sha256,
+    );
+}
+
+pub fn matchesSnapshotPython3Preinst(bytes: []const u8) bool {
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return std.crypto.timing_safe.eql(
+        [32]u8,
+        snapshot_python3_preinst_sha256,
         sha256,
     );
 }
@@ -1506,6 +1519,24 @@ pub fn discoverScriptAuthority(
             .paths = &.{},
             .immutable_targets = try owned.dupe([]const u8, targets),
             .require_targets_absent = true,
+            .arena = storage.arena,
+            .backing_allocator = allocator,
+        };
+    }
+    if (matchesSnapshotPython3Preinst(bytes)) {
+        // The pinned tool rejects the literal absolute name before changing state.
+        return .{
+            .groups = &.{},
+            .commands = &.{},
+            .paths = &.{"dev/null"},
+            .immutable_targets = &.{
+                "/usr/bin/python3",
+                "/usr/share/doc/python3/html",
+                "/usr/bin/sh",
+                "/usr/bin/rm",
+                "/var/lib/dpkg/info/python3.preinst",
+                "/var/lib/dpkg/info/python3-minimal.list",
+            },
             .arena = storage.arena,
             .backing_allocator = allocator,
         };
@@ -3752,6 +3783,116 @@ test "native_alternatives.test.snapshot less preinst pins one quiet removal" {
             discoverScriptAuthority(testing.allocator, bytes, .{}),
         );
     }
+}
+
+test "native_alternatives.test.signed python3 install preinst has no alternatives transition" {
+    const testing = std.testing;
+    const signed = @embedFile("fixtures/ubuntu-stonking-python3-3.14.7-3.preinst");
+    try testing.expectEqual(@as(usize, 856), signed.len);
+    try testing.expect(matchesSnapshotPython3Preinst(signed));
+    var script = try discoverScriptAuthority(testing.allocator, signed, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 0), script.groups.len);
+    try testing.expectEqual(@as(usize, 0), script.commands.len);
+    try testing.expectEqual(@as(usize, 1), script.paths.len);
+    try testing.expectEqualStrings("dev/null", script.paths[0]);
+    try testing.expectEqual(@as(usize, 6), script.immutable_targets.len);
+    try testing.expectEqualStrings(
+        "/usr/share/doc/python3/html",
+        script.immutable_targets[1],
+    );
+    for ([_][]const u8{
+        "update-alternatives --auto /usr/bin/python3 >/dev/null 2>&1 || true\n",
+        "#!/bin/sh\nupdate-alternatives --auto /usr/bin/python3 >/dev/null 2>&1 || true\n",
+        "#!/bin/sh\nupdate-alternatives --auto python3 || true\n",
+        "#!/bin/sh\nupdate-alternatives --auto /usr/bin/python3 || true\n",
+        "#!/bin/sh\nupdate-alternatives --auto /usr/bin/python3 >/dev/null 2>&1\n",
+    }) |altered| {
+        try testing.expect(!matchesSnapshotPython3Preinst(altered));
+        try testing.expectError(
+            error.InvalidAlternativesScript,
+            discoverScriptAuthority(testing.allocator, altered, .{}),
+        );
+    }
+    const modified = try testing.allocator.dupe(u8, signed);
+    defer testing.allocator.free(modified);
+    modified[modified.len - 1] = ' ';
+    try testing.expect(!matchesSnapshotPython3Preinst(modified));
+    try testing.expectError(
+        error.InvalidAlternativesScript,
+        discoverScriptAuthority(testing.allocator, modified, .{}),
+    );
+}
+
+test "native_alternatives.test.protected signed python3 preinst preserves all records and selectors" {
+    const testing = std.testing;
+    const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") orelse return;
+    const after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER") orelse
+        return error.TestUnexpectedResult;
+    var before_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
+    defer before_root.close();
+    var after_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
+    defer after_root.close();
+    var script = try discoverScriptAuthority(
+        testing.allocator,
+        @embedFile("fixtures/ubuntu-stonking-python3-3.14.7-3.preinst"),
+        .{},
+    );
+    defer script.deinit();
+    var listed = try listGroups(testing.allocator, before_root.root, .{});
+    defer listed.deinit();
+    try testing.expectEqual(@as(usize, 14), listed.names.len);
+    const groups = try testing.allocator.alloc(GroupAuthority, listed.names.len);
+    defer testing.allocator.free(groups);
+    for (listed.names, groups) |name, *allowed|
+        allowed.* = .{ .name = name, .mutable = false };
+    const authority: Authority = .{ .groups = groups };
+    var before = try capture(testing.allocator, before_root.root, authority);
+    defer before.deinit();
+    try testing.expect(before.group("python3") == null);
+    var inputs = try captureScriptInputs(testing.allocator, before_root.root, script, before, .{});
+    defer inputs.deinit();
+    try validateScriptInputs(testing.allocator, before_root.root, script, before, inputs, .{});
+    var same = try capture(testing.allocator, before_root.root, authority);
+    defer same.deinit();
+    try validateScriptTransition(testing.allocator, before, same, script, authority);
+    var after = try capture(testing.allocator, after_root.root, authority);
+    defer after.deinit();
+    try testing.expect(after.group("python3") == null);
+    for (listed.names) |name| {
+        const path = try std.fmt.allocPrint(
+            testing.allocator,
+            "{s}/{s}",
+            .{ database_directory, name },
+        );
+        defer testing.allocator.free(path);
+        const old_record = try before_root.root.readFileAlloc(
+            testing.allocator,
+            try root_fs.Path.init(path),
+            1024 * 1024,
+        );
+        defer testing.allocator.free(old_record);
+        const new_record = try after_root.root.readFileAlloc(
+            testing.allocator,
+            try root_fs.Path.init(path),
+            1024 * 1024,
+        );
+        defer testing.allocator.free(new_record);
+        try testing.expectEqualSlices(u8, old_record, new_record);
+        try testing.expectEqualStrings(
+            before.group(name).?.selected,
+            after.group(name).?.selected,
+        );
+    }
+    const forged_groups = try testing.allocator.dupe(GroupState, before.groups);
+    defer testing.allocator.free(forged_groups);
+    forged_groups[0].digest[0] ^= 1;
+    var forged_after = before;
+    forged_after.groups = forged_groups;
+    try testing.expectError(
+        error.AlternativesStateChanged,
+        validateScriptTransition(testing.allocator, before, forged_after, script, authority),
+    );
 }
 
 test "native_alternatives.test.snapshot less postinst pins one quiet install" {

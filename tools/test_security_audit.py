@@ -396,6 +396,26 @@ class SecurityAuditTests(unittest.TestCase):
             "verifySnapshotSudoStructuralOwner(allocator, root, program)",
             sources["src/native_unpack.zig"],
         )
+        self.assertIn(
+            "if (matchesSnapshotPython3Preinst(bytes)) {",
+            sources["src/native_alternatives.zig"],
+        )
+        self.assertIn(
+            '.paths = &.{"dev/null"}',
+            sources["src/native_alternatives.zig"],
+        )
+        self.assertIn(
+            "verifySnapshotPython3PreinstInputs(allocator, root, program)",
+            sources["src/native_unpack.zig"],
+        )
+        self.assertIn(
+            "verifySnapshotPython3NullOutput(allocator, root)",
+            sources["src/native_unpack.zig"],
+        )
+        self.assertIn(
+            "observed.entry.mode != 0o600 and observed.entry.mode != 0o644",
+            sources["src/native_unpack.zig"],
+        )
         capability_owners = sorted({
             relative
             for relative, text in sources.items()

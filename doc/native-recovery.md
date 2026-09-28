@@ -289,6 +289,17 @@ of one root or change persisted action identities.
 | Exact recorded launcher outcome | Consume the original outcome once, without rerunning the script. |
 | Continuation checkpoint | Follow the recorded compiler branch and native phase state. |
 
+The signed python3 install-only preinst has an additional exact witness
+before an exit-0 outcome can be persisted: its initially empty, pinned
+root-owned regular `/dev/null` (exact pre/post mode 0600 or 0644)
+must contain the 96-byte diagnostic of the
+snapshot-pinned alternatives tool rejecting `/usr/bin/python3` as an
+invalid name. This file is part of the managed checkpoint. If the child
+launched but the witness, tool, or immutable alternatives state differs,
+the attempt requires recovery after mutation; neither `|| true` nor a
+zero script exit can fabricate a settled outcome. An unknown script
+outcome is never replayed.
+
 A recorded `not_started` result is an outcome governed by the original
 failure/continuation policy, not permission to invent a retry. Missing trace
 output is never proof that a child did not start. Exact script source/version,

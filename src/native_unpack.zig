@@ -17726,6 +17726,8 @@ const snapshot_udev_postinst_sha256 =
 
 const snapshot_sudo_postinst_sha256 =
     "e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8";
+const snapshot_python3_preinst_sha256 =
+    "115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f";
 
 fn snapshotSudoProcIsBound(
     architecture: []const u8,
@@ -17746,6 +17748,55 @@ fn snapshotSudoProcIsBound(
         arguments.len == 2 and
         std.mem.eql(u8, arguments[0], "configure") and
         arguments[1].len == 0;
+}
+
+fn snapshotPython3PreinstIsBound(
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    action_kind: native_recovery.ActionKind,
+    script_sha256: native_program.Digest,
+    arguments: []const []const u8,
+) bool {
+    return std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.name, "python3") and
+        std.mem.eql(u8, package.version, "3.14.7-3") and
+        std.mem.eql(u8, package.architecture, "amd64") and
+        kind == .preinst and source == .new_package and
+        action_kind == .script and
+        std.mem.eql(u8, &script_sha256, snapshot_python3_preinst_sha256) and
+        arguments.len == 1 and
+        std.mem.eql(u8, arguments[0], "install");
+}
+
+fn snapshotPython3PreinstCandidate(
+    candidate: []const u8,
+    installed: []const u8,
+) ?SignedDebconfPostinstCandidate {
+    if (!std.mem.eql(u8, installed, "var/lib/dpkg/info/python3.preinst"))
+        return null;
+    if (std.mem.eql(u8, candidate, installed)) return .installed;
+    if (std.mem.eql(u8, candidate, lifecycle_tmp_ci ++ "/python3.preinst"))
+        return .staged;
+    return null;
+}
+
+fn verifySnapshotPython3PreinstPaths(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    candidate: []const u8,
+    installed: []const u8,
+) !void {
+    _ = snapshotPython3PreinstCandidate(candidate, installed) orelse
+        return error.InvalidPython3PreinstControl;
+    for ([_][]const u8{ candidate, installed }) |path|
+        try verifySignedDebconfControlFile(allocator, root, .{
+            .path = path,
+            .size = 856,
+            .mode = 0o755,
+            .sha256 = snapshot_python3_preinst_sha256,
+        }, error.InvalidPython3PreinstControl);
 }
 
 fn verifySnapshotSudoPostinstPaths(
@@ -18075,6 +18126,113 @@ test "native_unpack.test.signed sudo PID-only proc requires exact configure and 
         error.InstalledScriptMismatch,
         verifySnapshotSudoPostinstPaths(testing.allocator, root, staged, installed, expected),
     );
+}
+
+test "native_unpack.test.signed python3 preinst is inert only for exact install identity" {
+    const script = @embedFile("fixtures/ubuntu-stonking-python3-3.14.7-3.preinst");
+    const package: native_program.PackageIdentity = .{
+        .name = "python3",
+        .version = "3.14.7-3",
+        .architecture = "amd64",
+    };
+    const digest: native_program.Digest = snapshot_python3_preinst_sha256.*;
+    const args: []const []const u8 = &.{"install"};
+    try testing.expect(snapshotPython3PreinstIsBound(
+        "amd64",
+        package,
+        .preinst,
+        .new_package,
+        .script,
+        digest,
+        args,
+    ));
+    try testing.expect(try snapshotPython3PreinstIsInert(
+        script,
+        "amd64",
+        package,
+        .preinst,
+        .new_package,
+        args,
+        .script,
+    ));
+    try testing.expect(!(try snapshotPython3PreinstIsInert(
+        "update-alternatives --auto /usr/bin/python3 || true\n",
+        "amd64",
+        package,
+        .preinst,
+        .new_package,
+        args,
+        .script,
+    )));
+    try testing.expect(!snapshotPython3PreinstIsBound(
+        "amd64",
+        package,
+        .preinst,
+        .new_package,
+        .script,
+        @splat('0'),
+        args,
+    ));
+    for ([_]struct {
+        architecture: []const u8 = "amd64",
+        package: native_program.PackageIdentity = package,
+        kind: maintainer_script.Kind = .preinst,
+        source: native_program.ScriptSource = .new_package,
+        action_kind: native_recovery.ActionKind = .script,
+        digest: native_program.Digest = digest,
+        arguments: []const []const u8 = args,
+    }{
+        .{ .architecture = "arm64" },
+        .{ .package = .{ .name = "python3-minimal", .version = package.version, .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "3.14.7-4", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
+        .{ .kind = .postinst },
+        .{ .source = .installed_package },
+        .{ .action_kind = .trigger },
+        .{ .arguments = &.{} },
+        .{ .arguments = &.{ "install", "" } },
+        .{ .arguments = &.{ "upgrade", "3.14.7-3" } },
+    }) |case| {
+        try testing.expect(!snapshotPython3PreinstIsBound(
+            case.architecture,
+            case.package,
+            case.kind,
+            case.source,
+            case.action_kind,
+            case.digest,
+            case.arguments,
+        ));
+        try testing.expectError(
+            error.InvalidAlternativesScriptAuthority,
+            snapshotPython3PreinstIsInert(
+                script,
+                case.architecture,
+                case.package,
+                case.kind,
+                case.source,
+                case.arguments,
+                case.action_kind,
+            ),
+        );
+    }
+    const installed = "var/lib/dpkg/info/python3.preinst";
+    const staged = lifecycle_tmp_ci ++ "/python3.preinst";
+    try testing.expectEqual(
+        SignedDebconfPostinstCandidate.installed,
+        snapshotPython3PreinstCandidate(installed, installed).?,
+    );
+    try testing.expectEqual(
+        SignedDebconfPostinstCandidate.staged,
+        snapshotPython3PreinstCandidate(staged, installed).?,
+    );
+    for ([_][]const u8{
+        "var/lib/dpkg/tmp.ci/python3.preinst",
+        lifecycle_tmp_ci ++ "/other.preinst",
+        "var/lib/dpkg/info/other.preinst",
+    }) |wrong| try testing.expect(
+        snapshotPython3PreinstCandidate(wrong, installed) == null,
+    );
+    try testing.expect(snapshotPython3PreinstCandidate(staged, staged) == null);
 }
 
 fn publishTriggerAuthority(
@@ -19384,15 +19542,19 @@ fn snapshotChronyPostinstUsesInfo(
         arguments[1].len == 0;
 }
 
-const SnapshotDebconfControlError =
-    error{ InvalidConsoleSetupPostinstControl, InvalidChronyPostinstControl };
+const SignedSnapshotControlError =
+    error{
+        InvalidConsoleSetupPostinstControl,
+        InvalidChronyPostinstControl,
+        InvalidPython3PreinstControl,
+    };
 
 fn verifyAuthenticatedSnapshotArtifact(
     artifacts: []const native_program.ProgramArtifact,
     package: native_program.PackageIdentity,
     expected_size: u64,
     sha512: []const u8,
-    invalid: SnapshotDebconfControlError,
+    invalid: SignedSnapshotControlError,
 ) !void {
     const expected = (try content_digest.Value.parse(
         .sha512,
@@ -19468,7 +19630,7 @@ fn verifySignedDebconfControlFile(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     binding: SignedDebconfControlFile,
-    invalid: SnapshotDebconfControlError,
+    invalid: SignedSnapshotControlError,
 ) !void {
     var pinned = try root.pinRegularFile(try root_fs.Path.init(binding.path));
     defer pinned.close();
@@ -20343,6 +20505,28 @@ fn snapshotLessPreinstIsInert(
     return true;
 }
 
+fn snapshotPython3PreinstIsInert(
+    bytes: []const u8,
+    architecture: []const u8,
+    package: native_program.PackageIdentity,
+    kind: maintainer_script.Kind,
+    source: native_program.ScriptSource,
+    arguments: []const []const u8,
+    action_kind: native_recovery.ActionKind,
+) !bool {
+    if (!native_alternatives.matchesSnapshotPython3Preinst(bytes)) return false;
+    if (!snapshotPython3PreinstIsBound(
+        architecture,
+        package,
+        kind,
+        source,
+        action_kind,
+        snapshot_python3_preinst_sha256.*,
+        arguments,
+    )) return error.InvalidAlternativesScriptAuthority;
+    return true;
+}
+
 fn snapshotLessPostinstIsBound(
     bytes: []const u8,
     architecture: []const u8,
@@ -20736,6 +20920,278 @@ fn verifySnapshotSudoStructuralOwner(
             !std.mem.eql(u8, observed.target, expected.target))
             return error.InvalidAlternativesScriptAuthority;
     }
+}
+
+fn verifySnapshotPython3PreinstInputs(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+) !void {
+    const linux = std.os.linux;
+    var root_stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(
+        root.dir.handle,
+        "",
+        linux.AT.EMPTY_PATH,
+        .BASIC_STATS,
+        &root_stat,
+    )) != .SUCCESS) return error.InvalidPython3PreinstControl;
+    const required: linux.STATX = .{
+        .TYPE = true,
+        .MODE = true,
+        .UID = true,
+        .GID = true,
+    };
+    const bits: u32 = @bitCast(required);
+    if (@as(u32, @bitCast(root_stat.mask)) & bits != bits or
+        root_stat.uid != 0 or root_stat.gid != 0 or
+        root_stat.mode != 0o40700)
+        return error.InvalidPython3PreinstControl;
+
+    for ([_]struct { path: []const u8, empty: bool = false }{
+        .{ .path = "dev" },
+        .{ .path = "proc", .empty = true },
+        .{ .path = "usr/share/doc/python3" },
+    }) |binding| {
+        var directory = try root.pinDirectory(try root_fs.Path.init(binding.path));
+        defer directory.close();
+        const entry = (try directory.metadata()).entry;
+        if (!entry.modeled or entry.kind != .directory or
+            entry.mode != 0o755 or entry.uid != 0 or entry.gid != 0)
+            return error.InvalidPython3PreinstControl;
+        if (binding.empty) {
+            var contents = try directory.observeAlloc(allocator, 0, 0);
+            contents.deinit();
+        }
+    }
+    if (try root.entryIfExists(
+        try root_fs.Path.init("usr/share/doc/python3/html"),
+    ) != null) return error.InvalidPython3PreinstControl;
+    for ([_][]const u8{ "usr/sbin/update-alternatives", "usr/sbin/rm" }) |shadow| {
+        if (try root.entryIfExists(try root_fs.Path.init(shadow)) != null)
+            return error.InvalidPython3PreinstControl;
+    }
+    for ([_]struct { path: []const u8, target: []const u8 }{
+        .{ .path = "bin", .target = "usr/bin" },
+        .{ .path = "sbin", .target = "usr/sbin" },
+        .{ .path = "usr/bin/sh", .target = "dash" },
+        .{ .path = "usr/bin/rm", .target = "gnurm" },
+        .{ .path = "usr/bin/python3", .target = "python3.14" },
+    }) |binding| {
+        var link = try root.pinSymbolicLink(try root_fs.Path.init(binding.path));
+        defer link.close();
+        var buffer: [64]u8 = undefined;
+        const observed = try link.observe(&buffer);
+        if (!observed.entry.modeled or observed.entry.uid != 0 or
+            observed.entry.gid != 0 or observed.entry.mode != 0o777 or
+            observed.entry.link_count != 1 or
+            observed.entry.size != binding.target.len or
+            !std.mem.eql(u8, observed.target, binding.target))
+            return error.InvalidPython3PreinstControl;
+    }
+    for ([_]struct {
+        package: native_program.PackageIdentity,
+        size: u64,
+        sha512: []const u8,
+    }{
+        .{
+            .package = .{ .name = "python3", .version = "3.14.7-3", .architecture = "amd64" },
+            .size = 23672,
+            .sha512 = "1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6",
+        },
+        .{
+            .package = .{ .name = "python3-minimal", .version = "3.14.7-3", .architecture = "amd64" },
+            .size = 25858,
+            .sha512 = "3a23950e7a9bb65cf6e40a97bb05f7a7402c04d7167f2bc4d152c05ff8abaee45cbdbc298e937d3a0ff5c49758537e92a4f8880a1aec7629274a4790eae38bdf",
+        },
+    }) |binding| try verifyAuthenticatedSnapshotArtifact(
+        program.artifacts,
+        binding.package,
+        binding.size,
+        binding.sha512,
+        error.InvalidPython3PreinstControl,
+    );
+    for ([_]SignedDebconfControlFile{
+        .{ .path = "var/lib/dpkg/info/python3.preinst", .size = 856, .mode = 0o755, .sha256 = snapshot_python3_preinst_sha256 },
+        .{ .path = "var/lib/dpkg/info/python3.list", .size = 918, .mode = 0o644, .sha256 = "d830caf623e35ec940e8f6d185455faa601a627052b1daffe3e4741b960bb1a3" },
+        .{ .path = "var/lib/dpkg/info/python3-minimal.list", .size = 781, .mode = 0o644, .sha256 = "a0d9c1023aeef88ea89781862449be6b65cf84157b7d894aacd0c536b0940ba8" },
+        .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
+        .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "c734a13ce654834fad2af9066cc637e25e6228daa6a9b8ee247bd7d67382e61e" },
+    }) |binding| try verifySignedDebconfControlFile(
+        allocator,
+        root,
+        binding,
+        error.InvalidPython3PreinstControl,
+    );
+    try verifySnapshotPython3NullFile(
+        allocator,
+        root,
+        0,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    );
+}
+
+fn verifySnapshotPython3NullFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    size: u64,
+    sha256: []const u8,
+) !void {
+    var pinned = try root.pinRegularFile(try root_fs.Path.init("dev/null"));
+    defer pinned.close();
+    const observed = try pinned.observeStableAlloc(allocator, 1024 * 1024);
+    defer allocator.free(observed.bytes);
+    if (observed.entry.mode != 0o600 and observed.entry.mode != 0o644)
+        return error.InvalidPython3PreinstControl;
+    var digest: [32]u8 = undefined;
+    Sha256.hash(observed.bytes, &digest, .{});
+    if (!matchesSignedDebconfControlFile(observed.entry, digest, .{
+        .path = "dev/null",
+        .size = size,
+        .mode = @intCast(observed.entry.mode),
+        .sha256 = sha256,
+    })) return error.InvalidPython3PreinstControl;
+}
+
+fn verifySnapshotPython3NullOutput(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !void {
+    try verifySnapshotPython3NullFile(
+        allocator,
+        root,
+        96,
+        "3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc",
+    );
+}
+
+test "native_unpack.test.protected signed python3 inputs and redirected tool witness are exact" {
+    const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") orelse return;
+    const after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER") orelse
+        return error.TestUnexpectedResult;
+    const before_0644_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_0644") orelse
+        return error.TestUnexpectedResult;
+    const after_0644_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644") orelse
+        return error.TestUnexpectedResult;
+    var before = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
+    defer before.close();
+    var after = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
+    defer after.close();
+    var before_0644 = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_0644_path));
+    defer before_0644.close();
+    var after_0644 = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_0644_path));
+    defer after_0644.close();
+    const identities = [_]struct {
+        package: native_program.PackageIdentity,
+        size: u64,
+        sha512: []const u8,
+    }{
+        .{
+            .package = .{ .name = "python3", .version = "3.14.7-3", .architecture = "amd64" },
+            .size = 23672,
+            .sha512 = "1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6",
+        },
+        .{
+            .package = .{ .name = "python3-minimal", .version = "3.14.7-3", .architecture = "amd64" },
+            .size = 25858,
+            .sha512 = "3a23950e7a9bb65cf6e40a97bb05f7a7402c04d7167f2bc4d152c05ff8abaee45cbdbc298e937d3a0ff5c49758537e92a4f8880a1aec7629274a4790eae38bdf",
+        },
+    };
+    var artifacts: [identities.len]native_program.ProgramArtifact = undefined;
+    for (identities, &artifacts, 0..) |binding, *artifact, index| {
+        const digest = (try content_digest.Value.parse(.sha512, binding.sha512)).sha512;
+        artifact.* = .{
+            .index = @intCast(index),
+            .package = binding.package,
+            .archive_identity = content_digest.JsonIdentity.init(
+                try content_digest.Identity.init(.{ .sha512 = digest }, .sha512),
+            ),
+            .size = binding.size,
+            .application_sha256 = @splat('0'),
+            .origin_v2 = .{ .authenticated_repository = .{
+                .repository_id = @splat('0'),
+                .repository_snapshot_sha256 = @splat('0'),
+            } },
+        };
+    }
+    var program: native_program.Program = undefined;
+    program.artifacts = &artifacts;
+    try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);
+    try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);
+    try verifySnapshotPython3PreinstPaths(
+        testing.allocator,
+        before.root,
+        "var/lib/dpkg/info/python3.preinst",
+        "var/lib/dpkg/info/python3.preinst",
+    );
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullOutput(testing.allocator, before.root),
+    );
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullOutput(testing.allocator, before_0644.root),
+    );
+    try verifySnapshotPython3NullOutput(testing.allocator, after.root);
+    try verifySnapshotPython3NullOutput(testing.allocator, after_0644.root);
+
+    program.artifacts = artifacts[0..1];
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program),
+    );
+    var altered = artifacts;
+    altered[1].size += 1;
+    program.artifacts = &altered;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program),
+    );
+    altered = artifacts;
+    altered[0].origin_v2 = null;
+    program.artifacts = &altered;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program),
+    );
+    altered = artifacts;
+    var forged = (try content_digest.Value.parse(.sha512, identities[0].sha512)).sha512;
+    forged[0] ^= 1;
+    altered[0].archive_identity = content_digest.JsonIdentity.init(
+        try content_digest.Identity.init(.{ .sha512 = forged }, .sha512),
+    );
+    program.artifacts = &altered;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program),
+    );
+    program.artifacts = &artifacts;
+    for ([_][:0]const u8{
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_HTML",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_LINK",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_SHADOW",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_0640",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_ROOT",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_SCRIPT",
+    }) |name| {
+        const path = std.c.getenv(name) orelse
+            return error.TestUnexpectedResult;
+        var changed = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+        defer changed.close();
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3PreinstInputs(testing.allocator, changed.root, &program),
+        );
+    }
+    const proc_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_PROC") orelse
+        return error.TestUnexpectedResult;
+    var proc_root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(proc_path));
+    defer proc_root.close();
+    try testing.expectError(
+        error.DirectoryTooLarge,
+        verifySnapshotPython3PreinstInputs(testing.allocator, proc_root.root, &program),
+    );
 }
 
 test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure" {
@@ -21868,6 +22324,15 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
+    const python3_inert = try snapshotPython3PreinstIsInert(
+        script_bytes,
+        architecture,
+        package,
+        kind,
+        source,
+        arguments,
+        action_kind,
+    );
     const procps_trigger_inert = try snapshotProcpsTriggerPostinstIsInert(
         script_bytes,
         architecture,
@@ -21885,7 +22350,8 @@ fn prepareAlternativesScriptBoundary(
         source,
         arguments,
     );
-    const inert = less_inert or procps_inert or procps_trigger_inert;
+    const inert = less_inert or python3_inert or
+        procps_inert or procps_trigger_inert;
     if (procps_trigger_inert)
         try verifySnapshotProcpsTriggerHandler(program, package, script_bytes);
     const snapshot_postinst = try snapshotLessPostinstIsBound(
@@ -21954,6 +22420,11 @@ fn prepareAlternativesScriptBoundary(
     errdefer script.deinit();
     if (procps_trigger_inert)
         try guardSnapshotProcpsTriggerInputs(root, &script);
+    if (python3_inert and (script.groups.len != 0 or
+        script.commands.len != 0 or script.paths.len != 1 or
+        !std.mem.eql(u8, script.paths[0], "dev/null") or
+        script.immutable_targets.len != 6))
+        return error.InvalidAlternativesScriptAuthority;
     const tool_digest = try native_alternatives.verifyPinnedTool(
         allocator,
         root,
@@ -21969,6 +22440,8 @@ fn prepareAlternativesScriptBoundary(
         )) return error.InvalidAlternativesTool;
     if (snapshot_sudo_rs_postinst)
         try verifySudoRsStructuralOwner(allocator, root, program);
+    if (python3_inert)
+        try verifySnapshotPython3PreinstInputs(allocator, root, program);
     if (snapshot_sudo_postinst) {
         try verifySnapshotSudoStructuralOwner(allocator, root, program);
         if (script.groups.len != 1 or script.commands.len != 1 or
@@ -22232,8 +22705,17 @@ fn runLifecycleScript(
         script_sha256,
         arguments,
     );
+    const snapshot_python3_preinst = snapshotPython3PreinstIsBound(
+        program.target_architecture,
+        package,
+        kind,
+        source,
+        recovery_action.kind,
+        script_sha256,
+        arguments,
+    );
     const info_path = if (snapshot_systemd_proc or snapshot_udev_proc or
-        snapshot_sudo_proc)
+        snapshot_sudo_proc or snapshot_python3_preinst)
         try lifecycleInstalledScriptPath(
             allocator,
             root,
@@ -22297,6 +22779,13 @@ fn runLifecycleScript(
             candidate_path,
             path,
             expected,
+        );
+    if (snapshot_python3_preinst)
+        try verifySnapshotPython3PreinstPaths(
+            allocator,
+            root,
+            candidate_path,
+            path,
         );
     const observed = try rootFileSha256(allocator, root, path, 64 * 1024 * 1024);
     if (!std.mem.eql(u8, &expected, &observed))
@@ -22746,6 +23235,15 @@ fn runLifecycleScript(
             checkpoint_paths.items,
         );
     }
+    if (snapshot_python3_preinst) switch (report.outcome) {
+        .exited => |code| if (code == 0) {
+            verifySnapshotPython3NullOutput(allocator, root) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
+        },
+        else => {},
+    };
     var native_outcome: ?native_recovery.ScriptOutcome = null;
     var managed_checkpoint_sha256: ?native_recovery.Digest = null;
     if (execution.recovery) |runtime| {

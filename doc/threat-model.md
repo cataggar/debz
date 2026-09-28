@@ -97,6 +97,20 @@ other script. A broken or substituted alternatives link still refuses;
 normal script failure remains a failure, and a crash cannot turn an
 unknown outcome into success.
 
+The python3 preinst exception is not another proc or shell grant. It is
+limited to exact signed `python3:amd64` `3.14.7-3` install-branch bytes,
+arguments and authenticated provider ownership. In a root-owned mode-0700
+fixture with signed tool and shell bytes, the literal absolute alternatives
+*name* is rejected by the pinned tool before changing state. An existing
+python3 group is not synthesized; the actual groups and their links remain
+immutable. The script's authored `|| true` is not generalized: an exact
+96-byte diagnostic written into a pinned, initially empty regular
+`/dev/null` of mode 0600 or 0644 proves the expected rejection before an
+exit-0 outcome is recorded. A replaced `/dev/null`, PATH shadow, forged
+signed-minimal link,
+nonempty HTML cleanup target or live `/proc` refuses before launch.
+After-launch divergence requires recovery, not a successful return.
+
 The future `debz apt` facade has a separate Linux-only live-root boundary
 (`src/live_root.zig`). It never weakens the product backend's host-root denial:
 the backend still receives `allow_host_root = false` and the stable alternate

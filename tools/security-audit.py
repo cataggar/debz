@@ -912,6 +912,26 @@ def audit_production_sources() -> None:
     ):
         if required not in alternatives and required not in unpack:
             fail(f"reviewed signed sudo alternatives admission changed: {required}")
+    for required in (
+        "if (matchesSnapshotPython3Preinst(bytes)) {",
+        '.paths = &.{"dev/null"}',
+        '"/usr/share/doc/python3/html"',
+    ):
+        if required not in alternatives:
+            fail(f"reviewed signed python3 inert script grammar changed: {required}")
+    for required in (
+        "snapshotPython3PreinstIsBound(",
+        "snapshotPython3PreinstIsInert(",
+        "verifySnapshotPython3PreinstPaths(",
+        "verifySnapshotPython3PreinstInputs(allocator, root, program)",
+        "verifySnapshotPython3NullOutput(allocator, root)",
+        "observed.entry.mode != 0o600 and observed.entry.mode != 0o644",
+        'root,\n        0,\n        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"',
+        'root,\n        96,\n        "3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc"',
+        '"usr/sbin/rm"',
+    ):
+        if required not in unpack:
+            fail(f"reviewed signed python3 root and output proof changed: {required}")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")
