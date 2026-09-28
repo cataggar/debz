@@ -1677,6 +1677,52 @@ harness mounts an unrestricted procfs in a private mount namespace and
 is not an equivalent invocation-scoped proc view for the signed systemd
 and udev scripts; do not treat it as an isolated proof for this run.
 
+On final #255 squash `bef1f15a42791b1ba1e55a6bef220e9d82979436`
+plus only the glib self-file-trigger change, a separate, genuinely new
+root-owned checkout
+`/var/lib/debz-glib-reference-255/checkout` with mode-0700
+`.real-snapshot` created
+`.real-snapshot/amd64-glib-255-protected-signed-1` from an empty root,
+cache and state. Its ReleaseSafe executable SHA-256 was
+`9f8bc04254dba33a14c8391ca07d1f3a86e66e8720a0df97d9c3e0fca5748030`;
+its protected keyring SHA-256 was
+`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`.
+Fresh authenticated metadata signed by
+`f6ecb3762474eda9d21b7022871920d1991bc93c` produced a 175-package
+`stonking` amd64 lock (file SHA-256
+`188993c0e7f09da540bf4e49544f244a0c0e934621942c4f9903c8c114047129`).
+Independent SHA-512 rehashing checked all **175/175** signed archive
+objects, their exact cache-object set and declared sizes (67,976,788
+bytes); `evidence/cas-rehash.tsv` SHA-256 was
+`0e3f2a55adb3d91d60b216f9af8c61c5785e05ab8266b4f0fee220464558a7c1`.
+
+Native `install` returned exit **0** with sealed receipt SHA-256
+`fc24d39ca96bcdba878883b64b15e1c17f334b5673d4c4495d407fe259f79d15`.
+Separate **read-only** native `transaction-result verify` reported
+`succeeded`, `final_verification_status: exact_match`,
+`receipt_evidence: exact_match` and `root_operation_status: cleared`;
+all 175 packages, including glib and procps, are `install ok installed`,
+and `triggers/Unincorp` is empty. The sealed receipt contains 81
+activation events, no automatic file events addressed to their own
+source and no glib self listener. Glib's sole source event addresses
+`ldconfig` to `libc-bin`. The five deferred step-1428 callbacks include
+the exact signed procps postinst at ordinal 3, spawned with
+`["triggered", "/usr/lib/sysctl.d"]`, exit **0** and zero output; glib
+has no self callback. This is completed **native amd64 closure** on
+final #255 plus the glib-only delta, not full pinned-dpkg filesystem
+parity or arm64 parity.
+
+The longer disposable acceptance wrapper stopped **after** the successful
+native installation because its separate verifier command incorrectly
+passed the legacy-only `--state-path` option to the native verifier. Its
+`create-summary.stderr` records that refusal and its later update/no-op
+checks did not run. The correct documented native verifier omits
+`--state-path`; its successful, separate result is retained as
+`evidence/create-native-summary.json`. The completed root is retained
+read-only, not retried as a new installation. A full pinned-reference
+root and bounded differential capture for this exact lock have **not**
+been compared; the manual two-architecture parity gate remains open.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
