@@ -96,6 +96,20 @@ them into a separate oracle root only if dpkg's dependency checks permit it,
 and requires both captures to compare. Direct alphabetical lock order
 currently fails the reference's `Pre-Depends` checks; this gate is not yet
 passing real-package parity.
+The previous full-reference harness mounted unrestricted procfs and is
+retired; its healthy historical oracle root is not a private-PID parity
+proof. The bounded replacement refuses shared/unprotected checkouts,
+unknown or multi-package/pending script operations, and unsupported arm64
+script profiles. Hosted checkout staging, mode-0700 root-owned workspace
+and cleanup, small protected namespace tests, arm64 signed profiles and
+more than the current 90-minute job budget require separate review before
+re-enabling the full opt-in reference run. No retained failed root may be
+reused as a fresh proof.
+The opt-in `test-real-snapshot-reference-protected` Zig build target requires
+explicit root-owned protected fixture paths and a fresh proof workspace; it
+returns a failure, not a skip, without them. Its small pinned-dpkg operations
+and refusals are not a substitute for the exact signed proc, runtime binding,
+descendant teardown and network proofs required before #258 can close.
 Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
 dpkg/helper/package state, selects `native` explicitly, and exec-traces
 candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.

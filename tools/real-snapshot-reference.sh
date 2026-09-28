@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
+export PYTHONNOUSERSITE=1
 
 [[ $# == 5 ]] || {
   echo "usage: $0 REFERENCE_DPKG LOCK CACHE ARCHITECTURE WORKSPACE" >&2
@@ -12,6 +15,59 @@ cache=$(realpath "$3")
 architecture=$4
 workspace=$(realpath -m "$5")
 repository_root=$(pwd -P)
+script_path=$(realpath -- "${BASH_SOURCE[0]}")
+[[ "$script_path" == "$repository_root/tools/real-snapshot-reference.sh" ]] || {
+  echo "run the protected reference script from its checkout root" >&2
+  exit 2
+}
+python3 -I - "$repository_root" "$workspace" "$reference_dpkg" "$lock" "$cache" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+def protected(path, directory=False):
+    if not path.is_absolute() or any(
+        item in ("", ".", "..") for item in str(path).split("/")[1:]
+    ):
+        raise ValueError(f"noncanonical reference path: {path}")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, component in enumerate(path.parts[1:]):
+            last = index == len(path.parts) - 2
+            opened = os.open(
+                component, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC |
+                (os.O_DIRECTORY if not last or directory else 0),
+                dir_fd=fd,
+            )
+            os.close(fd)
+            fd = opened
+            info = os.fstat(fd)
+            if (info.st_uid != 0 or info.st_gid != 0 or
+                stat.S_IMODE(info.st_mode) & 0o022 or
+                ((not last or directory) and not stat.S_ISDIR(info.st_mode)) or
+                (last and not directory and not stat.S_ISREG(info.st_mode))):
+                raise ValueError(f"non-root or writable reference path: {path}")
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+
+repository, workspace, dpkg, lock, cache = map(Path, sys.argv[1:])
+for path in (repository, repository / ".real-snapshot", workspace, cache):
+    result = protected(path, directory=True)
+    if path in (repository / ".real-snapshot", workspace) and result.st_mode & 0o7777 != 0o700:
+        raise ValueError(f"reference directory must be root-only 0700: {path}")
+for path in (repository / "tools/real-snapshot-reference.sh",
+             repository / "tools/real-snapshot-reference-launcher.zig",
+             repository / "tools/real-snapshot-reference-order.py",
+             repository / "tools/real_snapshot_reference_paths.py",
+             repository / "tools/prepare-native-dpkg.py",
+             repository / "tools/native-differential.py",
+             dpkg, lock, workspace / "evidence/create.json"):
+    protected(path)
+protected(workspace / "evidence", directory=True)
+protected(cache / "packages-v2/objects", directory=True)
+PY
 case "$workspace" in
   "$repository_root"/.real-snapshot/*) ;;
   *) echo "unsafe reference workspace" >&2; exit 2 ;;
@@ -32,6 +88,17 @@ reference_root=$workspace/reference-root
 evidence=$workspace/evidence
 [[ ! -e "$reference_root" && ! -L "$reference_root" ]] || {
   echo "reference root must be new: $reference_root" >&2
+  exit 2
+}
+for name in reference-archives.tsv reference-install.stdout reference-install.stderr \
+  reference-identity.txt reference-installed.txt reference.snapshot.json; do
+  [[ ! -e "$evidence/$name" && ! -L "$evidence/$name" ]] || {
+    echo "reference evidence must be new: $evidence/$name" >&2
+    exit 2
+  }
+done
+[[ ! -e "$workspace/reference-launcher" && ! -L "$workspace/reference-launcher" ]] || {
+  echo "reference launcher must be new" >&2
   exit 2
 }
 jq -e --arg arch "$architecture" '
@@ -73,6 +140,7 @@ fi
 python3 tools/prepare-native-dpkg.py --architecture "$architecture" \
   --verify-only "$reference_dpkg"
 
+mkdir -m 0700 "$reference_root"
 mkdir -p "$reference_root/usr/bin" "$reference_root/usr/sbin" \
   "$reference_root/usr/lib" "$reference_root/usr/lib64" \
   "$reference_root/var/lib/dpkg/"{info,triggers,updates} "$reference_root/dev" \
@@ -85,6 +153,8 @@ ln -s usr/sbin "$reference_root/sbin"
 ln -s usr/lib "$reference_root/lib"
 ln -s usr/lib64 "$reference_root/lib64"
 : >"$reference_root/var/lib/dpkg/status"
+: >"$reference_root/.debz-reference-archive"
+chmod 0600 "$reference_root/.debz-reference-archive"
 
 # The oracle alone receives exact-lock payloads for its chrooted script
 # interpreter and tools; no package database entries are preinstalled.
@@ -96,25 +166,27 @@ done
 [[ -x "$reference_root/usr/bin/perl" ]]
 [[ -L "$reference_root/usr/bin/sh" &&
    $(readlink "$reference_root/usr/bin/sh") == dash ]]
+chmod 0700 "$reference_root"
 
 printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nbootstrap_archives=%s\n' \
   "$(sha256sum "$reference_dpkg" | cut -d' ' -f1)" \
   "$(sha256sum "$lock" | cut -d' ' -f1)" "${#bootstrap[@]}" \
   >"$evidence/reference-identity.txt"
-unshare --mount --propagation private -- \
-  sh -c 'mount -t proc -o nosuid,nodev,noexec proc "$1/proc" && shift && exec "$@"' \
-  sh "$reference_root" timeout --signal=TERM --kill-after=30s 40m \
+launcher="$workspace/reference-launcher"
+zig build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+  --cache-dir "$workspace/reference-zig-cache" \
+  --global-cache-dir "$workspace/reference-zig-global-cache" \
+  -femit-bin="$launcher"
+chmod 0500 "$launcher"
+timeout --signal=TERM --kill-after=30s 40m \
   python3 tools/real-snapshot-reference-order.py \
+    --launcher "$launcher" --architecture "$architecture" \
     --dpkg "$reference_dpkg" --root "$reference_root" \
     --cache "$cache" --evidence "$evidence"
-dpkg-query --admindir="$reference_root/var/lib/dpkg" \
-  -W -f='${db:Status-Abbrev} ${binary:Package} ${Version}\n' \
-  >"$evidence/reference-installed.txt"
+python3 tools/real-snapshot-reference-order.py \
+  --report-only --architecture "$architecture" \
+  --root "$reference_root" --cache "$cache" --evidence "$evidence"
 grep -Eq '^ii  ubuntu-minimal(:[^ ]+)? ' "$evidence/reference-installed.txt"
-if grep -Evq '^ii  ' "$evidence/reference-installed.txt"; then
-  echo "reference dpkg database contains unconfigured packages" >&2
-  exit 1
-fi
 [[ -c "$reference_root/dev/null" && ! -L "$reference_root/dev/null" &&
    $(stat -c '%t:%T' "$reference_root/dev/null") == 1:3 ]]
 device_claim=0
@@ -123,6 +195,10 @@ if (( device_claim != 1 )); then
   echo "reference package claims excluded chroot device" >&2
   exit 1
 fi
+[[ -f "$reference_root/.debz-reference-archive" &&
+   ! -L "$reference_root/.debz-reference-archive" &&
+   $(stat -c '%s' "$reference_root/.debz-reference-archive") == 0 ]]
+rm -- "$reference_root/.debz-reference-archive"
 zig-out/bin/native-differential capture \
   --root "$reference_root" \
   --exclude dev/null \

@@ -355,6 +355,7 @@ pub fn build(b: *std.Build) void {
             "python3",
             "-m",
             "unittest",
+            "tools/test_real_snapshot_reference_launcher.py",
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
@@ -362,6 +363,41 @@ pub fn build(b: *std.Build) void {
         },
     );
     audit_step.dependOn(&audit_tests.step);
+    const reference_launcher_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-launcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_launcher_module.link_libc = true;
+    const reference_launcher_tests = b.addTest(.{ .root_module = reference_launcher_module });
+    const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);
+    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation and syscall filters")
+        .dependOn(&run_reference_launcher_tests.step);
+    audit_step.dependOn(&run_reference_launcher_tests.step);
+    const protected_reference = b.addSystemCommand(
+        &.{ "python3", "tools/test_real_snapshot_reference_protected.py" },
+    );
+    protected_reference.addArgs(&.{
+        "--launcher",
+        b.option([]const u8, "reference-protected-launcher", "Root-owned protected ReleaseSafe launcher") orelse "",
+        "--dpkg",
+        b.option([]const u8, "reference-protected-dpkg", "Root-owned native hash-pinned dpkg 1.22.22") orelse "",
+        "--root-template",
+        b.option([]const u8, "reference-protected-root-template", "New protected script-free reference root template") orelse "",
+        "--workspace",
+        b.option([]const u8, "reference-protected-workspace", "New empty root-owned mode-0700 proof workspace") orelse "",
+        "--archive",
+        b.option([]const u8, "reference-protected-archive", "Protected authenticated test package archive") orelse "",
+        "--archive-sha512",
+        b.option([]const u8, "reference-protected-archive-sha512", "Authenticated archive SHA512") orelse "",
+        "--archive-size",
+        b.fmt("{d}", .{b.option(usize, "reference-protected-archive-size", "Authenticated archive byte size") orelse 0}),
+        "--architecture",
+        b.option([]const u8, "reference-protected-architecture", "Native amd64 or arm64") orelse "",
+    });
+    protected_reference.setCwd(b.path("."));
+    b.step("test-real-snapshot-reference-protected", "Run non-skipped root-owned pinned-dpkg namespace proofs")
+        .dependOn(&protected_reference.step);
 
     const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
     const release_policy_tests = b.addTest(.{
