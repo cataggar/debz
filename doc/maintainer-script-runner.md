@@ -62,6 +62,10 @@ A spawned script runs with:
   is inherited.
 - **No shell.** The script is executed with `execve` on an absolute in-root
   path and an exact argv; no `sh -c` string is ever constructed.
+- **Child capability gate.** After any helper/proc mounts and chroot, but
+  before `execve`, every native script child applies the same closed
+  filesystem/account capability and syscall policy described below. Failed
+  setup never executes the script.
 - **Stdin.** Standard input is `/dev/null`, so scripts cannot block on input.
 - **Standard descriptors.** Every descriptor the child still needs is first
   moved above the standard range, so installing stdin, stdout, and stderr is
@@ -162,9 +166,9 @@ mounts a fresh read-only, nosuid, nodev, noexec procfs with `hidepid=2`,
 single read-only copy of the actual kernel boot ID at
 `/proc/sys/kernel/random/boot_id`, then remounts the mask read-only. No
 maintainer script runs between the first mount and the completed mask; the
-other sysctl entries remain absent. Before `execve`, the child drops
-`CAP_SYS_ADMIN` from bounding, effective, permitted, inheritable and ambient
-sets and sets `no_new_privs`; it cannot unmount the mask. Every descriptor
+other sysctl entries remain absent. Before `execve`, the child applies the closed script capability and syscall
+policy below, including the removal of `CAP_SYS_ADMIN` and `no_new_privs`;
+it cannot unmount the mask. Every descriptor
 above the standard streams is marked close-on-exec (including any inherited
 host-root descriptor); if the kernel rejects this seal, the script does not
 launch. A parent-death signal is established before setup with a control-pipe
@@ -176,9 +180,10 @@ script or the deferred procps trigger can run. A setup failure is a typed
 non-spawned `snapshot_proc` outcome, never a successful script exit. Helper overlay
 setup retains its own existing `root_isolation` stage and failure claim.
 
-The opt-in uses a distinct v2 policy domain and exact invocation digest
-extension containing the SHA-256 of the kernel boot ID; default requests keep
-their v1 policy digest. Native program and script-outcome recovery retain
+The opt-in previously used a distinct v2 policy domain and exact invocation
+digest extension containing the SHA-256 of the kernel boot ID; after the
+capability gate it uses v3 and default requests use v2. Native program and
+script-outcome recovery retain
 their existing program-policy and unknown-outcome claims. Synthetic positive
 and negative namespace tests run in the privileged
 `test-native-helper-namespace` target; the signed postinst test additionally
@@ -191,7 +196,8 @@ The capability syscall header uses the kernel's 8-byte layout with its
 32-bit PID at offset 4; Zig's `linux.cap_user_header_t` instead pads a
 machine-width PID to offset 8, which can send an uninitialized PID and yield
 `ESRCH` in Debug builds. The scoped runner checks the exact header layout
-and verifies that `CAP_SYS_ADMIN` is absent after dropping it. These
+and verifies both 32-bit capability words and the bounding and ambient sets
+after dropping them. These
 requirements passed on the local Linux 6.18.31 privileged runner. Missing
 support refuses the exact invocation without a proc or mount fallback.
 Workflow-dispatch CI run
@@ -223,15 +229,16 @@ launch. This does not admit udev triggers, other
 scripts, other architectures, or other package versions.
 
 The child reuses the isolated PID-1/chroot boundary, descriptor seal,
-private mount propagation, privilege drop, no-new-privileges setting,
+private mount propagation, closed capability and syscall policy,
 supervision and teardown described above, but mounts a fresh
 `ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs. It never mounts
 the broader procfs or creates a boot-ID mask: `/proc/sys` and its boot-ID
 path must both be absent before exec. PID 1's proc-visible root must
 match the pinned fixture. The script cannot remount proc after
-`CAP_SYS_ADMIN` is dropped, and a failed setup records the existing typed
-non-spawned `snapshot_proc` outcome. The policy has its own v3 digest
-domain and pins the exact provider paths and hashes; systemd's v2
+mount authority is dropped, and a failed setup records the existing typed
+non-spawned `snapshot_proc` outcome. The policy previously had its own v3 digest
+domain and now uses v4 with the capability gate; its original v3
+domain pins the exact provider paths and hashes; systemd's boot-ID
 boot-ID admission and its one-file `/proc/sys` representation remain
 separate. This environment passed protected amd64 pinned-dpkg and
 signed-script comparisons; it does not authorize a broader proc view
@@ -259,12 +266,13 @@ The namespace helper uses the same fresh, private
 `ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs as the udev mode,
 without granting either script the other's identity. PID 1 and its
 descendants stay in the same pinned chroot; `/proc/sys` and boot ID are
-absent, inherited host-root descriptors are sealed, and `CAP_SYS_ADMIN`
-and remount authority are dropped before the script runs. Setup failure
+absent, inherited host-root descriptors are sealed, and mount and kernel
+authority are dropped before the script runs. Setup failure
 records a typed non-spawned result; exit, deadline, crash and recovery
 preserve ordinary durable outcomes and private mount teardown. The
-invocation uses a separate v4 policy digest; the earlier systemd v2 and
-udev v3 invocation digests remain unchanged. This is no grant to sudo
+invocation originally used a separate v4 policy digest; it is v5 with the
+capability gate, as are the separately bumped systemd v3 and udev v4
+invocation digests. This is no grant to sudo
 triggers, other scripts or package versions, and does not establish
 CI arm64 or WSL namespace capability.
 From the root-owned protected checkout on final #252 squash plus sudo-only
@@ -276,6 +284,67 @@ authenticated root persisted sudo step 1376 exit 0 and installed. The
 next refusal was python3 preinst at step 1383, before its script launched.
 This local proof does not substitute for hosted arm64 namespace coverage
 or authorize python3.
+
+## Pre-cutover child capability gate (#257)
+
+The **native** launcher now applies this gate to ordinary scripts and to the
+three separately authorized, unchanged systemd boot-ID, udev PID-only and
+sudo PID-only proc views. It runs only *after* required helper overlays, root
+entry and proc mounts/masking; no child runs between mounting and restriction.
+No new script digest, root identity, helper, proc entry or host-root admission
+is authorized. The pinned reference runner remains a separate policy; this
+change is not a native-only cutover or a claim of reference parity.
+
+The closed list of potentially usable capabilities is `CAP_CHOWN` (signed
+sudo's `chown` and account/file ownership), `CAP_DAC_OVERRIDE` (root-owned
+file updates), `CAP_FOWNER` (ownership/permission repairs), `CAP_FSETID`
+(file modes), `CAP_SETGID` and `CAP_SETUID` (signed udev
+`systemd-sysusers` and ordinary account changes), and `CAP_SETFCAP`
+(account/file capability metadata). No `CAP_MKNOD`, `CAP_SYS_CHROOT`,
+`CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+`CAP_BPF` or `CAP_CHECKPOINT_RESTORE` survives a privileged parent.
+This list permits only capabilities the parent already held; it never grants
+any. In the child, `capget` uses the 8-byte v3 kernel header (32-bit PID at
+offset 4), `capset` masks **both** 32-bit effective, permitted and inheritable
+words, and a readback verifies them. Every supported capability outside the
+list is dropped from the bounding set and read back; all ambient capabilities
+are cleared and individually checked, and `no_new_privs` is verified.
+A parent without *any* usable or inheritable capability cannot drop its
+bounding set; that case is accepted only after verifying all six current
+capability words are zero and `no_new_privs` is set, so neither setuid
+executables nor file capabilities can promote it. A partially privileged
+parent that cannot drop its bounding set fails closed.
+
+After the capset readback, a mandatory arch-checked seccomp filter rejects
+mount/unmount, namespace entry/creation, pivot/chroot, new mount API,
+open-by-handle, device creation, module loading, reboot/kexec, swap and
+kernel BPF/perf/userfault/ptrace/write-foreign-process syscalls with `EPERM`;
+it rejects namespace-flavored `clone`, and returns `ENOSYS` for `clone3` so
+ordinary libc forks can use the filtered `clone` path. Wrong-architecture and
+x32 syscall aliases kill the child. Missing capset, bounding, ambient, NNP,
+or seccomp support refuses the script with a typed non-successful
+`capability_policy` setup outcome (the existing `snapshot_proc` setup stage
+applies to its three scoped modes). This syscall denylist supplements, rather
+than replaces, the capability bounding contract.
+
+The policy changes the on-disk script policy and invocation evidence: default
+policy v1 becomes v2; systemd v2 becomes v3, udev v3 becomes v4 and sudo v4
+becomes v5, each with an additional `script-capability-seccomp-v1` marker.
+Preexisting durable programs/receipts must not be reinterpreted using the new
+contract; prepare new policy-bound programs. Debug and ReleaseSafe
+`test-maintainer-script`, privileged `test-native-helper-namespace`, and
+`security-audit` exercise the new boundary. The privileged Zig probe checks
+denied mount/namespace/module operations with a fully capable parent, both
+capability words and readbacks, and permitted ownership, file-mode and
+UID/GID changes on a disposable test file; it never attempts a real host
+mutation.
+
+**Separate network boundary (#278):** dropping `CAP_NET_ADMIN` and
+`CAP_NET_RAW` does *not* disable ordinary socket or host-network access.
+The current `/proc/net` view and inherited socket/namespace boundary must
+be investigated and decided **for both** engines in #278. Do not infer host
+network isolation from this gate, silently adjust one signed proc view, or
+authorize any new network connectivity on this evidence.
 
 ## Exact signed python3 preinst inert alternatives call
 
@@ -315,7 +384,8 @@ absolute name elsewhere or the signed script's upgrade branch.
 `cancelled`, `output_limit_exceeded`, `setup_failed` (with the exact stage —
 `pipe`, `stdin_device`, `fork`, `session`, `standard_streams`,
 `root_isolation`, `working_directory`, `execute`, `launcher`, `wait` — and the
-operating-system error number), and `rejected`. `Outcome.spawned()` states
+operating-system error number; `snapshot_proc` and `capability_policy` both
+represent non-executed child setup failures), and `rejected`. `Outcome.spawned()` states
 whether a child process actually existed, which separates pre-fork setup
 failures from in-child failures. `Report.succeeded()` is true only for exit
 code 0.
