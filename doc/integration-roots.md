@@ -1435,6 +1435,85 @@ is interrupted and is retained for read-only evidence, never reused as
 a fresh trial. Neither python3 admission nor full native/reference
 parity follows from sudo's successful step.
 
+A separately protected checkout
+`/root/debz-issue-86-python3-preinst` (root-owned, mode 0700, with
+root-owned mode-0700 `.real-snapshot`) compared the authenticated
+`python3:amd64` `3.14.7-3` preinst against pinned dpkg 1.22.22.
+The disposable source was the independent authenticated pre-udev copy
+previously used for sudo proof, **not** the failed step-1383 root. Its
+signed script, link, package lists and alternatives tool matched the
+read-only failed-root prestate; the 14 records and 76 selectors matched
+their documented fingerprints. The signed python3 and python3-minimal
+archives independently matched the lock's SHA-512 digests.
+Both pinned and snapshot `update-alternatives --root <disposable-root>
+--auto /usr/bin/python3` returned 2 before touching the root, rejecting
+the slash-containing alternative name. The exact signed preinst
+`["install"]` on one protected copy exited 0. Pinned dpkg 1.22.22 on
+another copy, after fixture-only removal and purge of the already
+unpacked python3 package, ran the archive's preinst with exactly
+`( install )` and unpacked successfully. Both copies retained all 14
+record bytes, all 76 selector links, the signed python3-minimal link and
+the absent HTML target. Both wrote the same 96-byte error text into
+the root's initially empty, regular `/dev/null`; its SHA-256 is
+`3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc`.
+This is a *bounded* proof for the install-only branch, not evidence for
+python3 upgrades or a completed 175-package install.
+
+A first **new**, protected 175-package root,
+`/root/debz-issue-86-python3-preinst/.real-snapshot/amd64-python3-preinst-fresh-long-1`,
+reauthenticated Ubuntu signer `F6ECB3762474EDA9D21B7022871920D1991BC93C`
+and rehashed all 175 lock archives (67,976,788 bytes; lock SHA-256
+`4442a57e27f993cfafa20b9f62339605c0b02f9253be675de7c01d28607c4ffc`).
+It reached step 1383 but refused **before launch** with
+`InvalidPython3PreinstControl`: its empty, root-owned regular `/dev/null`
+had mode **0644**, whereas the initial proof copy and the older refused
+root had mode 0600. The action remained `prepared`, with no script outcome;
+this failed root is retained for read-only evidence, never resumed or
+used as fresh input. A read-only regression against that root verifies
+the corrected guard, but does not execute its pending action.
+
+Separate new disposable copies of the independent authenticated prestate
+changed **only** that file mode to 0644. The exact signed script
+`["install"]` and pinned dpkg 1.22.22 unpack of the signed archive both
+exited 0, kept that file at 0644 and wrote the identical 96-byte
+diagnostic. The script copy retained all 14 records byte-for-byte and
+all 76 selectors; the pinned-dpkg copy also retained those records and
+selectors (its fixture-only python3 purge ran before the no-force unpack).
+The native guard admits **only** the independently proved 0600 and 0644
+root-owned regular-file modes, with the same exact empty-file prestate
+and post-exit bytes. Modes 0640 and 0666 remain negative test cases;
+this does not accept arbitrary writable files or a real device.
+
+A **second** new, root-owned mode-0700 root/cache/state from an
+earlier local branch **also containing unpublished procps-trigger admission**,
+`/root/debz-issue-86-python3-preinst/.real-snapshot/amd64-python3-preinst-fresh-long-2`,
+independently refreshed authenticated metadata from signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C` and downloaded and
+rehash-verified **175/175** SHA-512 archives (67,976,788 bytes; exact
+lock SHA-256
+`4442a57e27f993cfafa20b9f62339605c0b02f9253be675de7c01d28607c4ffc`).
+It used the protected ReleaseSafe executable SHA-256
+`9a0c3641daa87f832233b0e6913f2cbf7a25a0fda9fed47aa91ee4cde163fa61`.
+Signed python3 preinst step **1383** durably recorded `spawned=true`,
+exit **0**, zero output, and a completed `succeeded` action; python3
+became `install ok installed`. Its exact 96-byte `/dev/null` witness
+was verified before that outcome persisted; later scripts wrote to the
+same regular file, so its final contents are not that witness.
+
+The **next distinct blocker** is *after* all recorded script and
+deferred-trigger callbacks: seven step-1428 trigger outcomes recorded
+exit 0, including `libglib2.0-0t64:amd64` `2.90.0-1` callback ordinal 4
+for `/usr/lib/x86_64-linux-gnu/gio/modules` and
+`/usr/share/glib-2.0/schemas`. Despite that successful callback,
+`libglib2.0-0t64` ends `install ok triggers-awaited` with
+`Triggers-Awaited: libglib2.0-0t64` (its own awaited schema trigger).
+Following completed database step 1431, final verification returned
+`final_closure_mismatch`; the install ended `recovery_required`, exit
+**8** on that local combined branch. This is not a prediction for final main
+plus python3 alone; no complete 175-package parity is established. This second
+interrupted root is retained for evidence and must never be reused as
+fresh or resumed by this investigation.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
