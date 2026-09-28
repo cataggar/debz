@@ -230,8 +230,8 @@ def candidate_failures(
             or set(allowances[path]) != operators
         ):
             failures.append(f"{path}: unreviewed child-process operator; no indirect execveat or dpkg basename allowance")
-    required_hashes = set(allowances) | reference_paths | contract_paths | {
-        "src/main.zig", "src/transaction_recovery.zig", *GUARD_CUTOVER_ROUTES,
+    required_hashes = production_paths | guard_paths | reference_paths | contract_paths | {
+        "src/live_root.zig", "actions/setup/src/runner.ts",
     }
     if set(fingerprints) != required_hashes:
         failures.append(f"{INVENTORY}: missing/stale fingerprint path classification: {sorted(set(fingerprints) ^ required_hashes)}")
