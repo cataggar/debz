@@ -153,16 +153,16 @@
       {
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
-        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs and python3 install-only invalid-name and redirected-tool witness, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12413,
+        "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs and python3 install-only invalid-name and redirected-tool witness, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded glib automatic file-trigger self-interest exclusion, failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
+        "count": 12417,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1120,
-          "sha256_token": 11146
+          "raw_32_byte": 1121,
+          "sha256_token": 11149
         },
-        "sha512": "9cc4343a778587ccc213d800d695f92481b4fd537834dabd288ae45ceb8106721e9af3909e69ce69f571925754076972dff8269181384f2a227ba9b580d40ba5"
+        "sha512": "36197da32e90d8886b8d2a727c05bfea89dcf4cb487b55527e7e991e06aa95a30bfdfd53dde12ae1f71169fac8a24d7d8c7f820f779d4ebe990d62e0325f09b1"
       },
       {
         "scope": "test",

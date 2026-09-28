@@ -15174,6 +15174,37 @@ fn appendRuntimeTriggerEvent(
     });
 }
 
+fn appendAutomaticFileTriggerEvent(
+    allocator: std.mem.Allocator,
+    events: *std.ArrayList(RuntimeTriggerEvent),
+    source: package_database.Identity,
+    native_architecture: []const u8,
+    trigger: []const u8,
+    interests: []const package_database.TriggerInterest,
+) !void {
+    var eligible: std.ArrayList(package_database.TriggerInterest) = .empty;
+    defer eligible.deinit(allocator);
+    for (interests) |interest| {
+        if (!std.mem.eql(u8, interest.trigger, trigger)) continue;
+        if (std.mem.eql(u8, interest.package.name, source.name) and
+            ((interest.package.architecture.len == 0 and
+                std.mem.eql(u8, source.architecture, native_architecture)) or
+                std.mem.eql(u8, interest.package.architecture, source.architecture)))
+            continue;
+        try eligible.append(allocator, interest);
+    }
+    if (eligible.items.len != 0)
+        try appendRuntimeTriggerEvent(
+            allocator,
+            events,
+            source,
+            trigger,
+            true,
+            eligible.items,
+            .automatic,
+        );
+}
+
 fn persistRuntimeTriggerEvents(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -15324,14 +15355,13 @@ fn collectArchiveTriggerEvents(
             continue;
         if ((try seen_file.getOrPut(allocator, interest.trigger)).found_existing)
             continue;
-        try appendRuntimeTriggerEvent(
+        try appendAutomaticFileTriggerEvent(
             event_allocator,
             events,
             source,
+            architecture,
             interest.trigger,
-            true,
             database.model.triggers.interests,
-            .automatic,
         );
     }
 }
@@ -15428,14 +15458,13 @@ fn collectRemovalTriggerEvents(
         }
         if (!touched or (try seen.getOrPut(allocator, interest.trigger)).found_existing)
             continue;
-        try appendRuntimeTriggerEvent(
+        try appendAutomaticFileTriggerEvent(
             allocator,
             sink.events,
             sink.source,
+            model.native_architecture,
             interest.trigger,
-            true,
             model.triggers.interests,
-            .automatic,
         );
     }
 }
@@ -38722,6 +38751,213 @@ test "native_unpack.test.failed bootstrap preinst requires journaled payload and
         authorization,
         identity,
     )));
+}
+
+test "native_unpack.test.automatic file triggers omit only matching self interests" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const source: package_database.Identity = .{
+        .name = "libglib2.0-0t64",
+        .architecture = "amd64",
+    };
+    const schema = "/usr/share/glib-2.0/schemas";
+    const own: package_database.TriggerInterest = .{
+        .trigger = schema,
+        .package = source,
+        .await_mode = .awaited,
+    };
+    const unqualified: package_database.TriggerInterest = .{
+        .trigger = schema,
+        .package = .{ .name = source.name, .architecture = "" },
+        .await_mode = .awaited,
+    };
+    const other: package_database.TriggerInterest = .{
+        .trigger = schema,
+        .package = .{ .name = "other-handler", .architecture = "amd64" },
+        .await_mode = .awaited,
+    };
+    const foreign: package_database.TriggerInterest = .{
+        .trigger = schema,
+        .package = .{ .name = source.name, .architecture = "arm64" },
+        .await_mode = .noawait,
+    };
+    var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    try appendAutomaticFileTriggerEvent(allocator, &events, source, "amd64", schema, &.{ own, unqualified });
+    try testing.expectEqual(@as(usize, 0), events.items.len);
+    try appendAutomaticFileTriggerEvent(allocator, &events, source, "amd64", schema, &.{ own, other });
+    try appendAutomaticFileTriggerEvent(allocator, &events, source, "amd64", schema, &.{ own, other });
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    try testing.expectEqual(@as(usize, 1), events.items[0].listeners.len);
+    try testing.expectEqualStrings("other-handler", events.items[0].listeners[0].package.name);
+    try testing.expect(events.items[0].activation_awaits);
+    try appendAutomaticFileTriggerEvent(allocator, &events, source, "amd64", schema, &.{ own, foreign });
+    try testing.expectEqual(@as(usize, 2), events.items.len);
+    try testing.expectEqualStrings("arm64", events.items[1].listeners[0].package.architecture);
+    const foreign_source: package_database.Identity = .{ .name = source.name, .architecture = "arm64" };
+    var cross_arch: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    try appendAutomaticFileTriggerEvent(allocator, &cross_arch, foreign_source, "amd64", schema, &.{unqualified});
+    try testing.expectEqual(@as(usize, 1), cross_arch.items.len);
+    try testing.expectEqualStrings("", cross_arch.items[0].listeners[0].package.architecture);
+    try appendRuntimeTriggerEvent(allocator, &events, source, schema, true, &.{own}, .dynamic);
+    try testing.expectEqual(@as(usize, 3), events.items.len);
+    try testing.expectEqualStrings(source.name, events.items[2].listeners[0].package.name);
+    const named: package_database.TriggerInterest = .{
+        .trigger = "named-self",
+        .package = source,
+        .await_mode = .awaited,
+    };
+    try appendRuntimeTriggerEvent(allocator, &events, source, named.trigger, true, &.{named}, .automatic);
+    try testing.expectEqual(@as(usize, 4), events.items.len);
+}
+
+test "native_unpack.test.signed glib empty directories do not activate their own file interests" {
+    const archive_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_GLIB_ARCHIVE") orelse return;
+    const root_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_GLIB_ROOT") orelse
+        return error.TestUnexpectedResult;
+    const bytes = try readAbsoluteFile(
+        testing.allocator,
+        testing.io,
+        std.mem.span(archive_path),
+        2 * 1024 * 1024,
+    );
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(usize, 1613714), bytes.len);
+    var digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(bytes, &digest, .{});
+    const signed = (try content_digest.Value.parse(
+        .sha512,
+        "1ce37ac69b92ea9521c93f76aed4ba1a28962abf10481d474ee909ed5d2649596e8e059efcb9f938b97ecea451828274dbb61651c7d014fe1a6a028ce046e79c",
+    )).sha512;
+    try testing.expectEqual(signed, digest);
+    var opened = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(root_path));
+    defer opened.close();
+    const declarations = try opened.root.readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/info/libglib2.0-0t64:amd64.triggers"),
+        1024,
+    );
+    defer testing.allocator.free(declarations);
+    var control_digest: [32]u8 = undefined;
+    Sha256.hash(declarations, &control_digest, .{});
+    try testing.expectEqual(
+        parseHex(32, "7ad0cfea75305b62f9ac8daf97f4304d922a54afb9713b7493aeb285336b9a91").?,
+        control_digest,
+    );
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    try testing.expectEqualStrings("libglib2.0-0t64", model.facts.package);
+    try testing.expectEqualStrings("amd64", model.facts.architecture);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    try collectArchiveTriggerEvents(
+        testing.allocator,
+        arena.allocator(),
+        opened.root,
+        "amd64",
+        &model,
+        &events,
+        null,
+    );
+    var ldconfig = false;
+    for (events.items) |event| {
+        if (std.mem.eql(u8, event.trigger, "ldconfig")) ldconfig = true;
+        try testing.expect(!std.mem.eql(u8, event.trigger, "/usr/share/glib-2.0/schemas"));
+        try testing.expect(!std.mem.eql(u8, event.trigger, "/usr/lib/x86_64-linux-gnu/gio/modules"));
+    }
+    try testing.expect(ldconfig);
+
+    var other_source = model;
+    other_source.facts.package = "reference-directory-only";
+    var other_events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    try collectArchiveTriggerEvents(
+        testing.allocator,
+        arena.allocator(),
+        opened.root,
+        "amd64",
+        &other_source,
+        &other_events,
+        null,
+    );
+    var schema = false;
+    var modules = false;
+    for (other_events.items) |event| {
+        if (std.mem.eql(u8, event.trigger, "/usr/share/glib-2.0/schemas")) {
+            schema = true;
+            try testing.expectEqualStrings("libglib2.0-0t64", event.listeners[0].package.name);
+        }
+        if (std.mem.eql(u8, event.trigger, "/usr/lib/x86_64-linux-gnu/gio/modules"))
+            modules = true;
+    }
+    try testing.expect(schema and modules);
+}
+
+test "native_unpack.test.self file trigger exclusion survives crash and rejects forged recovery events" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.ensureDirectory(
+        try root_fs.Path.init(root_operation.namespace_path),
+        root_fs.default_directory_permissions,
+    );
+    const intent: native_recovery.Digest = @splat('f');
+    try native_recovery.initializeProgress(testing.allocator, root, intent);
+    try native_recovery.initializeTriggerEvents(testing.allocator, root, intent);
+    var runtime: native_recovery.Runtime = .{
+        .allocator = testing.allocator,
+        .root = root,
+        .intent_sha256 = intent,
+    };
+    var execution: ExecutionState = .{ .recovery = &runtime };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const source: package_database.Identity = .{ .name = "glib", .architecture = "amd64" };
+    const trigger = "/usr/share/glib-2.0/schemas";
+    const own: package_database.TriggerInterest = .{
+        .trigger = trigger,
+        .package = source,
+        .await_mode = .awaited,
+    };
+    const other: package_database.TriggerInterest = .{
+        .trigger = trigger,
+        .package = .{ .name = "other", .architecture = "amd64" },
+        .await_mode = .awaited,
+    };
+    var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    try appendAutomaticFileTriggerEvent(allocator, &events, source, "amd64", trigger, &.{ own, other });
+    try persistRuntimeTriggerEvents(&execution, testing.allocator, root, events.items);
+    const prepared = nativeAction(.trigger, 1428, 1, 4);
+    try runtime.append(prepared, .prepared, .none, null);
+
+    var resumed_runtime: native_recovery.Runtime = .{
+        .allocator = testing.allocator,
+        .root = root,
+        .intent_sha256 = intent,
+        .recovering = true,
+    };
+    var resumed: ExecutionState = .{ .recovery = &resumed_runtime };
+    var restored: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    try restoreRuntimeTriggerEvents(&resumed, allocator, root, &restored);
+    try testing.expectEqual(@as(usize, 1), restored.items.len);
+    try testing.expectEqual(@as(usize, 1), restored.items[0].listeners.len);
+    try testing.expectEqualStrings("other", restored.items[0].listeners[0].package.name);
+    try testing.expectEqualStrings(source.name, restored.items[0].source.name);
+    try testing.expectEqual(
+        native_recovery.Stage.prepared,
+        (try resumed_runtime.latest(prepared)).?.stage,
+    );
+    var forged = events.items[0];
+    forged.listeners = &.{own};
+    try testing.expectError(
+        error.TriggerEventsChanged,
+        persistRuntimeTriggerEvents(&resumed, testing.allocator, root, &.{forged}),
+    );
+    var retained = try native_recovery.readTriggerEvents(testing.allocator, root);
+    defer retained.deinit();
+    try testing.expectEqualStrings("other", retained.document.events[0].listeners[0].package);
 }
 
 test "native_unpack.test.removal triggers preserve every interested identity" {

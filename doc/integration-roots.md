@@ -1630,6 +1630,53 @@ The glib self-file-trigger settlement is a separate, unpublished
 change. This interrupted root is retained read-only and is never
 resumed as a fresh installation.
 
+Pinned dpkg 1.22.22 independently isolated that closure mismatch in
+root-owned disposable copies of the earlier authenticated prestate,
+**not** in the interrupted root. The signed glib archive's two empty
+file-interest directories did not activate their own listener during a
+no-force first install, or during a same-version re-unpack after its
+interest was already registered. Separate directory-only and
+regular-file probe packages did activate the same schema interest and
+the latter's awaited edge was cleared by the successful pinned callback.
+The narrowly corrected native path excludes a matching source/listener
+only while emitting automatic **file** events; it keeps other listeners
+and leaves explicit and dynamic trigger activations unchanged. New-root
+verification of this correction is separate from the failed root above.
+
+An earlier independent **new**, empty, root-owned mode-0700 root/cache/state
+from the local procps-and-glib branch before #255's final squash,
+`/root/debz-issue-86-glib-self-trigger/.real-snapshot/amd64-glib-self-fresh-long-1`,
+used the protected local-branch ReleaseSafe binary SHA-256
+`fe0ca285dad63711b1f9c0df9d81e01c0a2f402f36bcc3f7be29e4edc151219a`.
+It independently refreshed authenticated metadata for signer
+`F6ECB3762474EDA9D21B7022871920D1991BC93C`, planned a new
+175-package lock (file SHA-256
+`345431196138c0c7da03dfa3706f664c5ec8bef36f33c8c48cd2810d34d13d94`),
+downloaded and independently SHA-512-rehashed all **175/175** archives
+(67,976,788 bytes), and installed without retrying either interrupted
+predecessor root. The native install returned exit **0** with receipt
+SHA-256 `d1504d5ebff4ff1d46f7cd35a74b90bcbcae3f4df3538ded140f832ec642b5d9`.
+Separate `transaction-result verify` reported `succeeded`,
+`final_verification_status: exact_match`, `receipt_evidence: exact_match`,
+and `root_operation_status: cleared`. All 175 dpkg status entries are
+`install ok installed`, including glib; `triggers/Unincorp` is empty.
+The sealed receipt has 81 activation events, **zero** automatic file
+events addressed to their own source, no glib self listener, and five
+successful step-1428 triggered callbacks. Glib's only source event is
+the independent `ldconfig` activation, whose listener is `libc-bin`.
+
+This proves the previously failing native final closure **on that local
+branch**, not yet on final #255 plus this glib-only delta, and agrees with
+the separately observed pinned dpkg 1.22.22 glib self-interest behavior.
+It does **not** establish complete filesystem/reference parity or arm64
+parity: no equivalent full pinned-reference root and bounded differential
+capture were compared for this new signed lock. The bounded native capture
+is retained as `evidence/native.snapshot.json` for that later comparison.
+The older full-reference
+harness mounts an unrestricted procfs in a private mount namespace and
+is not an equivalent invocation-scoped proc view for the signed systemd
+and udev scripts; do not treat it as an isolated proof for this run.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
