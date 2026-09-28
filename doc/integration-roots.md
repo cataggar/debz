@@ -119,6 +119,13 @@ an existing root is never reused or reset by this script.
 Local candidate installation must run as UID 0: the private helper workspace
 is root-owned and a user-owned workspace fails its sealed bootstrap preflight.
 Availability of `sudo` alone does not elevate the acceptance runner.
+After install, the wrapper verifies the native receipt using
+`transaction-result verify --transaction-backend native --install-root ROOT
+--lock-input LOCK --architecture ARCH --json`; native verification does not
+accept legacy `--state-path`. The wrapper requires exact final-state, lock,
+receipt, and cleared root-operation evidence before it can proceed to the no-op update.
+A failed verification leaves the installed root and provenance intact for
+diagnosis, but is never reported as wrapper completion.
 
 The native side begins with only an existing empty directory: no dpkg
 database, helper placeholder, package state, merged-/usr links, or private
@@ -1724,6 +1731,21 @@ checks did not run. The correct documented native verifier omits
 read-only, not retried as a new installation. A full pinned-reference
 root and bounded differential capture for this exact lock have **not**
 been compared; the manual two-architecture parity gate remains open.
+
+On source `3620f7ba36f6b839e79dcdfdae963bd3d67ebe3e`, a separate manual
+[CI run](https://github.com/cataggar/debz/actions/runs/36434581928) exercised
+the corrected wrapper on a **new** amd64 root. The authenticated signer was
+`f6ecb3762474eda9d21b7022871920d1991bc93c` and the 175-package lock
+SHA-256 was `a7c9904735d9d2e3c94f60770a612b8fed9ec7c87281bb52a856d722f1485529`.
+Refresh, planning and download succeeded, but traced native `install` exceeded
+the wrapper's existing 30-minute command limit and exited **124** before
+publishing a result. The retained bounded artifact has 145 unpacked package
+status entries, no `create-summary.json`, no update evidence and no forbidden
+native `dpkg`/`dpkg-deb` execs in the traced operations. The workflow cleaned
+up this interrupted root; it is **not** proof of post-install wrapper
+completion and cannot be reused as a fresh root. A faster protected amd64
+runner or a separately justified bounded install-time budget is needed for
+the remaining fresh-root acceptance proof.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

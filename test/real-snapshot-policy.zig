@@ -390,6 +390,13 @@ test "snapshot: legacy verification requires state path, native rejects it" {
     });
     defer legacy.deinit();
     try legacy.ok();
+    const legacy_without_state = try support.run(&.{
+        "env", env_calls, f.executable, "transaction-result", "verify",
+        "--lock-input", update_lock, "--architecture", f.arch, "--json",
+    });
+    defer legacy_without_state.deinit();
+    try testing.expect(legacy_without_state.code != 0);
+    try support.contains(legacy_without_state.stderr, "MissingState");
     const native_with_state = try support.run(&.{
         "env", env_calls, f.executable, "transaction-result", "verify",
         "--transaction-backend", "native", "--install-root", root, "--state-path", state,
