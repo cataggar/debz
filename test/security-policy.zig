@@ -97,6 +97,118 @@ test "security: commit-pinned composite actions reject floating refs" {
     try bad.failsWith("action.yml: actions/cache/restore is not commit-pinned");
 }
 
+const ActionCandidateMutation = enum {
+    none, metadata, input, capability, bundle_capability, action_capability,
+    action_guard, bundle, handoff,
+};
+
+fn actionCandidate(
+    f: *Fixture,
+    action: []const u8,
+    mutation: ActionCandidateMutation,
+) ![]const u8 {
+    const allocator = f.arena.allocator();
+    const prefix = try std.fmt.allocPrint(allocator, "actions/{s}/", .{action});
+    const metadata_path = try std.fmt.allocPrint(allocator, "{s}action.yml", .{prefix});
+    const inputs_path = try std.fmt.allocPrint(allocator, "{s}src/inputs.ts", .{prefix});
+    const bundle_path = try std.fmt.allocPrint(allocator, "{s}dist/index.js", .{prefix});
+    const child_path = try std.fmt.allocPrint(allocator, "{s}src/subprocess.ts", .{prefix});
+    var metadata = try f.replace(try f.source(metadata_path), "default: legacy_dpkg", "default: native");
+    const original_inputs = try f.source(inputs_path);
+    var inputs = try f.replace(original_inputs, "'legacy_dpkg';", "'native';");
+    inputs = try f.replace(inputs, "transactionBackend !== 'legacy_dpkg' && transactionBackend !== 'native'", "transactionBackend !== 'native'");
+    inputs = try f.replace(inputs, "transaction-backend must be 'legacy_dpkg' or 'native'", "transaction-backend refuses legacy_dpkg: Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.");
+    const default_expression = if (std.mem.eql(u8, action, "download"))
+        "optionalScalar(e,\"TRANSACTION_BACKEND\")??\"native\""
+    else
+        "exactScalar(e,\"TRANSACTION_BACKEND\")||\"native\"";
+    var bundle: []const u8 = try std.fmt.allocPrint(
+        allocator,
+        "const s={s};if(s!==\"native\"){{throw Error(\"legacy refusal\")}};setOutput(\"backend-capability\",\"native-transaction-execution-v1\");",
+        .{default_expression},
+    );
+    var overrides: std.json.ObjectMap = .empty;
+    if (mutation == .metadata) metadata = try f.replace(metadata, "default: native", "default: legacy_dpkg");
+    if (mutation == .input) inputs = if (std.mem.eql(u8, action, "download"))
+        try f.replace(inputs, "?? 'native';", "?? 'legacy_dpkg';")
+    else
+        try f.replace(inputs, "|| 'native';", "|| 'legacy_dpkg';");
+    if (mutation == .capability) metadata = try f.replace(metadata, "  backend-capability:", "  missing-capability:");
+    if (mutation == .bundle_capability) bundle = try f.replace(bundle, "\"backend-capability\"", "\"missing-capability\"");
+    try overrides.put(allocator, metadata_path, .{ .string = metadata });
+    try overrides.put(allocator, inputs_path, .{ .string = inputs });
+    if (mutation != .bundle) try overrides.put(allocator, bundle_path, .{ .string = bundle });
+    const action_path = try std.fmt.allocPrint(allocator, "{s}src/action.ts", .{prefix});
+    const original_action = try f.source(action_path);
+    const marker = if (std.mem.eql(u8, action, "download"))
+        "  const inputs = await readInputs();"
+    else
+        "  const protectedFiles = await Promise.all(";
+    const guarded = if (std.mem.eql(u8, action, "download"))
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}\n  if (inputs.transactionBackend !== 'native') throw new Error('legacy refusal');",
+            .{marker},
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "  if (inputs.transactionBackend !== 'native') throw new Error('legacy refusal');\n{s}",
+            .{marker},
+        );
+    var action_source = try f.replace(original_action, marker, guarded);
+    if (mutation == .action_capability) action_source = try f.replace(action_source, "'backend-capability'", "'missing-capability'");
+    if (mutation == .action_guard) action_source = original_action;
+    try overrides.put(allocator, action_path, .{ .string = action_source });
+    if (std.mem.eql(u8, action, "install")) {
+        const original_child = try f.source(child_path);
+        const old = "const expectedBackendCapability =\n    inputs.transactionBackend === 'legacy_dpkg'\n      ? 'legacy-dpkg-execution-deprecated-v1'\n      : 'native-transaction-execution-v1';";
+        var child = try f.replace(original_child, old, "const expectedBackendCapability = 'native-transaction-execution-v1';");
+        if (mutation == .handoff) child = try f.replace(child, "DEBZ_DOWNLOAD_TRANSACTION_BACKEND: this.inputs.transactionBackend", "DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg'");
+        try overrides.put(allocator, child_path, .{ .string = child });
+    } else if (mutation == .handoff) {
+        const runner_path = try std.fmt.allocPrint(allocator, "{s}src/runner.ts", .{prefix});
+        const runner = try f.source(runner_path);
+        const wrong = try std.mem.replaceOwned(u8, allocator, runner, "package-cache-v5", "package-cache-v3");
+        try overrides.put(allocator, runner_path, .{ .string = wrong });
+    }
+    return std.json.Stringify.valueAlloc(allocator, .{ .action = action, .overrides = std.json.Value{ .object = overrides } }, .{});
+}
+
+test "security: both Actions rehearse native-only contracts without changing the shipped release" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    for ([_][]const u8{ "download", "install" }) |action| {
+        const baseline = try f.check("actions-native-only", try std.json.Stringify.valueAlloc(
+            f.arena.allocator(), .{ .action = action, .overrides = std.json.Value{ .object = .empty } }, .{},
+        ));
+        defer baseline.deinit();
+        try baseline.failsWith("action.yml: candidate transaction-backend default must be native");
+        try baseline.failsWith("inputs.ts: candidate omitted backend must select native");
+        try baseline.failsWith("dist/index.js: checked-in bundle is stale or accepts legacy");
+        const future = try f.check("actions-native-only", try actionCandidate(&f, action, .none));
+        defer future.deinit();
+        try future.ok();
+        for ([_]struct { mutation: ActionCandidateMutation, message: []const u8 }{
+            .{ .mutation = .metadata, .message = "action.yml: candidate transaction-backend default must be native" },
+            .{ .mutation = .input, .message = "inputs.ts: candidate omitted backend must select native" },
+            .{ .mutation = .capability, .message = "action.yml: candidate must publish backend-capability" },
+            .{ .mutation = .bundle_capability, .message = "dist/index.js: native backend-capability evidence is missing" },
+            .{ .mutation = .action_capability, .message = "action.ts: native backend-capability output is missing" },
+            .{ .mutation = .action_guard, .message = "action.ts: candidate must reject a forged legacy input before work" },
+            .{ .mutation = .bundle, .message = "dist/index.js: checked-in bundle is stale or accepts legacy" },
+            .{ .mutation = .handoff, .message = if (std.mem.eql(u8, action, "download"))
+                "download runner.ts: native lock/fingerprint/cache contract is missing"
+            else
+                "install subprocess.ts: selected backend is not handed to download" },
+        }) |negative| {
+            const refused = try f.check("actions-native-only", try actionCandidate(&f, action, negative.mutation));
+            defer refused.deinit();
+            try refused.failsWith(negative.message);
+        }
+    }
+}
+
 test "security: Zig installer must remain exact and setup-zig or cache substitutions refuse" {
     var f = try Fixture.init();
     defer f.deinit();

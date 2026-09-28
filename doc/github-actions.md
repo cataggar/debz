@@ -75,3 +75,41 @@ The install action additionally documents alternate-root confinement,
 explicit `sudo -n`, conffile/force policy, recovery-state preservation,
 fail-closed offline behavior, legacy canonical transaction-result validation,
 and native receipt versus unchanged-closure evidence before success outputs.
+
+## Native-only cutover rehearsal (#275)
+
+The shipped defaults, checked-in bundles and documentation above remain
+legacy-capable. The opt-in `actions-native-only` security-policy check
+(`python3 tools/security-audit.py check actions-native-only <fixture.json>`)
+evaluates **each** Action's metadata, TypeScript selector, checked-in bundle,
+backend-capability output and native handoff. A fixture is a JSON object with
+`"action": "download"` or `"install"` and `"overrides": {}`; missing override
+paths are read from the checkout. Against this release, **both** checks must
+fail: the default and bundle still select legacy. `zig build security-audit`
+tests candidate fixtures and exact negative mutations for both Actions without
+enabling the candidate on the shipped release. Set
+`DEBZ_ACTIONS_NATIVE_ONLY_CANDIDATE=1` for either Action's `npm test` only while
+working on the final cutover; those additional early-refusal tests intentionally
+fail on this release. Ordinary tests must continue to pass.
+
+In the *single* post-parity #283/#274 cutover, change together:
+
+- `actions/{download,install}/action.yml` transaction-backend defaults and
+  accepted values, and `actions/{download,install}/src/inputs.ts` selectors,
+  early legacy/v1 refusal and versioned active-recovery guidance;
+- `actions/download/src/{action,runner}.ts` native v3 lock, v5 fingerprint,
+  restore domain, preparation and capability output, plus
+  `actions/install/src/{action,runner,subprocess,errors}.ts` native probe,
+  nested download handoff, receipt/completion and unchanged result binding;
+- both `actions/{download,install}/dist/index.js` bundles, reproducibly built
+  from those sources (never copy one Action's bundle alone), their Action
+  READMEs, this page, `doc/legacy-compatibility.md`, release examples and
+  `security/legacy-cutover-policy.json` generated-contract inventory;
+- `tools/security-audit.py`'s shipped-mode Action/legacy checks and the
+  `.github/workflows/{ci,release}.yml` Action, bundle and release gates.
+
+Before claiming readiness, run both normal and candidate Action tests, both
+deterministic `npm ... run bundle`/`git diff --exit-code -- actions/{download,install}/dist`
+checks, and `zig build security-audit` with the cutover policy changed in the
+same PR. #274 remains blocked on the four signed parity gates, #277 and #278;
+this rehearsal does not relax any merge or release gate.

@@ -312,6 +312,55 @@ test('unsupported native capability refuses before package preparation or instal
   }
 });
 
+test('a legacy command result cannot replace native receipt evidence or trigger fallback', async () => {
+  const value = harness(true, 'native');
+  const original = value.services.runDebz;
+  let installs = 0;
+  value.services.runDebz = async (executable, args, sudo, maximum) => {
+    if (args[0] === 'install') {
+      installs += 1;
+      return { code: 0, stdout: commandResult(), stderr: '' };
+    }
+    return await original(executable, args, sudo, maximum);
+  };
+  await assert.rejects(runAction(value.inputs, ioFor(value), value.services), /native install result/u);
+  assert.equal(installs, 1);
+  assert.equal(value.calls.some((call) => call.arguments[1] === 'verify'), false);
+  assert.equal(value.outputs.size, 0);
+  assert.equal(value.saved, false);
+  assert.equal(value.cleanup, true);
+});
+
+test('active legacy recovery refusal preserves typed version guidance without retrying legacy', async () => {
+  const value = harness(true, 'native');
+  const original = value.services.runDebz;
+  let installs = 0;
+  value.services.runDebz = async (executable, args, sudo, maximum) => {
+    if (args[0] === 'install') {
+      installs += 1;
+      const response = JSON.parse(commandResult(8));
+      response.diagnostics = [{
+        id: 'active_legacy_root_operation',
+        message: 'Recover this operation with debz >=0.3.0,<0.4.0 before installing a native-only release.',
+      }];
+      return { code: 8, stdout: `${JSON.stringify(response)}\n`, stderr: '' };
+    }
+    return await original(executable, args, sudo, maximum);
+  };
+  await assert.rejects(
+    runAction(value.inputs, ioFor(value), value.services),
+    (error: unknown) => error instanceof DebzInstallExitError
+      && error.exitCode === 8
+      && error.transactionBackend === 'native'
+      && /active_legacy_root_operation.*>=0\.3\.0,<0\.4\.0/u.test(error.diagnostic ?? ''),
+  );
+  assert.equal(installs, 1);
+  assert.equal(value.calls.some((call) => call.arguments[1] === 'verify'), false);
+  assert.equal(value.outputs.size, 0);
+  assert.equal(value.saved, false);
+  assert.equal(value.cleanup, true);
+});
+
 test('native receipt, completion, caller, program, root, and closure mismatches publish no outputs', async () => {
   for (const field of [
     'transaction_digest_sha256', 'completion_digest_sha256', 'program_sha256',

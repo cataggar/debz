@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdir, rm, symlink } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 
@@ -37,14 +37,53 @@ test('selects native explicitly from standard input and refuses unknown backends
   }
 });
 
+if (process.env.DEBZ_ACTIONS_NATIVE_ONLY_CANDIDATE === '1') {
+  test('native-only candidate selects native when backend is omitted', async () => {
+    const fixture = await createInputEnvironment('candidate-default-native');
+    fixture.environment.RUNNER_ARCH = 'X64';
+    fixture.environment.DEBZ_INSTALL_ARCHITECTURE = 'amd64';
+    await writeFile(
+      path.join(fixture.workspace, 'lock.json'),
+      await readFile(path.resolve(process.cwd(), '../../fuzz/corpus/state/lock-v3.json')),
+    );
+    assert.equal(
+      (await readInputs(fixture.environment, { platform: 'linux', architecture: 'x64' })).transactionBackend,
+      'native',
+    );
+  });
+
+  test('native-only candidate refuses legacy inputs and v1 lock before setup or root work', async () => {
+    const fixture = await createInputEnvironment('candidate-native-only');
+    const root = fixture.environment.DEBZ_INSTALL_INSTALL_ROOT as string;
+    const cacheRoot = fixture.environment.DEBZ_INSTALL_CACHE_ROOT as string;
+    fixture.environment.DEBZ_INSTALL_TRANSACTION_BACKEND = 'legacy_dpkg';
+    await assert.rejects(
+      readInputs(fixture.environment),
+      /legacy_dpkg.*>=0\.3\.0,<0\.4\.0/u,
+    );
+    await assert.rejects(lstat(root), /ENOENT/u);
+    await assert.rejects(lstat(cacheRoot), /ENOENT/u);
+
+    delete fixture.environment.DEBZ_INSTALL_TRANSACTION_BACKEND;
+    await writeFile(
+      path.join(fixture.workspace, 'lock.json'),
+      '{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1}\n',
+    );
+    await assert.rejects(readInputs(fixture.environment), /exact-closure-lock-v1|legacy|unsupported/u);
+    await assert.rejects(lstat(root), /ENOENT/u);
+    await assert.rejects(lstat(cacheRoot), /ENOENT/u);
+  });
+}
+
 test('rejects host root, wrong architecture, unsafe booleans, and bad selectors', async () => {
   const root = await createInputEnvironment('root');
   root.environment.DEBZ_INSTALL_INSTALL_ROOT = '/';
   await assert.rejects(readInputs(root.environment), /host root/u);
 
   const architecture = await createInputEnvironment('architecture');
-  architecture.environment.DEBZ_INSTALL_ARCHITECTURE = 'arm64';
-  await assert.rejects(readInputs(architecture.environment), /native amd64/u);
+  const incompatibleArchitecture = process.arch === 'arm64' ? 'amd64' : 'arm64';
+  architecture.environment.DEBZ_INSTALL_ARCHITECTURE = incompatibleArchitecture;
+  await assert.rejects(readInputs(architecture.environment), /native (amd64|arm64)/u);
 
   const mutation = await createInputEnvironment('mutation');
   mutation.environment.DEBZ_INSTALL_ASSUME_YES = 'yes';

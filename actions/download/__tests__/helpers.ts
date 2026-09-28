@@ -12,7 +12,7 @@ export function environment(
     GITHUB_WORKSPACE: workspace,
     RUNNER_TEMP: runnerTemp,
     RUNNER_OS: 'Linux',
-    RUNNER_ARCH: 'X64',
+    RUNNER_ARCH: process.arch === 'arm64' ? 'ARM64' : 'X64',
     DEBZ_DOWNLOAD_TRANSACTION_BACKEND: 'legacy_dpkg',
     DEBZ_DOWNLOAD_LOCK_INPUT: 'lock.json',
     DEBZ_DOWNLOAD_ARCHITECTURE: 'amd64',
