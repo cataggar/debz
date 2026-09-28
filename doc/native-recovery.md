@@ -1958,7 +1958,7 @@ before retiring the Python entry points from the required gate.
 | `exercise_projection`: one read-only root with *both* `native_transaction_result.test.projected root external fixture` and `apt_system_orchestrator.test.projected native dispatch external fixture` | `test-native-recovery-zig-family`, `readOnlyProjection`: private PID/mount child runs the **actual test executable** with `DEBZ_NATIVE_PROJECTION_FIXTURE=1`, requires both named tests to report OK, byte-identical root evidence, empty lock and no leaked projection mount. The three signed projected workflows are separate cases, not proxies for this row. | Executed: 1/1. |
 | `exercise_repository_projection`: scoped caller preparation/adoption and cleanup | `test-native-recovery-zig-repository`, `projectionCase`: real private projected root, exact completion marker, lock-only namespace, absence of installed list and unchanged held bytes. | Executed: 1/1. |
 | `exercise_repository_execution`: execution `{success,known_failure,interrupted,missing_helper,unchanged,diagnostic,expired}`; resume `{success,known_failure,interrupted,unchanged}`; held unchanged `{refresh,no-refresh}`; dispatch `{success,no_refresh,unchanged,unchanged_no_refresh,known_failure,interrupted,completion_interrupted,locked_interrupted,scope_lost,refresh_failure,expired}` | `test-native-recovery-zig-repository`, `executionCase` (11), `unchangedCases` (2), `dispatchCases` (11): real private projected caller/backend children and original-input eviction. The six terminal execution/resume receipts now validate original locked checkpoint against typed final checkpoint, managed files against typed manifest and live bytes, caller completion record/generation and independently recomputed discharge, byte-identical private-mode completion copies, retained-document and actual database digests, exactly two source-bound script outcomes and isolated helper invocations, helper bytes/inode, and resumed caller/history identity (eight original inode/byte witnesses for success). Five nonterminal cases explicitly refuse all receipt/helper/repository artifacts and preserve the held path. Both no-receipt unchanged cases validate original vs publisher caller identity, checkpoint/manifest, held database, exact lock and descriptor archive/link digests; all eleven dispatch cases decode canonical result/checkpoint/provenance or unchanged evidence, hold state, non-success initial interruption, repeated result and unchanged helper identity. | Executed per named scenario and evidence shape: 11 + 2 + 11. The projected Zig fixture has its own pinned **amd64** target architecture even when the outer runner validates the pinned arm64 dpkg environment; do not mistake this synthetic projection for an arm64 dpkg differential. Aggregate runner. |
-| `exercise_fresh_helper_bootstrap`: recoverable `{after_execution_intent,during_filesystem_publication,during_database_publication,after_helper_source_prepared,during_helper_source_publication,after_helper_source_publication,after_helper_probe_prepared,after_helper_probe_outcome,after_helper_probe_completed,after_provenance}`; unknown `{after_helper_probe_in_flight,after_helper_probe_return_before_outcome}`; `ambient-target`, `ambient-source`; cleanup `{after_helper_cleanup_prepared,during_helper_cleanup,after_helper_cleanup_completed}`; scripted `{after_script_prepared,after_script_outcome,after_script_return_before_outcome}` | `test-native-recovery-zig-bootstrap`, explicit `recoverable`, `unknown_probe`, `cleanup`, `script_known` loops and `blocked` script case: real package-owned helper bootstrap, exit 86, eviction, fresh recovery, pinned dpkg and two immutable refusals for unknown/ambient cases. | Executed: 20/20. |
+| `exercise_fresh_helper_bootstrap`: recoverable `{after_execution_intent,during_filesystem_publication,during_database_publication,after_helper_source_prepared,during_helper_source_publication,after_helper_source_publication,after_helper_probe_prepared,after_helper_probe_outcome,after_helper_probe_completed,after_provenance}`; unknown `{after_helper_probe_in_flight,after_helper_probe_return_before_outcome}`; `ambient-target`, `ambient-source`; cleanup `{after_helper_cleanup_prepared,during_helper_cleanup,after_helper_cleanup_completed}`; scripted `{after_script_prepared,after_script_outcome,after_script_return_before_outcome}` | `test-native-recovery-zig-bootstrap`, explicit `recoverable`, `unknown_probe`, `cleanup`, `script_known` loops and `blocked` script case: real package-owned helper bootstrap, exit 86, eviction, fresh recovery, pinned dpkg and two immutable refusals for unknown/ambient cases. Separate `configCase/configRefusal` add seven dual-config crash windows and four refusal windows; see the [#267 transition inventory](#native-crash-transition-inventory-267). | Executed: 20/20 migrated cases; 11 additional #267 cases. |
 
 **Repository architecture scope:** Python `exercise_repository_projection`
 and `exercise_repository_execution` create the outer private root with the
@@ -1997,3 +1997,159 @@ private projected fixture intentionally targets amd64 even on arm64, matching
 the former Python fixture. FAMILY independently performs host-architecture
 projected transactions and pinned-dpkg comparisons; neither is an arm64
 repository-backend/dpkg differential.
+
+### Native crash-transition inventory (#267)
+
+This is an inventory of **real process termination** coverage, not a claim
+that every path through a journal is covered. Every cited Zig acceptance
+driver requires child exit **86**, absence of a completion report, and a new
+guarded root for its crash case; a unit-only assertion does not count.
+`src/native_recovery.zig::CrashPoint` has **58** values. The table below
+names all of them: 56 have an executable process-kill case, two remain
+uncovered. The selected previously unit-only family is bootstrap config-slot
+serialization (seven process cases, including the shared intent seam).
+
+In the table, `O` is the durable native `root-operation-v1.json` attempt
+(backend `native`, exact-lock/request/policy/program digests bound to
+`native-execution-intent-v1.json`); `M` is the same attempt/program in
+`root-mutation-v1.json`; `J` is the native progress/active-script record;
+`D` is the diversion contract/cache/managed-state checkpoint; `T` is trigger
+authority/events; `P` is the attempt-bound provenance/terminal completion.
+Caller-owned bootstrap is `repository_bootstrap/add` in the new `BC`
+fixtures. Ordinary install/upgrade/remove/purge use their own active native
+root-operation attempt. The lock is re-acquired for recovery, **not** for a
+new trial; the original owner remains active until the receipt is published
+and acknowledged. `R` means exact recovery against pinned dpkg or an
+explicitly tested failure state; `Q` means typed `recovery_required` without
+script/helper replay or a second mutation. A selected hook and its adjacent
+unit test alone are **not** evidence of `R`/`Q`.
+
+Evidence abbreviations: `BC` =
+`test/native_recovery_bootstrap.zig::configCase/configRefusal` (real dual
+config-bearing package bootstrap); `B` = the earlier `recovered/blocked`
+single-helper bootstrap cases; `A` = `test/native_recovery_acceptance.zig`
+core crash/completion cases; `H` = `test/native_recovery_helper.zig`
+ordinary/helper/known-failure cases; `C` = conffile, `N` = metadata,
+`L` = literal-path, `S` = scriptless, `V` =
+`test/native_recovery_diversions.zig::cases/runCase` (the numbered 100-case
+matrix); all are `test/native_recovery_*.zig` process drivers, not library
+unit tests. Rows with several drivers name a representative real case, not
+every family of operations using that selector.
+
+| `CrashPoint` | Durable seam and required outcome | Process evidence |
+| --- | --- | --- |
+| `after_execution_intent` | O/J: intent durable, no package mutation; R, then P | BC, A, H |
+| `after_helper_source_prepared` | O/J: owned source not yet published; R | B |
+| `during_helper_source_publication` | O/J: verify/adopt exact private source; R | B |
+| `after_helper_source_publication` | O/J: source completed; R without replacement | B |
+| `after_helper_probe_prepared` | O/J: probe has not launched; R | B |
+| `after_helper_probe_in_flight` | O/J: launch outcome unknowable; Q | B |
+| `after_helper_probe_return_before_outcome` | O/J: no durable outcome; Q | B |
+| `after_helper_probe_outcome` | O/J: probe outcome durable; R without relaunch | B |
+| `after_helper_probe_completed` | O/J: verified helper ready; R | B |
+| `after_helper_cleanup_prepared` | O/J/P: owned source cleanup on acknowledgment; R | B |
+| `during_helper_cleanup` | O/J/P: cleanup journal owns source; R | B |
+| `after_helper_cleanup_completed` | O/J/P: cleanup verified before active clear; R | B |
+| `during_filesystem_publication` | O/M/J: restore/retry exact owned publication; R | A, H, V |
+| `during_database_publication` | O/M/J: restore/retry database bytes; R | A, C, B |
+| `during_bootstrap_config_staging` | O/M/J: first slot staging prepared, journal owns `tmp.ci/config`; R | BC |
+| `after_bootstrap_config_stage` | O/J: first slot durable, first installed config absent; R | BC |
+| `after_subsequent_bootstrap_config_stage` | O/J: first slot cleared, second staged; R without first restage | BC |
+| `after_bootstrap_payload_before_config_cleanup` | O/J: first payload committed, first staged slot still owned; R | BC |
+| `during_bootstrap_config_cleanup` | O/M/J: removal journal owns first slot, no second publication; R | BC |
+| `after_bootstrap_config_cleanup` | O/J: first installed config durable, slot cleared; R | BC |
+| `after_script_prepared` | O/J: script not launched; owned retry R | B, H, C |
+| `after_script_outcome` | O/J: known outcome durable, no script replay; R | B, H, C |
+| `after_script_return_before_outcome` | O/J: script did run, no durable outcome; Q | BC, B, H |
+| `after_upgrade_postrm_return_before_outcome` | O/J/D: upgrade postrm unknown; Q | V, H |
+| `after_upgrade_postrm_route_publication` | O/J/D: route contract durable, cache/checkpoint owed; R or Q on drift | V #23/#27 |
+| `after_upgrade_postrm_cache_refresh` | O/J/D: private refreshed cache durable, checkpoint owed; R or Q on drift | **GAP #293** |
+| `after_upgrade_postrm_route_checkpoint` | O/J/D: contract/cache/managed checkpoint durable; R or Q on drift | **GAP #293** |
+| `after_upgrade_postrm_outcome` | O/J/D: known old postrm outcome, route evidence verified; R | V #24/#28/#58 |
+| `after_upgrade_unwind_outcome` | O/J/D: unwind outcome durable, no replay; R | V #59/#60 |
+| `after_upgrade_pre_rollback_compensation_outcome` | O/J/D: compensation outcome durable; R | V #61 |
+| `after_upgrade_postrm_marker_cleared` | O/J/D: script marker cleared only after known outcome; R | V #71/#72 |
+| `after_upgrade_postrm_completed` | O/J/D: completed old postrm; R | V #73/#74 |
+| `after_upgrade_unwind_completed` | O/J/D: completed unwind; R | V #75/#76 |
+| `after_upgrade_pre_rollback_compensation_completed` | O/J/D: completed compensation; R | V #77 |
+| `during_known_unpack_rollback` | O/M/J: original failed attempt, rollback journal owed; R or durable Q | V #64, final-gaps |
+| `after_known_unpack_rollback` | O/M/J: known rollback complete, no fresh install; R | V #65 |
+| `after_failure_outcome` | O/J/P: failed outcome retained, exact failed state/receipt; R | A, H, C, V |
+| `after_script_failure_state` | O/J: half-configured failure state durable; R | H |
+| `after_trigger_outcome` | O/J/T: known trigger outcome/events, no re-execution; R | H, N, L, V |
+| `after_provenance` | O/J/P: receipt published, active claim not yet cleared; R/ack | A, H, B |
+| `after_active_clear` | P: prior owner discharged; allow new attempt only with verified receipt | H |
+| `before_scriptless_trigger_completion` | O/J/T: no invented script/outcome; R or Q on drift | S |
+| `after_scriptless_trigger_completion` | O/J/T: no-handler completion durable; R | S |
+| `after_unpack_backups` | O/M/J/D: previous payload/backups held for rollback; R | V #41/#45–#48 |
+| `during_unpack_backup_publication` | O/M/J/D: backup publication journal owed; R | V #53 |
+| `during_unpack_backup_cleanup` | O/M/J/D: cleanup journal direction preserved; R | V #54/#56 |
+| `during_failed_unpack_publication` | O/M/J/D: failure publication/rollback owned; R | V #55 |
+| `before_failed_unpack_publication` | O/J/D: failure intent durable; R | V #51 |
+| `after_failed_unpack_publication` | O/J/D: failed-state publication durable; R | V #52 |
+| `before_unpack_backup_cleanup` | O/J/D: prior backups still present; R | V #42/#49 |
+| `after_unpack_backup_cleanup` | O/J/D: prior backups removed only after verified target; R | V #43/#50 |
+| `during_unpack_obsolete_removal` | O/M/J/D: old paths journaled, direction preserved; R or Q on drift | V #78–#83 |
+| `after_unpack_payload` | O/J/D: unpack bytes present, settlement not yet committed; R | V #84–#86 |
+| `after_unpack_payload_commit` | O/J/D: payload committed, downstream database owed; R | V #87 |
+| `during_unpack_settlement` | O/M/J/D: route settlement journal owed; R or Q on drift | V #88–#92 |
+| `after_unpack_settlement` | O/J/D: settlement durable, later commit owed; R | V #93/#94 |
+| `after_unpack_settlement_commit` | O/J/D: settlement committed, keep original owner; R | V #95 |
+| `after_unpack_settlement_rollback` | O/J/D: rollback settled, retry original failure only; R | V #96/#97 |
+
+**Checked bootstrap config-stage result.** `BC` runs the two-archive program
+with distinct `DEBIAN/config` scripts and deliberately fails if either
+config script is ever invoked. It checks the *latest process-kill progress*
+for database stage (substep 0), filesystem publication (1), and config-slot
+removal (2), including the first package's fully cleared slot before the
+second stages. The `during_*` crashes additionally decode the live mutation
+journal and match both its owner and program digest to the durable intent.
+Each of the seven interruptions uses original-archive eviction, refuses an
+unrelated purge **before** recovery, replays the same owner, compares the
+complete final root with a three-phase pinned-dpkg reference, repeats recovery
+without mutation, refuses purge **again** before acknowledgment, then checks
+the success receipt survives explicit acknowledgment and the terminal
+completion binds the original attempt. `config-changed-slot`,
+`config-corrupt-journal`, and `config-forged-journal` fail closed on two
+repeated recoveries and a new purge: exact current details are respectively
+`FileNotFound`, `JournalCorrupt`, and `AttemptMismatch`. The forged journal is
+canonical and digest-resealed with a different attempt owner, not merely
+invalid JSON; none of these refusals changes package state or clears the
+original owner. The changed-slot detail
+is a typed durable refusal but **not** a config-specific diagnostic; do not
+claim that it proves phase-specific diagnostics (#296). `config-unknown-script`
+executes a postinst once, crashes before its outcome, returns
+`recovery_required/script_outcome_unknown` twice without replay, and blocks
+purge. The verifier fix chooses helper filesystem substep 1 when the same
+bootstrap owner's config-staging database substep 0 exists (otherwise 0);
+without it the unknown-script refusal was masked as
+`native_helper_evidence_invalid`.
+
+**Observed gate (arm64, pinned dpkg 1.22.22):** the 58-row inventory was
+checked against executable Zig selectors; the 31 bootstrap cases (20
+existing + seven `config-*` transition cases + four refusal cases) passed
+in both Debug and ReleaseSafe. In both modes the command
+`zig build test-native-recovery-zig-unit test-native-recovery-helper-zig
+test-native-recovery-zig-bootstrap -Dnative-reference-dpkg=/absolute/pinned/dpkg
+-j2` passed; the focused bootstrap target was also run separately in both
+modes. A green unit/helper/bootstrap gate does **not** close #293–#296 or
+discharge the full #86 crash-coverage acceptance.
+
+**Other journal boundaries, not discharged by the 56 selectors.** The native
+root-mutation journal itself names 27 syscall hooks in
+`src/root_mutation.zig::Boundary`. Its `Stage` directions are
+prepared/applying/rolling_back → restore old,
+verified/completing/completed → finish new,
+releasing_rollback/rolled_back → finish old, and
+recovery_required → refuse. Existing unit hook assertions and selected
+`during_*_publication` process cases are **not** independent child-kill
+evidence for each hook. #294 tracks 13 journal/staging/backup boundaries;
+#295 tracks 14 publication/metadata/verification/release/restore boundaries.
+The five core completion boundaries (`after_native_receipt`,
+`after_completed_record`, `after_owed_provenance_document`,
+`after_provenance_published`, `after_native_acknowledged`) **are not**
+`CrashPoint` values; `A::coreCases` and the FAMILY owner cases exercise them
+with real children, original receipt and active owner through terminal
+acknowledgment. This table does not substitute for the remaining root
+mutation/process proof or for every package-specific script/trigger path in
+#86.
