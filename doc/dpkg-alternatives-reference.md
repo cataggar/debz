@@ -618,10 +618,26 @@ successful deferred callbacks, ordinal 3 at step **1428** remained
 `prepared` with **no script outcome**. The signed configure-only procps
 postinst SHA-256
 `7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
-was pending `/usr/lib/sysctl.d`; its separate `triggered` admission is
-unpublished. Native execution returned `InvalidAlternativesScriptAuthority`
+was pending `/usr/lib/sysctl.d`; its separate `triggered` admission was
+not present in #254. Native execution returned `InvalidAlternativesScriptAuthority`
 (exit 8). This root is retained for read-only evidence, never resumed as
 a fresh trial, and does not establish full snapshot parity.
+
+On #254's final squash plus only this procps-trigger admission, a
+separate new root-owned protected 175-package amd64 workspace
+`/var/lib/debz-procps-reference-254/checkout/.real-snapshot/amd64-procps-254-protected-signed-1`
+authenticated the signer and independently checked every SHA-512
+archive and the exact object set. Signed procps postinst step **1428**,
+ordinal **3**, spawned with `["triggered", "/usr/lib/sysctl.d"]`,
+durably exited **0** with zero output and completed `succeeded`;
+procps ended installed. The 78-byte `vtrgb` record retained reference
+SHA-256 `1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`.
+The seven deferred callbacks exited 0, but
+`libglib2.0-0t64` remained self `triggers-awaited`: final closure
+refused with `final_closure_mismatch`, exit **8**. This independently
+authenticated native outcome does not establish pinned-reference
+parity or authorize the separate glib settlement; the interrupted
+root is never reused.
 
 The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
 `4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)

@@ -1595,6 +1595,41 @@ never reused as fresh. The console-setup failure was addressed by the
 subsequent exact signed script-path admission; its pinned-dpkg parity does
 not follow from the procps trigger proof.
 
+On final #254 python3 squash
+`0e17210b0f2c15ce8cba7f029892911aa887887f` plus **only** the
+procps-trigger delta, a new root-owned checkout
+`/var/lib/debz-procps-reference-254/checkout` (mode-0700
+`.real-snapshot`) created an empty
+`.real-snapshot/amd64-procps-254-protected-signed-1/root`, cache and
+state. Its authenticated `stonking` amd64 lock SHA-256 was
+`67eaaf9146202f75d1ff63e9a0ce81cc3e001efcb667777a7f471c73c01724a2`,
+signed by `f6ecb3762474eda9d21b7022871920d1991bc93c`.
+All **175/175** SHA-512 archive objects (67,976,788 bytes) matched
+their signed identities, declared sizes and exact cache object set;
+`evidence/cas-rehash.tsv` SHA-256 was
+`0e3f2a55adb3d91d60b216f9af8c61c5785e05ab8266b4f0fee220464558a7c1`.
+The ReleaseSafe executable SHA-256 was
+`936df94bb4f5a03a2d17ad42381535b5548e6f9fffa68f110926f51abe6fd425`.
+Signed `python3` preinst step 1383 again exited 0. The exact
+signed procps postinst SHA-256
+`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+then **spawned** for deferred trigger step **1428**, ordinal **3**,
+with `["triggered", "/usr/lib/sysctl.d"]`, durably exited **0** with
+zero output, and completed `succeeded`; `procps` ended `install ok
+installed`. The reference-exact 78-byte `vtrgb` record retained SHA-256
+`1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`;
+the private `/proc` mount left no `/proc/sys`.
+
+This is **not** a successful complete install or pinned-reference
+parity proof. All seven deferred callbacks exited 0, including the
+signed `libglib2.0-0t64` callback at ordinal 4, but that package
+remained self `triggers-awaited` for its own schema trigger.
+Following completed database step 1431, final verification refused
+with `final_closure_mismatch`; `create.json` recorded exit **8**.
+The glib self-file-trigger settlement is a separate, unpublished
+change. This interrupted root is retained read-only and is never
+resumed as a fresh installation.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
