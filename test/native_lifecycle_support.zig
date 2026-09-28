@@ -328,6 +328,8 @@ pub const Action = struct {
     architecture: []const u8,
 };
 
+pub const ImportDrift = enum { status_mode, installed_script_mode };
+
 pub const Phase = struct {
     operation: []const u8,
     archives: []const []const u8 = &.{},
@@ -342,6 +344,7 @@ pub const Phase = struct {
     ordered_actions: ?[]const Action = null,
     rollback_links: []const []const u8 = &.{},
     created_rollback_links: []const []const u8 = &.{},
+    fixture_import_drift: ?ImportDrift = null,
 };
 
 pub fn runExit(fixture: *foundation.Fixture, argv: []const []const u8, log: []const u8) !u8 {
@@ -448,6 +451,7 @@ pub fn native(fixture: *foundation.Fixture, executable: []const u8, root: []cons
         .recovery = phase.recovery,
         .crash_at = phase.crash_at,
         .ordered_actions = phase.ordered_actions,
+        .fixture_import_drift = phase.fixture_import_drift,
     }, .{});
     defer fixture.allocator.free(document);
     try fixture.write(request_relative, document, 0o644);
