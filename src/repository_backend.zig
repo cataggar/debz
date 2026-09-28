@@ -2000,6 +2000,8 @@ pub const Backend = struct {
         execution_path: ExecutionPath,
     ) !api.Result {
         const transaction_backend = self.transaction_backend;
+        if (!self.legacy_execution_capable and transaction_backend == .legacy_dpkg)
+            return mapRootOperationError(error.LegacyCapabilityRequired);
         const native = execution_path == .native_runtime;
         if (native and (transaction_backend != .native or self.root_projection == null or self.native_executor != null))
             return api.failure(
@@ -4163,6 +4165,9 @@ const RootOperationGuard = struct {
         if (backend == .native) {
             prior = self.coordinator.inspect(self.allocator) catch |err|
                 return mapRootOperationError(err);
+            if (!self.legacy_execution_capable and prior != null and
+                prior.?.record.backend == .legacy_dpkg)
+                return mapRootOperationError(error.LegacyCapabilityRequired);
             if (self.native_resume_completion) {
                 if (prior) |value| {
                     const record = value.record;
@@ -11964,6 +11969,31 @@ fn repositoryTestRoot(
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = try directory.realPath(std.testing.io, &buffer);
     return std.fmt.allocPrint(allocator, "{s}/root", .{buffer[0..length]});
+}
+
+test "repository backend native-only rehearsal rejects legacy before root or sidecar creation" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "sentinel", .data = "original\n" });
+    const root = try repositoryTestRoot(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root);
+    var backend: Backend = .{ .io = std.testing.io, .legacy_execution_capable = false };
+    const request: api.Request = .{
+        .root = root,
+        .descriptor_url = "https://packages.test/config.deb",
+    };
+    for (0..2) |_| {
+        var refused = try backend.execute(std.testing.allocator, request);
+        defer refused.deinit();
+        try std.testing.expectEqual(api.ExitStatus.recovery, refused.exit_status);
+        try std.testing.expectEqual(api.DiagnosticId.legacy_recovery_release_required, refused.diagnostics[0].id);
+        try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, legacy_compat.recovery_guidance) != null);
+    }
+    try std.testing.expectError(error.FileNotFound, directory.dir.openDir(std.testing.io, "root/var", .{}));
+    const sentinel = try directory.dir.readFileAlloc(std.testing.io, "sentinel", std.testing.allocator, .limited(32));
+    defer std.testing.allocator.free(sentinel);
+    try std.testing.expectEqualStrings("original\n", sentinel);
 }
 
 fn stageRepositoryTestRoot(directory: std.Io.Dir) !void {

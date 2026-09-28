@@ -1,6 +1,7 @@
 const std = @import("std");
 const debz = @import("debz");
 const api = debz.repository_api;
+const backend_policy = @import("cli_backend_policy");
 
 pub const OutputFormat = enum {
     human,
@@ -18,6 +19,7 @@ pub const ParseError = error{
     InvalidDigest,
     InvalidNumber,
     InvalidTransactionBackend,
+    LegacyCapabilityRequired,
     MissingUrl,
     MissingValue,
     OutOfMemory,
@@ -60,12 +62,20 @@ const Option = enum {
 };
 
 pub fn parseAdd(arguments: []const []const u8) ParseError!ParsedAdd {
+    return parseAddForRuntime(arguments, .legacy_capable);
+}
+
+pub fn parseAddForRuntime(
+    arguments: []const []const u8,
+    runtime: debz.legacy_compat.RuntimeMode,
+) ParseError!ParsedAdd {
     var parsed: ParsedAdd = .{
         .request = .{
             .root = "/",
             .descriptor_url = "",
         },
     };
+    var selected: ?debz.transaction_engine.Kind = null;
     var seen: std.EnumSet(Option) = .initEmpty();
     var index: usize = 0;
     var options = true;
@@ -99,7 +109,7 @@ pub fn parseAdd(arguments: []const []const u8) ParseError!ParsedAdd {
             parsed.request.architecture = try next(arguments, &index);
         } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
             try setOnce(&seen, .transaction_backend);
-            parsed.transaction_backend = std.meta.stringToEnum(
+            selected = std.meta.stringToEnum(
                 debz.transaction_engine.Kind,
                 try next(arguments, &index),
             ) orelse return error.InvalidTransactionBackend;
@@ -200,6 +210,11 @@ pub fn parseAdd(arguments: []const []const u8) ParseError!ParsedAdd {
     }
     if (!seen.contains(.url) or parsed.request.descriptor_url.len == 0)
         return error.MissingUrl;
+    parsed.transaction_backend = backend_policy.select(runtime, selected, .repository) catch |err|
+        switch (err) {
+            error.LegacyCapabilityRequired => return error.LegacyCapabilityRequired,
+            else => return error.InvalidTransactionBackend,
+        };
     return parsed;
 }
 
@@ -380,4 +395,20 @@ test "repo add parser rejects missing duplicate malformed and positional inputs"
         "--",
         "operand",
     }));
+}
+
+test "repo add parser rehearses native-only omitted and explicit backend refusal" {
+    const url = [_][]const u8{ "--url", "https://packages.test/config.deb" };
+    const native = try parseAddForRuntime(&url, .native_only);
+    try std.testing.expectEqual(debz.transaction_engine.Kind.native, native.transaction_backend);
+    try std.testing.expectError(error.LegacyCapabilityRequired, parseAddForRuntime(
+        &.{ "--url", "https://packages.test/config.deb", "--transaction-backend", "legacy_dpkg" },
+        .native_only,
+    ));
+    const explicit = try parseAddForRuntime(
+        &.{ "--url", "https://packages.test/config.deb", "--transaction-backend", "native" },
+        .native_only,
+    );
+    try std.testing.expectEqual(debz.transaction_engine.Kind.native, explicit.transaction_backend);
+    try std.testing.expectEqual(debz.transaction_engine.Kind.legacy_dpkg, (try parseAdd(&url)).transaction_backend);
 }

@@ -444,6 +444,11 @@
       "cutover": "retain_historical_classifier_delete_new_execution_disposition"
     },
     {
+      "path": "src/cli_backend_policy.zig",
+      "role": "opt_in_cli_native_only_backend_refusal_and_historical_verification",
+      "cutover": "retain_historical_verification_delete_legacy_new_execution_selection"
+    },
+    {
       "path": "src/native_authorization.zig",
       "role": "native_authorization_rejects_legacy_authority",
       "cutover": "retain_guard"

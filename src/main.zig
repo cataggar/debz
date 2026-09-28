@@ -1,10 +1,16 @@
 const std = @import("std");
 const debz = @import("debz");
 const repository_cli = @import("repository_cli");
+const backend_policy = @import("cli_backend_policy");
+const native_only_rehearsal = @import("cli_rehearsal_options").native_only;
 const api = debz.product_api;
 const repository_api = debz.repository_api;
 const apt_cli = debz.apt_system_cli;
 const apt_command = debz.apt_system_command;
+
+fn runtimeMode() debz.legacy_compat.RuntimeMode {
+    return if (native_only_rehearsal) .native_only else .legacy_capable;
+}
 
 const root_help =
     \\debz - deterministic Debian package operations
@@ -256,7 +262,7 @@ const transaction_result_help =
     \\
 ;
 
-const CliError = error{ InvalidArguments, MissingValue, InvalidNumber, OutOfMemory };
+const CliError = error{ InvalidArguments, MissingValue, InvalidNumber, OutOfMemory, LegacyCapabilityRequired };
 const SingleOption = enum {
     transaction_backend,
     install_root,
@@ -316,6 +322,16 @@ pub fn main(init: std.process.Init) !void {
         try stdout.writeAll(root_help);
         return;
     };
+    if (native_only_rehearsal and
+        !std.mem.eql(u8, command, "version") and
+        !std.mem.eql(u8, command, "repo") and
+        !std.mem.eql(u8, command, "transaction-result") and
+        !(if (debz.parseOperation(command)) |operation| supportsExactLocks(operation) else false))
+    {
+        try stderr.writeAll("debz: native-only rehearsal does not cover this selector (#280/#284)\n");
+        try stderr.flush();
+        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+    }
     if (std.mem.eql(u8, command, "version")) {
         if (args.next()) |argument| {
             try stderr.print("debz: unexpected argument '{s}' for 'debz version'\n", .{argument});
@@ -373,7 +389,19 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     };
     var requested_output: api.OutputFormat = .human;
-    const parsed = parse(init.arena.allocator(), operation, &args, &requested_output) catch |err| {
+    const parsed = parse(init.arena.allocator(), operation, &args, &requested_output, runtimeMode()) catch |err| {
+        if (err == error.LegacyCapabilityRequired) {
+            const refused = api.failure(
+                operation,
+                .recovery,
+                .legacy_recovery_release_required,
+                debz.legacy_compat.recovery_guidance,
+            );
+            try render(init.arena.allocator(), stdout, stderr, requested_output, refused);
+            try stdout.flush();
+            try stderr.flush();
+            std.process.exit(@intFromEnum(refused.exit_status));
+        }
         if (requested_output == .json) {
             const invalid = api.failure(operation, .usage, .invalid_request, @errorName(err));
             try render(init.arena.allocator(), stdout, stderr, .json, invalid);
@@ -390,6 +418,7 @@ pub fn main(init: std.process.Init) !void {
     var backend_context: debz.ProductionBackend = .{
         .io = init.io,
         .transaction_backend = parsed.transaction_backend,
+        .legacy_execution_capable = !native_only_rehearsal,
         .native_runtime_allocator = if (parsed.transaction_backend == .native) init.gpa else null,
     };
     const result = api.execute(init.arena.allocator(), request, .{
@@ -676,7 +705,7 @@ fn runTransactionResult(
         std.process.exit(@intFromEnum(api.ExitStatus.usage));
     }
 
-    var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
+    var selected_backend: ?debz.transaction_engine.Kind = null;
     var install_root: ?[]const u8 = null;
     var state_path: ?[]const u8 = null;
     var lock_input: ?[]const u8 = null;
@@ -695,7 +724,7 @@ fn runTransactionResult(
                 return transactionResultUsage(stderr, "duplicate --transaction-backend");
             const value = args.next() orelse
                 return transactionResultUsage(stderr, "missing --transaction-backend value");
-            transaction_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, value) orelse
+            selected_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, value) orelse
                 return transactionResultUsage(stderr, "invalid --transaction-backend");
         } else if (std.mem.eql(u8, argument, "--install-root")) {
             setOnceTransactionResult(&seen, .install_root) catch
@@ -723,6 +752,11 @@ fn runTransactionResult(
     }
     if (!requested_json)
         return transactionResultUsage(stderr, "--json is required");
+    const transaction_backend = try backend_policy.select(
+        runtimeMode(),
+        selected_backend,
+        .transaction_result_verification,
+    );
     if (capabilities) {
         if (transaction_backend != .native or state_path != null or install_root != null or
             lock_input != null or architecture != null)
@@ -1362,8 +1396,20 @@ fn runRepository(
 
     var arguments: std.ArrayList([]const u8) = .empty;
     while (args.next()) |argument| try arguments.append(init.arena.allocator(), argument);
-    const parsed = repository_cli.parseAdd(arguments.items) catch |err| {
+    const parsed = repository_cli.parseAddForRuntime(arguments.items, runtimeMode()) catch |err| {
         const output = requestedRepositoryOutput(arguments.items);
+        if (err == error.LegacyCapabilityRequired) {
+            const refused = repository_api.failure(
+                .recovery,
+                .legacy_recovery_release_required,
+                "root-operation",
+                debz.legacy_compat.recovery_guidance,
+            );
+            try renderRepository(init.arena.allocator(), stdout, stderr, output, refused);
+            try stdout.flush();
+            try stderr.flush();
+            std.process.exit(@intFromEnum(refused.exit_status));
+        }
         if (output == .json) {
             const invalid = repository_api.failure(
                 .usage,
@@ -1384,6 +1430,7 @@ fn runRepository(
     var backend_context: debz.ProductionRepositoryBackend = .{
         .io = init.io,
         .transaction_backend = parsed.transaction_backend,
+        .legacy_execution_capable = !native_only_rehearsal,
     };
     var result = (switch (parsed.transaction_backend) {
         .native => debz.repository_command.executeNative(init.arena.allocator(), parsed.request),
@@ -1566,6 +1613,7 @@ fn parse(
     operation: api.Operation,
     args: *std.process.Args.Iterator,
     requested_output: *api.OutputFormat,
+    runtime: debz.legacy_compat.RuntimeMode,
 ) CliError!ParsedProductCommand {
     var packages: std.ArrayList([]const u8) = .empty;
     var sources: std.ArrayList([]const u8) = .empty;
@@ -1574,7 +1622,7 @@ fn parse(
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
     var seen: std.EnumSet(SingleOption) = .initEmpty();
-    var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;
+    var selected_backend: ?debz.transaction_engine.Kind = null;
     var native_result = false;
     var options: api.CommonOptions = .{
         .install_root = "",
@@ -1626,7 +1674,7 @@ fn parse(
         } else if (std.mem.eql(u8, argument, "--transaction-backend")) {
             if (!supportsExactLocks(operation)) return error.InvalidArguments;
             try setOnce(&seen, .transaction_backend);
-            transaction_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, try next(args)) orelse
+            selected_backend = std.meta.stringToEnum(debz.transaction_engine.Kind, try next(args)) orelse
                 return error.InvalidArguments;
         } else if (std.mem.eql(u8, argument, "--lock-input")) {
             try setOnce(&seen, .lock_input);
@@ -1665,6 +1713,13 @@ fn parse(
         } else return error.InvalidArguments;
     }
 
+    const transaction_backend = if (supportsExactLocks(operation))
+        backend_policy.select(runtime, selected_backend, .product) catch |err| switch (err) {
+            error.LegacyCapabilityRequired => return error.LegacyCapabilityRequired,
+            else => return error.InvalidArguments,
+        }
+    else
+        debz.transaction_engine.Kind.legacy_dpkg;
     if (native_result and (operation != .install or transaction_backend != .native or
         options.output != .json or options.lock_input_path == null))
         return error.InvalidArguments;

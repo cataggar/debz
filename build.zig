@@ -77,20 +77,31 @@ pub fn build(b: *std.Build) void {
     debz.linkLibrary(zstd);
     debz.link_libc = true;
 
+    const cli_backend_policy = b.createModule(.{
+        .root_source_file = b.path("src/cli_backend_policy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cli_backend_policy.addImport("debz", debz);
     const repository_cli = b.createModule(.{
         .root_source_file = b.path("src/repository_cli.zig"),
         .target = target,
         .optimize = optimize,
     });
     repository_cli.addImport("debz", debz);
+    repository_cli.addImport("cli_backend_policy", cli_backend_policy);
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const release_cli_options = b.addOptions();
+    release_cli_options.addOption(bool, "native_only", false);
     cli_module.addImport("debz", debz);
     cli_module.addImport("repository_cli", repository_cli);
+    cli_module.addImport("cli_backend_policy", cli_backend_policy);
+    cli_module.addOptions("cli_rehearsal_options", release_cli_options);
 
     const cli = b.addExecutable(.{
         .name = "debz",
@@ -1686,6 +1697,52 @@ pub fn build(b: *std.Build) void {
         "test-legacy-compat",
         "Run legacy artifact, profile, journal, and active-operation policy tests",
     ).dependOn(&run_legacy_compat_tests.step);
+
+    const native_only_rehearsal = b.step(
+        "test-native-only-rehearsal",
+        "Rehearse opt-in CLI selection and pre-mutation root refusal without changing release defaults",
+    );
+    const rehearsal_backend_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "root_operation.test.native-only rehearsal",
+            "production native-only rehearsal",
+            "repository backend native-only rehearsal",
+            "legacy_compat.test.active legacy evidence requires",
+            "legacy_compat.test.capability evidence binds",
+            "transaction result summary binds successful canonical evidence",
+        },
+    });
+    native_only_rehearsal.dependOn(&b.addRunArtifact(rehearsal_backend_tests).step);
+    const rehearsal_cli_tests = b.addTest(.{
+        .root_module = repository_cli,
+        .filters = &.{
+            "cli_backend_policy.test.",
+            "repo add parser rehearses native-only",
+        },
+    });
+    native_only_rehearsal.dependOn(&b.addRunArtifact(rehearsal_cli_tests).step);
+    const rehearsal_options = b.addOptions();
+    rehearsal_options.addOption(bool, "native_only", true);
+    const rehearsal_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rehearsal_module.addImport("debz", debz);
+    rehearsal_module.addImport("repository_cli", repository_cli);
+    rehearsal_module.addImport("cli_backend_policy", cli_backend_policy);
+    rehearsal_module.addOptions("cli_rehearsal_options", rehearsal_options);
+    const rehearsal_cli = b.addExecutable(.{
+        .name = "debz-native-only-rehearsal",
+        .root_module = rehearsal_module,
+    });
+    const rehearsal_cli_cases = b.addSystemCommand(&.{
+        "sh", "tools/test-native-only-rehearsal.sh",
+    });
+    rehearsal_cli_cases.addArtifactArg(rehearsal_cli);
+    native_only_rehearsal.dependOn(&rehearsal_cli_cases.step);
+    test_step.dependOn(native_only_rehearsal);
 
     const production_customize_tests = b.addTest(.{
         .root_module = b.createModule(.{
