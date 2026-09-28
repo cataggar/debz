@@ -512,11 +512,11 @@ test "recovery-unit.rollback comparison accepts only the failure-clock interval"
     try std.testing.expectError(error.MissingRollbackPath, oracle.normalizeRollbackTimes(&entries, &.{.{ .path = "absent", .original_nanoseconds = 100 }}, 125, 175, true));
 }
 
-test "recovery-unit.consumer parity matrix requires all 28 matched signed-suite cases" {
+test "recovery-unit.consumer parity matrix requires all 30 matched signed-suite cases" {
     const cases = oracle.parity_cases;
     try std.testing.expectEqualStrings("debian-stable", oracle.parity_suites[0]);
     try std.testing.expectEqualStrings("ubuntu-26.04", oracle.parity_suites[1]);
-    try std.testing.expectEqual(@as(usize, 14), cases.len);
+    try std.testing.expectEqual(@as(usize, 15), cases.len);
     try std.testing.expect(cases[4].recommends and !cases[3].recommends);
     try std.testing.expect(cases[10].archives.len == 0 and cases[10].update);
     try std.testing.expectEqualStrings("fixture-upgrade", cases[9].seeds[0]);
@@ -530,7 +530,10 @@ test "recovery-unit.consumer parity matrix requires all 28 matched signed-suite 
     try std.testing.expectEqualStrings("trigger-pkg", cases[8].package.?);
     try std.testing.expectEqualStrings("literal-paths-pkg", cases[6].archives[0]);
     try std.testing.expectEqualStrings("retained-metadata-pkg", cases[7].archives[0]);
-    var rows: [28]oracle.ParityRow = undefined;
+    try std.testing.expectEqualStrings("pre-depends-known-failure", cases[14].id);
+    try std.testing.expectEqualStrings("fail-script", cases[14].reference_phases[0][0]);
+    try std.testing.expectEqual(@as(u8, 7), cases[14].exit_status);
+    var rows: [oracle.parity_suites.len * cases.len]oracle.ParityRow = undefined;
     for (oracle.parity_suites, 0..) |suite, suite_index| {
         for (cases, 0..) |case, index| {
             rows[suite_index * cases.len + index] = .{
@@ -545,7 +548,7 @@ test "recovery-unit.consumer parity matrix requires all 28 matched signed-suite 
     try oracle.validateConsumerParity(&rows, "amd64");
     try std.testing.expectError(error.IncompleteOrDuplicatedConsumerParity, oracle.validateConsumerParity(&.{}, "amd64"));
     try std.testing.expectError(error.IncompleteOrDuplicatedConsumerParity, oracle.validateConsumerParity(rows[0 .. rows.len - 1], "amd64"));
-    var extra: [29]oracle.ParityRow = undefined;
+    var extra: [rows.len + 1]oracle.ParityRow = undefined;
     @memcpy(extra[0..rows.len], &rows);
     extra[rows.len] = rows[0];
     try std.testing.expectError(error.IncompleteOrDuplicatedConsumerParity, oracle.validateConsumerParity(&extra, "amd64"));

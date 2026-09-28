@@ -403,8 +403,8 @@ These are executed fixture cases, not corpus labels or program-only checks.
 the hash-pinned dpkg reference and exact `status`/`status-old`, `info`,
 filesystem and length-prefixed script-trace snapshots. The signed consumer
 cases additionally compare core and FAMILY to pinned dpkg on distinct roots,
-using identical authenticated v3 locks. Every signed repository archive now
-publishes SHA-256, SHA-512 and Size; the Zig runner independently rehashes both
+using identical authenticated v3 locks. This signed parity cohort publishes
+SHA-256, SHA-512 and Size for each archive; the Zig runner independently rehashes both
 digests and checks the declared byte count for every locked repository archive.
 The pinned reference's executable SHA-256 and version remain checked before
 each run.
