@@ -738,6 +738,39 @@ and supplies no full-closure parity claim. The signed lock, independent
 175-archive rehash and next refusal are recorded in the
 [integration roots](integration-roots.md).
 
+The same signed `procps` archive's postinst is pending with
+`["triggered", "/usr/lib/sysctl.d"]`. That exact branch shifts its arguments,
+dispatches `/usr/lib/sysctl.d` to `_update_sysctl`, and exits 0 **before**
+the parameterized `check_alternatives` function can run. `_update_sysctl`
+cannot invoke `sysctl` when `/proc/sys` is absent. In a disposable copy of
+the interrupted root with that path absent, pinned dpkg 1.22.22
+`--triggers-only procps:amd64` exited 0, cleared the pending trigger and
+left both the alternatives-record inventory (SHA-256
+`892dd4d64385f38db6abcdefc197440d1c7cc79441675f2d0072fdf4f435217d`)
+and selector inventory (SHA-256
+`12b2a9e513aec2ff3a1dd768cdd48ae4f9ab1bafed82df02fd68629bdfd2ebe1`)
+unchanged. No `uptime`, `vmstat`, `w`, or `ps` group appeared.
+
+The additional native admission is restricted to a **trigger** action,
+the new-package `procps:amd64` 2:4.0.6-3ubuntu1 postinst with the exact
+script bytes, bound trigger handler and arguments above, and the snapshot
+amd64 `update-alternatives` tool. It still requires all four `.procps`
+providers absent and every group immutable; it also refuses an occupied
+`/proc/sys` before launch and checkpoints that absence through post-exit
+validation. This is not a general trigger or shell-variable allowance:
+different triggers, arguments, scripts, actions, handlers, tools, or
+observed alternatives mutations fail closed. The script's actual outcome
+and unknown-outcome recovery remain unchanged.
+
+An independently authenticated new 175-package root persisted this exact
+procps callback at step 1428, ordinal 3, with exit 0 and zero output;
+its immutable alternatives checkpoint passed and `procps` reached
+`install ok installed`. The overall install nevertheless failed: an earlier
+`console-setup:all postinst configure` at step 1297 exited 10 and left that
+package half-configured. Its later failed receipt is not a procps or
+full-root parity claim. The console-setup failure was addressed separately
+in the subsequent signed script-path admission.
+
 External tool execution intentionally retains the oracle's observable
 non-atomic failure boundary. When native code itself owns a record/link
 transition, the complete database-plus-selector-plus-generic-link intent set is

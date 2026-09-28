@@ -1561,6 +1561,40 @@ has configure-only admission on this branch, not an authorized
 trigger-admission branch. No full install/parity claim follows from
 python3's success; this root is retained read-only, never reused.
 
+An earlier, independently authenticated procps-trigger proof followed
+the interrupted console-setup-linux root described above:
+
+In a disposable **copy** of the earlier procps-refused root, pinned dpkg 1.22.22
+processed only the exact pending procps trigger with exit 0 and left every
+alternatives record and selector unchanged. The signed callback exits its
+triggered branch before alternatives commands; `/proc/sys` was absent,
+so its conditional `sysctl` action was unreachable. Native admission now
+requires the exact compiled handler, `["triggered", "/usr/lib/sysctl.d"]`,
+snapshot tool, all four absent `.procps` providers, absent `/proc/sys`,
+and immutable alternatives checkpoints. A new, independently authenticated
+root `.real-snapshot/amd64-procps-trigger-fresh-long-1` authenticated the
+reviewed signer, independently SHA-512-rehashed all 175 archives against
+its newly resolved lock (file SHA-256
+`c518a6a265e68857a603c9e47c807cab2bf0db2728451a495e37b5bcb03a4243`),
+and persisted the exact procps trigger at step 1428, ordinal 3, with
+`["triggered", "/usr/lib/sysctl.d"]`, exit 0 and zero output bytes. Its
+script journal records `outcome exited` and `completed succeeded`, followed
+by a completed database transition; `procps` ended `install ok installed`.
+The snapshot `vtrgb` record remained byte-identical to pinned dpkg.
+
+**This is not a successful install**: earlier in the same new root,
+`console-setup:all` 1.248ubuntu3 `postinst configure` at step 1297
+(script SHA-256
+`e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d`)
+actually exited **10**, with zero output bytes. Its journal records
+`completed failed`, and the package remains `install ok half-configured`.
+The transaction processed its deferred trigger callbacks, including procps,
+then published a terminal **failed** receipt (`install` exit 7,
+`failed_after_mutation`). The root is retained as a failed transaction,
+never reused as fresh. The console-setup failure was addressed by the
+subsequent exact signed script-path admission; its pinned-dpkg parity does
+not follow from the procps trigger proof.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON
