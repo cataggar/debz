@@ -209,6 +209,107 @@ test "security: both Actions rehearse native-only contracts without changing the
     }
 }
 
+fn productionCandidateOverrides(f: *Fixture, overrides: std.json.ObjectMap) !support.Result {
+    const input = try std.json.Stringify.valueAlloc(
+        f.arena.allocator(),
+        .{ .overrides = std.json.Value{ .object = overrides } },
+        .{},
+    );
+    return f.check("native-only-candidate", input);
+}
+
+fn productionCandidate(f: *Fixture, path: ?[]const u8, text: ?[]const u8) !support.Result {
+    var overrides: std.json.ObjectMap = .empty;
+    if (path) |relative| try overrides.put(
+        f.arena.allocator(),
+        relative,
+        if (text) |value| .{ .string = value } else .null,
+    );
+    return productionCandidateOverrides(f, overrides);
+}
+
+test "security: native-only production candidate refuses shipped routes and exact negative mutations" {
+    var f = try Fixture.init();
+    defer f.deinit();
+
+    const baseline = try productionCandidate(&f, null, null);
+    defer baseline.deinit();
+    for ([_][]const u8{
+        "src/main.zig: candidate cutover task: remove CLI legacy selection/default",
+        "src/transaction_executor.zig: legacy production dpkg/dpkg-deb command adapter remains",
+        "src/transaction_executor.zig: active legacy journal recovery still launches dpkg",
+        "src/transaction_recovery.zig: candidate cutover task: remove active legacy journal v4 publication/replay; retain v1-v4 decode",
+        "src/root_operation.zig: candidate cutover task: remove root-operation active legacy publication default",
+        "src/production_backend.zig: candidate cutover task:",
+        "src/repository_backend.zig: candidate cutover task:",
+        "src/package_family_backend.zig: candidate cutover task:",
+        "src/apt_system_orchestrator.zig: candidate cutover task:",
+        "src/target_apt_config.zig: candidate cutover task:",
+        "download dist/index.js: checked-in bundle is stale or accepts legacy",
+        "install dist/index.js: checked-in bundle is stale or accepts legacy",
+    }) |message| try baseline.failsWith(message);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/prepare-native-dpkg.py:") == null);
+    try testing.expect(std.mem.indexOf(u8, baseline.stderr, "tools/native-differential.py:") == null);
+
+    for ([_]struct { path: []const u8, from: []const u8, to: []const u8, message: []const u8 }{
+        .{ .path = "src/main.zig", .from = "var transaction_backend: debz.transaction_engine.Kind = .legacy_dpkg;", .to = "var transaction_backend: debz.transaction_engine.Kind = .native;", .message = "src/main.zig: stale reviewed inventory fingerprint" },
+        .{ .path = "actions/download/src/inputs.ts", .from = "?? 'legacy_dpkg';", .to = "?? 'native';", .message = "download inputs.ts: candidate must refuse legacy before reading lock" },
+        .{ .path = "actions/install/src/inputs.ts", .from = "|| 'legacy_dpkg';", .to = "|| 'native';", .message = "install inputs.ts: candidate must refuse legacy before reading lock" },
+        .{ .path = "actions/download/dist/index.js", .from = "legacy-dpkg-execution-deprecated-v1", .to = "forged-legacy-capability", .message = "actions/download/dist/index.js: stale reviewed inventory fingerprint" },
+        .{ .path = "src/transaction_recovery.zig", .from = "pub fn persist(allocator:", .to = "pub fn persistLegacy(allocator:", .message = "src/transaction_recovery.zig: stale reviewed inventory fingerprint" },
+        .{ .path = "src/transaction_executor.zig", .from = ".argv = invocation.argv,", .to = ".argv = &.{ \"/usr/bin/dpkg\" },", .message = "src/transaction_executor.zig: stale reviewed inventory fingerprint" },
+        .{ .path = "src/live_root.zig", .from = "const forked = linux.fork();", .to = "const other = linux.syscall5(.execveat, fd, path, argv, envp, flags);\n        const forked = linux.fork();", .message = "src/live_root.zig: unreviewed/stale child-process allowance" },
+        .{ .path = "src/package_family_backend.zig", .from = "const std = @import(\"std\");", .to = "const std = @import(\"std\");\nfn unreviewedLaunch() void { _ = std.process.run(allocator, io, args); }", .message = "src/package_family_backend.zig: unreviewed production child-process launch" },
+        .{ .path = "tools/native-differential.py", .from = "#!/usr/bin/env python3", .to = "#!/usr/bin/env python3\n# changed oracle", .message = "tools/native-differential.py: stale reviewed inventory fingerprint" },
+    }) |mutation| {
+        const source = try f.source(mutation.path);
+        const changed = try f.replace(source, mutation.from, mutation.to);
+        const refused = try productionCandidate(&f, mutation.path, changed);
+        defer refused.deinit();
+        try refused.failsWith(mutation.message);
+    }
+
+    const missing = try productionCandidate(&f, "src/maintainer_script.zig", null);
+    defer missing.deinit();
+    try missing.failsWith("src/maintainer_script.zig: missing/unreadable candidate inventory path");
+    const inventory = try f.source("security/native-only-production-policy.json");
+    const changed_inventory = try f.replace(inventory, "\"linux.execve\": 1", "\"linux.execveat\": 1");
+    const unreviewed = try productionCandidate(&f, "security/native-only-production-policy.json", changed_inventory);
+    defer unreviewed.deinit();
+    try unreviewed.failsWith("src/maintainer_script.zig: unreviewed child-process operator");
+    try unreviewed.failsWith("src/maintainer_script.zig: unreviewed/stale child-process allowance");
+    const stale = try f.replace(inventory, "eb546e88d64091c9", "ab546e88d64091c9");
+    const wrong_fingerprint = try productionCandidate(&f, "security/native-only-production-policy.json", stale);
+    defer wrong_fingerprint.deinit();
+    try wrong_fingerprint.failsWith("src/transaction_executor.zig: stale reviewed inventory fingerprint");
+
+    const live_root = try f.source("src/live_root.zig");
+    const indirect = try f.replace(
+        live_root,
+        "const forked = linux.fork();",
+        "const executed = linux.syscall5(.execveat, fd, path, argv, envp, flags);\n        const forked = linux.fork();",
+    );
+    var digest: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(indirect, &digest, .{});
+    const updated_hash = std.fmt.bytesToHex(digest, .lower);
+    const reviewed = try f.replace(
+        inventory,
+        "73c3b5707811b3d6d9835c7303c45bb90dd4e0d103521620e4ddfc12963a8ab97790702f886e5489d27c7cee698524d5f38fdc6ebff85b7393290a28cad10c61",
+        updated_hash[0..],
+    );
+    var overrides: std.json.ObjectMap = .empty;
+    try overrides.put(f.arena.allocator(), "src/live_root.zig", .{ .string = indirect });
+    try overrides.put(f.arena.allocator(), "security/native-only-production-policy.json", .{ .string = reviewed });
+    const repinned = try productionCandidateOverrides(&f, overrides);
+    defer repinned.deinit();
+    try repinned.failsWith("src/live_root.zig: unreviewed/stale child-process allowance");
+    try testing.expect(std.mem.indexOf(u8, repinned.stderr, "src/live_root.zig: stale reviewed inventory fingerprint") == null);
+
+    const fake_reference = try productionCandidate(&f, "tools/unreviewed-dpkg-oracle.py", "dpkg-query");
+    defer fake_reference.deinit();
+    try fake_reference.failsWith("candidate fixture has unknown override path");
+}
+
 test "security: Zig installer must remain exact and setup-zig or cache substitutions refuse" {
     var f = try Fixture.init();
     defer f.deinit();

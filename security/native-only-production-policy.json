@@ -1,0 +1,36 @@
+{
+  "schema": "https://debz.dev/schema/native-only-production-candidate-v1",
+  "issue": 276,
+  "removed_production_paths": [],
+  "launch_allowances": {
+    "src/transaction_executor.zig": {"std.process.run": 1},
+    "src/target_apt_config.zig": {"std.process.run": 1},
+    "src/maintainer_script.zig": {"linux.clone2": 1, "linux.fork": 1, "linux.execve": 1},
+    "src/live_root.zig": {"linux.fork": 3},
+    "actions/setup/src/runner.ts": {"execFileAsync": 1},
+    "actions/download/src/runner.ts": {"execFile": 1},
+    "actions/install/src/subprocess.ts": {"spawn": 2}
+  },
+  "reviewed_fingerprints": {
+    "src/transaction_executor.zig": "eb546e88d64091c900ba097f1066c5a809df4884bb12b8ba469f9b4d3c502b6663a2c5deae7e769bbff010174b927f3a688ae0327d13a3d128b621b3a1f30427",
+    "src/target_apt_config.zig": "f53fda429830e5f52b1c984989d93717cce9568090ad63d7cd66d6cd7b0093e1ad2f2b6dc3432595e2ebeccbcaf1392a5477cf7094ed71f76bdff5034edd4dba",
+    "src/maintainer_script.zig": "3701bb54e525f05a58c5b2bb100d613ae6e16e18c90e6add5423375846738ecd78fbfcb5676018e1d70f8d7058c33c1d4078b05cc19d6544cc243707b160d260",
+    "src/live_root.zig": "73c3b5707811b3d6d9835c7303c45bb90dd4e0d103521620e4ddfc12963a8ab97790702f886e5489d27c7cee698524d5f38fdc6ebff85b7393290a28cad10c61",
+    "actions/setup/src/runner.ts": "430b5d8f5a743f55b8183ff530326c0a1839fd3ca3cfd51534d621a5b44a7ea94707ba00331897e95e8a165a7fd13e1b6f17feeddaafcfa31c1612077d7bbbb9",
+    "actions/download/src/runner.ts": "ddd4f232e7fc041bc965211c7ab6cfd871bc708e9658d16384e025b4aa6aff1a43447bef0dcf33c8d2cf6a650f20478e6971c91e6f0da6679feac0a34875e372",
+    "actions/install/src/subprocess.ts": "0503a09372e6b1af4debd1579f369103995d94d4f86f6155fe2bb6b765cfe3e4e9c213a5a110d1eda09d68c1d63348717f811e49b6e12841fa83fce8b9a17792",
+    "src/main.zig": "e0fd86e17efef92602fcdf2e9913d77508598e4449732dda17f13aa942c526bb2c01924472ea6001cd77c52bbf8f50a77f4ecbaa786a896398edc9f195f0908a",
+    "src/root_operation.zig": "45701ea94da6da87c12c77833c529df3f1d9e37282812d90571c6ffe7ccbf25c935ea067442fb363c4e82a3ddfcc09feaec7509b930f459f948e15c40cbc0f73",
+    "src/transaction_recovery.zig": "ffa106804985ab2590833ca7bccf5714651966bd986f47ed35d50396f3b2f249ae2216532aa481a9ff400ecf16ebcf4f646199fe9246a78a7eec9efe1f849231",
+    "actions/download/dist/index.js": "23229ca48d984f02d6555316df68c337ea9d587c38f1745e40eb56dc686e9a9ecb081e2e2fd75d87bc0a8c099cd09d84be97ad7602200996b8c67286ddde3ed0",
+    "actions/install/dist/index.js": "dad4adb56fe188e157583ce95be562d1ea31fc9b61ba3b093920de84f266104c4962a00667bc6b887cfdbf6af408dcff755be66ed03f167a08bf5f42af05aafb",
+    "tools/prepare-native-dpkg.py": "f0493486db28dbfa4c25944a1484cfca736c92c7792fae2dd84f40c1a00470b5c83a9a716da78abc3ff659190fc77655ff433ccbd53848aea1870cb68b6ead07",
+    "tools/native-differential.py": "f144304ac294c30e7d2f8fc491230bb042919cd387cafacff9f52408f9c0e1a82253a11b60c358aa15f06fe1397c03bd8358b3ec3cf7e2125b4567703b7a06f5"
+  },
+  "signed_script_exception": {
+    "path": "src/maintainer_script.zig",
+    "identity": "snapshotSudoIdentity",
+    "script": "var/lib/dpkg/info/sudo.postinst",
+    "tool": "usr/bin/dpkg-query"
+  }
+}
