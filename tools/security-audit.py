@@ -1261,6 +1261,7 @@ RECOVERY_ZIG_SHARDS = {
             "test-native-recovery-zig-conffile",
             "test-native-recovery-zig-final-gaps",
             "test-native-recovery-zig-diversions",
+            "test-native-recovery-zig-mutation-boundaries",
         ),
     ),
 }
@@ -1520,7 +1521,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         command for command in expected_commands
         if command.startswith("zig build test-native-recovery")
     ]
-    if len(inventory_commands) != 30 or len(inventory_commands) != len(set(inventory_commands)):
+    if len(inventory_commands) != 32 or len(inventory_commands) != len(set(inventory_commands)):
         failures.append("ci.yml: recovery command inventory contains duplicate targets")
     actual_commands = re.findall(
         r"(?m)^[ \t]+(zig build test-native-recovery[^\n]+)$", text,
@@ -1689,11 +1690,11 @@ def native_recovery_gate_wiring_failures(
          "metadata_recovery", "literal_recovery", "scriptless_recovery"),
         ("recovery_zig", "recovery_helper", "recovery_bootstrap", "recovery_family",
          "recovery_diversions", "statoverride_recovery", "conffile_recovery",
-         "metadata_recovery", "literal_recovery"),
+         "metadata_recovery", "literal_recovery", "mutation_boundaries"),
         ("recovery_zig", "recovery_family", "recovery_parity", "recovery_helper",
          "final_gaps", "recovery_bootstrap", "repository_recovery", "rollback_clock",
          "scriptless_recovery", "statoverride_recovery", "literal_recovery",
-         "metadata_recovery", "conffile_recovery", "recovery_diversions"),
+         "metadata_recovery", "conffile_recovery", "recovery_diversions", "mutation_boundaries"),
     )
     if tuple(tuple(re.findall(r"[a-z_]+", group)) for group in arrays) != expected:
         failures.append("build.zig: parity, core, or default recovery workload lost an executed runner")

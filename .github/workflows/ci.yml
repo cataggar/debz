@@ -1063,6 +1063,8 @@ jobs:
           zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-diversions -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-mutation-boundaries -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-mutation-boundaries -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   arm64-dpkg-oracles:
     if: github.event_name == 'workflow_dispatch' && inputs.run_arm64_dpkg_oracles

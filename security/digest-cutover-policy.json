@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 479,
-      "sha512": "95e2922b133afc493d7f7c2e26961f493e8affc3c29a17f4b7ad710f90ba0f3623178c3fe4a17d57b54313ba8f0104d0332504ccb7ff4d2172bb0bb1e2437967"
+      "count": 480,
+      "sha512": "9d85ff8e59c59cf78fd8c165a8f4e81626aa488fe1c3acc86ea53bcd83e063d40bf40567c3a8d07f38d1d69a7361009074fddd258b03fe7535c0d1c275d6d04e"
     },
     "findings": {
-      "count": 21495,
+      "count": 21518,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 179,
-        "raw_32_byte": 1206,
-        "sha256_token": 19813
+        "raw_32_byte": 1208,
+        "sha256_token": 19834
       },
-      "sha512": "3b6c59ac915177c324eb9554c7fbf3c37b199fc0bf85b37ad49042fcfe86bc8973c65a7a1d8b8b3697fa669fab8705a0646a21e75005a9eb28721d93bd8f3489"
+      "sha512": "68a680f69776415d1084acbff77593f943ad640fa8a76e782fb0d68777105f0d77f5147f675d840d45c2478f5396c82ba77d505f729821c0f51fa83674aa1118"
     },
     "classifications": [
       {
@@ -168,15 +168,15 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 913,
+        "count": 936,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 8,
-          "raw_32_byte": 74,
-          "sha256_token": 827
+          "raw_32_byte": 76,
+          "sha256_token": 848
         },
-        "sha512": "70747a5071a7a6e04ebd25b6bddb1b71b719e9cbedac4ce881bf1929376e0d6fee5ae0d99e0d31813304d527341063bedf5d47ef3a2cbd1e6a7a92d7a59d6bba"
+        "sha512": "1a705ba8558d3bbd9a25fbed568a0774ddd3c0a5d408a06f089c42ad172c557d57ab24ac3edbda3022c2912f48d4f1f892bedb7520b6b49f642f5728b7c6eec3"
       },
       {
         "scope": "tools",

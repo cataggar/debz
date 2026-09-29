@@ -2208,21 +2208,47 @@ case runs seven real process kills, including independent changed/missing
 cache, checkpoint and contract refusals; a numbered Python case or a unit
 cache test does not substitute for either selector.
 
-**Other journal boundaries, not discharged by the 61 selectors.** The native
-root-mutation journal itself names 27 syscall hooks in
+**Root-mutation syscall boundaries (#294).** In addition to the 61 native
+`CrashPoint` selectors above, `test-native-recovery-zig-mutation-boundaries`
+selects each of the 13 journal/staging/backup `root_mutation.Boundary` hooks
+by its own name. The version-1 Zig table runs an actual caller-owned native
+upgrade child to exit 86 on a distinct guarded root for each hook:
+`journal_write`, `journal_sync`, `progress_append`, `progress_sync`,
+`progress_truncate`, `workspace_create`, `stage_create`, `stage_write`,
+`stage_sync`, `stage_metadata`, `stage_dir_sync`, `backup_link`, and
+`backup_dir_sync`. `workspace_create` requires the private workspace to be
+absent before the first database-phase preflight; `progress_truncate` receives
+a synced short progress tail in its first filesystem-phase append so the
+real compare-and-set repair hook, not an unrelated publication hook, fires.
+One separate `after_execution_intent` child proves no package mutation before
+execution intent, and a second `backup_dir_sync` child changes a captured
+backup and proves two immutable typed refusals. Every successful case checks
+the original attempt/exact-lock/program/intent and decoded journal/old-file
+metadata/ownership binding, the physical staged or backed-up bytes where
+applicable, caller archive eviction, pre-recovery and pre-ack second-mutation
+refusal, receipt ownership through acknowledgment, and exact pinned-dpkg
+final-root parity. The early no-journal phase is durably marked rolled back
+before retry; it is not silently replayed as a second prepared action.
+Run both Debug and ReleaseSafe with
+`zig build test-native-recovery-zig-mutation-boundaries
+-Dnative-reference-dpkg=/absolute/pinned/dpkg` (optionally select one with
+`-Dnative-zig-recovery-mutation-boundary-case=stage_write`).
+
+The native root-mutation journal names 27 syscall hooks in
 `src/root_mutation.zig::Boundary`. Its `Stage` directions are
 prepared/applying/rolling_back → restore old,
 verified/completing/completed → finish new,
 releasing_rollback/rolled_back → finish old, and
 recovery_required → refuse. Existing unit hook assertions and selected
 `during_*_publication` process cases are **not** independent child-kill
-evidence for each hook. #294 tracks 13 journal/staging/backup boundaries;
-#295 tracks 14 publication/metadata/verification/release/restore boundaries.
+evidence for each hook. The 13 #294 journal/staging/backup hooks have their
+own process evidence above; **#295 still tracks 14**
+publication/metadata/verification/release/restore boundaries.
 The five core completion boundaries (`after_native_receipt`,
 `after_completed_record`, `after_owed_provenance_document`,
 `after_provenance_published`, `after_native_acknowledged`) **are not**
 `CrashPoint` values; `A::coreCases` and the FAMILY owner cases exercise them
 with real children, original receipt and active owner through terminal
-acknowledgment. This table does not substitute for the remaining root
-mutation/process proof or for every package-specific script/trigger path in
-#86.
+acknowledgment. This table does not substitute for #295's remaining
+root-mutation/process proof or for every package-specific script/trigger path
+in #86.
