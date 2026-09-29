@@ -1502,20 +1502,20 @@ Focused Zig `-Dnative-zig-*` case, route and shard options remain available
 on their individual targets, but the complete `test-native-recovery` gate
 rejects them rather than silently running an incomplete matrix. The default
 and public selectors retain pinned `-Dnative-reference-dpkg` propagation and
-real native-helper/result-CLI artifacts. CI runs just the complete gate once
-per mode on each architecture, not the same expensive suites again as
-separate focused commands. The required CI recovery jobs instead split the
-scenario workload from four architecture-parallel numbered diversion shards:
+real native-helper/result-CLI artifacts. CI runs each focused recovery target
+once per mode on each architecture, without duplicating the complete gate.
+The required CI recovery jobs split the scenario workload from four
+architecture-parallel numbered diversion shards:
 each diversion job runs its one 25-case range in Debug and ReleaseSafe,
 shard 4 also runs both named #293 routes, and the scenario job retains the
 full #294 journal/staging and #295 publication/metadata/rollback matrices
 in both modes. The existing `Build and test (linux-x64/arm64)` checks require
 **all** core, repository, helper/bootstrap/parity/rollback, FAMILY, scenario
 and diversion matrix jobs to succeed; a failed, skipped or canceled shard
-cannot satisfy either aggregate. Each
-scenario/diversion job retains a 75-minute budget. This partition addresses
-the previous x64 cancellation after case 077, but x64 headroom under
-concurrent CI load requires a successful post-change run and repeat.
+cannot satisfy either aggregate. Each scenario/diversion job retains a
+75-minute budget. This partition addresses the previous x64 cancellation
+after case 077, but x64 headroom under concurrent CI load requires a
+successful post-change run and repeat.
 
 The native Linux amd64/arm64 runner requires the existing dpkg/chroot fixture
 prerequisites and passwordless sudo. Only fixture execution is elevated.
