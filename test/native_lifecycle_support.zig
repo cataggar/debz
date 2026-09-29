@@ -338,6 +338,7 @@ pub const Phase = struct {
     triggers: bool = false,
     fault: ?[]const u8 = null,
     recovery: bool = false,
+    crash_at: ?[]const u8 = null,
     ordered_actions: ?[]const Action = null,
     rollback_links: []const []const u8 = &.{},
     created_rollback_links: []const []const u8 = &.{},
@@ -445,6 +446,7 @@ pub fn native(fixture: *foundation.Fixture, executable: []const u8, root: []cons
         .defer_triggers = phase.defer_triggers,
         .fault = phase.fault,
         .recovery = phase.recovery,
+        .crash_at = phase.crash_at,
         .ordered_actions = phase.ordered_actions,
     }, .{});
     defer fixture.allocator.free(document);

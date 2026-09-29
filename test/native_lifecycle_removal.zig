@@ -101,34 +101,63 @@ fn phase(
     }
 }
 
-fn blockedPostrmRetry(case: *support.Scenario, selected: []const foundation.PackageIdentity, operation: []const u8) !void {
-    const input: support.Phase = .{ .operation = operation, .packages = selected };
-    if (case.fixture.oracle_only) {
-        try case.phase(input, false);
-        return;
-    }
+fn expectRetryRefused(case: *support.Scenario, selected: []const foundation.PackageIdentity, label: []const u8) !void {
     const before = try foundation.capture(case.fixture.allocator, case.fixture.io, case.native_root);
     defer case.fixture.allocator.free(before);
-    const destination = try std.fmt.allocPrint(case.fixture.allocator, "{s}/retry-{s}", .{ case.name, operation });
+    const destination = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}", .{ case.name, label });
     defer case.fixture.allocator.free(destination);
     try case.fixture.directory(destination);
-    if (try support.reference(case.fixture, case.dpkg, case.reference_root, input, destination) != 0)
-        return error.UnexpectedPostrmReferenceRetry;
-    var result = try support.native(case.fixture, case.executable, case.native_root, case.architecture, input, destination);
-    defer result.deinit();
-    if (!std.mem.eql(u8, result.value.outcome, "refused") or
-        !std.mem.eql(u8, result.value.detail, "program_compile_rejected"))
-        return error.UnexpectedPostrmRetryOutcome;
+    var report = try support.native(case.fixture, case.executable, case.native_root, case.architecture, .{
+        .operation = "remove",
+        .packages = selected,
+    }, destination);
+    defer report.deinit();
+    if (!std.mem.eql(u8, report.value.outcome, "refused") or
+        !std.mem.eql(u8, report.value.detail, "program_compile_rejected"))
+        return error.UnexpectedUnsafeRetryOutcome;
     const after = try foundation.capture(case.fixture.allocator, case.fixture.io, case.native_root);
     defer case.fixture.allocator.free(after);
-    if (!std.mem.eql(u8, before, after)) return error.PostrmRetryChangedNativeRoot;
+    if (!std.mem.eql(u8, before, after)) return error.UnsafeRetryMutatedRoot;
     try support.assertNoActiveEvidence(case.fixture, case.native_root);
-    const reference = try foundation.capture(case.fixture.allocator, case.fixture.io, case.reference_root);
-    defer case.fixture.allocator.free(reference);
-    if (std.mem.eql(u8, reference, after)) return error.PostrmRetryAccidentallyMatched;
-    std.debug.print("{s}/{s}: dpkg exit 0, native refused before mutation (not parity)\n", .{
-        case.name, operation,
-    });
+}
+
+fn retryProofGuards(case: *support.Scenario, selected: []const foundation.PackageIdentity) !void {
+    if (case.fixture.oracle_only) return;
+    const marker = try relative(case, "native", "var/lib/debz/native-remove-retry-v1.json");
+    defer case.fixture.allocator.free(marker);
+    const original = try support.read(case.fixture, marker, 4096);
+    defer case.fixture.allocator.free(original);
+    const Proof = struct {
+        package: struct { name: []const u8, version: []const u8, architecture: []const u8 },
+        previous_attempt_id: []const u8,
+        previous_program_sha256: []const u8,
+        previous_exact_lock_sha256: []const u8,
+        postrm_sha256: []const u8,
+    };
+    const decoded = try std.json.parseFromSlice(Proof, case.fixture.allocator, original, .{ .ignore_unknown_fields = true });
+    defer decoded.deinit();
+    const proof = decoded.value;
+    if (!std.mem.eql(u8, proof.package.name, name) or
+        !std.mem.eql(u8, proof.package.version, "1") or
+        !std.mem.eql(u8, proof.package.architecture, case.architecture) or
+        proof.previous_attempt_id.len != 64 or proof.previous_program_sha256.len != 64 or
+        proof.previous_exact_lock_sha256.len != 64 or proof.postrm_sha256.len != 64)
+        return error.InvalidPostrmRetryProof;
+    try case.fixture.dir.deleteFile(case.fixture.io, marker);
+    try expectRetryRefused(case, selected, "retry-without-proof");
+    try support.fixtureFile(case.fixture, marker, original, 0o600);
+    const changed = try case.fixture.allocator.dupe(u8, original);
+    defer case.fixture.allocator.free(changed);
+    const digest = std.mem.indexOf(u8, changed, proof.previous_attempt_id) orelse return error.InvalidPostrmRetryProof;
+    changed[digest] = if (changed[digest] == '0') '1' else '0';
+    try support.fixtureFile(case.fixture, marker, changed, 0o600);
+    try expectRetryRefused(case, selected, "retry-corrupt-proof");
+    try support.fixtureFile(case.fixture, marker, original, 0o600);
+    const conffile = try relative(case, "native", configuration);
+    defer case.fixture.allocator.free(conffile);
+    try support.fixtureFile(case.fixture, conffile, "changed after failure\n", 0o644);
+    try expectRetryRefused(case, selected, "retry-changed-root");
+    try support.fixtureFile(case.fixture, conffile, "edited configuration\n", 0o644);
 }
 
 fn removedReinstallBlock(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
@@ -288,6 +317,11 @@ fn failureAndRetry(
         const failure_index = case.index;
         try phase(&case, .{ .operation = entry.operation, .packages = &selected }, true, entry.callbacks);
         try expectScriptFailure(&case, failure_index, entry.operation, if (std.mem.eql(u8, entry.label, "prerm")) "prerm" else "postrm");
+        if (!fixture.oracle_only and !std.mem.eql(u8, entry.label, "postrm")) {
+            const marker = try relative(&case, "native", "var/lib/debz/native-remove-retry-v1.json");
+            defer fixture.allocator.free(marker);
+            try support.absent(fixture, marker);
+        }
         try expectFile(&case, configuration, if (std.mem.eql(u8, entry.operation, "purge"))
             null
         else
@@ -298,7 +332,20 @@ fn failureAndRetry(
         }
         try bothFile(&case, support.failure, null);
         if (std.mem.eql(u8, entry.label, "postrm")) {
-            try blockedPostrmRetry(&case, &selected, entry.operation);
+            try retryProofGuards(&case, &selected);
+            try phase(&case, .{ .operation = "remove", .packages = &selected }, false, &.{
+                .{ .kind = "postrm", .args = &.{"remove"} },
+            });
+            try expectStatus(&case, "Status: deinstall ok config-files");
+            try expectFile(&case, configuration, "edited configuration\n");
+            try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".list", "/" ++ configuration ++ "\n");
+            try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".postrm", name ++ "@1:postrm");
+            try expectFile(&case, "usr/share/" ++ name ++ "/data", null);
+            if (!fixture.oracle_only) {
+                const marker = try relative(&case, "native", "var/lib/debz/native-remove-retry-v1.json");
+                defer fixture.allocator.free(marker);
+                try support.absent(fixture, marker);
+            }
             continue;
         }
         try phase(&case, .{ .operation = entry.operation, .packages = &selected }, false, if (std.mem.eql(u8, entry.operation, "purge")) &.{
@@ -317,6 +364,243 @@ fn failureAndRetry(
         try expectStatus(&case, null);
         try expectFile(&case, configuration, null);
     }
+}
+
+fn interruptedPostrmRetry(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    first: []const u8,
+) !void {
+    var case = try support.Scenario.init(fixture, "removal-failure-postrm-interrupted-retry", driver, dpkg, arch, false);
+    defer case.deinit();
+    try case.seed(first);
+    const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    try bothFile(&case, configuration, "edited configuration\n");
+    try bothFile(&case, support.failure, name ++ "@1:postrm:remove\n");
+    try phase(&case, .{ .operation = "remove", .packages = &selected }, true, &.{
+        .{ .kind = "prerm", .args = &.{"remove"}, .payload = "data version 1" },
+        .{ .kind = "postrm", .args = &.{"remove"} },
+    });
+    try bothFile(&case, support.failure, null);
+    if (fixture.oracle_only) {
+        try phase(&case, .{ .operation = "remove", .packages = &selected }, false, &.{
+            .{ .kind = "postrm", .args = &.{"remove"} },
+        });
+        return;
+    }
+    const destination = try support.path(fixture.allocator, case.name, "interrupted-retry");
+    defer fixture.allocator.free(destination);
+    try fixture.directory(destination);
+    if (try support.reference(fixture, dpkg, case.reference_root, .{
+        .operation = "remove",
+        .packages = &selected,
+    }, destination) != 0) return error.UnexpectedReferenceRetry;
+    var interrupted = try support.native(fixture, driver, case.native_root, arch, .{
+        .operation = "remove",
+        .packages = &selected,
+        .fault = "after_script_before_record",
+    }, destination);
+    defer interrupted.deinit();
+    if (!std.mem.eql(u8, interrupted.value.outcome, "recovery_required") or
+        !std.mem.eql(u8, interrupted.value.detail, "script_outcome_unknown"))
+        return error.RetryInterruptionNotOwned;
+    const reference_trace = try trace(&case);
+    defer fixture.allocator.free(reference_trace);
+    const native_trace_path = try relative(&case, "native", support.trace);
+    defer fixture.allocator.free(native_trace_path);
+    const native_trace = try support.read(fixture, native_trace_path, 64 * 1024);
+    defer fixture.allocator.free(native_trace);
+    if (!std.mem.eql(u8, reference_trace, native_trace) or
+        std.mem.count(u8, native_trace, name ++ "@1:prerm\t") != 1 or
+        std.mem.count(u8, native_trace, name ++ "@1:postrm\t") != 2)
+        return error.RetryReplayedSuccessfulScript;
+    const operation_path = try relative(&case, "native", "var/lib/debz/root-operation-v1.json");
+    defer fixture.allocator.free(operation_path);
+    const script_path = try relative(&case, "native", "var/lib/debz/native-lifecycle-script-v1.json");
+    defer fixture.allocator.free(script_path);
+    const operation = try support.read(fixture, operation_path, 64 * 1024);
+    defer fixture.allocator.free(operation);
+    const active = try support.read(fixture, script_path, 64 * 1024);
+    defer fixture.allocator.free(active);
+    const Owner = struct {
+        attempt_id: []const u8,
+        program_sha256: []const u8,
+        state: []const u8,
+        mutation_started: bool,
+    };
+    const Script = struct {
+        program_sha256: []const u8,
+        kind: []const u8,
+        arguments: []const []const u8,
+        outcome: []const u8,
+    };
+    const owner = try std.json.parseFromSlice(Owner, fixture.allocator, operation, .{ .ignore_unknown_fields = true });
+    defer owner.deinit();
+    const script = try std.json.parseFromSlice(Script, fixture.allocator, active, .{ .ignore_unknown_fields = true });
+    defer script.deinit();
+    if (!std.mem.eql(u8, owner.value.state, "recovery_required") or !owner.value.mutation_started or
+        owner.value.attempt_id.len != 64 or
+        !std.mem.eql(u8, owner.value.program_sha256, script.value.program_sha256) or
+        !std.mem.eql(u8, script.value.kind, "postrm") or
+        script.value.arguments.len != 1 or
+        !std.mem.eql(u8, script.value.arguments[0], "remove") or
+        !std.mem.eql(u8, script.value.outcome, "in_flight"))
+        return error.RetryInterruptionBinding;
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    for ([_][]const u8{ "remove", "purge", "recover" }) |operation_name| {
+        const next = try std.fmt.allocPrint(fixture.allocator, "{s}/retry-{s}", .{ case.name, operation_name });
+        defer fixture.allocator.free(next);
+        try fixture.directory(next);
+        var blocked = try support.native(fixture, driver, case.native_root, arch, .{
+            .operation = operation_name,
+            .packages = if (std.mem.eql(u8, operation_name, "recover")) &.{} else &selected,
+            .recovery = std.mem.eql(u8, operation_name, "recover"),
+        }, next);
+        defer blocked.deinit();
+        if (!std.mem.eql(u8, blocked.value.outcome, "recovery_required"))
+            return error.RetryInterruptionAllowedMutation;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        const operation_after = try support.read(fixture, operation_path, 64 * 1024);
+        defer fixture.allocator.free(operation_after);
+        const active_after = try support.read(fixture, script_path, 64 * 1024);
+        defer fixture.allocator.free(active_after);
+        if (!std.mem.eql(u8, before, after) or
+            !std.mem.eql(u8, operation, operation_after) or
+            !std.mem.eql(u8, active, active_after))
+            return error.RetryInterruptionLostOwner;
+    }
+}
+
+fn recoverEarlyPostrmRetry(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    first: []const u8,
+    changed_root: bool,
+) !void {
+    var case = try support.Scenario.init(
+        fixture,
+        if (changed_root) "removal-failure-postrm-early-recovery-changed-root" else "removal-failure-postrm-early-recovery",
+        driver,
+        dpkg,
+        arch,
+        false,
+    );
+    defer case.deinit();
+    try case.seed(first);
+    const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    try bothFile(&case, configuration, "edited configuration\n");
+    try bothFile(&case, support.failure, name ++ "@1:postrm:remove\n");
+    try phase(&case, .{ .operation = "remove", .packages = &selected }, true, &.{
+        .{ .kind = "prerm", .args = &.{"remove"}, .payload = "data version 1" },
+        .{ .kind = "postrm", .args = &.{"remove"} },
+    });
+    try bothFile(&case, support.failure, null);
+    if (fixture.oracle_only) {
+        if (changed_root) return;
+        try phase(&case, .{ .operation = "remove", .packages = &selected }, false, &.{
+            .{ .kind = "postrm", .args = &.{"remove"} },
+        });
+        return;
+    }
+    const destination = try support.path(fixture.allocator, case.name, "interrupted-before-remove");
+    defer fixture.allocator.free(destination);
+    try fixture.directory(destination);
+    if (try support.reference(fixture, dpkg, case.reference_root, .{
+        .operation = "remove",
+        .packages = &selected,
+    }, destination) != 0) return error.UnexpectedReferenceRetry;
+    if (support.native(fixture, driver, case.native_root, arch, .{
+        .operation = "remove",
+        .packages = &selected,
+        .recovery = true,
+        .crash_at = "after_execution_intent",
+    }, destination)) |unexpected| {
+        var result = unexpected;
+        result.deinit();
+        return error.EarlyRetryCrashNotInjected;
+    } else |err| if (err != error.ChildFailed) return err;
+    const pre_resume_trace = try relative(&case, "native", support.trace);
+    defer fixture.allocator.free(pre_resume_trace);
+    const prior_trace = try support.read(fixture, pre_resume_trace, 64 * 1024);
+    defer fixture.allocator.free(prior_trace);
+    if (std.mem.count(u8, prior_trace, name ++ "@1:prerm\t") != 1 or
+        std.mem.count(u8, prior_trace, name ++ "@1:postrm\t") != 1)
+        return error.EarlyRetryReplayedScript;
+    const marker = try relative(&case, "native", "var/lib/debz/native-remove-retry-v1.json");
+    defer fixture.allocator.free(marker);
+    var before: ?[]u8 = null;
+    defer if (before) |value| fixture.allocator.free(value);
+    var original_marker: ?[]u8 = null;
+    defer if (original_marker) |value| fixture.allocator.free(value);
+    if (changed_root) {
+        const conffile = try relative(&case, "native", configuration);
+        defer fixture.allocator.free(conffile);
+        try support.fixtureFile(fixture, conffile, "changed after crash\n", 0o644);
+        before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        original_marker = try support.read(fixture, marker, 4096);
+    }
+    const destination_resume = try support.path(fixture.allocator, case.name, "resume");
+    defer fixture.allocator.free(destination_resume);
+    try fixture.directory(destination_resume);
+    var resumed = try support.native(fixture, driver, case.native_root, arch, .{
+        .operation = "recover",
+        .recovery = true,
+    }, destination_resume);
+    defer resumed.deinit();
+    if (changed_root) {
+        if (!std.mem.eql(u8, resumed.value.outcome, "recovery_required") or
+            !std.mem.eql(u8, resumed.value.detail, "removal_retry_recovery_binding_changed"))
+            return error.EarlyRetryChangedRootAccepted;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        const retained_marker = try support.read(fixture, marker, 4096);
+        defer fixture.allocator.free(retained_marker);
+        const retained_trace = try support.read(fixture, pre_resume_trace, 64 * 1024);
+        defer fixture.allocator.free(retained_trace);
+        if (!std.mem.eql(u8, before.?, after) or
+            !std.mem.eql(u8, original_marker.?, retained_marker) or
+            !std.mem.eql(u8, prior_trace, retained_trace))
+            return error.EarlyRetryChangedRootMutated;
+        const next = try support.path(fixture.allocator, case.name, "changed-root-second-mutation");
+        defer fixture.allocator.free(next);
+        try fixture.directory(next);
+        var blocked = try support.native(fixture, driver, case.native_root, arch, .{
+            .operation = "remove",
+            .packages = &selected,
+        }, next);
+        defer blocked.deinit();
+        if (!std.mem.eql(u8, blocked.value.outcome, "recovery_required"))
+            return error.EarlyRetryChangedRootAllowedMutation;
+        const final = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(final);
+        if (!std.mem.eql(u8, before.?, final))
+            return error.EarlyRetryChangedRootMutated;
+        return;
+    }
+    if (!std.mem.eql(u8, resumed.value.outcome, "applied"))
+        return error.EarlyRetryRecoveryFailed;
+    const reference = try foundation.capture(fixture.allocator, fixture.io, case.reference_root);
+    defer fixture.allocator.free(reference);
+    const native = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(native);
+    if (!std.mem.eql(u8, reference, native))
+        return error.EarlyRetryRecoveryMismatch;
+    const after_trace = try support.read(fixture, pre_resume_trace, 64 * 1024);
+    defer fixture.allocator.free(after_trace);
+    const reference_trace = try trace(&case);
+    defer fixture.allocator.free(reference_trace);
+    if (!std.mem.eql(u8, after_trace, reference_trace) or
+        std.mem.count(u8, after_trace, name ++ "@1:prerm\t") != 1 or
+        std.mem.count(u8, after_trace, name ++ "@1:postrm\t") != 2)
+        return error.EarlyRetryReplayedScript;
+    try support.absent(fixture, marker);
+    try support.assertNoActiveEvidence(fixture, case.native_root);
 }
 
 fn unknownRemoval(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
@@ -443,5 +727,9 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     try residueAndReinstall(fixture, driver, dpkg, arch, first, second);
     try removedReinstallBlock(fixture, driver, dpkg, arch, first);
     try failureAndRetry(fixture, driver, dpkg, arch, first);
+    try interruptedPostrmRetry(fixture, driver, dpkg, arch, first);
+    try recoverEarlyPostrmRetry(fixture, driver, dpkg, arch, first, false);
+    if (!fixture.oracle_only)
+        try recoverEarlyPostrmRetry(fixture, driver, dpkg, arch, first, true);
     try unknownRemoval(fixture, driver, dpkg, arch, first);
 }

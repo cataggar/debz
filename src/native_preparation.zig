@@ -23,6 +23,7 @@ pub const Request = struct {
     script_policy: maintainer_script.Policy,
     foreign_architectures: []const []const u8 = &.{},
     installed: native_program.InstalledDatabase,
+    removal_retry: ?native_program.RemovalRetry = null,
     archives: []const native_program.Archive = &.{},
     trigger_authority: ?native_authorization.TriggerAuthority = null,
     ownership_conflicts: []const native_program.OwnershipConflict = &.{},
@@ -33,6 +34,7 @@ pub const Request = struct {
 pub const Prepared = struct {
     authorization: native_authorization.OwnedAuthorization,
     program: native_program.OwnedProgram,
+    removal_retry: ?native_program.RemovalRetry = null,
 
     pub fn deinit(self: *Prepared) void {
         self.program.deinit();
@@ -986,6 +988,7 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         .authorization = &authorization.authorization,
         .ordered_actions = request.plan.ordered_actions,
         .installed = request.installed,
+        .removal_retry = request.removal_retry,
         .archives = request.archives,
         .script_policy = request.script_policy,
         .ownership_conflicts = request.ownership_conflicts,
@@ -1006,8 +1009,17 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
                 &program.program,
                 null,
             );
+            var retry = request.removal_retry;
+            if (retry) |*proof| {
+                const owned = program.arena.allocator();
+                proof.package = .{
+                    .name = try owned.dupe(u8, proof.package.name),
+                    .version = try owned.dupe(u8, proof.package.version),
+                    .architecture = try owned.dupe(u8, proof.package.architecture),
+                };
+            }
             authorization_transferred = true;
-            return .{ .prepared = .{ .authorization = authorization, .program = program } };
+            return .{ .prepared = .{ .authorization = authorization, .program = program, .removal_retry = retry } };
         },
     }
 }

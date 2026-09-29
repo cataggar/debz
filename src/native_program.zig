@@ -894,6 +894,19 @@ pub const InstalledDatabase = struct {
     updates_pending: bool = false,
 };
 
+/// Preflight proof of a terminal, known `postrm remove` failure. The caller
+/// must verify the retained record against the root under its operation lock;
+/// a half-installed database state by itself is not retry authority.
+pub const RemovalRetry = struct {
+    package: PackageIdentity,
+    database_generation_sha256: [32]u8,
+    installed_evidence_sha256: [32]u8,
+    postrm_sha256: [32]u8,
+    previous_attempt_id: [32]u8,
+    previous_program_sha256: [32]u8,
+    previous_exact_lock_sha256: [32]u8,
+};
+
 pub const ArchiveScript = struct {
     kind: maintainer_script.Kind,
     sha256: [32]u8,
@@ -945,6 +958,7 @@ pub const Input = struct {
     /// action exactly once; nothing may be dropped or invented.
     ordered_actions: []const solver.OrderedAction,
     installed: InstalledDatabase,
+    removal_retry: ?RemovalRetry = null,
     archives: []const Archive = &.{},
     /// Maintainer-script environment and isolation policy the runner applies.
     script_policy: maintainer_script.Policy = .{},
@@ -1517,7 +1531,7 @@ fn triggerAuthorityDigest(
     return hasher.finalResult();
 }
 
-fn installedEvidenceDigest(packages: []const InstalledPackage) [32]u8 {
+pub fn installedEvidenceDigest(packages: []const InstalledPackage) [32]u8 {
     var hasher = Sha256.init(.{});
     hasher.update("debz-native-transaction-program-installed-evidence-v1\x00");
     for (packages) |package| {
@@ -1638,6 +1652,14 @@ fn validateBinding(self: *Compiler) CompileError!void {
         });
     if (self.input.installed.updates_pending)
         return self.reject(.{ .code = .database_not_quiescent });
+    if (self.input.removal_retry) |retry| {
+        if (authorization.actions.len != 1 or authorization.actions[0].kind != .remove or
+            !std.mem.eql(u8, &retry.database_generation_sha256, &self.input.installed.generation_sha256) or
+            std.mem.allEqual(u8, &retry.previous_attempt_id, 0) or
+            std.mem.allEqual(u8, &retry.previous_program_sha256, 0) or
+            std.mem.allEqual(u8, &retry.previous_exact_lock_sha256, 0))
+            return self.reject(.{ .code = .installed_state_contradiction, .detail = "removal retry binding" });
+    }
     const absent = absentDatabaseGeneration();
     if (self.input.installed.bootstrap_absent !=
         std.mem.eql(u8, &self.input.installed.generation_sha256, &absent) or
@@ -1725,6 +1747,10 @@ fn buildInstalled(self: *Compiler) CompileError!void {
         self.installed_index.putAssumeCapacity(key, @intCast(index));
     }
     self.installed = packages;
+    if (self.input.removal_retry) |retry| {
+        if (!std.mem.eql(u8, &retry.installed_evidence_sha256, &installedEvidenceDigest(source)))
+            return self.reject(.{ .code = .installed_state_contradiction, .detail = "removal retry evidence" });
+    }
 }
 
 fn prepareScripts(self: *Compiler, package: InstalledPackage) CompileError![]const InstalledScript {
@@ -2301,6 +2327,25 @@ fn validateActionEvidence(
             switch (state) {
                 .installed, .triggers_awaited, .triggers_pending => {},
                 .config_files => {},
+                .half_installed => {
+                    const retry = self.input.removal_retry orelse return self.reject(.{
+                        .code = .installed_state_contradiction,
+                        .detail = "half-installed removal requires known postrm failure",
+                        .package = action.package,
+                    });
+                    const postrm = installedScript(self, entry, .postrm) orelse
+                        return self.reject(.{ .code = .missing_script_evidence, .package = action.package });
+                    if (action.kind != .remove or
+                        !std.mem.eql(u8, retry.package.name, action.package) or
+                        !std.mem.eql(u8, retry.package.version, prior) or
+                        !std.mem.eql(u8, retry.package.architecture, action.architecture) or
+                        !std.mem.eql(u8, &retry.postrm_sha256, &postrm))
+                        return self.reject(.{
+                            .code = .installed_state_contradiction,
+                            .detail = "postrm retry identity",
+                            .package = action.package,
+                        });
+                },
                 else => return self.reject(.{
                     .code = .installed_state_contradiction,
                     .detail = "unhealthy installed state",
@@ -2860,42 +2905,47 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
         package.architecture,
     );
     var last = entry.assert_step;
+    const retry_postrm = entry.state == .half_installed;
     if (entry.state != .config_files) {
-        if (installedScript(self, entry.*, .prerm)) |digest| {
-            last = try emitScript(
-                self,
-                .remove,
-                &.{last},
-                package_identity,
-                .prerm,
-                .installed_package,
-                digest,
-                &.{"remove"},
-                .{
-                    .state = .half_configured,
-                    .unwind = try makeUnwind(
-                        self,
-                        installedScript(self, entry.*, .postinst),
-                        .postinst,
-                        .installed_package,
-                        &.{"abort-remove"},
-                    ),
-                    .recovery_required = false,
-                },
-            );
+        if (!retry_postrm) {
+            if (installedScript(self, entry.*, .prerm)) |digest| {
+                last = try emitScript(
+                    self,
+                    .remove,
+                    &.{last},
+                    package_identity,
+                    .prerm,
+                    .installed_package,
+                    digest,
+                    &.{"remove"},
+                    .{
+                        .state = .half_configured,
+                        .unwind = try makeUnwind(
+                            self,
+                            installedScript(self, entry.*, .postinst),
+                            .postinst,
+                            .installed_package,
+                            &.{"abort-remove"},
+                        ),
+                        .recovery_required = false,
+                    },
+                );
+            }
         }
-        last = try self.addStep(.remove, &.{last}, .{ .record_package_state = .{
-            .package = package_identity,
-            .state = .half_installed,
-            .hold = entry.hold,
-            .remove_entry = false,
-        } });
+        if (!retry_postrm) {
+            last = try self.addStep(.remove, &.{last}, .{ .record_package_state = .{
+                .package = package_identity,
+                .state = .half_installed,
+                .hold = entry.hold,
+                .remove_entry = false,
+            } });
+        }
         last = try self.addStep(.remove, &.{last}, .{ .remove_package_files = .{
             .package = package_identity,
             .owned_paths_sha256 = hex(32, package.owned_paths_sha256),
             .retain_conffiles = !purge,
         } });
-        if (!purge) {
+        if (!purge and !retry_postrm) {
             for (package.conffiles) |conffile| {
                 try self.charge(1);
                 last = try self.addStep(.remove, &.{last}, .{ .apply_conffile_decision = .{
@@ -5689,6 +5739,71 @@ test "native_program.test.remove retains conffiles and publishes the config-file
     try testing.expect(retained);
     try testing.expectEqual(PackageState.config_files, final_state.?);
     try testing.expectEqual(@as(usize, 0), program.countSteps(.purge_package_files));
+}
+
+test "native_program.test.only a bound known postrm remove failure can retry half-installed" {
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .remove,
+        .package = "legacy",
+        .version = "2.0",
+        .architecture = "amd64",
+        .prior_version = "2.0",
+        .artifact = null,
+    }};
+    const final = [_]native_authorization.FinalPackage{.{
+        .name = "legacy",
+        .version = "2.0",
+        .architecture = "amd64",
+        .state = .config_files,
+        .dpkg_selection_hold = false,
+    }};
+    var authorization = try testAuthorization(testing.allocator, &actions, &final);
+    defer authorization.deinit();
+    const ordered = removalOrdered(.remove);
+    var installed = removal_installed;
+    installed[0].state = .half_installed;
+    var input: Input = .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &ordered,
+        .installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed },
+    };
+    try expectDiagnostic(compile(testing.allocator, input), .installed_state_contradiction);
+    input.removal_retry = .{
+        .package = .{ .name = "legacy", .version = "2.0", .architecture = "amd64" },
+        .database_generation_sha256 = @splat(0x71),
+        .installed_evidence_sha256 = installedEvidenceDigest(&installed),
+        .postrm_sha256 = @splat(0x95),
+        .previous_attempt_id = @splat(0x12),
+        .previous_program_sha256 = @splat(0x13),
+        .previous_exact_lock_sha256 = @splat(0x14),
+    };
+    {
+        var bad = input;
+        bad.removal_retry.?.postrm_sha256[0] ^= 1;
+        try expectDiagnostic(compile(testing.allocator, bad), .installed_state_contradiction);
+    }
+    {
+        var bad = input;
+        bad.removal_retry.?.database_generation_sha256[0] ^= 1;
+        try expectDiagnostic(compile(testing.allocator, bad), .installed_state_contradiction);
+    }
+    {
+        var bad = input;
+        var missing_postrm = installed;
+        missing_postrm[0].scripts = &.{};
+        bad.installed.packages = &missing_postrm;
+        bad.removal_retry.?.installed_evidence_sha256 = installedEvidenceDigest(&missing_postrm);
+        try expectDiagnostic(compile(testing.allocator, bad), .missing_script_evidence);
+    }
+    var retry = try expectProgram(compile(testing.allocator, input));
+    defer retry.deinit();
+    try testing.expectEqual(@as(usize, 0), retry.program.countSteps(.apply_conffile_decision));
+    try testing.expectEqual(@as(usize, 1), retry.program.countSteps(.remove_package_files));
+    try testing.expectEqual(@as(usize, 1), retry.program.countSteps(.run_maintainer_script));
+    try testing.expectEqual(maintainer_script.Kind.postrm, scriptCallAt(retry.program, 0).?.kind);
+    try testing.expectEqualStrings("remove", scriptCallAt(retry.program, 0).?.arguments[0]);
+    try testing.expect(scriptCallAt(retry.program, 1) == null);
 }
 
 fn expectConffilePurgeOrdering(program: Program) !void {
