@@ -41,15 +41,15 @@
       "sha512": "95e2922b133afc493d7f7c2e26961f493e8affc3c29a17f4b7ad710f90ba0f3623178c3fe4a17d57b54313ba8f0104d0332504ccb7ff4d2172bb0bb1e2437967"
     },
     "findings": {
-      "count": 21369,
+      "count": 21457,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
-        "fixed_64_hex": 177,
-        "raw_32_byte": 1197,
-        "sha256_token": 19698
+        "fixed_64_hex": 179,
+        "raw_32_byte": 1203,
+        "sha256_token": 19778
       },
-      "sha512": "1036636b4d5b5627feef3e59effd16aa61efaadc1cd947a311b36f269f71dcd641eff0bcccf8667232073c60ffd3acd6898de98ec155bf7e45bb7b3d05b0a1fe"
+      "sha512": "fbdd6204aa59a4c936a4326e857ec37de89318b4f6186220690de95fe2a74ff91c04936105c86f441480707d7f85363b96aed2b2c6a86c494211865dfcc078ea"
     },
     "classifications": [
       {
@@ -154,29 +154,29 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs and python3 install-only invalid-name and redirected-tool witness, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded glib automatic file-trigger self-interest exclusion, failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12432,
+        "count": 12508,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
-          "raw_32_byte": 1121,
-          "sha256_token": 11164
+          "raw_32_byte": 1127,
+          "sha256_token": 11234
         },
-        "sha512": "26982303b0cec85bbcfc473633caefd2ba32f6e20919cdd604ba098d20630f65dc54e0440d73b6069b8681a056c9ccee3d09a895ab97ab473e29ff1a605e9165"
+        "sha512": "ca7f401355cc4705bb1b0eed70e05bfbbc1c0e1c2ca5be91b4da46eb613b7704dcb2faece7bbcea27aa4725d984fec191f7b18a67579dd6b6972cfd17366c106"
       },
       {
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 865,
+        "count": 877,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
-          "fixed_64_hex": 6,
+          "fixed_64_hex": 8,
           "raw_32_byte": 71,
-          "sha256_token": 784
+          "sha256_token": 794
         },
-        "sha512": "d1e786ea890a4e9a119a304107938c22bf067f1c7bce9cf093d9810a4b2d366a700a555c19e20775a30646765b369e30f76c7ca6bee35cb9e7e5f13ce7941bc6"
+        "sha512": "6b61ed01e308a52561b48a254129a49f3076ab439f50067346402f7423a570bec1d8f6dc1bfef54b616e33fc1f885a6c0a0a7759701531645e7a2eec03d44738"
       },
       {
         "scope": "tools",
@@ -229,7 +229,7 @@
       "id": "raw-control-and-compatibility-fields",
       "kind": "raw_32_byte_field",
       "classification": "fixed_control_and_versioned_compatibility",
-      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony, signed sudo and signed python3 control verifiers), or protocol controls, or fields inside frozen version-specific compatibility structures; current package content authority is typed.",
+      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony, signed sudo and signed python3 control verifiers), or protocol controls, including the bounded known-postrm-failure retry proof bound to the original attempt; other fields belong to frozen version-specific compatibility structures. Current package content authority is typed.",
       "paths": [
         "src/apt_system_api.zig",
         "src/apt_system_cli.zig",
@@ -271,8 +271,8 @@
         "src/transaction_provenance_v3.zig",
         "src/transaction_result_summary.zig"
       ],
-      "count": 359,
-      "sha512": "b8b698ac4d41f6adca34791f290fc11a4912d126f6d4102be8af463fdee20832e09978a5888002bc3724674ae215666ce1133e7fb6bbf6e6aae886e1b5408854"
+      "count": 364,
+      "sha512": "56a0f5e01028294c1895800fec1dbc5412f4c0ad8aeb7e5e14feb0b678d6fe760f6369cd71e8fde4154094f7a5a9d1d2983c95ad46a041cdddd36d490283a9de"
     },
     {
       "id": "schema-historical-authority-fields",
@@ -458,15 +458,16 @@
       "id": "fixed-lifecycle-control-assertions",
       "kind": "fixed_64_hex_assumption",
       "classification": "fixed_control_protocol",
-      "rationale": "These exact Zig test assertions validate a 64-character SHA256 control digest and its schema pattern; they do not define package, repository, or artifact content authority.",
+      "rationale": "These exact Zig test assertions validate 64-character SHA256 control digests and their schema patterns, including the prior attempt, program, exact lock, and postrm retry proof; they do not define package, repository, or artifact content authority.",
       "paths": [
         "test/native_failure_schema_validation.zig",
         "test/native_lifecycle_acceptance.zig",
         "test/native_lifecycle_negative.zig",
+        "test/native_lifecycle_removal.zig",
         "test/native_lifecycle_support.zig"
       ],
-      "count": 4,
-      "sha512": "6d6a6d9c06742ea79d1fa92ff00845aa80ee7ad80e3828bdf273175cd67375dd5bc5320200ccbd9df569659ad7e2cc0f6cc87faf7a21b8aa89f98dffd99e2342"
+      "count": 6,
+      "sha512": "a668292eace874f4f9cbf77dfa05e609fb52a297fa9c6621a046373fe2aaf87e37cf986177c44b94a5badeaeb83b6448e481a454d89f0f6cb1a0d807bcb97ecd"
     },
     {
       "id": "fixed-recovery-handler-schema-control",

@@ -107,6 +107,7 @@ fn checkRuntimeBounds(bounds: ?*RuntimeBounds) !void {
 
 const ExecutionState = struct {
     recovery: ?*native_recovery.Runtime = null,
+    removal_retry: bool = false,
     action: ?native_recovery.Action = null,
     program_step: u32 = 0,
     phase_ordinal: u16 = 0,
@@ -12385,7 +12386,7 @@ fn removalConfigVersion(
 ) ?[]const u8 {
     return switch (record.status.current) {
         .installed, .triggers_awaited, .triggers_pending => record.version,
-        .unpacked, .config_files => switch (configVersionField(record)) {
+        .half_installed, .unpacked, .config_files => switch (configVersionField(record)) {
             .valid => |value| value,
             .absent, .invalid => null,
         },
@@ -12672,6 +12673,13 @@ fn materializeRemoval(
             return .{ .outcome = .refused, .detail = "package_state_unsupported" };
         switch (record.status.current) {
             .installed, .unpacked, .config_files => {},
+            .half_installed => {
+                if (purge or request.borrowed_attempt == null or request.execution == null or
+                    !request.execution.?.removal_retry or
+                    request.planning.program.countSteps(.remove_package_files) != 1 or
+                    request.planning.program.countSteps(.run_maintainer_script) != 1)
+                    return .{ .outcome = .refused, .detail = "package_state_unsupported" };
+            },
             else => return .{
                 .outcome = .refused,
                 .detail = "package_state_unsupported",
@@ -15801,6 +15809,205 @@ fn deriveDeferredFinalState(
     return final_state;
 }
 
+const removal_retry_path = "var/lib/debz/native-remove-retry-v1.json";
+
+const RemovalRetryRecord = struct {
+    schema: []const u8 = "https://debz.dev/schema/native-remove-retry-v1",
+    version: u32 = 1,
+    install_root: []const u8,
+    root_inode: u64,
+    package: native_program.PackageIdentity,
+    database_generation_sha256: native_program.Digest,
+    installed_evidence_sha256: native_program.Digest,
+    postrm_sha256: native_program.Digest,
+    previous_attempt_id: native_program.Digest,
+    previous_program_sha256: native_program.Digest,
+    previous_exact_lock_sha256: native_program.Digest,
+    digest_sha256: native_program.Digest = @splat('0'),
+
+    fn digest(self: @This()) native_program.Digest {
+        var copy = self;
+        copy.digest_sha256 = @splat('0');
+        var buffer: [4096]u8 = undefined;
+        var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+        sink.writer.writeAll("debz-native-remove-retry-v1\x00") catch unreachable;
+        std.json.Stringify.value(copy, .{ .whitespace = .minified }, &sink.writer) catch unreachable;
+        sink.writer.flush() catch unreachable;
+        return std.fmt.bytesToHex(sink.hasher.finalResult(), .lower);
+    }
+
+    fn evidence(self: @This()) ?native_program.RemovalRetry {
+        if (!std.mem.eql(u8, self.schema, "https://debz.dev/schema/native-remove-retry-v1") or
+            self.version != 1 or !std.mem.eql(u8, &self.digest_sha256, &self.digest()))
+            return null;
+        const generation = parseHex(32, &self.database_generation_sha256) orelse return null;
+        const installed = parseHex(32, &self.installed_evidence_sha256) orelse return null;
+        const script = parseHex(32, &self.postrm_sha256) orelse return null;
+        const attempt = parseHex(32, &self.previous_attempt_id) orelse return null;
+        const program = parseHex(32, &self.previous_program_sha256) orelse return null;
+        const lock = parseHex(32, &self.previous_exact_lock_sha256) orelse return null;
+        return .{
+            .package = self.package,
+            .database_generation_sha256 = generation,
+            .installed_evidence_sha256 = installed,
+            .postrm_sha256 = script,
+            .previous_attempt_id = attempt,
+            .previous_program_sha256 = program,
+            .previous_exact_lock_sha256 = lock,
+        };
+    }
+};
+
+fn readRemovalRetry(allocator: std.mem.Allocator, root: root_fs.Root) !?std.json.Parsed(RemovalRetryRecord) {
+    const bytes = root.readFileAlloc(allocator, try root_fs.Path.init(removal_retry_path), 4096) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(RemovalRetryRecord, allocator, bytes, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+    });
+    errdefer parsed.deinit();
+    const canonical = try std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .minified });
+    defer allocator.free(canonical);
+    if (parsed.value.evidence() == null or !std.mem.eql(u8, bytes, canonical))
+        return error.InvalidRemovalRetry;
+    return parsed;
+}
+
+fn recoveringRemovalRetry(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: native_program.Program,
+    database: package_database.Database,
+) !bool {
+    if (program.countSteps(.remove_package_files) != 1 or
+        program.countSteps(.run_maintainer_script) != 1)
+        return false;
+    const script = for (program.steps) |step| {
+        if (step.operation == .run_maintainer_script)
+            break step.operation.run_maintainer_script;
+    } else unreachable;
+    if (script.kind != .postrm or script.arguments.len != 1 or
+        !std.mem.eql(u8, script.arguments[0], "remove"))
+        return false;
+    var record = (try readRemovalRetry(allocator, root)) orelse return false;
+    defer record.deinit();
+    const proof = record.value.evidence().?;
+    if (!std.mem.eql(u8, record.value.install_root, program.install_root) or
+        record.value.root_inode != (try root.metadataOfRoot()).inode or
+        !std.mem.eql(u8, &record.value.database_generation_sha256, &program.installed_database.generation_sha256) or
+        !std.mem.eql(u8, proof.package.name, script.package.name) or
+        !std.mem.eql(u8, proof.package.version, script.package.version) or
+        !std.mem.eql(u8, proof.package.architecture, script.package.architecture) or
+        !std.mem.eql(u8, &record.value.postrm_sha256, &script.script_sha256))
+        return error.InvalidRemovalRetry;
+    if (std.mem.eql(u8, &database.generation.sha256, &proof.database_generation_sha256)) {
+        const installed = try lifecycleInstalledEvidence(allocator, root, database.model);
+        if ((try verifiedRemovalRetry(
+            allocator,
+            root,
+            program.install_root,
+            database,
+            installed,
+            proof.package,
+        )) == null) return error.InvalidRemovalRetry;
+    }
+    return true;
+}
+
+fn verifiedRemovalRetry(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    database: package_database.Database,
+    installed: []const native_program.InstalledPackage,
+    package: native_program.PackageIdentity,
+) !?native_program.RemovalRetry {
+    var record = (try readRemovalRetry(allocator, root)) orelse return null;
+    defer record.deinit();
+    const evidence = record.value.evidence().?;
+    if (!std.mem.eql(u8, record.value.install_root, install_root) or
+        record.value.root_inode != (try root.metadataOfRoot()).inode or
+        !std.mem.eql(u8, &evidence.database_generation_sha256, &database.generation.sha256) or
+        !std.mem.eql(u8, &evidence.installed_evidence_sha256, &native_program.installedEvidenceDigest(installed)) or
+        !std.mem.eql(u8, evidence.package.name, package.name) or
+        !std.mem.eql(u8, evidence.package.version, package.version) or
+        !std.mem.eql(u8, evidence.package.architecture, package.architecture))
+        return null;
+    const actual = database.model.find(package.name, package.architecture) orelse return null;
+    const postrm = actual.script(.postrm) orelse return null;
+    if (actual.status.current != .half_installed or
+        actual.status.want != .deinstall or actual.status.error_state != .ok or
+        !std.mem.eql(u8, &postrm.sha256, &evidence.postrm_sha256))
+        return null;
+    var owned = evidence;
+    owned.package = .{
+        .name = try allocator.dupe(u8, evidence.package.name),
+        .version = try allocator.dupe(u8, evidence.package.version),
+        .architecture = try allocator.dupe(u8, evidence.package.architecture),
+    };
+    return owned;
+}
+
+fn publishRemovalRetry(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    install_root: []const u8,
+    architecture: []const u8,
+    attempt: *root_operation.Attempt,
+    program: native_program.Program,
+    package: native_program.PackageIdentity,
+) !void {
+    if (!attempt.locked() or !attempt.record().mutation_started)
+        return error.RemovalRetryOwnerLost;
+    var captured = try captureDatabaseSnapshot(allocator, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+    var database = switch (try package_database.importSnapshot(allocator, .{
+        .native_architecture = architecture,
+        .snapshot = captured.snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidRemovalRetry,
+    };
+    defer database.deinit();
+    const installed = try lifecycleInstalledEvidence(allocator, root, database.model);
+    defer {
+        for (installed) |item| {
+            allocator.free(item.scripts);
+            allocator.free(item.conffiles);
+            allocator.free(item.triggers);
+        }
+        allocator.free(installed);
+    }
+    const actual = database.model.find(package.name, package.architecture) orelse return error.InvalidRemovalRetry;
+    const postrm = actual.script(.postrm) orelse return error.InvalidRemovalRetry;
+    if (actual.status.current != .half_installed or actual.status.want != .deinstall or
+        actual.status.error_state != .ok or !std.mem.eql(u8, actual.version, package.version))
+        return error.InvalidRemovalRetry;
+    var record: RemovalRetryRecord = .{
+        .install_root = install_root,
+        .root_inode = (try root.metadataOfRoot()).inode,
+        .package = package,
+        .database_generation_sha256 = native_provenance.hexDigest(database.generation.sha256),
+        .installed_evidence_sha256 = native_provenance.hexDigest(native_program.installedEvidenceDigest(installed)),
+        .postrm_sha256 = native_provenance.hexDigest(postrm.sha256),
+        .previous_attempt_id = native_provenance.hexDigest(attempt.attemptId()),
+        .previous_program_sha256 = program.digest_sha256,
+        .previous_exact_lock_sha256 = program.exact_lock.digest_sha256,
+    };
+    record.digest_sha256 = record.digest();
+    const bytes = try std.json.Stringify.valueAlloc(allocator, record, .{ .whitespace = .minified });
+    defer allocator.free(bytes);
+    try root.publishFile(try root_fs.Path.init(removal_retry_path), bytes, .{
+        .permissions = .fromMode(0o600),
+        .overwrite = .replace,
+        .durable = true,
+    });
+}
+
 fn compileLifecycleProgram(
     allocator: std.mem.Allocator,
     raw_request: []const u8,
@@ -15817,6 +16024,17 @@ fn compileLifecycleProgram(
     const owned = arena.allocator();
 
     const installed = try lifecycleInstalledEvidence(owned, root, database.model);
+    const retry: ?native_program.RemovalRetry = if (external.operation == .remove and
+        !external.triggers and external.packages.len == 1)
+    blk: {
+        const record = database.model.find(external.packages[0].name, external.packages[0].architecture) orelse break :blk null;
+        if (record.status.current != .half_installed) break :blk null;
+        break :blk verifiedRemovalRetry(owned, root, external.root, database, installed, .{
+            .name = record.name,
+            .version = record.version,
+            .architecture = record.architecture,
+        }) catch return null;
+    } else null;
     const archives = try lifecycleArchiveEvidence(owned, models, archive_bytes);
     var actions: std.ArrayList(native_authorization.Action) = .empty;
     for (archives, 0..) |archive, index| {
@@ -15964,6 +16182,7 @@ fn compileLifecycleProgram(
             .trigger_state_sha256 = native_trigger.stateDigest(database.model),
             .updates_pending = database.model.pending_updates.len != 0,
         },
+        .removal_retry = retry,
         .archives = archives,
         .script_policy = lifecycleScriptPolicy(),
     });
@@ -15977,7 +16196,7 @@ fn compileLifecycleProgram(
     errdefer program.deinit();
     if (!program.program.matchesAuthorization(authorization.authorization))
         return error.InvalidLifecycleProgram;
-    return .{ .authorization = authorization, .program = program };
+    return .{ .authorization = authorization, .program = program, .removal_retry = retry };
 }
 
 fn lifecycleArchiveIndex(
@@ -19398,6 +19617,7 @@ fn stageLifecycleScripts(
     if (initial_model.find(package.name, package.architecture)) |record| {
         for (record.scripts) |script| {
             const kind = lifecycleScriptKind(script.kind);
+            if (execution.removal_retry and kind != .postrm) continue;
             const source = try std.fmt.allocPrint(
                 scratch,
                 "{s}/{s}/{s}.{s}",
@@ -27017,6 +27237,18 @@ pub const Runtime = struct {
         _ = try native_diversion.Index.init(temporary, database.model.diversions);
         _ = try native_statoverride.read(temporary, root, database.model.stat_overrides);
         const installed = try lifecycleInstalledEvidence(temporary, root, database.model);
+        const retry: ?native_program.RemovalRetry = if (request.plan.actions.len == 1 and
+            request.plan.actions[0].kind == .remove and request.archives.len == 0)
+        blk: {
+            const action = request.plan.actions[0];
+            const existing = database.model.find(action.package, action.architecture) orelse break :blk null;
+            if (existing.status.current != .half_installed) break :blk null;
+            break :blk verifiedRemovalRetry(temporary, root, request.attempt.record().install_root, database, installed, .{
+                .name = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+            }) catch return error.InvalidRemovalRetry;
+        } else null;
         const models = try temporary.alloc(archive_application.Model, request.archives.len);
         const origins = try temporary.alloc(exact_lock_v3.PackageOrigin, request.archives.len);
         const identities = try temporary.alloc(
@@ -27087,6 +27319,7 @@ pub const Runtime = struct {
                 .updates_pending = database.model.pending_updates.len != 0,
                 .bootstrap_absent = captured.absent,
             },
+            .removal_retry = retry,
             .archives = archives,
             .trigger_authority = authority,
         });
@@ -28985,6 +29218,30 @@ fn executeLifecycleProgramWithRequest(
         },
     };
     defer locked_database.deinit();
+    if (compiled.removal_retry) |expected| {
+        const installed = try lifecycleInstalledEvidence(scratch, root, locked_database.model);
+        const observed = verifiedRemovalRetry(
+            scratch,
+            root,
+            external.root,
+            locked_database,
+            installed,
+            expected.package,
+        ) catch null;
+        if (observed == null or
+            !std.mem.eql(u8, &observed.?.previous_attempt_id, &expected.previous_attempt_id) or
+            !std.mem.eql(u8, &observed.?.previous_program_sha256, &expected.previous_program_sha256) or
+            !std.mem.eql(u8, &observed.?.previous_exact_lock_sha256, &expected.previous_exact_lock_sha256) or
+            !std.mem.eql(u8, &observed.?.installed_evidence_sha256, &expected.installed_evidence_sha256))
+        {
+            if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
+            return .{
+                .outcome = .refused,
+                .detail = "removal_retry_binding_changed",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+    }
     if (recovery_intent != null and requiresDatabaseInitialization(program.*) or
         (locked_capture != null and locked_capture.?.absent))
         locked_database.generation.sha256 = native_program.absentDatabaseGeneration();
@@ -29052,8 +29309,22 @@ fn executeLifecycleProgramWithRequest(
         }
     }
     var recovery_runtime: native_recovery.Runtime = undefined;
+    const retry_on_recovery = if (recovery_intent != null)
+        recoveringRemovalRetry(scratch, root, program.*, locked_database) catch {
+            attempt.requireRecovery(allocator, .verification) catch |err| {
+                if (err != error.MutationEvidenceRequired) return err;
+            };
+            return .{
+                .outcome = .recovery_required,
+                .detail = "removal_retry_recovery_binding_changed",
+                .program_sha256 = program.digest_sha256,
+            };
+        }
+    else
+        false;
     var execution_state: ExecutionState = .{
         .bounds = bounds,
+        .removal_retry = compiled.removal_retry != null or retry_on_recovery,
         .stat_overrides = stat_overrides,
         .diversion_observation = try native_diversion.observe(allocator, root),
         .diversion_cache = if (diversion_session) |*session| session else null,
@@ -30442,6 +30713,20 @@ fn executeLifecycleProgramWithRequest(
                 if (lifecycleMaterializationFailure(restored)) |failure|
                     return failure;
             }
+            if (outcome == .exited and call.kind == .postrm and
+                call.source == .installed_package and
+                call.arguments.len == 1 and
+                std.mem.eql(u8, call.arguments[0], "remove") and
+                action != null and action.?.kind == .remove)
+                try publishRemovalRetry(
+                    scratch,
+                    root,
+                    external.root,
+                    external.architecture,
+                    attempt,
+                    program.*,
+                    call.package,
+                );
             try clearTriggerAuthority(
                 allocator,
                 root,
@@ -30620,6 +30905,10 @@ fn executeLifecycleProgramWithRequest(
             .detail = "final_closure_mismatch",
             .program_sha256 = program.digest_sha256,
         };
+    }
+    if (execution.removal_retry) {
+        if (!attempt.locked()) return error.RemovalRetryOwnerLost;
+        try root.removeFile(try root_fs.Path.init(removal_retry_path));
     }
     if (execution.recovery) |runtime| {
         const owner_matches = verifyNativeHelperBootstrapFinalOwner(
