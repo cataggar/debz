@@ -2288,6 +2288,16 @@ fn validateActionEvidence(
             switch (state) {
                 .installed, .triggers_awaited, .triggers_pending => {},
                 .unpacked => {},
+                .config_files => if (action.kind != .reinstall or
+                    !std.mem.eql(u8, action.version, prior) or
+                    self.installed[entry.installed.?].configured_version == null or
+                    !std.mem.eql(u8, self.installed[entry.installed.?].configured_version.?, prior))
+                    return self.reject(.{
+                        .code = .installed_state_contradiction,
+                        .detail = "unhealthy installed state",
+                        .package = action.package,
+                        .architecture = action.architecture,
+                    }),
                 .half_configured => if (action.kind != .reinstall or
                     !std.mem.eql(u8, action.version, entry.installed_version.?))
                     return self.reject(.{
@@ -3040,40 +3050,44 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
     const package_identity = record.package;
     const prior_version = entry.installed_version;
     var last = self.artifact_steps[artifact];
-    switch (action.kind) {
-        .install => {
-            if (archiveScriptDigest(prepared, .preinst)) |digest| {
-                const args: []const []const u8 = if (prior_version) |version|
-                    &.{ "install", version }
-                else
-                    &.{"install"};
-                const unwind_args: []const []const u8 = if (prior_version) |version|
-                    &.{ "abort-install", version }
-                else
-                    &.{"abort-install"};
-                last = try emitScript(
-                    self,
-                    .unpack,
-                    &.{ last, entry.assert_step },
-                    package_identity,
-                    .preinst,
-                    .new_package,
-                    digest,
-                    args,
-                    .{
-                        .state = .half_installed,
-                        .unwind = try makeUnwind(
-                            self,
-                            archiveScriptDigest(prepared, .postrm),
-                            .postrm,
-                            .new_package,
-                            unwind_args,
-                        ),
-                        .recovery_required = false,
-                    },
-                );
-            }
-        },
+    const reinstall_removed = action.kind == .reinstall and entry.state == .config_files;
+    if (action.kind == .install or reinstall_removed) {
+        if (archiveScriptDigest(prepared, .preinst)) |digest| {
+            const args: []const []const u8 = if (reinstall_removed)
+                &.{ "install", prior_version.?, action.version }
+            else if (prior_version) |version|
+                &.{ "install", version }
+            else
+                &.{"install"};
+            const unwind_args: []const []const u8 = if (reinstall_removed)
+                &.{ "abort-install", prior_version.?, action.version }
+            else if (prior_version) |version|
+                &.{ "abort-install", version }
+            else
+                &.{"abort-install"};
+            last = try emitScript(
+                self,
+                .unpack,
+                &.{ last, entry.assert_step },
+                package_identity,
+                .preinst,
+                .new_package,
+                digest,
+                args,
+                .{
+                    .state = if (reinstall_removed) .config_files else .half_installed,
+                    .unwind = try makeUnwind(
+                        self,
+                        archiveScriptDigest(prepared, .postrm),
+                        .postrm,
+                        .new_package,
+                        unwind_args,
+                    ),
+                    .recovery_required = false,
+                },
+            );
+        }
+    } else switch (action.kind) {
         .upgrade, .downgrade, .reinstall => {
             const prior = action.prior_version.?;
             if (entry.state != .unpacked) if (installedScript(self, entry.*, .prerm)) |digest| {
@@ -3142,7 +3156,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
                 );
             }
         },
-        .remove, .purge => unreachable,
+        else => unreachable,
     }
     var requires: [3]u32 = undefined;
     var required: usize = 0;
@@ -3167,7 +3181,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
             null,
     } });
     entry.unpack_step = last;
-    switch (action.kind) {
+    if (!reinstall_removed) switch (action.kind) {
         .upgrade, .downgrade, .reinstall => {
             if (installedScript(self, entry.*, .postrm)) |digest| {
                 last = try emitScript(
@@ -3230,7 +3244,7 @@ fn emitUnpack(self: *Compiler, action_index: usize) CompileError!u32 {
             }
         },
         else => {},
-    }
+    };
     last = try emitConffiles(self, entry_index, package_identity, last, .unpack);
     if (prepared.triggers.len != 0) {
         last = try self.addStep(.unpack, &.{last}, .{ .record_trigger_interests = .{
@@ -7144,6 +7158,71 @@ test "native_program.test.install over config files replays the recorded version
         ConffileAction.replace_unmodified,
         conffileDecisionFor(owned.program, "/etc/app.conf").?.action,
     );
+}
+
+test "native_program.test.same-version reinstall from config files uses install scripts and retains edited conffile" {
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .reinstall,
+        .package = "app",
+        .version = "1.2",
+        .architecture = "amd64",
+        .prior_version = "1.2",
+        .artifact = testArtifact(0x31, 100),
+    }};
+    var authorization = try testAuthorization(testing.allocator, &actions, &install_final);
+    defer authorization.deinit();
+    const installed = [_]InstalledPackage{.{
+        .name = "app",
+        .version = "1.2",
+        .architecture = "amd64",
+        .state = .config_files,
+        .configured_version = "1.2",
+        .scripts = &.{.{ .kind = .postrm, .sha256 = @splat(0x91) }},
+        .conffiles = &.{.{
+            .path = "/etc/app.conf",
+            .recorded_md5 = @splat(0x61),
+            .on_disk_md5 = @splat(0x62),
+        }},
+    }};
+    const archives = [_]Archive{upgradeArchive()};
+    const input: Input = .{
+        .authorization = &authorization.authorization,
+        .ordered_actions = &install_ordered,
+        .installed = .{ .generation_sha256 = @splat(0x71), .packages = &installed },
+        .archives = &archives,
+    };
+    var owned = try expectProgram(compile(testing.allocator, input));
+    defer owned.deinit();
+    const preinst = scriptCallAt(owned.program, 0).?;
+    try testing.expectEqual(maintainer_script.Kind.preinst, preinst.kind);
+    try testing.expectEqual(ScriptSource.new_package, preinst.source);
+    try testing.expectEqualStrings("install", preinst.arguments[0]);
+    try testing.expectEqualStrings("1.2", preinst.arguments[1]);
+    try testing.expectEqualStrings("1.2", preinst.arguments[2]);
+    try testing.expectEqualStrings("abort-install", preinst.failure.unwind.?.arguments[0]);
+    try testing.expectEqualStrings("1.2", preinst.failure.unwind.?.arguments[1]);
+    try testing.expectEqualStrings("1.2", preinst.failure.unwind.?.arguments[2]);
+    try testing.expectEqual(PackageState.config_files, preinst.failure.state);
+    const postinst = scriptCallAt(owned.program, 1).?;
+    try testing.expectEqual(maintainer_script.Kind.postinst, postinst.kind);
+    try testing.expectEqualStrings("configure", postinst.arguments[0]);
+    try testing.expectEqualStrings("1.2", postinst.arguments[1]);
+    try testing.expect(scriptCallAt(owned.program, 2) == null);
+    try testing.expectEqual(
+        ConffileAction.keep_user_modified,
+        conffileDecisionFor(owned.program, "/etc/app.conf").?.action,
+    );
+    var unhealthy = installed;
+    unhealthy[0].state = .half_installed;
+    var bad = input;
+    bad.installed.packages = &unhealthy;
+    try expectDiagnostic(compile(testing.allocator, bad), .installed_state_contradiction);
+    unhealthy[0].state = .config_files;
+    unhealthy[0].configured_version = null;
+    try expectDiagnostic(compile(testing.allocator, bad), .installed_state_contradiction);
+    unhealthy[0].configured_version = "1.1";
+    try expectDiagnostic(compile(testing.allocator, bad), .installed_state_contradiction);
 }
 
 test "native_program.test.downgrade and reinstall keep the upgrade script contract" {

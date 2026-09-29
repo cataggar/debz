@@ -189,7 +189,7 @@ pub fn transitionAllowed(from: CurrentState, to: CurrentState) bool {
             else => false,
         },
         .config_files => switch (to) {
-            .half_installed, .not_installed => true,
+            .half_installed, .unpacked, .not_installed => true,
             else => false,
         },
         .half_installed => switch (to) {
@@ -1846,6 +1846,7 @@ test "package_database_changes.test.transition table refuses impossible publicat
     try testing.expect(transitionAllowed(.installed, .triggers_pending));
     try testing.expect(transitionAllowed(.triggers_awaited, .installed));
     try testing.expect(transitionAllowed(.installed, .config_files));
+    try testing.expect(transitionAllowed(.config_files, .unpacked));
     try testing.expect(!transitionAllowed(.not_installed, .installed));
     try testing.expect(!transitionAllowed(.config_files, .installed));
     try testing.expect(!transitionAllowed(.half_installed, .installed));
