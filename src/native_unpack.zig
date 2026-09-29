@@ -18786,6 +18786,57 @@ fn stagedConfigMatches(
     );
 }
 
+const BootstrapConfigDrift = enum { missing, changed };
+
+fn changedBootstrapConfigCheckpoint(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    intent_sha256: native_recovery.Digest,
+    progress: native_recovery.ProgressDocument,
+    program: native_program.Program,
+    models: []archive_application.Model,
+) !?BootstrapConfigDrift {
+    if (!std.mem.eql(u8, &progress.intent_sha256, &intent_sha256))
+        return error.InvalidRecoveryProgress;
+    var managed = try native_recovery.readManagedState(allocator, root);
+    defer managed.deinit();
+    if (!std.mem.eql(u8, &managed.document.intent_sha256, &intent_sha256) or
+        managed.document.transient != null)
+        return error.InvalidManagedState;
+    const stable = managed.document.stable orelse return null;
+    for (program.steps) |step| {
+        if (step.operation != .materialize_bootstrap_payload) continue;
+        const index = lifecycleArchiveIndex(models, step.operation.materialize_bootstrap_payload.package) orelse continue;
+        const config = models[index].script(.config) orelse continue;
+        const action = nativeAction(.database, step.sequence, 0, 0);
+        if (!std.meta.eql(stable.action, action)) continue;
+        const stage = native_recovery.latest(progress, action) orelse return null;
+        if (stage.stage != .completed or
+            (stage.result != .applied and stage.result != .recovered) or
+            stage.evidence_sha256 == null or
+            !std.mem.eql(u8, &stage.evidence_sha256.?, &stable.digest_sha256) or
+            native_recovery.latest(progress, nativeAction(.filesystem, step.sequence, 1, 0)) != null)
+            return null;
+        var recorded = false;
+        for (stable.entries) |entry| {
+            if (!std.mem.eql(u8, entry.path, dpkg_config_staging_path)) continue;
+            if (recorded or entry.kind != .regular or entry.mode != config.mode or
+                entry.uid != 0 or entry.gid != 0 or entry.link_count != 1 or
+                entry.size != config.size or entry.content_sha256 == null or
+                !std.mem.eql(u8, &entry.content_sha256.?, &native_recovery.hexDigest(config.sha256)))
+                return null;
+            recorded = true;
+        }
+        if (!recorded) return null;
+        const matches = stagedConfigMatches(allocator, root, config.*) catch |err| switch (err) {
+            error.StagedConfigChanged => return .changed,
+            else => return err,
+        };
+        return if (matches) null else .missing;
+    }
+    return null;
+}
+
 fn installedConfigMatches(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -25610,6 +25661,7 @@ fn recoverNativeRootMutation(
     diversion_cache: *?native_diversion.Session,
     program: native_program.Program,
     authorization: native_authorization.Authorization,
+    models: []archive_application.Model,
     script_recovery: ActiveScriptRecovery,
 ) !bool {
     try checkRuntimeBounds(bounds);
@@ -25701,11 +25753,26 @@ fn recoverNativeRootMutation(
         },
     ) orelse {
         try validateManagedDiversionUpdate(allocator, runtime, false);
-        try native_recovery.validateStableManagedState(
+        native_recovery.validateStableManagedState(
             allocator,
             root,
             runtime.intent_sha256,
-        );
+        ) catch |err| {
+            if (err == error.ManagedStateChanged) {
+                if (try changedBootstrapConfigCheckpoint(
+                    allocator,
+                    root,
+                    runtime.intent_sha256,
+                    initial_progress.document,
+                    program,
+                    models,
+                )) |drift| return switch (drift) {
+                    .missing => error.StagedConfigMissing,
+                    .changed => error.StagedConfigChanged,
+                };
+            }
+            return err;
+        };
         return true;
     };
     defer opened.deinit();
@@ -29061,8 +29128,20 @@ fn executeLifecycleProgramWithRequest(
             &diversion_session,
             program.*,
             authorization.*,
+            models,
             script_recovery,
         ) catch |err| switch (err) {
+            error.StagedConfigChanged, error.StagedConfigMissing => {
+                try attempt.requireRecovery(allocator, .verification);
+                return .{
+                    .outcome = .recovery_required,
+                    .detail = if (err == error.StagedConfigMissing)
+                        "staged_config_missing"
+                    else
+                        "staged_config_changed",
+                    .program_sha256 = program.digest_sha256,
+                };
+            },
             error.ManagedStateChanged,
             error.InvalidManagedState,
             error.UnmodeledManagedState,
