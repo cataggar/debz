@@ -1074,16 +1074,23 @@ the exact executed/declaration count, fails on a missing selector, and does
 not substitute a fixture/schema or a lifecycle-only test for a crash case.
 The declared and executed set is **all 100 Python tuples, 001–100**; the
 compile-time ordering check rejects omissions and duplicates. CI requires
-the entire set in **both**
-optimization modes on amd64 and arm64, with the SHA-256-pinned private dpkg;
+four disjoint shards, **001–025**, **026–050**, **051–075** and **076–100**,
+in **both** optimization modes on amd64 and arm64, with the SHA-256-pinned
+private dpkg. A compile-time partition check rejects gaps or overlaps;
+`-Dnative-zig-recovery-diversion-shard=1` through `4` select these ranges
+only on the focused Zig target. A missing shard value, repeated selector or
+invalid shard number refuses execution; the complete aggregate rejects all
+focused shard selectors.
 `-Dnative-zig-recovery-diversion-case=N` selects a single number for
 diagnostics only on the focused Zig target. The aggregate's
-`-Dnative-diversions-only=true` selector always runs all 100 numbers.
+`-Dnative-diversions-only=true` selector always runs all 100 numbers and
+both named routes.
 Two additional **named** #293 process-kill cases are not Python tuples:
 `-Dnative-zig-recovery-diversion-route-case=cache-refresh` or
 `route-checkpoint` selects one case and its seven independent guarded-root
 trials. The default focused/aggregate diversion target runs both named cases
-after the 100 numbered cases, without altering the one-to-one Python count.
+after the 100 numbered cases. CI runs both only in shard 4 after case 100,
+without altering the one-to-one Python count or repeating the named trials.
 
 These cases install a package-owned `dpkg-trigger` helper, execute package
 scripts and triggers in real guarded roots, run the pinned dpkg on the
@@ -1489,15 +1496,26 @@ public workload selectors retain their former scenario boundaries:
 | `native-repository-cli-only` | Public CLI cases alone |
 | `native-consumer-parity-only` | Diversion, statoverride, conffile, metadata, literal, scriptless and 30 signed consumer cases |
 | `native-fresh-helper-only` | Twenty fresh package-owned helper/bootstrap cases |
-| `native-diversions-only` | All 100 numbered diversion recovery cases |
+| `native-diversions-only` | All 100 numbered diversion recovery cases and both named #293 routes |
 
-Focused Zig `-Dnative-zig-*` case/partial-workload options remain available
+Focused Zig `-Dnative-zig-*` case, route and shard options remain available
 on their individual targets, but the complete `test-native-recovery` gate
 rejects them rather than silently running an incomplete matrix. The default
 and public selectors retain pinned `-Dnative-reference-dpkg` propagation and
 real native-helper/result-CLI artifacts. CI runs just the complete gate once
 per mode on each architecture, not the same expensive suites again as
-separate focused commands.
+separate focused commands. The required CI recovery jobs instead split the
+scenario workload from four architecture-parallel numbered diversion shards:
+each diversion job runs its one 25-case range in Debug and ReleaseSafe,
+shard 4 also runs both named #293 routes, and the scenario job retains the
+full #294 journal/staging and #295 publication/metadata/rollback matrices
+in both modes. The existing `Build and test (linux-x64/arm64)` checks require
+**all** core, repository, helper/bootstrap/parity/rollback, FAMILY, scenario
+and diversion matrix jobs to succeed; a failed, skipped or canceled shard
+cannot satisfy either aggregate. Each
+scenario/diversion job retains a 75-minute budget. This partition addresses
+the previous x64 cancellation after case 077, but x64 headroom under
+concurrent CI load requires a successful post-change run and repeat.
 
 The native Linux amd64/arm64 runner requires the existing dpkg/chroot fixture
 prerequisites and passwordless sudo. Only fixture execution is elevated.

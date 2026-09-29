@@ -127,6 +127,18 @@ const cases = [_]Case{
     .{ .number = 100, .operation = "upgrade", .crash = "during_unpack_settlement", .mutation = "backup-postrm-directory-drift" },
 };
 
+const CaseShard = struct {
+    first: u8,
+    last: u8,
+};
+
+const case_shards = [_]CaseShard{
+    .{ .first = 1, .last = 25 },
+    .{ .first = 26, .last = 50 },
+    .{ .first = 51, .last = 75 },
+    .{ .first = 76, .last = 100 },
+};
+
 const RouteCase = struct {
     name: []const u8,
     crash: []const u8,
@@ -154,6 +166,14 @@ comptime {
         if (c.number <= previous or c.number > 100) @compileError("diversion recovery case numbers must be unique, ordered Python tuples");
         previous = c.number;
     }
+    var next: u8 = 1;
+    for (case_shards) |shard| {
+        if (shard.first != next or shard.last < shard.first or shard.last > cases.len)
+            @compileError("diversion recovery shards must partition all 100 cases without gaps or overlap");
+        next = shard.last + 1;
+    }
+    if (next != cases.len + 1) @compileError("diversion recovery shards must end at case 100");
+    if (route_cases.len != 2) @compileError("both named diversion route cases must remain required");
 }
 
 const Report = struct {
@@ -1101,13 +1121,18 @@ pub fn main(init: std.process.Init) !void {
     var pinned: ?[]const u8 = null;
     var selected: ?u8 = null;
     var selected_route: ?[]const u8 = null;
+    var selected_shard: ?usize = null;
     while (args.next()) |option| {
         if (eq(option, "--case")) {
-            if (selected != null or selected_route != null) return error.DuplicateCase;
+            if (selected != null or selected_route != null or selected_shard != null) return error.DuplicateCase;
             selected = try std.fmt.parseInt(u8, args.next() orelse return error.MissingCase, 10);
         } else if (eq(option, "--route-case")) {
-            if (selected != null or selected_route != null) return error.DuplicateCase;
+            if (selected != null or selected_route != null or selected_shard != null) return error.DuplicateCase;
             selected_route = args.next() orelse return error.MissingRouteCase;
+        } else if (eq(option, "--shard")) {
+            if (selected != null or selected_route != null or selected_shard != null) return error.DuplicateCase;
+            selected_shard = try std.fmt.parseInt(usize, args.next() orelse return error.MissingShard, 10);
+            if (selected_shard.? == 0 or selected_shard.? > case_shards.len) return error.InvalidDiversionShard;
         } else if (eq(option, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
             pinned = args.next() orelse return error.MissingPinnedDpkg;
@@ -1119,29 +1144,35 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer lifecycle.assertHostUnchanged(a, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed: {s}\n", .{@errorName(err)});
+    const shard = if (selected_shard) |number| case_shards[number - 1] else null;
     var executed: usize = 0;
     for (cases) |c| {
         if (selected_route != null) continue;
         if (selected != null and selected.? != c.number) continue;
+        if (shard) |bounds| {
+            if (c.number < bounds.first or c.number > bounds.last) continue;
+        }
         runCase(&fixture, driver, reference.executable, reference.architecture, c) catch |err| {
             std.debug.print("Python diversion recovery case {d} failed: {s}\n", .{ c.number, @errorName(err) });
             return err;
         };
         executed += 1;
     }
-    if (executed != (if (selected_route != null) @as(usize, 0) else if (selected != null) @as(usize, 1) else cases.len))
+    const expected_cases: usize = if (selected_route != null) 0 else if (selected != null) 1 else if (shard) |bounds| @as(usize, bounds.last) - bounds.first + 1 else cases.len;
+    if (executed != expected_cases)
         return error.DiversionCaseAccountingMismatch;
     var route_executed: usize = 0;
-    if (selected == null) for (route_cases) |c| {
+    const run_routes = selected == null and (selected_shard == null or selected_shard.? == case_shards.len);
+    if (run_routes) for (route_cases) |c| {
         if (selected_route != null and !eq(selected_route.?, c.name)) continue;
         try routeCase(&fixture, driver, reference.executable, reference.architecture, c);
         route_executed += 1;
     };
-    if (route_executed != (if (selected != null) @as(usize, 0) else if (selected_route != null) @as(usize, 1) else route_cases.len))
+    if (route_executed != (if (!run_routes) @as(usize, 0) else if (selected_route != null) @as(usize, 1) else route_cases.len))
         return error.RouteCaseAccountingMismatch;
     try lifecycle.assertHostUnchanged(a, init.io, reference.before);
     if (selected_route == null)
-        std.debug.print("diversion recovery: {d}/{d} declared real crash cases executed against pinned dpkg\n", .{ executed, if (selected != null) @as(usize, 1) else cases.len });
-    if (selected == null)
+        std.debug.print("diversion recovery: {d}/{d} declared real crash cases executed against pinned dpkg\n", .{ executed, expected_cases });
+    if (run_routes)
         std.debug.print("route transition recovery: {d}/{d} named real crash cases executed against pinned dpkg\n", .{ route_executed, if (selected_route != null) @as(usize, 1) else route_cases.len });
 }

@@ -1493,6 +1493,9 @@ pub fn build(b: *std.Build) void {
     const route_case = b.option([]const u8, "native-zig-recovery-diversion-route-case", "Run one named diversion postrm crash transition and its drift controls");
     if (route_case) |name|
         recovery_diversions.addArgs(&.{ "--route-case", name });
+    const diversion_shard = b.option([]const u8, "native-zig-recovery-diversion-shard", "Run one of four complete numbered diversion shards; shard 4 also runs both named routes");
+    if (diversion_shard) |shard|
+        recovery_diversions.addArgs(&.{ "--shard", shard });
     b.step("test-native-recovery-zig-diversions", "Run counted real-process diversion crash/recovery cases against pinned dpkg")
         .dependOn(&recovery_diversions.step);
 
@@ -1510,7 +1513,8 @@ pub fn build(b: *std.Build) void {
         if (enabled) selected += 1;
     }
     const focused = zig_core_only or zig_deadline_only or family_executed_only or
-        parity_case != null or bootstrap_case != null or repository_case != null or diversion_case != null or mutation_boundary_case != null;
+        parity_case != null or bootstrap_case != null or repository_case != null or
+        diversion_case != null or route_case != null or diversion_shard != null or mutation_boundary_case != null;
     if (selected > 1 or focused) {
         const invalid = b.addFail(if (selected > 1)
             "native recovery workload selectors are mutually exclusive"
