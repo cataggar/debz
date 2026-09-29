@@ -3413,6 +3413,14 @@ fn openWork(
         }
         configured_version = switch (record.status.current) {
             .installed, .triggers_awaited, .triggers_pending => record.version,
+            .config_files => if (lifecycleConfiguredVersion(record.*)) |version| version else blk: {
+                try builder.deferFeature(.{
+                    .feature = .config_version,
+                    .package = identity.name,
+                    .architecture = identity.architecture,
+                });
+                break :blk null;
+            },
             .unpacked => switch (configVersionField(record.*)) {
                 .absent => null,
                 .valid => |value| value,
@@ -14606,7 +14614,15 @@ fn lifecycleConfiguredVersion(
     record: package_database.PackageRecord,
 ) ?[]const u8 {
     return switch (record.status.current) {
-        .installed, .triggers_awaited, .triggers_pending, .config_files => record.version,
+        .installed, .triggers_awaited, .triggers_pending => record.version,
+        .config_files => if ((record.status.want == .deinstall or record.status.want == .install) and
+            record.status.error_state == .ok)
+            switch (configVersionField(record)) {
+                .valid => |value| if (std.mem.eql(u8, value, record.version)) value else null,
+                .absent, .invalid => null,
+            }
+        else
+            null,
         .unpacked, .half_configured => switch (configVersionField(record)) {
             .valid => |value| value,
             .absent, .invalid => null,

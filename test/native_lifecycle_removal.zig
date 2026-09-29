@@ -160,7 +160,7 @@ fn retryProofGuards(case: *support.Scenario, selected: []const foundation.Packag
     try support.fixtureFile(case.fixture, conffile, "edited configuration\n", 0o644);
 }
 
-fn removedReinstallBlock(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
+fn removedReinstallParity(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
     var case = try support.Scenario.init(fixture, "removal-config-files-same-version-reinstall", driver, dpkg, arch, false);
     defer case.deinit();
     const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
@@ -171,52 +171,225 @@ fn removedReinstallBlock(fixture: *foundation.Fixture, driver: []const u8, dpkg:
         .{ .kind = "postrm", .args = &.{"remove"} },
     });
     try expectStatus(&case, "Status: deinstall ok config-files");
-    const input: support.Phase = .{ .operation = "reinstall", .archives = &.{first}, .packages = &selected };
+    try expectFile(&case, configuration, "administrator configuration\n");
+    try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".list", "/" ++ configuration ++ "\n");
+    try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".postrm", name ++ "@1:postrm");
+    try phase(&case, .{ .operation = "reinstall", .archives = &.{first}, .packages = &selected }, false, &.{
+        .{ .kind = "preinst", .args = &.{ "install", "1", "1" } },
+        .{ .kind = "postinst", .args = &.{ "configure", "1" }, .payload = "data version 1" },
+    });
+    try expectStatus(&case, "Status: install ok installed");
+    try expectFile(&case, configuration, "administrator configuration\n");
+    try expectFile(&case, "usr/share/" ++ name ++ "/data", "data version 1\n");
+    try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".list", "/usr/share/" ++ name ++ "/data\n");
+    for (support.kinds) |kind| {
+        const member = try std.fmt.allocPrint(fixture.allocator, "var/lib/dpkg/info/{s}.{s}", .{ name, kind });
+        defer fixture.allocator.free(member);
+        const signature = try std.fmt.allocPrint(fixture.allocator, "{s}@1:{s}", .{ name, kind });
+        defer fixture.allocator.free(signature);
+        try expectInfoContains(&case, member, signature);
+    }
+}
+
+fn removedReinstallPreinstFailure(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
+    var case = try support.Scenario.init(fixture, "removal-config-files-reinstall-preinst-failure", driver, dpkg, arch, false);
+    defer case.deinit();
+    const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    try case.seed(first);
+    try bothFile(&case, configuration, "administrator configuration\n");
+    try case.phase(.{ .operation = "remove", .packages = &selected }, false);
+    try expectStatus(&case, "Status: deinstall ok config-files");
+    try bothFile(&case, support.failure, name ++ "@1:preinst:install\n");
+    const failure_index = case.index;
+    try phase(&case, .{ .operation = "reinstall", .archives = &.{first}, .packages = &selected }, true, &.{
+        .{ .kind = "preinst", .args = &.{ "install", "1", "1" } },
+        .{ .kind = "postrm", .args = &.{ "abort-install", "1", "1" } },
+    });
+    try expectScriptFailure(&case, failure_index, "reinstall", "preinst");
+    try expectStatus(&case, "Status: install ok config-files");
+    try expectFile(&case, configuration, "administrator configuration\n");
+    try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".list", "/" ++ configuration ++ "\n");
+    try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".postrm", name ++ "@1:postrm");
+    try bothFile(&case, support.failure, null);
+    try phase(&case, .{ .operation = "reinstall", .archives = &.{first}, .packages = &selected }, false, &.{
+        .{ .kind = "preinst", .args = &.{ "install", "1", "1" } },
+        .{ .kind = "postinst", .args = &.{ "configure", "1" }, .payload = "data version 1" },
+    });
+    try expectStatus(&case, "Status: install ok installed");
+    try expectFile(&case, configuration, "administrator configuration\n");
+}
+
+fn removedReinstallInterrupted(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
+    var case = try support.Scenario.init(fixture, "removal-config-files-reinstall-unknown-preinst", driver, dpkg, arch, false);
+    defer case.deinit();
+    const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    try case.seed(first);
+    try bothFile(&case, configuration, "administrator configuration\n");
+    try case.phase(.{ .operation = "remove", .packages = &selected }, false);
+    try expectStatus(&case, "Status: deinstall ok config-files");
     if (fixture.oracle_only) {
-        try case.phase(input, false);
+        try case.phase(.{ .operation = "reinstall", .archives = &.{first}, .packages = &selected }, false);
         return;
     }
-    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
-    defer fixture.allocator.free(before);
-    const earlier = try trace(&case);
-    defer fixture.allocator.free(earlier);
-    const destination = try support.path(fixture.allocator, case.name, "reinstall-removed");
+    const old_trace = try trace(&case);
+    defer fixture.allocator.free(old_trace);
+    const destination = try support.path(fixture.allocator, case.name, "interrupted");
     defer fixture.allocator.free(destination);
     try fixture.directory(destination);
-    if (try support.reference(fixture, dpkg, case.reference_root, input, destination) != 0)
-        return error.UnexpectedRemovedReinstallReference;
-    const installed = try trace(&case);
-    defer fixture.allocator.free(installed);
-    if (!std.mem.startsWith(u8, installed, earlier) or
-        std.mem.indexOf(u8, installed[earlier.len..], name ++ "@1:preinst\t") == null or
-        std.mem.indexOf(u8, installed[earlier.len..], name ++ "@1:postinst\t") == null)
-        return error.ReferenceDidNotReinstallRemovedPackage;
-    const status_path = try relative(&case, "reference", "var/lib/dpkg/status");
-    defer fixture.allocator.free(status_path);
-    const reference_status = try support.read(fixture, status_path, 1024 * 1024);
-    defer fixture.allocator.free(reference_status);
-    if (std.mem.indexOf(u8, reference_status, "Status: install ok installed") == null)
-        return error.ReferenceDidNotReinstallRemovedPackage;
-    var result = try support.native(fixture, driver, case.native_root, arch, input, destination);
-    defer result.deinit();
-    if (!std.mem.eql(u8, result.value.outcome, "refused") or
-        !std.mem.eql(u8, result.value.detail, "program_compile_rejected"))
-        return error.UnexpectedRemovedReinstallOutcome;
-    const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
-    defer fixture.allocator.free(after);
-    if (!std.mem.eql(u8, before, after)) return error.RemovedReinstallChangedNativeRoot;
-    try support.assertNoActiveEvidence(fixture, case.native_root);
-    const retained_status_path = try relative(&case, "native", "var/lib/dpkg/status");
-    defer fixture.allocator.free(retained_status_path);
-    const retained_status = try support.read(fixture, retained_status_path, 1024 * 1024);
-    defer fixture.allocator.free(retained_status);
-    if (std.mem.indexOf(u8, retained_status, "Status: deinstall ok config-files") == null)
-        return error.RemovedReinstallLostResidualStatus;
+    var report = try support.native(fixture, driver, case.native_root, arch, .{
+        .operation = "reinstall",
+        .archives = &.{first},
+        .packages = &selected,
+        .fault = "after_script_before_record",
+    }, destination);
+    defer report.deinit();
+    if (!std.mem.eql(u8, report.value.outcome, "recovery_required"))
+        return error.RemovedReinstallUnknownOutcomeAccepted;
+    const operation_path = try relative(&case, "native", "var/lib/debz/root-operation-v1.json");
+    defer fixture.allocator.free(operation_path);
+    const script_path = try relative(&case, "native", "var/lib/debz/native-lifecycle-script-v1.json");
+    defer fixture.allocator.free(script_path);
+    const operation_bytes = try support.read(fixture, operation_path, 1024 * 1024);
+    defer fixture.allocator.free(operation_bytes);
+    const script_bytes = try support.read(fixture, script_path, 1024 * 1024);
+    defer fixture.allocator.free(script_bytes);
+    const Operation = struct {
+        state: []const u8,
+        phase: []const u8,
+        mutation_started: bool,
+        program_sha256: []const u8,
+        install_root: []const u8,
+    };
+    const Script = struct {
+        program_sha256: []const u8,
+        package: []const u8,
+        version: []const u8,
+        kind: []const u8,
+        source: []const u8,
+        script_sha256: []const u8,
+        arguments: []const []const u8,
+        outcome: []const u8,
+        exit_code: ?u8,
+    };
+    const operation = try std.json.parseFromSlice(Operation, fixture.allocator, operation_bytes, .{ .ignore_unknown_fields = true });
+    defer operation.deinit();
+    const script = try std.json.parseFromSlice(Script, fixture.allocator, script_bytes, .{ .ignore_unknown_fields = true });
+    defer script.deinit();
+    const source = "packages/removal/" ++ name ++ "_1_data.source/DEBIAN/preinst";
+    const source_bytes = try support.read(fixture, source, 64 * 1024);
+    defer fixture.allocator.free(source_bytes);
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_bytes, &hash, .{});
+    if (!std.mem.eql(u8, operation.value.state, "recovery_required") or
+        !std.mem.eql(u8, operation.value.phase, "script") or
+        !operation.value.mutation_started or
+        !std.mem.eql(u8, operation.value.install_root, case.native_root) or
+        !std.mem.eql(u8, report.value.program_sha256 orelse "", operation.value.program_sha256) or
+        !std.mem.eql(u8, script.value.program_sha256, operation.value.program_sha256) or
+        !std.mem.eql(u8, script.value.package, name) or
+        !std.mem.eql(u8, script.value.version, "1") or
+        !std.mem.eql(u8, script.value.kind, "preinst") or
+        !std.mem.eql(u8, script.value.source, "new_package") or
+        !std.mem.eql(u8, script.value.script_sha256, &std.fmt.bytesToHex(hash, .lower)) or
+        script.value.arguments.len != 3 or
+        !std.mem.eql(u8, script.value.arguments[0], "install") or
+        !std.mem.eql(u8, script.value.arguments[1], "1") or
+        !std.mem.eql(u8, script.value.arguments[2], "1") or
+        !std.mem.eql(u8, script.value.outcome, "in_flight") or script.value.exit_code != null)
+        return error.InvalidRemovedReinstallRecoveryBinding;
+    const observed_path = try relative(&case, "native", support.trace);
+    defer fixture.allocator.free(observed_path);
+    const observed = try support.read(fixture, observed_path, 64 * 1024);
+    defer fixture.allocator.free(observed);
+    const expected = try std.fmt.allocPrint(fixture.allocator, "{s}{s}@1:preinst\t{s}\tpreinst\t{s}\t3\t7:install\t1:1\t1:1\tpayload=<absent>\n", .{
+        old_trace, name, name, arch,
+    });
+    defer fixture.allocator.free(expected);
+    if (!std.mem.eql(u8, observed, expected))
+        return error.RemovedReinstallScriptReplayed;
+    try expectStatus(&case, "Status: deinstall ok config-files");
     try expectFile(&case, configuration, "administrator configuration\n");
-    const reference = try foundation.capture(fixture.allocator, fixture.io, case.reference_root);
-    defer fixture.allocator.free(reference);
-    if (std.mem.eql(u8, reference, after)) return error.RemovedReinstallAccidentallyMatched;
-    std.debug.print("{s}/reinstall: dpkg exit 0, native refused before mutation (not parity)\n", .{case.name});
+    try expectInfoContains(&case, "var/lib/dpkg/info/" ++ name ++ ".postrm", name ++ "@1:postrm");
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    for ([_][]const u8{ "reinstall", "recover", "purge" }) |operation_name| {
+        const next = try support.path(fixture.allocator, case.name, operation_name);
+        defer fixture.allocator.free(next);
+        try fixture.directory(next);
+        var blocked = try support.native(fixture, driver, case.native_root, arch, .{
+            .operation = operation_name,
+            .archives = if (std.mem.eql(u8, operation_name, "reinstall")) &.{first} else &.{},
+            .packages = if (std.mem.eql(u8, operation_name, "recover")) &.{} else &selected,
+            .recovery = std.mem.eql(u8, operation_name, "recover"),
+        }, next);
+        defer blocked.deinit();
+        if (!std.mem.eql(u8, blocked.value.outcome, "recovery_required"))
+            return error.RemovedReinstallUnknownAllowedReplay;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        const operation_after = try support.read(fixture, operation_path, 1024 * 1024);
+        defer fixture.allocator.free(operation_after);
+        const script_after = try support.read(fixture, script_path, 1024 * 1024);
+        defer fixture.allocator.free(script_after);
+        if (!std.mem.eql(u8, before, after) or
+            !std.mem.eql(u8, operation_bytes, operation_after) or
+            !std.mem.eql(u8, script_bytes, script_after))
+            return error.RemovedReinstallUnknownChangedOwner;
+    }
+}
+
+fn removedReinstallRefusals(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8) !void {
+    if (fixture.oracle_only) return;
+    const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+    for ([_]struct {
+        label: []const u8,
+        original: []const u8,
+        replacement: []const u8,
+        outcome: []const u8,
+        detail: []const u8,
+    }{
+        .{ .label = "wrong-config-version", .original = "Config-Version: 1\n", .replacement = "Config-Version: 2\n", .outcome = "refused", .detail = "program_compile_rejected" },
+        .{ .label = "purge-selection", .original = "Status: deinstall ok config-files\n", .replacement = "Status: purge ok config-files\n", .outcome = "refused", .detail = "program_compile_rejected" },
+        .{ .label = "half-installed", .original = "Status: deinstall ok config-files\n", .replacement = "Status: install ok half-installed\n", .outcome = "refused", .detail = "program_compile_rejected" },
+    }) |entry| {
+        const label = try std.fmt.allocPrint(fixture.allocator, "removal-config-files-reinstall-{s}-refusal", .{entry.label});
+        defer fixture.allocator.free(label);
+        var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+        defer case.deinit();
+        try case.seed(first);
+        try bothFile(&case, configuration, "administrator configuration\n");
+        try case.phase(.{ .operation = "remove", .packages = &selected }, false);
+        const status_path = try relative(&case, "native", "var/lib/dpkg/status");
+        defer fixture.allocator.free(status_path);
+        const status = try support.read(fixture, status_path, 1024 * 1024);
+        defer fixture.allocator.free(status);
+        const at = std.mem.indexOf(u8, status, entry.original) orelse return error.MissingRemovedReinstallGuardInput;
+        const changed = try std.fmt.allocPrint(fixture.allocator, "{s}{s}{s}", .{
+            status[0..at], entry.replacement, status[at + entry.original.len ..],
+        });
+        defer fixture.allocator.free(changed);
+        try support.fixtureFile(fixture, status_path, changed, 0o644);
+        const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(before);
+        const destination = try support.path(fixture.allocator, label, "refusal");
+        defer fixture.allocator.free(destination);
+        try fixture.directory(destination);
+        var report = try support.native(fixture, driver, case.native_root, arch, .{
+            .operation = "reinstall",
+            .archives = &.{first},
+            .packages = &selected,
+        }, destination);
+        defer report.deinit();
+        if (!std.mem.eql(u8, report.value.outcome, entry.outcome) or
+            !std.mem.eql(u8, report.value.detail, entry.detail))
+            return error.RemovedReinstallGuardAccepted;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        if (!std.mem.eql(u8, before, after))
+            return error.RemovedReinstallGuardChangedOwner;
+        try support.assertNoActiveEvidence(fixture, case.native_root);
+        try expectFile(&case, configuration, "administrator configuration\n");
+    }
 }
 
 fn expectScriptFailure(case: *support.Scenario, index: usize, operation: []const u8, kind: []const u8) !void {
@@ -725,7 +898,10 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     });
     defer fixture.allocator.free(second);
     try residueAndReinstall(fixture, driver, dpkg, arch, first, second);
-    try removedReinstallBlock(fixture, driver, dpkg, arch, first);
+    try removedReinstallParity(fixture, driver, dpkg, arch, first);
+    try removedReinstallPreinstFailure(fixture, driver, dpkg, arch, first);
+    try removedReinstallInterrupted(fixture, driver, dpkg, arch, first);
+    try removedReinstallRefusals(fixture, driver, dpkg, arch, first);
     try failureAndRetry(fixture, driver, dpkg, arch, first);
     try interruptedPostrmRetry(fixture, driver, dpkg, arch, first);
     try recoverEarlyPostrmRetry(fixture, driver, dpkg, arch, first, false);
