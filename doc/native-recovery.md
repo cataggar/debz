@@ -1001,14 +1001,14 @@ These controlled negative mutations are private-root/oracle checks, not claims
 that the native runtime emitted a success report on a crash or attempted a
 rollback. This slice does not cover rollback-clock integration, consumer
 parity suites, family/repository transport, or every helper bootstrap seam.
-The required Zig core/repository CI shard runs this helper target alongside
-core, repository, rollback-clock and signed-parity Zig acceptance; a separate
-FAMILY shard runs signed workflow acceptance. Both use pinned dpkg on both
-architectures in Debug and ReleaseSafe. The core/repository shard creates
-`.tmp` as the runner user before its Zig unit tests or privileged fixtures
-run; the FAMILY shard also creates it before privileged fixtures. The
-standalone repository target orders workspace creation ahead of both its
-privileged acceptance process and unprivileged unit tests. This prepared
+The required Zig helper CI shard runs this target alongside bootstrap,
+rollback-clock and signed-parity Zig acceptance; independent core, repository
+and FAMILY shards run their corresponding acceptance. All use pinned dpkg on
+both architectures in Debug and ReleaseSafe. The core shard creates `.tmp`
+as the runner user before its Zig unit tests or privileged fixtures run;
+the repository, helper and FAMILY shards also create it before privileged
+fixtures. The standalone repository target orders workspace creation ahead
+of both its privileged acceptance process and unprivileged unit tests. This prepared
 branch exposes the complete public Zig aggregate and selectors; the
 published parent retains both Python gates until its pre-retirement matrix
 passes.
@@ -1205,7 +1205,7 @@ its generation/step on refusal and is not asserted byte-identical.
 This is executed coverage of all 20 cases in that **one Python method**,
 not the entire recovery suite. The fresh-helper selector now selects these
 Zig cases; the parent draft retains the Python gates pending its full matrix.
-The target runs in the required Zig core/repository shard on both architectures
+The target runs in the required Zig helper shard on both architectures
 in Debug and ReleaseSafe; the security audit rejects removal of either
 sharded command and detects a
 bootstrap-source digest-inventory mutation. It does not exercise #231's
@@ -1785,7 +1785,7 @@ path and an actual arbitrary in-namespace symlink, while the existing unit
 case exercises symlinks at both production document paths. This preserves
 the refusal boundary without mistaking a receipt evidence-file path test
 for a report-path test or claiming identical Python and Zig reader APIs.
-The standalone Zig unit target runs in both modes in the core/repository
+The standalone Zig unit target runs in both modes in the core
 CI shard; the public aggregate also includes it for local default and
 selector runs. The parent draft retains both Python gates until the
 complete pre-retirement matrix proves parity.
@@ -1969,12 +1969,18 @@ cases on both architectures and in both optimization modes.
 ### Recovery entry-point selector reconciliation (#215; Zig-only gate)
 
 This is an inventory of **executed processes**, not of unit tests or fixture
-constants. Each Zig target below is required by one of the three
+constants. Each Zig target below is required by one of the five
 `native-recovery-zig-*` CI shards in Debug and ReleaseSafe on amd64/arm64.
 The scenario shard, including its 100-case diversion matrix, has a 75-minute
-job limit to tolerate slow x64 runners; the core/repository and FAMILY shards
-retain 35-minute limits. The public aggregate offers the same default and
-focused selectors without
+job limit to tolerate slow x64 runners; the independent core (with units),
+repository, helper/bootstrap/parity/rollback and FAMILY shards each retain
+a 35-minute limit. On the canceled x64 #313 attempt, the combined core and
+repository selectors took 21.7 minutes after units; helper through Debug
+rollback-clock took another 10.9 minutes. Separate required jobs prevent
+those costs from accumulating toward a single 35-minute deadline without
+skipping ReleaseSafe rollback-clock. Both `Build and test` architecture checks
+require every shard to succeed, including on cancellation. The public
+aggregate offers the same default and focused selectors without
 duplicating the complete suite in CI. `-Dnative-reference-dpkg=...` selects pinned
 dpkg 1.22.22. "Executed" means that the named case reaches the driver or
 public binary in a disposable root; **partial** means that some Python
