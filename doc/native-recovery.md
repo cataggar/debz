@@ -330,6 +330,14 @@ obsolete intermediate states; managed-state verification still runs first.
 Absent-postinst handlers journal only their database transition, never a
 fabricated script outcome. Restart continues the remaining handler database
 phases without reusing completed phase identities.
+Deferred awaited removal follows the same rule: once the helper queue is
+incorporated, replay accounts for its completed database phase even though
+`Unincorp` is empty. The next phase publishes the independently derived
+receiver status, while a removed conffile-retaining source stays
+`config-files`. A verified already-published closure is not written again.
+If `postrm remove` returned before its outcome was recorded, the queue and
+script evidence remain owned under `recovery_required`; no script retry or
+terminal success is inferred from a zero exit observed outside the journal.
 
 Automatic file activations omit an interested package acting on its own
 files *before* their trigger-event journal is published. Other listeners
