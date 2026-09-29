@@ -1067,6 +1067,8 @@ pub const Runtime = struct {
     root: root_fs.Root,
     intent_sha256: Digest,
     crash: CrashController = .{},
+    mutation_crash: ?@import("root_mutation.zig").Boundary = null,
+    mutation_torn_tail_injected: bool = false,
     recovering: bool = false,
     recovered_phase_count: u64 = 0,
     staging_directory_initially_present: bool = false,

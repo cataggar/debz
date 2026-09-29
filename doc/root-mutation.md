@@ -293,6 +293,14 @@ Application of one step:
    comparison proved is bound in the very record that publishes the boundary,
    so the state and the inode it landed on become durable together.
 
+The `workspace_create` injection hook precedes the private workspace
+`ensureWorkspace` in preflight. On the first phase there is no root-mutation
+journal yet; a caller-owned native attempt may already have a durable
+execution intent. Recovery of a prepared native phase with no journal
+records a rolled-back phase before retrying it. A short, synced progress tail
+similarly replays only the complete prefix and reaches the distinct
+`progress_truncate` repair hook before the next append.
+
 ## Metadata order and privileged bits
 
 Applying metadata is three syscalls, and their order is part of the durable

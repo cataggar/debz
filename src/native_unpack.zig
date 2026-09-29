@@ -1357,6 +1357,32 @@ const CombinedMutationHooks = struct {
             try call(self.original.context, boundary, index);
         const runtime = self.runtime orelse return;
         const action = self.action orelse return;
+        if (runtime.mutation_crash) |selected_boundary| {
+            if (action.kind == (if (selected_boundary == .workspace_create)
+                native_recovery.ActionKind.database
+            else
+                native_recovery.ActionKind.filesystem))
+            {
+                if (selected_boundary == .workspace_create and boundary == .workspace_create) {
+                    const workspace = root_fs.Path.init(root_mutation.workspace_path) catch unreachable;
+                    if ((runtime.root.entryIfExists(workspace) catch return error.AccessDenied) != null)
+                        return error.AccessDenied;
+                }
+                if (selected_boundary == .progress_truncate and
+                    boundary == .progress_append and !runtime.mutation_torn_tail_injected)
+                {
+                    // A synced short append reaches the actual compare-and-set repair hook.
+                    const path = root_fs.Path.init(root_mutation.progress_path) catch unreachable;
+                    const entry = runtime.root.entry(path) catch return error.AccessDenied;
+                    if (entry.kind != .file or entry.size % root_mutation.progress_record_bytes != 0)
+                        return error.AccessDenied;
+                    runtime.root.appendAt(path, entry.size, "torn", true) catch return error.AccessDenied;
+                    runtime.mutation_torn_tail_injected = true;
+                }
+                if (selected_boundary == boundary)
+                    std.process.exit(native_recovery.crash_exit_code);
+            }
+        }
         const selected = runtime.crash.selected orelse return;
         if (self.publication_crash_point == .during_unpack_settlement and
             selected == .after_unpack_settlement_rollback and !self.settlement_failure_injected and
@@ -10844,12 +10870,19 @@ fn materializePlanned(
     const attempt = request.borrowed_attempt orelse &owned_attempt;
     defer if (owns_attempt) attempt.release();
 
+    var combined_hooks: CombinedMutationHooks = .{
+        .original = request.hooks,
+        .runtime = execution.recovery,
+        .action = execution.action,
+        .publication_crash_point = request.publication_crash_point,
+    };
     const preflight_result = root_mutation.preflight(
         allocator,
         request.root,
         .{
             .intents = lowered.intents.items[0..payload_end],
             .limits = request.mutation_limits,
+            .hooks = .{ .context = &combined_hooks, .beforeFn = CombinedMutationHooks.before },
         },
     ) catch |err| {
         if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
@@ -10887,12 +10920,6 @@ fn materializePlanned(
         if (execution.action) |action|
             try runtime.append(action, .prepared, .none, null);
     }
-    var combined_hooks: CombinedMutationHooks = .{
-        .original = request.hooks,
-        .runtime = execution.recovery,
-        .action = execution.action,
-        .publication_crash_point = request.publication_crash_point,
-    };
     if (if (request.split_unpack_settlement) null else lowered.first_deferred_removal) |path| {
         combined_hooks.deferred_removal_step = for (mutation_plan.steps) |step| {
             if ((step.kind == .remove_path or step.kind == .remove_directory) and std.mem.eql(u8, step.path, path))
@@ -11249,10 +11276,20 @@ fn executePhaseMaterialization(
     }
     const attempt = request.borrowed_attempt orelse &owned_attempt;
     defer if (owns_attempt) attempt.release();
+    var combined_hooks: CombinedMutationHooks = .{
+        .original = request.hooks,
+        .runtime = execution.recovery,
+        .action = execution.action,
+        .publication_crash_point = request.publication_crash_point,
+    };
     const preflight_result = root_mutation.preflight(
         allocator,
         request.root,
-        .{ .intents = intents, .limits = request.mutation_limits },
+        .{
+            .intents = intents,
+            .limits = request.mutation_limits,
+            .hooks = .{ .context = &combined_hooks, .beforeFn = CombinedMutationHooks.before },
+        },
     ) catch |err| {
         if (owns_attempt) try attempt.abandonIfPreMutation(allocator);
         return err;
@@ -11301,12 +11338,6 @@ fn executePhaseMaterialization(
                 );
         }
     }
-    var combined_hooks: CombinedMutationHooks = .{
-        .original = request.hooks,
-        .runtime = execution.recovery,
-        .action = execution.action,
-        .publication_crash_point = request.publication_crash_point,
-    };
     if (request.deferred_removal_path) |path| {
         combined_hooks.deferred_removal_step = for (mutation_plan.steps) |step| {
             if ((step.kind == .remove_path or step.kind == .remove_directory) and std.mem.eql(u8, step.path, path))
@@ -14490,6 +14521,7 @@ const ExternalLifecycleRequest = struct {
     defer_triggers: bool = false,
     recovery: bool = false,
     crash_at: ?native_recovery.CrashPoint = null,
+    root_mutation_crash: ?root_mutation.Boundary = null,
     caller_owned: bool = false,
     acknowledge_native: bool = false,
     core_product: bool = false,
@@ -25174,6 +25206,7 @@ fn prepareNativeRecovery(
         .root = root,
         .intent_sha256 = intent.digest_sha256,
         .crash = .{ .selected = external.crash_at },
+        .mutation_crash = external.root_mutation_crash,
         .staging_directory_initially_present = staging_directory_initially_present,
         .caller_owned = production_request != null,
         .helper_binding = helper_binding,
@@ -26029,6 +26062,9 @@ fn recoverNativeRootMutation(
             }
             return err;
         };
+        // No journal means this prepared action never published a root-mutation target.
+        if (pendingNativeMutationAction(initial_progress.document)) |action|
+            try runtime.append(action, .completed, .rolled_back, null);
         return true;
     };
     defer opened.deinit();
@@ -27094,6 +27130,8 @@ pub const Runtime = struct {
     /// production-validated before this hook is reached.
     pub const ExternalMechanics = struct {
         context: ?*anyopaque = null,
+        /// Selected only by the guarded lifecycle fixture, never persisted.
+        mutation_crash: ?root_mutation.Boundary = null,
         probe_helper_fn: ?*const fn (
             context: ?*anyopaque,
             allocator: std.mem.Allocator,
@@ -27797,10 +27835,12 @@ fn executePreparedNativeProgramWithHelper(
         compiled.authorization.authorization,
         program,
     );
+    var lifecycle_request = productionLifecycleRequest(request.execution(), crash_at);
+    lifecycle_request.root_mutation_crash = external_mechanics.mutation_crash;
     return executeLifecycleProgramWithRequest(
         allocator,
         root,
-        productionLifecycleRequest(request.execution(), crash_at),
+        lifecycle_request,
         compiled,
         archives.models,
         archives.bytes,
@@ -28894,10 +28934,12 @@ fn recoverPreparedNativeProgramWithHelper(
     try checkRuntimeBounds(bounds);
     if (attempt.record().mutation_started)
         try attempt.beginRecovery(allocator, attempt.record().phase);
+    var lifecycle_request = productionLifecycleRequest(request.execution(), crash_at);
+    lifecycle_request.root_mutation_crash = external_mechanics.mutation_crash;
     return executeLifecycleProgramWithRequest(
         allocator,
         root,
-        productionLifecycleRequest(request.execution(), crash_at),
+        lifecycle_request,
         &compiled,
         inputs.models,
         inputs.archive_bytes,
@@ -29353,6 +29395,7 @@ fn executeLifecycleProgramWithRequest(
             .root = root,
             .intent_sha256 = intent.digest_sha256,
             .crash = .{ .selected = external.crash_at },
+            .mutation_crash = external.root_mutation_crash,
             .recovering = true,
             .staging_directory_initially_present = intent.staging_directory_initially_present,
             .caller_owned = production_request != null,
@@ -32982,7 +33025,7 @@ fn callerOwnedLifecycleFixture(
                 &attempt,
                 deadline,
                 external.crash_at,
-                .{},
+                .{ .mutation_crash = external.root_mutation_crash },
             );
             defer report.deinit();
             break :block typedRuntimeFixtureResult(report);
@@ -33083,6 +33126,7 @@ fn callerOwnedLifecycleFixture(
             .archives = archive_bytes,
             .operation = std.meta.stringToEnum(native_recovery.Operation, @tagName(external.operation)).?,
             .deadline = deadline,
+            .external_mechanics = .{ .mutation_crash = external.root_mutation_crash },
         };
         var report = if (external.crash_at) |crash|
             try Runtime.executeWithCrash(allocator, request, crash)
@@ -33459,6 +33503,9 @@ test "native_unpack.test.lifecycle external fixture" {
         (external.acknowledge_native and (!external.caller_owned or external.operation != .recover)) or
         (external.core_product and (!external.caller_owned or !external.isolated_helper)) or
         (external.core_completion_crash != null and (!external.core_product or external.operation != .recover)) or
+        (external.root_mutation_crash != null and
+            (!external.caller_owned or !external.isolated_helper or
+                external.operation == .recover or external.crash_at != null)) or
         (external.deadline_after_ms != null and (!external.isolated_helper or external.core_product)) or
         (external.helper_bootstrap_expectation != null and
             (!external.caller_owned or !external.isolated_helper or

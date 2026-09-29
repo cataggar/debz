@@ -1406,6 +1406,29 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-recovery-zig-metadata", "Run eleven real retained-metadata crash/recovery cases")
         .dependOn(&metadata_recovery.step);
 
+    const mutation_boundaries_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_mutation_boundaries.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mutation_boundaries_module.addImport("debz", debz);
+    mutation_boundaries_module.addOptions("native_test_options", native_fixture_options);
+    const mutation_boundaries_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-mutation-boundaries",
+        .root_module = mutation_boundaries_module,
+    });
+    const mutation_boundaries = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    mutation_boundaries.addArtifactArg(mutation_boundaries_executable);
+    mutation_boundaries.addArtifactArg(native_lifecycle_tests);
+    const mutation_boundary_case = b.option([]const u8, "native-zig-recovery-mutation-boundary-case", "Run one named root-mutation journal/staging crash boundary");
+    if (mutation_boundary_case) |boundary|
+        mutation_boundaries.addArgs(&.{ "--case", boundary });
+    b.step("test-native-recovery-zig-mutation-boundaries", "Run thirteen real native root-mutation journal/staging crash boundaries")
+        .dependOn(&mutation_boundaries.step);
+
     const conffile_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_conffile.zig"),
         .target = target,
@@ -1466,7 +1489,7 @@ pub fn build(b: *std.Build) void {
         if (enabled) selected += 1;
     }
     const focused = zig_core_only or zig_deadline_only or family_executed_only or
-        parity_case != null or bootstrap_case != null or repository_case != null or diversion_case != null;
+        parity_case != null or bootstrap_case != null or repository_case != null or diversion_case != null or mutation_boundary_case != null;
     if (selected > 1 or focused) {
         const invalid = b.addFail(if (selected > 1)
             "native recovery workload selectors are mutually exclusive"
@@ -1499,13 +1522,13 @@ pub fn build(b: *std.Build) void {
             for ([_]*std.Build.Step.Run{
                 recovery_zig,        recovery_helper,       recovery_bootstrap, recovery_family,
                 recovery_diversions, statoverride_recovery, conffile_recovery,  metadata_recovery,
-                literal_recovery,
+                literal_recovery,    mutation_boundaries,
             }) |runner| native_recovery.dependOn(&runner.step);
         } else {
             for ([_]*std.Build.Step.Run{
                 recovery_zig,       recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
                 recovery_bootstrap, repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
-                literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions,
+                literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions, mutation_boundaries,
             }) |runner| native_recovery.dependOn(&runner.step);
         }
     }
@@ -1520,7 +1543,7 @@ pub fn build(b: *std.Build) void {
         for ([_]*std.Build.Step.Run{
             recovery_zig,       recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
             recovery_bootstrap, repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
-            literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions,
+            literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions, mutation_boundaries,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
     }
     if (b.option(

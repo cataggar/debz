@@ -2003,6 +2003,7 @@ pub const PlanResult = union(enum) {
 pub const PreflightRequest = struct {
     intents: []const Intent,
     limits: Limits = .{},
+    hooks: Hooks = .{},
 };
 
 const PathModel = struct {
@@ -2064,6 +2065,10 @@ pub fn preflight(
     request: PreflightRequest,
 ) Error!PlanResult {
     const store: Store = .{ .root = root, .limits = request.limits };
+    request.hooks.before(.workspace_create, ProgressRecord.no_index) catch |err| switch (err) {
+        error.SimulatedCrash => return error.SimulatedCrash,
+        else => return error.IoFailed,
+    };
     store.ensureWorkspace() catch return error.StoreFailed;
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
