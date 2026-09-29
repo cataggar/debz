@@ -28,6 +28,23 @@ GHR_ZIG_INSTALL = """\
       - name: Validate Zig version
         run: test "$(zig version)" = 0.16.0
 """
+CI_GHR_ZIG_JOBS = (
+    "install-action-native",
+    "download-action-cache",
+    "download-action-container-fixture",
+    "build-and-test-workload",
+    "native-recovery-zig-workflows",
+    "native-recovery-zig-repository",
+    "native-recovery-zig-helper",
+    "native-recovery-zig-family",
+    "native-recovery-zig-scenarios",
+    "security-audit",
+    "release-dry-run",
+    "fuzz",
+    "integration-required",
+    "integration-full",
+    "ubuntu-real-snapshot",
+)
 
 
 def require(pattern: str, message: str, text: str, flags: int = 0) -> None:
@@ -49,7 +66,7 @@ def audit_actions(text: str, workflow: pathlib.Path) -> None:
 
 def audit_zig_installation(ci: str, release: str) -> None:
     for label, text, expected_count in (
-        ("ci.yml", ci, 13),
+        ("ci.yml", ci, len(CI_GHR_ZIG_JOBS)),
         ("release.yml", release, 1),
     ):
         if "mlugg/setup-zig" in text or "use-cache:" in text:
@@ -59,6 +76,17 @@ def audit_zig_installation(ci: str, release: str) -> None:
             FAILURES.append(
                 f"{label}: expected {expected_count} exact verified ghr Zig install blocks, found {count}"
             )
+        if text.count("uses: cataggar/ghr/actions/install@") != expected_count:
+            FAILURES.append(f"{label}: unverified or duplicate ghr Zig installer use")
+    jobs = re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        ci.partition("\njobs:\n")[2],
+    )
+    installed = [
+        name for name, body in jobs for _ in range(body.count(GHR_ZIG_INSTALL))
+    ]
+    if len(jobs) != len({name for name, _ in jobs}) or sorted(installed) != sorted(CI_GHR_ZIG_JOBS):
+        FAILURES.append("ci.yml: exact verified ghr Zig installs must match the reviewed CI job inventory")
 
 
 def audit_setup_action(ci: str, release: str) -> None:

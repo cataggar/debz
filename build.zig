@@ -358,6 +358,7 @@ pub fn build(b: *std.Build) void {
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
+            "tools/test_release_workflow_policy.py",
         },
     );
     audit_step.dependOn(&audit_tests.step);
