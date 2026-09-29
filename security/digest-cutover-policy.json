@@ -41,15 +41,15 @@
       "sha512": "95e2922b133afc493d7f7c2e26961f493e8affc3c29a17f4b7ad710f90ba0f3623178c3fe4a17d57b54313ba8f0104d0332504ccb7ff4d2172bb0bb1e2437967"
     },
     "findings": {
-      "count": 21333,
+      "count": 21359,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 177,
         "raw_32_byte": 1197,
-        "sha256_token": 19662
+        "sha256_token": 19688
       },
-      "sha512": "b68aed22de644397a38af98decda7ba6409658d5f6444b47fd9724bd6d1f00994d494795a0de6a9ccd8615a7dd07f3141ee626d6ad4ba86a6e4241ee6b14cefb"
+      "sha512": "7eff1ad453a77de141758c3b640ae80214cbf0d029ddfcd4af9a95eba044b05e4235b6ee69b0978205718a8cdb60a56112c22a58b9fb2ca106f31c470d29a1e8"
     },
     "classifications": [
       {
@@ -154,29 +154,29 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs and python3 install-only invalid-name and redirected-tool witness, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded glib automatic file-trigger self-interest exclusion, failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12418,
+        "count": 12432,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
           "raw_32_byte": 1121,
-          "sha256_token": 11150
+          "sha256_token": 11164
         },
-        "sha512": "2df799df43739a02f97f6436898178ea1e59db1930687a2b65826f4c01b88662bf0383a086d826cad22d3f9b86bf10d180b266b9b2c83ff28740808aedccaff4"
+        "sha512": "26982303b0cec85bbcfc473633caefd2ba32f6e20919cdd604ba098d20630f65dc54e0440d73b6069b8681a056c9ccee3d09a895ab97ab473e29ff1a605e9165"
       },
       {
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 843,
+        "count": 855,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 6,
           "raw_32_byte": 71,
-          "sha256_token": 762
+          "sha256_token": 774
         },
-        "sha512": "9a048f4927444d707f7f734d8a9b288cd93c21860fc94aab94537588bd1c8e63770b9a19e5b30927bf1314d344ea8a8c32ac5033c942e104b89f6182ddc240a6"
+        "sha512": "0905abceacf674403483801a08643261e0dfc930b5f078d9fe4f2159c08335030cc6e274548ffe4a47707a88588dbe7e83031b1f0fe22fe461b926dc87a4535c"
       },
       {
         "scope": "tools",
