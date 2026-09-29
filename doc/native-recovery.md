@@ -1217,6 +1217,16 @@ completed publication and removal progress and verifies its installed config
 against the authenticated archive; it neither restages nor removes a later
 package's slot. A not-yet-cleared step still requires its own exact staged
 config; missing, foreign or changed bytes/mode/ownership remain refusals.
+When a completed bootstrap config-staging checkpoint is the latest stable
+managed state and no mutation journal is active, recovery verifies its
+program-bound staged slot before attempting to retain refusal provenance.
+A missing slot reports `recovery_required/staged_config_missing`; changed
+bytes, mode or owner report `recovery_required/staged_config_changed`. Missing
+retained archive evidence still reports `FileNotFound`, while an active forged
+mutation journal is checked by journal recovery (`AttemptMismatch`), not
+reclassified as slot drift. None of these refusals replays or clears the
+changed root.
+
 This serialization does not move or invoke config scripts or change configure
 callback ordering.
 
@@ -1958,7 +1968,7 @@ before retiring the Python entry points from the required gate.
 | `exercise_projection`: one read-only root with *both* `native_transaction_result.test.projected root external fixture` and `apt_system_orchestrator.test.projected native dispatch external fixture` | `test-native-recovery-zig-family`, `readOnlyProjection`: private PID/mount child runs the **actual test executable** with `DEBZ_NATIVE_PROJECTION_FIXTURE=1`, requires both named tests to report OK, byte-identical root evidence, empty lock and no leaked projection mount. The three signed projected workflows are separate cases, not proxies for this row. | Executed: 1/1. |
 | `exercise_repository_projection`: scoped caller preparation/adoption and cleanup | `test-native-recovery-zig-repository`, `projectionCase`: real private projected root, exact completion marker, lock-only namespace, absence of installed list and unchanged held bytes. | Executed: 1/1. |
 | `exercise_repository_execution`: execution `{success,known_failure,interrupted,missing_helper,unchanged,diagnostic,expired}`; resume `{success,known_failure,interrupted,unchanged}`; held unchanged `{refresh,no-refresh}`; dispatch `{success,no_refresh,unchanged,unchanged_no_refresh,known_failure,interrupted,completion_interrupted,locked_interrupted,scope_lost,refresh_failure,expired}` | `test-native-recovery-zig-repository`, `executionCase` (11), `unchangedCases` (2), `dispatchCases` (11): real private projected caller/backend children and original-input eviction. The six terminal execution/resume receipts now validate original locked checkpoint against typed final checkpoint, managed files against typed manifest and live bytes, caller completion record/generation and independently recomputed discharge, byte-identical private-mode completion copies, retained-document and actual database digests, exactly two source-bound script outcomes and isolated helper invocations, helper bytes/inode, and resumed caller/history identity (eight original inode/byte witnesses for success). Five nonterminal cases explicitly refuse all receipt/helper/repository artifacts and preserve the held path. Both no-receipt unchanged cases validate original vs publisher caller identity, checkpoint/manifest, held database, exact lock and descriptor archive/link digests; all eleven dispatch cases decode canonical result/checkpoint/provenance or unchanged evidence, hold state, non-success initial interruption, repeated result and unchanged helper identity. | Executed per named scenario and evidence shape: 11 + 2 + 11. The projected Zig fixture has its own pinned **amd64** target architecture even when the outer runner validates the pinned arm64 dpkg environment; do not mistake this synthetic projection for an arm64 dpkg differential. Aggregate runner. |
-| `exercise_fresh_helper_bootstrap`: recoverable `{after_execution_intent,during_filesystem_publication,during_database_publication,after_helper_source_prepared,during_helper_source_publication,after_helper_source_publication,after_helper_probe_prepared,after_helper_probe_outcome,after_helper_probe_completed,after_provenance}`; unknown `{after_helper_probe_in_flight,after_helper_probe_return_before_outcome}`; `ambient-target`, `ambient-source`; cleanup `{after_helper_cleanup_prepared,during_helper_cleanup,after_helper_cleanup_completed}`; scripted `{after_script_prepared,after_script_outcome,after_script_return_before_outcome}` | `test-native-recovery-zig-bootstrap`, explicit `recoverable`, `unknown_probe`, `cleanup`, `script_known` loops and `blocked` script case: real package-owned helper bootstrap, exit 86, eviction, fresh recovery, pinned dpkg and two immutable refusals for unknown/ambient cases. Separate `configCase/configRefusal` add seven dual-config crash windows and four refusal windows; see the [#267 transition inventory](#native-crash-transition-inventory-267). | Executed: 20/20 migrated cases; 11 additional #267 cases. |
+| `exercise_fresh_helper_bootstrap`: recoverable `{after_execution_intent,during_filesystem_publication,during_database_publication,after_helper_source_prepared,during_helper_source_publication,after_helper_source_publication,after_helper_probe_prepared,after_helper_probe_outcome,after_helper_probe_completed,after_provenance}`; unknown `{after_helper_probe_in_flight,after_helper_probe_return_before_outcome}`; `ambient-target`, `ambient-source`; cleanup `{after_helper_cleanup_prepared,during_helper_cleanup,after_helper_cleanup_completed}`; scripted `{after_script_prepared,after_script_outcome,after_script_return_before_outcome}` | `test-native-recovery-zig-bootstrap`, explicit `recoverable`, `unknown_probe`, `cleanup`, `script_known` loops and `blocked` script case: real package-owned helper bootstrap, exit 86, eviction, fresh recovery, pinned dpkg and two immutable refusals for unknown/ambient cases. Separate `configCase/configRefusal` add seven dual-config crash windows and eight refusal windows; see the [#267 transition inventory](#native-crash-transition-inventory-267). | Executed: 20/20 migrated cases; 11 #267 cases plus four #296 refusal cases. |
 
 **Repository architecture scope:** Python `exercise_repository_projection`
 and `exercise_repository_execution` create the outer private root with the
@@ -2110,14 +2120,19 @@ complete final root with a three-phase pinned-dpkg reference, repeats recovery
 without mutation, refuses purge **again** before acknowledgment, then checks
 the success receipt survives explicit acknowledgment and the terminal
 completion binds the original attempt. `config-changed-slot`,
-`config-corrupt-journal`, and `config-forged-journal` fail closed on two
-repeated recoveries and a new purge: exact current details are respectively
-`FileNotFound`, `JournalCorrupt`, and `AttemptMismatch`. The forged journal is
-canonical and digest-resealed with a different attempt owner, not merely
-invalid JSON; none of these refusals changes package state or clears the
-original owner. The changed-slot detail
-is a typed durable refusal but **not** a config-specific diagnostic; do not
-claim that it proves phase-specific diagnostics (#296). `config-unknown-script`
+`config-missing-slot`, `config-wrong-mode`, and `config-wrong-owner` each
+crash after the first config stage; they report respectively
+`staged_config_changed`, `staged_config_missing`, `staged_config_changed`,
+and `staged_config_changed` on two repeated recoveries. The classifier
+requires the original program-bound archive and the completed config-stage
+progress/checkpoint, and runs only after recovery finds no active mutation
+journal. A genuinely missing retained archive remains `FileNotFound`.
+`config-corrupt-journal` and `config-forged-journal` retain `JournalCorrupt`
+and `AttemptMismatch` instead of being reported as config drift. The forged
+journal is canonical and digest-resealed with a different attempt owner, not
+merely invalid JSON. All eight refusal fixtures preserve original attempt,
+lock, authorization, program and intent evidence and block a new purge;
+none replays or clears the original root. `config-unknown-script`
 executes a postinst once, crashes before its outcome, returns
 `recovery_required/script_outcome_unknown` twice without replay, and blocks
 purge. The verifier fix chooses helper filesystem substep 1 when the same
@@ -2125,14 +2140,17 @@ bootstrap owner's config-staging database substep 0 exists (otherwise 0);
 without it the unknown-script refusal was masked as
 `native_helper_evidence_invalid`.
 
-**Observed gate (arm64, pinned dpkg 1.22.22):** the 58-row inventory was
-checked against executable Zig selectors; the 31 bootstrap cases (20
-existing + seven `config-*` transition cases + four refusal cases) passed
-in both Debug and ReleaseSafe. In both modes the command
+**Observed #267 gate (arm64, pinned dpkg 1.22.22):** the 58-row inventory was
+checked against executable Zig selectors; its 31 bootstrap cases (20
+existing + seven `config-*` transition cases + four original refusal cases)
+passed in both Debug and ReleaseSafe. In both modes the command
 `zig build test-native-recovery-zig-unit test-native-recovery-helper-zig
 test-native-recovery-zig-bootstrap -Dnative-reference-dpkg=/absolute/pinned/dpkg
 -j2` passed; the focused bootstrap target was also run separately in both
-modes. A green unit/helper/bootstrap gate does **not** close #293–#296 or
+modes. The #296 gate includes four additional config refusal controls
+(missing slot, wrong mode, wrong owner and missing retained archive), for
+35 bootstrap cases in the same Debug and ReleaseSafe unit/helper/bootstrap
+command. A green unit/helper/bootstrap gate does **not** close #293–#295 or
 discharge the full #86 crash-coverage acceptance.
 
 **Other journal boundaries, not discharged by the 56 selectors.** The native

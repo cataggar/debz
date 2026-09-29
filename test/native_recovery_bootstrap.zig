@@ -680,7 +680,40 @@ fn configCase(
     std.debug.print("{s}: real config transition exit 86, owned recovery, receipt and dpkg parity passed\n", .{name});
 }
 
-const ConfigRefusal = enum { changed_slot, corrupt_journal, forged_journal, unknown_script };
+const ConfigRefusal = enum {
+    changed_slot,
+    missing_slot,
+    wrong_mode,
+    wrong_owner,
+    missing_artifact,
+    corrupt_journal,
+    forged_journal,
+    unknown_script,
+};
+
+fn configRefusalName(reason: ConfigRefusal) []const u8 {
+    return switch (reason) {
+        .changed_slot => "config-changed-slot",
+        .missing_slot => "config-missing-slot",
+        .wrong_mode => "config-wrong-mode",
+        .wrong_owner => "config-wrong-owner",
+        .missing_artifact => "config-missing-artifact",
+        .corrupt_journal => "config-corrupt-journal",
+        .forged_journal => "config-forged-journal",
+        .unknown_script => "config-unknown-script",
+    };
+}
+
+fn configRefusalDetail(reason: ConfigRefusal) []const u8 {
+    return switch (reason) {
+        .changed_slot, .wrong_mode, .wrong_owner => "staged_config_changed",
+        .missing_slot => "staged_config_missing",
+        .missing_artifact => "FileNotFound",
+        .corrupt_journal => "JournalCorrupt",
+        .forged_journal => "AttemptMismatch",
+        .unknown_script => "script_outcome_unknown",
+    };
+}
 
 fn forgeConfigJournal(fixture: *foundation.Fixture, root: []const u8) !void {
     const bytes = try read(fixture, root, debz.root_mutation.journal_path, debz.root_mutation.maximum_document_bytes);
@@ -710,12 +743,7 @@ fn configRefusal(
     arch: []const u8,
     reason: ConfigRefusal,
 ) !void {
-    const name = switch (reason) {
-        .changed_slot => "config-changed-slot",
-        .corrupt_journal => "config-corrupt-journal",
-        .forged_journal => "config-forged-journal",
-        .unknown_script => "config-unknown-script",
-    };
+    const name = configRefusalName(reason);
     const root_relative = try support.path(fixture.allocator, name, "native");
     const root = try fixture.makeRoot(root_relative, arch);
     try support.copyProgram(fixture, root_relative, "/bin/sh", "/bin/sh");
@@ -725,7 +753,7 @@ fn configRefusal(
     const archives = [_][]const u8{ first, second };
     const actions = configActions(arch);
     const boundary: []const u8 = switch (reason) {
-        .changed_slot => "after_bootstrap_config_stage",
+        .changed_slot, .missing_slot, .wrong_mode, .wrong_owner, .missing_artifact => "after_bootstrap_config_stage",
         .corrupt_journal, .forged_journal => "during_bootstrap_config_staging",
         .unknown_script => "after_script_return_before_outcome",
     };
@@ -738,6 +766,14 @@ fn configRefusal(
     var retained = try evidence(fixture, root);
     defer retained.deinit();
     const intent = try read(fixture, root, intent_path, 16 * 1024 * 1024);
+    const program_path = try support.path(fixture.allocator, debz.root_operation.namespace_path, retained.intent.intent.program_path);
+    const authorization_path = try support.path(fixture.allocator, debz.root_operation.namespace_path, retained.intent.intent.authorization_path);
+    const original_program = try read(fixture, root, program_path, 16 * 1024 * 1024);
+    const original_authorization = try read(fixture, root, authorization_path, 16 * 1024 * 1024);
+    const binding = retained.request.execution().program;
+    try equal(&binding.program_sha256, &retained.intent.intent.program_sha256);
+    try equal(&binding.authorization_sha256, &retained.intent.intent.authorization_sha256);
+    try equal(&binding.exact_lock_sha256, &retained.intent.intent.exact_lock_sha256);
     if (reason == .corrupt_journal or reason == .forged_journal or reason == .unknown_script)
         try absent(fixture, root, config_slot)
     else
@@ -749,6 +785,22 @@ fn configRefusal(
     try absent(fixture, root, config_marker);
     if (reason == .changed_slot)
         try fixture.write(try path(fixture, root, config_slot), "forged config\n", 0o755);
+    if (reason == .missing_slot)
+        try fixture.dir.deleteFile(fixture.io, try path(fixture, root, config_slot));
+    if (reason == .wrong_mode or reason == .wrong_owner) {
+        var guarded = try foundation.guardedRoot(fixture.io, root);
+        defer guarded.close(fixture.io);
+        try (debz.root_fs.Root.init(fixture.io, guarded)).applyMetadata(
+            try debz.root_fs.Path.init(config_slot),
+            if (reason == .wrong_mode) .{ .mode = 0o644 } else .{ .uid = 1234 },
+        );
+    }
+    if (reason == .missing_artifact) {
+        const artifact = for (retained.intent.intent.blobs) |blob| {
+            if (blob.kind == .artifact) break blob;
+        } else return error.MissingConfigRetainedArtifact;
+        try fixture.dir.deleteFile(fixture.io, try path(fixture, root, artifact.storage_path));
+    }
     if (reason == .corrupt_journal)
         try fixture.write(try path(fixture, root, debz.root_mutation.journal_path), "{\"forged\":true}\n", 0o600);
     if (reason == .forged_journal)
@@ -769,15 +821,12 @@ fn configRefusal(
         const destination = try std.fmt.allocPrint(fixture.allocator, "{s}/refused-{d}", .{ name, index });
         try expectReport(try invoke(fixture, driver, root, arch, destination, .{
             .operation = "recover",
-        }), "recovery_required", switch (reason) {
-            .changed_slot => "FileNotFound",
-            .corrupt_journal => "JournalCorrupt",
-            .forged_journal => "AttemptMismatch",
-            .unknown_script => "script_outcome_unknown",
-        });
+        }), "recovery_required", configRefusalDetail(reason));
         try unchanged(fixture, root, before);
         try equal(try configClaim(fixture, root), original_claim);
         try equal(try read(fixture, root, intent_path, 16 * 1024 * 1024), intent);
+        try equal(try read(fixture, root, program_path, 16 * 1024 * 1024), original_program);
+        try equal(try read(fixture, root, authorization_path, 16 * 1024 * 1024), original_authorization);
         try absent(fixture, root, completion_path);
         try absent(fixture, root, config_marker);
         if (reason == .unknown_script)
@@ -786,6 +835,19 @@ fn configRefusal(
         defer owner.deinit();
         try equal(try text(owner.value, "attempt_id"), &retained.intent.intent.attempt_id);
         try equal(try text(owner.value, "backend"), "native");
+        try equal(try text(owner.value, "surface"), "repository_bootstrap");
+        try equal(try text(owner.value, "operation"), "add");
+        try equal(try text(owner.value, "program_sha256"), &binding.program_sha256);
+        try equal(try text(owner.value, "authorization_sha256"), &binding.authorization_sha256);
+        const lock = owner.value.object.get("exact_lock") orelse return error.MissingBootstrapEvidence;
+        try equal(try text(lock, "digest_sha256"), &binding.exact_lock_sha256);
+        if (reason == .changed_slot or reason == .missing_slot or
+            reason == .wrong_mode or reason == .wrong_owner)
+        {
+            try equal(try text(owner.value, "state"), "recovery_required");
+            try equal(try text(owner.value, "phase"), "verification");
+            try absent(fixture, root, provenance_path);
+        }
     }
     const unowned = [_]foundation.PackageIdentity{.{ .name = "debz-unowned-second", .architecture = arch }};
     try expectReport(try invoke(fixture, driver, root, arch, try support.path(fixture.allocator, name, "blocked-purge"), .{
@@ -795,6 +857,8 @@ fn configRefusal(
     try unchanged(fixture, root, before);
     try equal(try configClaim(fixture, root), original_claim);
     try equal(try read(fixture, root, intent_path, 16 * 1024 * 1024), intent);
+    try equal(try read(fixture, root, program_path, 16 * 1024 * 1024), original_program);
+    try equal(try read(fixture, root, authorization_path, 16 * 1024 * 1024), original_authorization);
     try absent(fixture, root, completion_path);
     std.debug.print("{s}: real exit 86, repeated typed refusal and no new mutation passed\n", .{name});
 }
@@ -864,13 +928,11 @@ pub fn main(init: std.process.Init) !void {
         matched = true;
         try configCase(&fixture, driver, reference.executable, reference.architecture, boundary);
     }
-    for ([_]ConfigRefusal{ .changed_slot, .corrupt_journal, .forged_journal, .unknown_script }) |reason| {
-        const name = switch (reason) {
-            .changed_slot => "config-changed-slot",
-            .corrupt_journal => "config-corrupt-journal",
-            .forged_journal => "config-forged-journal",
-            .unknown_script => "config-unknown-script",
-        };
+    for ([_]ConfigRefusal{
+        .changed_slot,     .missing_slot,    .wrong_mode,     .wrong_owner,
+        .missing_artifact, .corrupt_journal, .forged_journal, .unknown_script,
+    }) |reason| {
+        const name = configRefusalName(reason);
         if (selected != null and !std.mem.eql(u8, selected.?, name)) continue;
         matched = true;
         try configRefusal(&fixture, driver, reference.architecture, reason);
