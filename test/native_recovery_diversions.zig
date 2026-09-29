@@ -4,6 +4,8 @@ const foundation = @import("native_test_foundation.zig");
 const lifecycle = @import("native_lifecycle_support.zig");
 const options = @import("native_test_options");
 const root_fs = @import("debz").root_fs;
+const native_recovery = debz.native_recovery;
+const route_settlement = debz.native_unpack_route_settlement;
 
 const package = "diversion-lifecycle";
 const base = "usr/share/" ++ package;
@@ -13,6 +15,7 @@ const intent_path = namespace ++ "native-execution-intent-v1.json";
 const completion_path = namespace ++ "root-operation-completion-v1.json";
 const proof_path = namespace ++ "native-transaction-provenance-v1.json";
 const diversion_cache = namespace ++ "native-diversion-cache-v1.json";
+const managed_state = namespace ++ "native-managed-state-v1.json";
 
 const Case = struct {
     number: u8,
@@ -122,6 +125,26 @@ const cases = [_]Case{
     .{ .number = 98, .operation = "upgrade", .crash = "after_unpack_payload", .mutation = "backup-postrm-payload-drift" },
     .{ .number = 99, .operation = "upgrade", .crash = "after_unpack_payload", .mutation = "backup-settlement-input-drift" },
     .{ .number = 100, .operation = "upgrade", .crash = "during_unpack_settlement", .mutation = "backup-postrm-directory-drift" },
+};
+
+const RouteCase = struct {
+    name: []const u8,
+    crash: []const u8,
+};
+
+const route_cases = [_]RouteCase{
+    .{ .name = "cache-refresh", .crash = "after_upgrade_postrm_cache_refresh" },
+    .{ .name = "route-checkpoint", .crash = "after_upgrade_postrm_route_checkpoint" },
+};
+
+const RouteDrift = enum {
+    none,
+    cache_changed,
+    cache_missing,
+    checkpoint_changed,
+    checkpoint_missing,
+    contract_changed,
+    contract_missing,
 };
 
 comptime {
@@ -350,6 +373,14 @@ fn invoke(f: *foundation.Fixture, driver: []const u8, root: []const u8, arch: []
 }
 
 fn invokeWithMode(f: *foundation.Fixture, driver: []const u8, root: []const u8, arch: []const u8, destination: []const u8, operation: []const u8, archive: ?[]const u8, crash: ?[]const u8, recovery_fault: bool) !?std.json.Parsed(Report) {
+    return invokeConfigured(f, driver, root, arch, destination, operation, archive, crash, recovery_fault, false, false);
+}
+
+fn invokeRoute(f: *foundation.Fixture, driver: []const u8, root: []const u8, arch: []const u8, destination: []const u8, operation: []const u8, archive: ?[]const u8, crash: ?[]const u8, acknowledge: bool) !?std.json.Parsed(Report) {
+    return invokeConfigured(f, driver, root, arch, destination, operation, archive, crash, false, true, acknowledge);
+}
+
+fn invokeConfigured(f: *foundation.Fixture, driver: []const u8, root: []const u8, arch: []const u8, destination: []const u8, operation: []const u8, archive: ?[]const u8, crash: ?[]const u8, recovery_fault: bool, caller_receipt: bool, acknowledge: bool) !?std.json.Parsed(Report) {
     var guarded = try foundation.guardedRoot(f.io, root);
     guarded.close(f.io);
     if (eq(operation, "recover") and (archive != null or (crash != null and !recovery_fault)))
@@ -381,7 +412,8 @@ fn invokeWithMode(f: *foundation.Fixture, driver: []const u8, root: []const u8, 
         .recovery = true,
         .caller_owned = true,
         .isolated_helper = true,
-        .core_product = !recovery_fault,
+        .core_product = !recovery_fault and !caller_receipt,
+        .acknowledge_native = acknowledge,
         .crash_at = crash,
     }, .{});
     defer f.allocator.free(payload);
@@ -789,6 +821,278 @@ fn runCase(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: [
     std.debug.print("{s}: exit-86, evicted archive, {s} recovery, pinned-dpkg parity and immutable replay\n", .{ name, result.value.outcome });
 }
 
+fn assertRouteOwner(f: *foundation.Fixture, root: []const u8, original: std.json.Value, intent: std.json.Value) !void {
+    var active = try document(f, root, operation_path);
+    defer active.deinit();
+    for ([_][]const u8{ "attempt_id", "request_sha256", "policy_sha256", "program_sha256" }) |key|
+        try same(try text(active.value, key), try text(original, key));
+    const lock = try field(active.value, "exact_lock");
+    const original_lock = try field(original, "exact_lock");
+    for ([_][]const u8{ "schema", "digest_sha256" }) |key|
+        try same(try text(lock, key), try text(original_lock, key));
+    const version = try field(lock, "version");
+    const original_version = try field(original_lock, "version");
+    if (version != .integer or original_version != .integer or version.integer != original_version.integer)
+        return error.ExactLockChanged;
+    var persisted = try document(f, root, intent_path);
+    defer persisted.deinit();
+    try same(try text(persisted.value, "digest_sha256"), try text(intent, "digest_sha256"));
+    try same(try text(persisted.value, "attempt_id"), try text(original, "attempt_id"));
+}
+
+fn rejectSecondMutation(f: *foundation.Fixture, driver: []const u8, root: []const u8, arch: []const u8, destination: []const u8, original: std.json.Value, intent: std.json.Value) !void {
+    const before = try foundation.capture(f.allocator, f.io, root);
+    defer f.allocator.free(before);
+    var blocked = try reportExpected(try invokeRoute(f, driver, root, arch, destination, "purge", null, null, false), "recovery_required");
+    defer blocked.deinit();
+    if (blocked.value.detail.len == 0) return error.UntypedSecondMutationRefusal;
+    const after = try foundation.capture(f.allocator, f.io, root);
+    defer f.allocator.free(after);
+    if (!eq(before, after)) return error.SecondMutationChangedRoot;
+    try assertRouteOwner(f, root, original, intent);
+}
+
+fn routeScenario(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, c: RouteCase, drift: RouteDrift) !void {
+    const name = try std.fmt.allocPrint(f.allocator, "route-{s}-{s}", .{ c.name, @tagName(drift) });
+    defer f.allocator.free(name);
+    var scenario = try lifecycle.Scenario.init(f, name, driver, dpkg, arch, true);
+    defer scenario.deinit();
+    const records = try diversionRecords(f, "distrib");
+    defer f.allocator.free(records);
+    const changed = try diversionRecords(f, "changed");
+    defer f.allocator.free(changed);
+    for ([_][]const u8{ scenario.reference_root, scenario.native_root }) |root| {
+        try seedRecord(f, root, "var/lib/dpkg/diversions", records);
+        try lifecycle.copyProgram(f, root[f.path.len + 1 ..], "/usr/bin/stat", "/backup-probe-stat");
+        try lifecycle.copyProgram(f, root[f.path.len + 1 ..], "/usr/bin/rm", "/backup-probe-rm");
+    }
+    const receiver = try lifecycle.makePackage(f, arch, "1", "diversion-receiver", name, .{
+        .declarations = "interest-noawait /usr/share/diversion-lifecycle\n",
+    });
+    try scenario.seed(receiver);
+    const target = try makeHelperPackage(f, arch, name, scenario.reference_root);
+    try scenario.seed(target);
+    const first = try makePackage(f, arch, name, "1", true, false);
+    try scenario.seed(first);
+    const second = try makePackage(f, arch, name, "2", true, false);
+    for ([_][]const u8{ scenario.reference_root, scenario.native_root }) |root| {
+        try lifecycle.copyProgram(f, root[f.path.len + 1 ..], "/bin/mv", "/diversion-mv");
+        try seedRecord(f, root, "diversion-postrm-replace", changed);
+    }
+    const destination = try lifecycle.path(f.allocator, name, "operation");
+    defer f.allocator.free(destination);
+    try f.directory(destination);
+    const phase: lifecycle.Phase = .{
+        .operation = "upgrade",
+        .archives = &.{second},
+        .packages = &.{.{ .name = package, .architecture = arch }},
+        .triggers = true,
+    };
+    if (try lifecycle.reference(f, dpkg, scenario.reference_root, phase, destination) != 0)
+        return error.UnexpectedReferenceOutcome;
+    const crash_dir = try lifecycle.path(f.allocator, name, "crash");
+    defer f.allocator.free(crash_dir);
+    _ = try invokeRoute(f, driver, scenario.native_root, arch, crash_dir, "upgrade", second, c.crash, false);
+    var original = try document(f, scenario.native_root, operation_path);
+    defer original.deinit();
+    var intent = try document(f, scenario.native_root, intent_path);
+    defer intent.deinit();
+    try same(try text(original.value, "backend"), "native");
+    try same(try text(original.value, "attempt_id"), try text(intent.value, "attempt_id"));
+    for ([_][]const u8{ "program_sha256", "authorization_sha256", "artifact_evidence_sha256" }) |key|
+        try same(try text(original.value, key), try text(intent.value, key));
+    try same(try text(try field(original.value, "exact_lock"), "digest_sha256"), try text(intent.value, "exact_lock_sha256"));
+    const intent_text = try text(intent.value, "digest_sha256");
+    if (intent_text.len != @sizeOf(native_recovery.Digest)) return error.InvalidRouteIntentDigest;
+    var intent_digest: native_recovery.Digest = undefined;
+    @memcpy(&intent_digest, intent_text);
+    if (native_recovery.parseDigest(intent_digest) == null) return error.InvalidRouteIntentDigest;
+    const route_path = try evidenceFile(f, scenario.native_root, "native-unpack-route-settlement-v1-");
+    defer f.allocator.free(route_path);
+    var route = try document(f, scenario.native_root, route_path);
+    defer route.deinit();
+    const step_value = try field(route.value, "program_step");
+    if (step_value != .integer or step_value.integer < 0 or step_value.integer > std.math.maxInt(u32))
+        return error.InvalidRouteProgramStep;
+    const step: u32 = @intCast(step_value.integer);
+    var route_buffer: [128]u8 = undefined;
+    try same(route_path, try native_recovery.unpackRouteSettlementPath(step, &route_buffer));
+    const unpack_path = try evidenceFile(f, scenario.native_root, "native-unpack-diversion-v1-");
+    defer f.allocator.free(unpack_path);
+    var unpack_buffer: [128]u8 = undefined;
+    try same(unpack_path, try native_recovery.unpackDiversionPath(step, &unpack_buffer));
+    const unpack_bytes = try read(f, scenario.native_root, unpack_path, 16 * 1024 * 1024);
+    defer f.allocator.free(unpack_bytes);
+    var unpack = try debz.native_unpack_diversion.decode(f.allocator, unpack_bytes, intent_digest, step);
+    defer unpack.deinit();
+    const route_bytes = try read(f, scenario.native_root, route_path, 16 * 1024 * 1024);
+    defer f.allocator.free(route_bytes);
+    var contract = try route_settlement.decode(f.allocator, route_bytes, intent_digest, step, unpack.digest_sha256);
+    defer contract.deinit();
+    const cache_bytes = try read(f, scenario.native_root, diversion_cache, 16 * 1024 * 1024);
+    defer f.allocator.free(cache_bytes);
+    var cache = try debz.native_diversion_cache.decode(f.allocator, cache_bytes, intent_digest);
+    defer cache.deinit();
+    try same(cache.cache.bytes orelse return error.MissingRefreshedRouteCache, changed);
+    const lowered = try route_settlement.lowerSuccess(f.allocator, contract.contract, &unpack, &cache);
+    var changed_route = false;
+    for (lowered.routes) |entry| {
+        if (entry.route_changed and std.mem.endsWith(u8, entry.post_script_route, "/mode.changed"))
+            changed_route = true;
+    }
+    if (!changed_route) return error.UpgradeDidNotChangeRoute;
+    const old_postrm = package ++ "@1:postrm\t";
+    const trace_before = try read(f, scenario.native_root, lifecycle.trace, 16 * 1024 * 1024);
+    defer f.allocator.free(trace_before);
+    if (std.mem.count(u8, trace_before, old_postrm) != 1)
+        return error.OldPostrmNotExecutedExactlyOnce;
+    try lifecycle.absent(f, try relative(f, scenario.native_root, "backup-before"));
+    var guard = try foundation.guardedRoot(f.io, scenario.native_root);
+    defer guard.close(f.io);
+    try route_settlement.validateBoundPaths(f.allocator, .init(f.io, guard), lowered.bound_paths);
+    const route_inode = (try rootEntry(f, scenario.native_root, route_path)).inode;
+    const unpack_inode = (try rootEntry(f, scenario.native_root, unpack_path)).inode;
+    var managed = try native_recovery.readManagedState(f.allocator, .init(f.io, guard));
+    defer managed.deinit();
+    if (!std.mem.eql(u8, &managed.document.intent_sha256, &intent_digest)) return error.UnboundManagedRouteCheckpoint;
+    const snapshot = managed.document.transient orelse managed.document.stable orelse
+        return error.MissingRouteCheckpoint;
+    const cache_hash = blk: {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(cache_bytes, &hash, .{});
+        break :blk native_recovery.hexDigest(hash);
+    };
+    const route_hash = blk: {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(route_bytes, &hash, .{});
+        break :blk native_recovery.hexDigest(hash);
+    };
+    var cache_entry: ?native_recovery.ManagedEntry = null;
+    var route_entry: ?native_recovery.ManagedEntry = null;
+    for (snapshot.entries) |entry| {
+        if (eq(entry.path, diversion_cache)) cache_entry = entry;
+        if (eq(entry.path, route_path)) route_entry = entry;
+    }
+    if (cache_entry == null or route_entry == null) return error.MissingRouteCheckpointEntry;
+    if (eq(c.name, "cache-refresh")) {
+        if (route_entry.?.kind != .absent or
+            (cache_entry.?.content_sha256 != null and std.mem.eql(u8, &cache_entry.?.content_sha256.?, &cache_hash)))
+            return error.CacheRefreshAlreadyCheckpointed;
+    } else {
+        if (managed.document.transient == null or snapshot.action.kind != .script or
+            snapshot.action.program_step != step + 1 or cache_entry.?.kind != .regular or
+            route_entry.?.kind != .regular or cache_entry.?.content_sha256 == null or
+            route_entry.?.content_sha256 == null or
+            !std.mem.eql(u8, &cache_entry.?.content_sha256.?, &cache_hash) or
+            !std.mem.eql(u8, &route_entry.?.content_sha256.?, &route_hash))
+            return error.RouteCheckpointNotDurable;
+        const last = managed.document.history[managed.document.history.len - 1];
+        if (!std.mem.eql(u8, &last.snapshot_sha256, &snapshot.digest_sha256) or
+            !std.meta.eql(last.action, snapshot.action) or !last.transient)
+            return error.RouteCheckpointHistoryChanged;
+    }
+    try f.dir.deleteFile(f.io, second[f.path.len + 1 ..]);
+    try f.dir.deleteFile(f.io, first[f.path.len + 1 ..]);
+    try lifecycle.absent(f, second[f.path.len + 1 ..]);
+    const blocked_dir = try lifecycle.path(f.allocator, name, "second-mutation");
+    defer f.allocator.free(blocked_dir);
+    try rejectSecondMutation(f, driver, scenario.native_root, arch, blocked_dir, original.value, intent.value);
+    switch (drift) {
+        .none => {},
+        .cache_changed => try mutate(f, scenario.native_root, "backup-postrm-cache-drift"),
+        .cache_missing => try mutate(f, scenario.native_root, "cache-missing-drift"),
+        .contract_changed => try mutate(f, scenario.native_root, "backup-postrm-route-drift"),
+        .contract_missing => try mutate(f, scenario.native_root, "backup-postrm-route-missing-drift"),
+        .checkpoint_changed, .checkpoint_missing => {
+            const path = try relative(f, scenario.native_root, managed_state);
+            defer f.allocator.free(path);
+            if (drift == .checkpoint_changed)
+                try f.write(path, "external managed checkpoint drift\n", 0o600)
+            else
+                try f.dir.deleteFile(f.io, path);
+        },
+    }
+    if (drift != .none) {
+        const changed_state = try foundation.capture(f.allocator, f.io, scenario.native_root);
+        defer f.allocator.free(changed_state);
+        var detail: ?[]const u8 = null;
+        for ([_][]const u8{ "refusal", "refusal-repeat" }) |label| {
+            const refusal_dir = try lifecycle.path(f.allocator, name, label);
+            defer f.allocator.free(refusal_dir);
+            var refused = try reportExpected(try invokeRoute(f, driver, scenario.native_root, arch, refusal_dir, "recover", null, null, false), "recovery_required");
+            defer refused.deinit();
+            if (refused.value.detail.len == 0) return error.UntypedRouteRefusal;
+            if (detail) |prior| try same(refused.value.detail, prior);
+            detail = try f.allocator.dupe(u8, refused.value.detail);
+            const after = try foundation.capture(f.allocator, f.io, scenario.native_root);
+            defer f.allocator.free(after);
+            if (!eq(changed_state, after)) return error.RouteRefusalMutatedRoot;
+            try assertRouteOwner(f, scenario.native_root, original.value, intent.value);
+        }
+        try lifecycle.absent(f, try relative(f, scenario.native_root, proof_path));
+        std.debug.print("{s}: exit 86, original owner, blocked second mutation, stable {s} refusal\n", .{ name, detail.? });
+        return;
+    }
+    const finish = try lifecycle.path(f.allocator, name, "fresh-recovery");
+    defer f.allocator.free(finish);
+    var recovered = try reportExpected(try invokeRoute(f, driver, scenario.native_root, arch, finish, "recover", null, null, false), "applied");
+    defer recovered.deinit();
+    try same(recovered.value.detail, "awaiting_caller_acknowledgment");
+    try assertRouteOwner(f, scenario.native_root, original.value, intent.value);
+    if ((try rootEntry(f, scenario.native_root, unpack_path)).inode != unpack_inode or
+        (try rootEntry(f, scenario.native_root, route_path)).inode != route_inode)
+        return error.RecoveryRepublishedRouteOrBackups;
+    const retained_unpack = try read(f, scenario.native_root, unpack_path, 16 * 1024 * 1024);
+    defer f.allocator.free(retained_unpack);
+    const retained_route = try read(f, scenario.native_root, route_path, 16 * 1024 * 1024);
+    defer f.allocator.free(retained_route);
+    try same(retained_unpack, unpack_bytes);
+    try same(retained_route, route_bytes);
+    const trace_after = try read(f, scenario.native_root, lifecycle.trace, 16 * 1024 * 1024);
+    defer f.allocator.free(trace_after);
+    if (!std.mem.startsWith(u8, trace_after, trace_before) or
+        std.mem.count(u8, trace_after, old_postrm) != 1)
+        return error.OldPostrmRepeatedDuringReplay;
+    const comparison = try lifecycle.path(f.allocator, name, "comparison");
+    defer f.allocator.free(comparison);
+    try f.directory(comparison);
+    try lifecycle.compare(f, scenario.reference_root, scenario.native_root, comparison, true);
+    const proof_before = try read(f, scenario.native_root, proof_path, 16 * 1024 * 1024);
+    defer f.allocator.free(proof_before);
+    const settled = try foundation.capture(f.allocator, f.io, scenario.native_root);
+    defer f.allocator.free(settled);
+    const repeat_dir = try lifecycle.path(f.allocator, name, "repeat");
+    defer f.allocator.free(repeat_dir);
+    var repeated = try reportExpected(try invokeRoute(f, driver, scenario.native_root, arch, repeat_dir, "recover", null, null, false), "applied");
+    defer repeated.deinit();
+    try assertRouteOwner(f, scenario.native_root, original.value, intent.value);
+    const repeat = try foundation.capture(f.allocator, f.io, scenario.native_root);
+    defer f.allocator.free(repeat);
+    if (!eq(settled, repeat)) return error.RepeatedRouteRecoveryChangedRoot;
+    const blocked_ack_dir = try lifecycle.path(f.allocator, name, "second-before-ack");
+    defer f.allocator.free(blocked_ack_dir);
+    try rejectSecondMutation(f, driver, scenario.native_root, arch, blocked_ack_dir, original.value, intent.value);
+    const ack_dir = try lifecycle.path(f.allocator, name, "ack");
+    defer f.allocator.free(ack_dir);
+    var acknowledged = try reportExpected(try invokeRoute(f, driver, scenario.native_root, arch, ack_dir, "recover", null, null, true), "applied");
+    defer acknowledged.deinit();
+    try same(acknowledged.value.attempt_id orelse return error.MissingReportBinding, try text(original.value, "attempt_id"));
+    try same(try read(f, scenario.native_root, proof_path, 16 * 1024 * 1024), proof_before);
+    try checkBinding(f, scenario.native_root, original.value, intent.value, acknowledged.value, false);
+    for ([_][]const u8{ operation_path, intent_path }) |path|
+        try lifecycle.absent(f, try relative(f, scenario.native_root, path));
+    std.debug.print("{s}: exit 86, owned replay, no postrm/backup repetition, pinned dpkg parity and acknowledged original receipt\n", .{name});
+}
+
+fn routeCase(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, c: RouteCase) !void {
+    for (std.enums.values(RouteDrift)) |drift| {
+        routeScenario(f, driver, dpkg, arch, c, drift) catch |err| {
+            std.debug.print("{s}/{s} failed: {s}\n", .{ c.name, @tagName(drift), @errorName(err) });
+            return err;
+        };
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     var args = init.minimal.args.iterate();
@@ -796,10 +1100,14 @@ pub fn main(init: std.process.Init) !void {
     const driver = args.next() orelse return error.MissingNativeDriver;
     var pinned: ?[]const u8 = null;
     var selected: ?u8 = null;
+    var selected_route: ?[]const u8 = null;
     while (args.next()) |option| {
         if (eq(option, "--case")) {
-            if (selected != null) return error.DuplicateCase;
+            if (selected != null or selected_route != null) return error.DuplicateCase;
             selected = try std.fmt.parseInt(u8, args.next() orelse return error.MissingCase, 10);
+        } else if (eq(option, "--route-case")) {
+            if (selected != null or selected_route != null) return error.DuplicateCase;
+            selected_route = args.next() orelse return error.MissingRouteCase;
         } else if (eq(option, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
             pinned = args.next() orelse return error.MissingPinnedDpkg;
@@ -813,6 +1121,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("host dpkg status changed: {s}\n", .{@errorName(err)});
     var executed: usize = 0;
     for (cases) |c| {
+        if (selected_route != null) continue;
         if (selected != null and selected.? != c.number) continue;
         runCase(&fixture, driver, reference.executable, reference.architecture, c) catch |err| {
             std.debug.print("Python diversion recovery case {d} failed: {s}\n", .{ c.number, @errorName(err) });
@@ -820,7 +1129,19 @@ pub fn main(init: std.process.Init) !void {
         };
         executed += 1;
     }
-    if (executed != (if (selected != null) @as(usize, 1) else cases.len)) return error.DiversionCaseAccountingMismatch;
+    if (executed != (if (selected_route != null) @as(usize, 0) else if (selected != null) @as(usize, 1) else cases.len))
+        return error.DiversionCaseAccountingMismatch;
+    var route_executed: usize = 0;
+    if (selected == null) for (route_cases) |c| {
+        if (selected_route != null and !eq(selected_route.?, c.name)) continue;
+        try routeCase(&fixture, driver, reference.executable, reference.architecture, c);
+        route_executed += 1;
+    };
+    if (route_executed != (if (selected != null) @as(usize, 0) else if (selected_route != null) @as(usize, 1) else route_cases.len))
+        return error.RouteCaseAccountingMismatch;
     try lifecycle.assertHostUnchanged(a, init.io, reference.before);
-    std.debug.print("diversion recovery: {d}/{d} declared real crash cases executed against pinned dpkg\n", .{ executed, if (selected != null) @as(usize, 1) else cases.len });
+    if (selected_route == null)
+        std.debug.print("diversion recovery: {d}/{d} declared real crash cases executed against pinned dpkg\n", .{ executed, if (selected != null) @as(usize, 1) else cases.len });
+    if (selected == null)
+        std.debug.print("route transition recovery: {d}/{d} named real crash cases executed against pinned dpkg\n", .{ route_executed, if (selected_route != null) @as(usize, 1) else route_cases.len });
 }
