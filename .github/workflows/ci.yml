@@ -898,7 +898,7 @@ jobs:
           test "$REUSED" -eq 0
 
   native-recovery-zig-workflows:
-    name: Native crash recovery Zig core and repository (${{ matrix.name }})
+    name: Native crash recovery Zig core (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     strategy:
@@ -942,14 +942,104 @@ jobs:
           mkdir -p .tmp
           zig build test-native-recovery-zig-unit -j2 --summary all
           zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all
-      - name: Exercise Zig core, repository, and helper recovery
+      - name: Exercise Zig core recovery
         run: |
           mkdir -p .tmp
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
           zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+
+  native-recovery-zig-repository:
+    name: Native crash recovery Zig repository (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux-x64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Install metadata decompression and signed fixture dependencies
+        run: |
+          if ! command -v pkg-config >/dev/null ||
+             ! pkg-config --exists liblzma libzstd ||
+             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/apt-mirrors.txt
+            fi
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+          fi
+      - name: Exercise Zig repository recovery
+        run: |
+          mkdir -p .tmp
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
           zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+
+  native-recovery-zig-helper:
+    name: Native crash recovery Zig helper, bootstrap, parity and rollback (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux-x64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Install metadata decompression and signed fixture dependencies
+        run: |
+          if ! command -v pkg-config >/dev/null ||
+             ! pkg-config --exists liblzma libzstd ||
+             ! /usr/bin/python3 -c 'import cryptography, jsonschema' >/dev/null 2>&1; then
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/apt-mirrors.txt
+            fi
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-cryptography python3-jsonschema
+          fi
+      - name: Exercise Zig helper, bootstrap, parity and rollback recovery
+        run: |
+          mkdir -p .tmp
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
           zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-helper-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery-zig-bootstrap -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
@@ -1194,7 +1284,7 @@ jobs:
 
   build-and-test:
     name: Build and test (${{ matrix.name }})
-    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]
+    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1207,11 +1297,15 @@ jobs:
         env:
           BUILD_RESULT: ${{ needs.build-and-test-workload.result }}
           RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}
+          RECOVERY_REPOSITORY_RESULT: ${{ needs.native-recovery-zig-repository.result }}
+          RECOVERY_HELPER_RESULT: ${{ needs.native-recovery-zig-helper.result }}
           RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}
           RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}
         run: |
           test "$BUILD_RESULT" = success
           test "$RECOVERY_WORKFLOWS_RESULT" = success
+          test "$RECOVERY_REPOSITORY_RESULT" = success
+          test "$RECOVERY_HELPER_RESULT" = success
           test "$RECOVERY_FAMILY_RESULT" = success
           test "$RECOVERY_SCENARIOS_RESULT" = success
 

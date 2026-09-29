@@ -37,8 +37,8 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 481,
-      "sha512": "58015be085ac88f701b0d62c94bb06874b88c8f177a3fb36c432d7cbf00e912cbe34a9f216417e2fc794ebda456306449e6db2bb908470f97ed371a9890b7a49"
+      "count": 482,
+      "sha512": "1f424af87716578e7046ee7efb9518dbc9d15b9fe474c101961fd4c41bdb1cb5c2a7a4389c98e6a76957535dd5dcb3a944d9616bbdf72a1b9fef788d5d5370ef"
     },
     "findings": {
       "count": 21547,
@@ -167,7 +167,7 @@
       {
         "scope": "test",
         "classification": "test_and_fixture_coverage",
-        "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
+        "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority. Recovery selector mutation controls protect both journal/staging and publication runners and their pinned dpkg handoffs.",
         "count": 961,
         "counts": {
           "cas_layout": 4,

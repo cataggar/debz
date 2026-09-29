@@ -98,8 +98,15 @@ test "security: commit-pinned composite actions reject floating refs" {
 }
 
 const ActionCandidateMutation = enum {
-    none, metadata, input, capability, bundle_capability, action_capability,
-    action_guard, bundle, handoff,
+    none,
+    metadata,
+    input,
+    capability,
+    bundle_capability,
+    action_capability,
+    action_guard,
+    bundle,
+    handoff,
 };
 
 fn actionCandidate(
@@ -180,7 +187,9 @@ test "security: both Actions rehearse native-only contracts without changing the
     defer f.deinit();
     for ([_][]const u8{ "download", "install" }) |action| {
         const baseline = try f.check("actions-native-only", try std.json.Stringify.valueAlloc(
-            f.arena.allocator(), .{ .action = action, .overrides = std.json.Value{ .object = .empty } }, .{},
+            f.arena.allocator(),
+            .{ .action = action, .overrides = std.json.Value{ .object = .empty } },
+            .{},
         ));
         defer baseline.deinit();
         try baseline.failsWith("action.yml: candidate transaction-backend default must be native");
@@ -385,7 +394,7 @@ test "security: required CI modes, architecture and aggregate failure propagatio
     for ([_]struct { original: []const u8, changed: []const u8, message: []const u8 }{
         .{ .original = "optimize: [Debug, ReleaseSafe]", .changed = "optimize: [Debug]", .message = "both optimization modes" },
         .{ .original = "name: [linux-x64, linux-arm64]", .changed = "name: [linux-x64]", .message = "both optimization modes" },
-        .{ .original = "needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]", .changed = "needs: [build-and-test-workload]", .message = "existing required build checks" },
+        .{ .original = "needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios]", .changed = "needs: [build-and-test-workload]", .message = "existing required build checks" },
         .{ .original = "zig build test-release -j2 --summary all", .changed = "echo skip release", .message = "Test release packaging must remain required" },
     }) |mutation| {
         const changed = try f.replace(workflow, mutation.original, mutation.changed);
@@ -442,14 +451,18 @@ test "security: all required CI workloads and optimized-mode selections fail clo
         try rejected.failsWith("ci.yml:");
     }
     const recovery = [_][]const u8{
-        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]",
+        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios]",
         "    if: ${{ always() }}",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
         "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
+        "          RECOVERY_REPOSITORY_RESULT: ${{ needs.native-recovery-zig-repository.result }}",
+        "          RECOVERY_HELPER_RESULT: ${{ needs.native-recovery-zig-helper.result }}",
         "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
         "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
         "          test \"$BUILD_RESULT\" = success",
         "          test \"$RECOVERY_WORKFLOWS_RESULT\" = success",
+        "          test \"$RECOVERY_REPOSITORY_RESULT\" = success",
+        "          test \"$RECOVERY_HELPER_RESULT\" = success",
         "          test \"$RECOVERY_FAMILY_RESULT\" = success",
         "          test \"$RECOVERY_SCENARIOS_RESULT\" = success",
         "          zig build test-native-recovery-zig-unit -j2 --summary all",
@@ -538,15 +551,19 @@ test "security: required recovery shards keep every mode, selector, setup and ag
     const workflow = try f.source(".github/workflows/ci.yml");
     const gate = try job(workflow, "build-and-test", "\n  security-audit:\n");
     for ([_][]const u8{
-        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-family, native-recovery-zig-scenarios]",
+        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios]",
         "    if: ${{ always() }}",
         "        name: [linux-x64, linux-arm64]",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
         "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
+        "          RECOVERY_REPOSITORY_RESULT: ${{ needs.native-recovery-zig-repository.result }}",
+        "          RECOVERY_HELPER_RESULT: ${{ needs.native-recovery-zig-helper.result }}",
         "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
         "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
         "          test \"$BUILD_RESULT\" = success",
         "          test \"$RECOVERY_WORKFLOWS_RESULT\" = success",
+        "          test \"$RECOVERY_REPOSITORY_RESULT\" = success",
+        "          test \"$RECOVERY_HELPER_RESULT\" = success",
         "          test \"$RECOVERY_FAMILY_RESULT\" = success",
         "          test \"$RECOVERY_SCENARIOS_RESULT\" = success",
     }) |token| {
@@ -556,17 +573,19 @@ test "security: required recovery shards keep every mode, selector, setup and ag
         try rejected.failsWith("ci.yml:");
     }
     const shards = [_]struct { name: []const u8, next: []const u8, targets: []const []const u8 }{
-        .{ .name = "native-recovery-zig-workflows", .next = "\n  native-recovery-zig-family:\n", .targets = &.{
-            "test-native-recovery-zig",        "test-native-recovery-zig-repository",
+        .{ .name = "native-recovery-zig-workflows", .next = "\n  native-recovery-zig-repository:\n", .targets = &.{"test-native-recovery-zig"} },
+        .{ .name = "native-recovery-zig-repository", .next = "\n  native-recovery-zig-helper:\n", .targets = &.{"test-native-recovery-zig-repository"} },
+        .{ .name = "native-recovery-zig-helper", .next = "\n  native-recovery-zig-family:\n", .targets = &.{
             "test-native-recovery-helper-zig", "test-native-recovery-zig-bootstrap",
             "test-native-recovery-zig-parity", "test-native-recovery-zig-rollback-clock",
         } },
         .{ .name = "native-recovery-zig-family", .next = "\n  native-recovery-zig-scenarios:\n", .targets = &.{"test-native-recovery-zig-family"} },
         .{ .name = "native-recovery-zig-scenarios", .next = "\n  arm64-dpkg-oracles:\n", .targets = &.{
-            "test-native-recovery-zig-scriptless", "test-native-recovery-zig-statoverride",
-            "test-native-recovery-zig-literal",    "test-native-recovery-zig-metadata",
-            "test-native-recovery-zig-conffile",   "test-native-recovery-zig-final-gaps",
-            "test-native-recovery-zig-diversions",
+            "test-native-recovery-zig-scriptless",          "test-native-recovery-zig-statoverride",
+            "test-native-recovery-zig-literal",             "test-native-recovery-zig-metadata",
+            "test-native-recovery-zig-conffile",            "test-native-recovery-zig-final-gaps",
+            "test-native-recovery-zig-diversions",          "test-native-recovery-zig-publication",
+            "test-native-recovery-zig-mutation-boundaries",
         } },
     };
     for (shards) |shard| {
@@ -595,9 +614,7 @@ test "security: required recovery shards keep every mode, selector, setup and ag
             defer duplicate_budget.deinit();
             try duplicate_budget.failsWith("ci.yml:");
         }
-        if (std.mem.eql(u8, shard.name, "native-recovery-zig-workflows") or
-            std.mem.eql(u8, shard.name, "native-recovery-zig-family"))
-        {
+        if (!std.mem.eql(u8, shard.name, "native-recovery-zig-scenarios")) {
             const changed = try f.replace(workflow, body, try f.replace(body, "          mkdir -p .tmp", ""));
             const rejected = try f.check("ci-recovery", changed);
             defer rejected.deinit();
@@ -637,7 +654,11 @@ test "security: required recovery shards keep every mode, selector, setup and ag
             }
         }
         const exercises: []const []const u8 = if (std.mem.eql(u8, shard.name, "native-recovery-zig-workflows"))
-            &.{ "Exercise Zig recovery units in both modes", "Exercise Zig core, repository, and helper recovery" }
+            &.{ "Exercise Zig recovery units in both modes", "Exercise Zig core recovery" }
+        else if (std.mem.eql(u8, shard.name, "native-recovery-zig-repository"))
+            &.{"Exercise Zig repository recovery"}
+        else if (std.mem.eql(u8, shard.name, "native-recovery-zig-helper"))
+            &.{"Exercise Zig helper, bootstrap, parity and rollback recovery"}
         else if (std.mem.eql(u8, shard.name, "native-recovery-zig-family"))
             &.{"Exercise Zig signed FAMILY recovery"}
         else
@@ -658,7 +679,7 @@ test "security: required recovery shards keep every mode, selector, setup and ag
     const duplicate = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n  duplicate-recovery:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: Duplicate signed FAMILY recovery\n        run: |\n          zig build test-native-recovery-zig-family -Dnative-reference-dpkg=\"$reference_dpkg\" -j2 --summary all\n", .{workflow});
     const extra = try f.check("ci-recovery", duplicate);
     defer extra.deinit();
-    try extra.failsWith("ci.yml: recovery targets must execute only in the three required Zig shards");
+    try extra.failsWith("ci.yml: recovery targets must execute only in the five required Zig shards");
 }
 
 test "security: aggregate gate rejects failure, cancellation, skip and unknown job results" {
@@ -668,24 +689,22 @@ test "security: aggregate gate rejects failure, cancellation, skip and unknown j
     const gate = try job(workflow, "build-and-test", "\n  security-audit:\n");
     const commands = try script(try step(gate, "Require every build and native recovery shard"));
     const states = [_][]const u8{ "success", "failure", "cancelled", "skipped", "unknown" };
-    for (states) |build| {
-        for (states) |workflows| {
-            for (states) |family| {
-                for (states) |scenarios| {
-                    const build_var = try std.fmt.allocPrint(f.arena.allocator(), "BUILD_RESULT={s}", .{build});
-                    const workflows_var = try std.fmt.allocPrint(f.arena.allocator(), "RECOVERY_WORKFLOWS_RESULT={s}", .{workflows});
-                    const family_var = try std.fmt.allocPrint(f.arena.allocator(), "RECOVERY_FAMILY_RESULT={s}", .{family});
-                    const scenarios_var = try std.fmt.allocPrint(f.arena.allocator(), "RECOVERY_SCENARIOS_RESULT={s}", .{scenarios});
-                    const result = try support.run(&.{ "env", build_var, workflows_var, family_var, scenarios_var, "bash", "-e", "-c", commands });
-                    defer result.deinit();
-                    try testing.expectEqual(
-                        std.mem.eql(u8, build, "success") and std.mem.eql(u8, workflows, "success") and
-                            std.mem.eql(u8, family, "success") and
-                            std.mem.eql(u8, scenarios, "success"),
-                        result.code == 0,
-                    );
-                }
-            }
+    const names = [_][]const u8{
+        "BUILD_RESULT",           "RECOVERY_WORKFLOWS_RESULT", "RECOVERY_REPOSITORY_RESULT",
+        "RECOVERY_HELPER_RESULT", "RECOVERY_FAMILY_RESULT",    "RECOVERY_SCENARIOS_RESULT",
+    };
+    for (names, 0..) |_, changed| {
+        for (states) |state| {
+            var values: [names.len][]const u8 = undefined;
+            for (names, 0..) |name, index|
+                values[index] = try std.fmt.allocPrint(f.arena.allocator(), "{s}={s}", .{ name, if (index == changed) state else "success" });
+            const result = try support.run(&.{
+                "env",     values[0], values[1], values[2], values[3],
+                values[4], values[5], "bash",    "-e",      "-c",
+                commands,
+            });
+            defer result.deinit();
+            try testing.expectEqual(std.mem.eql(u8, state, "success"), result.code == 0);
         }
     }
 }
@@ -1298,26 +1317,26 @@ test "security: complete recovery selector graph and pinned fixture handoffs ref
         "native_recovery.dependOn(&repository_recovery.step);",
     });
     try nativeMutationsIn(&f, "native-gate", "build.zig", "} else if (native_parity_only) {", "} else if (native_core_only) {", &.{
-        "recovery_parity,",     "recovery_diversions,", "statoverride_recovery,",
-        "conffile_recovery,",   "metadata_recovery,",   "literal_recovery,",
-        "scriptless_recovery,",
+        "recovery_parity,",     "recovery_diversions,",  "statoverride_recovery,",
+        "conffile_recovery,",   "metadata_recovery,",    "literal_recovery,",
+        "scriptless_recovery,", "publication_recovery,",
     });
-    try nativeMutationsIn(&f, "native-gate", "build.zig", "} else if (native_core_only) {", "        } else {\n            for ([_]*std.Build.Step.Run{", &.{
-        "recovery_zig,",        "recovery_helper,",       "recovery_bootstrap,", "recovery_family,",
-        "recovery_diversions,", "statoverride_recovery,", "conffile_recovery,",  "metadata_recovery,",
-        "literal_recovery,",
+    try nativeMutationsIn(&f, "native-gate", "build.zig", "} else if (native_core_only) {", "\n        } else {\n            for ([_]*std.Build.Step.Run{", &.{
+        "recovery_zig,",        "recovery_helper,",       "recovery_bootstrap,",   "recovery_family,",
+        "recovery_diversions,", "statoverride_recovery,", "conffile_recovery,",    "metadata_recovery,",
+        "literal_recovery,",    "mutation_boundaries,",   "publication_recovery,",
     });
-    try nativeMutationsIn(&f, "native-gate", "build.zig", "        } else {\n            for ([_]*std.Build.Step.Run{\n                recovery_zig,       recovery_family", "\n    if (b.option([]const u8, \"native-reference-dpkg\"", &.{
+    try nativeMutationsIn(&f, "native-gate", "build.zig", "        } else {\n            for ([_]*std.Build.Step.Run{", "\n    if (b.option([]const u8, \"native-reference-dpkg\"", &.{
         "recovery_zig,",        "recovery_family,",       "recovery_parity,",     "recovery_helper,",
         "final_gaps,",          "recovery_bootstrap,",    "repository_recovery,", "rollback_clock,",
         "scriptless_recovery,", "statoverride_recovery,", "literal_recovery,",    "metadata_recovery,",
-        "conffile_recovery,",   "recovery_diversions,",
+        "conffile_recovery,",   "recovery_diversions,",   "mutation_boundaries,", "publication_recovery,",
     });
     try nativeMutationsIn(&f, "native-gate", "build.zig", "    if (b.option([]const u8, \"native-reference-dpkg\"", "    if (b.option(\n        []const u8,\n        \"native-reference-architecture\"", &.{
         "recovery_zig,",        "recovery_family,",       "recovery_parity,",     "recovery_helper,",
         "final_gaps,",          "recovery_bootstrap,",    "repository_recovery,", "rollback_clock,",
         "scriptless_recovery,", "statoverride_recovery,", "literal_recovery,",    "metadata_recovery,",
-        "conffile_recovery,",   "recovery_diversions,",
+        "conffile_recovery,",   "recovery_diversions,",   "mutation_boundaries,", "publication_recovery,",
     });
     for ([_][]const u8{
         "native-zig-recovery-family-fixture-python",
