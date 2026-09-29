@@ -2,6 +2,7 @@ const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const settlement = @import("native_diversion_settlement.zig");
+const removal_cases = @import("native_trigger_removal.zig");
 const options = @import("native_test_options");
 const root_fs = @import("debz").root_fs;
 
@@ -338,7 +339,10 @@ fn runTriggerChains(fixture: *foundation.Fixture, driver: []const u8, helper: []
     defer self_cycle.deinit();
     try self_cycle.seed(loop);
     try copyNativeHelper(fixture, &self_cycle, helper);
+    const self_index = self_cycle.index;
     try self_cycle.phase(.{ .operation = "install", .archives = &.{looping_source}, .triggers = true }, true);
+    try removal_cases.expectNativeOutcome(&self_cycle, self_index, "install", "trigger_failed", "trigger_cycle_no_progress");
+    try assertCycleCallbacks(&self_cycle, receiver, trigger);
 
     const cycling_second = try support.makePackage(fixture, arch, "1", second_name, "cycle-packages", .{
         .declarations = "interest-noawait debz-b\n",
@@ -351,7 +355,25 @@ fn runTriggerChains(fixture: *foundation.Fixture, driver: []const u8, helper: []
     try two_cycle.seed(first);
     try two_cycle.seed(cycling_second);
     try copyNativeHelper(fixture, &two_cycle, helper);
+    const cycle_index = two_cycle.index;
     try two_cycle.phase(.{ .operation = "install", .archives = &.{source_archive}, .triggers = true }, true);
+    try removal_cases.expectNativeOutcome(&two_cycle, cycle_index, "install", "trigger_failed", "trigger_cycle_no_progress");
+    try assertCycleCallbacks(&two_cycle, first_name, "debz-a");
+    try assertCycleCallbacks(&two_cycle, second_name, "debz-b");
+}
+
+fn assertCycleCallbacks(case: *support.Scenario, package_name: []const u8, activated: []const u8) !void {
+    const marker = try std.fmt.allocPrint(case.fixture.allocator, "{s}@1:postinst\t{s}\tpostinst\t{s}\t2\t9:triggered\t{d}:{s}\t", .{
+        package_name, package_name, case.architecture, activated.len, activated,
+    });
+    defer case.fixture.allocator.free(marker);
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const path = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, support.trace });
+        defer case.fixture.allocator.free(path);
+        const bytes = try support.read(case.fixture, path, 16 * 1024 * 1024);
+        defer case.fixture.allocator.free(bytes);
+        if (std.mem.count(u8, bytes, marker) == 0) return error.NoProgressCycleDidNotRunCallbacks;
+    }
 }
 
 fn processExistingQueue(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
@@ -963,6 +985,7 @@ pub fn main(init: std.process.Init) !void {
     var oracle_only = false;
     var diversions_only = false;
     var settlement_reference_only = false;
+    var removal_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--native-helper")) {
             if (helper != null) return error.DuplicateHelper;
@@ -982,11 +1005,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--diversion-settlement-reference-only")) {
             if (settlement_reference_only) return error.DuplicateSelector;
             settlement_reference_only = true;
+        } else if (std.mem.eql(u8, option, "--removal-only")) {
+            if (removal_only) return error.DuplicateSelector;
+            removal_only = true;
         } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
             driver = option;
         }
     }
     try validateSelection(driver, helper, oracle_only, diversions_only, settlement_reference_only);
+    if (removal_only and (diversions_only or settlement_reference_only)) return error.InvalidArguments;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
@@ -998,7 +1025,16 @@ pub fn main(init: std.process.Init) !void {
     else
         "";
     const native_driver = driver orelse "";
+    if (removal_only) {
+        try removal_cases.run(&fixture, native_driver, selected, reference.executable, reference.architecture, copyNativeHelper);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     if (!diversions_only and !settlement_reference_only) {
+        removal_cases.run(&fixture, native_driver, selected, reference.executable, reference.architecture, copyNativeHelper) catch |err| {
+            try support.assertHostUnchanged(allocator, init.io, reference.before);
+            return err;
+        };
         runTriggerCases(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;

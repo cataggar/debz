@@ -419,6 +419,30 @@ each run.
 | Unsupported archive path | `unsupported-fifo-payload` builds a real FIFO-bearing archive. Pinned dpkg exits 0 and installs a FIFO; native refuses `archive_payload_unsupported_file_type` before any root mutation/script. This is a measured difference, **not** normalized parity; FIFO support is tracked in [#288](https://github.com/cataggar/debz/issues/288) before any FIFO-bearing #270–#273 claim. |
 | Unknown script return | `script-outcome-unknown` and `core-unknown-script-return` retain in-flight script identity/recovery ownership and refuse a second mutation; the known nonzero outcome above has dpkg parity. A pinned dpkg *post-return/pre-outcome-record* root is not a comparable dpkg terminal state, so unknown-outcome roots are not represented as parity matches; the transition inventory remains [#267](https://github.com/cataggar/debz/issues/267). |
 
+### Removal and trigger failure inventory (#264)
+
+`test-native-lifecycle-zig` runs `native_lifecycle_removal.zig`; its
+`--removal-only` selector isolates these new Zig cases. Every paired phase
+uses separately prepared guarded roots and the pinned dpkg reference.
+The root comparison includes file content/metadata/links, ownership,
+`status`/`status-old`, `info`, trigger records and full script traces.
+The removal-specific assertions also require the exact invocation sequence,
+arguments, payload observation, residual conffile status and info records.
+Reference commands exit exactly 0 on success and 1 on failure; native
+reports `applied` or the corresponding typed script failure, not merely an
+absent callback.
+
+| Boundary | Executable evidence |
+| --- | --- |
+| Same-version reinstall, upgrade/downgrade ownership, remove versus purge | `removal-residue-reinstall-versions`: reinstall an installed edited-conffile package, upgrade/downgrade payload ownership and links, then remove (retained edited conffile and `deinstall ok config-files`, retained `.list`/`.postrm`) and purge (no status stanza or residual conffile/info). Each phase matches the reference root. |
+| Same-version reinstall **after remove** | `removal-config-files-same-version-reinstall`: the paired remove and residual conffile state match, but dpkg exits 0 and runs preinst/postinst on the original `config-files` root while native refuses `program_compile_rejected` without mutation or missing ownership. This is **not parity**; tracked as [#300](https://github.com/cataggar/debz/issues/300). |
+| Prerm failure and successful retry | `removal-failure-prerm`: actual `prerm remove` exits 23 and invokes `postinst abort-remove`; both roots match, then the failure marker is removed and a **same-root** remove/purge succeeds with matching state. |
+| Postrm remove failure | `removal-failure-postrm`: exact failed callback and `deinstall ok half-installed` match, but a same-root retry exits 0 in dpkg while native refuses `program_compile_rejected` without mutation or a retained active journal. This is **not parity**; tracked as [#299](https://github.com/cataggar/debz/issues/299). |
+| Purge postrm failure and successful retry | `removal-failure-purge-postrm`: conffile bytes are gone *before* the failing purge callback, while `purge ok config-files` and `.postrm` remain; retrying the same root completes purge on both sides. |
+| Unknown removal callback outcome | `removal-prerm-outcome-unknown`: a real `prerm remove` executes once, but the native after-return/before-record fault retains the in-flight script hash, arguments and program-bound recovery ownership. Remove, purge and explicit recovery attempts cannot mutate the root or replace evidence. The reference terminal remove is **not** claimed equivalent to this in-flight state. |
+| Trigger incorporation, awaited/noawait, deferred callback failure | `removal-interest-{await,noawait}-deferred-callback-failure` in `native_trigger_removal.zig`: `postrm remove` activates a named trigger; the deferred queue, failing `postinst triggered`, half-configured listener and subsequent explicit configure/purge match pinned dpkg, including actual callback counts and arguments. Existing `existing-unincorporated-queue`, `file-trigger-lifecycle`, `self-cycle-no-progress` and `two-package-cycle` compare queued work and the full no-progress terminal states; the latter now require a real callback with the expected trigger argument (dpkg may stop after one callback). |
+| **Awaited activation** from postrm removal | `removal-activate-await-refusal`: pinned dpkg leaves the receiver triggers-pending. Native instead runs prerm/postrm and removes source files, then reports `invalid_transition` with the receiver still installed and a live, program-bound `mutating` journal. The original root refuses trigger processing/purge re-entry without replay. This is **not parity**; tracked as [#301](https://github.com/cataggar/debz/issues/301). |
+
 For a focused local run of the new lifecycle family:
 
 ```sh
