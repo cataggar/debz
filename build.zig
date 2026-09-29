@@ -1429,6 +1429,26 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-recovery-zig-mutation-boundaries", "Run thirteen real native root-mutation journal/staging crash boundaries")
         .dependOn(&mutation_boundaries.step);
 
+    const publication_recovery_module = b.createModule(.{
+        .root_source_file = b.path("test/native_recovery_publication.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    publication_recovery_module.addImport("debz", debz);
+    publication_recovery_module.addOptions("native_test_options", native_fixture_options);
+    const publication_recovery_executable = b.addExecutable(.{
+        .name = "native-recovery-zig-publication",
+        .root_module = publication_recovery_module,
+    });
+    const publication_recovery = b.addSystemCommand(&.{
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    publication_recovery.addArtifactArg(publication_recovery_executable);
+    publication_recovery.addArtifactArg(native_lifecycle_tests);
+    b.step("test-native-recovery-zig-publication", "Run 14 named mutation syscall crashes, rollback release and three refusals")
+        .dependOn(&publication_recovery.step);
+
     const conffile_recovery_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_conffile.zig"),
         .target = target,
@@ -1516,19 +1536,20 @@ pub fn build(b: *std.Build) void {
         } else if (native_parity_only) {
             for ([_]*std.Build.Step.Run{
                 recovery_parity,   recovery_diversions, statoverride_recovery, conffile_recovery,
-                metadata_recovery, literal_recovery,    scriptless_recovery,
+                metadata_recovery, literal_recovery,    scriptless_recovery,   publication_recovery,
             }) |runner| native_recovery.dependOn(&runner.step);
         } else if (native_core_only) {
             for ([_]*std.Build.Step.Run{
-                recovery_zig,        recovery_helper,       recovery_bootstrap, recovery_family,
-                recovery_diversions, statoverride_recovery, conffile_recovery,  metadata_recovery,
-                literal_recovery,    mutation_boundaries,
+                recovery_zig,        recovery_helper,       recovery_bootstrap,   recovery_family,
+                recovery_diversions, statoverride_recovery, conffile_recovery,    metadata_recovery,
+                literal_recovery,    mutation_boundaries,   publication_recovery,
             }) |runner| native_recovery.dependOn(&runner.step);
         } else {
             for ([_]*std.Build.Step.Run{
-                recovery_zig,       recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
-                recovery_bootstrap, repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
-                literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions, mutation_boundaries,
+                recovery_zig,         recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
+                recovery_bootstrap,   repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
+                literal_recovery,     metadata_recovery,   conffile_recovery, recovery_diversions, mutation_boundaries,
+                publication_recovery,
             }) |runner| native_recovery.dependOn(&runner.step);
         }
     }
@@ -1541,9 +1562,10 @@ pub fn build(b: *std.Build) void {
         for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, settlement, lifecycle_oracle_zig, trigger_oracle_zig, settlement_oracle_zig }) |runner|
             runner.addArgs(&.{ "--reference-dpkg", path });
         for ([_]*std.Build.Step.Run{
-            recovery_zig,       recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
-            recovery_bootstrap, repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
-            literal_recovery,   metadata_recovery,   conffile_recovery, recovery_diversions, mutation_boundaries,
+            recovery_zig,         recovery_family,     recovery_parity,   recovery_helper,     final_gaps,
+            recovery_bootstrap,   repository_recovery, rollback_clock,    scriptless_recovery, statoverride_recovery,
+            literal_recovery,     metadata_recovery,   conffile_recovery, recovery_diversions, mutation_boundaries,
+            publication_recovery,
         }) |runner| runner.addArgs(&.{ "--reference-dpkg", path });
     }
     if (b.option(

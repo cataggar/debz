@@ -1057,6 +1057,8 @@ jobs:
           zig build test-native-recovery-zig-literal -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-metadata -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+          zig build test-native-recovery-zig-publication -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-recovery-zig-publication -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig-conffile -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
           zig build test-native-recovery-zig-final-gaps -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
