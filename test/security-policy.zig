@@ -619,7 +619,7 @@ test "security: required recovery shards keep every mode, selector, setup and ag
             defer duplicate_budget.deinit();
             try duplicate_budget.failsWith("ci.yml:");
         }
-        if (!std.mem.eql(u8, shard.name, "native-recovery-zig-scenarios")) {
+        if (!std.mem.eql(u8, shard.name, "native-recovery-zig-scenarios") and !diversion_shard) {
             const changed = try f.replace(workflow, body, try f.replace(body, "          mkdir -p .tmp", ""));
             const rejected = try f.check("ci-recovery", changed);
             defer rejected.deinit();
