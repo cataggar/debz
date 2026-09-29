@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 480,
-      "sha512": "9d85ff8e59c59cf78fd8c165a8f4e81626aa488fe1c3acc86ea53bcd83e063d40bf40567c3a8d07f38d1d69a7361009074fddd258b03fe7535c0d1c275d6d04e"
+      "count": 481,
+      "sha512": "58015be085ac88f701b0d62c94bb06874b88c8f177a3fb36c432d7cbf00e912cbe34a9f216417e2fc794ebda456306449e6db2bb908470f97ed371a9890b7a49"
     },
     "findings": {
-      "count": 21518,
+      "count": 21547,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 179,
-        "raw_32_byte": 1208,
-        "sha256_token": 19834
+        "raw_32_byte": 1210,
+        "sha256_token": 19861
       },
-      "sha512": "68a680f69776415d1084acbff77593f943ad640fa8a76e782fb0d68777105f0d77f5147f675d840d45c2478f5396c82ba77d505f729821c0f51fa83674aa1118"
+      "sha512": "fc43886f8344920c626e240742d7e3e13cc209c44a4c776bbe7e5d860c49e5d6e34dca39ad64eac8c783199796edbffde2a39b8305cf4fb669077f9e75f06228"
     },
     "classifications": [
       {
@@ -154,29 +154,29 @@
         "scope": "src",
         "classification": "typed_authority_and_frozen_controls",
         "rationale": "Production sources use content_digest typed identities for current package authorities while retaining reviewed control hashes, including exact authenticated less, bash, procps configure and bounded triggered callback, sudo-rs and python3 install-only invalid-name and redirected-tool witness, util-linux, console-setup-linux, console-setup and chrony signed debconf script-path and sidecar gates, keyboard and iproute2 maintainer-script/template gates, separate exact signed systemd boot-ID-only, udev PID-only and sudo PID-only proc isolation, signed sudo ownership, alternatives restoration and its pinned sourced dpkg helper fragment, bounded glib automatic file-trigger self-interest exclusion, failed-trigger incorporation and netcat regressions, and versioned compatibility readers.",
-        "count": 12510,
+        "count": 12514,
         "counts": {
           "cas_layout": 75,
           "digest_version": 54,
           "fixed_64_hex": 18,
           "raw_32_byte": 1127,
-          "sha256_token": 11236
+          "sha256_token": 11240
         },
-        "sha512": "c1605e7bf95c8c8a0d0bb711eace5a42c3824a5f8ee5ea673392de34dd4aa0062f6ebd3cce5f0596464d093819395499a0a269f185a054655b893a527aa6a8ac"
+        "sha512": "ae211ef7b50eec6bc8d57af84a6c234cced4a6095d553ca1243ee5e0a638c413539410a2b05a978c36f88ebce2997f7c9b52e53ee82a2c492d2dd914b7fd9f29"
       },
       {
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 936,
+        "count": 961,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 8,
-          "raw_32_byte": 76,
-          "sha256_token": 848
+          "raw_32_byte": 78,
+          "sha256_token": 871
         },
-        "sha512": "1a705ba8558d3bbd9a25fbed568a0774ddd3c0a5d408a06f089c42ad172c557d57ab24ac3edbda3022c2912f48d4f1f892bedb7520b6b49f642f5728b7c6eec3"
+        "sha512": "e6314e53090fd20dad23076ecd30155ac3ea8e3373a0424b733d97df7ffd0c7dbf4c52604a0fef3b8d05b99f72b3bba7c7075386109413410176b6ed405de1b0"
       },
       {
         "scope": "tools",

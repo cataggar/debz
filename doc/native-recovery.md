@@ -2048,7 +2048,7 @@ This is an inventory of **real process termination** coverage, not a claim
 that every path through a journal is covered. Every cited Zig acceptance
 driver requires child exit **86**, absence of a completion report, and a new
 guarded root for its crash case; a unit-only assertion does not count.
-`src/native_recovery.zig::CrashPoint` has **61** values. The table below
+`src/native_recovery.zig::CrashPoint` has **76** values. The table below
 names all of them: each now has at least one executable process-kill case.
 This is selector coverage, **not** every journaled syscall or operation
 variant. The selected previously unit-only #267 family is bootstrap
@@ -2083,7 +2083,10 @@ ordinary/helper/known-failure cases; `C` = conffile, `N` = metadata,
 matrix), `VR` = that file's `route_cases/routeCase` (two additional
 changed-route upgrade selectors, seven guarded roots apiece), and `RM` =
 `test/native_trigger_removal.zig::awaitedRemovalInterruptions` through
-`test-native-triggers-zig` (actual awaited-removal crash children); all are
+`test-native-triggers-zig` (actual awaited-removal crash children); `MP` =
+`test/native_recovery_publication.zig::cases/runCase` (14 distinct named
+publication/metadata/release/restore seams and a rollback-release control);
+all are
 `test/native_recovery_*.zig` process drivers, not library unit tests. Rows
 with several drivers name a representative real case, not every family of
 operations using that selector.
@@ -2103,6 +2106,21 @@ operations using that selector.
 | `during_helper_cleanup` | O/J/P: cleanup journal owns source; R | B |
 | `after_helper_cleanup_completed` | O/J/P: cleanup verified before active clear; R | B |
 | `during_filesystem_publication` | O/M/J: restore/retry exact owned publication; R | A, H, V |
+| `mutation_precondition_check` | O/M/J: precondition still owned, restore old before retry; R | MP |
+| `mutation_target_remove` | O/M/J: database cleanup removal not yet issued; R | MP |
+| `mutation_publish_rename` | O/M/J: old target retained, restore/retry; R or Q on bytes, mode or journal drift | MP |
+| `mutation_publish_create` | O/M/J: directory creation not yet issued; R | MP |
+| `mutation_metadata_apply` | O/M/J: target metadata sequence not yet started; R | MP |
+| `mutation_metadata_chown` | O/M/J: target owner change owed; R | MP |
+| `mutation_metadata_chmod` | O/M/J: ownership applied, final mode still owed; R | MP |
+| `mutation_metadata_utimens` | O/M/J: owner/mode applied, final timestamp owed; R | MP |
+| `mutation_parent_sync` | O/M/J: publication durable, parent sync owed; R | MP |
+| `mutation_verify` | O/M/J: publication awaiting exact verification; R | MP |
+| `mutation_release_staging` | O/M/J: verified new root, staging release owed; R | MP |
+| `mutation_release_backup` | O/M/J: verified new root, backup release owed; R | MP |
+| `mutation_release_backup_rollback` | O/M/J: restored old root, rollback backup release owed; R | MP |
+| `mutation_restore_rename` | O/M/J: rollback old regular file publication owed; R | MP |
+| `mutation_restore_create` | O/M/J: rollback old symlink publication owed; R | MP |
 | `during_database_publication` | O/M/J: restore/retry database bytes; R | A, C, B |
 | `during_bootstrap_config_staging` | O/M/J: first slot staging prepared, journal owns `tmp.ci/config`; R | BC |
 | `after_bootstrap_config_stage` | O/J: first slot durable, first installed config absent; R | BC |
@@ -2208,7 +2226,7 @@ case runs seven real process kills, including independent changed/missing
 cache, checkpoint and contract refusals; a numbered Python case or a unit
 cache test does not substitute for either selector.
 
-**Root-mutation syscall boundaries (#294).** In addition to the 61 native
+**Root-mutation syscall boundaries (#294).** In addition to the 76 native
 `CrashPoint` selectors above, `test-native-recovery-zig-mutation-boundaries`
 selects each of the 13 journal/staging/backup `root_mutation.Boundary` hooks
 by its own name. The version-1 Zig table runs an actual caller-owned native
@@ -2242,13 +2260,40 @@ releasing_rollback/rolled_back → finish old, and
 recovery_required → refuse. Existing unit hook assertions and selected
 `during_*_publication` process cases are **not** independent child-kill
 evidence for each hook. The 13 #294 journal/staging/backup hooks have their
-own process evidence above; **#295 still tracks 14**
-publication/metadata/verification/release/restore boundaries.
+own process evidence above. The separate
+`test-native-recovery-zig-publication` gate for #295 exercises all 14 named
+publication/metadata/verification/release/restore hooks in fresh guarded
+real-child native transactions (exit 86 without a success report), plus a
+`release_backup` crash during `releasing_rollback` and three contradictory
+evidence controls. `target_remove` is reached in the native database cleanup
+transaction; all other selectors target the filesystem transaction.
+`metadata_chown`, `metadata_chmod` and `metadata_utimens` are selected only
+after target `metadata_apply`, never during staging. The directory fixture's
+numeric statoverride changes ownership, and its final `02555` mode differs
+from the temporary searchable `02755` mode so all three syscalls genuinely
+run. Rollback selectors inject a normal verification failure after an old
+regular file or symlink has been replaced, then kill the child immediately
+before the corresponding restoration syscall; they are not broad
+`during_*` aliases.
+
+The gate checks the original attempt, authorization, program, exact lock,
+intent and per-step journal after each interruption; precise bytes, owner,
+mode, and modification time at the named metadata and rollback/release
+phases; an unrelated second mutation refused before recovery; and receipt
+and provenance bindings before the original claim and journal are cleared.
+It evicts both requested archives before fresh recovery and compares the
+settled root with an independent pinned-dpkg 1.22.22 root. Wrong bytes,
+wrong mode, and a canonical digest-resealed journal with a forged attempt
+owner yield typed, repeated `recovery_required`, retain the original
+authority, and block a second mutation without changing the package root.
+The root-operation record may advance its recovery generation between
+refusals; the original attempt/lock/program/intent and forged journal remain
+bound and unchanged. Together the two required gates cover all 27
+`root_mutation.Boundary` hooks; neither subsumes the other's fixtures.
 The five core completion boundaries (`after_native_receipt`,
 `after_completed_record`, `after_owed_provenance_document`,
 `after_provenance_published`, `after_native_acknowledged`) **are not**
 `CrashPoint` values; `A::coreCases` and the FAMILY owner cases exercise them
 with real children, original receipt and active owner through terminal
-acknowledgment. This table does not substitute for #295's remaining
-root-mutation/process proof or for every package-specific script/trigger path
-in #86.
+acknowledgment. The mutation matrix does not substitute for every
+package-specific script/trigger path in #86.

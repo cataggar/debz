@@ -1346,6 +1346,57 @@ const CombinedMutationHooks = struct {
     publication_crash_point: ?native_recovery.CrashPoint = null,
     deferred_removal_step: ?u32 = null,
     settlement_failure_injected: bool = false,
+    publication_rollback_injected: bool = false,
+    rollback_failure_step: ?u32 = null,
+    publication_plan_ready: bool = false,
+    publishing_metadata: bool = false,
+
+    fn crashBoundary(point: native_recovery.CrashPoint) ?root_mutation.Boundary {
+        return switch (point) {
+            .mutation_precondition_check => .precondition_check,
+            .mutation_target_remove => .target_remove,
+            .mutation_publish_rename => .publish_rename,
+            .mutation_publish_create => .publish_create,
+            .mutation_metadata_apply => .metadata_apply,
+            .mutation_metadata_chown => .metadata_chown,
+            .mutation_metadata_chmod => .metadata_chmod,
+            .mutation_metadata_utimens => .metadata_utimens,
+            .mutation_parent_sync => .parent_sync,
+            .mutation_verify => .verify,
+            .mutation_release_staging => .release_staging,
+            .mutation_release_backup => .release_backup,
+            .mutation_release_backup_rollback => .release_backup,
+            .mutation_restore_rename => .restore_rename,
+            .mutation_restore_create => .restore_create,
+            else => null,
+        };
+    }
+
+    fn rollbackFailureStep(steps: []const root_mutation.Step, selected: ?native_recovery.CrashPoint) ?u32 {
+        const kind: root_mutation.Kind = switch (selected orelse return null) {
+            .mutation_restore_rename, .mutation_release_backup_rollback => .regular,
+            .mutation_restore_create => .symlink,
+            else => return null,
+        };
+        for (steps) |step| {
+            const previous = switch (step.expected) {
+                .present => |state| state,
+                .absent => continue,
+            };
+            const desired = switch (step.desired) {
+                .present => |state| state,
+                .absent => continue,
+            };
+            if (previous.kind != kind) continue;
+            if (kind == .regular and previous.content_sha256 != null and desired.content_sha256 != null and
+                !std.mem.eql(u8, &previous.content_sha256.?, &desired.content_sha256.?))
+                return step.index;
+            if (kind == .symlink and (desired.kind != .symlink or
+                !std.mem.eql(u8, previous.link_target orelse continue, desired.link_target orelse continue)))
+                return step.index;
+        }
+        return null;
+    }
 
     fn before(
         context: ?*anyopaque,
@@ -1384,6 +1435,26 @@ const CombinedMutationHooks = struct {
             }
         }
         const selected = runtime.crash.selected orelse return;
+        if (action.kind == .filesystem) {
+            if (boundary == .stage_metadata) self.publishing_metadata = false;
+            if (boundary == .metadata_apply) self.publishing_metadata = true;
+            if (self.rollback_failure_step == index and boundary == .verify and
+                (selected == .mutation_restore_rename or selected == .mutation_restore_create or
+                    selected == .mutation_release_backup_rollback))
+            {
+                self.publication_rollback_injected = true;
+                return error.AccessDenied;
+            }
+        }
+        if (if (self.publication_plan_ready) crashBoundary(selected) else null) |wanted| {
+            if (boundary == wanted and
+                (action.kind == .filesystem or
+                    (selected == .mutation_target_remove and action.kind == .database)) and
+                (selected != .mutation_release_backup_rollback or self.publication_rollback_injected) and
+                (boundary != .metadata_chown and boundary != .metadata_chmod and boundary != .metadata_utimens or
+                    self.publishing_metadata))
+                std.process.exit(native_recovery.crash_exit_code);
+        }
         if (self.publication_crash_point == .during_unpack_settlement and
             selected == .after_unpack_settlement_rollback and !self.settlement_failure_injected and
             (boundary == .publish_rename or boundary == .publish_create))
@@ -10920,6 +10991,11 @@ fn materializePlanned(
         if (execution.action) |action|
             try runtime.append(action, .prepared, .none, null);
     }
+    combined_hooks.rollback_failure_step = CombinedMutationHooks.rollbackFailureStep(
+        mutation_plan.steps,
+        if (execution.recovery) |runtime| runtime.crash.selected else null,
+    );
+    combined_hooks.publication_plan_ready = true;
     if (if (request.split_unpack_settlement) null else lowered.first_deferred_removal) |path| {
         combined_hooks.deferred_removal_step = for (mutation_plan.steps) |step| {
             if ((step.kind == .remove_path or step.kind == .remove_directory) and std.mem.eql(u8, step.path, path))
@@ -11338,6 +11414,11 @@ fn executePhaseMaterialization(
                 );
         }
     }
+    combined_hooks.rollback_failure_step = CombinedMutationHooks.rollbackFailureStep(
+        mutation_plan.steps,
+        if (execution.recovery) |runtime| runtime.crash.selected else null,
+    );
+    combined_hooks.publication_plan_ready = true;
     if (request.deferred_removal_path) |path| {
         combined_hooks.deferred_removal_step = for (mutation_plan.steps) |step| {
             if ((step.kind == .remove_path or step.kind == .remove_directory) and std.mem.eql(u8, step.path, path))
