@@ -98,8 +98,15 @@ test "security: commit-pinned composite actions reject floating refs" {
 }
 
 const ActionCandidateMutation = enum {
-    none, metadata, input, capability, bundle_capability, action_capability,
-    action_guard, bundle, handoff,
+    none,
+    metadata,
+    input,
+    capability,
+    bundle_capability,
+    action_capability,
+    action_guard,
+    bundle,
+    handoff,
 };
 
 fn actionCandidate(
@@ -180,7 +187,9 @@ test "security: both Actions rehearse native-only contracts without changing the
     defer f.deinit();
     for ([_][]const u8{ "download", "install" }) |action| {
         const baseline = try f.check("actions-native-only", try std.json.Stringify.valueAlloc(
-            f.arena.allocator(), .{ .action = action, .overrides = std.json.Value{ .object = .empty } }, .{},
+            f.arena.allocator(),
+            .{ .action = action, .overrides = std.json.Value{ .object = .empty } },
+            .{},
         ));
         defer baseline.deinit();
         try baseline.failsWith("action.yml: candidate transaction-backend default must be native");
@@ -1298,26 +1307,26 @@ test "security: complete recovery selector graph and pinned fixture handoffs ref
         "native_recovery.dependOn(&repository_recovery.step);",
     });
     try nativeMutationsIn(&f, "native-gate", "build.zig", "} else if (native_parity_only) {", "} else if (native_core_only) {", &.{
-        "recovery_parity,",     "recovery_diversions,", "statoverride_recovery,",
-        "conffile_recovery,",   "metadata_recovery,",   "literal_recovery,",
-        "scriptless_recovery,",
+        "recovery_parity,",     "recovery_diversions,",  "statoverride_recovery,",
+        "conffile_recovery,",   "metadata_recovery,",    "literal_recovery,",
+        "scriptless_recovery,", "publication_recovery,",
     });
-    try nativeMutationsIn(&f, "native-gate", "build.zig", "} else if (native_core_only) {", "        } else {\n            for ([_]*std.Build.Step.Run{", &.{
-        "recovery_zig,",        "recovery_helper,",       "recovery_bootstrap,", "recovery_family,",
-        "recovery_diversions,", "statoverride_recovery,", "conffile_recovery,",  "metadata_recovery,",
-        "literal_recovery,",
+    try nativeMutationsIn(&f, "native-gate", "build.zig", "} else if (native_core_only) {", "\n        } else {\n            for ([_]*std.Build.Step.Run{", &.{
+        "recovery_zig,",        "recovery_helper,",       "recovery_bootstrap,",   "recovery_family,",
+        "recovery_diversions,", "statoverride_recovery,", "conffile_recovery,",    "metadata_recovery,",
+        "literal_recovery,",    "mutation_boundaries,",   "publication_recovery,",
     });
-    try nativeMutationsIn(&f, "native-gate", "build.zig", "        } else {\n            for ([_]*std.Build.Step.Run{\n                recovery_zig,       recovery_family", "\n    if (b.option([]const u8, \"native-reference-dpkg\"", &.{
+    try nativeMutationsIn(&f, "native-gate", "build.zig", "        } else {\n            for ([_]*std.Build.Step.Run{", "\n    if (b.option([]const u8, \"native-reference-dpkg\"", &.{
         "recovery_zig,",        "recovery_family,",       "recovery_parity,",     "recovery_helper,",
         "final_gaps,",          "recovery_bootstrap,",    "repository_recovery,", "rollback_clock,",
         "scriptless_recovery,", "statoverride_recovery,", "literal_recovery,",    "metadata_recovery,",
-        "conffile_recovery,",   "recovery_diversions,",
+        "conffile_recovery,",   "recovery_diversions,",   "mutation_boundaries,", "publication_recovery,",
     });
     try nativeMutationsIn(&f, "native-gate", "build.zig", "    if (b.option([]const u8, \"native-reference-dpkg\"", "    if (b.option(\n        []const u8,\n        \"native-reference-architecture\"", &.{
         "recovery_zig,",        "recovery_family,",       "recovery_parity,",     "recovery_helper,",
         "final_gaps,",          "recovery_bootstrap,",    "repository_recovery,", "rollback_clock,",
         "scriptless_recovery,", "statoverride_recovery,", "literal_recovery,",    "metadata_recovery,",
-        "conffile_recovery,",   "recovery_diversions,",
+        "conffile_recovery,",   "recovery_diversions,",   "mutation_boundaries,", "publication_recovery,",
     });
     for ([_][]const u8{
         "native-zig-recovery-family-fixture-python",

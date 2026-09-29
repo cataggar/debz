@@ -167,7 +167,7 @@
       {
         "scope": "test",
         "classification": "test_and_fixture_coverage",
-        "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
+        "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority. Recovery selector mutation controls protect both journal/staging and publication runners and their pinned dpkg handoffs.",
         "count": 961,
         "counts": {
           "cas_layout": 4,
