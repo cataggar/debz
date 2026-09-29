@@ -137,6 +137,10 @@ the expected pending/awaited fields from generation-bound initial work and
 bounded, validated automatic and helper activation events. Handler/caller
 identity, trigger names, await policy, coalescing, and ordering remain
 constrained by the compiled authority.
+For a conffile-retaining source removed by `postrm remove`, dpkg incorporates
+an authenticated `--await` activation into the receiver's `triggers-pending`
+state but does not put the source back into `triggers-awaited`: its final
+selection remains `deinstall ok config-files`.
 
 The expected closure is not copied from observed final status. Final
 verification compares the actual database against the independently derived
@@ -193,12 +197,15 @@ call after clearing the marker; they never treat a missing callback or a
 refused trigger-only retry as success. The existing self/two-package
 no-progress fixtures now also require actual callbacks with exact trigger arguments,
 in addition to their exact terminal root and script-trace comparison.
-The separate `removal-activate-await-refusal` fixture does **not** claim
-parity for an awaited postrm activation: dpkg queues the receiver, while
-native reports `invalid_transition` after source removal and retains a
-`mutating` operation journal. Both re-entry and journal overwrite are
-blocked; [#301](https://github.com/cataggar/debz/issues/301) tracks the
-missing settlement.
+The historically named `removal-activate-await-refusal` fixture now proves
+same-root parity for a real `postrm remove` **awaited activation**, including
+`config-files` source, `triggers-pending` receiver, empty incorporated queue,
+single source script invocation, later receiver callback and purge. Separate
+real-process crashes after postrm registration, queue incorporation, status
+publication and provenance test the retained exact owner/lock/program and
+completion. An unrecorded postrm outcome remains `script_outcome_unknown`
+with a durable `recovery_required` owner; fresh trigger processing and purge
+cannot overwrite it. Known outcomes resume without rerunning postrm.
 
 Reference roots use the real `dpkg-trigger`; candidate execution uses a
 separately compiled native helper installed at the same in-root path.

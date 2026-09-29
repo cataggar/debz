@@ -15773,6 +15773,9 @@ fn deriveDeferredFinalState(
         );
     }
     for (final_state) |*package| {
+        // dpkg does not put a removed, conffile-retaining activator into
+        // triggers-awaited, even when its postrm used --await.
+        if (package.state == .config_files) continue;
         var key_buffer: [512]u8 = undefined;
         const key = try std.fmt.bufPrint(
             &key_buffer,
@@ -16753,6 +16756,9 @@ fn lifecyclePublishDerivedFinalState(
         .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
     };
     defer database.deinit();
+    if (execution.recovery) |runtime| if (runtime.recovering and
+        lifecycleFinalClosureMatches(expected, database))
+        return .{ .outcome = .applied, .detail = "derived_trigger_state_already_published" };
     var updates: std.ArrayList(TriggerPackageUpdate) = .empty;
     defer updates.deinit(allocator);
     for (expected) |package| {
@@ -16858,8 +16864,16 @@ fn lifecycleIncorporateTriggerQueue(
         .diagnostic => return .{ .outcome = .refused, .detail = "trigger_queue_rejected" },
     };
     defer database.deinit();
-    if (database.model.triggers.pending.len == 0)
+    if (database.model.triggers.pending.len == 0) {
+        // On replay the helper queue can already have been incorporated.
+        // Account for its completed database phase before assigning the
+        // derived status publication a new recovery action identity.
+        if (execution.recovery) |runtime| {
+            if (runtime.recovering)
+                _ = try consumeRecoveredDatabasePhase(execution);
+        }
         return .{ .outcome = .applied, .detail = "trigger_queue_empty" };
+    }
     const arena = try allocator.create(std.heap.ArenaAllocator);
     defer allocator.destroy(arena);
     arena.* = .init(allocator);
@@ -17318,6 +17332,8 @@ fn lifecycleRunTriggerWork(
         );
         if (lifecycleMaterializationFailure(incorporated)) |failure| return failure;
         if (!known_failure) {
+            if (execution.recovery) |runtime|
+                runtime.crash.hit(.after_deferred_trigger_queue_incorporation);
             const derived = try lifecyclePublishDerivedFinalState(
                 execution,
                 allocator,
@@ -17334,6 +17350,8 @@ fn lifecycleRunTriggerWork(
                 activation_log.items,
             );
             if (lifecycleMaterializationFailure(derived)) |failure| return failure;
+            if (execution.recovery) |runtime|
+                runtime.crash.hit(.after_deferred_trigger_status_publication);
         }
         if (program.trigger_authority.?.defer_triggers) return .{
             .outcome = .applied,
@@ -23224,6 +23242,9 @@ fn runLifecycleScript(
 
     if (execution.recovery) |runtime| {
         runtime.crash.hit(.after_script_return_before_outcome);
+        if (kind == .postrm and source == .installed_package and
+            arguments.len != 0 and std.mem.eql(u8, arguments[0], "remove"))
+            runtime.crash.hit(.after_removal_postrm_return_before_outcome);
         if (kind == .postrm and source == .installed_package)
             runtime.crash.hit(.after_upgrade_postrm_return_before_outcome);
     }

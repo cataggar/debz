@@ -1,6 +1,7 @@
 const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
+const recovery = @import("native_recovery_scriptless.zig");
 
 const receiver = "removal-trigger-receiver";
 const source = "removal-trigger-source";
@@ -69,7 +70,7 @@ fn marker(case: *support.Scenario, fail: bool) !void {
     }
 }
 
-fn awaitedRemovalBlock(
+fn awaitedRemoval(
     fixture: *foundation.Fixture,
     driver: []const u8,
     helper: []const u8,
@@ -102,86 +103,221 @@ fn awaitedRemovalBlock(
         .triggers = true,
         .defer_triggers = true,
     };
-    if (fixture.oracle_only) {
-        try case.phase(input, false);
-        return;
-    }
-    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
-    defer fixture.allocator.free(before);
-    const destination = try support.path(fixture.allocator, label, "remove-await");
-    defer fixture.allocator.free(destination);
-    try fixture.directory(destination);
-    if (try support.reference(fixture, dpkg, case.reference_root, input, destination) != 0)
-        return error.UnexpectedAwaitedRemovalReference;
-    try assertSideStatus(&case, "reference", source, "Status: deinstall ok config-files");
-    try assertSideStatus(&case, "reference", receiver, "Triggers-Pending: " ++ trigger);
-    const reference_trace = try readRoot(&case, "reference", support.trace);
-    defer fixture.allocator.free(reference_trace);
-    if (std.mem.count(u8, reference_trace, source ++ "@1:postrm\t") != 1)
-        return error.ReferenceRemovalDidNotActivate;
-    var result = try support.native(fixture, driver, case.native_root, arch, input, destination);
-    defer result.deinit();
-    if (!std.mem.eql(u8, result.value.outcome, "refused") or
-        !std.mem.eql(u8, result.value.detail, "invalid_transition"))
-        return error.UnexpectedAwaitedRemovalOutcome;
-    const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
-    defer fixture.allocator.free(after);
-    if (std.mem.eql(u8, before, after)) return error.AwaitedRemovalDidNotReachMutation;
+    const removal_index = case.index;
+    try case.phase(input, false);
+    if (fixture.oracle_only) return;
+    try expectNativeOutcome(&case, removal_index, "remove", "applied", "completed");
     try assertStatus(&case, source, "Status: deinstall ok config-files");
-    try assertSideStatus(&case, "native", receiver, "Status: install ok installed");
+    try assertStatus(&case, receiver, "Status: install ok triggers-pending");
+    try assertStatus(&case, receiver, "Triggers-Pending: " ++ trigger);
     try traceCount(&case, source ++ "@1:postrm\t", 1);
     try traceCount(&case, receiver ++ "@1:postinst\t", 0);
-    const operation_path = try std.fmt.allocPrint(fixture.allocator, "{s}/native/var/lib/debz/root-operation-v1.json", .{label});
-    defer fixture.allocator.free(operation_path);
-    const authority_path = try std.fmt.allocPrint(fixture.allocator, "{s}/native/var/lib/debz/native-trigger-authority-v1.json", .{label});
-    defer fixture.allocator.free(authority_path);
-    const operation_bytes = try support.read(fixture, operation_path, 1024 * 1024);
-    defer fixture.allocator.free(operation_bytes);
-    const authority_bytes = try support.read(fixture, authority_path, 1024 * 1024);
-    defer fixture.allocator.free(authority_bytes);
-    const Operation = struct {
-        state: []const u8,
-        phase: []const u8,
-        mutation_started: bool,
-        program_sha256: []const u8,
-    };
-    const Authority = struct { program_sha256: []const u8 };
-    const operation = try std.json.parseFromSlice(Operation, fixture.allocator, operation_bytes, .{ .ignore_unknown_fields = true });
-    defer operation.deinit();
-    const authority = try std.json.parseFromSlice(Authority, fixture.allocator, authority_bytes, .{ .ignore_unknown_fields = true });
-    defer authority.deinit();
-    if (!std.mem.eql(u8, operation.value.state, "mutating") or
-        !std.mem.eql(u8, operation.value.phase, "mutation") or
-        !operation.value.mutation_started or
-        !std.mem.eql(u8, operation.value.program_sha256, authority.value.program_sha256))
-        return error.AwaitedRemovalLostRecoveryOwnership;
-    const reference = try foundation.capture(fixture.allocator, fixture.io, case.reference_root);
-    defer fixture.allocator.free(reference);
-    if (std.mem.eql(u8, reference, after)) return error.AwaitedRemovalAccidentallyMatched;
-    for ([_][]const u8{ "process_triggers", "purge" }) |operation_name| {
-        const next = try std.fmt.allocPrint(fixture.allocator, "{s}/blocked-{s}", .{ label, operation_name });
-        defer fixture.allocator.free(next);
-        try fixture.directory(next);
-        var blocked = try support.native(fixture, driver, case.native_root, arch, .{
-            .operation = operation_name,
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const queue = try readRoot(&case, side, "var/lib/dpkg/triggers/Unincorp");
+        defer fixture.allocator.free(queue);
+        if (queue.len != 0) return error.AwaitedRemovalQueueNotIncorporated;
+    }
+    try case.phase(.{ .operation = "process_triggers", .triggers = true }, false);
+    try traceCount(&case, receiver ++ "@1:postinst\t", 1);
+    try assertStatus(&case, source, "Status: deinstall ok config-files");
+    try case.phase(.{ .operation = "purge", .packages = &selected, .triggers = true }, false);
+}
+
+fn awaitedRemovalInterruptions(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    helper: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    installHelper: *const fn (*foundation.Fixture, *support.Scenario, []const u8) anyerror!void,
+) !void {
+    if (fixture.oracle_only) return;
+    for ([_]struct { name: []const u8, crash: []const u8, unknown_script: bool }{
+        .{ .name = "registration", .crash = "after_removal_postrm_return_before_outcome", .unknown_script = true },
+        .{ .name = "queue-incorporation", .crash = "after_deferred_trigger_queue_incorporation", .unknown_script = false },
+        .{ .name = "status-publication", .crash = "after_deferred_trigger_status_publication", .unknown_script = false },
+        .{ .name = "terminal-acknowledgment", .crash = "after_provenance", .unknown_script = false },
+    }) |boundary| {
+        const label = try std.fmt.allocPrint(fixture.allocator, "removal-activate-await-crash-{s}", .{boundary.name});
+        defer fixture.allocator.free(label);
+        const handler = try support.makePackage(fixture, arch, "1", receiver, label, .{
+            .declarations = "interest-await " ++ trigger ++ "\n",
+        });
+        defer fixture.allocator.free(handler);
+        const activating = try support.makePackage(fixture, arch, "1", source, label, .{
+            .conffile_content = "retained configuration\n",
+            .activation = trigger,
+            .activation_kind = "postrm",
+            .activation_when = "remove",
+            .activation_await = true,
+        });
+        defer fixture.allocator.free(activating);
+        var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, true);
+        defer case.deinit();
+        try case.seed(handler);
+        try case.seed(activating);
+        try installHelper(fixture, &case, helper);
+        const selected = [_]foundation.PackageIdentity{.{ .name = source, .architecture = arch }};
+        const reference_log = try support.path(fixture.allocator, label, "reference-remove");
+        defer fixture.allocator.free(reference_log);
+        try fixture.directory(reference_log);
+        if (try support.reference(fixture, dpkg, case.reference_root, .{
+            .operation = "remove",
+            .packages = &selected,
             .triggers = true,
-            .packages = if (std.mem.eql(u8, operation_name, "purge")) &selected else &.{},
-        }, next);
-        defer blocked.deinit();
-        if (!std.mem.eql(u8, blocked.value.outcome, "recovery_required"))
-            return error.AwaitedRemovalAllowedReplay;
+            .defer_triggers = true,
+        }, reference_log) != 0) return error.UnexpectedAwaitedRemovalReference;
+        const crash_log = try support.path(fixture.allocator, label, "crash");
+        defer fixture.allocator.free(crash_log);
+        _ = try recovery.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+            .operation = "remove",
+            .packages = &selected,
+            .defer_triggers = true,
+            .crash_at = boundary.crash,
+        });
+        const owner_path = try recovery.rootPath(fixture, case.native_root, "var/lib/debz/root-operation-v1.json");
+        defer fixture.allocator.free(owner_path);
+        const owner_bytes = try support.read(fixture, owner_path, 1024 * 1024);
+        defer fixture.allocator.free(owner_bytes);
+        var owner = try recovery.rootDocument(fixture, case.native_root, "var/lib/debz/root-operation-v1.json");
+        defer owner.deinit();
+        var intent = try recovery.rootDocument(fixture, case.native_root, "var/lib/debz/native-execution-intent-v1.json");
+        defer intent.deinit();
+        try recovery.same(try recovery.text(owner.value, "state"), if (boundary.unknown_script) "mutating" else if (std.mem.eql(u8, boundary.crash, "after_provenance")) "completed" else "mutating");
+        if (!(try recovery.field(owner.value, "mutation_started")).bool)
+            return error.AwaitedRemovalLostMutationEvidence;
+        try recovery.same(try recovery.text(owner.value, "attempt_id"), try recovery.text(intent.value, "attempt_id"));
+        try recovery.same(try recovery.text(owner.value, "program_sha256"), try recovery.text(intent.value, "program_sha256"));
+        try recovery.same(try recovery.text(try recovery.field(owner.value, "exact_lock"), "digest_sha256"), try recovery.text(intent.value, "exact_lock_sha256"));
+        if (!std.mem.eql(u8, boundary.crash, "after_provenance")) {
+            var authority = try recovery.rootDocument(fixture, case.native_root, "var/lib/debz/native-trigger-authority-v1.json");
+            defer authority.deinit();
+            try recovery.same(
+                try recovery.text(owner.value, "program_sha256"),
+                try recovery.text(authority.value, "program_sha256"),
+            );
+            try recovery.same(
+                try recovery.text(owner.value, "attempt_id"),
+                try recovery.text(authority.value, "attempt_id"),
+            );
+        }
+        const queued = try readRoot(&case, "native", "var/lib/dpkg/triggers/Unincorp");
+        defer fixture.allocator.free(queued);
+        if (boundary.unknown_script) {
+            if (!std.mem.eql(u8, queued, trigger ++ " " ++ source ++ "\n"))
+                return error.AwaitedRemovalRegistrationWasNotPersisted;
+        } else if (queued.len != 0) {
+            return error.AwaitedRemovalQueueNotIncorporated;
+        }
+        if (std.mem.eql(u8, boundary.name, "queue-incorporation"))
+            try assertSideStatus(&case, "native", receiver, "Status: install ok installed");
+        if (std.mem.eql(u8, boundary.name, "status-publication") or
+            std.mem.eql(u8, boundary.name, "terminal-acknowledgment"))
+            try assertSideStatus(&case, "native", receiver, "Status: install ok triggers-pending");
+        const before_block = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(before_block);
+        for ([_][]const u8{ "process_triggers", "purge" }) |operation_name| {
+            const blocked_log = try std.fmt.allocPrint(fixture.allocator, "{s}/blocked-{s}", .{ label, operation_name });
+            defer fixture.allocator.free(blocked_log);
+            try fixture.directory(blocked_log);
+            var blocked = try support.native(fixture, driver, case.native_root, arch, .{
+                .operation = operation_name,
+                .triggers = true,
+                .packages = if (std.mem.eql(u8, operation_name, "purge")) &selected else &.{},
+            }, blocked_log);
+            defer blocked.deinit();
+            if (!std.mem.eql(u8, blocked.value.outcome, "recovery_required"))
+                return error.AwaitedRemovalAllowedReplay;
+            const retained = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+            defer fixture.allocator.free(retained);
+            const owner_after = try support.read(fixture, owner_path, 1024 * 1024);
+            defer fixture.allocator.free(owner_after);
+            if (!std.mem.eql(u8, before_block, retained) or
+                !std.mem.eql(u8, owner_bytes, owner_after))
+                return error.AwaitedRemovalReentryChangedRootOrJournal;
+        }
+        const resume_log = try support.path(fixture.allocator, label, "recover");
+        defer fixture.allocator.free(resume_log);
+        var resumed = (try recovery.invoke(fixture, driver, case.native_root, arch, resume_log, .{
+            .operation = "recover",
+            .defer_triggers = true,
+        })) orelse return error.AwaitedRemovalRecoveryMissingReport;
+        defer resumed.deinit();
+        if (boundary.unknown_script) {
+            try recovery.same(resumed.value.outcome, "recovery_required");
+            try recovery.same(resumed.value.detail, "script_outcome_unknown");
+            var retained = try recovery.rootDocument(fixture, case.native_root, "var/lib/debz/root-operation-v1.json");
+            defer retained.deinit();
+            try recovery.same(try recovery.text(retained.value, "state"), "recovery_required");
+            try recovery.same(try recovery.text(retained.value, "phase"), "script");
+            try recovery.same(try recovery.text(retained.value, "program_sha256"), try recovery.text(owner.value, "program_sha256"));
+            var proof = try recovery.rootDocument(fixture, case.native_root, "var/lib/debz/native-transaction-provenance-v1.json");
+            defer proof.deinit();
+            try recovery.same(try recovery.text(proof.value, "outcome"), "recovery_required");
+            try recovery.same(try recovery.text(proof.value, "attempt_id"), try recovery.text(owner.value, "attempt_id"));
+            try recovery.same(try recovery.text(proof.value, "exact_lock_sha256"), try recovery.text(intent.value, "exact_lock_sha256"));
+            const recovery_owner = try support.read(fixture, owner_path, 1024 * 1024);
+            defer fixture.allocator.free(recovery_owner);
+            const recovery_snapshot = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+            defer fixture.allocator.free(recovery_snapshot);
+            const blocked_log = try support.path(fixture.allocator, label, "blocked-after-recovery");
+            defer fixture.allocator.free(blocked_log);
+            try fixture.directory(blocked_log);
+            var blocked = try support.native(fixture, driver, case.native_root, arch, .{
+                .operation = "process_triggers",
+                .triggers = true,
+            }, blocked_log);
+            defer blocked.deinit();
+            try recovery.same(blocked.value.outcome, "recovery_required");
+            const retained_owner = try support.read(fixture, owner_path, 1024 * 1024);
+            defer fixture.allocator.free(retained_owner);
+            const retained_snapshot = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+            defer fixture.allocator.free(retained_snapshot);
+            if (!std.mem.eql(u8, recovery_owner, retained_owner) or
+                !std.mem.eql(u8, recovery_snapshot, retained_snapshot))
+                return error.AwaitedRemovalRecoveryOwnerChangedOnReplay;
+            try traceCount(&case, source ++ "@1:postrm\t", 1);
+            continue;
+        }
+        try recovery.same(resumed.value.outcome, "applied");
+        var proof = try recovery.rootDocument(fixture, case.native_root, "var/lib/debz/native-transaction-provenance-v1.json");
+        defer proof.deinit();
+        try recovery.same(try recovery.text(proof.value, "outcome"), "succeeded");
+        try recovery.same(try recovery.text(proof.value, "attempt_id"), try recovery.text(owner.value, "attempt_id"));
+        try recovery.same(try recovery.text(proof.value, "program_sha256"), try recovery.text(owner.value, "program_sha256"));
+        try recovery.same(try recovery.text(proof.value, "exact_lock_sha256"), try recovery.text(intent.value, "exact_lock_sha256"));
+        try support.assertNoActiveEvidence(fixture, case.native_root);
+        try recovery.rootAbsent(fixture, case.native_root, "var/lib/debz/native-execution-intent-v1.json");
+        try recovery.rootAbsent(fixture, case.native_root, "var/lib/debz/root-mutation-v1.json");
+        const comparison = try support.path(fixture.allocator, label, "comparison");
+        defer fixture.allocator.free(comparison);
+        try fixture.directory(comparison);
+        try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+        try assertStatus(&case, source, "Status: deinstall ok config-files");
+        try assertStatus(&case, receiver, "Status: install ok triggers-pending");
+        try traceCount(&case, source ++ "@1:postrm\t", 1);
+        try traceCount(&case, receiver ++ "@1:postinst\t", 0);
+        const settled = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(settled);
+        const proof_path = try recovery.rootPath(fixture, case.native_root, "var/lib/debz/native-transaction-provenance-v1.json");
+        defer fixture.allocator.free(proof_path);
+        const proof_bytes = try support.read(fixture, proof_path, 16 * 1024 * 1024);
+        defer fixture.allocator.free(proof_bytes);
+        const repeat_log = try support.path(fixture.allocator, label, "repeat-recovery");
+        defer fixture.allocator.free(repeat_log);
+        var repeated = (try recovery.invoke(fixture, driver, case.native_root, arch, repeat_log, .{
+            .operation = "recover",
+            .defer_triggers = true,
+        })) orelse return error.AwaitedRemovalRecoveryMissingReport;
+        defer repeated.deinit();
+        try recovery.same(repeated.value.outcome, "applied");
         const retained = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
         defer fixture.allocator.free(retained);
-        const operation_after = try support.read(fixture, operation_path, 1024 * 1024);
-        defer fixture.allocator.free(operation_after);
-        const authority_after = try support.read(fixture, authority_path, 1024 * 1024);
-        defer fixture.allocator.free(authority_after);
-        if (!std.mem.eql(u8, after, retained) or
-            !std.mem.eql(u8, operation_bytes, operation_after) or
-            !std.mem.eql(u8, authority_bytes, authority_after))
-            return error.AwaitedRemovalReentryChangedRootOrJournal;
+        const retained_proof = try support.read(fixture, proof_path, 16 * 1024 * 1024);
+        defer fixture.allocator.free(retained_proof);
+        if (!std.mem.eql(u8, settled, retained) or !std.mem.eql(u8, proof_bytes, retained_proof))
+            return error.AwaitedRemovalRecoveryRewroteReceipt;
     }
-    std.debug.print("{s}/remove: dpkg exit 0; native invalid_transition after mutation with retained journal (not parity)\n", .{label});
 }
 
 pub fn run(
@@ -260,5 +396,6 @@ pub fn run(
         try assertStatus(&case, receiver, "Status: install ok installed");
         try case.phase(.{ .operation = "purge", .packages = &selected, .triggers = true }, false);
     }
-    try awaitedRemovalBlock(fixture, driver, helper, dpkg, arch, installHelper);
+    try awaitedRemoval(fixture, driver, helper, dpkg, arch, installHelper);
+    try awaitedRemovalInterruptions(fixture, driver, helper, dpkg, arch, installHelper);
 }
