@@ -1079,6 +1079,11 @@ optimization modes on amd64 and arm64, with the SHA-256-pinned private dpkg;
 `-Dnative-zig-recovery-diversion-case=N` selects a single number for
 diagnostics only on the focused Zig target. The aggregate's
 `-Dnative-diversions-only=true` selector always runs all 100 numbers.
+Two additional **named** #293 process-kill cases are not Python tuples:
+`-Dnative-zig-recovery-diversion-route-case=cache-refresh` or
+`route-checkpoint` selects one case and its seven independent guarded-root
+trials. The default focused/aggregate diversion target runs both named cases
+after the 100 numbered cases, without altering the one-to-one Python count.
 
 These cases install a package-owned `dpkg-trigger` helper, execute package
 scripts and triggers in real guarded roots, run the pinned dpkg on the
@@ -1108,6 +1113,26 @@ committed, require its inode/bytes/mtime and staged conffile contents to
 survive recovery. There are **no unexecuted tuples in this Python function**.
 This local parity result alone did **not** justify retiring either Python
 gate: complete amd64/arm64 Debug/ReleaseSafe CI still gates the transition.
+
+The two #293 trials use the actual changed-route, mid-unpack **upgrade** with
+an old postrm that probes the original backup inodes and removes its one-use
+marker. At each named seam, seven fresh roots independently check successful
+replay, changed/missing private cache, changed/missing managed checkpoint and
+changed/missing route contract. Each requires exit 86 and no completion
+report, evicts the original caller archives, binds the attempt, exact lock,
+native intent, retained unpack input and changed-route contract, and refuses
+a second purge before recovery. At cache refresh the newly published private
+cache differs from the prior managed snapshot (whose route slot is still
+absent); at route checkpoint the transient snapshot binds both file digests
+and the old-postrm script step after the unpack step. Successful recovery
+retains the route/unpack document bytes and inodes, compares the complete
+root and script trace with pinned dpkg, refuses a second purge before
+acknowledgment, and retains the original caller/receipt until acknowledgment.
+Every drift trial recovers twice and requires the same typed
+`recovery_required` detail and unchanged root/owner. Changed/missing cache
+and contract report `ManagedStateChanged`; changed/missing checkpoint report
+`SyntaxError`/`FileNotFound`. These details are stable typed refusals, not
+claims of phase-specific diagnostics.
 
 For the core/deadline target,
 `-Dnative-zig-recovery-core-only=true` and
@@ -1965,6 +1990,7 @@ before retiring the Python entry points from the required gate.
 | `exercise_script_failure_state`: unowned `postinst-failure-after_failure_outcome`, `postinst-failure-after_script_failure_state` | `test-native-recovery-helper-zig`, `knownFailure`: **unowned** actual failed postinst, durably applied half-configured state on the second seam, archive eviction, pinned-dpkg failure parity and repeated recovery/acknowledgment. These are not the separate helper-owned failures in `caseRun`. | Executed: both. |
 | `exercise_core`: `core-after_native_receipt`, `core-after_completed_record`, `core-after_owed_provenance_document`, `core-after_provenance_published`, `core-after_native_acknowledged`; `core-known-failure`; `core-unknown-script` | `test-native-recovery-zig`, `coreCases` and `coreScriptOutcomes`: all five completion crashes now use scriptful archives, evict the archive, compare to pinned dpkg, validate the typed receipt and every retained evidence digest, original caller request, output and helper-bound script invocation, and check completion/no repeated work. Known preinst failure compares to dpkg; unknown script return refuses in both core and FAMILY and remains inspectable. | Executed: all seven; core target additionally runs three initial journal/provenance windows. |
 | `exercise_diversion_recovery`: exact Python tuple numbers **001–100** | `test-native-recovery-zig-diversions`, `cases[0..100]` and `runCase`; each explicit `Case.number` is ordered/unique at compile time, runs a crash child and the matching recovery/refusal against pinned dpkg. See [numbered diversion inventory](#numbered-diversion-recovery-migration) for the windows and drift groups. | Executed: 100/100; number maps one-to-one to the Python tuple in source order. |
+| #293 changed-route postrm transition seams (additional Zig-only cases) | `test-native-recovery-zig-diversions`, `route_cases`/`routeCase`: two named exit-86 selectors, seven separate guarded-root trials per selector, pinned-dpkg success/owned acknowledgment and repeated immutable typed drift refusals; not substitutes for any of the 100 Python tuples. | Executed: 2/2 named selectors, 14/14 child kills. |
 | `exercise_statoverride_recovery`: install at `after_execution_intent`, `during_filesystem_publication`, `after_script_outcome`, `after_failure_outcome`; upgrade at `during_filesystem_publication`, `after_script_outcome`; remove at `after_script_outcome`; purge at `after_script_prepared`; install-{account,override,created} at `after_script_outcome`; drift `passwd-blob`, `group-blob-missing`, `passwd`, `group`, `statoverride`, `owner` at their respective Python windows | `test-native-recovery-zig-statoverride`, 17 ordered `cases` + `runCase`; real helper-bound/core crashes, pinned dpkg, retained original passwd/group blobs, immutable drift refusal, unchanged helper inode/bytes. | Executed: 17/17. |
 | `exercise_conffile_lifecycle_recovery`: purge at `after_execution_intent`, `during_database_publication`, `after_script_prepared`, `after_script_outcome`, `after_failure_outcome` (failed), `after_trigger_outcome` (failed), `after_script_return_before_outcome`, `after_script_prepared` (drift); purge-deferred at failed `after_failure_outcome`; purge-helper at failed `after_failure_outcome`, `after_trigger_outcome`; purge-helper-deferred at failed `after_failure_outcome`; configure at `after_script_prepared`, `during_database_publication`, `during_database_publication` (drift), `after_script_outcome`, `after_script_prepared` (drift); configure-upgrade at `after_script_prepared`, `after_script_outcome`, `during_database_publication` | `test-native-recovery-zig-conffile`, 20 explicit `cases` + `runCase`; each runs a real crash, checks modified conffile, known failure/unknown outcome or drift, and successful pinned-dpkg recovery with retained completion. | Executed: 20/20. |
 | `exercise_metadata_recovery`: install/during-filesystem; upgrade/after-trigger; remove/after-script; purge/after-script; install/after-trigger drift in `symbols` bytes, mode, absence or `config` bytes, mode, owner, absence | `test-native-recovery-zig-metadata`, 11 ordered `cases` + `runCase`; script/helper-bound crashes, immutable seven drift refusals, original retained metadata and pinned dpkg. | Executed: 11/11. |
@@ -2022,10 +2048,14 @@ This is an inventory of **real process termination** coverage, not a claim
 that every path through a journal is covered. Every cited Zig acceptance
 driver requires child exit **86**, absence of a completion report, and a new
 guarded root for its crash case; a unit-only assertion does not count.
-`src/native_recovery.zig::CrashPoint` has **58** values. The table below
-names all of them: 56 have an executable process-kill case, two remain
-uncovered. The selected previously unit-only family is bootstrap config-slot
-serialization (seven process cases, including the shared intent seam).
+`src/native_recovery.zig::CrashPoint` has **61** values. The table below
+names all of them: each now has at least one executable process-kill case.
+This is selector coverage, **not** every journaled syscall or operation
+variant. The selected previously unit-only #267 family is bootstrap
+config-slot serialization (seven process cases, including the shared intent
+seam); #293 adds independent postrm cache/checkpoint proofs. Since the
+original 58-row #267 inventory, main also added three real awaited-removal
+script/trigger interruption selectors.
 
 In the table, `O` is the durable native `root-operation-v1.json` attempt
 (backend `native`, exact-lock/request/policy/program digests bound to
@@ -2050,9 +2080,13 @@ core crash/completion cases; `H` = `test/native_recovery_helper.zig`
 ordinary/helper/known-failure cases; `C` = conffile, `N` = metadata,
 `L` = literal-path, `S` = scriptless, `V` =
 `test/native_recovery_diversions.zig::cases/runCase` (the numbered 100-case
-matrix); all are `test/native_recovery_*.zig` process drivers, not library
-unit tests. Rows with several drivers name a representative real case, not
-every family of operations using that selector.
+matrix), `VR` = that file's `route_cases/routeCase` (two additional
+changed-route upgrade selectors, seven guarded roots apiece), and `RM` =
+`test/native_trigger_removal.zig::awaitedRemovalInterruptions` through
+`test-native-triggers-zig` (actual awaited-removal crash children); all are
+`test/native_recovery_*.zig` process drivers, not library unit tests. Rows
+with several drivers name a representative real case, not every family of
+operations using that selector.
 
 | `CrashPoint` | Durable seam and required outcome | Process evidence |
 | --- | --- | --- |
@@ -2079,10 +2113,11 @@ every family of operations using that selector.
 | `after_script_prepared` | O/J: script not launched; owned retry R | B, H, C |
 | `after_script_outcome` | O/J: known outcome durable, no script replay; R | B, H, C |
 | `after_script_return_before_outcome` | O/J: script did run, no durable outcome; Q | BC, B, H |
+| `after_removal_postrm_return_before_outcome` | O/J/T: awaited removal postrm registered a trigger but has no durable outcome; Q without re-executing it | RM `registration` |
 | `after_upgrade_postrm_return_before_outcome` | O/J/D: upgrade postrm unknown; Q | V, H |
 | `after_upgrade_postrm_route_publication` | O/J/D: route contract durable, cache/checkpoint owed; R or Q on drift | V #23/#27 |
-| `after_upgrade_postrm_cache_refresh` | O/J/D: private refreshed cache durable, checkpoint owed; R or Q on drift | **GAP #293** |
-| `after_upgrade_postrm_route_checkpoint` | O/J/D: contract/cache/managed checkpoint durable; R or Q on drift | **GAP #293** |
+| `after_upgrade_postrm_cache_refresh` | O/J/D: private refreshed cache durable, prior managed route slot still absent; R or Q on changed/missing cache, checkpoint or contract | VR `cache-refresh` |
+| `after_upgrade_postrm_route_checkpoint` | O/J/D: contract/cache/transient managed checkpoint bind unpack and old-postrm script steps; R or Q on changed/missing cache, checkpoint or contract | VR `route-checkpoint` |
 | `after_upgrade_postrm_outcome` | O/J/D: known old postrm outcome, route evidence verified; R | V #24/#28/#58 |
 | `after_upgrade_unwind_outcome` | O/J/D: unwind outcome durable, no replay; R | V #59/#60 |
 | `after_upgrade_pre_rollback_compensation_outcome` | O/J/D: compensation outcome durable; R | V #61 |
@@ -2095,6 +2130,8 @@ every family of operations using that selector.
 | `after_failure_outcome` | O/J/P: failed outcome retained, exact failed state/receipt; R | A, H, C, V |
 | `after_script_failure_state` | O/J: half-configured failure state durable; R | H |
 | `after_trigger_outcome` | O/J/T: known trigger outcome/events, no re-execution; R | H, N, L, V |
+| `after_deferred_trigger_queue_incorporation` | O/J/T: awaited queue emptied, receiver status publication owed; R without repeating removal postrm | RM `queue-incorporation` |
+| `after_deferred_trigger_status_publication` | O/J/T: receiver triggers-pending status durable; R without triggering the receiver prematurely | RM `status-publication` |
 | `after_provenance` | O/J/P: receipt published, active claim not yet cleared; R/ack | A, H, B |
 | `after_active_clear` | P: prior owner discharged; allow new attempt only with verified receipt | H |
 | `before_scriptless_trigger_completion` | O/J/T: no invented script/outcome; R or Q on drift | S |
@@ -2148,8 +2185,8 @@ bootstrap owner's config-staging database substep 0 exists (otherwise 0);
 without it the unknown-script refusal was masked as
 `native_helper_evidence_invalid`.
 
-**Observed #267 gate (arm64, pinned dpkg 1.22.22):** the 58-row inventory was
-checked against executable Zig selectors; its 31 bootstrap cases (20
+**Observed #267 gate (arm64, pinned dpkg 1.22.22):** the then-58-row inventory
+was checked against executable Zig selectors; its 31 bootstrap cases (20
 existing + seven `config-*` transition cases + four original refusal cases)
 passed in both Debug and ReleaseSafe. In both modes the command
 `zig build test-native-recovery-zig-unit test-native-recovery-helper-zig
@@ -2158,10 +2195,20 @@ test-native-recovery-zig-bootstrap -Dnative-reference-dpkg=/absolute/pinned/dpkg
 modes. The #296 gate includes four additional config refusal controls
 (missing slot, wrong mode, wrong owner and missing retained archive), for
 35 bootstrap cases in the same Debug and ReleaseSafe unit/helper/bootstrap
-command. A green unit/helper/bootstrap gate does **not** close #293–#295 or
-discharge the full #86 crash-coverage acceptance.
+command. A green unit/helper/bootstrap gate alone does **not** close #293;
+the separate named diversion cases below do. Neither gate closes #294–#295
+or discharges the full #86 crash-coverage acceptance.
 
-**Other journal boundaries, not discharged by the 56 selectors.** The native
+**Observed #293 gate (arm64, pinned dpkg 1.22.22):** `zig build
+test-native-recovery-zig-diversions
+-Dnative-zig-recovery-diversion-route-case=cache-refresh
+-Dnative-reference-dpkg=/absolute/pinned/dpkg -j2` and the same command
+selecting `route-checkpoint` each passed in Debug and ReleaseSafe. Each named
+case runs seven real process kills, including independent changed/missing
+cache, checkpoint and contract refusals; a numbered Python case or a unit
+cache test does not substitute for either selector.
+
+**Other journal boundaries, not discharged by the 61 selectors.** The native
 root-mutation journal itself names 27 syscall hooks in
 `src/root_mutation.zig::Boundary`. Its `Stage` directions are
 prepared/applying/rolling_back → restore old,

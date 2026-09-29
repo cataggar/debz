@@ -1446,6 +1446,9 @@ pub fn build(b: *std.Build) void {
     const diversion_case = b.option([]const u8, "native-zig-recovery-diversion-case", "Run one numbered Python diversion recovery case");
     if (diversion_case) |number|
         recovery_diversions.addArgs(&.{ "--case", number });
+    const route_case = b.option([]const u8, "native-zig-recovery-diversion-route-case", "Run one named diversion postrm crash transition and its drift controls");
+    if (route_case) |name|
+        recovery_diversions.addArgs(&.{ "--route-case", name });
     b.step("test-native-recovery-zig-diversions", "Run counted real-process diversion crash/recovery cases against pinned dpkg")
         .dependOn(&recovery_diversions.step);
 

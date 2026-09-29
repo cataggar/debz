@@ -25928,7 +25928,7 @@ fn recoverNativeRootMutation(
     const pending_mutation = pendingNativeMutationAction(
         initial_progress.document,
     ) != null;
-    const managed_cache = readManagedDiversionCache(
+    var managed_cache = readManagedDiversionCache(
         allocator,
         root,
         runtime.intent_sha256,
@@ -25955,6 +25955,7 @@ fn recoverNativeRootMutation(
         },
         else => return err,
     };
+    defer if (managed_cache) |*cached| cached.deinit();
     if (route_checkpoint_action == null and pending_mutation) {
         const action = switch (script_recovery) {
             .known_outcome => |value| value,
@@ -25981,9 +25982,7 @@ fn recoverNativeRootMutation(
             }
         }
     }
-    if (managed_cache) |value| {
-        var cached = value;
-        defer cached.deinit();
+    if (managed_cache) |*cached| {
         if (route_checkpoint_action == null)
             diversion_cache.* = native_diversion.Session.restore(
                 allocator,

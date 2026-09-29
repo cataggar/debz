@@ -41,15 +41,15 @@
       "sha512": "95e2922b133afc493d7f7c2e26961f493e8affc3c29a17f4b7ad710f90ba0f3623178c3fe4a17d57b54313ba8f0104d0332504ccb7ff4d2172bb0bb1e2437967"
     },
     "findings": {
-      "count": 21469,
+      "count": 21495,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 179,
-        "raw_32_byte": 1204,
-        "sha256_token": 19789
+        "raw_32_byte": 1206,
+        "sha256_token": 19813
       },
-      "sha512": "36053c892cecb5a90bb927ae810c665925d7954c7094f1acb8afb686c9bc47c441f8abc8b58a9425dfa2c01262919277ed350d9b076dfbc10e73718c13450c63"
+      "sha512": "3b6c59ac915177c324eb9554c7fbf3c37b199fc0bf85b37ad49042fcfe86bc8973c65a7a1d8b8b3697fa669fab8705a0646a21e75005a9eb28721d93bd8f3489"
     },
     "classifications": [
       {
@@ -168,15 +168,15 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority.",
-        "count": 887,
+        "count": 913,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 8,
-          "raw_32_byte": 72,
-          "sha256_token": 803
+          "raw_32_byte": 74,
+          "sha256_token": 827
         },
-        "sha512": "0ac28846d4a662634c4e7f3f934b964e5baa685b90d2a5d550dd15c9d2f22655c18d646e6976b975bffb64e966e1fed474c0d7b38997116ffae1ec2466396eee"
+        "sha512": "70747a5071a7a6e04ebd25b6bddb1b71b719e9cbedac4ce881bf1929376e0d6fee5ae0d99e0d31813304d527341063bedf5d47ef3a2cbd1e6a7a92d7a59d6bba"
       },
       {
         "scope": "tools",

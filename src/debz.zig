@@ -270,6 +270,7 @@ pub const native_recovery = @import("native_recovery.zig");
 pub const native_provenance = @import("native_provenance.zig");
 pub const native_diversion_cache = @import("native_diversion_cache.zig");
 pub const native_unpack_diversion = @import("native_unpack_diversion.zig");
+pub const native_unpack_route_settlement = @import("native_unpack_route_settlement.zig");
 pub const native_unpack = @import("native_unpack.zig");
 pub const native_diversion = @import("native_diversion.zig");
 pub const native_alternatives = @import("native_alternatives.zig");
