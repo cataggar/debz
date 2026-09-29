@@ -361,7 +361,7 @@ fn runCase(f: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: [
             })) orelse return error.MissingMutationRefusal;
             defer refused.deinit();
             try same(refused.value.outcome, "recovery_required");
-            if (refused.value.detail.len == 0) return error.UntypedMutationRefusal;
+            try same(refused.value.detail, "mutation_evidence_unresolved");
             if (first_detail) |detail| try same(refused.value.detail, detail) else first_detail = try f.allocator.dupe(u8, refused.value.detail);
             if (!std.mem.eql(u8, changed, try foundation.capture(f.allocator, f.io, scenario.native_root)) or
                 !std.mem.eql(u8, old_intent, try read(f, scenario.native_root, intent_path)) or
@@ -499,7 +499,7 @@ pub fn main(init: std.process.Init) !void {
         };
         count += 1;
     }
-    if (selected == null)
+    if (selected == null or selected == .backup_dir_sync)
         try runCase(&fixture, driver, reference.executable, reference.architecture, .backup_dir_sync, true);
     if (count != (if (selected != null) @as(usize, 1) else boundaries.len))
         return error.MutationSelectorAccountingMismatch;
