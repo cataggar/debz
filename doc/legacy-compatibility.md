@@ -136,3 +136,40 @@ The security audit fails if an inventoried path disappears without policy
 review, if a production selector is not classified, if the action bundles omit
 capability evidence, or if the policy claims native-only readiness while
 cutover blockers remain.
+
+## Opt-in production candidate (#276)
+
+Run `python3 tools/security-audit.py native-only-candidate` only when rehearsing
+the **future** cutover. It must fail on this legacy-capable release. The output
+names remaining deletion/default tasks by exact source path (#280–#285), not a
+claim of #274 readiness. Ordinary `zig build security-audit` continues to
+check the shipped legacy-capable policy and tests the candidate's expected
+failure and negative mutations; it does not enable native-only defaults.
+
+`security/native-only-production-policy.json` pins reviewed child-process
+allowances and source/bundle fingerprints. The candidate scans *all* production
+Zig sources and Setup/Download/Install Action TypeScript for direct and
+indirect launches, including descriptor-based `execveat`. An unknown launch,
+changed/missing allowance, unreadable source, missing inventory path, or stale
+fingerprint is a failure, not a skip. The legacy command adapter and the
+host-root dpkg architecture probe must disappear; native script execution and
+root probes must remain exactly reviewed. The signed sudo post-install
+`dpkg-query` input is pinned to that script's exact identity and tool binding,
+**not** a general dpkg/dpkg-query basename exception. The exact pinned oracle
+paths under `tools/` are reference-only and may not migrate into production.
+Journals v1–v4 remain distinct read-only historical decode formats; active
+legacy journal publication/replay is a separate cutover blocker.
+
+The #279 CLI/root rehearsal is opt-in, not a changed release mode. The
+candidate also pins `build.zig`'s shipped CLI mode, the exact
+`src/cli_backend_policy.zig` selector, and the CLI/root operation wiring. The
+native-only cutover must remove the legacy new-execution fallback without
+removing completed historical verification or enabling the rehearsal as a
+success-shaped substitute for changing the shipped default.
+
+After integrating #274, update fingerprints and allowances only with a review
+of the changed paths, run this candidate, both Actions' candidate contracts
+and bundle reproducibility checks, and the production install/remove/reinstall/
+downgrade/failure/recovery exec-trace gates before marking readiness. A
+source-only candidate pass is not a runtime process trace or permission to
+release.

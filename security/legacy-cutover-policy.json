@@ -90,9 +90,9 @@
     },
     {
       "schema": "debz:transaction-journal",
-      "versions": [1, 2, 3],
+      "versions": [1, 2, 3, 4],
       "backend": "legacy_dpkg",
-      "new_execution": "version_3_only",
+      "new_execution": "version_4_only",
       "active_recovery": "legacy_capable_release_required",
       "completed_history": "checksummed_exact_bytes_read_only"
     },

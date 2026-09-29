@@ -2994,7 +2994,7 @@ def audit_legacy_cutover_policy() -> None:
         "io.github.cataggar.debz.transaction-result-summary.v1": ((1,), "legacy_dpkg"),
         "io.github.cataggar.debz.transaction-result-summary.v2": ((2,), "native"),
         "io.github.cataggar.debz.transaction-result-capability.v1": ((1,), "native"),
-        "debz:transaction-journal": ((1, 2, 3), "legacy_dpkg"),
+        "debz:transaction-journal": ((1, 2, 3, 4), "legacy_dpkg"),
         "https://debz.dev/schema/root-operation-record-v1": ((1,), "explicit"),
         "https://debz.dev/schema/root-operation-completion-v1": ((1,), "explicit"),
         "https://debz.dev/schema/apt-system-operation-state-v1": (
@@ -3289,7 +3289,7 @@ def main() -> int:
 
 def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
     """Apply a production policy validator to one bounded, external input."""
-    limit = 2 * 1024 * 1024 if kind == "native-final" else 1024 * 1024
+    limit = 2 * 1024 * 1024 if kind in ("native-final", "native-only-candidate") else 1024 * 1024
     try:
         descriptor = os.open(input_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
@@ -3304,6 +3304,28 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         return 2
     if kind == "action-pin":
         failures = action_pin_failures(text, "action.yml")
+    elif kind == "native-only-candidate":
+        import native_only_candidate
+
+        try:
+            fixture = json.loads(text)
+            if (
+                not isinstance(fixture, dict)
+                or set(fixture) != {"overrides"}
+                or not isinstance(fixture["overrides"], dict)
+                or any(
+                    not isinstance(key, str)
+                    or (value is not None and not isinstance(value, str))
+                    for key, value in fixture["overrides"].items()
+                )
+            ):
+                raise ValueError("invalid overrides")
+        except (ValueError, TypeError):
+            print("security-audit: invalid native-only candidate fixture", file=sys.stderr)
+            return 2
+        failures = native_only_candidate.candidate_failures(
+            ROOT, fixture["overrides"], actions_native_only_candidate_failures,
+        )
     elif kind == "actions-native-only":
         try:
             fixture = json.loads(text)
@@ -3525,4 +3547,16 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "check":
         raise SystemExit(check_policy_input(sys.argv[2], pathlib.Path(sys.argv[3])))
+    if len(sys.argv) == 2 and sys.argv[1] == "native-only-candidate":
+        import native_only_candidate
+
+        failures = native_only_candidate.candidate_failures(
+            ROOT, {}, actions_native_only_candidate_failures,
+        )
+        for failure in failures:
+            print(f"security-audit: {failure}", file=sys.stderr)
+        if failures:
+            raise SystemExit(1)
+        print("security-audit: native-only candidate passed")
+        raise SystemExit(0)
     raise SystemExit(main())
