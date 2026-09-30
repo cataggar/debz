@@ -49,7 +49,7 @@
         "raw_32_byte": 1210,
         "sha256_token": 19861
       },
-      "sha512": "d187136fd9831e222ae20f37d5b02ba5f091b5d7ed2c57422c3a15e3b4ec02336d7ded0d2d2e8ed71f708009f01527092f9eb79a670e514f39495bd3090a5049"
+      "sha512": "22f12c219c73a04e8d691cb4435fa065ba0cc768f724f06a9fb665347e20ff96bbbe810efd91959e3d6fda7af392affe48591cd8a393a1e6ed4cb841a8141032"
     },
     "classifications": [
       {
@@ -78,7 +78,7 @@
           "raw_32_byte": 0,
           "sha256_token": 490
         },
-        "sha512": "51fab9ca61649364d070a7bc39ec35ad7d745f04b7615b0832002e41fa14b54716f1161c5f2e6cd9a30f186086cb3efbe42ead1e17e07bd2e6ca24cdbac22cff"
+        "sha512": "9c20c1d4f494402a5c00a981f95cce65c3104ae7fe58dc805f23507bab302f39d7b7263a869a5ddd3fcc918db7cc142c7be77a29e1fda72eaa2e05d3853a9765"
       },
       {
         "scope": "build",
@@ -452,7 +452,7 @@
         "tools/test_vendor_state_capture.py"
       ],
       "count": 172,
-      "sha512": "f679a42d56b23689ca3462bd3d18d0196117bebd323a37bebfd259e8fd4b0e7c6107492b150ab10d81042e9ad6a0aaf2e37ddb66712f8d098876ae648517bbf9"
+      "sha512": "e823fcd186cb384f08c6a65e02b77fd75b9ebe04c8f359f9d535cafafa3e058ea7ac22c5203da6f8b0c59f790bc00626480afe2ae90cd6b3feb5b3354eaea4fe"
     },
     {
       "id": "fixed-lifecycle-control-assertions",
