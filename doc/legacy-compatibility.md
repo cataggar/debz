@@ -92,16 +92,24 @@ default changes here.
 
 ## Digest compatibility inventory
 
-The tracked repository digest inventory is
-[`security/digest-cutover-policy.json`](../security/digest-cutover-policy.json).
+The tracked repository digest policy is
+[`security/digest-cutover-policy.json`](../security/digest-cutover-policy.json);
+the merge-friendly per-file finding inventory is
+[`security/digest-inventory-v1.tsv`](../security/digest-inventory-v1.tsv).
 Current package, repository-index, artifact, and package-CAS authority must use
 `content_digest.Identity`, `Value`, or `Set`, or the equivalent versioned
 algorithm-tagged wire form. SHA256-only fields and raw `[32]u8` widths remain
 allowlisted only for frozen version-specific compatibility or unrelated
 document, policy, signature, state, and transport controls. Each exception has
-an exact-path SHA512 inventory fingerprint and rationale; path globs and
-unreviewed inventory drift fail the security audit. Fixed 64-hex and SHA256 CAS
-layout assumptions cannot authorize current content.
+an exact path, a per-scope classification/rationale in the JSON policy, and a
+sorted TSV inventory line with per-kind counts plus the SHA512 of that file's
+canonical findings. The audit derives repository and scope totals at run time;
+there is no repository-wide `tracked_files` aggregate to repin because every
+scoped path is still checked against the classified scope list. Path globs,
+malformed, duplicate, unsorted, missing, extra, stale, or unreviewed inventory
+lines fail closed. Regenerate the TSV after rebasing with
+`zig build write-digest-inventory`. Fixed 64-hex and SHA256 CAS layout
+assumptions cannot authorize current content.
 
 ## Migration
 

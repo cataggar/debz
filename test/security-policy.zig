@@ -1028,24 +1028,56 @@ test "security: new raw package authority, schema digest field and fixed cache l
     try positive.ok();
 }
 
+fn digestInventoryAppendFixture(
+    f: *Fixture,
+    path: []const u8,
+    append: []const u8,
+) ![]const u8 {
+    return std.json.Stringify.valueAlloc(f.arena.allocator(), .{
+        .path = path,
+        .append = append,
+    }, .{});
+}
+
+fn digestInventorySyntheticFixture(f: *Fixture, case: []const u8) ![]const u8 {
+    return std.json.Stringify.valueAlloc(f.arena.allocator(), .{ .case = case }, .{});
+}
+
 test "security: frozen digest inventory, typed authority, and narrow reviewed compatibility" {
     var f = try Fixture.init();
     defer f.deinit();
-    const inventory = try std.json.Stringify.valueAlloc(f.arena.allocator(), .{
-        .path = "src/content_digest.zig",
-        .append = "",
-    }, .{});
-    const valid = try f.check("digest-inventory", inventory);
+    const policy = try f.source("security/digest-cutover-policy.json");
+    const valid = try f.check("digest-inventory-synthetic", try digestInventorySyntheticFixture(&f, "valid"));
     defer valid.deinit();
     try valid.ok();
-    const drift = try std.json.Stringify.valueAlloc(f.arena.allocator(), .{
-        .path = "src/content_digest.zig",
-        .append = "\n// sha256 inventory drift canary\n",
-    }, .{});
-    const rejected = try f.check("digest-inventory", drift);
-    defer rejected.deinit();
-    try rejected.failsWith("digest policy finding inventory changed");
-    const policy = try f.source("security/digest-cutover-policy.json");
+    const real_drift = try f.check(
+        "digest-inventory",
+        try digestInventoryAppendFixture(&f, "src/content_digest.zig", "\n// sha256 inventory drift canary\n"),
+    );
+    defer real_drift.deinit();
+    try real_drift.failsWith("digest inventory record changed: src/content_digest.zig");
+    for ([_]struct { case: []const u8, diagnostic: []const u8 }{
+        .{ .case = "added", .diagnostic = "digest inventory record changed: src/digest_synthetic.zig" },
+        .{ .case = "removed", .diagnostic = "digest inventory record changed: src/digest_synthetic.zig" },
+        .{ .case = "edited", .diagnostic = "digest inventory record changed: src/digest_synthetic.zig" },
+        .{ .case = "missing-record", .diagnostic = "digest inventory is missing a record: src/digest_synthetic.zig" },
+        .{ .case = "extra-missing-file", .diagnostic = "digest inventory contains an unexpected record: tools/zzzz_digest_inventory_canary.py" },
+        .{ .case = "extra-no-findings", .diagnostic = "digest inventory contains an unexpected record: doc/empty-digest-synthetic.md" },
+        .{ .case = "unsorted", .diagnostic = "digest inventory records are not sorted" },
+        .{ .case = "duplicate", .diagnostic = "digest inventory contains a duplicate record" },
+        .{ .case = "malformed", .diagnostic = "digest inventory line" },
+        .{ .case = "absolute-path", .diagnostic = "has an invalid path" },
+        .{ .case = "parent-path", .diagnostic = "has an invalid path" },
+        .{ .case = "glob-path", .diagnostic = "has an invalid path" },
+        .{ .case = "outside-scope-path", .diagnostic = "has an invalid path" },
+        .{ .case = "invalid-scope", .diagnostic = "has an invalid scope" },
+        .{ .case = "old-schema", .diagnostic = "digest cutover policy identity changed" },
+        .{ .case = "unclassified-scope", .diagnostic = "digest policy does not classify every tracked audit scope" },
+    }) |mutation| {
+        const result = try f.check("digest-inventory-synthetic", try digestInventorySyntheticFixture(&f, mutation.case));
+        defer result.deinit();
+        try result.failsWith(mutation.diagnostic);
+    }
     const baseline = try f.check("digest-allowlist", policy);
     defer baseline.deinit();
     try baseline.ok();
@@ -1064,6 +1096,7 @@ test "security: digest audit includes nonignored untracked files and reviewed po
     try f.work.write("src/ignored.ignore", "generated");
     try f.work.write(".gitignore", "*.ignore\n");
     try f.work.write("security/digest-cutover-policy.json", "{}\n");
+    try f.work.write("security/digest-inventory-v1.tsv", "");
     const created = try support.run(&.{ "git", "init", "-q", f.work.root });
     defer created.deinit();
     try created.ok();
@@ -1073,6 +1106,7 @@ test "security: digest audit includes nonignored untracked files and reviewed po
     try discovered.ok();
     try support.contains(discovered.stdout, "src/sha512_transaction_e2e_test.zig\n");
     try support.contains(discovered.stdout, "security/digest-cutover-policy.json\n");
+    try support.contains(discovered.stdout, "security/digest-inventory-v1.tsv\n");
     try testing.expect(std.mem.indexOf(u8, discovered.stdout, "ignored.ignore") == null);
 }
 
@@ -1289,15 +1323,13 @@ test "security: policy-check inputs are regular and bounded, not symlink or spec
 test "security: recovery bootstrap, signed consumer, and repository evidence are inventoried" {
     var f = try Fixture.init();
     defer f.deinit();
+    const inventory = try f.source("security/digest-inventory-v1.tsv");
     for ([_][]const u8{
         "test/native_recovery_bootstrap.zig",
         "test/native_recovery_parity_evidence.zig",
         "test/native_recovery_repository.zig",
     }) |path| {
-        const fixture = try std.json.Stringify.valueAlloc(f.arena.allocator(), .{ .path = path, .append = "\n// sha256 evidence mutation canary\n" }, .{});
-        const rejected = try f.check("digest-inventory", fixture);
-        defer rejected.deinit();
-        try rejected.failsWith("digest policy finding inventory changed");
+        try support.contains(inventory, try std.fmt.allocPrint(f.arena.allocator(), "{s}\t", .{path}));
     }
 }
 

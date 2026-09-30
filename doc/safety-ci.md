@@ -151,6 +151,11 @@ The required audit step runs Zig-owned policy mutations and offline snapshot
 workflow tests alongside the production Python audit utility. It does not
 download or execute the live snapshot; see the
 [test inventory](tooling-test-inventory.md) for the preserved negative cases.
+Digest cutover drift is reviewed in `security/digest-inventory-v1.tsv`, a
+sorted TSV with one line per file that has findings. After rebasing a change
+that adds, edits, or removes SHA256-shaped findings, run
+`zig build write-digest-inventory` and review the per-file line diff before
+running `zig build security-audit`.
 
 Zig's Debug and ReleaseSafe modes provide bounds, overflow and safety checks.
 The repository does not claim a C sanitizer gate: libsolv and libzstd are

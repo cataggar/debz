@@ -338,6 +338,12 @@ pub fn build(b: *std.Build) void {
     );
     const audit = b.addSystemCommand(&.{ "python3", "tools/security-audit.py" });
     audit_step.dependOn(&audit.step);
+    const write_digest_inventory_step = b.step(
+        "write-digest-inventory",
+        "Regenerate the per-file digest cutover inventory",
+    );
+    const write_digest_inventory = b.addSystemCommand(&.{ "python3", "tools/security-audit.py", "--write-digest-inventory" });
+    write_digest_inventory_step.dependOn(&write_digest_inventory.step);
     const security_policy_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/security-policy.zig"),
@@ -2025,6 +2031,8 @@ fn installReleaseFiles(
         .{ .source = "THIRD_PARTY_NOTICES", .destination = "share/doc/debz/THIRD_PARTY_NOTICES" },
         .{ .source = "security/digest-cutover-policy.json", .destination = "share/debz/digest-cutover-policy.json" },
         .{ .source = "security/digest-cutover-policy.json", .destination = "share/doc/debz/digest-cutover-policy.json" },
+        .{ .source = "security/digest-inventory-v1.tsv", .destination = "share/debz/digest-inventory-v1.tsv" },
+        .{ .source = "security/digest-inventory-v1.tsv", .destination = "share/doc/debz/digest-inventory-v1.tsv" },
         .{ .source = "security/legacy-cutover-policy.json", .destination = "share/debz/legacy-cutover-policy.json" },
         .{ .source = "security/legacy-cutover-policy.json", .destination = "share/doc/debz/legacy-cutover-policy.json" },
     };
