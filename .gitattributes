@@ -21,9 +21,9 @@ src/fixtures/package-database/** whitespace=-blank-at-eof
 # The authenticated script's trailing spaces and blank EOF are digest-bound bytes.
 src/fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst whitespace=-blank-at-eof,-trailing-space
 # The signed sudo-rs postinst's blank EOF is part of its authenticated digest.
-src/fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst whitespace=-blank-at-eof
+src/fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst whitespace=-blank-at-eof
 # The signed util-linux postinst's blank EOF is part of its authenticated digest.
-src/fixtures/ubuntu-stonking-util-linux-2.41.3-3ubuntu2.postinst whitespace=-blank-at-eof
+src/fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst whitespace=-blank-at-eof
 # The signed console-setup postinst's blank EOF is part of its authenticated digest.
 src/fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst whitespace=-blank-at-eof
 

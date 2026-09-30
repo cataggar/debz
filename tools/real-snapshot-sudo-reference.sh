@@ -104,7 +104,7 @@ require_protected_file "$source_root/var/lib/dpkg/alternatives/sudo"
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
   -f='${Version} ${Status}' sudo) == '1.9.17p2-7ubuntu3 install ok unpacked' ]]
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' sudo-rs) == '0.2.14-1ubuntu2 install ok installed' ]]
+  -f='${Version} ${Status}' sudo-rs) == '0.2.14-1ubuntu4 install ok installed' ]]
 for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit:sudo.ws' \
   'usr/share/man/man8/sudoedit.8.gz:/etc/alternatives/sudoedit.8.gz:sudo.ws.8.gz'; do
   IFS=: read -r name target payload_target <<<"$link"

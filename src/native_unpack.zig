@@ -21266,7 +21266,7 @@ fn snapshotSudoRsPostinstIsBound(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, package.name, "sudo-rs") or
-        !std.mem.eql(u8, package.version, "0.2.14-1ubuntu2") or
+        !std.mem.eql(u8, package.version, "0.2.14-1ubuntu4") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -21287,7 +21287,7 @@ fn snapshotUtilLinuxPostinstIsBound(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, package.name, "util-linux") or
-        !std.mem.eql(u8, package.version, "2.41.3-3ubuntu2") or
+        !std.mem.eql(u8, package.version, "2.42.2-1ubuntu2") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -21418,9 +21418,9 @@ fn verifySudoRsStructuralOwner(
         },
         .{
             .name = "sudo-rs",
-            .version = "0.2.14-1ubuntu2",
-            .size = 595874,
-            .sha512 = "0d4aba12d8a354c6bae762c81c95573c5d9e6d40046e415955da73c32c4e86d6d9923efeffcb0aefc12cbc59591a1348e8e094cbe957a2e765b85e5575681364",
+            .version = "0.2.14-1ubuntu4",
+            .size = 590768,
+            .sha512 = "aeff8aeba736d791c7a2c12b6a46ba7964c5729e63d46bf457700db221d54aa1672beec0df1b15ae584852a57d9607c7a370d041469a24e8192dc84d2b332ea2",
         },
     };
     for (expected_artifacts) |expected| {
@@ -21789,11 +21789,11 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
 
 test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst",
+        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst",
     );
     const sudo_rs: native_program.PackageIdentity = .{
         .name = "sudo-rs",
-        .version = "0.2.14-1ubuntu2",
+        .version = "0.2.14-1ubuntu4",
         .architecture = "amd64",
     };
     try testing.expect(try snapshotSudoRsPostinstIsBound(
@@ -21881,11 +21881,11 @@ test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure"
 
 test "native_unpack.test.snapshot util-linux requires signed fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-util-linux-2.41.3-3ubuntu2.postinst",
+        "fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst",
     );
     const util_linux: native_program.PackageIdentity = .{
         .name = "util-linux",
-        .version = "2.41.3-3ubuntu2",
+        .version = "2.42.2-1ubuntu2",
         .architecture = "amd64",
     };
     try testing.expect(try snapshotUtilLinuxPostinstIsBound(

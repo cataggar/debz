@@ -11,7 +11,7 @@ on:
         description: "Pinned immutable Ubuntu snapshot URI"
         required: true
         type: string
-        default: "https://snapshot.ubuntu.com/ubuntu/20260923T000000Z"
+        default: "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z"
       ubuntu_snapshot_suite:
         description: "Pinned snapshot suite/codename"
         required: true
@@ -1637,7 +1637,7 @@ jobs:
       - name: Test real acceptance input validation
         run: |
           tools/real-snapshot-acceptance.sh --validate-values \
-            https://snapshot.ubuntu.com/ubuntu/20260923T000000Z stonking amd64
+            https://snapshot.ubuntu.com/ubuntu/20261001T000000Z stonking amd64
           ! tools/real-snapshot-acceptance.sh --validate-values \
             https://example.invalid stonking amd64
       - name: Run static security audit
