@@ -203,6 +203,13 @@ For authenticated route changes it also preserves the original publication
 route as trigger authority across success, unwind, rollback and later postinst
 failure.
 
+A direct purge of an installed package compiles as one journaled
+remove-then-purge program in dpkg's order: `prerm remove`, file removal,
+`postrm remove`, then the purge half. Like dpkg's `removal_bulk`, remove and
+purge of a package with neither conffiles nor a postrm both go straight to
+not-installed, without an intermediate `config-files` record or purge
+settlement ([#326](https://github.com/cataggar/debz/issues/326)).
+
 Purge deletes conffile bytes and recognized side files before `postrm purge`,
 while leaving the original control records visible to that script. A known
 outcome then settles the conffile records; final directory/info removal follows
@@ -464,6 +471,8 @@ absent callback.
 | Early retry crash and recovery | `removal-failure-postrm-early-recovery`: a crash after the retry intent is published but before file settlement leaves the first failed callback intact. Explicit recovery resumes the bound retry with only one further postrm invocation, clears the marker and matches dpkg's complete root and trace. The changed-root variant edits the conffile after the crash and verifies that recovery refuses without replay or mutation. |
 | Purge postrm failure and successful retry | `removal-failure-purge-postrm`: conffile bytes are gone *before* the failing purge callback, while `purge ok config-files` and `.postrm` remain; retrying the same root completes purge on both sides. |
 | Unknown removal callback outcome | `removal-prerm-outcome-unknown`: a real `prerm remove` executes once, but the native after-return/before-record fault retains the in-flight script hash, arguments and program-bound recovery ownership. Remove, purge and explicit recovery attempts cannot mutate the root or replace evidence. The reference terminal remove is **not** claimed equivalent to this in-flight state. |
+| Direct purge of an installed package | `direct-purge-{scriptless,scriptless-conffile,scripts,scripts-conffile,no-postrm}`: one `purge` from `install ok installed` matches pinned `dpkg --purge`, with exact callbacks `prerm remove`, `postrm remove`, `postrm purge` (only `prerm remove` without a postrm, none without scripts). The edited conffile is deleted, and no status stanza, conffile, payload or info residue remains. A package with neither conffiles nor a postrm goes straight to not-installed, as in dpkg ([#326](https://github.com/cataggar/debz/issues/326)). |
+| Interrupted direct purge | `direct-purge-recovery-*` crashes on existing boundaries: after the recorded `prerm remove` outcome (with and without a postrm), during the removal half's file removal (`mutation_target_remove`) and during its database publication. Purge re-entry is refused without mutation. Explicit recovery then finishes the same program through purge and matches the complete root and trace of the terminal dpkg purge. After an unrecorded `postrm remove` return (`after_removal_postrm_return_before_outcome`), the edited conffile is retained, and recovery (`script_outcome_unknown`), remove and purge stay blocked without mutation. That root is **not** claimed as dpkg parity. |
 | Trigger incorporation, awaited/noawait, deferred callback failure | `removal-interest-{await,noawait}-deferred-callback-failure` in `native_trigger_removal.zig`: `postrm remove` activates a named trigger; the deferred queue, failing `postinst triggered`, half-configured listener and subsequent explicit configure/purge match pinned dpkg, including actual callback counts and arguments. Existing `existing-unincorporated-queue`, `file-trigger-lifecycle`, `self-cycle-no-progress` and `two-package-cycle` compare queued work and the full no-progress terminal states; the latter now require a real callback with the expected trigger argument (dpkg may stop after one callback). |
 | **Awaited activation** from postrm removal | `removal-activate-await-refusal` (historical fixture name): both roots retain the source in `config-files`, publish the receiver as `triggers-pending` with an incorporated, empty queue, then match after receiver callback and source purge. The real postrm executes once. Four interruption boundaries retain the bound owner, lock and program; an unrecorded postrm return blocks re-entry, while known outcomes recover without rerunning postrm. See [#301](https://github.com/cataggar/debz/issues/301). |
 

@@ -2982,8 +2982,10 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
                 .{ .state = .half_installed, .unwind = null, .recovery_required = true },
             );
         }
-        const residual_state: PackageState = if (!purge and
-            package.conffiles.len == 0 and installedScript(self, entry.*, .postrm) == null)
+        // Like dpkg's removal_bulk, both remove and purge go straight to
+        // not-installed when neither conffiles nor a postrm remain.
+        const residual_state: PackageState = if (package.conffiles.len == 0 and
+            installedScript(self, entry.*, .postrm) == null)
             .not_installed
         else
             .config_files;
@@ -2995,7 +2997,7 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
         } });
         entry.state = residual_state;
     }
-    if (!purge) return;
+    if (!purge or entry.state == .not_installed) return;
     for (package.conffiles) |conffile| {
         try self.charge(1);
         last = try self.addStep(.remove, &.{last}, .{ .apply_conffile_decision = .{
@@ -5884,6 +5886,71 @@ test "native_program.test.purge removes conffiles and the database record" {
         else => {},
     };
     try testing.expect(removed_entry);
+}
+
+test "native_program.test.purge without postrm or conffiles goes straight to not-installed" {
+    const actions = [_]native_authorization.Action{.{
+        .sequence = 0,
+        .kind = .purge,
+        .package = "legacy",
+        .version = "2.0",
+        .architecture = "amd64",
+        .prior_version = "2.0",
+        .artifact = null,
+    }};
+    var authorization = try testAuthorization(testing.allocator, &actions, &.{});
+    defer authorization.deinit();
+    const ordered = removalOrdered(.purge);
+    const installed = [_]InstalledPackage{
+        .{
+            .name = "legacy",
+            .version = "2.0",
+            .architecture = "amd64",
+            .state = .installed,
+        },
+        .{
+            .name = "legacy",
+            .version = "2.0",
+            .architecture = "amd64",
+            .state = .installed,
+            .scripts = &.{
+                .{ .kind = .prerm, .sha256 = @splat(0x94) },
+                .{ .kind = .postinst, .sha256 = @splat(0x96) },
+            },
+        },
+    };
+    for (installed, 0..) |package, index| {
+        var owned = try expectProgram(compile(testing.allocator, .{
+            .authorization = &authorization.authorization,
+            .ordered_actions = &ordered,
+            .installed = .{ .generation_sha256 = @splat(0x71), .packages = &.{package} },
+        }));
+        defer owned.deinit();
+        const program = owned.program;
+        try testing.expectEqual(@as(usize, 1), program.countSteps(.remove_package_files));
+        try testing.expectEqual(@as(usize, 0), program.countSteps(.purge_package_files));
+        try testing.expectEqual(@as(usize, 0), program.countSteps(.apply_conffile_decision));
+        if (index == 0) {
+            try testing.expect(scriptCallAt(program, 0) == null);
+        } else {
+            const prerm = scriptCallAt(program, 0).?;
+            try testing.expectEqual(maintainer_script.Kind.prerm, prerm.kind);
+            try testing.expectEqualStrings("remove", prerm.arguments[0]);
+            try testing.expect(scriptCallAt(program, 1) == null);
+        }
+        var records: usize = 0;
+        var residual: ?PackageState = null;
+        for (program.steps) |step| switch (step.operation) {
+            .record_package_state => |record| if (record.state != .half_installed) {
+                records += 1;
+                residual = record.state;
+                try testing.expect(record.remove_entry);
+            },
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 1), records);
+        try testing.expectEqual(PackageState.not_installed, residual.?);
+    }
 }
 
 test "native_program.test.purge of a config-files package skips file removal" {
