@@ -84,29 +84,63 @@ def fresh_root(template: Path, workspace: Path, name: str) -> Path:
     return destination
 
 
+ESCAPE_CHECKS = (
+    "pid-namespace", "no-proc-view", "inherited-descriptors", "no-new-privileges",
+    "seccomp-filter", "capabilities", "path-escape", "re-chroot-denied",
+    "pivot-root-denied", "handle-escape-denied", "mount-denied", "umount-denied",
+    "move-mount-denied", "device-node-denied", "module-load-denied",
+    "module-file-denied", "module-remove-denied", "host-admin-denied",
+    "host-time-denied", "raw-network-denied", "unshare-denied", "setns-denied",
+    "clone-user-denied", "clone-network-denied", "clone-mount-denied", "clone3-denied",
+)
+# Unconfined root must visibly hold each authority the confined probe lacks.
+CONTROL_DETECTS = tuple(
+    check for check in ESCAPE_CHECKS if check not in ("inherited-descriptors", "path-escape")
+)
+DESCENDANT_MARKER = ".debz-escape-probe-descendant"
+
+
+def probe_results(output: str) -> dict[str, str]:
+    results: dict[str, str] = {}
+    for line in output.splitlines():
+        fields = line.split(" ", 3)
+        if len(fields) < 3 or fields[0] != "debz-escape-probe:" or fields[2] == "info":
+            continue
+        if fields[1] in results or fields[2] not in ("ok", "FAIL"):
+            raise AssertionError(f"ambiguous escape probe report: {line!r}")
+        results[fields[1]] = fields[2]
+    return results
+
+
 def operation(
     workspace: Path, name: str, launcher: Path, dpkg: Path, root: Path,
     architecture: str, archive: Path, digest: str, size: int, verb: str,
     *, readable_output: bool = False, inherited_fd: int | None = None,
+    package: str = "debz-reference-proof",
 ) -> tuple[int, str]:
     stdout_path = workspace / f"{name}.stdout"
     stderr_path = workspace / f"{name}.stderr"
     stdout_mode = "a+b" if readable_output else "ab"
-    with stdout_path.open(stdout_mode) as stdout, stderr_path.open("ab") as stderr:
-        command = [
-            str(launcher), str(root), str(dpkg), architecture, "none", verb,
-            "debz-reference-proof:" + architecture, str(archive), digest, str(size),
-        ]
-        try:
-            result = subprocess.run(
-                command, env=ORDER.oracle_environment(), stdin=subprocess.DEVNULL,
-                stdout=stdout, stderr=stderr, timeout=45,
-                pass_fds=() if inherited_fd is None else (inherited_fd,),
-                check=False,
-            )
-            status = result.returncode
-        except subprocess.TimeoutExpired:
-            status = -1
+    command = [
+        str(launcher), str(root), str(dpkg), architecture, "none", verb,
+        f"{package}:{architecture}", str(archive), digest, str(size),
+    ]
+    # subprocess.DEVNULL is read-write; the launcher requires a read-only stdin.
+    stdin = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        with stdout_path.open(stdout_mode) as stdout, stderr_path.open("ab") as stderr:
+            try:
+                result = subprocess.run(
+                    command, env=ORDER.oracle_environment(), stdin=stdin,
+                    stdout=stdout, stderr=stderr, timeout=45,
+                    pass_fds=() if inherited_fd is None else (inherited_fd,),
+                    check=False,
+                )
+                status = result.returncode
+            except subprocess.TimeoutExpired:
+                status = -1
+    finally:
+        os.close(stdin)
     assert_teardown(root)
     error = stderr_path.read_text(errors="replace")
     (workspace / f"{name}.json").write_text(json.dumps({
@@ -132,16 +166,23 @@ def main() -> None:
     parser.add_argument("--archive", type=Path, required=True)
     parser.add_argument("--archive-sha512", required=True)
     parser.add_argument("--archive-size", type=int, required=True)
+    parser.add_argument("--escape-probe", type=Path, required=True)
+    parser.add_argument("--escape-archive", type=Path, required=True)
+    parser.add_argument("--escape-archive-sha512", required=True)
+    parser.add_argument("--escape-archive-size", type=int, required=True)
     parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
     args = parser.parse_args()
     if os.geteuid() != 0 or os.getegid() != 0:
         raise PermissionError("protected reference proof requires UID/GID 0")
+    # Launcher output streams must not be group/other writable whatever the caller's umask.
+    os.umask(0o077)
     if not all(path.is_absolute() for path in (
         args.launcher, args.dpkg, args.root_template, args.workspace, args.archive,
+        args.escape_probe, args.escape_archive,
     )):
         raise ValueError("protected proof inputs must be absolute paths")
     protected(Path(__file__).resolve())
-    for path in (args.launcher, args.dpkg, args.archive):
+    for path in (args.launcher, args.dpkg, args.archive, args.escape_probe, args.escape_archive):
         protected(path)
     protected_directory(args.root_template)
     protected_directory(args.workspace, empty=True)
@@ -152,18 +193,22 @@ def main() -> None:
         mountpoint.st_size != 0 or mountpoint.st_dev != args.root_template.stat().st_dev
     ):
         raise ValueError("protected proof template has invalid proc/archive mountpoints")
-    if not re.fullmatch("[a-f0-9]{128}", args.archive_sha512):
-        raise ValueError("archive SHA512 must come from the authenticated lock")
-    if not 0 < args.archive_size <= 512 * 1024 * 1024:
-        raise ValueError("invalid authenticated archive size")
-    if args.archive.stat().st_size != args.archive_size:
-        raise ValueError("authenticated archive size differs")
-    archive_hash = hashlib.sha512()
-    with args.archive.open("rb") as source:
-        while block := source.read(1024 * 1024):
-            archive_hash.update(block)
-    if archive_hash.hexdigest() != args.archive_sha512:
-        raise ValueError("authenticated archive SHA512 differs")
+    for archive, digest, size in (
+        (args.archive, args.archive_sha512, args.archive_size),
+        (args.escape_archive, args.escape_archive_sha512, args.escape_archive_size),
+    ):
+        if not re.fullmatch("[a-f0-9]{128}", digest):
+            raise ValueError("archive SHA512 must come from the authenticated lock")
+        if not 0 < size <= 512 * 1024 * 1024:
+            raise ValueError("invalid authenticated archive size")
+        if archive.stat().st_size != size:
+            raise ValueError("authenticated archive size differs")
+        archive_hash = hashlib.sha512()
+        with archive.open("rb") as source:
+            while block := source.read(1024 * 1024):
+                archive_hash.update(block)
+        if archive_hash.hexdigest() != digest:
+            raise ValueError("authenticated archive SHA512 differs")
     identity = hashlib.sha256(args.dpkg.read_bytes()).hexdigest()
     pinned = {
         "amd64": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
@@ -242,7 +287,49 @@ def main() -> None:
         require(status, error, "UnprotectedPath", "writable")
     finally:
         parent.chmod(0o700)
-    print("protected pinned-dpkg probe/unpack and six refusals: executed without skips")
+
+    # The same static probe, unconfined, must observe every authority it checks.
+    control_path = args.workspace / "escape-control.stdout"
+    with control_path.open("xb") as control_output:
+        control = subprocess.run(
+            [str(args.escape_probe), "control"], env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"},
+            stdin=subprocess.DEVNULL, stdout=control_output, stderr=subprocess.STDOUT,
+            timeout=45, check=False,
+        )
+    control_results = probe_results(control_path.read_text(errors="replace"))
+    undetected = [check for check in CONTROL_DETECTS if control_results.get(check) != "FAIL"]
+    if control.returncode != 1 or control_results.get("result") != "FAIL" or undetected:
+        raise AssertionError(
+            f"escape-control: unconfined probe missed authority {undetected}; "
+            f"exit={control.returncode}"
+        )
+
+    # Pinned dpkg (namespace PID 1) runs the static probe as its preinst; the
+    # probe attempts each escape and leaves a detached descendant behind.
+    root = fresh_root(args.root_template, args.workspace, "escape")
+    parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        status, error = operation(
+            args.workspace, "escape", args.launcher, args.dpkg, root,
+            args.architecture, args.escape_archive, args.escape_archive_sha512,
+            args.escape_archive_size, "unpack", inherited_fd=parent_fd,
+            package="debz-reference-escape-probe",
+        )
+    finally:
+        os.close(parent_fd)
+    results = probe_results((args.workspace / "escape.stdout").read_text(errors="replace"))
+    failed = [check for check in (*ESCAPE_CHECKS, "descendant-started", "result")
+              if results.get(check) != "ok"]
+    if status != 0 or failed:
+        raise AssertionError(f"escape: confinement checks failed {failed}; exit={status}: {error}")
+    if not read_root_file(root, DESCENDANT_MARKER, 64).strip().isdigit():
+        raise AssertionError("escape: detached descendant never started")
+    if ("debz-reference-escape-probe", args.architecture) not in ORDER.database_packages(root):
+        raise AssertionError("escape: pinned dpkg did not record the probe package")
+    print(
+        "protected pinned-dpkg probe/unpack, six refusals, unconfined escape control and "
+        f"{len(ESCAPE_CHECKS)} confined escape checks with descendant teardown: executed without skips"
+    )
 
 
 if __name__ == "__main__":

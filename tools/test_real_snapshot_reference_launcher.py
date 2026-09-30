@@ -82,12 +82,44 @@ class ReferenceLauncherTests(unittest.TestCase):
              "--archive", str(self.root / "archive"),
              "--archive-sha512", "0" * 128,
              "--archive-size", "1",
+             "--escape-probe", str(self.root / "escape-probe"),
+             "--escape-archive", str(self.root / "escape-archive"),
+             "--escape-archive-sha512", "0" * 128,
+             "--escape-archive-size", "1",
              "--architecture", "amd64"],
             cwd=ROOT, text=True, capture_output=True, timeout=10,
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertRegex(result.stderr, "PermissionError|writable or non-root ancestor")
         self.assertNotIn("SKIP", result.stderr)
+
+    def test_escape_probe_report_parsing_refuses_ambiguity(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "debz_reference_protected", TOOLS / "test_real_snapshot_reference_protected.py"
+        )
+        assert spec and spec.loader
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+        report = "\n".join((
+            "Preparing to unpack /.debz-reference-archive ...",
+            "debz-escape-probe: mount-denied ok errno=PERM",
+            "debz-escape-probe: shared-network-namespace info inet_socket=SUCCESS",
+            "debz-escape-probe: result ok failures=0 mode=install",
+        ))
+        self.assertEqual(harness.probe_results(report), {"mount-denied": "ok", "result": "ok"})
+        for ambiguous in (
+            "debz-escape-probe: mount-denied ok\ndebz-escape-probe: mount-denied FAIL",
+            "debz-escape-probe: mount-denied skipped",
+        ):
+            with self.assertRaises(AssertionError):
+                harness.probe_results(ambiguous)
+        self.assertEqual(
+            set(harness.CONTROL_DETECTS) | {"inherited-descriptors", "path-escape"},
+            set(harness.ESCAPE_CHECKS),
+        )
+        probe = (TOOLS / "real-snapshot-reference-escape-probe.zig").read_text()
+        for check in (*harness.ESCAPE_CHECKS, "descendant-started", "result"):
+            self.assertIn(f'"{check}"', probe)
 
     def test_same_named_script_in_different_checkout_refuses_before_preflight(self) -> None:
         other_tools = self.root / "tools"

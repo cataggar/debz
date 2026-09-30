@@ -164,6 +164,17 @@ any capability, aborts before dpkg launch. The reference uses the kernel's
 8-byte capability header (`pid` at offset 4): Zig 0.16's
 `linux.cap_user_header_t` instead pads its `usize pid` to offset 8 on
 64-bit hosts, which made even unprivileged capget probes fail unpredictably.
+`zig build test-real-snapshot-reference-launcher` (a `security-audit`
+dependency) runs its test binary through `sudo -n`, because the capability
+transition is proven with the same real-root authority the protected
+launcher uses. That test fails, never skips, without UID 0; a separate test
+drops to UID/GID 65534 and requires the reduction to refuse with `EPERM`
+before installing any seccomp filter or dropping a bounding capability. The
+probe deliberately does not use an unprivileged user namespace: on hosted
+ubuntu-24.04, `kernel.apparmor_restrict_unprivileged_userns=1` lets
+`unshare(CLONE_NEWUSER)` succeed under a capability-denying profile whose
+effective set lacks `CAP_SYS_MODULE` while its bounding set keeps it, so a
+namespace probe there observes the LSM, not the launcher.
 It closes host descriptors on
 exec and reports setup failure separately from dpkg's exit. The driver checks
 root-owned, non-writable ancestry and mode-0700 workspaces before root
@@ -181,6 +192,7 @@ These offline checks are not a privileged isolation proof.
 `zig build test-real-snapshot-reference-protected` is a separate, mandatory
 (never skipped) ReleaseSafe proof target for a **protected** native runner.
 It requires `-Dreference-protected-{launcher,dpkg,root-template,workspace,archive,archive-sha512,archive-size,architecture}`
+and `-Dreference-protected-escape-{probe,archive,archive-sha512,archive-size}`
 with absolute paths. The checkout containing the proof program, the launcher,
 the pinned dpkg 1.22.22 executable, the independently prepared root template,
 the archive and a **new empty** workspace must have root-owned non-writable
@@ -196,15 +208,49 @@ then rejects altered archive identity/size, a readable stdout, a symlinked
 root/archive and writable ancestry. It records actual process exits and stderr per
 case, checks an unpacked dpkg database entry, and inspects surviving
 root-associated processes and mountpoints after each operation. It fails
-instead of passing or skipping when protected inputs are unavailable. This
-small gate does **not** exercise the exact signed proc profiles, prove runtime
-library binding, establish that arbitrary descendants cannot escape, or
-resolve the shared host-network decision (#278); it must not be presented as
-full protected confinement or root parity until the remaining privileged
-negative probes and independent root evidence execute.
+instead of passing or skipping when protected inputs are unavailable.
+
+The escape archive's `preinst` is the static
+`tools/real-snapshot-reference-escape-probe.zig`, run by pinned dpkg
+(namespace PID 1) on its own fresh root with an inherited host directory fd.
+It must report `ok` for every check: its parent is PID 1 and no procfs is
+visible; no descriptor above 2 survives; no-new-privileges and a seccomp
+filter are active; effective, permitted, inheritable, bounding and ambient
+capabilities hold nothing outside the allowlist; `/..` is `/`; chroot,
+pivot_root, open_by_handle_at, mount, umount, open_tree, device mknod,
+init/finit/delete_module, sethostname, settimeofday, `AF_PACKET` raw
+sockets, unshare, setns and each namespace clone fail with `EPERM` (clone3
+with `ENOSYS`). It then leaves a setsid double-forked sleeper that must be
+gone, with no process rooted in the proof root, when the launcher returns.
+The same binary is also run unconfined as root (`control`) and must report
+`FAIL` for every check except the descriptor and `/..` checks, proving each
+check detects the authority it denies. Every attempted operation targets a
+missing path, an invalid argument or the probe's own process. The shared
+network namespace is only reported (#278).
+
+`tools/real-snapshot-reference-protected-stage.sh` stages these inputs for
+the native architecture. Run it as root from a root-owned checkout (every
+ancestor root-owned and not group/world-writable) whose `.real-snapshot` is
+mode 0700, passing a root-owned Zig, a root-owned debz and a new workspace
+beneath `.real-snapshot`. It uses debz to lock and download the distribution
+dpkg's closure from the pinned authenticated Ubuntu snapshot, verifies each
+SHA512 archive before extracting the loader, libraries, tar and GNU `rm`
+into a script-free merged-usr template with `/dev/null`, `/proc` and a 1777
+`/tmp`, downloads and verifies the SHA256-pinned Debian dpkg 1.22.22 with
+`tools/prepare-native-dpkg.py`, builds the ReleaseSafe launcher and static
+probe, builds both proof archives, and writes `reference-protected.args`
+plus an `evidence/staging-manifest.txt` of input hashes. Pass that file's
+options to the target, for example
+`zig build test-real-snapshot-reference-protected $(cat WORKSPACE/reference-protected.args) -Doptimize=ReleaseSafe`.
+It does not run the proof.
+
+This gate does **not** exercise the exact signed proc profiles, prove runtime
+library binding (#263), or resolve the shared host-network decision (#278).
+An arm64 run is not amd64 evidence; hosted protected execution is #268.
 
 PID 1 now refuses supervisor-pipe EOF (including the death-before-`prctl`
-window), not just unexpected bytes; its installed seccomp policy also refuses
+window), not just unexpected bytes, and requires `getppid()` to be 0 because
+its supervisor lies outside the new PID namespace; its installed seccomp policy also refuses
 every Linux `CLONE_NEW*` namespace flag after setup, including `NEWNET`,
 without changing the inherited network namespace. This is independent of
 the native script host's policy (#257) and does not settle #278.

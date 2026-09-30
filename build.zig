@@ -370,10 +370,24 @@ pub fn build(b: *std.Build) void {
     });
     reference_launcher_module.link_libc = true;
     const reference_launcher_tests = b.addTest(.{ .root_module = reference_launcher_module });
-    const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);
-    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation and syscall filters")
+    // The capability transition must be proven with real root authority, as the
+    // protected launcher runs; the unprivileged refusal is a separate test.
+    const run_reference_launcher_tests = b.addSystemCommand(&.{ "sudo", "-n", "--" });
+    run_reference_launcher_tests.addArtifactArg(reference_launcher_tests);
+    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation, syscall filters and root capability transition")
         .dependOn(&run_reference_launcher_tests.step);
     audit_step.dependOn(&run_reference_launcher_tests.step);
+    // The protected proof stages this static probe itself; compiling it here
+    // keeps it building on every audited architecture.
+    const reference_escape_probe = b.addExecutable(.{
+        .name = "real-snapshot-reference-escape-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/real-snapshot-reference-escape-probe.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    audit_step.dependOn(&reference_escape_probe.step);
     const protected_reference = b.addSystemCommand(
         &.{ "python3", "tools/test_real_snapshot_reference_protected.py" },
     );
@@ -392,6 +406,14 @@ pub fn build(b: *std.Build) void {
         b.option([]const u8, "reference-protected-archive-sha512", "Authenticated archive SHA512") orelse "",
         "--archive-size",
         b.fmt("{d}", .{b.option(usize, "reference-protected-archive-size", "Authenticated archive byte size") orelse 0}),
+        "--escape-probe",
+        b.option([]const u8, "reference-protected-escape-probe", "Root-owned static escape probe run unconfined as a control") orelse "",
+        "--escape-archive",
+        b.option([]const u8, "reference-protected-escape-archive", "Protected archive whose preinst is the static escape probe") orelse "",
+        "--escape-archive-sha512",
+        b.option([]const u8, "reference-protected-escape-archive-sha512", "Escape probe archive SHA512") orelse "",
+        "--escape-archive-size",
+        b.fmt("{d}", .{b.option(usize, "reference-protected-escape-archive-size", "Escape probe archive byte size") orelse 0}),
         "--architecture",
         b.option([]const u8, "reference-protected-architecture", "Native amd64 or arm64") orelse "",
     });

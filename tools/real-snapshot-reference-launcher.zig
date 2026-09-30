@@ -490,7 +490,6 @@ fn readBootId() ![37]u8 {
 }
 
 const Child = struct {
-    parent_pid: i32,
     options: Options,
     root: Pinned,
     proc_mountpoint: Pinned,
@@ -860,7 +859,9 @@ fn childMain(input: Child) noreturn {
         0,
         0,
     ), status, 2);
-    if (linux.getppid() != child.parent_pid) fail(status, 2, .CHILD);
+    // PID 1 of the new PID namespace sees its supervisor as PID 0; the control
+    // pipe then proves the supervisor did not exit before PDEATHSIG was armed.
+    if (linux.getppid() != 0) fail(status, 2, .CHILD);
     if (!supervisorPipeAlive(child.control_pipe[0])) fail(status, 2, .CHILD);
     _ = linux.close(child.control_pipe[0]);
     must(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0), status, 3);
@@ -1034,7 +1035,6 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
         _ = linux.close(control[1]);
     }
     const child: Child = .{
-        .parent_pid = linux.getpid(),
         .options = options,
         .root = root,
         .proc_mountpoint = proc,
@@ -1071,8 +1071,12 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
     return linux.W.EXITSTATUS(status);
 }
 
-test "reference capability transition clears ambient and high bounding privileges" {
+test "reference capability transition clears ambient and high bounding privileges as root" {
     try capabilityTransitionProbe();
+}
+
+test "reference capability transition fails closed without root authority" {
+    try unprivilegedTransitionProbe();
 }
 
 test "reference launcher rejects wider profiles and unsafe operation shapes" {
@@ -1174,13 +1178,14 @@ test "reference capability transition retains only filesystem and account author
     try std.testing.expectEqual(@as(u32, 0), data[1].inheritable);
 }
 
+// The protected launcher runs as real root, so this probe does too (the build
+// runs the test binary through `sudo -n`). A user namespace is not a substitute:
+// an LSM may confine it and filter its effective set but not its bounding set.
 fn capabilityTransitionProbe() !void {
     const child = linux.fork();
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(child));
     if (child == 0) {
-        const isolated = linux.errno(linux.syscall1(.unshare, linux.CLONE.NEWUSER));
-        if (isolated == .PERM or isolated == .NOSYS) linux.exit(77);
-        if (isolated != .SUCCESS) linux.exit(1);
+        if (linux.geteuid() != 0 or linux.getuid() != 0) linux.exit(14);
         var data: [2]linux.cap_user_data_t = undefined;
         if (readCapabilities(&data) != .SUCCESS) linux.exit(2);
         if (linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.SYS_MODULE, 0, 0, 0) == 1 and
@@ -1221,7 +1226,40 @@ fn capabilityTransitionProbe() !void {
     );
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(waited));
     try std.testing.expect(linux.W.IFEXITED(status));
-    if (linux.W.EXITSTATUS(status) == 77) return error.SkipZigTest;
+    if (linux.W.EXITSTATUS(status) == 14) return error.CapabilityProbeRequiresRoot;
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+}
+
+fn unprivilegedTransitionProbe() !void {
+    const child = linux.fork();
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(child));
+    if (child == 0) {
+        if (linux.geteuid() == 0 or linux.getuid() == 0) {
+            const nobody = [_]linux.gid_t{65534};
+            if (linux.errno(linux.setgroups(nobody.len, &nobody)) != .SUCCESS) linux.exit(1);
+            if (linux.errno(linux.setresgid(65534, 65534, 65534)) != .SUCCESS) linux.exit(1);
+            if (linux.errno(linux.setresuid(65534, 65534, 65534)) != .SUCCESS) linux.exit(1);
+        }
+        var data: [2]linux.cap_user_data_t = undefined;
+        if (readCapabilities(&data) != .SUCCESS) linux.exit(2);
+        if (data[0].effective != 0 or data[0].permitted != 0 or
+            data[1].effective != 0 or data[1].permitted != 0) linux.exit(3);
+        if (restrictReferencePrivileges() != .PERM) linux.exit(4);
+        if (linux.prctl(@intFromEnum(linux.PR.GET_SECCOMP), 0, 0, 0, 0) != 0) linux.exit(5);
+        if (linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), linux.CAP.DAC_READ_SEARCH, 0, 0, 0) != 1)
+            linux.exit(6);
+        linux.exit(0);
+    }
+    var status: u32 = 0;
+    const waited = linux.syscall4(
+        .wait4,
+        @bitCast(@as(isize, @intCast(child))),
+        @intFromPtr(&status),
+        0,
+        0,
+    );
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(waited));
+    try std.testing.expect(linux.W.IFEXITED(status));
     try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
 }
 

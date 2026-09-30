@@ -107,9 +107,12 @@ re-enabling the full opt-in reference run. No retained failed root may be
 reused as a fresh proof.
 The opt-in `test-real-snapshot-reference-protected` Zig build target requires
 explicit root-owned protected fixture paths and a fresh proof workspace; it
-returns a failure, not a skip, without them. Its small pinned-dpkg operations
-and refusals are not a substitute for the exact signed proc, runtime binding,
-descendant teardown and network proofs required before #258 can close.
+returns a failure, not a skip, without them;
+`tools/real-snapshot-reference-protected-stage.sh` stages them. Its
+pinned-dpkg operations, refusals and confined escape probe (including
+detached-descendant teardown) are not a substitute for the exact signed proc
+profiles, runtime binding (#263), hosted protected staging (#268) or the
+network decision (#278).
 Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
 dpkg/helper/package state, selects `native` explicitly, and exec-traces
 candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.
@@ -140,6 +143,9 @@ The required audit step runs Zig-owned policy mutations and offline snapshot
 workflow tests alongside the production Python audit utility. It does not
 download or execute the live snapshot; see the
 [test inventory](tooling-test-inventory.md) for the preserved negative cases.
+It needs passwordless `sudo -n` (as on hosted runners): the reference
+launcher's capability-transition test runs as real root and fails closed,
+rather than skipping, when that authority is unavailable.
 
 Zig's Debug and ReleaseSafe modes provide bounds, overflow and safety checks.
 The repository does not claim a C sanitizer gate: libsolv and libzstd are
