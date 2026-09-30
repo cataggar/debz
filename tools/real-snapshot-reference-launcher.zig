@@ -1071,10 +1071,6 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
     return linux.W.EXITSTATUS(status);
 }
 
-test "reference capability transition clears ambient and high bounding privileges as root" {
-    try capabilityTransitionProbe();
-}
-
 test "reference capability transition fails closed without root authority" {
     try unprivilegedTransitionProbe();
 }
@@ -1142,9 +1138,7 @@ test "reference syscall filter denies namespace changes and permits ordinary for
     }
     try std.testing.expectEqual(@as(u32, 0x00050001), try evaluateFilter(arch, @intFromEnum(linux.SYS.chroot), 0));
     try std.testing.expectEqual(@as(u32, 0x00050026), try evaluateFilter(arch, @intFromEnum(linux.SYS.clone3), 0));
-    inline for (.{ linux.CLONE.NEWUSER, linux.CLONE.NEWNS, linux.CLONE.NEWPID,
-        linux.CLONE.NEWNET, linux.CLONE.NEWUTS, linux.CLONE.NEWIPC,
-        linux.CLONE.NEWCGROUP, linux.CLONE.NEWTIME }) |flag| {
+    inline for (.{ linux.CLONE.NEWUSER, linux.CLONE.NEWNS, linux.CLONE.NEWPID, linux.CLONE.NEWNET, linux.CLONE.NEWUTS, linux.CLONE.NEWIPC, linux.CLONE.NEWCGROUP, linux.CLONE.NEWTIME }) |flag| {
         try std.testing.expectEqual(@as(u32, 0x00050001), try evaluateFilter(arch, @intFromEnum(linux.SYS.clone), flag));
     }
     try std.testing.expectEqual(@as(u32, 0x7fff0000), try evaluateFilter(arch, @intFromEnum(linux.SYS.clone), 0));
@@ -1178,10 +1172,12 @@ test "reference capability transition retains only filesystem and account author
     try std.testing.expectEqual(@as(u32, 0), data[1].inheritable);
 }
 
-// The protected launcher runs as real root, so this probe does too (the build
-// runs the test binary through `sudo -n`). A user namespace is not a substitute:
-// an LSM may confine it and filter its effective set but not its bounding set.
-fn capabilityTransitionProbe() !void {
+// The protected launcher runs as real root, so this probe does too: only
+// `tools/real-snapshot-reference-launcher-root-test.zig`, run through `sudo -n`
+// by `zig build test-real-snapshot-reference-launcher-root`, calls it. A user
+// namespace is not a substitute: an LSM may confine it and filter its effective
+// set but not its bounding set.
+pub fn capabilityTransitionProbe() !void {
     const child = linux.fork();
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(child));
     if (child == 0) {
@@ -1279,16 +1275,14 @@ test "installed reference filter refuses module, mount, re-chroot, and namespace
         const installed = linux.errno(linux.syscall3(.seccomp, 1, 0, @intFromPtr(&policy)));
         if (installed != .SUCCESS) linux.exit(2);
         inline for (.{
-            linux.SYS.init_module, linux.SYS.finit_module, linux.SYS.delete_module,
-            linux.SYS.mount, linux.SYS.open_tree, linux.SYS.move_mount,
-            linux.SYS.mount_setattr, linux.SYS.chroot, linux.SYS.unshare,
+            linux.SYS.init_module,   linux.SYS.finit_module, linux.SYS.delete_module,
+            linux.SYS.mount,         linux.SYS.open_tree,    linux.SYS.move_mount,
+            linux.SYS.mount_setattr, linux.SYS.chroot,       linux.SYS.unshare,
             linux.SYS.setns,
         }) |call| {
             if (linux.errno(linux.syscall0(call)) != .PERM) linux.exit(3);
         }
-        inline for (.{ linux.CLONE.NEWUSER, linux.CLONE.NEWNS,
-            linux.CLONE.NEWPID, linux.CLONE.NEWNET, linux.CLONE.NEWUTS,
-            linux.CLONE.NEWIPC, linux.CLONE.NEWCGROUP, linux.CLONE.NEWTIME }) |flag| {
+        inline for (.{ linux.CLONE.NEWUSER, linux.CLONE.NEWNS, linux.CLONE.NEWPID, linux.CLONE.NEWNET, linux.CLONE.NEWUTS, linux.CLONE.NEWIPC, linux.CLONE.NEWCGROUP, linux.CLONE.NEWTIME }) |flag| {
             const clone = linux.clone2(flag | @intFromEnum(linux.SIG.CHLD), 0);
             if (linux.errno(clone) != .PERM) linux.exit(4);
         }
@@ -1298,8 +1292,11 @@ test "installed reference filter refuses module, mount, re-chroot, and namespace
         if (ordinary == 0) linux.exit(0);
         var grandchild_status: u32 = 0;
         const reaped = linux.syscall4(
-            .wait4, @bitCast(@as(isize, @intCast(ordinary))),
-            @intFromPtr(&grandchild_status), 0, 0,
+            .wait4,
+            @bitCast(@as(isize, @intCast(ordinary))),
+            @intFromPtr(&grandchild_status),
+            0,
+            0,
         );
         if (linux.errno(reaped) != .SUCCESS or
             !linux.W.IFEXITED(grandchild_status) or

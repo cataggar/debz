@@ -37,8 +37,8 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 489,
-      "sha512": "c5c300fd5cbe613b7ee8788843e76d475b15d8205103faa355997091fea5bf446ebd3de216146c78df5749952ada68ed15fbb8d4c25837430cc992eabc433ecb"
+      "count": 490,
+      "sha512": "97a5e424406784749ddf969350dd1ec931d2b99541fd99f4ed119988aa16b5aa47b8fc0b41097b8149d75cea223b6d427bd805853f696faba1b743c1c9b1ea09"
     },
     "findings": {
       "count": 21574,

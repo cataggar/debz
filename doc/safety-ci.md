@@ -143,9 +143,12 @@ The required audit step runs Zig-owned policy mutations and offline snapshot
 workflow tests alongside the production Python audit utility. It does not
 download or execute the live snapshot; see the
 [test inventory](tooling-test-inventory.md) for the preserved negative cases.
-It needs passwordless `sudo -n` (as on hosted runners): the reference
-launcher's capability-transition test runs as real root and fails closed,
-rather than skipping, when that authority is unavailable.
+It needs no passwordless sudo. The same CI job then runs
+`zig build test-real-snapshot-reference-launcher-root`, which proves the
+reference launcher's capability transition as real root through `sudo -n`
+and fails with `CapabilityProbeRequiresRoot`, rather than skipping, without
+that authority; the audit refuses a missing, conditional or
+`continue-on-error` step and any audit dependency on it.
 
 Zig's Debug and ReleaseSafe modes provide bounds, overflow and safety checks.
 The repository does not claim a C sanitizer gate: libsolv and libzstd are

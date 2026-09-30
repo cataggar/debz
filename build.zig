@@ -370,13 +370,24 @@ pub fn build(b: *std.Build) void {
     });
     reference_launcher_module.link_libc = true;
     const reference_launcher_tests = b.addTest(.{ .root_module = reference_launcher_module });
-    // The capability transition must be proven with real root authority, as the
-    // protected launcher runs; the unprivileged refusal is a separate test.
-    const run_reference_launcher_tests = b.addSystemCommand(&.{ "sudo", "-n", "--" });
-    run_reference_launcher_tests.addArtifactArg(reference_launcher_tests);
-    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation, syscall filters and root capability transition")
+    const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);
+    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation, syscall filters and unprivileged capability refusal")
         .dependOn(&run_reference_launcher_tests.step);
     audit_step.dependOn(&run_reference_launcher_tests.step);
+    // The capability transition must be proven with the real root authority the
+    // protected launcher uses. It stays outside security-audit, which must run
+    // without passwordless sudo; CI runs this step explicitly.
+    const reference_launcher_root_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-launcher-root-test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_launcher_root_module.link_libc = true;
+    const reference_launcher_root_tests = b.addTest(.{ .root_module = reference_launcher_root_module });
+    const run_reference_launcher_root_tests = b.addSystemCommand(&.{ "sudo", "-n", "--" });
+    run_reference_launcher_root_tests.addArtifactArg(reference_launcher_root_tests);
+    b.step("test-real-snapshot-reference-launcher-root", "Prove the reference capability transition as root through sudo -n")
+        .dependOn(&run_reference_launcher_root_tests.step);
     // The protected proof stages this static probe itself; compiling it here
     // keeps it building on every audited architecture.
     const reference_escape_probe = b.addExecutable(.{

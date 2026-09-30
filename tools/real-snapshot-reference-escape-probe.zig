@@ -12,7 +12,7 @@ const linux = std.os.linux;
 
 const CapHeader = extern struct { version: u32 = 0x20080522, pid: i32 = 0 };
 const allowed_caps = [_]u32{
-    linux.CAP.CHOWN,  linux.CAP.DAC_OVERRIDE, linux.CAP.FOWNER, linux.CAP.FSETID,
+    linux.CAP.CHOWN,  linux.CAP.DAC_OVERRIDE, linux.CAP.FOWNER,  linux.CAP.FSETID,
     linux.CAP.SETGID, linux.CAP.SETUID,       linux.CAP.SETFCAP,
 };
 const missing: [*:0]const u8 = "/.debz-escape-probe-missing";
@@ -171,10 +171,9 @@ fn checkPrivileges() void {
         if (bounded == 1 and !allowed(count)) extra_bounding += 1;
         if (linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), 1, count, 0, 0) == 1) ambient += 1;
     }
-    report("capabilities", !extra_sets and extra_bounding == 0 and ambient == 0 and count > 0,
-        "effective0=0x{x} permitted0=0x{x} word1=0x{x} extra_bounding={d} ambient={d} known={d}", .{
+    report("capabilities", !extra_sets and extra_bounding == 0 and ambient == 0 and count > 0, "effective0=0x{x} permitted0=0x{x} word1=0x{x} extra_bounding={d} ambient={d} known={d}", .{
         data[0].effective, data[0].permitted, data[1].effective | data[1].permitted,
-        extra_bounding, ambient, count,
+        extra_bounding,    ambient,           count,
     });
 }
 

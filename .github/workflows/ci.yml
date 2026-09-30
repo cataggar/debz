@@ -1416,6 +1416,8 @@ jobs:
             https://example.invalid stonking amd64
       - name: Run static security audit
         run: zig build security-audit
+      - name: Prove root reference capability transition
+        run: zig build test-real-snapshot-reference-launcher-root --summary all
 
   release-dry-run:
     name: Required release dry-run (${{ matrix.platform }})

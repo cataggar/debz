@@ -1685,3 +1685,52 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
         try refused.failsWith("required fixture import is missing");
     }
 }
+
+test "security: root reference capability proof stays required outside the sudo-free audit" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "reference-root", ".github/workflows/ci.yml", &.{
+        "      - name: Prove root reference capability transition\n",
+        "        run: zig build test-real-snapshot-reference-launcher-root --summary all\n",
+    });
+    try nativeMutations(&f, "reference-root", "build.zig", &.{
+        "    audit_step.dependOn(&run_reference_launcher_tests.step);\n",
+        "\"sudo\", \"-n\", \"--\" ",
+        "    run_reference_launcher_root_tests.addArtifactArg(reference_launcher_root_tests);\n",
+        "b.step(\"test-real-snapshot-reference-launcher-root\", ",
+    });
+    try nativeMutations(&f, "reference-root", "tools/real-snapshot-reference-launcher.zig", &.{
+        "    if (linux.W.EXITSTATUS(status) == 14) return error.CapabilityProbeRequiresRoot;\n",
+        "        if (linux.geteuid() != 0 or linux.getuid() != 0) linux.exit(14);\n",
+        "        if (restrictReferencePrivileges() != .PERM) linux.exit(4);\n",
+        "    try unprivilegedTransitionProbe();\n",
+    });
+    try nativeMutations(&f, "reference-root", "tools/real-snapshot-reference-launcher-root-test.zig", &.{
+        "    try launcher.capabilityTransitionProbe();\n",
+    });
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const root_step = "      - name: Prove root reference capability transition\n";
+    const build = try f.source("build.zig");
+    const launcher = try f.source("tools/real-snapshot-reference-launcher.zig");
+    const root_test = try f.source("tools/real-snapshot-reference-launcher-root-test.zig");
+    for ([_]struct { path: []const u8, text: []const u8 }{
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, root_step, root_step ++ "        if: false\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, root_step, root_step ++ "        continue-on-error: true\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    name: Security and dependency policy\n", "    name: Security and dependency policy\n    if: false\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "--summary all\n\n  release-dry-run:", "--summary all\n        if: ${{ github.event_name == 'push' }}\n\n  release-dry-run:") },
+        .{ .path = "build.zig", .text = try f.replace(build, "    audit_step.dependOn(&run_reference_launcher_tests.step);\n", "    audit_step.dependOn(&run_reference_launcher_tests.step);\n    audit_step.dependOn(&run_reference_launcher_root_tests.step);\n") },
+        .{ .path = "build.zig", .text = try f.replace(build, "const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);", "const run_reference_launcher_tests = b.addSystemCommand(&.{ \"sudo\", \"-n\", \"--\" });") },
+        .{ .path = "tools/real-snapshot-reference-launcher.zig", .text = try f.replace(launcher, "test \"reference launcher rejects wider", "test \"reference capability transition as root\" {\n    try capabilityTransitionProbe();\n}\n\ntest \"reference launcher rejects wider") },
+        .{ .path = "tools/real-snapshot-reference-launcher.zig", .text = try f.replace(launcher, "return error.CapabilityProbeRequiresRoot;", "return error.SkipZigTest;") },
+        .{ .path = "tools/real-snapshot-reference-launcher-root-test.zig", .text = try f.replace(root_test, "    try launcher.capabilityTransitionProbe();\n", "    if (@import(\"std\").os.linux.geteuid() != 0) return error.SkipZigTest;\n    try launcher.capabilityTransitionProbe();\n") },
+    }) |mutation| {
+        const refused = try nativeCheck(&f, "reference-root", mutation.path, mutation.text);
+        defer refused.deinit();
+        if (refused.code == 0) std.debug.print("unchecked reference-root mutation in {s}\n", .{mutation.path});
+        try testing.expectEqual(@as(u8, 1), refused.code);
+        try refused.failsWith("security-audit:");
+    }
+    const missing = try nativeCheck(&f, "reference-root", "tools/real-snapshot-reference-launcher-root-test.zig", null);
+    defer missing.deinit();
+    try testing.expectEqual(@as(u8, 1), missing.code);
+}

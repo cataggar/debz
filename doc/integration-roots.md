@@ -165,11 +165,17 @@ any capability, aborts before dpkg launch. The reference uses the kernel's
 `linux.cap_user_header_t` instead pads its `usize pid` to offset 8 on
 64-bit hosts, which made even unprivileged capget probes fail unpredictably.
 `zig build test-real-snapshot-reference-launcher` (a `security-audit`
-dependency) runs its test binary through `sudo -n`, because the capability
-transition is proven with the same real-root authority the protected
-launcher uses. That test fails, never skips, without UID 0; a separate test
-drops to UID/GID 65534 and requires the reduction to refuse with `EPERM`
-before installing any seccomp filter or dropping a bounding capability. The
+dependency) runs unprivileged, so the audit needs no passwordless sudo; its
+refusal test drops to UID/GID 65534 when started as root and requires the
+reduction to refuse with `EPERM` before installing any seccomp filter or
+dropping a bounding capability. The capability transition itself is proven
+with the same real-root authority the protected launcher uses by the
+separate `zig build test-real-snapshot-reference-launcher-root`, which runs
+`tools/real-snapshot-reference-launcher-root-test.zig` (and the launcher's
+unprivileged tests) through `sudo -n`. That test fails with
+`CapabilityProbeRequiresRoot`, never skips, without UID 0. The required
+Security and dependency policy CI job runs it as an explicit unconditional
+step, and `security-audit` pins that step and wiring. The
 probe deliberately does not use an unprivileged user namespace: on hosted
 ubuntu-24.04, `kernel.apparmor_restrict_unprivileged_userns=1` lets
 `unshare(CLONE_NEWUSER)` succeed under a capability-denying profile whose
