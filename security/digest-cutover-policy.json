@@ -37,19 +37,19 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 482,
-      "sha512": "1f424af87716578e7046ee7efb9518dbc9d15b9fe474c101961fd4c41bdb1cb5c2a7a4389c98e6a76957535dd5dcb3a944d9616bbdf72a1b9fef788d5d5370ef"
+      "count": 483,
+      "sha512": "bb21be328a78b14e3df9734f91d49ef9a4d76a93385ea8844596a13d00de06d12faacb554459f5658463ea166775b708736e5355cdeeed6373a70c7dbbc20528"
     },
     "findings": {
-      "count": 21547,
+      "count": 21550,
       "counts": {
         "cas_layout": 194,
         "digest_version": 103,
         "fixed_64_hex": 179,
         "raw_32_byte": 1210,
-        "sha256_token": 19861
+        "sha256_token": 19864
       },
-      "sha512": "22f12c219c73a04e8d691cb4435fa065ba0cc768f724f06a9fb665347e20ff96bbbe810efd91959e3d6fda7af392affe48591cd8a393a1e6ed4cb841a8141032"
+      "sha512": "a47d2573cec6dcaa93d615525d556dda1f4f603f8188145d58a6a6afa230234df77ddf2995917f6912f3f446fd9345f86122ec694ec68f8dea21d270458831f3"
     },
     "classifications": [
       {
@@ -168,15 +168,15 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority. Recovery selector mutation controls protect both journal/staging and publication runners and their pinned dpkg handoffs.",
-        "count": 961,
+        "count": 964,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 8,
           "raw_32_byte": 78,
-          "sha256_token": 871
+          "sha256_token": 874
         },
-        "sha512": "e6314e53090fd20dad23076ecd30155ac3ea8e3373a0424b733d97df7ffd0c7dbf4c52604a0fef3b8d05b99f72b3bba7c7075386109413410176b6ed405de1b0"
+        "sha512": "6086c805519a8e4830845de40fc481f560395cf5cace0c6edef33653edb7e8f9f5f40d63d08dd619ac646cb3aa223017d636f3c3796bc7714721cbf3be4be62a"
       },
       {
         "scope": "tools",
