@@ -5572,7 +5572,7 @@ fn mapRuntimeError(operation: api.Operation, err: anyerror) api.Result {
         error.MalformedKeyring,
         error.NoKeyrings,
         => api.failure(operation, .authentication, .repository_authentication_failed, @errorName(err)),
-        error.PackageTooLarge, error.SizeMismatch, error.DigestMismatch => api.failure(operation, .download, .download_failed, @errorName(err)),
+        error.PackageTooLarge, error.SizeMismatch, error.DigestMismatch, error.DerivedDigestMismatch => api.failure(operation, .download, .download_failed, @errorName(err)),
         error.InvalidPackagePayload => api.failure(operation, .download, .download_failed, @errorName(err)),
         else => api.failure(operation, .internal, .internal_error, @errorName(err)),
     };

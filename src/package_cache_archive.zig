@@ -521,6 +521,7 @@ pub fn importTaggedFile(
         if (!content_digest.Identity.eql(identity, locked.archive_identity) or
             locked.declared_size != size or matches[lock_index] != null)
             return error.LockObjectMismatch;
+        locked.verifyDerivedSha512(bytes) catch return error.LockObjectMismatch;
         matches[lock_index] = .{
             .identity = identity,
             .size = size,

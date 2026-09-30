@@ -1,13 +1,18 @@
 # Debian 13 stable signed-input readiness (issue #261)
 
-**Blocked, not an acceptance closure.** The pinned Debian `trixie` snapshot
-has an authenticatable, still-fresh Release and parseable `main` indexes, but
-publishes **SHA256 only** for the selected indexes and **every** package
-archive. It cannot produce the required **SHA512-primary** exact v3 lock.
-Neither the Ubuntu `stonking` closure nor a locally computed SHA512 of a
-SHA256-authenticated archive substitutes for a published Debian identity.
-No Debian package was resolved, downloaded into CAS, installed, or claimed
-supported in this session.
+**Eligible signed input, not an acceptance closure.** The pinned Debian
+`trixie` snapshot has an authenticatable, still-fresh Release and parseable
+`main` indexes. It publishes **SHA256 only** for the selected indexes and
+**every** package archive. The #261 owner decision accepts those signed SHA256
+Release/Packages entries (plus size) as the authenticated archive binding. An
+exact v3 lock marks such a repository
+`"archive_binding":"signed_sha256_derived_sha512"`. It records each archive's
+locally computed SHA512 only in `derived_archive_identity`, with provenance
+`derived_from_signed_sha256`, and only after the bytes matched the signed
+SHA256 ([exact locks](exact-locks-and-provenance.md)). A derived SHA512 is
+never presented as signed, and the Ubuntu `stonking` closure is not a
+substitute for Debian. No Debian package was resolved, downloaded into CAS,
+installed, or claimed supported in this session.
 
 ## Reviewed source, trust, and freshness
 
@@ -57,7 +62,7 @@ also underwent matching-architecture debz authenticated refresh in this
 session. The amd64 checksum inspection performed on arm64 is **not** an
 amd64 native signed-refresh run.
 
-## Reproduce the read-only refusal
+## Reproduce the read-only preflight
 
 From a fresh checkout with Zig 0.16.0 and Python 3:
 
@@ -70,12 +75,23 @@ python3 tools/debian-stable-readiness.py \
 ```
 
 Use `--architecture amd64` only on an x86_64 runner and give each attempt a
-new direct child of this checkout's `.tmp`. The command deliberately exits
-**3** with `blocked_missing_published_sha512`, rather than resolving a
-weaker lock. Authentication, index checksum and bounded missing-expiry
-freshness failures exit **2**. A mismatched native architecture is rejected
-before network access and workspace creation. The helper never invokes
-`plan`, `download`, or any mutating debz transaction.
+new direct child of this checkout's `.tmp`. For this snapshot the preflight
+exits **0** with status `eligible_signed_sha256_derived_sha512` and
+`archive_binding: "signed_sha256_derived_sha512"`. A repository whose signed
+index and every record publish SHA512 reports `eligible_signed_sha512`
+(`published_digests`). A repository that publishes SHA512 only partially exits
+**3** with `refused_partial_published_sha512`, because one repository cannot
+mix signed-SHA512 and SHA256-bound archives. Exit **2** covers:
+
+- authentication failures;
+- index checksum failures, including a substituted record SHA256, which
+  changes the signed index identity;
+- a missing or malformed record SHA256;
+- bounded missing-expiry freshness failures.
+
+A mismatched native architecture is rejected before network access and
+workspace creation. The helper never invokes `plan`, `download`, or any
+mutating debz transaction, and never publishes a lock.
 
 The exact generated deb822 source bytes are:
 
@@ -103,45 +119,70 @@ keeps repository identity constant for independent runs in one checkout;
 the per-workspace config digest naturally differs because `source_path`
 contains the workspace. Cross-machine byte-identical lock comparisons will
 require the same reviewed absolute `Signed-By` path (it is part of
-repository identity) once a suitable Debian snapshot exists.
+repository identity) once bound Debian locks are produced.
 
-Two fresh, independent **native arm64** ReleaseSafe preflights returned
-`refresh.exit_status=0`, retained the same Release and
-`be16b37b...` index hashes and all 68,196 SHA256-only package records,
-and exited 3 without altering either root. An authenticated cache-only
-refresh reverified the retained multi-signature snapshot. No amd64 native
-runner was available here, so it has **not** independently refreshed.
-The bounded [arm64 run evidence](../tools/fixtures/debian-stable-readiness-arm64-evidence-v1.json)
-retains both local repository IDs, executable/source/config byte hashes,
-observed refusal codes, and explicit absence of lock, CAS, and root mutation.
-It is an input **blocker** ledger, not signed-root acceptance or an
-externally attested workflow artifact.
+Before the #261 decision, two fresh, independent **native arm64** ReleaseSafe
+preflights returned `refresh.exit_status=0`. They retained the same Release
+and `be16b37b...` index hashes and all 68,196 SHA256-only package records,
+then exited 3 without altering either root. An authenticated cache-only
+refresh reverified the retained multi-signature snapshot. That bounded
+[pre-decision arm64 evidence](../tools/fixtures/debian-stable-readiness-arm64-evidence-v1.json)
+remains a historical refusal ledger.
+
+After the decision, two more fresh, independent native arm64 ReleaseSafe
+preflights of the signed-SHA256 binding change produced the same repository
+identity `7fe912e2...`. They reverified the same Release, the index, and the
+signed SHA256 of all 68,196 records, and found no published SHA512. Both
+exited 0 with `eligible_signed_sha256_derived_sha512` and left the root
+empty. The
+[post-decision arm64 evidence](../tools/fixtures/debian-stable-readiness-arm64-evidence-v2.json)
+retains:
+
+- executable, source, and config byte hashes;
+- the repository identity and the binding status;
+- the explicit absence of any lock, CAS, and root mutation.
+
+No amd64 native runner was available here, so amd64 has **not**
+independently refreshed. Both ledgers are input evidence, not signed-root
+acceptance or externally attested workflow artifacts.
 
 ## Prioritized closure blockers and next steps
 
-1. **P0, input provenance:** choose a current, complete, independently
-   reviewed Debian stable signed source whose Release **and every selected
-   package record** actually publish SHA512. This selected official snapshot
-   does not. Do not synthesize digests, backdate verification, switch to
-   Ubuntu, or call SHA256-primary locks acceptance artifacts. If Debian
-   stable cannot publish these identities, decide the issue's SHA512
-   requirement explicitly before resuming.
-2. **P1, native evidence:** run independently on native amd64 and arm64
+1. **Resolved, input provenance:** the #261 decision accepts this snapshot's
+   signed SHA256 archive entries. Exact-lock v3 records that authority
+   explicitly with the `signed_sha256_derived_sha512` binding. Library
+   binding (`bindSignedSha256Repositories`) and every consumer (acquisition,
+   cache hit, tagged CAS import, native unpack) verify the signed SHA256
+   before the derived SHA512 and refuse any mismatch. Do not synthesize
+   signed SHA512 values, backdate verification, or switch to Ubuntu.
+2. **P0, product lock publication:** `download --lock-output` still writes
+   an unbound v3 lock before acquisition. It has no source, configuration,
+   or CLI opt-in for a SHA256-signed repository. The remaining step must
+   acquire every locked archive, verify its signed SHA256, bind the derived
+   SHA512 through the library above, and publish only the bound lock. An
+   unbound SHA256-only lock is not an acceptance artifact under
+   `sha512_identity_required`.
+3. **P1, native evidence:** run independently on native amd64 and arm64
    with one normalized keyring path and fresh roots/caches. Repeat
-   signed refresh, resolve a representative closure, bind complete v3
-   SHA512-primary identities, acquire every exact-size/all-published-digest
-   archive into CAS, and compare byte-identical locks and CAS inventory.
-   This session has **no** accepted package set, lock, CAS inventory, or
-   signed archive payload, so its vendor integration closure is empty by
-   policy, not a claimed supported empty Debian install.
-3. **P1, native feature gap inventory:** only after (1)–(2), inspect the
-   actual selected `.deb` control/data members: exact package and script
-   versions, invoked script arguments and tools, conffiles, trigger
-   interests/activations, diversions, accounts, system features, and
-   explicitly unsupported native cases before **any** mutation. No
-   speculative script gap is marked fixed or supported by the current
-   metadata-only reconnaissance.
-4. **P2, parity:** native/reference fresh-root execution and full equality
+   signed refresh, resolve a representative closure, and bind complete
+   v3 identities with the explicit derived-SHA512 provenance. Then acquire
+   every exact-size, signed-SHA256 archive into CAS and compare
+   byte-identical locks and CAS inventory. This session has **no** accepted
+   package set, lock, CAS inventory, or signed archive payload. Its vendor
+   integration closure is therefore empty by policy, not a claimed
+   supported empty Debian install.
+4. **P1, native feature gap inventory:** only after (2)–(3), inspect the
+   actual selected `.deb` control/data members **before any mutation**:
+   - exact package and script versions;
+   - invoked script arguments and tools;
+   - conffiles;
+   - trigger interests/activations;
+   - diversions, accounts, and system features;
+   - explicitly unsupported native cases.
+
+   The current metadata-only reconnaissance does not mark any speculative
+   script gap fixed or supported.
+5. **P2, parity:** native/reference fresh-root execution and full equality
    are later issues; no result here may satisfy that gate.
 
 The actual `librust-winapi-dev` arm64 package record contains a 75,639-byte

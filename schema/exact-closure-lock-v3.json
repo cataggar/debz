@@ -158,12 +158,24 @@
         "snapshot_sha256": { "$ref": "#/$defs/sha256" },
         "release_sha256": { "$ref": "#/$defs/sha256" },
         "index_identity": { "$ref": "#/$defs/digestIdentity" },
+        "archive_binding": { "const": "signed_sha256_derived_sha512" },
         "signer_fingerprints": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/fingerprint" }
         }
+      }
+    },
+    "derivedSha512": {
+      "$comment": "SHA512 computed locally from bytes that first matched the signed SHA256 archive_identity. It is derived evidence bound to that signed digest, never a signed identity. Present exactly for packages of a repository with archive_binding; the Zig validator enforces the cross-object rules.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provenance", "algorithm", "digest"],
+      "properties": {
+        "provenance": { "const": "derived_from_signed_sha256" },
+        "algorithm": { "const": "sha512" },
+        "digest": { "$ref": "#/$defs/sha512" }
       }
     },
     "localArtifact": {
@@ -218,6 +230,7 @@
           ]
         },
         "archive_identity": { "$ref": "#/$defs/digestIdentity" },
+        "derived_archive_identity": { "$ref": "#/$defs/derivedSha512" },
         "declared_size": { "type": "integer", "minimum": 0 },
         "retention": { "enum": ["requested", "dependency", "retained"] },
         "dpkg_selection_hold": { "type": "boolean" }

@@ -89,10 +89,12 @@ foreign arm64 roots on amd64.
 
 The separate [Debian stable signed-input readiness
 inventory](debian-stable-readiness.md) records a real, authenticated Debian 13
-stable snapshot and its current SHA256-only index/archive metadata. It does
-not satisfy Debian vendor-closure acceptance; the hermetic `debian-stable`
-fixture remains synthetic, not a substitute for a published SHA512-primary
-Debian lock on both architectures.
+stable snapshot and its current SHA256-only index/archive metadata. Per
+issue #261 those signed SHA256 entries are its archive binding. An exact v3
+lock records them with an explicit derived-SHA512 provenance, never a signed
+SHA512. It does not satisfy Debian vendor-closure acceptance. The hermetic
+`debian-stable` fixture remains synthetic. It is not a substitute for bound
+Debian locks and CAS reproduced on both native architectures.
 
 The repository exercises dependencies and Pre-Depends, alternatives,
 versioned virtual Provides, Conflicts/Breaks/Replaces, Recommends policy,

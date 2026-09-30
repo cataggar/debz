@@ -20,7 +20,9 @@ PIN = json.loads((ROOT / "tools/fixtures/debian-stable-readiness-v1.json").read_
 
 
 class ReadinessTests(unittest.TestCase):
-    def test_pinned_run_evidence_never_claims_acceptance(self):
+    def test_pre_decision_run_evidence_never_claims_acceptance(self):
+        # Recorded before the #261 signed-SHA256 binding decision, when a
+        # missing published SHA512 still exited 3.
         evidence = json.loads(
             (ROOT / "tools/fixtures/debian-stable-readiness-arm64-evidence-v1.json").read_text()
         )
@@ -37,6 +39,33 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(len({row["refresh_repository_identity"] for row in evidence["runs"]}), 1)
         for run in evidence["runs"]:
             self.assertEqual((run["refresh_exit_status"], run["preflight_exit_status"]), (0, 3))
+
+    def test_signed_sha256_binding_run_evidence_publishes_no_lock_or_cas(self):
+        evidence = json.loads(
+            (ROOT / "tools/fixtures/debian-stable-readiness-arm64-evidence-v2.json").read_text()
+        )
+        index = PIN["architectures"]["arm64"]
+        self.assertEqual(evidence["inrelease_sha256"], PIN["release"]["inrelease_sha256"])
+        self.assertEqual(evidence["index_sha256"], index["index_sha256"])
+        self.assertEqual(evidence["signed_by_sha256"], PIN["signer"]["binary_sha256"])
+        self.assertEqual(evidence["package_records"], index["package_records"])
+        self.assertEqual(evidence["sha256_package_records"], index["package_records"])
+        self.assertEqual(
+            (evidence["status"], evidence["archive_binding"]),
+            readiness.archive_binding(
+                evidence["index_published_sha512"],
+                evidence["package_records"],
+                evidence["sha512_package_records"],
+            ),
+        )
+        self.assertEqual(evidence["archive_binding"], "signed_sha256_derived_sha512")
+        self.assertFalse(evidence["exact_lock_published"])
+        self.assertTrue(evidence["install_root_empty"])
+        self.assertEqual(evidence["cas_archive_count"], 0)
+        self.assertEqual(len(evidence["runs"]), 2)
+        self.assertEqual(len({row["refresh_repository_identity"] for row in evidence["runs"]}), 1)
+        for run in evidence["runs"]:
+            self.assertEqual((run["refresh_exit_status"], run["preflight_exit_status"]), (0, 0))
 
     def test_official_key_pin_never_trusts_modified_armor_or_fingerprint(self):
         body = b"\x04" + b"\x00" * 5 + b"\x01"
@@ -104,6 +133,44 @@ class ReadinessTests(unittest.TestCase):
         truncated = lzma.compress(paragraphs[:-69])
         with self.assertRaisesRegex(ValueError, "published SHA256"):
             readiness.index_counts(truncated, {**index, "index_size": len(truncated), "index_sha256": readiness.sha256(truncated)})
+
+    def test_record_sha256_is_bound_by_the_signed_index_and_must_be_well_formed(self):
+        def paragraphs(first):
+            return (
+                b"Package: example\nVersion: 1\nArchitecture: arm64\n"
+                b"SHA256: " + first + b"\n\n"
+                b"Package: second\nVersion: 2\nArchitecture: arm64\n"
+                b"SHA256: " + b"1" * 64 + b"\n\n"
+            )
+
+        signed = lzma.compress(paragraphs(b"0" * 64))
+        index = {"index_size": len(signed), "index_sha256": readiness.sha256(signed), "package_records": 2}
+        self.assertEqual(readiness.index_counts(signed, index), (2, 2, 0))
+        # A substituted archive SHA256 is not covered by the signed index identity.
+        substituted = lzma.compress(paragraphs(b"2" * 64))
+        with self.assertRaisesRegex(ValueError, "signed Release identity"):
+            readiness.index_counts(substituted, index)
+        for malformed in (b"0" * 63, b"0" * 65, b"A" * 64, b"g" * 64):
+            compressed = lzma.compress(paragraphs(malformed))
+            reindexed = {**index, "index_size": len(compressed), "index_sha256": readiness.sha256(compressed)}
+            with self.assertRaisesRegex(ValueError, "malformed published SHA256"):
+                readiness.index_counts(compressed, reindexed)
+
+    def test_archive_binding_records_derived_sha512_only_for_sha256_signed_repositories(self):
+        self.assertEqual(
+            readiness.archive_binding(True, 2, 2),
+            ("eligible_signed_sha512", "published_digests"),
+        )
+        for index_publishes_sha512 in (False, True):
+            self.assertEqual(
+                readiness.archive_binding(index_publishes_sha512, 2, 0),
+                ("eligible_signed_sha256_derived_sha512", "signed_sha256_derived_sha512"),
+            )
+        for index_publishes_sha512, sha512_count in ((True, 1), (False, 1), (False, 2)):
+            self.assertEqual(
+                readiness.archive_binding(index_publishes_sha512, 2, sha512_count),
+                ("refused_partial_published_sha512", None),
+            )
 
 
 if __name__ == "__main__":

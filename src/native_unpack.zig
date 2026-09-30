@@ -28137,9 +28137,7 @@ pub const Runtime = struct {
                 model.facts.version,
                 model.facts.architecture,
             ) orelse return error.ArchiveEvidenceMismatch;
-            if (locked.declared_size != bytes.len)
-                return error.ArchiveEvidenceMismatch;
-            locked.archive_identity.verify(bytes) catch
+            locked.verifyArchive(bytes) catch
                 return error.ArchiveEvidenceMismatch;
             if (!supportedArchiveMetadata(model))
                 return error.UnsupportedNativeArchive;

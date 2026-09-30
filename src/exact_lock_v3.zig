@@ -17,12 +17,48 @@ pub const Retention = enum {
     retained,
 };
 
+/// How a repository's signed metadata authenticates its package archives.
+pub const ArchiveBinding = enum {
+    /// Each archive identity is exactly the digest set published by the
+    /// signed metadata. This is the original v3 meaning; it is never
+    /// serialized, so locks that do not opt in keep identical bytes.
+    published_digests,
+    /// The signed metadata publishes SHA256, not SHA512, for archives. The
+    /// signed SHA256 (plus declared size) is the only authenticated binding.
+    /// Every package additionally records a SHA512 computed locally from the
+    /// bytes that first matched that signed SHA256. The SHA512 is derived
+    /// evidence, never an independently authenticated identity.
+    signed_sha256_derived_sha512,
+};
+
+/// Explicit wire provenance of `Package.derived_sha512`.
+pub const derived_sha512_provenance = "derived_from_signed_sha256";
+
+/// Which authority binds one locked archive, as seen by lock consumers.
+pub const ArchiveAuthentication = enum {
+    signed_sha512,
+    signed_sha256_derived_sha512,
+    signed_sha256_only,
+    local_artifact_sha512,
+    local_artifact_sha256_only,
+};
+
+/// Consumer policy for the archive authority a lock must carry.
+pub const ArchiveDigestPolicy = enum {
+    /// Original v3 acceptance: the signed published digest set, whatever it is.
+    published_digests,
+    /// Every archive is bound by a signed (or pinned) SHA512, or by a signed
+    /// SHA256 whose repository explicitly records the derived-SHA512 binding.
+    sha512_identity_required,
+};
+
 pub const Repository = struct {
     id: [64]u8,
     snapshot_sha256: [32]u8,
     release_sha256: [32]u8,
     index_identity: content_digest.Identity,
     signer_fingerprints: []const [20]u8,
+    archive_binding: ArchiveBinding = .published_digests,
 };
 
 pub const AuthenticatedRepositoryOrigin = struct {
@@ -40,10 +76,36 @@ pub const Package = struct {
     version: []const u8,
     architecture: []const u8,
     origin: PackageOrigin,
+    /// Only digests published by signed metadata (or pinned local evidence).
     archive_identity: content_digest.Identity,
+    /// Present exactly for packages of a `signed_sha256_derived_sha512`
+    /// repository. It is never part of `archive_identity`.
+    derived_sha512: ?[64]u8 = null,
     declared_size: u64,
     retention: Retention,
     dpkg_selection_hold: bool,
+
+    /// Verifies the derived SHA512 of bytes that already matched the signed
+    /// `archive_identity` and declared size. Callers must verify the signed
+    /// identity first; this never substitutes for it.
+    pub fn verifyDerivedSha512(self: Package, bytes: []const u8) error{DerivedDigestMismatch}!void {
+        const expected = self.derived_sha512 orelse return;
+        var actual: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(bytes, &actual, .{});
+        if (!std.crypto.timing_safe.eql([64]u8, expected, actual))
+            return error.DerivedDigestMismatch;
+    }
+
+    /// Size, then every signed/pinned digest, then any derived SHA512.
+    pub fn verifyArchive(self: Package, bytes: []const u8) error{
+        SizeMismatch,
+        DigestMismatch,
+        DerivedDigestMismatch,
+    }!void {
+        if (bytes.len != self.declared_size) return error.SizeMismatch;
+        self.archive_identity.verify(bytes) catch return error.DigestMismatch;
+        try self.verifyDerivedSha512(bytes);
+    }
 };
 
 pub const Input = struct {
@@ -107,6 +169,52 @@ pub const Lock = struct {
         const index = self.findIdentityIndex(name, architecture) orelse
             return null;
         return self.packages[index];
+    }
+
+    pub fn findRepository(self: Lock, id: [64]u8) ?Repository {
+        const index = findRepositoryIndex(self.repositories, id) orelse return null;
+        return self.repositories[index];
+    }
+
+    /// Classifies the authority that binds one package archive of this lock.
+    /// A derived SHA512 is reported only together with its signed SHA256.
+    pub fn archiveAuthentication(self: Lock, package: Package) ArchiveAuthentication {
+        return switch (package.origin) {
+            .local_artifact => if (package.archive_identity.digests.sha512 != null)
+                .local_artifact_sha512
+            else
+                .local_artifact_sha256_only,
+            .authenticated_repository => |origin| blk: {
+                const binding = if (self.findRepository(origin.repository_id)) |repository|
+                    repository.archive_binding
+                else
+                    .published_digests;
+                if (binding == .signed_sha256_derived_sha512 and package.derived_sha512 != null)
+                    break :blk .signed_sha256_derived_sha512;
+                break :blk if (package.archive_identity.digests.sha512 != null)
+                    .signed_sha512
+                else
+                    .signed_sha256_only;
+            },
+        };
+    }
+
+    /// Refuses a SHA256-only archive authority under a SHA512 policy unless
+    /// its repository explicitly records the signed-SHA256 derived binding.
+    pub fn requireArchiveDigestPolicy(
+        self: Lock,
+        policy: ArchiveDigestPolicy,
+    ) error{Sha512IdentityRequired}!void {
+        if (policy == .published_digests) return;
+        for (self.packages) |package| switch (self.archiveAuthentication(package)) {
+            .signed_sha512,
+            .signed_sha256_derived_sha512,
+            .local_artifact_sha512,
+            => {},
+            .signed_sha256_only,
+            .local_artifact_sha256_only,
+            => return error.Sha512IdentityRequired,
+        };
     }
 
     pub fn findIdentityIndex(
@@ -173,6 +281,14 @@ pub const ValidationError = error{
     TooManyPackages,
     TooManySigners,
     ValidationWorkLimitExceeded,
+    /// A derived SHA512 appears where no signed-SHA256 binding is recorded.
+    UnboundDerivedDigest,
+    /// A signed-SHA256-bound repository package lacks its derived SHA512.
+    MissingDerivedDigest,
+    /// A signed-SHA256-bound package claims a signed SHA512 or another
+    /// primary; derived evidence can never be promoted to signed evidence.
+    ArchiveBindingMismatch,
+    UnsupportedArchiveBinding,
 };
 
 const DigestIndex = struct {
@@ -314,9 +430,11 @@ pub fn create(
                     &repository.snapshot_sha256,
                     &origin.repository_snapshot_sha256,
                 )) return error.RepositorySnapshotMismatch;
+                try validateArchiveBinding(repository.archive_binding, package);
                 referenced_repositories[repository_index] = true;
             },
             .local_artifact => |origin| {
+                if (package.derived_sha512 != null) return error.UnboundDerivedDigest;
                 try package_origin.validateLocalArtifactV2(origin);
                 const artifact_index = findLocalArtifactIndex(
                     local_artifacts,
@@ -339,6 +457,10 @@ pub fn create(
                 };
                 referenced_artifacts[artifact_index] = true;
             },
+        }
+        if (package.derived_sha512) |derived| {
+            const entry = try package_digests.sha512.getOrPut(allocator, derived);
+            if (entry.found_existing) return error.DuplicateArtifact;
         }
     }
     std.mem.sort(Package, packages, {}, lessPackage);
@@ -365,6 +487,68 @@ pub fn create(
     return .{ .lock = lock, .arena = arena, .backing_allocator = allocator };
 }
 
+pub const BindError = ValidationError || error{
+    ArchiveCountMismatch,
+    MissingArchive,
+    SizeMismatch,
+    DigestMismatch,
+};
+
+/// Records the signed-SHA256 derived-SHA512 binding for `repository_ids`.
+/// `archives` is parallel to `lock.packages`; every package of a bound
+/// repository must supply its bytes. Each archive is checked against its
+/// declared size and signed SHA256 before its SHA512 is computed, and a
+/// package whose signed metadata already publishes SHA512 is refused rather
+/// than downgraded. Other packages and repositories are copied unchanged.
+pub fn bindSignedSha256Repositories(
+    allocator: std.mem.Allocator,
+    lock: Lock,
+    repository_ids: []const [64]u8,
+    archives: []const ?[]const u8,
+) (std.mem.Allocator.Error || BindError || package_origin.ValidationError)!OwnedLock {
+    if (archives.len != lock.packages.len) return error.ArchiveCountMismatch;
+    const repositories = try allocator.dupe(Repository, lock.repositories);
+    defer allocator.free(repositories);
+    for (repository_ids) |id| {
+        const index = findRepositoryIndex(repositories, id) orelse
+            return error.MissingRepository;
+        if (repositories[index].archive_binding != .published_digests)
+            return error.ArchiveBindingMismatch;
+        repositories[index].archive_binding = .signed_sha256_derived_sha512;
+    }
+    const packages = try allocator.dupe(Package, lock.packages);
+    defer allocator.free(packages);
+    for (packages, archives) |*package, archive| {
+        const origin = switch (package.origin) {
+            .authenticated_repository => |value| value,
+            .local_artifact => continue,
+        };
+        const repository_index = findRepositoryIndex(repositories, origin.repository_id) orelse
+            return error.MissingRepository;
+        if (repositories[repository_index].archive_binding != .signed_sha256_derived_sha512)
+            continue;
+        if (package.derived_sha512 != null) return error.ArchiveBindingMismatch;
+        if (package.archive_identity.primary != .sha256 or
+            package.archive_identity.digests.sha512 != null)
+            return error.ArchiveBindingMismatch;
+        const bytes = archive orelse return error.MissingArchive;
+        if (bytes.len != package.declared_size) return error.SizeMismatch;
+        package.archive_identity.verify(bytes) catch return error.DigestMismatch;
+        var derived: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(bytes, &derived, .{});
+        package.derived_sha512 = derived;
+    }
+    return create(allocator, .{
+        .target_architecture = lock.target_architecture,
+        .request_sha256 = lock.request_sha256,
+        .policy_sha256 = lock.policy_sha256,
+        .repositories = repositories,
+        .local_artifacts = lock.local_artifacts,
+        .packages = packages,
+        .verified_origins = true,
+    });
+}
+
 const OriginType = enum {
     authenticated_repository,
     local_artifact,
@@ -385,7 +569,14 @@ const WireRepository = struct {
     snapshot_sha256: []const u8,
     release_sha256: []const u8,
     index_identity: WireDigestIdentity,
+    archive_binding: ?[]const u8 = null,
     signer_fingerprints: []const []const u8,
+};
+
+const WireDerivedIdentity = struct {
+    provenance: []const u8,
+    algorithm: []const u8,
+    digest: []const u8,
 };
 
 const WireIdentity = struct {
@@ -421,6 +612,7 @@ const WirePackage = struct {
     architecture: []const u8,
     origin: WireOrigin,
     archive_identity: WireDigestIdentity,
+    derived_archive_identity: ?WireDerivedIdentity = null,
     declared_size: u64,
     retention: Retention,
     dpkg_selection_hold: bool,
@@ -480,6 +672,7 @@ pub fn decode(
             .release_sha256 = try parseHex(32, repository.release_sha256),
             .index_identity = try parseDigestIdentity(repository.index_identity),
             .signer_fingerprints = signers,
+            .archive_binding = try parseArchiveBinding(repository.archive_binding),
         };
         repositories_initialized += 1;
     }
@@ -501,6 +694,7 @@ pub fn decode(
             .architecture = package.architecture,
             .origin = try parseOrigin(package.origin),
             .archive_identity = try parseDigestIdentity(package.archive_identity),
+            .derived_sha512 = try parseDerivedIdentity(package.derived_archive_identity),
             .declared_size = package.declared_size,
             .retention = package.retention,
             .dpkg_selection_hold = package.dpkg_selection_hold,
@@ -690,6 +884,12 @@ fn writePayload(lock: Lock, writer: *std.Io.Writer) !void {
         try writeHexString(writer, &repository.release_sha256);
         try writer.writeAll(",\"index_identity\":");
         try writeDigestIdentity(writer, repository.index_identity);
+        switch (repository.archive_binding) {
+            .published_digests => {},
+            .signed_sha256_derived_sha512 => try writer.writeAll(
+                ",\"archive_binding\":\"signed_sha256_derived_sha512\"",
+            ),
+        }
         try writer.writeAll(",\"signer_fingerprints\":[");
         for (repository.signer_fingerprints, 0..) |fingerprint, signer_index| {
             if (signer_index != 0) try writer.writeByte(',');
@@ -715,6 +915,13 @@ fn writePayload(lock: Lock, writer: *std.Io.Writer) !void {
         try writeOrigin(writer, package.origin);
         try writer.writeAll(",\"archive_identity\":");
         try writeDigestIdentity(writer, package.archive_identity);
+        if (package.derived_sha512) |derived| {
+            try writer.writeAll(",\"derived_archive_identity\":{\"provenance\":");
+            try writeJsonString(writer, derived_sha512_provenance);
+            try writer.writeAll(",\"algorithm\":\"sha512\",\"digest\":");
+            try writeHexString(writer, &derived);
+            try writer.writeByte('}');
+        }
         try writer.print(",\"declared_size\":{},\"retention\":", .{package.declared_size});
         try writeJsonString(writer, @tagName(package.retention));
         try writer.print(",\"dpkg_selection_hold\":{}}}", .{package.dpkg_selection_hold});
@@ -857,6 +1064,24 @@ fn parseDigestIdentity(wire: WireDigestIdentity) ValidationError!content_digest.
     return content_digest.Identity.init(set, primary) catch error.InvalidDigest;
 }
 
+fn parseArchiveBinding(value: ?[]const u8) ValidationError!ArchiveBinding {
+    const text = value orelse return .published_digests;
+    // The default is never serialized, so only the explicit opt-in is valid.
+    if (std.mem.eql(u8, text, "signed_sha256_derived_sha512"))
+        return .signed_sha256_derived_sha512;
+    return error.UnsupportedArchiveBinding;
+}
+
+fn parseDerivedIdentity(value: ?WireDerivedIdentity) ValidationError!?[64]u8 {
+    const wire = value orelse return null;
+    if (!std.mem.eql(u8, wire.provenance, derived_sha512_provenance) or
+        !std.mem.eql(u8, wire.algorithm, "sha512"))
+        return error.UnsupportedArchiveBinding;
+    const digest = content_digest.Value.parse(.sha512, wire.digest) catch
+        return error.InvalidDigest;
+    return digest.sha512;
+}
+
 fn parseDigest(wire: WireDigest) ValidationError!content_digest.Value {
     const algorithm = content_digest.Algorithm.parse(wire.algorithm) catch
         return error.InvalidDigest;
@@ -888,6 +1113,20 @@ fn validIdentity(value: []const u8) bool {
 fn validateDigestIdentity(identity: content_digest.Identity) ValidationError!void {
     _ = content_digest.Identity.init(identity.digests, identity.primary) catch
         return error.InvalidDigest;
+}
+
+fn validateArchiveBinding(binding: ArchiveBinding, package: Package) ValidationError!void {
+    switch (binding) {
+        .published_digests => if (package.derived_sha512 != null)
+            return error.UnboundDerivedDigest,
+        .signed_sha256_derived_sha512 => {
+            if (package.archive_identity.primary != .sha256 or
+                package.archive_identity.digests.sha256 == null or
+                package.archive_identity.digests.sha512 != null)
+                return error.ArchiveBindingMismatch;
+            if (package.derived_sha512 == null) return error.MissingDerivedDigest;
+        },
+    }
 }
 
 fn findRepositoryIndex(repositories: []const Repository, id: [64]u8) ?usize {
@@ -1487,5 +1726,409 @@ test "exact_lock_v3.test.rejects origin substitution mismatch and unused evidenc
             .packages = &.{local_package},
             .verified_origins = true,
         },
+    ));
+}
+
+const test_debian_repository_id: [64]u8 = @splat('d');
+const test_debian_snapshot: [32]u8 = @splat(0x31);
+const test_debian_archives = [_]struct { name: []const u8, bytes: []const u8 }{
+    .{ .name = "base-files", .bytes = "debian base-files archive bytes" },
+    .{ .name = "libc6", .bytes = "debian libc6 archive bytes" },
+};
+
+fn testDebianSha256Lock(allocator: std.mem.Allocator) !OwnedLock {
+    var packages: [test_debian_archives.len]Package = undefined;
+    for (test_debian_archives, &packages) |archive, *package| package.* = .{
+        .name = archive.name,
+        .version = "1",
+        .architecture = "arm64",
+        .origin = .{ .authenticated_repository = .{
+            .repository_id = test_debian_repository_id,
+            .repository_snapshot_sha256 = test_debian_snapshot,
+        } },
+        // Debian's signed Packages publish SHA256 only.
+        .archive_identity = content_digest.Identity.ofSha256(archive.bytes),
+        .declared_size = archive.bytes.len,
+        .retention = .requested,
+        .dpkg_selection_hold = false,
+    };
+    return create(allocator, .{
+        .target_architecture = "arm64",
+        .request_sha256 = @splat(0x32),
+        .policy_sha256 = @splat(0x33),
+        .repositories = &.{.{
+            .id = test_debian_repository_id,
+            .snapshot_sha256 = test_debian_snapshot,
+            .release_sha256 = @splat(0x34),
+            .index_identity = content_digest.Identity.ofSha256("signed Packages.xz"),
+            .signer_fingerprints = &.{@splat(0x35)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &packages,
+        .verified_origins = true,
+    });
+}
+
+fn testDebianArchive(name: []const u8) []const u8 {
+    for (test_debian_archives) |archive|
+        if (std.mem.eql(u8, archive.name, name)) return archive.bytes;
+    unreachable;
+}
+
+fn testDebianArchives(lock: Lock, output: []?[]const u8) []const ?[]const u8 {
+    for (lock.packages, output[0..lock.packages.len]) |package, *archive|
+        archive.* = testDebianArchive(package.name);
+    return output[0..lock.packages.len];
+}
+
+fn testBindDebian(allocator: std.mem.Allocator, lock: Lock) !OwnedLock {
+    var archives: [test_debian_archives.len]?[]const u8 = undefined;
+    return bindSignedSha256Repositories(
+        allocator,
+        lock,
+        &.{test_debian_repository_id},
+        testDebianArchives(lock, &archives),
+    );
+}
+
+fn testReplaceOnce(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    needle: []const u8,
+    replacement: []const u8,
+) ![]u8 {
+    const offset = std.mem.indexOf(u8, source, needle) orelse return error.TestNeedleMissing;
+    return std.mem.concat(allocator, u8, &.{
+        source[0..offset],
+        replacement,
+        source[offset + needle.len ..],
+    });
+}
+
+test "exact_lock_v3.test.signed SHA256 Debian identity binds an explicit derived SHA512" {
+    const allocator = std.testing.allocator;
+    var unbound = try testDebianSha256Lock(allocator);
+    defer unbound.deinit();
+    try unbound.lock.requireArchiveDigestPolicy(.published_digests);
+    try std.testing.expectError(
+        error.Sha512IdentityRequired,
+        unbound.lock.requireArchiveDigestPolicy(.sha512_identity_required),
+    );
+    try std.testing.expectEqual(
+        ArchiveAuthentication.signed_sha256_only,
+        unbound.lock.archiveAuthentication(unbound.lock.packages[0]),
+    );
+
+    var bound = try testBindDebian(allocator, unbound.lock);
+    defer bound.deinit();
+    try bound.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+    try std.testing.expectEqual(
+        ArchiveBinding.signed_sha256_derived_sha512,
+        bound.lock.findRepository(test_debian_repository_id).?.archive_binding,
+    );
+    try std.testing.expect(!std.mem.eql(u8, &unbound.lock.digest_sha256, &bound.lock.digest_sha256));
+    const json = try bound.lock.canonicalJson(allocator);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "\"index_identity\":{\"primary\":\"sha256\",\"digests\":[{\"algorithm\":\"sha256\",\"digest\":\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        json,
+        "]},\"archive_binding\":\"signed_sha256_derived_sha512\",\"signer_fingerprints\":[",
+    ) != null);
+    for (bound.lock.packages) |package| {
+        const bytes = testDebianArchive(package.name);
+        try std.testing.expectEqual(
+            ArchiveAuthentication.signed_sha256_derived_sha512,
+            bound.lock.archiveAuthentication(package),
+        );
+        try std.testing.expectEqual(content_digest.Algorithm.sha256, package.archive_identity.primary);
+        try std.testing.expect(package.archive_identity.digests.sha512 == null);
+        try std.testing.expectEqualSlices(
+            u8,
+            &content_digest.Value.of(.sha512, bytes).sha512,
+            &package.derived_sha512.?,
+        );
+        try package.verifyArchive(bytes);
+
+        var sha256_hex: [128]u8 = undefined;
+        var sha512_hex: [128]u8 = undefined;
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "\"archive_identity\":{{\"primary\":\"sha256\",\"digests\":[{{\"algorithm\":\"sha256\",\"digest\":\"{s}\"}}]}}," ++
+                "\"derived_archive_identity\":{{\"provenance\":\"derived_from_signed_sha256\",\"algorithm\":\"sha512\",\"digest\":\"{s}\"}}," ++
+                "\"declared_size\":{d},",
+            .{
+                content_digest.Value.of(.sha256, bytes).hex(&sha256_hex),
+                content_digest.Value.of(.sha512, bytes).hex(&sha512_hex),
+                bytes.len,
+            },
+        );
+        defer allocator.free(expected);
+        try std.testing.expect(std.mem.indexOf(u8, json, expected) != null);
+    }
+
+    var decoded = try decode(allocator, json, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(u8, &bound.lock.digest_sha256, &decoded.lock.digest_sha256);
+    try decoded.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+    const reencoded = try decoded.lock.canonicalJson(allocator);
+    defer allocator.free(reencoded);
+    try std.testing.expectEqualStrings(json, reencoded);
+
+    var archives: [test_debian_archives.len]?[]const u8 = undefined;
+    try std.testing.expectError(error.ArchiveBindingMismatch, bindSignedSha256Repositories(
+        allocator,
+        bound.lock,
+        &.{test_debian_repository_id},
+        testDebianArchives(bound.lock, &archives),
+    ));
+}
+
+test "exact_lock_v3.test.tampered Debian archive is refused before any SHA512 is derived" {
+    const allocator = std.testing.allocator;
+    var unbound = try testDebianSha256Lock(allocator);
+    defer unbound.deinit();
+    var archives: [test_debian_archives.len]?[]const u8 = undefined;
+    const valid = testDebianArchives(unbound.lock, &archives);
+
+    const original = valid[0].?;
+    const tampered = try allocator.dupe(u8, original);
+    defer allocator.free(tampered);
+    tampered[0] ^= 1;
+    var changed: [test_debian_archives.len]?[]const u8 = undefined;
+    @memcpy(&changed, valid);
+    changed[0] = tampered;
+    try std.testing.expectError(error.DigestMismatch, bindSignedSha256Repositories(
+        allocator,
+        unbound.lock,
+        &.{test_debian_repository_id},
+        &changed,
+    ));
+    changed[0] = original[0 .. original.len - 1];
+    try std.testing.expectError(error.SizeMismatch, bindSignedSha256Repositories(
+        allocator,
+        unbound.lock,
+        &.{test_debian_repository_id},
+        &changed,
+    ));
+    changed[0] = null;
+    try std.testing.expectError(error.MissingArchive, bindSignedSha256Repositories(
+        allocator,
+        unbound.lock,
+        &.{test_debian_repository_id},
+        &changed,
+    ));
+    try std.testing.expectError(error.ArchiveCountMismatch, bindSignedSha256Repositories(
+        allocator,
+        unbound.lock,
+        &.{test_debian_repository_id},
+        valid[0..1],
+    ));
+    try std.testing.expectError(error.MissingRepository, bindSignedSha256Repositories(
+        allocator,
+        unbound.lock,
+        &.{@splat('e')},
+        valid,
+    ));
+
+    var bound = try testBindDebian(allocator, unbound.lock);
+    defer bound.deinit();
+    const package = bound.lock.findIdentity(unbound.lock.packages[0].name, "arm64").?;
+    // The signed SHA256 is checked first, so a tampered archive is reported
+    // as a signed-digest mismatch even though its derived SHA512 also differs.
+    try std.testing.expectError(error.DigestMismatch, package.verifyArchive(tampered));
+    try std.testing.expectError(
+        error.SizeMismatch,
+        package.verifyArchive(original[0 .. original.len - 1]),
+    );
+}
+
+test "exact_lock_v3.test.derived SHA512 mismatch is refused after the signed SHA256 matches" {
+    const allocator = std.testing.allocator;
+    var unbound = try testDebianSha256Lock(allocator);
+    defer unbound.deinit();
+    var bound = try testBindDebian(allocator, unbound.lock);
+    defer bound.deinit();
+    const bytes = testDebianArchive(bound.lock.packages[0].name);
+
+    var mismatched = bound.lock.packages[0];
+    mismatched.derived_sha512.?[0] ^= 1;
+    try mismatched.archive_identity.verify(bytes);
+    try std.testing.expectError(error.DerivedDigestMismatch, mismatched.verifyDerivedSha512(bytes));
+    try std.testing.expectError(error.DerivedDigestMismatch, mismatched.verifyArchive(bytes));
+
+    // A structurally valid lock cannot prove its derived value without bytes;
+    // replay refuses the wrong SHA512 as soon as the signed archive is present.
+    const packages = try allocator.dupe(Package, bound.lock.packages);
+    defer allocator.free(packages);
+    packages[0] = mismatched;
+    var forged = try create(allocator, .{
+        .target_architecture = bound.lock.target_architecture,
+        .request_sha256 = bound.lock.request_sha256,
+        .policy_sha256 = bound.lock.policy_sha256,
+        .repositories = bound.lock.repositories,
+        .local_artifacts = &.{},
+        .packages = packages,
+        .verified_origins = true,
+    });
+    defer forged.deinit();
+    const forged_package = forged.lock.findIdentity(mismatched.name, "arm64").?;
+    try std.testing.expectError(error.DerivedDigestMismatch, forged_package.verifyArchive(bytes));
+
+    const json = try bound.lock.canonicalJson(allocator);
+    defer allocator.free(json);
+    var derived_hex: [128]u8 = undefined;
+    const digest = (content_digest.Value{ .sha512 = bound.lock.packages[0].derived_sha512.? }).hex(&derived_hex);
+    var changed_hex: [128]u8 = undefined;
+    @memcpy(changed_hex[0..digest.len], digest);
+    changed_hex[0] = if (changed_hex[0] == '0') '1' else '0';
+    const tampered = try testReplaceOnce(allocator, json, digest, changed_hex[0..digest.len]);
+    defer allocator.free(tampered);
+    try std.testing.expectError(error.DigestMismatch, decode(allocator, tampered, maximum_document_bytes));
+}
+
+test "exact_lock_v3.test.forged provenance cannot present a derived SHA512 as signed" {
+    const allocator = std.testing.allocator;
+    var unbound = try testDebianSha256Lock(allocator);
+    defer unbound.deinit();
+    var bound = try testBindDebian(allocator, unbound.lock);
+    defer bound.deinit();
+    const derived = bound.lock.packages[0].derived_sha512.?;
+    const Case = enum { promoted, promoted_without_derived, unbound_repository, missing_derived, duplicate_derived, local_artifact };
+    for (std.enums.values(Case)) |case| {
+        const repositories = try allocator.dupe(Repository, bound.lock.repositories);
+        defer allocator.free(repositories);
+        const packages = try allocator.dupe(Package, bound.lock.packages);
+        defer allocator.free(packages);
+        var local_artifacts: []const package_origin.LocalArtifactEvidenceV2 = &.{};
+        var expected: anyerror = undefined;
+        switch (case) {
+            .promoted, .promoted_without_derived => {
+                packages[0].archive_identity = try content_digest.Identity.init(.{
+                    .sha256 = packages[0].archive_identity.digests.sha256,
+                    .sha512 = derived,
+                }, .sha512);
+                if (case == .promoted_without_derived) packages[0].derived_sha512 = null;
+                expected = error.ArchiveBindingMismatch;
+            },
+            .unbound_repository => {
+                repositories[0].archive_binding = .published_digests;
+                expected = error.UnboundDerivedDigest;
+            },
+            .missing_derived => {
+                packages[0].derived_sha512 = null;
+                expected = error.MissingDerivedDigest;
+            },
+            .duplicate_derived => {
+                packages[1].derived_sha512 = derived;
+                expected = error.DuplicateArtifact;
+            },
+            .local_artifact => {
+                const identity = packages[0].archive_identity;
+                const artifact: package_origin.LocalArtifactEvidenceV2 = .{
+                    .artifact_id = package_origin.artifactIdFromIdentity(identity),
+                    .archive_identity = identity,
+                    .size = packages[0].declared_size,
+                    .package = packages[0].name,
+                    .version = packages[0].version,
+                    .architecture = packages[0].architecture,
+                    .acquisition_url = "file:///local.deb",
+                    .trust_mode = .pinned_content_digest,
+                };
+                packages[0].origin = .{ .local_artifact = artifact };
+                local_artifacts = &.{artifact};
+                expected = error.UnboundDerivedDigest;
+            },
+        }
+        try std.testing.expectError(expected, create(allocator, .{
+            .target_architecture = bound.lock.target_architecture,
+            .request_sha256 = bound.lock.request_sha256,
+            .policy_sha256 = bound.lock.policy_sha256,
+            .repositories = repositories,
+            .local_artifacts = local_artifacts,
+            .packages = packages,
+            .verified_origins = true,
+        }));
+    }
+
+    const json = try bound.lock.canonicalJson(allocator);
+    defer allocator.free(json);
+    const WireCase = struct { needle: []const u8, replacement: []const u8, expected: anyerror };
+    for ([_]WireCase{
+        .{ .needle = "\"provenance\":\"derived_from_signed_sha256\"", .replacement = "\"provenance\":\"signed_release_sha512\"", .expected = error.UnsupportedArchiveBinding },
+        .{ .needle = "\"algorithm\":\"sha512\",\"digest\"", .replacement = "\"algorithm\":\"sha256\",\"digest\"", .expected = error.UnsupportedArchiveBinding },
+        .{ .needle = "\"archive_binding\":\"signed_sha256_derived_sha512\"", .replacement = "\"archive_binding\":\"published_digests\"", .expected = error.UnsupportedArchiveBinding },
+        .{ .needle = "\"archive_binding\":\"signed_sha256_derived_sha512\",", .replacement = "", .expected = error.UnboundDerivedDigest },
+        .{ .needle = "\"archive_binding\":\"signed_sha256_derived_sha512\"", .replacement = "\"archive_binding\":null", .expected = error.UnboundDerivedDigest },
+    }) |case| {
+        const forged = try testReplaceOnce(allocator, json, case.needle, case.replacement);
+        defer allocator.free(forged);
+        try std.testing.expectError(case.expected, decode(allocator, forged, maximum_document_bytes));
+    }
+}
+
+const test_ubuntu_archive = "ubuntu signed sha512 archive";
+// Canonical v3 bytes of a signed-SHA512 repository lock as serialized before
+// the signed-SHA256 binding existed; they must remain accepted unchanged.
+const test_ubuntu_lock =
+    \\{"schema":"https://debz.dev/schema/exact-closure-lock-v3","version":3,"target_architecture":"amd64","request_sha256":"1111111111111111111111111111111111111111111111111111111111111111","policy_sha256":"2222222222222222222222222222222222222222222222222222222222222222","repositories":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","snapshot_sha256":"3333333333333333333333333333333333333333333333333333333333333333","release_sha256":"4444444444444444444444444444444444444444444444444444444444444444","index_identity":{"primary":"sha256","digests":[{"algorithm":"sha256","digest":"5555555555555555555555555555555555555555555555555555555555555555"}]},"signer_fingerprints":["6666666666666666666666666666666666666666"]}],"local_artifacts":[],"packages":[{"name":"ubuntu-base","version":"1","architecture":"amd64","origin":{"type":"authenticated_repository","repository_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repository_snapshot_sha256":"3333333333333333333333333333333333333333333333333333333333333333"},"archive_identity":{"primary":"sha512","digests":[{"algorithm":"sha256","digest":"bc3ba1be2606713b74a45716997e95f0bd6c4d91941cface208a71f73873ac74"},{"algorithm":"sha512","digest":"d5430eb073f45b54562c73f158c7f6939dfc6828e0cb780c4084cdf0e311bb93ec360faa33721fcec6f9d2c4ca50ba70da26f627f95ecda682f97384d5f979b4"}]},"declared_size":28,"retention":"requested","dpkg_selection_hold":false}],"digest_sha256":"62db95e3983e412995a9107547305c45e1972a95110ee806ec3ddd95d3f83348"}
+;
+
+test "exact_lock_v3.test.signed SHA512 Ubuntu lock keeps its canonical bytes and authority" {
+    const allocator = std.testing.allocator;
+    var decoded = try decode(allocator, test_ubuntu_lock, maximum_document_bytes);
+    defer decoded.deinit();
+    const package = decoded.lock.packages[0];
+    try std.testing.expectEqual(
+        ArchiveBinding.published_digests,
+        decoded.lock.repositories[0].archive_binding,
+    );
+    try std.testing.expect(package.derived_sha512 == null);
+    try std.testing.expectEqual(ArchiveAuthentication.signed_sha512, decoded.lock.archiveAuthentication(package));
+    try decoded.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+    try package.verifyArchive(test_ubuntu_archive);
+
+    var created = try create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .repositories = &.{.{
+            .id = @splat('a'),
+            .snapshot_sha256 = @splat(0x33),
+            .release_sha256 = @splat(0x44),
+            .index_identity = sha256Identity(@splat(0x55)),
+            .signer_fingerprints = &.{@splat(0x66)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "ubuntu-base",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = @splat('a'),
+                .repository_snapshot_sha256 = @splat(0x33),
+            } },
+            .archive_identity = content_digest.Identity.ofSupported(test_ubuntu_archive),
+            .declared_size = test_ubuntu_archive.len,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+    defer created.deinit();
+    const json = try created.lock.canonicalJson(allocator);
+    defer allocator.free(json);
+    try std.testing.expectEqualStrings(test_ubuntu_lock, json);
+
+    // A published signed SHA512 is never downgraded to the SHA256 binding.
+    try std.testing.expectError(error.ArchiveBindingMismatch, bindSignedSha256Repositories(
+        allocator,
+        decoded.lock,
+        &.{decoded.lock.repositories[0].id},
+        &.{test_ubuntu_archive},
     ));
 }

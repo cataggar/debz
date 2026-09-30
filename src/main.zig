@@ -1317,6 +1317,7 @@ fn packageCacheFailure(err: anyerror) PackageCacheFailure {
         },
         error.SizeMismatch,
         error.DigestMismatch,
+        error.DerivedDigestMismatch,
         error.ResponseTooLarge,
         error.RedirectLimitExceeded,
         error.MissingRedirectLocation,

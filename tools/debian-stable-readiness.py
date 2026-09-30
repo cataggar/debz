@@ -136,7 +136,26 @@ def index_counts(compressed, index, published_sha512=None):
     sha512_count = sum(b"\nSHA512: " in item for item in records)
     if len(records) != index["package_records"] or sha256_count != len(records):
         raise ValueError("Packages record count or published SHA256 set changed")
+    for record in records:
+        digest = record.split(b"\nSHA256: ", 1)[1].split(b"\n", 1)[0]
+        if len(digest) != 2 * hashlib.sha256().digest_size or any(byte not in b"0123456789abcdef" for byte in digest):
+            raise ValueError("Packages record has a malformed published SHA256")
     return len(records), sha256_count, sha512_count
+
+
+def archive_binding(index_publishes_sha512, records, sha512_count):
+    """Classifies the signed archive authority an exact v3 lock may record.
+
+    Every record already carries a SHA256 covered by the signed Release via
+    the verified index identity. Per the #261 decision that signed SHA256 is
+    the archive binding when SHA512 is absent; the lock then records a locally
+    derived SHA512 with explicit `derived_from_signed_sha256` provenance.
+    """
+    if index_publishes_sha512 and sha512_count == records:
+        return "eligible_signed_sha512", "published_digests"
+    if sha512_count == 0:
+        return "eligible_signed_sha256_derived_sha512", "signed_sha256_derived_sha512"
+    return "refused_partial_published_sha512", None
 
 
 def main():
@@ -235,12 +254,12 @@ def main():
         "sha512_package_records": sha512_count,
         "root_mutated": False,
         "exact_lock_published": False,
-        "status": "eligible_for_read_only_resolution" if "SHA512" in sections and sha512_count == records else "blocked_missing_published_sha512",
     }
+    report["status"], report["archive_binding"] = archive_binding("SHA512" in sections, records, sha512_count)
     (workspace / "evidence" / "readiness.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, sort_keys=True))
-    if report["status"] == "blocked_missing_published_sha512":
-        print("refusing to resolve a SHA512-primary Debian lock: the signed index and/or packages do not publish SHA512", file=sys.stderr)
+    if report["archive_binding"] is None:
+        print("refusing a repository whose signed index and package records publish SHA512 only partially", file=sys.stderr)
         return 3
     return 0
 

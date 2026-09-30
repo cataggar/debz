@@ -55,6 +55,47 @@ identity. Local origins bind a typed artifact ID plus the complete archive and
 pinned content identities; v2/v3 plan serialization remains byte-for-byte
 unchanged.
 
+**Signed SHA256 with a derived SHA512.** Some signed archives, including
+Debian stable, publish only SHA256 in both
+Release and Packages. For those repositories debz accepts the signed SHA256
+entries (plus declared size) as the authenticated archive binding. It records
+a SHA512 only as a *derived* identity, bound to the verified SHA256, never as
+an independently authenticated one (issue #261). A repository opts in
+explicitly and additively:
+
+```json
+{"id":"…","index_identity":{…},"archive_binding":"signed_sha256_derived_sha512","signer_fingerprints":[…]}
+{"name":"…","archive_identity":{"primary":"sha256","digests":[{"algorithm":"sha256","digest":"…"}]},
+ "derived_archive_identity":{"provenance":"derived_from_signed_sha256","algorithm":"sha512","digest":"…"},…}
+```
+
+- `archive_identity` still holds exactly the signed digests. The derived value
+  lives only in `derived_archive_identity`, with the fixed provenance
+  `derived_from_signed_sha256`. Package CAS stays keyed by the signed SHA256
+  and never by the derived value.
+- Every package of a bound repository must be SHA256-only and must carry the
+  derived identity. The following are rejected: a derived identity without the
+  repository binding, a missing derived identity, a signed SHA512 in a bound
+  repository, local-artifact derived identities, other provenance or binding
+  strings, `null` values, and a derived value that duplicates another archive's
+  SHA512. So is promoting the derived value into `archive_identity` as a signed
+  SHA512 while the repository is bound.
+- `bindSignedSha256Repositories` produces bound locks. It checks every
+  archive's size and signed SHA256 *before* computing any SHA512; a mismatch
+  refuses and derives nothing. Acquisition, cache hits, tagged CAS import, and
+  native unpack verify size, then every signed digest, then the derived
+  SHA512. A derived mismatch refuses (`DerivedDigestMismatch`) and is never
+  published to or repaired in CAS.
+- `Lock.archiveAuthentication` reports each package's authority
+  (`signed_sha512`, `signed_sha256_derived_sha512`, `signed_sha256_only`, or a
+  local variant). `Lock.requireArchiveDigestPolicy(.sha512_identity_required)`
+  accepts signed/pinned SHA512 or the explicit binding. It refuses an unbound
+  SHA256-only archive.
+
+Locks that do not opt in, including every Ubuntu signed-SHA512 lock, keep
+identical bytes, digests, and meaning. Older decoders reject bound locks as
+unknown fields, so a derived SHA512 can never be read as signed.
+
 Native execution carries that identity without truncation through explicit
 successor documents: authorization v2, program v2, execution request v4,
 recovery intent v2, progress v3/v4, transaction result v3, native provenance
