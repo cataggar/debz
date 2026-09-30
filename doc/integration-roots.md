@@ -147,6 +147,10 @@ arm64 packages with none configured, within the former 30-minute limit
 stopped at 144 and 175). Protected local amd64 installs needed an untracked
 90-minute limit to finish. The ceiling is twice those 90 minutes, matching the
 fixed 2x ceiling of progress-bounded repository recovery invocations (#307).
+A later fresh amd64 install ran in CI under the seccomp-filtered exec trace
+described below. It finished all 175 packages in 110 minutes, and durable
+progress never paused for more than 25 seconds (the single-job probe below).
+The ceiling therefore leaves about 1.6 times that hosted duration.
 Twenty minutes without any durable publication is about 100 times the
 12-second mean interval between newly unpacked amd64 packages in those runs,
 yet stops a hang long before the ceiling. Local runs may tighten, never extend,
@@ -1821,6 +1825,23 @@ delegating an installation to `dpkg`. The audit still matches every
 it distinguishes these calls. The workflow cleaned up the interrupted root,
 and it is not wrapper-completion proof.
 
+A single-job probe (Actions run 36772399199, since deleted under CI runner
+rationing; its bounded artifact was retained offline) ran on source
+`d546b0bf9bc14099dca5d8112c6079572de75a37` plus a scratch workflow. It used
+the same snapshot and lock on a 4-CPU AMD EPYC 9V74 runner.
+The wrapper ran untraced, while an outer
+`strace -f --seccomp-bpf -e trace=execve,execveat` traced the whole wrapper,
+so this probe was not an execve audit. Native `install` succeeded after 6,620
+seconds with all 175 packages `install ok installed`. Native verification
+then reported outcome `succeeded`, lock reproduction planned only the
+top-level reinstall, and the update lock resolved to zero actions. The
+zero-action `upgrade-all` then failed with exit **7**
+`UnsupportedLifecycleConffile`. procps records
+`/etc/sysctl.conf newconffile remove-on-upgrade`, and native installed-package
+lifecycle evidence cannot yet represent a `newconffile` digest. The wrapper
+therefore still does not complete its post-install operations on a fresh
+native root. This probe is bound evidence only, not wrapper-completion proof.
+
 An untraced local ReleaseSafe run on a 16-CPU arm64 Neoverse N2 host, using
 the same snapshot and the arm64 lock, unpacked all 175 packages within about
 5.5 minutes. Durable progress never paused for more than 4 seconds. After 21
@@ -1829,6 +1850,18 @@ closed with `InvalidAlternativesTool` (exit 8). The snapshot's arm64
 `update-alternatives` digest
 `456f8a6940e8915c6b05bba7cb751df8836b9a14f5c1da2137e767aa6a867643` is not
 a reviewed snapshot tool binding. That arm64 admission belongs to #262.
+
+The same local host and lock then ran the wrapper as committed on source
+`1ab893c6dfa549db6a06488916b791205edda559`, with every candidate command
+under `strace -f --seccomp-bpf -qq -yy -e trace=execve,execveat` (strace
+6.8, the version on the CI runners). All 175 packages were again unpacked
+within 6 minutes, and progress never paused for more than 3 seconds.
+`install` stopped at the same step with the same 24 packages configured and
+an identical 398,143-byte ledger after 1,240 seconds, compared with 1,305
+seconds untraced. Seccomp-filtered tracing therefore adds no measurable
+install cost. `create.execve` still recorded each maintainer-script exec and
+its children, so the audit refused the run with exit **90** on the xkb-data
+`dpkg --validate-version` call described above.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
