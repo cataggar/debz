@@ -12,7 +12,7 @@ const namespace = "var/lib/debz/";
 const owner_path = namespace ++ "root-operation-v1.json";
 const intent_path = namespace ++ "native-execution-intent-v1.json";
 const completion_path = namespace ++ "root-operation-completion-v1.json";
-const case_table_version: u32 = 1;
+const case_table_version: u32 = 2;
 
 const boundaries = [_]mutation.Boundary{
     .journal_write,
@@ -157,7 +157,10 @@ fn invoke(
         .architecture = arch,
         .operation = call.operation,
         .archives = if (call.archive) |archive| &.{archive} else &.{},
-        .packages = if (std.mem.eql(u8, call.operation, "purge")) &packages else &.{},
+        .packages = if (std.mem.eql(u8, call.operation, "purge") or std.mem.eql(u8, call.operation, "remove"))
+            &packages
+        else
+            &.{},
         .report = response_absolute,
         .recovery = true,
         .caller_owned = true,
@@ -465,6 +468,274 @@ fn beforeIntentControl(f: *foundation.Fixture, driver: []const u8, dpkg: []const
     std.debug.print("before-intent control: exit 86, native intent durable, no package mutation\n", .{});
 }
 
+/// FIFO publication reuses the journal, staging, backup, publication, and
+/// release hooks of every other node kind. Each case kills a real native child
+/// whose filesystem action publishes only FIFOs, so the first occurrence of the
+/// selected hook is necessarily a FIFO step.
+const FifoCase = struct {
+    operation: []const u8,
+    boundary: ?mutation.Boundary = null,
+    crash_at: ?[]const u8 = null,
+};
+
+const fifo_cases = [_]FifoCase{
+    .{ .operation = "upgrade", .boundary = .journal_write },
+    .{ .operation = "upgrade", .boundary = .journal_sync },
+    .{ .operation = "upgrade", .boundary = .progress_append },
+    .{ .operation = "upgrade", .boundary = .progress_sync },
+    .{ .operation = "upgrade", .boundary = .progress_truncate },
+    .{ .operation = "upgrade", .boundary = .stage_create },
+    .{ .operation = "upgrade", .boundary = .stage_metadata },
+    .{ .operation = "upgrade", .boundary = .stage_dir_sync },
+    .{ .operation = "upgrade", .boundary = .backup_link },
+    .{ .operation = "upgrade", .boundary = .backup_dir_sync },
+    .{ .operation = "upgrade", .boundary = .precondition_check },
+    .{ .operation = "upgrade", .boundary = .publish_rename },
+    .{ .operation = "upgrade", .boundary = .parent_sync },
+    .{ .operation = "upgrade", .boundary = .verify },
+    .{ .operation = "upgrade", .boundary = .release_staging },
+    .{ .operation = "upgrade", .boundary = .release_backup },
+    .{ .operation = "upgrade", .crash_at = "mutation_restore_create" },
+    .{ .operation = "remove", .crash_at = "mutation_target_remove" },
+};
+
+comptime {
+    @setEvalBranchQuota(100_000);
+    for (fifo_cases, 0..) |spec, index| {
+        if ((spec.boundary == null) == (spec.crash_at == null))
+            @compileError("each FIFO case selects exactly one crash hook");
+        for (fifo_cases[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.operation, spec.operation) and fifoBoundary(previous) == fifoBoundary(spec))
+                @compileError("duplicate FIFO root-mutation crash selector");
+        }
+    }
+}
+
+const fifo_workspace = "mutation-fifo-packages";
+const fifo_base = "usr/share/" ++ package ++ "/";
+
+fn mkfifo(f: *foundation.Fixture, source: []const u8, name: []const u8, mode: []const u8) !void {
+    const relative = try support.path(f.allocator, source, name);
+    const absolute = try f.absolute(relative);
+    const log = try support.path(f.allocator, fifo_workspace, "mkfifo.log");
+    try f.run(&.{ "/usr/bin/mkfifo", absolute }, log, 10);
+    try f.run(&.{ "/usr/bin/chmod", mode, absolute }, log, 10);
+}
+
+/// Version 1 ships `pipe` (0644) and the regular file `becomes-pipe`; version
+/// 2 ships `pipe` (0640) and `becomes-pipe` as a FIFO (0600). No generation
+/// carries any other non-directory payload.
+fn fifoArchive(f: *foundation.Fixture, arch: []const u8, version: []const u8) ![]u8 {
+    const original = try support.makePackage(f, arch, version, package, fifo_workspace, .{ .no_scripts = true });
+    try f.dir.deleteFile(f.io, original[f.path.len + 1 ..]);
+    const source = try std.fmt.allocPrint(f.allocator, "{s}/{s}_{s}_data.source", .{ fifo_workspace, package, version });
+    inline for (.{ "data", "data.link", "current" }) |name|
+        try f.dir.deleteFile(f.io, try support.path(f.allocator, source, fifo_base ++ name));
+    if (std.mem.eql(u8, version, "1")) {
+        try mkfifo(f, source, fifo_base ++ "pipe", "0644");
+        try f.write(try support.path(f.allocator, source, fifo_base ++ "becomes-pipe"), "regular in 1\n", 0o644);
+    } else {
+        try mkfifo(f, source, fifo_base ++ "pipe", "0640");
+        try mkfifo(f, source, fifo_base ++ "becomes-pipe", "0600");
+    }
+    const destination = try std.fmt.allocPrint(f.allocator, "{s}/{s}_{s}_fifo.deb", .{ fifo_workspace, package, version });
+    return f.buildPackage(source, destination, .{});
+}
+
+fn fifoCaseName(f: *foundation.Fixture, spec: FifoCase) ![]u8 {
+    return std.fmt.allocPrint(f.allocator, "fifo-{s}-{s}", .{
+        spec.operation,
+        if (spec.boundary) |boundary| @tagName(boundary) else spec.crash_at.?,
+    });
+}
+
+fn fifoPublicationStarted(boundary: ?mutation.Boundary) bool {
+    const selected = boundary orelse return true;
+    return switch (selected) {
+        .journal_write,
+        .journal_sync,
+        .progress_append,
+        .progress_sync,
+        .progress_truncate,
+        .stage_create,
+        .stage_metadata,
+        .stage_dir_sync,
+        .backup_link,
+        .backup_dir_sync,
+        .precondition_check,
+        => false,
+        else => true,
+    };
+}
+
+fn checkFifoEvidence(
+    f: *foundation.Fixture,
+    root: []const u8,
+    spec: FifoCase,
+    old_pipe: root_fs.Entry,
+) ![]u8 {
+    var owner = try document(f, root, owner_path);
+    defer owner.deinit();
+    var intent = try document(f, root, intent_path);
+    defer intent.deinit();
+    const attempt_id = try f.allocator.dupe(u8, try text(owner.value, "attempt_id"));
+    try same(try text(intent.value, "attempt_id"), attempt_id);
+    try same(try text(intent.value, "operation"), spec.operation);
+    const removing = std.mem.eql(u8, spec.operation, "remove");
+    var guarded = try foundation.guardedRoot(f.io, root);
+    defer guarded.close(f.io);
+    const confined = root_fs.Root.init(f.io, guarded);
+    if (spec.boundary != null and spec.boundary.? == .journal_write) {
+        try support.absent(f, try path(f, root, mutation.journal_path));
+    } else {
+        var journal = (try (mutation.Store.init(confined)).readJournal(f.allocator)) orelse
+            return error.MissingMutationJournal;
+        defer journal.deinit();
+        try same(&std.fmt.bytesToHex(journal.journal.attempt_id, .lower), attempt_id);
+        var pipe_step = false;
+        var database_step = false;
+        for (journal.journal.steps) |step| {
+            if (step.satisfied()) continue;
+            // Only the dpkg database and, on removal, the emptied package
+            // directories may follow the FIFO steps, so the first occurrence
+            // of every selected hook is a FIFO step.
+            if (step.kind != (if (removing) mutation.StepKind.remove_path else .publish_fifo) or
+                !std.mem.startsWith(u8, step.path, fifo_base))
+            {
+                if (!std.mem.startsWith(u8, step.path, "var/lib/dpkg/") and
+                    !(removing and step.kind == .remove_directory and std.mem.startsWith(u8, fifo_base, step.path)))
+                    return error.NonFifoMutationStep;
+                database_step = true;
+                continue;
+            }
+            if (database_step) return error.FifoStepAfterDatabaseStep;
+            if (!std.mem.eql(u8, step.path, fifo_base ++ "pipe")) continue;
+            const old = switch (step.expected) {
+                .present => |value| value,
+                .absent => return error.MissingRecordedOldFifo,
+            };
+            if (old.kind != .fifo or old.metadata.mode != old_pipe.mode or
+                old.metadata.modified_nanoseconds != old_pipe.modified_nanoseconds or old.inode != old_pipe.inode)
+                return error.OldFifoJournalBindingChanged;
+            switch (step.desired) {
+                .absent => if (!removing) return error.WrongDesiredFifo,
+                .present => |desired| if (removing or desired.kind != .fifo or desired.metadata.mode != 0o640 or
+                    desired.content_sha256 != null or desired.link_target != null) return error.WrongDesiredFifo,
+            }
+            pipe_step = true;
+        }
+        if (!pipe_step) return error.MissingFifoMutationStep;
+        const progress_bytes = try (mutation.Store.init(confined)).readProgressBytes(f.allocator);
+        var progress = try mutation.replayProgress(f.allocator, journal.journal, progress_bytes);
+        defer progress.deinit();
+        const restoring = fifoBoundary(spec) == .restore_create;
+        if ((progress.stage == .rolling_back) != restoring) return error.UnexpectedFifoMutationDirection;
+        if (spec.boundary != null and spec.boundary.? == .stage_dir_sync) {
+            var staged: usize = 0;
+            for (journal.journal.steps) |step| {
+                const name = step.staging_entry orelse continue;
+                const desired = switch (step.desired) {
+                    .present => |value| value,
+                    .absent => continue,
+                };
+                const location = try std.fmt.allocPrint(f.allocator, "{s}/{s}", .{ mutation.staging_path, name });
+                const stored = try confined.entryIfExists(try root_fs.Path.init(location)) orelse continue;
+                if (stored.kind != .named_pipe or stored.mode != desired.metadata.mode or
+                    stored.uid != desired.metadata.uid or stored.gid != desired.metadata.gid or
+                    stored.modified_nanoseconds != desired.metadata.modified_nanoseconds)
+                    return error.StagedFifoMetadataMismatch;
+                staged += 1;
+            }
+            if (staged == 0) return error.MissingStagedFifo;
+        }
+    }
+    if (!fifoPublicationStarted(spec.boundary)) {
+        const current = try confined.entry(try root_fs.Path.initPackage(fifo_base ++ "pipe"));
+        if (current.kind != .named_pipe or current.inode != old_pipe.inode or current.mode != old_pipe.mode or
+            current.modified_nanoseconds != old_pipe.modified_nanoseconds)
+            return error.FifoChangedBeforePublication;
+    }
+    return attempt_id;
+}
+
+fn fifoCase(
+    f: *foundation.Fixture,
+    driver: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    spec: FifoCase,
+    first: []const u8,
+    second: []const u8,
+) !void {
+    const name = try fifoCaseName(f, spec);
+    var scenario = try support.Scenario.init(f, name, driver, dpkg, arch, true);
+    defer scenario.deinit();
+    const removing = std.mem.eql(u8, spec.operation, "remove");
+    const archive_directory = try support.path(f.allocator, name, "archives");
+    const seed_copy = try support.path(f.allocator, archive_directory, "seed.deb");
+    const next_copy = try support.path(f.allocator, archive_directory, "next.deb");
+    try support.fixtureFile(f, seed_copy, try support.read(f, (if (removing) second else first)[f.path.len + 1 ..], 16 * 1024 * 1024), 0o644);
+    try support.fixtureFile(f, next_copy, try support.read(f, second[f.path.len + 1 ..], 16 * 1024 * 1024), 0o644);
+    try scenario.seed(try f.absolute(seed_copy));
+    const next = try f.absolute(next_copy);
+    const old_pipe = try entry(f, scenario.native_root, fifo_base ++ "pipe");
+    if (old_pipe.kind != .named_pipe) return error.SeededFifoMissing;
+    const selected = [_]foundation.PackageIdentity{.{ .name = package, .architecture = arch }};
+    const reference_log = try support.path(f.allocator, name, "reference-run");
+    try f.directory(reference_log);
+    if (try support.reference(f, dpkg, scenario.reference_root, .{
+        .operation = spec.operation,
+        .archives = if (removing) &.{} else &.{next},
+        .packages = if (removing) &selected else &.{},
+        .triggers = true,
+    }, reference_log) != 0) return error.PinnedDpkgFifoOperationFailed;
+    if (try invoke(f, driver, scenario.native_root, arch, try support.path(f.allocator, name, "crash"), .{
+        .operation = spec.operation,
+        .archive = if (removing) null else next,
+        .boundary = spec.boundary,
+        .crash_at = spec.crash_at,
+    })) |unexpected| {
+        var report = unexpected;
+        report.deinit();
+        return error.MissingRealFifoMutationCrash;
+    }
+    const attempt_id = try checkFifoEvidence(f, scenario.native_root, spec, old_pipe);
+    try f.dir.deleteFile(f.io, seed_copy);
+    try f.dir.deleteFile(f.io, next_copy);
+    try support.absent(f, seed_copy);
+    try support.absent(f, next_copy);
+    const crashed = try foundation.capture(f.allocator, f.io, scenario.native_root);
+    try expectReport(try invoke(f, driver, scenario.native_root, arch, try support.path(f.allocator, name, "blocked-before-recovery"), .{
+        .operation = "purge",
+    }), "recovery_required");
+    if (!std.mem.eql(u8, crashed, try foundation.capture(f.allocator, f.io, scenario.native_root)))
+        return error.SecondMutationChangedFifoRoot;
+    var recovered = (try invoke(f, driver, scenario.native_root, arch, try support.path(f.allocator, name, "recover"), .{
+        .operation = "recover",
+    })) orelse return error.MissingFifoRecovery;
+    defer recovered.deinit();
+    try same(recovered.value.outcome, "applied");
+    try same(recovered.value.attempt_id orelse return error.MissingFifoRecovery, attempt_id);
+    const comparison = try support.path(f.allocator, name, "comparison");
+    try f.directory(comparison);
+    try support.compare(f, scenario.reference_root, scenario.native_root, comparison, true);
+    const settled = try foundation.capture(f.allocator, f.io, scenario.native_root);
+    try expectReport(try invoke(f, driver, scenario.native_root, arch, try support.path(f.allocator, name, "repeat"), .{
+        .operation = "recover",
+    }), "applied");
+    if (!std.mem.eql(u8, settled, try foundation.capture(f.allocator, f.io, scenario.native_root)))
+        return error.RepeatRecoveryChangedFifoRoot;
+    try expectReport(try invoke(f, driver, scenario.native_root, arch, try support.path(f.allocator, name, "acknowledge"), .{
+        .operation = "recover",
+        .acknowledge = true,
+    }), "applied");
+    try support.absent(f, try path(f, scenario.native_root, owner_path));
+    try support.absent(f, try path(f, scenario.native_root, intent_path));
+    try support.absent(f, try path(f, scenario.native_root, mutation.journal_path));
+    try support.compare(f, scenario.reference_root, scenario.native_root, comparison, true);
+    std.debug.print("root-mutation FIFO {s}: real exit 86, FIFO-only journal, recovery, dpkg parity\n", .{name});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args = init.minimal.args.iterate();
@@ -501,10 +772,38 @@ pub fn main(init: std.process.Init) !void {
     }
     if (selected == null or selected == .backup_dir_sync)
         try runCase(&fixture, driver, reference.executable, reference.architecture, .backup_dir_sync, true);
-    if (count != (if (selected != null) @as(usize, 1) else boundaries.len))
+    const regular_selected = if (selected) |boundary|
+        std.mem.indexOfScalar(mutation.Boundary, &boundaries, boundary) != null
+    else
+        true;
+    if (count != (if (selected == null) boundaries.len else @intFromBool(regular_selected)))
         return error.MutationSelectorAccountingMismatch;
+    var fifo_count: usize = 0;
+    var fifo_selected = selected == null;
+    for (fifo_cases) |spec| {
+        if (selected != null and fifoBoundary(spec) == selected.?) fifo_selected = true;
+    }
+    if (fifo_selected) {
+        const first = try fifoArchive(&fixture, reference.architecture, "1");
+        const second = try fifoArchive(&fixture, reference.architecture, "2");
+        for (fifo_cases) |spec| {
+            if (selected != null and fifoBoundary(spec) != selected.?) continue;
+            fifoCase(&fixture, driver, reference.executable, reference.architecture, spec, first, second) catch |err| {
+                std.debug.print("{s}: {s}; fixture {s}\n", .{ try fifoCaseName(&fixture, spec), @errorName(err), fixture.path });
+                return err;
+            };
+            fifo_count += 1;
+        }
+    }
+    if (count + fifo_count == 0) return error.UnknownMutationSelector;
     try support.assertHostUnchanged(allocator, init.io, reference.before);
-    std.debug.print("root-mutation journal/staging v{d}: {d}/{d} named real child kills\n", .{
-        case_table_version, count, boundaries.len,
+    std.debug.print("root-mutation journal/staging v{d}: {d}/{d} named real child kills; {d}/{d} FIFO real child kills\n", .{
+        case_table_version, count, boundaries.len, fifo_count, fifo_cases.len,
     });
+}
+
+fn fifoBoundary(spec: FifoCase) mutation.Boundary {
+    if (spec.boundary) |boundary| return boundary;
+    const point = spec.crash_at.?;
+    return std.meta.stringToEnum(mutation.Boundary, point["mutation_".len..]).?;
 }

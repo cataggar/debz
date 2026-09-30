@@ -79,6 +79,22 @@ in use, including by a symbolic link, so a planted link is never written
 through. `createDirectoryPath` creates missing components and proves that each
 existing component is a real directory.
 
+Linux-only `createNamedPipe` is a root-descriptor-relative `mknodat` primitive
+for an exclusive, initially private (`0o600`, subject to umask) FIFO. It never
+follows an intermediate or final symlink; an occupied name fails. It rechecks
+the canonical path grammar even if a caller constructed a raw `Path`.
+`publishNamedPipe` creates such a FIFO as a private `.debz-stage-*` sibling,
+writes the requested ownership, mode, and modification time onto it with
+`applyMetadata`, and only then renames it over the destination (replacing or
+non-replacing, as for files) and fsyncs the directory, so the published FIFO
+is never observable without its final attributes. `observeNamedPipe` reads a
+FIFO's identity and change time with a single no-follow `statx` and fails with
+`error.NotNamedPipe` for anything else. None of these ever opens a FIFO, so no
+call can block on a missing reader or writer. Only the journaled
+[`publish_fifo`](root-mutation.md#fifos-288) step and its restoration use them;
+`supportedMetadata` still rejects FIFOs, so no other caller can mistake one for
+a file.
+
 Replacing an existing path is possible only through atomic publication:
 
 - `stageFile` creates a private `.debz-stage-*` entry with `0o600` permissions

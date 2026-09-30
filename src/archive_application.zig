@@ -53,7 +53,9 @@ pub const Request = union(enum) {
     local: deb_payload.LocalExpected,
 };
 
-pub const FileKind = enum { regular, directory, symlink, hardlink };
+/// `fifo` is a named pipe: it has no content, and only its mode, ownership,
+/// and modification time are published.
+pub const FileKind = enum { regular, directory, symlink, hardlink, fifo };
 
 /// Bounded location of validated content inside the decompressed member.
 pub const Content = struct {
@@ -251,6 +253,7 @@ pub const Features = struct {
     directories: bool = false,
     symlinks: bool = false,
     hardlinks: bool = false,
+    fifos: bool = false,
     setuid_or_setgid: bool = false,
     sticky_bits: bool = false,
     non_root_ownership: bool = false,
@@ -589,8 +592,8 @@ pub fn prepare(
     limits: Limits,
 ) Result {
     const outcome = switch (request) {
-        .repository => |expected| deb_payload.validate(allocator, bytes, expected, limits.payload),
-        .local => |expected| deb_payload.inspectLocal(allocator, bytes, expected, limits.payload),
+        .repository => |expected| deb_payload.validateForApplication(allocator, bytes, expected, limits.payload),
+        .local => |expected| deb_payload.inspectLocalForApplication(allocator, bytes, expected, limits.payload),
     };
     var validation = switch (outcome) {
         .validation => |value| value,
@@ -911,6 +914,7 @@ fn buildFiles(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
             .directory => .directory,
             .symlink => .symlink,
             .hardlink => .hardlink,
+            .fifo => .fifo,
         };
         var content: ?Content = null;
         var sha256: ?[32]u8 = null;
@@ -927,6 +931,7 @@ fn buildFiles(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
             .directory => builder.features.directories = true,
             .symlink => builder.features.symlinks = true,
             .hardlink => builder.features.hardlinks = true,
+            .fifo => builder.features.fifos = true,
         }
         if (entry.mode & 0o6000 != 0) builder.features.setuid_or_setgid = true;
         if (entry.mode & 0o1000 != 0) builder.features.sticky_bits = true;
@@ -1098,7 +1103,7 @@ fn buildChecksums(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
                     return reject(diagnostic, .checksums, .checksum_target_missing, record_offset, file_index);
                 break :blk target_index;
             },
-            .directory, .symlink => return reject(diagnostic, .checksums, .checksum_target_missing, record_offset, file_index),
+            .directory, .symlink, .fifo => return reject(diagnostic, .checksums, .checksum_target_missing, record_offset, file_index),
         };
         // Hard links share payload bytes, so each distinct content entry is
         // hashed at most once regardless of how many paths name it.
@@ -1577,6 +1582,26 @@ fn buildArchive(allocator: std.mem.Allocator, options: TestArchive) ![]u8 {
 
 fn localRequest() Request {
     return .{ .local = .{} };
+}
+
+fn fifoFixtureExpected(bytes: []const u8) deb_payload.Expected {
+    var sha256: [32]u8 = undefined;
+    var sha512: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &sha256, .{});
+    std.crypto.hash.sha2.Sha512.hash(bytes, &sha512, .{});
+    return .{
+        .repository = "fixture-origin",
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .requested_package = "demo",
+        .filename = "demo_1.0_amd64.deb",
+        .size = bytes.len,
+        .archive_identity = .{
+            .primary = .sha512,
+            .digests = .{ .sha256 = sha256, .sha512 = sha512 },
+        },
+    };
 }
 
 fn testLimits() Limits {
@@ -2172,7 +2197,197 @@ test "archive_application.test.unsupported archive features are classified" {
             );
         },
     }
+}
 
+test "archive_application.test.authenticated FIFO payloads are modeled for application only" {
+    const bytes = try buildArchive(testing.allocator, .{
+        .data = &.{.{ .path = "usr/share/special/pipe", .kind = '6', .mode = 0o2640, .uid = 7, .gid = 9 }},
+    });
+    defer testing.allocator.free(bytes);
+    const expected = fifoFixtureExpected(bytes);
+    for ([_]Request{ .{ .repository = expected }, localRequest() }) |request| {
+        var model = switch (prepare(testing.allocator, bytes, request, testLimits())) {
+            .model => |value| value,
+            .diagnostic => |diagnostic| {
+                std.debug.print("FIFO application: {s}\n", .{diagnostic.message()});
+                return error.TestUnexpectedResult;
+            },
+        };
+        defer model.deinit();
+        try testing.expect(model.features.fifos);
+        try testing.expect(!model.features.regular_files);
+        try testing.expect(model.features.setuid_or_setgid);
+        try testing.expect(model.features.non_root_ownership);
+        try testing.expectEqual(@as(usize, 1), model.files.len);
+        const pipe = model.files[0];
+        try testing.expectEqual(FileKind.fifo, pipe.kind);
+        try testing.expectEqualStrings("usr/share/special/pipe", pipe.path);
+        try testing.expectEqual(@as(u32, 0o2640), pipe.mode);
+        try testing.expectEqual(@as(u64, 7), pipe.uid);
+        try testing.expectEqual(@as(u64, 9), pipe.gid);
+        try testing.expectEqual(test_mtime, pipe.mtime);
+        try testing.expectEqual(@as(u64, 0), pipe.size);
+        try testing.expect(pipe.content == null and pipe.sha256 == null and pipe.md5 == null);
+        try testing.expect(pipe.link_target == null and pipe.link_literal == null);
+        try testing.expect(!pipe.conffile);
+        try testing.expectError(error.NotRegularFile, model.fileBytes(pipe));
+    }
+
+    // The application digest binds the FIFO's kind and metadata.
+    const other_mode = try buildArchive(testing.allocator, .{
+        .data = &.{.{ .path = "usr/share/special/pipe", .kind = '6', .mode = 0o2600, .uid = 7, .gid = 9 }},
+    });
+    defer testing.allocator.free(other_mode);
+    const regular = try buildArchive(testing.allocator, .{
+        .data = &.{.{ .path = "usr/share/special/pipe", .mode = 0o2640, .uid = 7, .gid = 9 }},
+    });
+    defer testing.allocator.free(regular);
+    var first = switch (prepare(testing.allocator, bytes, localRequest(), testLimits())) {
+        .model => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer first.deinit();
+    for ([_][]const u8{ other_mode, regular }) |variant| {
+        var model = switch (prepare(testing.allocator, variant, localRequest(), testLimits())) {
+            .model => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer model.deinit();
+        try testing.expect(!std.mem.eql(u8, &first.digest, &model.digest));
+    }
+
+    var bad_size = expected;
+    bad_size.size += 1;
+    const size_failure = deb_payload.validateForApplication(
+        testing.allocator,
+        bytes,
+        bad_size,
+        .{},
+    ).diagnostic;
+    try testing.expectEqual(deb_payload.Stage.digest, size_failure.stage);
+    try testing.expectEqual(deb_payload.Code.size_mismatch, size_failure.code);
+    var bad_digest = expected;
+    var identity = bad_digest.archive_identity.?;
+    identity.digests.sha512.?[0] ^= 1;
+    bad_digest.archive_identity = identity;
+    const digest_failure = deb_payload.validateForApplication(
+        testing.allocator,
+        bytes,
+        bad_digest,
+        .{},
+    ).diagnostic;
+    try testing.expectEqual(deb_payload.Stage.digest, digest_failure.stage);
+    try testing.expectEqual(deb_payload.Code.digest_mismatch, digest_failure.code);
+
+    // Consumers outside the application model keep refusing FIFOs.
+    const default_failure = deb_payload.validate(
+        testing.allocator,
+        bytes,
+        expected,
+        .{},
+    ).diagnostic;
+    try testing.expectEqual(deb_payload.Stage.data_tar, default_failure.stage);
+    try testing.expectEqual(deb_payload.Code.unsupported_file_type, default_failure.code);
+    const local_failure = deb_payload.inspectLocal(testing.allocator, bytes, .{}, .{}).diagnostic;
+    try testing.expectEqual(deb_payload.Code.unsupported_file_type, local_failure.code);
+}
+
+test "archive_application.test.FIFOs cannot be conffiles, checksum targets, or hard-link sources" {
+    try expectRejected(.{
+        .control = &.{.{ .path = "conffiles", .content = "/etc/demo.fifo\n" }},
+        .data = &.{
+            .{ .path = "etc", .kind = '5', .mode = 0o755 },
+            .{ .path = "etc/demo.fifo", .kind = '6' },
+        },
+    }, .conffile_not_shipped, .conffile_declaration);
+    var checksum_text: [64]u8 = undefined;
+    const checksum = try std.fmt.bufPrint(&checksum_text, "{s}  usr/share/pipe\n", .{"d41d8cd98f00b204e9800998ecf8427e"});
+    var checksum_result = try prepareArchive(.{
+        .control = &.{.{ .path = "md5sums", .content = checksum }},
+        .data = &.{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share/pipe", .kind = '6' },
+        },
+    });
+    switch (checksum_result) {
+        .model => |*model| {
+            model.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |diagnostic| try testing.expectEqual(Code.checksum_target_missing, diagnostic.code),
+    }
+    var linked = try prepareArchive(.{
+        .data = &.{
+            .{ .path = "pipe", .kind = '6' },
+            .{ .path = "alias", .kind = '1', .link = "pipe" },
+        },
+    });
+    switch (linked) {
+        .model => |*model| {
+            model.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .diagnostic => |diagnostic| {
+            try testing.expectEqual(Code.payload_rejected, diagnostic.code);
+            try testing.expectEqual(deb_payload.Code.unsafe_link, diagnostic.payload.?.code);
+        },
+    }
+}
+
+test "archive_application.test.FIFO application rejects unsafe and unmodeled special entries" {
+    const entries = [_]struct { data: TestEntry, code: deb_payload.Code }{
+        .{ .data = .{ .path = "pipe", .kind = '6', .content = "bad" }, .code = .tar_invalid_number },
+        .{ .data = .{ .path = "pipe", .kind = '6', .link = "target" }, .code = .unsafe_link },
+        .{ .data = .{ .path = "../escape", .kind = '6' }, .code = .unsafe_path },
+        .{ .data = .{ .path = "pipe", .kind = '3' }, .code = .unsupported_file_type },
+        .{ .data = .{ .path = "pipe", .kind = '4' }, .code = .unsupported_file_type },
+        .{ .data = .{ .path = "pipe", .kind = '7' }, .code = .unsupported_file_type },
+        .{ .data = .{ .path = "pipe", .kind = 's' }, .code = .unsupported_file_type },
+    };
+    for (entries) |test_case| {
+        const bytes = try buildArchive(testing.allocator, .{ .data = &.{test_case.data} });
+        defer testing.allocator.free(bytes);
+        const expected = fifoFixtureExpected(bytes);
+        try testing.expectEqual(test_case.code, deb_payload.validateForApplication(
+            testing.allocator,
+            bytes,
+            expected,
+            .{},
+        ).diagnostic.code);
+    }
+}
+
+test "archive_application.test.FIFO application cannot widen control or resource limits" {
+    const fifo_control = try buildArchive(testing.allocator, .{
+        .control = &.{.{ .path = "extension", .kind = '6' }},
+    });
+    defer testing.allocator.free(fifo_control);
+    const fifo_data = try buildArchive(testing.allocator, .{
+        .data = &.{.{ .path = "pipe", .kind = '6' }},
+    });
+    defer testing.allocator.free(fifo_data);
+    try testing.expectEqual(deb_payload.Code.unsupported_file_type, deb_payload.validateForApplication(
+        testing.allocator,
+        fifo_control,
+        fifoFixtureExpected(fifo_control),
+        .{},
+    ).diagnostic.code);
+    try testing.expectEqual(deb_payload.Code.tar_entry_limit, deb_payload.validateForApplication(
+        testing.allocator,
+        fifo_data,
+        fifoFixtureExpected(fifo_data),
+        .{ .max_entries_per_tar = 1 },
+    ).diagnostic.code);
+    try testing.expectEqual(deb_payload.Code.tar_metadata_limit, deb_payload.validateForApplication(
+        testing.allocator,
+        fifo_data,
+        fifoFixtureExpected(fifo_data),
+        .{ .max_inventory_bytes_per_tar = 1 },
+    ).diagnostic.code);
+}
+
+test "archive_application.test.unsupported paths and bounded archives are classified" {
     const traversing = try buildArchive(testing.allocator, .{
         .data = &.{.{ .path = "usr/share/link", .kind = '2', .link = "../../../etc/passwd" }},
     });

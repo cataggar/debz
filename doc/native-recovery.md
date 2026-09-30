@@ -2302,10 +2302,28 @@ applicable, caller archive eviction, pre-recovery and pre-ack second-mutation
 refusal, receipt ownership through acknowledgment, and exact pinned-dpkg
 final-root parity. The early no-journal phase is durably marked rolled back
 before retry; it is not silently replayed as a second prepared action.
-Run both Debug and ReleaseSafe with
+The version-2 table adds 18 FIFO real-child kills (#288). A version-1 FIFO
+package (`pipe` 0644, regular `becomes-pipe`) is upgraded to version 2 (`pipe`
+0640, `becomes-pipe` a FIFO), whose filesystem journal holds only
+`publish_fifo` steps ahead of the dpkg database backup, so the first
+occurrence of each hook is a FIFO step: `journal_write`, `journal_sync`,
+`progress_append`, `progress_sync`, `progress_truncate`, `stage_create`,
+`stage_metadata`, `stage_dir_sync` (which also checks the staged FIFO's exact
+recorded metadata), `backup_link`, `backup_dir_sync` (the regular file the
+FIFO replaces), `precondition_check`, `publish_rename`, `parent_sync`,
+`verify`, `release_staging`, `release_backup`, and — through the existing
+`mutation_restore_create` `CrashPoint`, whose injected verification failure now
+also selects a changed FIFO — the rollback's FIFO `restore_create`. A removal
+of the version-2 FIFOs is killed at `mutation_target_remove`. Each case checks
+the retained attempt, the journal's recorded old FIFO (kind, mode, mtime,
+inode), that no pre-publication hook changed the installed FIFO, the journal
+direction, pre-recovery second-mutation refusal, recovery with the original
+attempt, idempotent repeat recovery, acknowledgment, and exact pinned-dpkg
+final-root parity. Run both Debug and ReleaseSafe with
 `zig build test-native-recovery-zig-mutation-boundaries
 -Dnative-reference-dpkg=/absolute/pinned/dpkg` (optionally select one with
-`-Dnative-zig-recovery-mutation-boundary-case=stage_write`).
+`-Dnative-zig-recovery-mutation-boundary-case=stage_write`, which runs every
+regular and FIFO case bound to that hook).
 
 The native root-mutation journal names 27 syscall hooks in
 `src/root_mutation.zig::Boundary`. Its `Stage` directions are

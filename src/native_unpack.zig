@@ -1387,6 +1387,10 @@ const CombinedMutationHooks = struct {
                 .present => |state| state,
                 .absent => continue,
             };
+            // A FIFO is recreated from the journal exactly as a symbolic link is.
+            if (kind == .symlink and previous.kind == .fifo and
+                (desired.kind != .fifo or !std.meta.eql(previous.metadata, desired.metadata)))
+                return step.index;
             if (previous.kind != kind) continue;
             if (kind == .regular and previous.content_sha256 != null and desired.content_sha256 != null and
                 !std.mem.eql(u8, &previous.content_sha256.?, &desired.content_sha256.?))
@@ -2186,7 +2190,7 @@ pub const Operation = enum {
     reinstall,
 };
 
-pub const Kind = enum { regular, directory, symlink, hardlink };
+pub const Kind = enum { regular, directory, symlink, hardlink, fifo };
 
 /// Why a claim on an already owned or already present path is allowed.
 pub const Disposition = enum {
@@ -2295,6 +2299,7 @@ pub const FilesystemChange = union(enum) {
     file: FileChange,
     symlink: SymlinkChange,
     hardlink: HardlinkChange,
+    fifo: FifoChange,
 
     pub const MetadataChange = struct {
         path: []const u8,
@@ -2328,6 +2333,15 @@ pub const FilesystemChange = union(enum) {
     pub const HardlinkChange = struct {
         path: []const u8,
         source: []const u8,
+    };
+
+    /// A named pipe. It has no content, so its whole state is its metadata.
+    pub const FifoChange = struct {
+        path: []const u8,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        modified_nanoseconds: i128,
     };
 };
 
@@ -4150,6 +4164,7 @@ fn kindOf(kind: archive_application.FileKind) Kind {
         .directory => .directory,
         .symlink => .symlink,
         .hardlink => .hardlink,
+        .fifo => .fifo,
     };
 }
 
@@ -4879,8 +4894,9 @@ fn describeTransactionClaim(
                 .package = item.identity.name,
             }),
         .directory => result.modified_nanoseconds = 0,
+        .fifo => {},
     }
-    if (claim.kind == .directory or claim.kind == .symlink) {
+    if (claim.kind == .directory or claim.kind == .symlink or claim.kind == .fifo) {
         if (builder.stat_overrides.get(file.path)) |override| {
             if (claim.kind != .symlink) result.mode = override.mode;
             result.uid = override.uid;
@@ -4909,7 +4925,8 @@ fn transactionClaimsCompatible(
     const file_pair = (left.kind == .regular or left.kind == .hardlink) and
         (right.kind == .regular or right.kind == .hardlink);
     const link_pair = left.kind == .symlink and right.kind == .symlink;
-    if (!file_pair and !link_pair) return false;
+    const fifo_pair = left.kind == .fifo and right.kind == .fifo;
+    if (!file_pair and !link_pair and !fifo_pair) return false;
     if (file_pair and left.kind != right.kind) return false;
     if (!optionalDigestEqual(left.sha256, right.sha256)) return false;
     if (!optionalTextEqual(left.hardlink_group, right.hardlink_group) or
@@ -5069,8 +5086,9 @@ fn planClaim(
             planned.gid = effective.gid;
             planned.modified_nanoseconds = effective.modified_nanoseconds;
         },
+        .fifo => {},
     }
-    if (claim.kind == .directory or claim.kind == .symlink) {
+    if (claim.kind == .directory or claim.kind == .symlink or claim.kind == .fifo) {
         if (builder.stat_overrides.get(file.path)) |override| {
             if (claim.kind != .symlink) planned.mode = override.mode;
             planned.uid = override.uid;
@@ -5450,6 +5468,7 @@ fn observeRootState(
         .file => .regular,
         .directory => .directory,
         .sym_link => .symlink,
+        .named_pipe => .fifo,
         else => return builder.fail(.{
             .surface = .transition,
             .code = .unsupported_entry,
@@ -5513,6 +5532,18 @@ fn observeRootState(
             entry = observation.entry;
             change_nanoseconds = observation.change_nanoseconds;
             link_target = try builder.arena.dupe(u8, observation.target);
+        },
+        .fifo => {
+            // Observed by name only: opening a FIFO with no peer blocks.
+            const observation = builder.request.root.observeNamedPipe(resolved) catch
+                return builder.fail(.{
+                    .surface = .transition,
+                    .code = .root_unreadable,
+                    .path = path,
+                    .package = package,
+                });
+            entry = observation.entry;
+            change_nanoseconds = observation.change_nanoseconds;
         },
         .directory => {
             const observation = try rootDirectoryObservation(
@@ -6114,6 +6145,19 @@ fn sharedMultiArch(
                 ))
                 return builder.fail(mismatch);
         },
+        .fifo => {
+            // A FIFO has no content, so a shared one is exactly its kind and
+            // metadata on a single unlinked-elsewhere inode.
+            if (observed.kind != .fifo or observed.link_count != 1 or
+                !modeledMetadataMatches(
+                    observed,
+                    incoming.mode,
+                    incoming.uid,
+                    incoming.gid,
+                    incoming.modified_nanoseconds,
+                ))
+                return builder.fail(mismatch);
+        },
         .directory => return .none,
     }
     try builder.chargeWork(1, mismatch);
@@ -6300,6 +6344,7 @@ fn rootMetadataMatchesPrevious(
         .regular, .hardlink => .file,
         .directory => .directory,
         .symlink => .sym_link,
+        .fifo => .named_pipe,
     };
     return previous.change_nanoseconds != null and
         observed.entry.modeled and
@@ -6492,7 +6537,7 @@ fn prepareEffectiveFiles(builder: *Builder, item: *PackageWork) PlanError!void {
     defer chain.deinit(allocator);
 
     for (item.model.files, 0..) |file, start| {
-        if (file.kind == .directory or file.kind == .symlink) {
+        if (file.kind == .directory or file.kind == .symlink or file.kind == .fifo) {
             states[start] = .done;
             continue;
         }
@@ -6576,7 +6621,7 @@ fn prepareEffectiveFiles(builder: *Builder, item: *PackageWork) PlanError!void {
                             .package = item.identity.name,
                         });
                 },
-                .directory, .symlink => return builder.fail(.{
+                .directory, .symlink, .fifo => return builder.fail(.{
                     .surface = .archive,
                     .code = .hard_link_target_missing,
                     .path = current.path,
@@ -7820,7 +7865,7 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
                 .path = logical_path,
                 .digest = planned.md5.?,
             }),
-            .directory, .symlink => {},
+            .directory, .symlink, .fifo => {},
         }
     }
     for (item.conffiles.items) |conffile| {
@@ -8168,6 +8213,13 @@ fn ownFilesystemChange(
             .path = try allocator.dupe(u8, value.path),
             .source = try allocator.dupe(u8, value.source),
         } },
+        .fifo => |value| .{ .fifo = .{
+            .path = try allocator.dupe(u8, value.path),
+            .mode = value.mode,
+            .uid = value.uid,
+            .gid = value.gid,
+            .modified_nanoseconds = value.modified_nanoseconds,
+        } },
     };
 }
 
@@ -8279,6 +8331,19 @@ fn lower(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
                 .hardlink => try changes.append(builder.allocator, .{ .hardlink = .{
                     .path = planned.path,
                     .source = planned.link_source.?,
+                } }),
+                .fifo => try changes.append(builder.allocator, .{ .fifo = .{
+                    .path = planned.path,
+                    .mode = planned.mode,
+                    .uid = planned.uid,
+                    .gid = planned.gid,
+                    .modified_nanoseconds = planned.modified_nanoseconds orelse
+                        return builder.fail(.{
+                            .surface = .lowering,
+                            .code = .unsupported_entry,
+                            .path = planned.path,
+                            .package = item.identity.name,
+                        }),
                 } }),
             }
         }
@@ -8691,6 +8756,14 @@ pub fn planDigest(value: Plan) [32]u8 {
             hashText(&hash, "hardlink");
             hashText(&hash, item.path);
             hashText(&hash, item.source);
+        },
+        .fifo => |item| {
+            hashText(&hash, "fifo");
+            hashText(&hash, item.path);
+            hashNumber(&hash, item.mode);
+            hashNumber(&hash, item.uid);
+            hashNumber(&hash, item.gid);
+            hashI128(&hash, item.modified_nanoseconds);
         },
     };
 
@@ -9978,6 +10051,18 @@ fn lowerMaterializationIntents(
                 .overwrite = try materializationOverwrite(&publications, link.path),
             } });
         },
+        .fifo => |pipe| {
+            if (guarded.contains(pipe.path))
+                try appendCaseGuard(allocator, owned, root, pipe.path, &touched, &intents);
+            try intents.append(allocator, .{ .fifo = .{
+                .path = pipe.path,
+                .mode = pipe.mode,
+                .uid = pipe.uid,
+                .gid = pipe.gid,
+                .modified_nanoseconds = pipe.modified_nanoseconds,
+                .overwrite = try materializationOverwrite(&publications, pipe.path),
+            } });
+        },
     };
     std.mem.reverse(root_mutation.Intent, directory_metadata.items);
     try intents.appendSlice(allocator, directory_metadata.items);
@@ -10112,6 +10197,14 @@ fn verifyMaterializedFilesystem(
             const source = try root.entry(try root_fs.Path.initPackage(link.source));
             if (!target.isRegularFile() or !source.isRegularFile() or
                 target.device != source.device or target.inode != source.inode)
+                return error.MaterializationVerificationFailed;
+        },
+        .fifo => |pipe| {
+            // Observed by name only; a FIFO is never opened.
+            const entry = try root.entry(try root_fs.Path.initPackage(pipe.path));
+            if (entry.kind != .named_pipe or entry.mode != pipe.mode or
+                entry.uid != pipe.uid or entry.gid != pipe.gid or
+                entry.modified_nanoseconds != pipe.modified_nanoseconds)
                 return error.MaterializationVerificationFailed;
         },
     };
@@ -13117,7 +13210,7 @@ fn materializeRemoval(
                     try directories.append(allocator, stored);
                     if (!purge) try retained_paths.append(allocator, listed);
                 },
-                .file, .sym_link => {
+                .file, .sym_link, .named_pipe => {
                     if (surviving_owner) continue;
                     try files.append(allocator, stored);
                     try removing.put(allocator, stored, {});
@@ -37212,6 +37305,142 @@ test "native_unpack.test.materialization repeats without stale journal" {
     ) == null);
 }
 
+fn expectFixtureFifo(fixture: *Fixture, path: []const u8, mode: u32) !void {
+    const entry = try fixture.root().entry(try root_fs.Path.init(path));
+    try testing.expectEqual(std.Io.File.Kind.named_pipe, entry.kind);
+    try testing.expectEqual(mode, entry.mode);
+    try testing.expectEqual(currentUid(), entry.uid);
+    try testing.expectEqual(currentGid(), entry.gid);
+    try testing.expectEqual(
+        @as(i128, archive_application.test_fixtures.mtime) * std.time.ns_per_s,
+        entry.modified_nanoseconds,
+    );
+}
+
+fn expectFixtureInfo(fixture: *Fixture, name: []const u8, expected: []const u8) !void {
+    var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const spelling = try std.fmt.bufPrint(&buffer, "var/lib/dpkg/info/{s}", .{name});
+    const bytes = try fixture.root().readFileAlloc(testing.allocator, try root_fs.Path.init(spelling), 1 << 20);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings(expected, bytes);
+}
+
+test "native_unpack.test.materialization creates, replaces, and removes FIFOs" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+
+    var first_data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo/becomes-file", .kind = '6', .mode = 0o600 },
+        .{ .path = "usr/share/demo/becomes-pipe", .content = "regular\n" },
+        .{ .path = "usr/share/demo/obsolete", .kind = '6', .mode = 0o644 },
+        .{ .path = "usr/share/demo/pipe", .kind = '6', .mode = 0o640 },
+    };
+    const first_bytes = try buildOwnedArchive(.{ .package = "demo", .version = "1" }, &first_data);
+    defer testing.allocator.free(first_bytes);
+    var first_model = try modelOf(first_bytes);
+    defer first_model.deinit();
+    const install_steps = [_]native_program.Step{unpackStep(0, &first_model, 0, null, false)};
+    var install_artifacts: [1]native_program.ProgramArtifact = undefined;
+    var install_program = try singleProgram(&fixture, &first_model, first_bytes, &install_steps, &install_artifacts);
+    const installed = try materializeFixture(
+        &fixture,
+        &install_program,
+        fixture.snapshot(),
+        &.{.{ .artifact = 0, .bytes = first_bytes }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.applied, installed.outcome);
+    try expectFixtureFifo(&fixture, "usr/share/demo/pipe", 0o640);
+    try expectFixtureFifo(&fixture, "usr/share/demo/becomes-file", 0o600);
+    try expectFixtureFifo(&fixture, "usr/share/demo/obsolete", 0o644);
+    // FIFOs are owned like any other path, and like dpkg they carry no
+    // checksum.
+    try expectFixtureInfo(&fixture, "demo.list", "/.\n/usr\n/usr/share\n/usr/share/demo\n/usr/share/demo/becomes-file\n" ++
+        "/usr/share/demo/becomes-pipe\n/usr/share/demo/obsolete\n/usr/share/demo/pipe\n");
+    const md5sums = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/info/demo.md5sums"),
+        1 << 20,
+    );
+    defer testing.allocator.free(md5sums);
+    try testing.expect(std.mem.endsWith(u8, md5sums, "  usr/share/demo/becomes-pipe\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, md5sums, "\n"));
+
+    var captured = try captureDatabaseSnapshot(testing.allocator, fixture.root(), .{});
+    defer captured.deinit();
+    var database = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    var second_data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share/demo/becomes-file", .content = "now a file\n" },
+        .{ .path = "usr/share/demo/becomes-pipe", .kind = '6', .mode = 0o644 },
+        .{ .path = "usr/share/demo/pipe", .kind = '6', .mode = 0o2660 },
+    };
+    const second_bytes = try buildOwnedArchive(.{ .package = "demo", .version = "2" }, &second_data);
+    defer testing.allocator.free(second_bytes);
+    var second_model = try modelOf(second_bytes);
+    defer second_model.deinit();
+    const upgrade_steps = [_]native_program.Step{unpackStep(0, &second_model, 0, "1", false)};
+    var upgrade_artifacts = [_]native_program.ProgramArtifact{
+        testArtifact(0, &second_model, second_bytes.len),
+    };
+    var upgrade_program = testProgram(
+        database.generation.sha256,
+        database.model.packages.len,
+        &upgrade_artifacts,
+        &upgrade_steps,
+    );
+    const pipe_before = try fixture.root().entry(try root_fs.Path.init("usr/share/demo/pipe"));
+    const upgraded = try materializeFixture(
+        &fixture,
+        &upgrade_program,
+        captured.snapshot,
+        &.{.{ .artifact = 0, .bytes = second_bytes }},
+        locks.interface(),
+        .install,
+        .{},
+    );
+    try testing.expectEqual(MaterializationOutcome.applied, upgraded.outcome);
+    // A FIFO is replaced by a fresh one with the new metadata, as dpkg does.
+    try expectFixtureFifo(&fixture, "usr/share/demo/pipe", 0o2660);
+    const pipe_after = try fixture.root().entry(try root_fs.Path.init("usr/share/demo/pipe"));
+    try testing.expect(pipe_after.inode != pipe_before.inode);
+    try expectFixtureFifo(&fixture, "usr/share/demo/becomes-pipe", 0o644);
+    const becomes_file = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("usr/share/demo/becomes-file"),
+        4096,
+    );
+    defer testing.allocator.free(becomes_file);
+    try testing.expectEqualStrings("now a file\n", becomes_file);
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init("usr/share/demo/obsolete"),
+    ) == null);
+    try expectFixtureInfo(&fixture, "demo.list", "/.\n/usr\n/usr/share\n/usr/share/demo\n/usr/share/demo/becomes-file\n" ++
+        "/usr/share/demo/becomes-pipe\n/usr/share/demo/pipe\n");
+    try testing.expect(try fixture.root().entryIfExists(
+        try root_fs.Path.init(root_mutation.journal_path),
+    ) == null);
+}
+
 test "native_unpack.test.materialization database capture has an aggregate bound" {
     var fixture: Fixture = undefined;
     try fixture.init(empty_status, &.{});
@@ -42149,7 +42378,7 @@ test "native_unpack.test.obsolete special files are never generic removals" {
         \\
     ;
     const info = [_]package_database.InfoEntry{
-        .{ .name = "alpha.list", .bytes = "/.\n/run/pipe\n/usr/share/alpha\n" },
+        .{ .name = "alpha.list", .bytes = "/.\n/run/socket\n/usr/share/alpha\n" },
     };
     var fixture: Fixture = undefined;
     try fixture.init(status, &info);
@@ -42158,12 +42387,13 @@ test "native_unpack.test.obsolete special files are never generic removals" {
         try root_fs.Path.init("run"),
         root_fs.default_directory_permissions,
     );
+    // A FIFO is an ordinary obsolete path now; a socket still is not.
     const linux = std.os.linux;
-    const fifo_name: [*:0]const u8 = "run/pipe";
+    const socket_name: [*:0]const u8 = "run/socket";
     switch (linux.errno(linux.mknodat(
         fixture.tmp.dir.handle,
-        fifo_name,
-        linux.S.IFIFO | 0o644,
+        socket_name,
+        linux.S.IFSOCK | 0o644,
         0,
     ))) {
         .SUCCESS => {},
