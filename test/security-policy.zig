@@ -384,6 +384,107 @@ test "security: workflow expected failures require bound outcomes, no hidden fai
     }
 }
 
+const workload_needs = "    needs: [build-and-test-workload, build-and-test-workload-production, build-and-test-workload-apt-system, build-and-test-workload-native, build-and-test-workload-release, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]";
+
+const WorkloadJob = struct {
+    name: []const u8,
+    next: []const u8,
+    partition: []const u8,
+    steps: []const []const u8,
+    commands: []const []const u8,
+    mutations: []const []const u8,
+};
+
+const workload_jobs = [_]WorkloadJob{
+    .{
+        .name = "build-and-test-workload",
+        .next = "\n  build-and-test-workload-production:\n",
+        .partition = "test-workload-core",
+        .steps = &.{ "Build and test workload core", "Check ReleaseSafe CLI help", "Prepare native download action fixture", "Prepare native exact-lock package closure", "Validate native download action outputs" },
+        .commands = &.{ "build -Doptimize={s} -j2 --summary all", "build test-workload-core -Doptimize={s} -j2 --summary all" },
+        .mutations = &.{
+            "          zig build -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n",
+            "        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help\n",
+            "          python3 tools/generate-integration-repository.py \\\n",
+            "        uses: ./actions/download\n",
+            "          test \"$DOWNLOADED\" -gt 0\n",
+        },
+    },
+    .{
+        .name = "build-and-test-workload-production",
+        .next = "\n  build-and-test-workload-apt-system:\n",
+        .partition = "test-workload-production",
+        .steps = &.{ "Build and test workload production", "Compare native triggers and diversion settlement with dpkg" },
+        .commands = &.{"build test-workload-production -Doptimize={s} -j2 --summary all"},
+        .mutations = &.{
+            "          mkdir -p .tmp\n",
+            "          reference_dpkg=\"$(python3 tools/prepare-native-dpkg.py)\"\n",
+            " test-native-diversion-settlement-zig",
+            "-Dnative-reference-dpkg=\"$reference_dpkg\" ",
+        },
+    },
+    .{
+        .name = "build-and-test-workload-apt-system",
+        .next = "\n  build-and-test-workload-native:\n",
+        .partition = "test-workload-apt-system",
+        .steps = &.{ "Build and test workload apt system", "Run required real apt facade acceptance", "Normalize apt facade acceptance diagnostics", "Run required privileged orchestration crash suite", "Normalize privileged orchestration diagnostics" },
+        .commands = &.{"build test-workload-apt-system -Doptimize={s} -j2 --summary all"},
+        .mutations = &.{
+            "            \"$(command -v zig)\" build test-apt-system-acceptance \\\n",
+            "              -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n",
+            "              -Drequire-privileged-orchestration-tests=true \\\n",
+            "            TMPDIR=\"$PWD/.zig-cache\" \\\n",
+            "            PYTHONPYCACHEPREFIX=\"$PWD/.zig-cache/pycache\" \\\n",
+            "            ZIG_GLOBAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-global\" \\\n",
+            "            ZIG_LOCAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-local\" \\\n",
+            "          sudo rm -rf /run/debz\n",
+        },
+    },
+    .{
+        .name = "build-and-test-workload-native",
+        .next = "\n  build-and-test-workload-release:\n",
+        .partition = "test-workload-native",
+        .steps = &.{ "Build and test workload native", "Compare native materialization, conffiles, differential, and lifecycle with dpkg", "Require private native helper namespaces" },
+        .commands = &.{"build test-workload-native -Doptimize={s} -j2 --summary all"},
+        .mutations = &.{
+            " test-native-conffiles",
+            " test-native-differential",
+            "          zig build test-native-lifecycle-zig \\\n",
+            "          mkdir -p .tmp\n",
+            "          zig build test-native-helper-namespace -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n",
+        },
+    },
+    .{
+        .name = "build-and-test-workload-release",
+        .next = "\n  native-recovery-zig-workflows:\n",
+        .partition = "test-workload-release",
+        .steps = &.{ "Build and test workload release", "Test release packaging", "Run pinned dpkg lifecycle and trigger reference oracles", "Exercise standalone Zig workspace selectors and fail-closed combinations" },
+        .commands = &.{ "build test-workload-release -Doptimize={s} -j2 --summary all", "build fuzz -Doptimize={s} -j2 --summary all" },
+        .mutations = &.{
+            "          zig build fuzz -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n",
+            "        run: zig build test-release -j2 --summary all\n",
+            " test-native-triggers-zig-settlement-reference",
+            "          zig build build-native-acceptance-zig -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n",
+            "            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \\\n",
+            "            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\\n",
+            "          grep -Fxq 'error: InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"\n",
+            "          grep -Fxq 'error: PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"\n",
+        },
+    },
+};
+
+const workload_results = [_]struct { variable: []const u8, job: []const u8 }{
+    .{ .variable = "BUILD_RESULT", .job = "build-and-test-workload" },
+    .{ .variable = "BUILD_PRODUCTION_RESULT", .job = "build-and-test-workload-production" },
+    .{ .variable = "BUILD_APT_SYSTEM_RESULT", .job = "build-and-test-workload-apt-system" },
+    .{ .variable = "BUILD_NATIVE_RESULT", .job = "build-and-test-workload-native" },
+    .{ .variable = "BUILD_RELEASE_RESULT", .job = "build-and-test-workload-release" },
+};
+
+fn partitionCommand(f: *Fixture, partition: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(f.arena.allocator(), "          zig build {s} -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n", .{partition});
+}
+
 test "security: required CI modes, architecture and aggregate failure propagation refuse mutations" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -392,10 +493,10 @@ test "security: required CI modes, architecture and aggregate failure propagatio
     defer valid.deinit();
     try valid.ok();
     for ([_]struct { original: []const u8, changed: []const u8, message: []const u8 }{
-        .{ .original = "optimize: [Debug, ReleaseSafe]", .changed = "optimize: [Debug]", .message = "both optimization modes" },
-        .{ .original = "name: [linux-x64, linux-arm64]", .changed = "name: [linux-x64]", .message = "both optimization modes" },
-        .{ .original = "needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]", .changed = "needs: [build-and-test-workload]", .message = "existing required build checks" },
-        .{ .original = "zig build test-release -j2 --summary all", .changed = "echo skip release", .message = "Test release packaging must remain required" },
+        .{ .original = "optimize: [Debug, ReleaseSafe]", .changed = "optimize: [Debug]", .message = "both architectures and optimization modes within 45 minutes" },
+        .{ .original = "name: [linux-x64, linux-arm64]", .changed = "name: [linux-x64]", .message = "both architectures and optimization modes within 45 minutes" },
+        .{ .original = workload_needs, .changed = "    needs: [build-and-test-workload]", .message = "existing required build checks" },
+        .{ .original = "zig build test-release -j2 --summary all", .changed = "echo skip release", .message = "must execute Test release packaging exactly as reviewed in Debug" },
     }) |mutation| {
         const changed = try f.replace(workflow, mutation.original, mutation.changed);
         const rejected = try f.check("ci-recovery", changed);
@@ -404,125 +505,172 @@ test "security: required CI modes, architecture and aggregate failure propagatio
     }
 }
 
-test "security: all required CI workloads and optimized-mode selections fail closed under mutation" {
+test "security: every split build workload job, mode and step fails closed under mutation" {
     var f = try Fixture.init();
     defer f.deinit();
     const workflow = try f.source(".github/workflows/ci.yml");
-    const workload = try job(workflow, "build-and-test-workload", "\n  native-recovery-zig-workflows:\n");
-    for ([_]struct { before: []const u8, after: []const u8 }{
-        .{ .before = "    timeout-minutes: 90", .after = "    timeout-minutes: 180" },
-        .{ .before = "name: [linux-x64, linux-arm64]", .after = "name: [linux-x64]" },
-        .{ .before = "optimize: [Debug, ReleaseSafe]", .after = "optimize: [Debug]" },
-        .{ .before = "optimize: [Debug, ReleaseSafe]", .after = "optimize: [ReleaseSafe]" },
-        .{ .before = "      OPTIMIZE: ${{ matrix.optimize }}", .after = "      OPTIMIZE: Debug" },
-        .{ .before = "        include:", .after = "        exclude:" },
-        .{ .before = "          zig build test -Doptimize=\"$OPTIMIZE\" -j2 --summary all", .after = "" },
-        .{ .before = "          zig build fuzz -Doptimize=\"$OPTIMIZE\" -j2 --summary all", .after = "" },
-        .{ .before = "      - name: Build and test\n", .after = "      - name: Build and test\n        if: false\n" },
-        .{ .before = "-Doptimize=\"$OPTIMIZE\"", .after = "-Doptimize=Debug" },
-        .{ .before = "test-native-materialization test-native-conffiles", .after = "test-native-materialization" },
-        .{ .before = "test-native-differential", .after = "" },
-        .{ .before = "test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig", .after = "test-native-lifecycle-zig test-native-triggers-zig" },
-        .{ .before = "test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle test-native-triggers-zig-settlement-reference", .after = "test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle" },
-        .{ .before = "test-native-diversion-settlement-zig \\\n            -Dnative-reference-dpkg=\"$reference_dpkg\"", .after = "test-native-diversion-settlement-zig \\\n            -Dnative-reference-dpkg=\"$untrusted_dpkg\"" },
-        .{ .before = "      - name: Exercise standalone Zig workspace selectors and fail-closed combinations\n", .after = "      - name: Exercise standalone Zig workspace selectors and fail-closed combinations\n        if: false\n" },
-        .{ .before = "          zig build build-native-acceptance-zig -Doptimize=\"$OPTIMIZE\" -j2 --summary all", .after = "" },
-        .{ .before = "            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \\", .after = "" },
-        .{ .before = "            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\", .after = "" },
-        .{ .before = "          grep -Fxq 'error: InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"", .after = "" },
-        .{ .before = "          grep -Fxq 'error: PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"", .after = "" },
-        .{ .before = "reference_dpkg=\"$(python3 tools/prepare-native-dpkg.py)\"", .after = "reference_dpkg=/usr/bin/dpkg" },
-        .{ .before = "-Dnative-reference-dpkg=\"$reference_dpkg\"", .after = "" },
-        .{ .before = "test-native-helper-namespace", .after = "test" },
-        .{ .before = "        run: zig build test-release -j2 --summary all", .after = "" },
-        .{ .before = "        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help", .after = "" },
-        .{ .before = "            \"$(command -v zig)\" build test-apt-system-acceptance \\", .after = "" },
-        .{ .before = "              -Doptimize=\"$OPTIMIZE\" -j2 --summary all", .after = "" },
-        .{ .before = "              -Drequire-privileged-orchestration-tests=true \\", .after = "" },
-        .{ .before = "          python3 tools/generate-integration-repository.py \\", .after = "" },
-        .{ .before = "        uses: ./actions/download", .after = "" },
-        .{ .before = "          test \"$DOWNLOADED\" -gt 0", .after = "" },
-    }) |mutation| {
-        const changed_workload = try f.replace(workload, mutation.before, mutation.after);
-        const changed = try f.replace(workflow, workload, changed_workload);
-        const rejected = try f.check("ci-recovery", changed);
-        defer rejected.deinit();
-        if (rejected.code == 0) std.debug.print("CI mutation missed workload: {s}\n", .{mutation.before});
-        try rejected.failsWith("ci.yml:");
+    for (workload_jobs) |workload_job| {
+        const body = try job(workflow, workload_job.name, workload_job.next);
+        const limit = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must require both architectures and optimization modes within 45 minutes", .{workload_job.name});
+        for ([_]struct { before: []const u8, after: []const u8 }{
+            .{ .before = "    timeout-minutes: 45", .after = "    timeout-minutes: 90" },
+            .{ .before = "    timeout-minutes: 45", .after = "    timeout-minutes: 46" },
+            .{ .before = "    timeout-minutes: 45", .after = "    timeout-minutes: 45\n    timeout-minutes: 45" },
+            .{ .before = "name: [linux-x64, linux-arm64]", .after = "name: [linux-x64]" },
+            .{ .before = "optimize: [Debug, ReleaseSafe]", .after = "optimize: [Debug]" },
+            .{ .before = "optimize: [Debug, ReleaseSafe]", .after = "optimize: [ReleaseSafe]" },
+            .{ .before = "      OPTIMIZE: ${{ matrix.optimize }}", .after = "      OPTIMIZE: Debug" },
+            .{ .before = "        include:", .after = "        exclude:" },
+            .{ .before = "          - os: ubuntu-24.04-arm\n", .after = "" },
+            .{ .before = "      fail-fast: false", .after = "      fail-fast: true" },
+            .{ .before = "\n    steps:\n", .after = "\n    if: false\n    steps:\n" },
+            .{ .before = "\n    steps:\n", .after = "\n    continue-on-error: true\n    steps:\n" },
+        }) |mutation| {
+            const changed = try f.replace(workflow, body, try f.replace(body, mutation.before, mutation.after));
+            const rejected = try f.check("ci-recovery", changed);
+            defer rejected.deinit();
+            if (rejected.code == 0) std.debug.print("CI mutation missed {s}: {s}\n", .{ workload_job.name, mutation.before });
+            try rejected.failsWith(limit);
+        }
+        const setup = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must retain pinned Zig and metadata dependencies", .{workload_job.name});
+        for ([_][]const u8{ "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U", "liblzma-dev libzstd-dev python3-jsonschema", "          persist-credentials: false\n" }) |token| {
+            const changed = try f.replace(workflow, body, try f.replace(body, token, ""));
+            const rejected = try f.check("ci-recovery", changed);
+            defer rejected.deinit();
+            try rejected.failsWith(setup);
+        }
+        const tokens = [_][]const []const u8{ workload_job.mutations, &.{ try partitionCommand(&f, workload_job.partition), "-Doptimize=\"$OPTIMIZE\"" } };
+        for (tokens) |group| for (group) |token| {
+            const changed = try f.replace(workflow, body, try f.replace(body, token, ""));
+            const rejected = try f.check("ci-recovery", changed);
+            defer rejected.deinit();
+            if (rejected.code == 0) std.debug.print("CI mutation missed {s}: {s}\n", .{ workload_job.name, token });
+            try rejected.failsWith("ci.yml:");
+        };
+        for (workload_job.steps) |name| {
+            const selected = try step(body, name);
+            const marker = try std.fmt.allocPrint(f.arena.allocator(), "      - name: {s}\n", .{name});
+            const disabled = if (std.mem.indexOf(u8, selected, "        if: ")) |if_start| blk: {
+                const if_end = std.mem.indexOfPos(u8, selected, if_start, "\n") orelse return error.MissingCondition;
+                break :blk try f.replace(selected, selected[if_start..if_end], "        if: false");
+            } else try f.replace(selected, marker, try std.fmt.allocPrint(f.arena.allocator(), "{s}        if: false\n", .{marker}));
+            const altered = try f.replace(workflow, selected, disabled);
+            const refused = try f.check("ci-recovery", altered);
+            defer refused.deinit();
+            const diagnostic = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must execute {s} exactly as reviewed", .{ workload_job.name, name });
+            try refused.failsWith(diagnostic);
+            const unreviewed = try f.replace(workflow, selected, try std.fmt.allocPrint(f.arena.allocator(), "      - name: Unreviewed extra step\n        run: echo skipped\n{s}", .{selected}));
+            const extra = try f.check("ci-recovery", unreviewed);
+            defer extra.deinit();
+            try extra.failsWith("has a missing, reordered or unreviewed workload step");
+        }
     }
-    const recovery = [_][]const u8{
-        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]",
-        "    if: ${{ always() }}",
-        "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
-        "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
-        "          RECOVERY_REPOSITORY_RESULT: ${{ needs.native-recovery-zig-repository.result }}",
-        "          RECOVERY_HELPER_RESULT: ${{ needs.native-recovery-zig-helper.result }}",
-        "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
-        "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
-        "          RECOVERY_DIVERSIONS_RESULT: ${{ needs.native-recovery-zig-diversions.result }}",
-        "          test \"$BUILD_RESULT\" = success",
-        "          test \"$RECOVERY_WORKFLOWS_RESULT\" = success",
-        "          test \"$RECOVERY_REPOSITORY_RESULT\" = success",
-        "          test \"$RECOVERY_HELPER_RESULT\" = success",
-        "          test \"$RECOVERY_FAMILY_RESULT\" = success",
-        "          test \"$RECOVERY_SCENARIOS_RESULT\" = success",
-        "          test \"$RECOVERY_DIVERSIONS_RESULT\" = success",
-        "          zig build test-native-recovery-zig-unit -j2 --summary all",
-        "          zig build test-native-recovery-zig-unit -Doptimize=ReleaseSafe -j2 --summary all",
-        "          - os: ubuntu-24.04-arm",
-    };
-    for (recovery) |token| {
-        const changed = try f.replace(workflow, token, "");
-        const rejected = try f.check("ci-recovery", changed);
-        defer rejected.deinit();
-        if (rejected.code == 0) std.debug.print("CI mutation missed recovery: {s}\n", .{token});
-        try rejected.failsWith("ci.yml:");
-    }
-    for ([_][]const u8{
-        "Test release packaging",                            "Check ReleaseSafe CLI help",
-        "Run required privileged orchestration crash suite", "Prepare native download action fixture",
-        "Prepare native exact-lock package closure",         "Validate native download action outputs",
-    }) |name| {
-        const selected = try step(workload, name);
-        const if_start = std.mem.indexOf(u8, selected, "        if: ${{ matrix.optimize ==") orelse return error.MissingOptimizationCondition;
-        const if_end = std.mem.indexOfPos(u8, selected, if_start, "\n") orelse return error.MissingOptimizationCondition;
-        const disabled = try f.replace(selected, selected[if_start..if_end], "        if: false");
-        const altered = try f.replace(workflow, selected, disabled);
-        const refused = try f.check("ci-recovery", altered);
-        defer refused.deinit();
-        const diagnostic = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must remain required", .{name});
-        try refused.failsWith(diagnostic);
-    }
-    for ([_][]const u8{
-        "Build and test",
-        "Run required real apt facade acceptance",
-        "Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg",
-        "Require private native helper namespaces",
-    }) |name| {
-        const shared = try step(workload, name);
-        const altered = try f.replace(workflow, shared, try std.fmt.allocPrint(f.arena.allocator(), "{s}        if: false\n", .{shared}));
-        const refused = try f.check("ci-recovery", altered);
-        defer refused.deinit();
-        try refused.failsWith("ci.yml:");
-    }
-    const apt_acceptance = try step(workload, "Run required real apt facade acceptance");
-    for ([_][]const u8{
-        "          sudo env \\",
-        "            TMPDIR=\"$PWD/.zig-cache\" \\",
-        "            PYTHONPYCACHEPREFIX=\"$PWD/.zig-cache/pycache\" \\",
-        "            ZIG_GLOBAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-global\" \\",
-        "            ZIG_LOCAL_CACHE_DIR=\"$PWD/.zig-cache/apt-system-acceptance-local\" \\",
-    }) |token| {
-        const changed = try f.replace(workflow, apt_acceptance, try f.replace(apt_acceptance, token, ""));
-        const refused = try f.check("ci-recovery", changed);
-        defer refused.deinit();
-        try refused.failsWith("ci.yml:");
-    }
-    const normalization = try step(workload, "Normalize apt facade acceptance diagnostics");
-    const disabled = try f.replace(workflow, normalization, try f.replace(normalization, "        if: ${{ always() }}", "        if: false"));
+    const normalization = try step(try job(workflow, "build-and-test-workload-apt-system", "\n  build-and-test-workload-native:\n"), "Normalize apt facade acceptance diagnostics");
+    const disabled = try f.replace(workflow, normalization, try f.replace(normalization, "        if: ${{ always() }}", "        if: success()"));
     const refused = try f.check("ci-recovery", disabled);
     defer refused.deinit();
-    try refused.failsWith("ci.yml: apt acceptance caches must be normalized for both modes");
+    try refused.failsWith("ci.yml: build-and-test-workload-apt-system must execute Normalize apt facade acceptance diagnostics exactly as reviewed");
+}
+
+test "security: every former workload target runs exactly once across the split jobs" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const inventory = "ci.yml: every former build workload target must execute exactly once across the workload jobs";
+    for (workload_jobs, 0..) |workload_job, index| {
+        const command = try partitionCommand(&f, workload_job.partition);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, workflow, command));
+        const body = try job(workflow, workload_job.name, workload_job.next);
+        const other = workload_jobs[(index + 1) % workload_jobs.len];
+        const other_body = try job(workflow, other.name, other.next);
+        const other_command = try partitionCommand(&f, other.partition);
+        const duplicated = try f.replace(workflow, other_body, try f.replace(other_body, other_command, try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ other_command, command })));
+        const repeated = try f.check("ci-recovery", duplicated);
+        defer repeated.deinit();
+        try repeated.failsWith(inventory);
+        const without = try f.replace(workflow, body, try f.replace(body, command, ""));
+        const moved = try f.replace(without, other_body, try f.replace(other_body, other_command, try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ other_command, command })));
+        const balanced = try f.check("ci-recovery", moved);
+        defer balanced.deinit();
+        const diagnostic = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must execute", .{other.name});
+        try balanced.failsWith(diagnostic);
+        const outside = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n  extra-partition:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: zig build {s} -j2\n", .{ workflow, workload_job.partition });
+        const escaped = try f.check("ci-recovery", outside);
+        defer escaped.deinit();
+        const once = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: workload partition {s} must execute exactly once", .{workload_job.partition});
+        try escaped.failsWith(once);
+    }
+    for ([_][]const u8{
+        "zig build test -Doptimize=\"$OPTIMIZE\" -j2 --summary all",
+        "zig build --summary all test",
+        "\"$(command -v zig)\" build test-release test",
+    }) |aggregate| {
+        const release = try job(workflow, "build-and-test-workload-release", "\n  native-recovery-zig-workflows:\n");
+        const fuzz = "          zig build fuzz -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n";
+        const restored = try f.replace(workflow, release, try f.replace(release, fuzz, try std.fmt.allocPrint(f.arena.allocator(), "{s}          {s}\n", .{ fuzz, aggregate })));
+        const rejected = try f.check("ci-recovery", restored);
+        defer rejected.deinit();
+        try rejected.failsWith("ci.yml: aggregate zig build test must not duplicate the workload partitions");
+        const elsewhere = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n  extra-aggregate:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: |\n          {s}\n", .{ workflow, aggregate });
+        const outside = try f.check("ci-recovery", elsewhere);
+        defer outside.deinit();
+        try outside.failsWith("ci.yml: aggregate zig build test must not duplicate the workload partitions");
+    }
+    const lifecycle = "          zig build test-native-lifecycle-zig \\\n            -Dnative-reference-dpkg=\"$reference_dpkg\" -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n";
+    const native = try job(workflow, "build-and-test-workload-native", "\n  build-and-test-workload-release:\n");
+    const repeated_target = try f.replace(workflow, native, try f.replace(native, lifecycle, try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ lifecycle, lifecycle })));
+    const duplicate = try f.check("ci-recovery", repeated_target);
+    defer duplicate.deinit();
+    try duplicate.failsWith(inventory);
+}
+
+test "security: build.zig test is exactly the disjoint union of the CI workload partitions" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const build = try f.source("build.zig");
+    const valid = try f.check("workload-build", build);
+    defer valid.deinit();
+    try valid.ok();
+    const partitions = [_][]const u8{ "workload_core", "workload_production", "workload_apt_system", "workload_native", "workload_release" };
+    var members: usize = 0;
+    var lines = std.mem.splitScalar(u8, build, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimStart(u8, line, " ");
+        const partition = for (partitions) |candidate| {
+            if (std.mem.startsWith(u8, trimmed, candidate) and std.mem.startsWith(u8, trimmed[candidate.len..], ".dependOn(")) break candidate;
+        } else continue;
+        members += 1;
+        const entry = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n", .{line});
+        const target = if (std.mem.eql(u8, partition, "workload_core")) "workload_native" else "workload_core";
+        const moved_line = try std.fmt.allocPrint(f.arena.allocator(), "    {s}{s}\n", .{ target, trimmed[partition.len..] });
+        for ([_][]const u8{ "", moved_line, try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ entry, moved_line }) }) |replacement| {
+            const changed = try f.replace(build, entry, replacement);
+            const rejected = try f.check("workload-build", changed);
+            defer rejected.deinit();
+            if (rejected.code == 0) std.debug.print("workload partition mutation missed: {s} -> {s}\n", .{ line, replacement });
+            try rejected.failsWith("build.zig:");
+        }
+    }
+    try testing.expectEqual(@as(usize, 41), members);
+    for (partitions) |partition| {
+        const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
+        const removed = try f.check("workload-build", try f.replace(build, binding, ""));
+        defer removed.deinit();
+        try removed.failsWith("build.zig: aggregate test step must depend only on every workload partition");
+    }
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "    test_step.dependOn(workload_release);\n", .after = "    test_step.dependOn(workload_release);\n    test_step.dependOn(&run_tests.step);\n" },
+        .{ .before = "    workload_release.dependOn(native_only_rehearsal);\n", .after = "    test_step.dependOn(native_only_rehearsal);\n" },
+        .{ .before = "addHelpFlagTests(b, workload_core,", .after = "addHelpFlagTests(b, workload_native," },
+        .{ .before = "addHelpFlagTests(b, workload_core,", .after = "addHelpFlagTests(b, test_step," },
+        .{ .before = "b.step(\"test-workload-native\",", .after = "b.step(\"test-workload-natives\"," },
+        .{ .before = "    test_step.dependOn(workload_release);\n", .after = "    test_step.dependOn(workload_release);\n    b.step(\"test-extra\", \"x\").dependOn(workload_native);\n" },
+    }) |mutation| {
+        const rejected = try f.check("workload-build", try f.replace(build, mutation.before, mutation.after));
+        defer rejected.deinit();
+        if (rejected.code == 0) std.debug.print("workload build mutation missed: {s}\n", .{mutation.after});
+        try rejected.failsWith("build.zig:");
+    }
 }
 
 fn job(workflow: []const u8, name: []const u8, next: []const u8) ![]const u8 {
@@ -553,10 +701,14 @@ test "security: required recovery shards keep every mode, selector, setup and ag
     const workflow = try f.source(".github/workflows/ci.yml");
     const gate = try job(workflow, "build-and-test", "\n  security-audit:\n");
     for ([_][]const u8{
-        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]",
+        workload_needs,
         "    if: ${{ always() }}",
         "        name: [linux-x64, linux-arm64]",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
+        "          BUILD_PRODUCTION_RESULT: ${{ needs.build-and-test-workload-production.result }}",
+        "          BUILD_APT_SYSTEM_RESULT: ${{ needs.build-and-test-workload-apt-system.result }}",
+        "          BUILD_NATIVE_RESULT: ${{ needs.build-and-test-workload-native.result }}",
+        "          BUILD_RELEASE_RESULT: ${{ needs.build-and-test-workload-release.result }}",
         "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
         "          RECOVERY_REPOSITORY_RESULT: ${{ needs.native-recovery-zig-repository.result }}",
         "          RECOVERY_HELPER_RESULT: ${{ needs.native-recovery-zig-helper.result }}",
@@ -564,6 +716,10 @@ test "security: required recovery shards keep every mode, selector, setup and ag
         "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
         "          RECOVERY_DIVERSIONS_RESULT: ${{ needs.native-recovery-zig-diversions.result }}",
         "          test \"$BUILD_RESULT\" = success",
+        "          test \"$BUILD_PRODUCTION_RESULT\" = success",
+        "          test \"$BUILD_APT_SYSTEM_RESULT\" = success",
+        "          test \"$BUILD_NATIVE_RESULT\" = success",
+        "          test \"$BUILD_RELEASE_RESULT\" = success",
         "          test \"$RECOVERY_WORKFLOWS_RESULT\" = success",
         "          test \"$RECOVERY_REPOSITORY_RESULT\" = success",
         "          test \"$RECOVERY_HELPER_RESULT\" = success",
@@ -698,9 +854,10 @@ test "security: aggregate gate rejects failure, cancellation, skip and unknown j
     const commands = try script(try step(gate, "Require every build and native recovery shard"));
     const states = [_][]const u8{ "success", "failure", "cancelled", "skipped", "unknown" };
     const names = [_][]const u8{
-        "BUILD_RESULT",               "RECOVERY_WORKFLOWS_RESULT", "RECOVERY_REPOSITORY_RESULT",
-        "RECOVERY_HELPER_RESULT",     "RECOVERY_FAMILY_RESULT",    "RECOVERY_SCENARIOS_RESULT",
-        "RECOVERY_DIVERSIONS_RESULT",
+        "BUILD_RESULT",               "BUILD_PRODUCTION_RESULT",    "BUILD_APT_SYSTEM_RESULT",
+        "BUILD_NATIVE_RESULT",        "BUILD_RELEASE_RESULT",       "RECOVERY_WORKFLOWS_RESULT",
+        "RECOVERY_REPOSITORY_RESULT", "RECOVERY_HELPER_RESULT",     "RECOVERY_FAMILY_RESULT",
+        "RECOVERY_SCENARIOS_RESULT",  "RECOVERY_DIVERSIONS_RESULT",
     };
     for (names, 0..) |_, changed| {
         for (states) |state| {
@@ -708,10 +865,13 @@ test "security: aggregate gate rejects failure, cancellation, skip and unknown j
             for (names, 0..) |name, index| {
                 values[index] = try std.fmt.allocPrint(f.arena.allocator(), "{s}={s}", .{ name, if (index == changed) state else "success" });
             }
-            const result = try support.run(&.{
-                "env",     values[0], values[1], values[2], values[3], values[4],
-                values[5], values[6], "bash",    "-e",      "-c",      commands,
-            });
+            var argv: [names.len + 4][]const u8 = undefined;
+            argv[0] = "env";
+            @memcpy(argv[1 .. names.len + 1], &values);
+            argv[names.len + 1] = "bash";
+            argv[names.len + 2] = "-e";
+            argv[names.len + 3] = "-c";
+            const result = try support.run(&(argv ++ [_][]const u8{commands}));
             defer result.deinit();
             try testing.expectEqual(std.mem.eql(u8, state, "success"), result.code == 0);
         }
@@ -744,24 +904,30 @@ test "security: Debug and ReleaseSafe build workloads execute all commands and p
     var f = try Fixture.init();
     defer f.deinit();
     const workflow = try f.source(".github/workflows/ci.yml");
-    const workload = try job(workflow, "build-and-test-workload", "\n  native-recovery-zig-workflows:\n");
-    const commands = try script(try step(workload, "Build and test"));
-    for ([_][]const u8{ "Debug", "ReleaseSafe" }) |mode| {
-        const optimize = try std.fmt.allocPrint(f.arena.allocator(), "OPTIMIZE={s}", .{mode});
-        const printed = try std.fmt.allocPrint(f.arena.allocator(), "build -Doptimize={s} -j2 --summary all\nbuild test -Doptimize={s} -j2 --summary all\nbuild fuzz -Doptimize={s} -j2 --summary all\n", .{ mode, mode, mode });
-        const stdout_script = try std.fmt.allocPrint(f.arena.allocator(), "zig() {{ printf '%s\\n' \"$*\"; }}\n{s}", .{commands});
-        const valid = try support.run(&.{ "env", optimize, "bash", "-e", "-c", stdout_script });
-        defer valid.deinit();
-        try valid.ok();
-        try testing.expectEqualStrings(printed, valid.stdout);
-        const fail_script = try std.fmt.allocPrint(f.arena.allocator(), "zig() {{ test \"$*\" != \"$FAIL_COMMAND\"; }}\n{s}", .{commands});
-        var lines = std.mem.splitScalar(u8, printed, '\n');
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            const failing = try std.fmt.allocPrint(f.arena.allocator(), "FAIL_COMMAND={s}", .{line});
-            const rejected = try support.run(&.{ "env", optimize, failing, "bash", "-e", "-c", fail_script });
-            defer rejected.deinit();
-            try testing.expect(rejected.code != 0);
+    for (workload_jobs) |workload_job| {
+        const workload = try job(workflow, workload_job.name, workload_job.next);
+        const commands = try script(try step(workload, workload_job.steps[0]));
+        for ([_][]const u8{ "Debug", "ReleaseSafe" }) |mode| {
+            const optimize = try std.fmt.allocPrint(f.arena.allocator(), "OPTIMIZE={s}", .{mode});
+            var expected: std.ArrayList(u8) = .empty;
+            for (workload_job.commands) |command| {
+                try expected.print(f.arena.allocator(), "{s}\n", .{try std.mem.replaceOwned(u8, f.arena.allocator(), command, "{s}", mode)});
+            }
+            const printed = expected.items;
+            const stdout_script = try std.fmt.allocPrint(f.arena.allocator(), "zig() {{ printf '%s\\n' \"$*\"; }}\n{s}", .{commands});
+            const valid = try support.run(&.{ "env", optimize, "bash", "-e", "-c", stdout_script });
+            defer valid.deinit();
+            try valid.ok();
+            try testing.expectEqualStrings(printed, valid.stdout);
+            const fail_script = try std.fmt.allocPrint(f.arena.allocator(), "zig() {{ test \"$*\" != \"$FAIL_COMMAND\"; }}\n{s}", .{commands});
+            var lines = std.mem.splitScalar(u8, printed, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const failing = try std.fmt.allocPrint(f.arena.allocator(), "FAIL_COMMAND={s}", .{line});
+                const rejected = try support.run(&.{ "env", optimize, failing, "bash", "-e", "-c", fail_script });
+                defer rejected.deinit();
+                try testing.expect(rejected.code != 0);
+            }
         }
     }
 }
@@ -1606,9 +1772,9 @@ test "security: lifecycle gates retain reference refusals and required Zig selec
         "trigger_zig.addArtifactArg(native_lifecycle_tests);",
         "trigger_zig.addArg(\"--native-helper\");",
         "trigger_zig.addArtifactArg(native_trigger_helper);",
-        "test_step.dependOn(&run_lifecycle_zig_tests.step);",
-        "test_step.dependOn(&run_trigger_zig_tests.step);",
-        "test_step.dependOn(&run_settlement_tests.step);",
+        "workload_native.dependOn(&run_lifecycle_zig_tests.step);",
+        "workload_native.dependOn(&run_trigger_zig_tests.step);",
+        "workload_native.dependOn(&run_settlement_tests.step);",
         "b.step(\"test-native-lifecycle-zig-oracle\",",
         "b.step(\"test-native-triggers-zig-oracle\",",
         "b.step(\"test-native-triggers-zig-settlement-reference\",",

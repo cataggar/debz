@@ -121,16 +121,26 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = debz });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit and CLI integration tests");
-    test_step.dependOn(&run_tests.step);
+    const workload_core = b.step("test-workload-core", "Run the core unit, CLI, consumer and repository-add workload partition");
+    const workload_production = b.step("test-workload-production", "Run the production backend, family, security and customize workload partition");
+    const workload_apt_system = b.step("test-workload-apt-system", "Run the apt system facade and orchestrator workload partition");
+    const workload_native = b.step("test-workload-native", "Run the native transaction, dpkg oracle and recovery unit workload partition");
+    const workload_release = b.step("test-workload-release", "Run the release schema and native-only rehearsal workload partition");
+    test_step.dependOn(workload_core);
+    test_step.dependOn(workload_production);
+    test_step.dependOn(workload_apt_system);
+    test_step.dependOn(workload_native);
+    test_step.dependOn(workload_release);
+    workload_core.dependOn(&run_tests.step);
 
     const repository_cli_tests = b.addTest(.{ .root_module = repository_cli });
     const run_repository_cli_tests = b.addRunArtifact(repository_cli_tests);
-    test_step.dependOn(&run_repository_cli_tests.step);
+    workload_core.dependOn(&run_repository_cli_tests.step);
 
     const cli_tests = b.addSystemCommand(&.{ "sh", "tools/test-cli.sh" });
     cli_tests.addArtifactArg(cli);
     cli_tests.addArg(version);
-    test_step.dependOn(&cli_tests.step);
+    workload_core.dependOn(&cli_tests.step);
 
     const help_cases = [_]struct {
         args: []const []const u8,
@@ -175,28 +185,28 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "package-cache", "fingerprint", "--unknown" }, .usage = "debz package-cache fingerprint --lock-input PATH" },
     };
     for (help_cases) |case| {
-        addHelpFlagTests(b, test_step, cli, case.args, case.usage);
+        addHelpFlagTests(b, workload_core, cli, case.args, case.usage);
     }
 
     const no_args_help = b.addRunArtifact(cli);
     no_args_help.expectExitCode(0);
     no_args_help.expectStdOutMatch("debz <command> [options] [packages...]");
     no_args_help.expectStdErrEqual("");
-    test_step.dependOn(&no_args_help.step);
+    workload_core.dependOn(&no_args_help.step);
 
     const positional_help = b.addRunArtifact(cli);
     positional_help.addArg("help");
     positional_help.expectExitCode(2);
     positional_help.expectStdOutEqual("");
     positional_help.expectStdErrMatch("debz: unknown command 'help'");
-    test_step.dependOn(&positional_help.step);
+    workload_core.dependOn(&positional_help.step);
 
     const removed_version_flag = b.addRunArtifact(cli);
     removed_version_flag.addArg("--version");
     removed_version_flag.expectExitCode(2);
     removed_version_flag.expectStdOutEqual("");
     removed_version_flag.expectStdErrMatch("debz: unknown command '--version'");
-    test_step.dependOn(&removed_version_flag.step);
+    workload_core.dependOn(&removed_version_flag.step);
 
     const consumer_tests = b.addSystemCommand(&.{
         b.graph.zig_exe,
@@ -205,7 +215,7 @@ pub fn build(b: *std.Build) void {
         "../../.zig-cache/public-consumer",
     });
     consumer_tests.setCwd(b.path("test/consumer"));
-    test_step.dependOn(&consumer_tests.step);
+    workload_core.dependOn(&consumer_tests.step);
 
     const integration_tests = b.addSystemCommand(&.{ "sh", "tools/test-integration-roots.sh" });
     integration_tests.addArtifactArg(cli);
@@ -241,7 +251,7 @@ pub fn build(b: *std.Build) void {
     real_snapshot_comparator_step.dependOn(
         &install_real_snapshot_comparator.step,
     );
-    test_step.dependOn(&run_real_snapshot_comparator_tests.step);
+    workload_core.dependOn(&run_real_snapshot_comparator_tests.step);
 
     const apt_system_acceptance_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-acceptance.zig"),
@@ -257,7 +267,7 @@ pub fn build(b: *std.Build) void {
     const run_apt_acceptance_unit_tests = b.addRunArtifact(apt_acceptance_unit_tests);
     b.step("test-apt-system-acceptance-unit", "Check Zig acceptance fixture guards without root")
         .dependOn(&run_apt_acceptance_unit_tests.step);
-    test_step.dependOn(&run_apt_acceptance_unit_tests.step);
+    workload_core.dependOn(&run_apt_acceptance_unit_tests.step);
     const apt_system_acceptance_zig = b.addRunArtifact(apt_system_acceptance_binary);
     apt_system_acceptance_zig.addArtifactArg(cli);
     b.step("test-apt-system-acceptance-zig", "Run executable Zig apt facade acceptance (requires root)")
@@ -301,7 +311,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_repository_backend_tests = b.addRunArtifact(repository_backend_tests);
     repository_add_step.dependOn(&run_repository_backend_tests.step);
-    test_step.dependOn(&repository_add_tests.step);
+    workload_core.dependOn(&repository_add_tests.step);
 
     const fuzz_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -384,7 +394,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-apt-system-schema", "Validate local apt/system schemas with the Zig validator")
         .dependOn(&run_apt_schema_tests.step);
     release_test_step.dependOn(&run_apt_schema_tests.step);
-    test_step.dependOn(&run_apt_schema_tests.step);
+    workload_release.dependOn(&run_apt_schema_tests.step);
     const install_layout_tests = b.addSystemCommand(&.{ "sh", "tools/test-release-install.sh" });
     install_layout_tests.addArg(b.graph.zig_exe);
     install_layout_tests.addArg(version);
@@ -437,8 +447,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_package_family_tests = b.addRunArtifact(package_family_tests);
     production_backend_test_step.dependOn(&run_package_family_tests.step);
-    test_step.dependOn(&run_package_family_tests.step);
-    test_step.dependOn(&run_production_backend_tests.step);
+    workload_production.dependOn(&run_package_family_tests.step);
+    workload_production.dependOn(&run_production_backend_tests.step);
 
     const system_profile_test_module = b.createModule(.{
         .root_source_file = b.path("src/system_profile.zig"),
@@ -569,12 +579,12 @@ pub fn build(b: *std.Build) void {
     apt_system_test_step.dependOn(&run_apt_system_command_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_state_tests.step);
     apt_system_test_step.dependOn(&run_apt_system_orchestrator_tests.step);
-    test_step.dependOn(&run_system_profile_tests.step);
-    test_step.dependOn(&run_apt_system_api_tests.step);
-    test_step.dependOn(&run_apt_system_cli_tests.step);
-    test_step.dependOn(&run_apt_system_command_tests.step);
-    test_step.dependOn(&run_apt_system_state_tests.step);
-    test_step.dependOn(&run_apt_system_orchestrator_tests.step);
+    workload_apt_system.dependOn(&run_system_profile_tests.step);
+    workload_apt_system.dependOn(&run_apt_system_api_tests.step);
+    workload_apt_system.dependOn(&run_apt_system_cli_tests.step);
+    workload_apt_system.dependOn(&run_apt_system_command_tests.step);
+    workload_apt_system.dependOn(&run_apt_system_state_tests.step);
+    workload_apt_system.dependOn(&run_apt_system_orchestrator_tests.step);
     const required_security_test_step = b.step(
         "test-required-security",
         "Run mandatory production ownership and restart security tests",
@@ -585,8 +595,8 @@ pub fn build(b: *std.Build) void {
     required_security_test_step.dependOn(
         &run_required_orchestrator_security_tests.step,
     );
-    test_step.dependOn(&run_required_production_security_tests.step);
-    test_step.dependOn(&run_required_orchestrator_security_tests.step);
+    workload_production.dependOn(&run_required_production_security_tests.step);
+    workload_apt_system.dependOn(&run_required_orchestrator_security_tests.step);
 
     const native_program_tests = b.addTest(.{
         .root_module = debz,
@@ -697,7 +707,7 @@ pub fn build(b: *std.Build) void {
         "test-native-alternatives",
         "Run native alternatives parser, selection, and topology tests",
     ).dependOn(&run_native_alternatives_tests.step);
-    test_step.dependOn(&run_native_alternatives_tests.step);
+    workload_native.dependOn(&run_native_alternatives_tests.step);
     const native_alternatives_oracle_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(
@@ -734,7 +744,7 @@ pub fn build(b: *std.Build) void {
         "test-native-alternatives-oracle",
         "Replay native alternatives parsing against admitted amd64/arm64 evidence",
     ).dependOn(&run_native_alternatives_oracle_tests.step);
-    test_step.dependOn(&run_native_alternatives_oracle_tests.step);
+    workload_native.dependOn(&run_native_alternatives_oracle_tests.step);
 
     const native_materialization_tests = b.addTest(.{
         .root_module = debz,
@@ -769,7 +779,7 @@ pub fn build(b: *std.Build) void {
     const native_snapshot_tests = b.addTest(.{ .root_module = native_snapshot_module });
     const run_native_snapshot_tests = b.addRunArtifact(native_snapshot_tests);
     native_differential_step.dependOn(&run_native_snapshot_tests.step);
-    test_step.dependOn(&run_native_snapshot_tests.step);
+    workload_native.dependOn(&run_native_snapshot_tests.step);
     const native_differential_zig_tests = b.addTest(.{ .root_module = native_differential_module });
     const run_native_differential_zig_tests = b.addRunArtifact(native_differential_zig_tests);
     const native_differential_zig = b.addExecutable(.{
@@ -780,7 +790,7 @@ pub fn build(b: *std.Build) void {
     run_native_differential_zig.addArtifactArg(native_materialization_tests);
     run_native_differential_zig.step.dependOn(&run_native_differential_zig_tests.step);
     native_differential_step.dependOn(&run_native_differential_zig.step);
-    test_step.dependOn(&run_native_differential_zig_tests.step);
+    workload_native.dependOn(&run_native_differential_zig_tests.step);
     const native_fixture_module = b.createModule(.{
         .root_source_file = b.path("test/native_materialization.zig"),
         .target = target,
@@ -799,7 +809,7 @@ pub fn build(b: *std.Build) void {
     const run_native_fixture = b.addRunArtifact(native_fixture);
     run_native_fixture.addArtifactArg(native_materialization_tests);
     run_native_fixture.step.dependOn(&run_native_fixture_tests.step);
-    test_step.dependOn(&run_native_fixture_tests.step);
+    workload_native.dependOn(&run_native_fixture_tests.step);
     const native_materialization_step = b.step(
         "test-native-materialization",
         "Compare real native data-only unpack with dpkg",
@@ -822,7 +832,7 @@ pub fn build(b: *std.Build) void {
     const run_native_conffile_zig = b.addRunArtifact(native_conffile_zig);
     run_native_conffile_zig.addArtifactArg(native_materialization_tests);
     run_native_conffile_zig.step.dependOn(&run_native_conffile_zig_tests.step);
-    test_step.dependOn(&run_native_conffile_zig_tests.step);
+    workload_native.dependOn(&run_native_conffile_zig_tests.step);
     const native_conffile_step = b.step(
         "test-native-conffiles",
         "Compare native conffile and remove/purge phases with dpkg",
@@ -837,7 +847,7 @@ pub fn build(b: *std.Build) void {
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_config_reference.py" },
     );
     dpkg_config_reference.step.dependOn(&dpkg_config_reference_tests.step);
-    test_step.dependOn(&dpkg_config_reference_tests.step);
+    workload_native.dependOn(&dpkg_config_reference_tests.step);
     b.step("test-dpkg-config-reference", "Verify pinned-dpkg config control-member behavior")
         .dependOn(&dpkg_config_reference.step);
 
@@ -849,7 +859,7 @@ pub fn build(b: *std.Build) void {
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_alternatives_reference.py" },
     );
     dpkg_alternatives_reference.step.dependOn(&dpkg_alternatives_reference_tests.step);
-    test_step.dependOn(&dpkg_alternatives_reference_tests.step);
+    workload_native.dependOn(&dpkg_alternatives_reference_tests.step);
     b.step(
         "test-dpkg-alternatives-reference",
         "Verify pinned dpkg/update-alternatives records, links, lifecycle and recovery",
@@ -857,7 +867,7 @@ pub fn build(b: *std.Build) void {
     const dpkg_oracle_evidence_tests = b.addSystemCommand(
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_oracle_evidence.py" },
     );
-    test_step.dependOn(&dpkg_oracle_evidence_tests.step);
+    workload_native.dependOn(&dpkg_oracle_evidence_tests.step);
 
     const native_lifecycle_tests = b.addTest(.{
         .root_module = debz,
@@ -951,7 +961,7 @@ pub fn build(b: *std.Build) void {
     );
     sha512_e2e_step.dependOn(&run_sha512_e2e_tests.step);
     sha512_e2e_step.dependOn(&run_sha512_legacy_compat_tests.step);
-    test_step.dependOn(&run_sha512_e2e_tests.step);
+    workload_native.dependOn(&run_sha512_e2e_tests.step);
     const native_trigger_queue_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/native_trigger.zig"),
@@ -964,7 +974,7 @@ pub fn build(b: *std.Build) void {
     const run_native_trigger_queue_tests = b.addRunArtifact(native_trigger_queue_tests);
     b.step("test-native-trigger-helper", "Run private native trigger queue and helper tests")
         .dependOn(&run_native_trigger_queue_tests.step);
-    test_step.dependOn(&run_native_trigger_queue_tests.step);
+    workload_native.dependOn(&run_native_trigger_queue_tests.step);
     const native_triggers_step = b.step("test-native-triggers", "Compare native trigger activation and processing with dpkg in Zig");
     native_triggers_step.dependOn(&run_native_trigger_queue_tests.step);
 
@@ -977,7 +987,7 @@ pub fn build(b: *std.Build) void {
     lifecycle_zig_module.addOptions("native_test_options", native_fixture_options);
     const lifecycle_zig_tests = b.addTest(.{ .root_module = lifecycle_zig_module });
     const run_lifecycle_zig_tests = b.addRunArtifact(lifecycle_zig_tests);
-    test_step.dependOn(&run_lifecycle_zig_tests.step);
+    workload_native.dependOn(&run_lifecycle_zig_tests.step);
     b.step("test-native-lifecycle-zig-unit", "Run unprivileged Zig lifecycle oracle regressions")
         .dependOn(&run_lifecycle_zig_tests.step);
     const lifecycle_zig_executable = b.addExecutable(.{
@@ -1013,7 +1023,7 @@ pub fn build(b: *std.Build) void {
     trigger_zig_module.addOptions("native_test_options", native_fixture_options);
     const trigger_zig_tests = b.addTest(.{ .root_module = trigger_zig_module });
     const run_trigger_zig_tests = b.addRunArtifact(trigger_zig_tests);
-    test_step.dependOn(&run_trigger_zig_tests.step);
+    workload_native.dependOn(&run_trigger_zig_tests.step);
     b.step("test-native-triggers-zig-unit", "Run unprivileged Zig trigger oracle regressions")
         .dependOn(&run_trigger_zig_tests.step);
     const trigger_zig_executable = b.addExecutable(.{
@@ -1069,7 +1079,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"native_unpack.test.success route settlement lowers every reference profile"},
     });
     const run_settlement_lowering_tests = b.addRunArtifact(settlement_lowering_tests);
-    test_step.dependOn(&run_settlement_tests.step);
+    workload_native.dependOn(&run_settlement_tests.step);
     const settlement_unit_step = b.step("test-native-diversion-settlement-zig-unit", "Run Zig settlement oracle mutation and production lowering tests");
     settlement_unit_step.dependOn(&run_settlement_tests.step);
     settlement_unit_step.dependOn(&run_settlement_lowering_tests.step);
@@ -1112,8 +1122,8 @@ pub fn build(b: *std.Build) void {
     recovery_unit_step.dependOn(&run_recovery_unit_tests.step);
     b.step("test-native-recovery-zig-unit", "Run unprivileged Zig recovery negative oracles")
         .dependOn(&run_recovery_unit_tests.step);
-    test_step.dependOn(&run_recovery_unit_tests.step);
-    test_step.dependOn(&run_native_recovery_tests.step);
+    workload_native.dependOn(&run_recovery_unit_tests.step);
+    workload_native.dependOn(&run_native_recovery_tests.step);
     const native_recovery = b.step("test-native-recovery", "Run the complete Zig recovery unit and pinned-dpkg acceptance workload");
     const native_core_only = b.option(bool, "native-core-recovery-only", "Select core native completion/recovery cases") orelse false;
     const native_deadline_only = b.option(bool, "native-deadline-only", "Select native execution deadline acceptance cases") orelse false;
@@ -1311,7 +1321,7 @@ pub fn build(b: *std.Build) void {
     const repository_recovery_step = b.step("test-native-recovery-zig-repository", "Run Zig-owned private-root repository transport and CLI acceptance");
     repository_recovery_step.dependOn(&run_repository_recovery_unit.step);
     repository_recovery_step.dependOn(&repository_recovery.step);
-    test_step.dependOn(&run_repository_recovery_unit.step);
+    workload_native.dependOn(&run_repository_recovery_unit.step);
 
     const rollback_clock_module = b.createModule(.{
         .root_source_file = b.path("test/native_recovery_rollback_clock.zig"),
@@ -1675,7 +1685,7 @@ pub fn build(b: *std.Build) void {
     );
     package_cache_test_step.dependOn(&run_package_cache_tests.step);
     package_cache_test_step.dependOn(&run_package_cache_archive_tests.step);
-    test_step.dependOn(&run_package_cache_archive_tests.step);
+    workload_native.dependOn(&run_package_cache_archive_tests.step);
 
     const policy_tests = b.addTest(.{
         .root_module = debz,
@@ -1801,7 +1811,7 @@ pub fn build(b: *std.Build) void {
     });
     rehearsal_cli_cases.addArtifactArg(rehearsal_cli);
     native_only_rehearsal.dependOn(&rehearsal_cli_cases.step);
-    test_step.dependOn(native_only_rehearsal);
+    workload_release.dependOn(native_only_rehearsal);
 
     const production_customize_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1816,7 +1826,7 @@ pub fn build(b: *std.Build) void {
         "test-production-customize",
         "Run production customize lock-root and diagnostics regression tests",
     ).dependOn(&run_production_customize_tests.step);
-    test_step.dependOn(&run_production_customize_tests.step);
+    workload_production.dependOn(&run_production_customize_tests.step);
 
     const version_oracle = b.addExecutable(.{
         .name = "version-oracle",
@@ -1836,7 +1846,7 @@ pub fn build(b: *std.Build) void {
 
 fn addHelpFlagTests(
     b: *std.Build,
-    test_step: *std.Build.Step,
+    step: *std.Build.Step,
     cli: *std.Build.Step.Compile,
     args: []const []const u8,
     usage: []const u8,
@@ -1848,7 +1858,7 @@ fn addHelpFlagTests(
         help.expectExitCode(0);
         help.expectStdOutMatch(usage);
         help.expectStdErrEqual("");
-        test_step.dependOn(&help.step);
+        step.dependOn(&help.step);
     }
 }
 
