@@ -1888,7 +1888,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot
     name: Native Ubuntu snapshot (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # Step budgets: native wrapper 220 (install ceiling 180), pinned
+    # reference 50 and diagnostics 15, leaving 15 for setup, build and upload.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -1938,6 +1940,7 @@ jobs:
             --architecture "$ARCHITECTURE")"
           printf 'dpkg=%s\n' "$reference_dpkg" >>"$GITHUB_OUTPUT"
       - name: Create and replay exact native Ubuntu root
+        timeout-minutes: 220
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
           REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
@@ -1950,6 +1953,7 @@ jobs:
             "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "$ARCHITECTURE" \
             "$PWD/.real-snapshot/$ARCHITECTURE"
       - name: Install exact closure with pinned dpkg reference
+        timeout-minutes: 50
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
           REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
@@ -1961,6 +1965,7 @@ jobs:
             "$PWD/.real-snapshot/$ARCHITECTURE"
       - name: Collect diagnostics and clean staged payloads
         if: always()
+        timeout-minutes: 15
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
           REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}

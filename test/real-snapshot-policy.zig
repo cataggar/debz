@@ -11,6 +11,8 @@ const Scenario = struct {
     injected_execve: []const u8 = "",
     no_trace: bool = false,
     execveat: bool = false,
+    progress_limit_seconds: []const u8 = "",
+    ceiling_seconds: []const u8 = "",
 };
 
 var fixture_compiled = false;
@@ -145,6 +147,10 @@ const Driver = struct {
         defer support.allocator.free(execve);
         const injected = try std.fmt.allocPrint(support.allocator, "SNAPSHOT_TEST_INJECTED_EXECVE={s}", .{config.injected_execve});
         defer support.allocator.free(injected);
+        const progress_limit = try std.fmt.allocPrint(support.allocator, "DEBZ_REAL_SNAPSHOT_INSTALL_PROGRESS_LIMIT_SECONDS={s}", .{config.progress_limit_seconds});
+        defer support.allocator.free(progress_limit);
+        const ceiling = try std.fmt.allocPrint(support.allocator, "DEBZ_REAL_SNAPSHOT_INSTALL_CEILING_SECONDS={s}", .{config.ceiling_seconds});
+        defer support.allocator.free(ceiling);
         const inherited = try support.run(&.{ "printenv", "PATH" });
         defer inherited.deinit();
         try inherited.ok();
@@ -153,7 +159,7 @@ const Driver = struct {
         const path = try std.fmt.allocPrint(support.allocator, "PATH={s}:{s}", .{ self.work.root, inherited_path });
         defer support.allocator.free(path);
         return support.runIn(&.{
-            "env", key, calls, name, path, execve, injected,
+            "env", key, calls, name, path, execve, injected, progress_limit, ceiling,
             if (config.trace) "DEBZ_REAL_SNAPSHOT_TRACE=1" else "DEBZ_REAL_SNAPSHOT_TRACE=0",
             if (config.no_trace) "SNAPSHOT_TEST_NO_TRACE=1" else "SNAPSHOT_TEST_NO_TRACE=0",
             if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0",
@@ -407,6 +413,146 @@ test "snapshot: legacy verification requires state path, native rejects it" {
     try support.contains(native_with_state.stderr, "NativeVerificationDoesNotUseStatePath");
 }
 
+test "snapshot: install verdict bounds time without durable progress by a fixed ceiling" {
+    var f = try Driver.init();
+    defer f.deinit();
+    for ([_]struct { elapsed: []const u8, progressed: []const u8, limit: []const u8, ceiling: []const u8, verdict: []const u8 }{
+        .{ .elapsed = "0", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "1199", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "1200", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "stalled\n" },
+        .{ .elapsed = "6199", .progressed = "5000", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "6200", .progressed = "5000", .limit = "1200", .ceiling = "10800", .verdict = "stalled\n" },
+        .{ .elapsed = "10799", .progressed = "10799", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "10800", .progressed = "10800", .limit = "1200", .ceiling = "10800", .verdict = "ceiling\n" },
+        .{ .elapsed = "10800", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "ceiling\n" },
+        .{ .elapsed = "3", .progressed = "0", .limit = "3", .ceiling = "3", .verdict = "ceiling\n" },
+    }) |case| {
+        const result = try f.run(f.keyring, &.{ "--progress-verdict", case.elapsed, case.progressed, case.limit, case.ceiling });
+        defer result.deinit();
+        try result.ok();
+        try testing.expectEqualStrings(case.verdict, result.stdout);
+    }
+    for ([_][4][]const u8{
+        .{ "5", "6", "1", "10" },
+        .{ "5", "0", "0", "10" },
+        .{ "5", "0", "11", "10" },
+        .{ "05", "0", "1", "10" },
+        .{ "-1", "0", "1", "10" },
+        .{ "5", "0", "one", "10" },
+        .{ "5", "0", "1", "1000000" },
+    }) |invalid| {
+        const result = try f.run(f.keyring, &.{ "--progress-verdict", invalid[0], invalid[1], invalid[2], invalid[3] });
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 2), result.code);
+        try support.contains(result.stderr, "invalid progress verdict input");
+    }
+}
+
+test "snapshot: reviewed install bounds are recorded and overrides may only tighten them" {
+    {
+        var f = try Driver.initOffline();
+        defer f.deinit();
+        const accepted = try f.offline(.{});
+        defer accepted.deinit();
+        try accepted.ok();
+        const identity = try f.work.read(".real-snapshot/fresh/evidence/invocation-identity.txt");
+        defer support.allocator.free(identity);
+        try support.contains(identity, "operation_limit=30m\nverification_limit=10m\n" ++
+            "install_progress_limit_seconds=1200\ninstall_ceiling_seconds=10800\n");
+        const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+        defer support.allocator.free(progress);
+        try support.contains(progress, "progress_limit_seconds=1200\nceiling_seconds=10800\nsample_seconds=60\n");
+        try support.contains(progress, "\nsha_instructions=");
+        try support.contains(progress, "\nverdict=completed\nexit_status=0\n");
+        try support.contains(progress, "status_entries=1 installed=1 unpacked=0 other=0 ledger_bytes=0\n");
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt"));
+    }
+    for ([_]struct { limit: []const u8 = "", ceiling: []const u8 = "", message: []const u8 }{
+        .{ .limit = "1201", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .ceiling = "10801", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .limit = "0", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .ceiling = "90m", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .limit = "30", .ceiling = "20", .message = "install progress limit exceeds its ceiling" },
+    }) |invalid| {
+        var f = try Driver.initOffline();
+        defer f.deinit();
+        const refused = try f.offline(.{ .progress_limit_seconds = invalid.limit, .ceiling_seconds = invalid.ceiling });
+        defer refused.deinit();
+        try testing.expectEqual(@as(u8, 2), refused.code);
+        try support.contains(refused.stderr, invalid.message);
+        try testing.expectError(error.FileNotFound, f.work.read("calls.jsonl"));
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh"));
+    }
+}
+
+fn progressField(progress: []const u8, comptime field: []const u8) !u64 {
+    const marker = "\n" ++ field ++ "=";
+    const start = (std.mem.lastIndexOf(u8, progress, marker) orelse return error.MissingProgressField) + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, progress, start, '\n') orelse return error.MissingProgressField;
+    return std.fmt.parseInt(u64, progress[start..end], 10);
+}
+
+test "snapshot: slowly progressing install continues beyond its progress limit" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const accepted = try f.offline(.{ .name = "slow-progress", .progress_limit_seconds = "3", .ceiling_seconds = "20" });
+    defer accepted.deinit();
+    try accepted.ok();
+    const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+    defer support.allocator.free(progress);
+    try support.contains(progress, "\nverdict=completed\nexit_status=0\n");
+    try testing.expect(try progressField(progress, "elapsed_seconds") > 3);
+    try testing.expect(try progressField(progress, "longest_progress_gap_seconds") < 3);
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt"));
+    try expectOperations(&f, &.{
+        "refresh", "plan", "download",    "install", "transaction-result",
+        "plan",    "plan", "upgrade-all", "plan",
+    });
+}
+
+test "snapshot: stalled install stops at its progress limit before verification" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const refused = try f.offline(.{ .name = "stalled-install", .trace = true, .progress_limit_seconds = "2", .ceiling_seconds = "20" });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 124), refused.code);
+    try support.contains(refused.stderr, "native create stalled after");
+    try expectOperations(&f, &.{ "refresh", "plan", "download", "install" });
+    const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+    defer support.allocator.free(progress);
+    try support.contains(progress, "\nverdict=stalled\nexit_status=124\n");
+    try support.contains(progress, "status_entries=1 installed=0 unpacked=1 other=0");
+    try testing.expect(try progressField(progress, "elapsed_seconds") < 20);
+    const watchdog = try f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt");
+    defer support.allocator.free(watchdog);
+    try support.contains(watchdog, "verdict=stalled\n");
+    try support.contains(watchdog, "\nloadavg=");
+    try support.contains(watchdog, " install --install-root ");
+    const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
+    defer support.allocator.free(audit);
+    try support.contains(audit, "operation=create\nexit_status=124\nforbidden_dpkg_exec=false\n");
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-summary.json"));
+}
+
+test "snapshot: continuously progressing install stops at its fixed ceiling" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const refused = try f.offline(.{ .name = "endless-progress", .progress_limit_seconds = "2", .ceiling_seconds = "4" });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 124), refused.code);
+    try support.contains(refused.stderr, "native create ceiling after");
+    try expectOperations(&f, &.{ "refresh", "plan", "download", "install" });
+    const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+    defer support.allocator.free(progress);
+    try support.contains(progress, "\nverdict=ceiling\nexit_status=124\n");
+    try testing.expect(try progressField(progress, "longest_progress_gap_seconds") < 2);
+    try testing.expect(try progressField(progress, "elapsed_seconds") < 20);
+    const watchdog = try f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt");
+    defer support.allocator.free(watchdog);
+    try support.contains(watchdog, "verdict=ceiling\n");
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-summary.json"));
+}
+
 test "snapshot: unreviewed update signer refuses before update" {
     {
         var f = try Driver.initOffline();
@@ -583,7 +729,6 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
     const job = workflow[start..];
     for ([_][]const u8{
         "if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot",
-        "timeout-minutes: 90",
         "- architecture: amd64",
         "- architecture: arm64",
         "real-snapshot-acceptance.sh --validate",
@@ -603,6 +748,43 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
     try testing.expect(std.mem.indexOf(u8, workflow[0..start], "schedule:\n") != null);
 }
 
+fn minutesAfter(text: []const u8, marker: []const u8) !u64 {
+    return numberBetween(text, marker, "\n");
+}
+
+fn numberBetween(text: []const u8, marker: []const u8, terminator: []const u8) !u64 {
+    const start = (std.mem.indexOf(u8, text, marker) orelse return error.MissingTimeBudget) + marker.len;
+    const end = std.mem.indexOfPos(u8, text, start, terminator) orelse return error.MissingTimeBudget;
+    return std.fmt.parseInt(u64, text[start..end], 10);
+}
+
+test "snapshot: manual job budgets cover the reviewed install ceiling and the pinned reference" {
+    const workflow = try source(".github/workflows/ci.yml");
+    defer support.allocator.free(workflow);
+    const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n") orelse return error.MissingSnapshotJob;
+    const job = workflow[start..];
+    const job_minutes = try minutesAfter(job, "\n    timeout-minutes: ");
+    const native_minutes = try minutesAfter(job, "- name: Create and replay exact native Ubuntu root\n        timeout-minutes: ");
+    const reference_minutes = try minutesAfter(job, "- name: Install exact closure with pinned dpkg reference\n        timeout-minutes: ");
+    const diagnostics_minutes = try minutesAfter(job, "- name: Collect diagnostics and clean staged payloads\n        if: always()\n        timeout-minutes: ");
+    const runner = try source("tools/real-snapshot-acceptance.sh");
+    defer support.allocator.free(runner);
+    const ceiling_minutes = try numberBetween(runner, "readonly maximum_install_ceiling_seconds=$((", " * 60))\n");
+    try testing.expectEqual(@as(u64, 300), job_minutes);
+    try testing.expectEqual(@as(u64, 220), native_minutes);
+    try testing.expectEqual(@as(u64, 50), reference_minutes);
+    try testing.expectEqual(@as(u64, 15), diagnostics_minutes);
+    // Refresh, planning, download, verification and the zero-action update
+    // need their own budget beyond the install ceiling; the reference keeps
+    // its 40-minute pinned-dpkg limit; setup, build and upload need 15.
+    try testing.expect(native_minutes >= ceiling_minutes + 30);
+    try testing.expect(reference_minutes >= 45);
+    try testing.expect(job_minutes >= native_minutes + reference_minutes + diagnostics_minutes + 15);
+    const reference = try source("tools/real-snapshot-reference.sh");
+    defer support.allocator.free(reference);
+    try support.contains(reference, "timeout --signal=TERM --kill-after=30s 40m");
+}
+
 test "snapshot: runner bounds and native backend safety checks remain explicit" {
     const runner = try source("tools/real-snapshot-acceptance.sh");
     defer support.allocator.free(runner);
@@ -613,6 +795,13 @@ test "snapshot: runner bounds and native backend safety checks remain explicit" 
         "maximum_release_age_seconds=$((31 * 24 * 60 * 60))",
         "DEBZ_REAL_SNAPSHOT_KEYRING",
         "trace=execve,execveat",
+        "readonly operation_limit=30m",
+        "readonly verification_limit=10m",
+        "readonly maximum_install_progress_limit_seconds=$((20 * 60))",
+        "readonly maximum_install_ceiling_seconds=$((180 * 60))",
+        "install progress bounds may only tighten the reviewed limits",
+        "kill -ALRM \"$pid\"",
+        "--kill-after=30s \"$((install_ceiling_seconds + 30))s\"",
         "candidate execution trace missing",
         "forbidden_dpkg_exec=true",
         "unexpected candidate stderr during",

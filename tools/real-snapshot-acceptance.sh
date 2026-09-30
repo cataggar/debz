@@ -9,6 +9,16 @@ readonly max_download_bytes=$((1536 * 1024 * 1024))
 readonly max_package_bytes=$((512 * 1024 * 1024))
 readonly max_cache_bytes=$((2 * 1024 * 1024 * 1024))
 readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
+# Command bounds; see "Acceptance time bounds" in doc/integration-roots.md.
+# Native install alone is bounded by time without durable progress, up to a
+# fixed ceiling, because a complete traced install can exceed any short limit.
+readonly operation_limit=30m
+readonly verification_limit=10m
+readonly maximum_install_progress_limit_seconds=$((20 * 60))
+readonly maximum_install_ceiling_seconds=$((180 * 60))
+readonly progress_sample_seconds=60
+readonly native_progress_log=var/lib/debz/native-execution-progress-v1.log
+readonly mutation_progress_log=var/lib/debz/root-mutation-v2.log
 
 validate_values() {
   local uri=$1 suite=$2 architecture=$3
@@ -30,8 +40,45 @@ validate() {
   esac
 }
 
+seconds_value() {
+  [[ $1 =~ ^(0|[1-9][0-9]{0,5})$ ]]
+}
+
+# Prints running, stalled (no durable progress within the limit) or ceiling.
+progress_verdict() {
+  local elapsed=$1 progressed=$2 limit=$3 ceiling=$4
+  seconds_value "$elapsed" && seconds_value "$progressed" &&
+    seconds_value "$limit" && seconds_value "$ceiling" &&
+    (( progressed <= elapsed && 0 < limit && limit <= ceiling )) || {
+    echo "invalid progress verdict input" >&2
+    return 2
+  }
+  if (( elapsed >= ceiling )); then
+    echo ceiling
+  elif (( elapsed - progressed >= limit )); then
+    echo stalled
+  else
+    echo running
+  fi
+}
+
+# Local overrides may only tighten the reviewed install bounds.
+install_bound() {
+  local value=$1 maximum=$2
+  seconds_value "$value" && (( 0 < value && value <= maximum )) || {
+    echo "install progress bounds may only tighten the reviewed limits" >&2
+    return 2
+  }
+  echo "$value"
+}
+
 if [[ ${1:-} == --validate-values ]]; then
   validate_values "$2" "$3" "$4"
+  exit
+fi
+if [[ ${1:-} == --progress-verdict ]]; then
+  [[ $# == 5 ]] || { echo "usage: $0 --progress-verdict ELAPSED PROGRESSED LIMIT CEILING" >&2; exit 2; }
+  progress_verdict "$2" "$3" "$4" "$5"
   exit
 fi
 if [[ ${1:-} == --validate ]]; then
@@ -50,6 +97,17 @@ architecture=$4
 workspace=$(realpath -m "$5")
 repository_root=$(pwd -P)
 validate "$uri" "$suite" "$architecture"
+install_progress_limit_seconds=$(install_bound \
+  "${DEBZ_REAL_SNAPSHOT_INSTALL_PROGRESS_LIMIT_SECONDS:-$maximum_install_progress_limit_seconds}" \
+  "$maximum_install_progress_limit_seconds")
+install_ceiling_seconds=$(install_bound \
+  "${DEBZ_REAL_SNAPSHOT_INSTALL_CEILING_SECONDS:-$maximum_install_ceiling_seconds}" \
+  "$maximum_install_ceiling_seconds")
+(( install_progress_limit_seconds <= install_ceiling_seconds )) || {
+  echo "install progress limit exceeds its ceiling" >&2
+  exit 2
+}
+readonly install_progress_limit_seconds install_ceiling_seconds
 [[ -x "$debz" ]]
 case "$workspace" in "$repository_root"/.real-snapshot/*) ;; *) echo "unsafe workspace" >&2; exit 2 ;; esac
 [[ ! -e "$5" && ! -L "$5" && ! -e "$workspace" && ! -L "$workspace" ]] || {
@@ -111,6 +169,10 @@ fi
   printf 'source_profile_sha256=%s\nrepository_profile_sha256=%s\n' \
     "$(sha256sum "$source_file" | cut -d' ' -f1)" \
     "$(sha256sum "$config_file" | cut -d' ' -f1)"
+  printf 'operation_limit=%s\nverification_limit=%s\n' \
+    "$operation_limit" "$verification_limit"
+  printf 'install_progress_limit_seconds=%s\ninstall_ceiling_seconds=%s\n' \
+    "$install_progress_limit_seconds" "$install_ceiling_seconds"
 } >"$evidence/invocation-identity.txt"
 
 common=(
@@ -127,15 +189,132 @@ common=(
 native_common=("${common[@]}" --transaction-backend native)
 mutating=(--assume-yes --noninteractive --conffile keep-existing)
 
+progress_fingerprint() {
+  stat -c '%n %i %s %.9Y' -- "$root" "$root/var/lib/debz" "$root/var/lib/dpkg" \
+    "$root/$native_progress_log" "$root/$mutation_progress_log" \
+    "$root/var/lib/dpkg/status" 2>/dev/null || true
+}
+
+package_progress() {
+  local ledger_bytes=0
+  if [[ -f "$root/$native_progress_log" ]]; then
+    ledger_bytes=$(stat -c '%s' "$root/$native_progress_log" 2>/dev/null || echo 0)
+  fi
+  if [[ -f "$root/var/lib/dpkg/status" ]]; then
+    awk '$1 == "Status:" { total++; state[$4]++ }
+      END { printf "status_entries=%d installed=%d unpacked=%d other=%d", total,
+        state["installed"], state["unpacked"], total - state["installed"] - state["unpacked"] }' \
+      "$root/var/lib/dpkg/status" 2>/dev/null || printf 'status_entries=unreadable'
+  else
+    printf 'status_entries=0 installed=0 unpacked=0 other=0'
+  fi
+  printf ' ledger_bytes=%s\n' "$ledger_bytes"
+}
+
+runner_identity() {
+  awk -F': *' '
+    /^(model name|CPU part)/ && model == "" { model = $2 }
+    /^(flags|Features)/ && sha == "" {
+      count = split($2, flag, " ")
+      for (i = 1; i <= count; i++) if (flag[i] == "sha_ni" || flag[i] == "sha2") sha = flag[i]
+    }
+    END { printf "cpu_model=%s\nsha_instructions=%s\n", model == "" ? "unknown" : model, sha == "" ? "none" : sha }
+  ' /proc/cpuinfo 2>/dev/null || true
+  printf 'usable_cpus=%s\n' "$(nproc 2>/dev/null || echo unknown)"
+}
+
+watchdog_snapshot() {
+  local name=$1 group=$2 verdict=$3 elapsed=$4 since=$5
+  {
+    printf 'verdict=%s\nelapsed_seconds=%s\nsince_progress_seconds=%s\n' \
+      "$verdict" "$elapsed" "$since"
+    printf 'loadavg=%s\n' "$(cat /proc/loadavg 2>/dev/null || echo unknown)"
+    printf '%s\n' "$(package_progress)"
+    ps -e -o pid=,ppid=,pgid=,stat=,etimes=,time=,wchan:32=,args= 2>/dev/null |
+      awk -v group="$group" '$3 == group { print substr($0, 1, 512) }' || true
+  } >>"$evidence/$name-watchdog.txt"
+}
+
+# Waits for the timeout(1) process PID that runs a native install. A stall or
+# the ceiling sends it SIGALRM, its own expiry signal: timeout then sends TERM
+# to its process group, escalates to KILL after 30 seconds and exits 124.
+watch_progress() {
+  local name=$1 pid=$2
+  local log=$evidence/$name-progress.txt
+  local started=$SECONDS elapsed=0 progressed=0 longest_gap=0 sampled=-1
+  local stopped='' verdict status=0 fingerprint current
+  fingerprint=$(progress_fingerprint)
+  {
+    printf 'progress_limit_seconds=%s\nceiling_seconds=%s\nsample_seconds=%s\n' \
+      "$install_progress_limit_seconds" "$install_ceiling_seconds" "$progress_sample_seconds"
+    runner_identity
+  } >"$log"
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    elapsed=$((SECONDS - started))
+    current=$(progress_fingerprint)
+    if [[ "$current" != "$fingerprint" ]]; then
+      fingerprint=$current
+      if (( elapsed - progressed > longest_gap )); then
+        longest_gap=$((elapsed - progressed))
+      fi
+      progressed=$elapsed
+    fi
+    if (( elapsed / progress_sample_seconds > sampled )); then
+      sampled=$((elapsed / progress_sample_seconds))
+      printf 'elapsed_seconds=%s since_progress_seconds=%s %s\n' \
+        "$elapsed" "$((elapsed - progressed))" "$(package_progress)" >>"$log"
+    fi
+    [[ -z "$stopped" ]] || continue
+    verdict=$(progress_verdict "$elapsed" "$progressed" \
+      "$install_progress_limit_seconds" "$install_ceiling_seconds")
+    if [[ "$verdict" != running ]]; then
+      stopped=$verdict
+      watchdog_snapshot "$name" "$pid" "$verdict" "$elapsed" "$((elapsed - progressed))"
+      echo "native $name $verdict after ${elapsed}s, $((elapsed - progressed))s without durable progress" >&2
+      kill -ALRM "$pid" 2>/dev/null || true
+    fi
+  done
+  wait "$pid" || status=$?
+  elapsed=$((SECONDS - started))
+  if (( elapsed - progressed > longest_gap )); then
+    longest_gap=$((elapsed - progressed))
+  fi
+  if [[ -z "$stopped" ]]; then
+    stopped=completed
+    (( status != 124 )) || stopped=timeout
+  fi
+  printf 'verdict=%s\nexit_status=%s\nelapsed_seconds=%s\nlongest_progress_gap_seconds=%s\n%s\n' \
+    "$stopped" "$status" "$elapsed" "$longest_gap" "$(package_progress)" >>"$log"
+  if [[ "$stopped" == stalled || "$stopped" == ceiling ]]; then
+    return 124
+  fi
+  return "$status"
+}
+
 run_candidate() {
   local name=$1 duration=$2
   local status=0
   local audit_status=0
+  local command
   shift 2
+  if [[ "$duration" == progress ]]; then
+    # The watchdog stops the install at its ceiling; timeout's own limit is a backstop.
+    command=(timeout --signal=TERM --kill-after=30s "$((install_ceiling_seconds + 30))s")
+  else
+    command=(timeout --signal=TERM --kill-after=30s "$duration")
+  fi
   if [[ ${DEBZ_REAL_SNAPSHOT_TRACE:-0} == 1 ]]; then
-    timeout --signal=TERM --kill-after=30s "$duration" \
-      strace -f -qq -yy -e trace=execve,execveat -o "$evidence/$name.execve" \
-      "$@" >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
+    command+=(strace -f -qq -yy -e trace=execve,execveat -o "$evidence/$name.execve")
+  fi
+  command+=("$@")
+  if [[ "$duration" == progress ]]; then
+    "${command[@]}" </dev/null >"$evidence/$name.json" 2>"$evidence/$name.stderr" &
+    watch_progress "$name" "$!" || status=$?
+  else
+    "${command[@]}" >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
+  fi
+  if [[ ${DEBZ_REAL_SNAPSHOT_TRACE:-0} == 1 ]]; then
     [[ -s "$evidence/$name.execve" ]] || {
       echo "candidate execution trace missing for $name" >&2
       exit 91
@@ -154,17 +333,17 @@ run_candidate() {
     fi
     printf 'operation=%s\nexit_status=%s\nforbidden_dpkg_exec=false\n' \
       "$name" "$status" >>"$evidence/native-exec-audit.txt"
-  else
-    timeout --signal=TERM --kill-after=30s "$duration" "$@" \
-      >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
   fi
   return "$status"
 }
 
 run() {
-  local name=$1
+  local name=$1 bound=$operation_limit
   shift
-  run_candidate "$name" 30m "$debz" "$@"
+  if [[ "$name" == create ]]; then
+    bound=progress
+  fi
+  run_candidate "$name" "$bound" "$debz" "$@"
   if [[ -s "$evidence/$name.stderr" ]]; then
     local retry_check=0
     local stderr_bytes
@@ -184,7 +363,7 @@ run() {
 
 verify_result() {
   local name=$1 lock_input=$2
-  run_candidate "$name-summary" 10m "$debz" transaction-result verify \
+  run_candidate "$name-summary" "$verification_limit" "$debz" transaction-result verify \
     --transaction-backend native --install-root "$root" \
     --lock-input "$lock_input" --architecture "$architecture" --json || {
       local status=$?
@@ -284,7 +463,7 @@ value["digest_sha256"] = ("0" if value["digest_sha256"][0] != "0" else "1") + va
 path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
 PY
 set +e
-run_candidate injected-failure 10m "$debz" plan "${native_common[@]}" \
+run_candidate injected-failure "$verification_limit" "$debz" plan "${native_common[@]}" \
   --lock-input "$evidence/injected-invalid.lock.json" ubuntu-minimal
 failure_status=$?
 set -e

@@ -127,6 +127,47 @@ receipt, and cleared root-operation evidence before it can proceed to the no-op 
 A failed verification leaves the installed root and provenance intact for
 diagnosis, but is never reported as wrapper completion.
 
+Every candidate command is time-bounded. Refresh, planning, download and the
+zero-action `upgrade-all` keep a fixed 30-minute limit; each
+`transaction-result verify` and the injected-failure probe keep 10 minutes.
+Native `install` is instead bounded by **durable progress**. Every second the
+wrapper fingerprints (inode, size and nanosecond mtime) the root, its
+`var/lib/debz` and `var/lib/dpkg` directories, the native execution progress
+ledger, the root-mutation progress log and the dpkg status file. If none of
+them changes for 20 minutes the install is `stalled`; an install that keeps
+progressing is stopped at a fixed 180-minute `ceiling`. Either stop sends
+`timeout`'s own expiry signal, so the install's process group receives TERM,
+then KILL 30 seconds later, and the command exits 124 exactly as under the
+former fixed limit; `timeout` itself backstops the ceiling 30 seconds later.
+The bounds come from recorded evidence. Traced CI installs of the pinned
+175-package lock reached only 145 unpacked amd64 packages, or all 175 unpacked
+arm64 packages with none configured, within the former 30-minute limit
+([run 36434581928](https://github.com/cataggar/debz/actions/runs/36434581928);
+[run 36440073294](https://github.com/cataggar/debz/actions/runs/36440073294)
+stopped at 144 and 175). Protected local amd64 installs needed an untracked
+90-minute limit to finish. The ceiling is twice those 90 minutes, matching the
+fixed 2x ceiling of progress-bounded repository recovery invocations (#307).
+Twenty minutes without any durable publication is about 100 times the
+12-second mean interval between newly unpacked amd64 packages in those runs,
+yet stops a hang long before the ceiling. Local runs may tighten, never extend,
+both bounds with `DEBZ_REAL_SNAPSHOT_INSTALL_PROGRESS_LIMIT_SECONDS` and
+`DEBZ_REAL_SNAPSHOT_INSTALL_CEILING_SECONDS`; `invocation-identity.txt`
+records every effective limit. `create-progress.txt` records the runner's CPU
+model, SHA instruction flag and usable CPUs, one sample per minute (elapsed
+time, seconds since progress, dpkg status counts and ledger bytes), and the
+final verdict, exit status and longest progress gap. A stop also writes
+`create-watchdog.txt` with host load and the install process group's state,
+CPU time and wait channel.
+
+The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
+the native wrapper step (the 180-minute install ceiling plus refresh,
+planning, download, verification and the zero-action update), 50 for the
+pinned reference step (its own 40-minute dpkg limit plus staging and
+capture), 15 for diagnostics and cleanup, and the remaining 15 for setup,
+build and upload. Step limits keep a slow native install from consuming the
+reference or diagnostics budget. The job stays dispatch-only; pull-request
+jobs are unchanged.
+
 The native side begins with only an existing empty directory: no dpkg
 database, helper placeholder, package state, merged-/usr links, or private
 debz namespace is pre-created. It authenticates metadata, resolves a genuine

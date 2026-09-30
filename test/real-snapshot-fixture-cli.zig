@@ -97,6 +97,7 @@ pub fn main(init: std.process.Init) !void {
         var root = try std.Io.Dir.openDirAbsolute(io, install_root, .{});
         defer root.close(io);
         try root.createDirPath(io, "var/lib/dpkg/info");
+        if (equals(operation, "install")) try installProgress(io, allocator, root, scenario);
         if (equals(operation, "install")) {
             const arch = option(args, "--architecture") orelse return error.MissingArchitecture;
             const status = try std.fmt.allocPrint(allocator,
@@ -167,6 +168,28 @@ pub fn main(init: std.process.Init) !void {
 
 fn equals(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+/// Publishes intermediate package states like a long native install: steadily
+/// (`slow-progress`), once and then never again (`stalled-install`), or
+/// steadily without ever finishing (`endless-progress`).
+fn installProgress(io: std.Io, allocator: std.mem.Allocator, root: std.Io.Dir, scenario: []const u8) !void {
+    const interval_ms: i64, const updates: usize = if (equals(scenario, "slow-progress"))
+        .{ 500, 10 }
+    else if (equals(scenario, "stalled-install"))
+        .{ 60_000, 1 }
+    else if (equals(scenario, "endless-progress"))
+        .{ 250, 240 }
+    else
+        return;
+    var status: std.ArrayList(u8) = .empty;
+    for (0..updates) |index| {
+        const entry = try std.fmt.allocPrint(allocator, "Package: fixture-{d}\nStatus: install ok unpacked\n\n", .{index});
+        try status.appendSlice(allocator, entry);
+        try root.writeFile(io, .{ .sub_path = "var/lib/dpkg/status", .data = status.items });
+        try io.sleep(.fromMilliseconds(interval_ms), .awake);
+    }
+    if (!equals(scenario, "slow-progress")) return error.FixtureInstallDidNotFinish;
 }
 
 fn option(args: []const []const u8, name: []const u8) ?[]const u8 {
