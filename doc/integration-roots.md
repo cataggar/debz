@@ -109,9 +109,11 @@ inventory](debian-stable-readiness.md) records a real, authenticated Debian 13
 stable snapshot and its current SHA256-only index/archive metadata. Per
 issue #261 those signed SHA256 entries are its archive binding. An exact v3
 lock records them with an explicit derived-SHA512 provenance, never a signed
-SHA512. It does not satisfy Debian vendor-closure acceptance. The hermetic
-`debian-stable` fixture remains synthetic. It is not a substitute for bound
-Debian locks and CAS reproduced on both native architectures.
+SHA512. Its committed amd64 and arm64 bound locks, CAS evidence and
+pre-mutation inventory are input evidence only; they do not satisfy Debian
+vendor-closure install or parity acceptance (#271, #273). The hermetic
+`debian-stable` fixture remains synthetic and is not a substitute for those
+real locks.
 
 The repository exercises dependencies and Pre-Depends, alternatives,
 versioned virtual Provides, Conflicts/Breaks/Replaces, Recommends policy,

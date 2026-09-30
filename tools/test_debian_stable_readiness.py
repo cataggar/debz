@@ -110,6 +110,35 @@ class ReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "signed index SHA256"):
             readiness.release_index(armor, bad, "arm64", now)
 
+    def test_ubuntu_release_substitution_is_refused_even_when_its_digest_is_pinned(self):
+        index = PIN["architectures"]["amd64"]
+        now = datetime.datetime(2026, 9, 28, tzinfo=datetime.timezone.utc)
+
+        def armor(origin, suite, codename):
+            return (
+                "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n"
+                f"Origin: {origin}\nSuite: {suite}\nCodename: {codename}\n"
+                "Date: Sat, 12 Sep 2026 07:55:41 UTC\nComponents: main restricted\n"
+                f"SHA256:\n {index['index_sha256']} {index['index_size']} {index['index_path']}\n"
+                "-----BEGIN PGP SIGNATURE-----\n"
+            ).encode()
+
+        for fields, message in (
+            (("Ubuntu", "stable", "trixie"), "Origin changed"),
+            (("Ubuntu", "noble", "noble"), "Origin changed"),
+            (("Debian", "noble", "trixie"), "Suite changed"),
+            (("Debian", "stable", "noble"), "Codename changed"),
+        ):
+            substituted = armor(*fields)
+            pin = copy.deepcopy(PIN)
+            # Even a reviewer who repinned the substituted bytes cannot make
+            # a non-Debian or non-trixie Release acceptable.
+            pin["release"]["inrelease_sha256"] = readiness.sha256(substituted)
+            with self.subTest(fields=fields), self.assertRaisesRegex(ValueError, message):
+                readiness.release_index(substituted, pin, "amd64", now)
+        with self.assertRaisesRegex(ValueError, "InRelease digest changed"):
+            readiness.release_index(armor("Ubuntu", "noble", "noble"), PIN, "amd64", now)
+
     def test_index_counts_require_every_published_digest_and_refuse_tampering(self):
         paragraphs = (
             b"Package: example\nVersion: 1\nArchitecture: arm64\n"
