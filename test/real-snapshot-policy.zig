@@ -109,10 +109,11 @@ const Driver = struct {
         try driver.work.write("strace",
             \\#!/usr/bin/env bash
             \\set -euo pipefail
-            \\[[ $# -ge 8 && "$1" == -f && "$2" == -qq && "$3" == -yy &&
-            \\   "$4" == -e && "$5" == trace=execve,execveat && "$6" == -o ]]
-            \\output=$7
-            \\shift 7
+            \\[[ $# -ge 9 && "$1" == -f && "$2" == --seccomp-bpf && "$3" == -qq &&
+            \\   "$4" == -yy && "$5" == -e && "$6" == trace=execve,execveat &&
+            \\   "$7" == -o ]]
+            \\output=$8
+            \\shift 8
             \\traced=${SNAPSHOT_TEST_EXECVE:-$1}
             \\if [[ " $* " == *injected-invalid.lock.json* ]]; then
             \\  traced=${SNAPSHOT_TEST_INJECTED_EXECVE:-$traced}
@@ -794,7 +795,7 @@ test "snapshot: runner bounds and native backend safety checks remain explicit" 
         "max_cache_bytes=$((2 * 1024 * 1024 * 1024))",
         "maximum_release_age_seconds=$((31 * 24 * 60 * 60))",
         "DEBZ_REAL_SNAPSHOT_KEYRING",
-        "trace=execve,execveat",
+        "strace -f --seccomp-bpf -qq -yy -e trace=execve,execveat",
         "readonly operation_limit=30m",
         "readonly verification_limit=10m",
         "readonly maximum_install_progress_limit_seconds=$((20 * 60))",

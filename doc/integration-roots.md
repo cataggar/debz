@@ -159,6 +159,17 @@ final verdict, exit status and longest progress gap. A stop also writes
 `create-watchdog.txt` with host load and the install process group's state,
 CPU time and wait channel.
 
+Traced candidate commands run under `strace -f --seccomp-bpf` with only
+`execve`/`execveat` selected. A seccomp filter stops the tracee only at those
+calls, so the audit sees the same exec records as before. Without the filter,
+ptrace stopped the install at every system call, and it spent most of its
+wall time in `ptrace_stop` (see run 36725228331 below).
+Before the `--seccomp-bpf` change, `strace` set no filter. `strace` now sets
+`no_new_privs` on the traced command before starting it. The command already
+runs as UID 0 with full capabilities, so the flag only blocks privilege gains
+at exec that the command could not use. The maintainer-script sandbox already
+sets the flag for every script.
+
 The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
 the native wrapper step (the 180-minute install ceiling plus refresh,
 planning, download, verification and the zero-action update), 50 for the
@@ -1787,6 +1798,37 @@ up this interrupted root; it is **not** proof of post-install wrapper
 completion and cannot be reused as a fresh root. A faster protected amd64
 runner or a separately justified bounded install-time budget is needed for
 the remaining fresh-root acceptance proof.
+
+On source `249507ef0cca9071a72f05e46c89c58d3118c971`,
+[run 36725228331](https://github.com/cataggar/debz/actions/runs/36725228331)
+repeated the traced fresh amd64 root under the durable-progress bound, using
+the same lock, on a 4-CPU Intel Xeon Platinum 8573C runner with SHA-NI.
+Refresh, planning and download succeeded. All 175 packages were unpacked
+about 46 minutes into `install`. No package was configured before the
+watchdog reached its 180-minute `ceiling` (verdict `ceiling`, exit **124**).
+Durable progress never paused for more than 75 seconds, so the 20-minute
+stall limit was never approached. The watchdog snapshot showed a load average
+below 0.6. `strace` and `debz` had each used about 55 CPU-minutes, and `debz`
+was waiting in `ptrace_stop`. The install was bound by per-syscall ptrace
+stops, not by the runner's CPUs; this is why the traced commands now use
+`--seccomp-bpf`.
+The trace audit then refused the run with exit **90**. The xkb-data preinst,
+through `dpkg-maintscript-helper`, and the libc6 preinst ran the target
+root's `/usr/bin/dpkg --validate-version` and `--compare-versions`. These are
+maintainer-script utility calls inside the script sandbox, not `debz`
+delegating an installation to `dpkg`. The audit still matches every
+`dpkg`/`dpkg-deb` exec, so no traced fresh root can finish the wrapper until
+it distinguishes these calls. The workflow cleaned up the interrupted root,
+and it is not wrapper-completion proof.
+
+An untraced local ReleaseSafe run on a 16-CPU arm64 Neoverse N2 host, using
+the same snapshot and the arm64 lock, unpacked all 175 packages within about
+5.5 minutes. Durable progress never paused for more than 4 seconds. After 21
+minutes, the mawk postinst configure step (program step 708 of 1432) failed
+closed with `InvalidAlternativesTool` (exit 8). The snapshot's arm64
+`update-alternatives` digest
+`456f8a6940e8915c6b05bba7cb751df8836b9a14f5c1da2137e767aa6a867643` is not
+a reviewed snapshot tool binding. That arm64 admission belongs to #262.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference

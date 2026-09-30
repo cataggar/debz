@@ -305,7 +305,9 @@ run_candidate() {
     command=(timeout --signal=TERM --kill-after=30s "$duration")
   fi
   if [[ ${DEBZ_REAL_SNAPSHOT_TRACE:-0} == 1 ]]; then
-    command+=(strace -f -qq -yy -e trace=execve,execveat -o "$evidence/$name.execve")
+    # A seccomp filter stops the tracee only at exec; per-syscall ptrace stops
+    # otherwise dominate native install time.
+    command+=(strace -f --seccomp-bpf -qq -yy -e trace=execve,execveat -o "$evidence/$name.execve")
   fi
   command+=("$@")
   if [[ "$duration" == progress ]]; then
