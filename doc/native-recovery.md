@@ -1545,9 +1545,29 @@ focused CLI run, combine `-Dnative-repository-cli-only=true` with
 `-Dnative-zig-repository-case=known_failure` (or another case in the table
 below); the default still runs all cases.
 The `repository-execution-success` projected invocation allows 240 seconds
-for its signed first execution under concurrent CI load, with a 245-second
-awake ceiling. Every other projected invocation, including CLI, retains its
-120-second external timeout and 125-second awake ceiling.
+for its signed first execution under concurrent CI load; every other
+projected invocation allows 120 seconds. Projection and CLI invocations keep
+that limit as their external timeout, with a 5-second awake ceiling beyond it.
+Execution invocations (typed execution, resume, held-unchanged and dispatch)
+print one `repository fixture pass` line per public-backend pass with its
+wall, child CPU and result, so their limit bounds the time **without
+progress** instead: the harness stops a child through its `timeout` process
+(same TERM, 2-second KILL escalation) when no pass completes within the
+limit and reports it as hung, while a child whose passes keep completing may
+continue to a fixed ceiling of twice the limit (480/240 seconds, the
+external timeout) and is reported as slow progress. The ceiling keeps the
+Debug and ReleaseSafe repository runs within the 35-minute job on runners
+several times slower than usual, such as x64 runners without SHA
+instructions, where Zig Debug code authenticates the bundled helper with
+portable hashing (#307; see [native triggers](native-triggers.md)).
+Before any deadline stops a child, two watchdog snapshots 20 and 10 seconds
+ahead record the process tree's state, CPU, wait channel, syscall and kernel
+stack, the tree CPU consumed between them against wall time, host
+CPU/steal and load, and the last completed pass. Each run first prints the
+runner's CPU model, flags, whether Zig's SHA-2 instructions are compiled in
+(`sha2_hardware`), usable CPUs, kernel, clocksource and cgroup quota
+and a fixed SHA-512/memcpy calibration timed in the harness's own optimize
+mode and code generator.
 
 Executed Zig-owned private-root acceptance now covers the repository
 projection; all **11** normal/resumed typed execution cases; both additional
