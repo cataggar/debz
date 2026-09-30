@@ -1142,6 +1142,15 @@ test "security: projected repository evidence and chunked secret scan refuse mut
         "std.debug.print(\"repository CLI {s}: exit={s}, diagnostic={s}; expected resource limit\\n\", .{",
         "return error.InvalidRepositoryDeadlineDiagnostic;",
         "try std.testing.expectEqual(@as(u64, 20), try cliWatchdog(&.{ \"--deadline-ms\", \"15000\" }, 0, \"deadline\"));",
+        "const limit_seconds: i64 = if (std.mem.eql(u8, name, \"repository-execution-success\")) 240 else 120;",
+        "const progress_ceiling_factor = 2;",
+        "const ceiling_seconds = if (progress_watched) limit_seconds * progress_ceiling_factor else limit_seconds;",
+        "if (stalled_ms == null and elapsed >= deadline_ms and deadline_ms < ceiling_seconds * 1000) {",
+        "previous = snapshotProcessTree(fixture, name, log, pid, deadline_ms, elapsed, host_before, previous);",
+        "const timed_out = stalled_ms != null or term == .exited and term.exited == 124 or wall_ms >= ceiling_seconds * 1000;",
+        "reportRunner(init.io, allocator);",
+        "test \"repository watchdog bounds time between fixture passes by a fixed ceiling\"",
+        "test \"repository watchdog samples a blocked child tree and host CPU\"",
     });
 }
 

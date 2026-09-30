@@ -321,6 +321,11 @@ The private helper omits debugger metadata by default, including in Debug
 builds; Debug code generation and runtime safety checks remain enabled.
 This keeps repeatedly authenticated and retained helper evidence compact,
 especially on CPUs without accelerated SHA-256. The default bundled artifact
-has an 8 MiB regression budget. `-Dnative-helper-debug-info=true` retains the
+has a 2 MiB regression budget and is always built with the LLVM backend:
+Zig's self-hosted x86_64 Debug backend ignores `strip` and pads its layout,
+which made the x64 Debug helper 6 MiB instead of about 1.3 MiB and turned
+each helper authentication in the repository recovery fixture into 4.5 times
+as much unaccelerated hashing (#307).
+`-Dnative-helper-debug-info=true` retains the
 metadata for helper debugging; use that option consistently when building the
 caller and helper because their exact byte/digest binding still applies.

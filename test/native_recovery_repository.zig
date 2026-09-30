@@ -67,36 +67,391 @@ fn projected(
     const log = try std.fmt.allocPrint(fixture.allocator, "{s}.log", .{name});
     defer fixture.allocator.free(log);
     const limit_seconds: i64 = if (std.mem.eql(u8, name, "repository-execution-success")) 240 else 120;
-    const limit = try std.fmt.allocPrint(fixture.allocator, "{d}s", .{limit_seconds});
-    defer fixture.allocator.free(limit);
-    const result = std.process.run(fixture.allocator, fixture.io, .{
-        .argv = &.{ "/usr/bin/timeout", "--kill-after=2s", limit, "/usr/bin/unshare", "--mount", "--pid", "--fork", "--", self, "--inside", @tagName(mode), root },
+    // Execution fixtures report each completed pass, so their limit bounds the
+    // time without progress: a hang still fails within it, while a slow but
+    // progressing child may continue up to the fixed ceiling.
+    const progress_watched = mode == .execution;
+    const ceiling_seconds = if (progress_watched) limit_seconds * progress_ceiling_factor else limit_seconds;
+    const ceiling = try std.fmt.allocPrint(fixture.allocator, "{d}s", .{ceiling_seconds});
+    defer fixture.allocator.free(ceiling);
+    var output = try fixture.dir.createFile(fixture.io, log, .{ .truncate = true, .permissions = .fromMode(0o644) });
+    defer output.close(fixture.io);
+    try output.setPermissions(fixture.io, .fromMode(0o644));
+    const host_before = hostCpu(fixture.io, fixture.allocator);
+    const started = std.Io.Clock.awake.now(fixture.io);
+    var child = std.process.spawn(fixture.io, .{
+        .argv = &.{ "/usr/bin/timeout", "--kill-after=2s", ceiling, "/usr/bin/unshare", "--mount", "--pid", "--fork", "--", self, "--inside", @tagName(mode), root },
         .environ_map = &fixture.environment,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(limit_seconds + 5), .clock = .awake } },
+        .stdin = .ignore,
+        .stdout = .{ .file = output },
+        .stderr = .{ .file = output },
     }) catch |err| {
         std.debug.print("{s}: transport {s}, fixture {s}\n", .{ name, @errorName(err), fixture.path });
         return err;
     };
-    defer fixture.allocator.free(result.stdout);
-    defer fixture.allocator.free(result.stderr);
-    const combined = try std.mem.concat(fixture.allocator, u8, &.{ result.stdout, result.stderr });
+    defer child.kill(fixture.io);
+    const pid = child.id orelse return error.RepositoryProjectionDidNotSpawn;
+    var previous: ?TreeSample = null;
+    var snapshots: usize = 0;
+    var passes: usize = 0;
+    var progressed_ms: i64 = 0;
+    var longest_gap_ms: i64 = 0;
+    var next_progress_check_ms: i64 = 0;
+    var stalled_ms: ?i64 = null;
+    var snapshot_deadline_ms: i64 = 0;
+    while (!childExited(pid)) {
+        const elapsed = started.durationTo(std.Io.Clock.awake.now(fixture.io)).toMilliseconds();
+        if (progress_watched and stalled_ms == null and elapsed >= next_progress_check_ms) {
+            next_progress_check_ms = elapsed + progress_poll_ms;
+            const completed = countFixturePasses(fixture, log);
+            if (completed > passes) {
+                passes = completed;
+                longest_gap_ms = @max(longest_gap_ms, elapsed - progressed_ms);
+                progressed_ms = elapsed;
+            }
+        }
+        const deadline_ms = progressDeadline(progress_watched, progressed_ms, limit_seconds, ceiling_seconds);
+        if (deadline_ms != snapshot_deadline_ms) {
+            snapshot_deadline_ms = deadline_ms;
+            snapshots = 0;
+            previous = null;
+        }
+        if (stalled_ms == null and snapshots < watchdog_snapshot_leads_ms.len and
+            elapsed >= deadline_ms - watchdog_snapshot_leads_ms[snapshots])
+        {
+            previous = snapshotProcessTree(fixture, name, log, pid, deadline_ms, elapsed, host_before, previous);
+            snapshots += 1;
+        }
+        if (stalled_ms == null and elapsed >= deadline_ms and deadline_ms < ceiling_seconds * 1000) {
+            std.debug.print("{s}: no fixture pass completed within {d}s after {d} completed passes; stopping the child as hung\n", .{ name, limit_seconds, passes });
+            // GNU timeout forwards the signal to its process group and then
+            // applies the same --kill-after escalation as its own expiry.
+            _ = linux.kill(pid, .TERM);
+            stalled_ms = elapsed;
+        }
+        const awake_ceiling_ms = if (stalled_ms) |stopped| stopped + (2 + 5) * 1000 else (ceiling_seconds + 5) * 1000;
+        if (elapsed >= awake_ceiling_ms) {
+            child.kill(fixture.io);
+            std.debug.print("{s}: transport Timeout after {d} ms awake ceiling, fixture {s}\n", .{ name, awake_ceiling_ms, fixture.path });
+            return error.Timeout;
+        }
+        try fixture.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    const term = try child.wait(fixture.io);
+    const wall_ms = started.durationTo(std.Io.Clock.awake.now(fixture.io)).toMilliseconds();
+    const combined = try fixture.dir.readFileAlloc(fixture.io, log, fixture.allocator, .limited(2 * 1024 * 1024));
     defer fixture.allocator.free(combined);
-    try fixture.write(log, combined, 0o644);
-    const succeeded = result.term == .exited and result.term.exited == 0;
-    if (succeeded != expected_success or result.term == .exited and result.term.exited == 124) {
-        std.debug.print("{s}: child {any}, expected success={}; {s}/{s}:\n{s}\n", .{
-            name,                                                   result.term, expected_success, fixture.path, log,
-            combined[combined.len - @min(combined.len, 12_000) ..],
+    reportFixturePasses(name, combined);
+    reportHostCpu(name, "projected", wall_ms, host_before, hostCpu(fixture.io, fixture.allocator));
+    const succeeded = term == .exited and term.exited == 0;
+    const timed_out = stalled_ms != null or term == .exited and term.exited == 124 or wall_ms >= ceiling_seconds * 1000;
+    if (succeeded != expected_success or timed_out) {
+        const verdict: []const u8 = if (stalled_ms != null)
+            " (hung: no fixture pass completed within the limit)"
+        else if (timed_out)
+            " (timed out at the ceiling)"
+        else
+            "";
+        std.debug.print("{s}: child {any} after {d} ms of a {d}s progress limit and {d}s ceiling{s}, expected success={}; {s}/{s}:\n{s}\n", .{
+            name,            term,                                                   wall_ms,          limit_seconds,
+            ceiling_seconds, verdict,                                                expected_success, fixture.path,
+            log,             combined[combined.len - @min(combined.len, 12_000) ..],
         });
         return error.UnexpectedRepositoryProcessExit;
     }
+    if (wall_ms >= limit_seconds * 1000)
+        std.debug.print("{s}: slow progress: {d} ms exceeded the {d}s limit, but each of {d} fixture passes completed within it (longest observed gap {d} ms)\n", .{
+            name, wall_ms, limit_seconds, std.mem.count(u8, combined, fixture_pass_marker), @max(longest_gap_ms, wall_ms - progressed_ms),
+        });
     if (expected_diagnostic) |diagnostic|
         if (std.mem.indexOf(u8, combined, diagnostic) == null) {
             std.debug.print("{s}: missing diagnostic {s}; {s}\n", .{ name, diagnostic, combined });
             return error.MissingRepositoryDiagnostic;
         };
+}
+
+/// Bounds a progressing execution child: the per-invocation limit applies to
+/// the time between completed fixture passes, and this multiple of it to the
+/// whole invocation, keeping the Debug and ReleaseSafe repository runs within
+/// the 35-minute CI job on a runner several times slower than usual.
+const progress_ceiling_factor = 2;
+const progress_poll_ms = 1000;
+const fixture_pass_marker = "repository fixture pass ";
+
+/// Returns the awake-clock deadline for the next fixture pass: the limit after
+/// the most recent progress, never beyond the invocation's ceiling.
+fn progressDeadline(progress_watched: bool, progressed_ms: i64, limit_seconds: i64, ceiling_seconds: i64) i64 {
+    if (!progress_watched) return limit_seconds * 1000;
+    return @min(progressed_ms + limit_seconds * 1000, ceiling_seconds * 1000);
+}
+
+fn countFixturePasses(fixture: *foundation.Fixture, log: []const u8) usize {
+    const output = fixture.dir.readFileAlloc(fixture.io, log, fixture.allocator, .limited(2 * 1024 * 1024)) catch return 0;
+    defer fixture.allocator.free(output);
+    return std.mem.count(u8, output, fixture_pass_marker);
+}
+
+fn reportFixturePasses(name: []const u8, output: []const u8) void {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    while (lines.next()) |line| if (std.mem.indexOf(u8, line, fixture_pass_marker)) |at|
+        std.debug.print("{s}: pass {s}\n", .{ name, line[at + fixture_pass_marker.len ..] });
+}
+
+/// Linux reports /proc CPU times in USER_HZ ticks, which is 100 on every
+/// architecture this harness runs on.
+const tick_ms = 10;
+/// Watchdog snapshots are taken twice before a deadline stops the child so the
+/// CPU consumed between them separates a slow, CPU-bound child (CPU advances
+/// with wall time) from a blocked one (CPU stays flat).
+const watchdog_snapshot_leads_ms = [_]i64{ 20_000, 10_000 };
+
+/// procfs files report a zero size, so `readFileAlloc` would read nothing.
+fn readProc(allocator: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ![]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var reader = file.readerStreaming(io, &.{});
+    return reader.interface.allocRemaining(allocator, .limited(limit)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        else => |e| return e,
+    };
+}
+
+const HostCpu = struct {
+    user: u64 = 0,
+    system: u64 = 0,
+    idle: u64 = 0,
+    iowait: u64 = 0,
+    steal: u64 = 0,
+    total: u64 = 0,
+};
+
+fn hostCpu(io: std.Io, allocator: std.mem.Allocator) HostCpu {
+    const bytes = readProc(allocator, io, "/proc/stat", 1024 * 1024) catch return .{};
+    defer allocator.free(bytes);
+    if (!std.mem.startsWith(u8, bytes, "cpu ")) return .{};
+    const line = bytes[0 .. std.mem.indexOfScalar(u8, bytes, '\n') orelse bytes.len];
+    var fields = std.mem.tokenizeScalar(u8, line["cpu ".len..], ' ');
+    var values: [8]u64 = @splat(0);
+    for (&values) |*value| value.* = std.fmt.parseInt(u64, fields.next() orelse break, 10) catch 0;
+    var total: u64 = 0;
+    for (values) |value| total += value;
+    return .{
+        .user = values[0] + values[1],
+        .system = values[2] + values[5] + values[6],
+        .idle = values[3],
+        .iowait = values[4],
+        .steal = values[7],
+        .total = total,
+    };
+}
+
+fn reportHostCpu(name: []const u8, label: []const u8, wall_ms: i64, before: HostCpu, after: HostCpu) void {
+    const total = after.total -| before.total;
+    if (total == 0) return;
+    std.debug.print("{s}: {s} wall_ms={d} host_cpu_percent user={d} system={d} idle={d} iowait={d} steal={d}\n", .{
+        name,                                          label,                                         wall_ms,
+        (after.user -| before.user) * 100 / total,     (after.system -| before.system) * 100 / total, (after.idle -| before.idle) * 100 / total,
+        (after.iowait -| before.iowait) * 100 / total, (after.steal -| before.steal) * 100 / total,
+    });
+}
+
+/// Identifies the runner CPU, kernel and build, and times a fixed CPU-bound
+/// calibration in the harness's own optimize mode and code generator, so a
+/// slow repository fixture can be attributed to the runner or to the fixture.
+fn reportRunner(io: std.Io, allocator: std.mem.Allocator) void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const keys = [_][]const u8{ "vendor_id", "model name", "cpu family", "model", "stepping", "microcode", "cpu MHz", "CPU implementer", "CPU part", "CPU variant" };
+    var values: [keys.len]?[]const u8 = @splat(null);
+    var flags: []const u8 = "?";
+    var processors: usize = 0;
+    const cpuinfo = readProc(arena, io, "/proc/cpuinfo", 8 * 1024 * 1024) catch "";
+    var lines = std.mem.splitScalar(u8, cpuinfo, '\n');
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.mem.eql(u8, key, "processor")) processors += 1;
+        if (std.mem.eql(u8, key, "flags") or std.mem.eql(u8, key, "Features")) {
+            if (flags.len == 1) flags = value;
+        }
+        for (keys, &values) |candidate, *slot| {
+            if (slot.* == null and std.mem.eql(u8, key, candidate)) slot.* = value;
+        }
+    }
+    var uts: linux.utsname = undefined;
+    const kernel: []const u8 = if (linux.errno(linux.uname(&uts)) == .SUCCESS) std.mem.sliceTo(&uts.release, 0) else "?";
+    const clocksource = readProc(arena, io, "/sys/devices/system/clocksource/clocksource0/current_clocksource", 256) catch "?";
+    const quota = readProc(arena, io, "/sys/fs/cgroup/cpu.max", 256) catch "?";
+    std.debug.print("repository runner: arch={s} mode={s} backend={s} target_cpu={s} sha2_hardware={} processors={d} usable={d} kernel={s} clocksource={s} cgroup_cpu_max={s}\n", .{
+        @tagName(@import("builtin").cpu.arch),    @tagName(@import("builtin").mode),
+        @tagName(@import("builtin").zig_backend), @import("builtin").cpu.model.name,
+        sha2_hardware,                            processors,
+        std.Thread.getCpuCount() catch 0,         kernel,
+        std.mem.trim(u8, clocksource, " \n"),     std.mem.trim(u8, quota, " \n"),
+    });
+    std.debug.print("repository runner cpu:", .{});
+    for (keys, values) |key, value| if (value) |text| std.debug.print(" {s}=\"{s}\"", .{ key, text });
+    std.debug.print("\nrepository runner flags: {s}\n", .{flags});
+    const buffer = arena.alloc(u8, calibration_bytes) catch return;
+    const copy = arena.alloc(u8, calibration_bytes) catch return;
+    const started = std.Io.Clock.awake.now(io);
+    for (buffer, 0..) |*byte, index| byte.* = @truncate(index *% 131);
+    const filled = std.Io.Clock.awake.now(io);
+    var digest: [std.crypto.hash.sha2.Sha512.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(buffer, &digest, .{});
+    const hashed = std.Io.Clock.awake.now(io);
+    for (0..8) |_| @memcpy(copy, buffer);
+    const copied = std.Io.Clock.awake.now(io);
+    std.debug.print("repository runner calibration: bytes={d} byte_loop_ms={d} sha512_ms={d} memcpy_x8_ms={d} digest={x}\n", .{
+        calibration_bytes,                          started.durationTo(filled).toMilliseconds(),
+        filled.durationTo(hashed).toMilliseconds(), hashed.durationTo(copied).toMilliseconds(),
+        digest[0..4],
+    });
+}
+
+const calibration_bytes = 4 * 1024 * 1024;
+
+// Mirrors std.crypto.hash.sha2's instruction selection: without it, fixture
+// helper authentication runs Zig's portable SHA-2 rounds (#307).
+const sha2_hardware = switch (@import("builtin").cpu.arch) {
+    .x86_64 => @import("builtin").cpu.hasAll(.x86, &.{ .sha, .avx2 }),
+    .aarch64 => @import("builtin").cpu.has(.aarch64, .sha2),
+    else => false,
+} and @import("builtin").zig_backend != .stage2_c;
+
+const TreeSample = struct { elapsed_ms: i64, cpu_ms: u64 };
+
+const ProcessStat = struct {
+    pid: i32,
+    ppid: i32,
+    state: u8,
+    comm: []const u8,
+    cpu_ms: u64,
+    reaped_ms: u64,
+    threads: u64,
+};
+
+fn processStat(allocator: std.mem.Allocator, io: std.Io, pid: i32) ?ProcessStat {
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/stat", .{pid}) catch return null;
+    const bytes = readProc(allocator, io, path, 4096) catch return null;
+    const open = std.mem.indexOfScalar(u8, bytes, '(') orelse return null;
+    const close = std.mem.lastIndexOfScalar(u8, bytes, ')') orelse return null;
+    if (close < open) return null;
+    var fields = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, bytes[close + 1 ..], "\n"), ' ');
+    var values: [18][]const u8 = undefined;
+    for (&values) |*value| value.* = fields.next() orelse return null;
+    const number = struct {
+        fn parse(text: []const u8) u64 {
+            return std.fmt.parseInt(u64, text, 10) catch 0;
+        }
+    }.parse;
+    return .{
+        .pid = pid,
+        .ppid = std.fmt.parseInt(i32, values[1], 10) catch return null,
+        .state = values[0][0],
+        .comm = bytes[open + 1 .. close],
+        .cpu_ms = (number(values[11]) + number(values[12])) * tick_ms,
+        .reaped_ms = (number(values[13]) + number(values[14])) * tick_ms,
+        .threads = number(values[17]),
+    };
+}
+
+fn procText(allocator: std.mem.Allocator, io: std.Io, pid: i32, leaf: []const u8) []const u8 {
+    const path = std.fmt.allocPrint(allocator, "/proc/{d}/{s}", .{ pid, leaf }) catch return "?";
+    const bytes = readProc(allocator, io, path, 16 * 1024) catch |err| return @errorName(err);
+    return std.mem.trim(u8, bytes, " \n");
+}
+
+/// Returns `root_pid` and every live descendant visible in this PID namespace.
+fn processTree(arena: std.mem.Allocator, io: std.Io, root_pid: i32) ![]const ProcessStat {
+    var all: std.ArrayList(ProcessStat) = .empty;
+    var dir = try std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true });
+    defer dir.close(io);
+    var entries = dir.iterate();
+    while (try entries.next(io)) |entry| {
+        const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        if (processStat(arena, io, pid)) |stat| try all.append(arena, stat);
+    }
+    var tree: std.ArrayList(ProcessStat) = .empty;
+    for (all.items) |stat| if (stat.pid == root_pid) try tree.append(arena, stat);
+    var grew = tree.items.len != 0;
+    while (grew) {
+        grew = false;
+        for (all.items) |stat| {
+            var member = false;
+            var parent = false;
+            for (tree.items) |known| {
+                if (known.pid == stat.pid) member = true;
+                if (known.pid == stat.ppid) parent = true;
+            }
+            if (!member and parent) {
+                try tree.append(arena, stat);
+                grew = true;
+            }
+        }
+    }
+    return tree.items;
+}
+
+/// Records the projected child's process tree before the external timeout
+/// kills it: per-process state, CPU, wait channel, current syscall and kernel
+/// stack, the tree's CPU progress since the previous snapshot, host CPU steal,
+/// and the last completed fixture pass.
+fn snapshotProcessTree(
+    fixture: *foundation.Fixture,
+    name: []const u8,
+    log: []const u8,
+    root_pid: i32,
+    deadline_ms: i64,
+    elapsed_ms: i64,
+    host_before: HostCpu,
+    previous: ?TreeSample,
+) TreeSample {
+    var arena_state = std.heap.ArenaAllocator.init(fixture.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = fixture.io;
+    const tree = processTree(arena, io, root_pid) catch |err| blk: {
+        std.debug.print("{s}: watchdog cannot list /proc: {s}\n", .{ name, @errorName(err) });
+        break :blk &.{};
+    };
+    var cpu_ms: u64 = 0;
+    for (tree) |stat| cpu_ms += stat.cpu_ms + stat.reaped_ms;
+    std.debug.print("{s}: watchdog snapshot at {d} ms, {d} ms before the {d} ms deadline: {d} processes, tree_cpu_ms={d}", .{
+        name, elapsed_ms, deadline_ms - elapsed_ms, deadline_ms, tree.len, cpu_ms,
+    });
+    if (previous) |prior| std.debug.print(", +{d} ms CPU over the last {d} ms wall", .{
+        cpu_ms -| prior.cpu_ms, elapsed_ms - prior.elapsed_ms,
+    });
+    std.debug.print(" (CPU tracking wall means slow progress; flat CPU means blocked)\n", .{});
+    reportHostCpu(name, "watchdog", elapsed_ms, host_before, hostCpu(io, arena));
+    const loadavg = readProc(arena, io, "/proc/loadavg", 256) catch "?";
+    std.debug.print("{s}: watchdog loadavg {s}\n", .{ name, std.mem.trim(u8, loadavg, " \n") });
+    for (tree) |stat| {
+        std.debug.print("{s}: watchdog pid={d} ppid={d} comm={s} state={c} cpu_ms={d} reaped_child_cpu_ms={d} threads={d} wchan={s} syscall={s}\n", .{
+            name,           stat.pid,     stat.ppid,                              stat.comm,                                stat.state, stat.cpu_ms,
+            stat.reaped_ms, stat.threads, procText(arena, io, stat.pid, "wchan"), procText(arena, io, stat.pid, "syscall"),
+        });
+        var frames = std.mem.splitScalar(u8, procText(arena, io, stat.pid, "stack"), '\n');
+        var shown: usize = 0;
+        while (frames.next()) |frame| : (shown += 1) {
+            if (shown == 12) break;
+            if (frame.len != 0) std.debug.print("{s}: watchdog pid={d} kernel {s}\n", .{ name, stat.pid, frame });
+        }
+    }
+    if (fixture.dir.readFileAlloc(io, log, arena, .limited(2 * 1024 * 1024))) |output| {
+        var passes: usize = 0;
+        var last: []const u8 = "none";
+        var lines = std.mem.splitScalar(u8, output, '\n');
+        while (lines.next()) |line| if (std.mem.indexOf(u8, line, fixture_pass_marker)) |at| {
+            passes += 1;
+            last = line[at + fixture_pass_marker.len ..];
+        };
+        std.debug.print("{s}: watchdog completed passes={d}; last {s}\n", .{ name, passes, last });
+    } else |err| std.debug.print("{s}: watchdog cannot read {s}: {s}\n", .{ name, log, @errorName(err) });
+    return .{ .elapsed_ms = elapsed_ms, .cpu_ms = cpu_ms };
 }
 
 fn mountAt(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -1485,6 +1840,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.indexOfScalar(u8, fixture_python, '/') != null)
             fixture_python = try std.fs.path.resolve(allocator, &.{ options.repository, fixture_python });
         const selected = try selectMode(false, projection_only, execution_only, cli_only);
+        reportRunner(init.io, allocator);
         const reference = try support.prerequisites(init, allocator, pinned);
         defer allocator.free(reference.architecture);
         var fixture = try foundation.Fixture.init(allocator, init.io, options.repository);
@@ -1579,4 +1935,45 @@ test "repository network evidence scans large files and split secrets" {
     }
     try fixture.write(path, bytes, 0o600);
     try assertNoQuerySecret(&fixture, root);
+}
+
+test "repository watchdog bounds time between fixture passes by a fixed ceiling" {
+    try std.testing.expectEqual(@as(i64, 120_000), progressDeadline(false, 90_000, 120, 120));
+    try std.testing.expectEqual(@as(i64, 240_000), progressDeadline(true, 0, 240, 240 * progress_ceiling_factor));
+    try std.testing.expectEqual(@as(i64, 330_000), progressDeadline(true, 90_000, 240, 240 * progress_ceiling_factor));
+    try std.testing.expectEqual(@as(i64, 480_000), progressDeadline(true, 470_000, 240, 240 * progress_ceiling_factor));
+    try std.testing.expectEqual(@as(i64, 240_000), progressDeadline(true, 200_000, 120, 120 * progress_ceiling_factor));
+}
+
+test "repository watchdog samples a blocked child tree and host CPU" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const host = hostCpu(io, a);
+    try std.testing.expect(host.total != 0 and host.idle <= host.total and host.steal <= host.total);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "sleep 30 & wait" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    const pid = child.id.?;
+    var tree: []const ProcessStat = &.{};
+    for (0..200) |_| {
+        tree = try processTree(a, io, pid);
+        if (tree.len == 2 and tree[1].state == 'S') break;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    defer for (tree) |stat| if (stat.pid != pid) {
+        _ = linux.kill(stat.pid, .KILL);
+    };
+    try std.testing.expectEqual(@as(usize, 2), tree.len);
+    try std.testing.expectEqual(pid, tree[0].pid);
+    try std.testing.expectEqualStrings("sh", tree[0].comm);
+    try std.testing.expectEqual(pid, tree[1].ppid);
+    try std.testing.expectEqualStrings("sleep", tree[1].comm);
+    try std.testing.expectEqual(@as(u8, 'S'), tree[1].state);
+    try std.testing.expectEqual(@as(usize, 0), (try processTree(a, io, std.math.maxInt(i32))).len);
 }

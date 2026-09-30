@@ -9898,6 +9898,58 @@ test "repository backend unchanged descriptor planning owns its empty executable
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testUnchangedDescriptorPlan, .{});
 }
 
+const FixturePass = struct {
+    family: []const u8,
+    case: []const u8,
+    pass: usize,
+    recover: ?bool = null,
+    revoke: ?RepositoryReceiptScope = null,
+};
+
+var fixture_pass_epoch_ms: ?u64 = null;
+
+fn fixtureMonotonicMs() u64 {
+    var now: std.os.linux.timespec = undefined;
+    if (std.os.linux.errno(std.os.linux.clock_gettime(.MONOTONIC, &now)) != .SUCCESS) return 0;
+    return @as(u64, @intCast(now.sec)) * std.time.ms_per_s + @as(u64, @intCast(now.nsec)) / std.time.ns_per_ms;
+}
+
+fn fixtureChildCpuMs() [2]u64 {
+    var usage: std.os.linux.rusage = undefined;
+    if (std.os.linux.errno(std.os.linux.getrusage(std.os.linux.rusage.CHILDREN, &usage)) != .SUCCESS)
+        return .{ 0, 0 };
+    return .{
+        @as(u64, @intCast(usage.utime.sec)) * std.time.ms_per_s + @as(u64, @intCast(usage.utime.usec)) / std.time.us_per_ms,
+        @as(u64, @intCast(usage.stime.sec)) * std.time.ms_per_s + @as(u64, @intCast(usage.stime.usec)) / std.time.us_per_ms,
+    };
+}
+
+/// Runs one projected fixture pass and reports its wall time beside the CPU
+/// time of the reaped pass, so a CPU-starved pass is distinguishable from a
+/// blocked one in retained logs even when an outer watchdog interrupts it.
+fn runTimedFixturePass(pass: FixturePass, request: live_root.ProjectedRequest) !live_root.Result {
+    const started = fixtureMonotonicMs();
+    const epoch = fixture_pass_epoch_ms orelse started;
+    fixture_pass_epoch_ms = epoch;
+    const before = fixtureChildCpuMs();
+    const outcome = live_root.runProjected(request);
+    const ended = fixtureMonotonicMs();
+    const after = fixtureChildCpuMs();
+    var buffer: [128]u8 = undefined;
+    const shown = if (outcome) |result|
+        std.fmt.bufPrint(&buffer, "{any}", .{result}) catch "unprintable"
+    else |err|
+        @errorName(err);
+    const recover = if (pass.recover) |value| (if (value) "true" else "false") else "-";
+    const revoke = if (pass.revoke) |scope| @tagName(scope) else "-";
+    const user_ms = after[0] -| before[0];
+    const system_ms = after[1] -| before[1];
+    std.debug.print("repository fixture pass family={s} case={s} pass={d} recover={s} revoke={s} start_ms={d} end_ms={d} wall_ms={d} child_user_ms={d} child_sys_ms={d} result={s}\n", .{
+        pass.family, pass.case, pass.pass, recover, revoke, started - epoch, ended - epoch, ended - started, user_ms, system_ms, shown,
+    });
+    return outcome;
+}
+
 test "repository backend native execution external fixture" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const enabled = std.c.getenv("DEBZ_NATIVE_REPOSITORY_EXECUTION_FIXTURE") orelse return error.SkipZigTest;
@@ -9926,7 +9978,7 @@ test "repository backend native execution external fixture" {
         };
         for (0..3) |pass| {
             var callback: Callback = .{ .case = dispatch_case, .pass = pass };
-            const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+            const result = try runTimedFixturePass(.{ .family = "dispatch", .case = @tagName(dispatch_case), .pass = pass }, .{ .context = &callback, .child = Callback.run });
             if (result != .exited or result.exited != 0) {
                 std.debug.print("repository dispatch {t} pass={d}: {any}\n", .{ dispatch_case, pass, result });
                 return error.InvalidProjectionFixture;
@@ -9949,7 +10001,7 @@ test "repository backend native execution external fixture" {
         };
         for (0..11) |pass| {
             var callback: Callback = .{ .no_refresh = std.mem.eql(u8, mode, "no-refresh"), .pass = pass };
-            const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+            const result = try runTimedFixturePass(.{ .family = "unchanged", .case = mode, .pass = pass }, .{ .context = &callback, .child = Callback.run });
             if (result != .exited or result.exited != 0) {
                 std.debug.print("repository unchanged pass={d}: {any}\n", .{ pass, result });
                 return error.InvalidProjectionFixture;
@@ -9985,7 +10037,7 @@ test "repository backend native execution external fixture" {
                 else => null,
             } else null,
         };
-        const result = try live_root.runProjected(.{ .context = &callback, .child = Callback.run });
+        const result = try runTimedFixturePass(.{ .family = "execution", .case = @tagName(case), .pass = index, .recover = callback.recover, .revoke = callback.revoke_scope }, .{ .context = &callback, .child = Callback.run });
         if (result != .exited or result.exited != 0) {
             std.debug.print("repository execution case {t}, recovery={}: {any}\n", .{ case, callback.recover, result });
             return error.InvalidProjectionFixture;
@@ -10003,7 +10055,7 @@ test "repository backend native execution external fixture" {
         };
         for (0..if (case == .success) @as(usize, 8) else if (terminal) @as(usize, 4) else 1) |pass| {
             var callback: ResumeCallback = .{ .case = case, .pass = pass };
-            const result = try live_root.runProjected(.{ .context = &callback, .child = ResumeCallback.run });
+            const result = try runTimedFixturePass(.{ .family = "resume", .case = @tagName(case), .pass = pass }, .{ .context = &callback, .child = ResumeCallback.run });
             if (result != .exited or result.exited != 0) {
                 std.debug.print("repository resume case {t}, pass={d}: {any}\n", .{ case, pass, result });
                 return error.InvalidProjectionFixture;
@@ -10021,7 +10073,7 @@ test "repository backend native execution external fixture" {
         };
         for (0..if (case == .success) @as(usize, 3) else 2) |pass| {
             var callback: ImportCallback = .{ .case = case, .pass = pass };
-            const result = try live_root.runProjected(.{ .context = &callback, .child = ImportCallback.run });
+            const result = try runTimedFixturePass(.{ .family = "import", .case = @tagName(case), .pass = pass }, .{ .context = &callback, .child = ImportCallback.run });
             if (result != .exited or result.exited != 0) {
                 std.debug.print("repository import case {t}, pass={d}: {any}\n", .{ case, pass, result });
                 return error.InvalidProjectionFixture;
@@ -10038,7 +10090,7 @@ test "repository backend native execution external fixture" {
         };
         for (0..if (case == .success) @as(usize, 11) else 4) |pass| {
             var callback: CompletionCallback = .{ .case = case, .pass = pass };
-            const result = try live_root.runProjected(.{ .context = &callback, .child = CompletionCallback.run });
+            const result = try runTimedFixturePass(.{ .family = "completion", .case = @tagName(case), .pass = pass }, .{ .context = &callback, .child = CompletionCallback.run });
             if (result != .exited or result.exited != 0) {
                 std.debug.print("repository completion case {t}, pass={d}: {any}\n", .{ case, pass, result });
                 return error.InvalidProjectionFixture;

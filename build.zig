@@ -891,6 +891,12 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
         .linkage = .static,
+        // Zig's self-hosted x86_64 Debug backend ignores `strip` and leaves
+        // layout gaps, emitting a 6 MiB helper instead of 1.4 MiB; every
+        // digest authentication of those bytes then costs 4.5x more (#307).
+        // LLVM is already the default everywhere else, so other helpers are
+        // byte-identical.
+        .use_llvm = true,
     });
     b.step("native-trigger-helper", "Build the private trigger helper without installing it")
         .dependOn(&native_trigger_helper.step);
