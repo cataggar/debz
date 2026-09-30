@@ -2,6 +2,7 @@ const std = @import("std");
 const absolute_path = @import("absolute_path.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const openpgp = @import("openpgp_verifier.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_refresh = @import("repository_refresh.zig");
 const source = @import("source.zig");
@@ -2376,6 +2377,84 @@ test "target_apt_config explicit source freshness is identity and manifest evide
             .dependencies = .{ .filesystem = files.interface() },
         },
     ));
+}
+
+test "target_apt_config carries per-repository archive binding declarations" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.createDirPath(std.testing.io, "root/etc/apt/sources.list.d");
+    try directory.dir.createDirPath(std.testing.io, "root/usr/share/keyrings");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/debian.sources",
+        .data = "Types: deb\nURIs: https://deb.example/debian\nSuites: stable\n" ++
+            "Components: main\nSigned-By: /usr/share/keyrings/vendor.gpg\n" ++
+            "X-Debz-Archive-Binding: signed_sha256_derived_sha512\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/security.list",
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg " ++
+            "debz-archive-binding=signed_sha256_derived_sha512] " ++
+            "https://security.example/debian stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/vendor.list",
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://vendor.example stable main\n",
+    });
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/usr/share/keyrings/vendor.gpg",
+        .data = &test_fixture.keyring,
+    });
+    const root_path = try testRootPath(std.testing.allocator, directory.dir);
+    defer std.testing.allocator.free(root_path);
+    var files = try ProductionFileSystem.init(std.testing.io, root_path);
+    defer files.deinit();
+    var imported = try snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+    });
+    defer imported.deinit();
+    try std.testing.expectEqual(@as(usize, 3), imported.configuration.repositories.len);
+    var bound: usize = 0;
+    for (imported.configuration.repositories, imported.manifest.manifest.repository_ids) |repository, id| {
+        try std.testing.expectEqualSlices(u8, &repository.id.bytes, &id);
+        if (std.mem.indexOf(u8, repository.uri, "vendor.example") != null) {
+            try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.published_digests, repository.archive_binding);
+        } else {
+            try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512, repository.archive_binding);
+            bound += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), bound);
+    // No new manifest wire field: the binding is carried by the recorded
+    // source bytes and by each repository identity.
+    try std.testing.expectEqual(ArtifactVersion.v1, imported.manifest.manifest.artifact_version);
+    const canonical = try imported.manifest.manifest.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expect(std.mem.indexOf(u8, canonical, "archive_binding") == null);
+    var decoded = try decodeManifest(std.testing.allocator, canonical, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(
+        [64]u8,
+        imported.manifest.manifest.repository_ids,
+        decoded.manifest.repository_ids,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        imported.configuration.canonical_deb822,
+        "# X-Debz-Archive-Binding: signed_sha256_derived_sha512\n",
+    ) != null);
+
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "root/etc/apt/sources.list.d/security.list",
+        .data = "deb [signed-by=/usr/share/keyrings/vendor.gpg debz-archive-binding=sha512] " ++
+            "https://security.example/debian stable main\n",
+    });
+    try std.testing.expectError(error.MalformedSource, snapshot(std.testing.allocator, .{
+        .root_path = root_path,
+        .architecture_override = "amd64",
+        .dependencies = .{ .filesystem = files.interface() },
+    }));
 }
 
 test "target_apt_config enforces aggregate source material bounds" {

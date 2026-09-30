@@ -358,6 +358,7 @@ pub const NativeBackend = struct {
                 .policy_sha256 = production.planningPolicyDigest(.native, mapped.request.options),
                 .foreign_architectures = mapped.request.options.foreign_architectures,
                 .completion = returned,
+                .archive_digest_policy = self.archive_digest_policy,
             },
             locks.interface(),
         ) catch |err| switch (err) {

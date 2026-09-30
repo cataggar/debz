@@ -59,8 +59,9 @@ pub const NativePreparationRequest = struct {
     archives: []const []const u8,
     /// Native engine default (#261). It governs authenticated repository
     /// dependencies; the descriptor artifact is admitted by its caller pin.
-    /// Repository-add sources cannot yet carry the per-repository binding
-    /// opt-in, so a signed-SHA256-only dependency is refused.
+    /// A signed-SHA256-only dependency is admitted only when its imported
+    /// target source declares the derived-SHA512 binding and the operation
+    /// lock records it.
     archive_digest_policy: exact_lock_v2.ArchiveDigestPolicy = .sha512_identity_required,
 };
 
@@ -3070,6 +3071,50 @@ pub const Backend = struct {
                 @errorName(err),
             );
         defer lock.deinit();
+        if (native and !persisted_lock_required and plan.actions.len != 0) {
+            const bound_ids = configuredArchiveBindings(
+                allocator,
+                lock.lock,
+                before_snapshot.configuration.repositories,
+            ) catch |err| return progress.fail(
+                state_store,
+                allocator,
+                .planning,
+                .lock_publication_failed,
+                "archive-binding",
+                @errorName(err),
+            );
+            defer allocator.free(bound_ids);
+            if (bound_ids.len != 0) {
+                var archive_source: PlanArchiveSource = .{
+                    .request = request,
+                    .cache = &package_cache,
+                    .acquisition = acquisition_dependencies,
+                    .plan = plan,
+                    .refreshed = dependency_published,
+                    .configuration = &before_snapshot.configuration,
+                    .budget = &budget,
+                };
+                const bound = bindOperationLock(
+                    allocator,
+                    lock.lock,
+                    bound_ids,
+                    archive_source.interface(),
+                ) catch |err| return progress.fail(
+                    state_store,
+                    allocator,
+                    if (err == error.ResourceBudgetExceeded) .unavailable else .download,
+                    if (err == error.ResourceBudgetExceeded)
+                        .resource_limit_exceeded
+                    else
+                        .dependency_acquisition_failed,
+                    "archive-binding",
+                    @errorName(err),
+                );
+                lock.deinit();
+                lock = bound;
+            }
+        }
         budget.validateLock(lock.lock) catch |err| return progress.fail(
             state_store,
             allocator,
@@ -6357,6 +6402,149 @@ fn completePlanOrigin(action: solver.PlanAction) !solver.PlanOriginV2 {
         } },
     };
 }
+
+/// Repository ids of a fresh operation lock whose imported target
+/// configuration opts into `signed_sha256_derived_sha512` (#261), through a
+/// declaration's `X-Debz-Archive-Binding` field or `debz-archive-binding`
+/// option. Every lock repository must still be configured.
+fn configuredArchiveBindings(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    configured: []const repository_policy.NormalizedRepository,
+) ![][64]u8 {
+    var ids: std.ArrayList([64]u8) = .empty;
+    errdefer ids.deinit(allocator);
+    for (lock.repositories) |repository| {
+        const normalized = findNormalized(configured, .{ .bytes = repository.id }) orelse
+            return error.MissingRepository;
+        if (normalized.archive_binding == .signed_sha256_derived_sha512)
+            try ids.append(allocator, repository.id);
+    }
+    return ids.toOwnedSlice(allocator);
+}
+
+const LockArchiveSource = struct {
+    context: *anyopaque,
+    /// Returns caller-owned bytes that already matched the package's signed
+    /// identity during acquisition; `exact_lock_v3` re-checks them anyway.
+    acquireFn: *const fn (*anyopaque, std.mem.Allocator, exact_lock_v2.Package) anyerror![]u8,
+};
+
+/// Binds the opted-in repositories of a fresh native operation lock. Each of
+/// their archives is acquired and `exact_lock_v3.bindSignedSha256Repositories`
+/// checks its declared size and signed SHA256 before deriving its SHA-512.
+fn bindOperationLock(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v2.Lock,
+    repository_ids: []const [64]u8,
+    archive_source: LockArchiveSource,
+) !exact_lock_v2.OwnedLock {
+    const archives = try allocator.alloc(?[]const u8, lock.packages.len);
+    @memset(archives, null);
+    defer {
+        for (archives) |archive| if (archive) |bytes| allocator.free(bytes);
+        allocator.free(archives);
+    }
+    for (lock.packages, archives) |package, *archive| {
+        const origin = switch (package.origin) {
+            .authenticated_repository => |value| value,
+            .local_artifact => continue,
+        };
+        if (!containsId(repository_ids, origin.repository_id)) continue;
+        archive.* = try archive_source.acquireFn(archive_source.context, allocator, package);
+    }
+    return exact_lock_v2.bindSignedSha256Repositories(allocator, lock, repository_ids, archives);
+}
+
+/// Acquires locked dependency archives through the ordinary verified package
+/// path and charges the operation's cache, package, and retained budgets.
+const PlanArchiveSource = struct {
+    request: api.Request,
+    cache: *package_acquisition.Cache,
+    acquisition: repository_acquisition.Dependencies,
+    plan: solver.Plan,
+    refreshed: ?*repository_policy.RefreshResult,
+    configuration: *const repository_policy.Configuration,
+    budget: *OperationBudget,
+    retained_bytes: u64 = 0,
+
+    fn interface(self: *PlanArchiveSource) LockArchiveSource {
+        return .{ .context = self, .acquireFn = acquire };
+    }
+
+    fn acquire(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        package: exact_lock_v2.Package,
+    ) anyerror![]u8 {
+        const self: *PlanArchiveSource = @ptrCast(@alignCast(context));
+        try self.budget.checkTime();
+        const origin = switch (package.origin) {
+            .authenticated_repository => |value| value,
+            .local_artifact => return error.LocalArtifactMismatch,
+        };
+        const action = for (self.plan.actions) |candidate| {
+            if (candidate.kind != .remove and
+                std.mem.eql(u8, candidate.package, package.name) and
+                std.mem.eql(u8, candidate.version, package.version) and
+                std.mem.eql(u8, candidate.architecture, package.architecture))
+                break candidate;
+        } else return error.MissingRepositoryPackage;
+        const repository_id: source.RepositoryId = .{ .bytes = origin.repository_id };
+        const published = self.refreshed orelse return error.MissingRepository;
+        const repository = findRepositoryInput(published.universe.repositories, repository_id) orelse
+            return error.MissingRepository;
+        const normalized = findNormalized(self.configuration.repositories, repository_id) orelse
+            return error.MissingRepository;
+        const planned = action.repository orelse return error.RepositoryOriginMismatch;
+        const record_index = findPlanRecord(repository, action) orelse
+            return error.MissingRepositoryPackage;
+        const record = repository.packages.records[record_index];
+        const selected = try package_acquisition.SelectedPackage.fromSolverSelection(
+            repository,
+            .{
+                .repository_id = repository_id,
+                .repository_priority = planned.priority,
+                .record_index = record_index,
+                .package = action.package,
+                .version = action.version,
+                .architecture = action.architecture,
+                .source_location = record.location.source,
+            },
+            try repository_acquisition.Uri.parse(normalized.uri),
+        );
+        try self.budget.reserveCacheGrowth(
+            selected.record.transport.size.value,
+            try self.cache.objectSize(selected.record.transport.identity),
+        );
+        try OperationBudget.charge(
+            &self.retained_bytes,
+            package.declared_size,
+            self.request.resources.maximum_retained_package_bytes,
+        );
+        const network = try self.budget.boundedTime(self.request.network);
+        var acquired = try package_acquisition.acquirePackage(
+            allocator,
+            self.cache,
+            .{
+                .selected = selected,
+                .policy = .{
+                    .mode = .online,
+                    .workflow = .transaction,
+                    .maximum_package_bytes = try self.budget.packageLimit(network.maximum_package_bytes),
+                    .proxy = try proxyPolicy(network.proxy_url),
+                    .deadlines = self.budget.acquisitionDeadlines(network),
+                    .redirect_limit = network.redirect_limit,
+                    .retry = retryPolicy(network),
+                },
+                .exact_lock_v3_package = package,
+            },
+            self.acquisition,
+        );
+        defer acquired.deinit();
+        return allocator.dupe(u8, acquired.bytes);
+    }
+};
 
 fn acquirePlanArtifacts(
     allocator: std.mem.Allocator,
@@ -10474,6 +10662,13 @@ const NativeCacheCase = enum {
     execution_diagnostic,
     local,
     mixed,
+    /// A signed-SHA256-only dependency whose repository opted in (#261).
+    mixed_bound,
+    /// The same opt-in with a derived SHA-512 that the archive does not match.
+    mixed_bound_derived_mismatch,
+    /// The signed-SHA256-only dependency relabelled as a local artifact to
+    /// reach the policy-exempt local class.
+    mixed_relabelled,
     empty,
     retained_limit,
     total_limit,
@@ -10682,7 +10877,7 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         },
     };
     const lock_backend: transaction_engine.Kind = if (case == .legacy_lock) .legacy_dpkg else .native;
-    var lock = try exact_lock_v2.create(allocator, .{
+    var unbound_lock = try exact_lock_v2.create(allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = try operationRequestDigest(allocator, request, plan, lock_backend),
         .policy_sha256 = repositoryLockPolicyDigest(lock_backend),
@@ -10700,7 +10895,78 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         .packages = packages[0..package_count],
         .verified_origins = true,
     });
+    const bound_case = case == .mixed_bound or case == .mixed_bound_derived_mismatch;
+    var lock = if (case == .mixed_relabelled) relabelled: {
+        defer unbound_lock.deinit();
+        const evidence: package_origin.LocalArtifactEvidenceV2 = .{
+            .artifact_id = .{ .sha256 = sha256(dependency_bytes) },
+            .archive_identity = packages[1].archive_identity,
+            .size = dependency_bytes.len,
+            .package = "demo",
+            .version = "1.0",
+            .architecture = "amd64",
+            .acquisition_url = "file:///relabelled/demo.deb",
+            .trust_mode = .pinned_content_digest,
+        };
+        var relabelled_packages = packages;
+        relabelled_packages[1].origin = .{ .local_artifact = evidence };
+        break :relabelled try exact_lock_v2.create(allocator, .{
+            .target_architecture = "amd64",
+            .request_sha256 = unbound_lock.lock.request_sha256,
+            .policy_sha256 = unbound_lock.lock.policy_sha256,
+            .repositories = &.{},
+            .local_artifacts = &.{ tagged_local, evidence },
+            .packages = &relabelled_packages,
+            .verified_origins = true,
+        });
+    } else if (bound_case) bound: {
+        defer unbound_lock.deinit();
+        const Archives = struct {
+            bytes: []const u8,
+            fn acquire(context: *anyopaque, backing: std.mem.Allocator, _: exact_lock_v2.Package) anyerror![]u8 {
+                const self: *@This() = @ptrCast(@alignCast(context));
+                return backing.dupe(u8, self.bytes);
+            }
+        };
+        var archive_bytes: Archives = .{ .bytes = dependency_bytes };
+        var bound = try bindOperationLock(allocator, unbound_lock.lock, &.{repository_id}, .{
+            .context = &archive_bytes,
+            .acquireFn = Archives.acquire,
+        });
+        if (case == .mixed_bound) break :bound bound;
+        defer bound.deinit();
+        // Same provenance and signed SHA256, but a derived SHA-512 that no
+        // longer matches the archive bytes.
+        var forged_packages = try allocator.dupe(exact_lock_v2.Package, bound.lock.packages);
+        defer allocator.free(forged_packages);
+        const demo_index = bound.lock.findPackageIndex("demo", "1.0", "amd64").?;
+        forged_packages[demo_index].derived_sha512.?[0] ^= 1;
+        break :bound try exact_lock_v2.create(allocator, .{
+            .target_architecture = bound.lock.target_architecture,
+            .request_sha256 = bound.lock.request_sha256,
+            .policy_sha256 = bound.lock.policy_sha256,
+            .repositories = bound.lock.repositories,
+            .local_artifacts = bound.lock.local_artifacts,
+            .packages = forged_packages,
+            .verified_origins = true,
+        });
+    } else unbound_lock;
     defer lock.deinit();
+    if (case == .mixed_relabelled) {
+        // The digest policy alone would admit the relabelled archive.
+        try std.testing.expectEqual(
+            exact_lock_v2.ArchiveAuthentication.local_artifact_sha256_only,
+            lock.lock.archiveAuthentication(lock.lock.findPackage("demo", "1.0", "amd64").?),
+        );
+        try lock.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+    }
+    if (bound_case) {
+        try std.testing.expectEqual(
+            exact_lock_v2.ArchiveBinding.signed_sha256_derived_sha512,
+            lock.lock.repositories[0].archive_binding,
+        );
+        try lock.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+    }
     var cache = try package_acquisition.Cache.initFromDir(std.testing.io, directory.dir, .{
         .maximum_object_bytes = request.cache.maximum_object_bytes,
     });
@@ -10759,8 +11025,12 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         .cache = &cache,
         .retained_archives = &.{descriptor_bytes},
         .deadline = .{ .context = &clock, .nowMsFn = NativeCacheClock.now, .expires_at_ms = 10 },
-        // Mixed closures carry signed-SHA256-only repository dependencies.
-        .archive_digest_policy = .published_digests,
+        // Unbound mixed closures carry signed-SHA256-only repository
+        // dependencies; bound cases keep the native default.
+        .archive_digest_policy = if (bound_case or case == .mixed_relabelled)
+            .sha512_identity_required
+        else
+            .published_digests,
     };
     var oversized = packages;
     const local_identity = @import("content_digest.zig").Identity.init(
@@ -10797,6 +11067,8 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         .missing_object => error.CacheMiss,
         .corrupt_object => error.CorruptObject,
         .invalid_payload => error.InvalidNativeArchive,
+        .mixed_bound_derived_mismatch => error.ArchiveEvidenceMismatch,
+        .mixed_relabelled => error.AuthorizationArtifactMismatch,
         .expired_before, .expired_during, .expired_after => error.DeadlineExceeded,
         .lost_lock_after => error.LockLost,
         else => null,
@@ -10858,6 +11130,13 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
                 required.archive_digest_policy = .sha512_identity_required;
                 try std.testing.expectError(error.Sha512IdentityRequired, prepareNative(allocator, required));
             } else try lock.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+            if (case == .mixed_bound) {
+                var expected_sha512: [64]u8 = undefined;
+                std.crypto.hash.sha2.Sha512.hash(dependency_bytes, &expected_sha512, .{});
+                const demo = lock.lock.findPackage("demo", "1.0", "amd64").?;
+                try std.testing.expectEqualSlices(u8, &expected_sha512, &demo.derived_sha512.?);
+                try std.testing.expect(demo.archive_identity.digests.sha512 == null);
+            }
             var repeated = try prepareNative(allocator, repeated_input);
             defer repeated.deinit();
             try std.testing.expect(repeated == .prepared);
@@ -10886,10 +11165,143 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
 }
 
 test "repository backend native cached preparation owns local mixed and empty closures" {
-    for ([_]NativeCacheCase{ .local, .mixed, .empty }) |case| {
+    for ([_]NativeCacheCase{
+        .local,
+        .mixed,
+        .mixed_bound,
+        .mixed_bound_derived_mismatch,
+        .mixed_relabelled,
+        .empty,
+    }) |case| {
         errdefer std.debug.print("native cached preparation case: {t}\n", .{case});
         try testNativeCachePreparation(case);
     }
+}
+
+test "repository backend binds only opted-in target repositories into operation locks" {
+    const allocator = std.testing.allocator;
+    const normalized = try repository_policy.normalize(allocator, &.{
+        .{
+            .bytes = "deb [arch=amd64 signed-by=/usr/share/keyrings/debian.gpg " ++
+                "debz-archive-binding=signed_sha256_derived_sha512] https://deb.example/debian stable main\n",
+            .format = .legacy,
+        },
+        .{
+            .bytes = "Types: deb\nURIs: https://vendor.example\nSuites: stable\nComponents: main\n" ++
+                "Architectures: amd64\nSigned-By: /usr/share/keyrings/vendor.gpg\n",
+            .format = .deb822,
+        },
+    }, null, .{});
+    var configuration = switch (normalized) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer configuration.deinit();
+    var debian_id: [64]u8 = undefined;
+    var vendor_id: [64]u8 = undefined;
+    for (configuration.repositories) |repository| {
+        if (repository.archive_binding == .signed_sha256_derived_sha512)
+            debian_id = repository.id.bytes
+        else
+            vendor_id = repository.id.bytes;
+    }
+    const debian_archive = "signed sha256 only archive";
+    const vendor_archive = "vendor archive";
+    const origin = struct {
+        fn of(id: [64]u8) exact_lock_v2.PackageOrigin {
+            return .{ .authenticated_repository = .{ .repository_id = id, .repository_snapshot_sha256 = @splat(1) } };
+        }
+        fn repository(id: [64]u8) exact_lock_v2.Repository {
+            return .{
+                .id = id,
+                .snapshot_sha256 = @splat(1),
+                .release_sha256 = @splat(2),
+                .index_identity = .{ .digests = .{ .sha256 = @splat(3) }, .primary = .sha256 },
+                .signer_fingerprints = &.{@splat(4)},
+            };
+        }
+    };
+    var unbound = try exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(5),
+        .policy_sha256 = repositoryLockPolicyDigest(.native),
+        .repositories = &.{ origin.repository(debian_id), origin.repository(vendor_id) },
+        .local_artifacts = &.{},
+        .packages = &.{
+            .{
+                .name = "debian-only",
+                .version = "1",
+                .architecture = "amd64",
+                .origin = origin.of(debian_id),
+                .archive_identity = .{ .digests = .{ .sha256 = sha256(debian_archive) }, .primary = .sha256 },
+                .declared_size = debian_archive.len,
+                .retention = .dependency,
+                .dpkg_selection_hold = false,
+            },
+            .{
+                .name = "vendor",
+                .version = "1",
+                .architecture = "amd64",
+                .origin = origin.of(vendor_id),
+                .archive_identity = .{ .digests = .{ .sha256 = sha256(vendor_archive) }, .primary = .sha256 },
+                .declared_size = vendor_archive.len,
+                .retention = .dependency,
+                .dpkg_selection_hold = false,
+            },
+        },
+        .verified_origins = true,
+    });
+    defer unbound.deinit();
+
+    const ids = try configuredArchiveBindings(allocator, unbound.lock, configuration.repositories);
+    defer allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqualSlices(u8, &debian_id, &ids[0]);
+    try std.testing.expectError(
+        error.MissingRepository,
+        configuredArchiveBindings(allocator, unbound.lock, configuration.repositories[0..1]),
+    );
+
+    const Archives = struct {
+        calls: usize = 0,
+        bytes: []const u8,
+        fn acquire(context: *anyopaque, backing: std.mem.Allocator, package: exact_lock_v2.Package) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            if (!std.mem.eql(u8, package.name, "debian-only")) return error.UnexpectedAcquisition;
+            return backing.dupe(u8, self.bytes);
+        }
+    };
+    var genuine: Archives = .{ .bytes = debian_archive };
+    var bound = try bindOperationLock(allocator, unbound.lock, ids, .{ .context = &genuine, .acquireFn = Archives.acquire });
+    defer bound.deinit();
+    try std.testing.expectEqual(@as(usize, 1), genuine.calls);
+    try bound.lock.requireArchiveDigestPolicy(.published_digests);
+    const debian = bound.lock.findPackage("debian-only", "1", "amd64").?;
+    const vendor = bound.lock.findPackage("vendor", "1", "amd64").?;
+    var expected_sha512: [64]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(debian_archive, &expected_sha512, .{});
+    try std.testing.expectEqualSlices(u8, &expected_sha512, &debian.derived_sha512.?);
+    try std.testing.expect(debian.archive_identity.digests.sha512 == null);
+    try std.testing.expectEqual(exact_lock_v2.ArchiveAuthentication.signed_sha256_derived_sha512, bound.lock.archiveAuthentication(debian));
+    try std.testing.expect(vendor.derived_sha512 == null);
+    try std.testing.expectEqual(exact_lock_v2.ArchiveAuthentication.signed_sha256_only, bound.lock.archiveAuthentication(vendor));
+    try std.testing.expectEqual(
+        exact_lock_v2.ArchiveBinding.published_digests,
+        bound.lock.findRepository(vendor_id).?.archive_binding,
+    );
+
+    // A tampered or truncated archive never yields a derived identity.
+    var tampered: Archives = .{ .bytes = "signed sha256 only archivE" };
+    try std.testing.expectError(
+        error.DigestMismatch,
+        bindOperationLock(allocator, unbound.lock, ids, .{ .context = &tampered, .acquireFn = Archives.acquire }),
+    );
+    var truncated: Archives = .{ .bytes = debian_archive[1..] };
+    try std.testing.expectError(
+        error.SizeMismatch,
+        bindOperationLock(allocator, unbound.lock, ids, .{ .context = &truncated, .acquireFn = Archives.acquire }),
+    );
 }
 
 test "repository backend native cached preparation preflights complete retained budgets" {
@@ -11552,6 +11964,72 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
                 reviewed_repository_profile.production_profiles,
             ),
         );
+    }
+
+    // #261: a descriptor declares the per-repository archive binding in its
+    // own static source bytes; unknown tokens are malformed sources.
+    const binding_sources = [_]struct {
+        path: []const u8,
+        bytes: []const u8,
+        binding: ?exact_lock_v2.ArchiveBinding,
+    }{
+        .{
+            .path = "etc/apt/sources.list.d/microsoft-prod.list",
+            .bytes = "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg " ++
+                "debz-archive-binding=signed_sha256_derived_sha512] " ++
+                "https://packages.microsoft.test/noble prod main\n",
+            .binding = .signed_sha256_derived_sha512,
+        },
+        .{
+            .path = "etc/apt/sources.list.d/microsoft-prod.sources",
+            .bytes = "Types: deb\nURIs: https://packages.microsoft.test/noble\n" ++
+                "Suites: prod\nComponents: main\nArchitectures: amd64\n" ++
+                "Signed-By: /usr/share/keyrings/microsoft-prod.gpg\n" ++
+                "X-Debz-Archive-Binding: signed_sha256_derived_sha512\n",
+            .binding = .signed_sha256_derived_sha512,
+        },
+        .{
+            .path = "etc/apt/sources.list.d/microsoft-prod.list",
+            .bytes = "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg " ++
+                "debz-archive-binding=signed_sha512] " ++
+                "https://packages.microsoft.test/noble prod main\n",
+            .binding = null,
+        },
+    };
+    for (binding_sources) |declared| {
+        const declared_payload = try std.mem.concat(
+            std.testing.allocator,
+            u8,
+            &.{ declared.bytes, &fixture.keyring },
+        );
+        defer std.testing.allocator.free(declared_payload);
+        entries[0].path = @constCast(declared.path);
+        entries[0].size = declared.bytes.len;
+        entries[1].header_offset = declared.bytes.len;
+        entries[1].content_offset = declared.bytes.len;
+        validation.data_bytes = declared_payload;
+        const expected = declared.binding orelse {
+            try std.testing.expectError(
+                error.MalformedRepositorySource,
+                inspectDescriptorMaterial(std.testing.allocator, &validation, "amd64", .{}, .{}),
+            );
+            continue;
+        };
+        var declared_material = try inspectDescriptorMaterial(
+            std.testing.allocator,
+            &validation,
+            "amd64",
+            .{},
+            .{},
+        );
+        defer declared_material.deinit();
+        try std.testing.expectEqual(@as(usize, 1), declared_material.configuration.repositories.len);
+        try std.testing.expectEqual(expected, declared_material.configuration.repositories[0].archive_binding);
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            material.configuration.repositories[0].id.slice(),
+            declared_material.configuration.repositories[0].id.slice(),
+        ));
     }
 
     const unsigned_source = "deb file:///synthetic-repository stable main\n";

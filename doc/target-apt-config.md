@@ -108,6 +108,12 @@ reject unknown fields and noncanonical documents, and verify the aggregate
 digest. `Store.writeAtomic` publishes through a no-follow directory handle,
 file sync, rename, and directory sync.
 
+A source may declare the per-repository signed-SHA256 archive binding
+(`X-Debz-Archive-Binding:` in DEB822 or `debz-archive-binding=` as a one-line
+option). Import validates the token, carries the declaration in the source
+bytes, normalized repositories, and repository identities, and leaves the
+manifest format unchanged ([exact locks](exact-locks-and-provenance.md)).
+
 The module is a foundation for the separately scoped `repo add` workflow. It
 does not install descriptors, mutate repository configuration, alter exact
 locks or transaction provenance, or add CLI commands.

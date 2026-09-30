@@ -160,15 +160,21 @@ acceptance or externally attested workflow artifacts.
    before the derived SHA512 and refuse any mismatch. Do not synthesize
    signed SHA512 values, backdate verification, or switch to Ubuntu.
 2. **Resolved, product lock publication:** the opt-in is the per-repository
-   `--config` setting `"archive_binding":"signed_sha256_derived_sha512"`
-   (no CLI flag). For an opted-in repository, native `plan`/`download
-   --lock-output` and package-family `resolve_lock` do three things before
-   publishing anything: acquire every locked archive, verify its size and
+   `--config` setting `"archive_binding":"signed_sha256_derived_sha512"`, or
+   the equivalent source declaration (`X-Debz-Archive-Binding:` /
+   `debz-archive-binding=`) that target-APT import and repository-add
+   descriptors carry (no CLI flag). For an opted-in repository, native
+   `plan`/`download --lock-output`, package-family `resolve_lock`, and native
+   repository-add operation locks do three things before publishing
+   anything: acquire every locked archive, verify its size and
    signed SHA256, and bind the derived SHA512 through the library above.
    Only the admitted bound lock is written, and a mismatch writes none.
    Native engine / exact-lock v3 consumers enforce
-   `sha512_identity_required` by default. An unbound SHA256-only lock is
-   refused and is not an acceptance artifact. Legacy consumers are
+   `sha512_identity_required` by default, including transaction-result
+   verification and orchestrator lock re-reads before recovery. An unbound
+   SHA256-only lock is refused and is not an acceptance artifact. A
+   repository archive relabelled as a local artifact is refused by origin
+   binding. Legacy consumers are
    unchanged. Hermetic Zig and integration lanes prove this with a
    Debian-shaped signed-SHA256 repository. The real snapshot still needs
    step 3.

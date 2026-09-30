@@ -99,22 +99,40 @@ Locks that do not opt in, including every Ubuntu signed-SHA512 lock, keep
 identical bytes, digests, and meaning. Older decoders reject bound locks as
 unknown fields, so a derived SHA512 can never be read as signed.
 
-**Opting in and native enforcement.** The opt-in is a per-repository source
-setting in the `--config` JSON; there is no CLI flag:
+**Opting in and native enforcement.** The opt-in is a per-repository setting;
+there is no CLI flag. It can be given in the `--config` JSON source entry:
 
 ```json
 {"source_path":"/etc/apt/sources.list.d/debian.sources","archive_binding":"signed_sha256_derived_sha512"}
 ```
 
+or declared on the source itself, as a DEB822 field or a one-line option:
+
+```text
+X-Debz-Archive-Binding: signed_sha256_derived_sha512
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg debz-archive-binding=signed_sha256_derived_sha512] https://deb.debian.org/debian trixie main
+```
+
 - `archive_binding` defaults to `published_digests`. Any other token refuses
-  the configuration (`configuration_required`). The binding is repository
-  identity input. Only an opted-in repository adds it to the repository ID and
-  to canonical sources (`# X-Debz-Archive-Binding: …`), so existing IDs,
-  configuration identities, and locks stay byte-identical. The same source
-  declared with and without the opt-in is a conflicting repository.
+  the configuration (`configuration_required`). A source declaration accepts
+  exactly `published_digests` or `signed_sha256_derived_sha512`; anything else
+  is a malformed source (`invalid_archive_binding`), and a repeated one-line
+  option is a duplicate option. A declaration that contradicts a non-default
+  `--config` setting for the same source refuses the configuration. APT
+  ignores both spellings, so the same files stay valid APT sources.
+- The binding is repository identity input. Only an opted-in repository adds
+  it to the repository ID and to canonical sources
+  (`# X-Debz-Archive-Binding: …`), so existing IDs, configuration identities,
+  and locks stay byte-identical. The same source declared with and without the
+  opt-in is a conflicting repository.
+- Because the declaration travels with the source bytes, target-APT
+  configuration import (`target-apt-config import`) and repository-add
+  descriptors (`.list` or `.sources` payloads) carry it unchanged into the
+  managed sources and repository IDs. The target-APT manifest format does not
+  change.
 - Native lock production (`plan`/`download --lock-output`, package-family
-  `resolve_lock`) acquires each opted-in repository's locked archives through
-  the package cache. With `--offline`/`--cache-only` it reads only the cache.
+  `resolve_lock`, and native repository-add operation locks) acquires each
+  opted-in repository's locked archives through the package cache. With `--offline`/`--cache-only` it reads only the cache.
   Every archive must match its declared size and signed SHA256 before any
   SHA512 is derived. The lock is written only after the bound lock passes
   admission. A tampered or substituted archive refuses with `download_failed`
@@ -131,20 +149,37 @@ setting in the `--config` JSON; there is no CLI flag:
     (`download_failed`, `DerivedDigestMismatch`).
 
   The policy governs repository archives. Caller-pinned local artifacts, such
-  as a repository-add descriptor pinned by SHA256, stay admissible. Embedders
-  can relax the default only explicitly, through
-  `Backend.native_archive_digest_policy`, `NativeBackend.archive_digest_policy`,
-  `Runtime.PrepareRequest.archive_digest_policy`, or the repository-add
+  as a repository-add descriptor pinned by SHA256, stay admissible. Local
+  artifacts carry distinct `local_artifact` provenance (artifact ID,
+  acquisition URL, trust mode) that only resolves against caller-supplied,
+  verified local artifact input. A repository archive relabelled as a local
+  artifact therefore refuses: product planning reports `planning_failed`
+  ("locked local artifact is unavailable"), and native repository-add
+  preparation refuses the plan/lock origin mismatch
+  (`AuthorizationArtifactMismatch`). Embedders can relax the default only
+  explicitly, through `Backend.native_archive_digest_policy`,
+  `NativeBackend.archive_digest_policy`,
+  `Runtime.PrepareRequest.archive_digest_policy`,
+  `native_transaction_result` `ExpectedCaller`/`OwnedRequest`
+  `archive_digest_policy`, or the repository-add
   `NativePreparationRequest`/`NativeCachePreparationRequest` field.
+- The policy is re-checked wherever a native exact-lock v3 is consumed after
+  planning, so a lock whose binding is stripped or altered after planning
+  refuses before any evidence is read:
+  - `native_transaction_result` verification of v3 results (`verify`,
+    `verifyForCaller`, pending/owned routes, and repository history);
+  - the APT/system orchestrator's lock re-reads before download, execution,
+    recovery, and acknowledgement (`OperationalVerificationFailure`);
+  - native preparation.
+
+  Persisted-only native recovery consumes no lock. It is bound to the admitted
+  lock digest through the authorization's exact-lock binding, so a changed
+  lock cannot be substituted there either.
 - Legacy consumers are unchanged. The legacy backend ignores the binding and
   writes ordinary v1 locks with no binding or derived fields. The only effect
   of opting in is the repository ID change.
-- Known gaps:
-  - target-APT configuration import and repository-add `.list` descriptors
-    cannot carry the opt-in yet. Native repository-add therefore refuses a
-    dependency from a signed-SHA256-only repository;
-  - native transaction-result verification and recovery consume
-    already-admitted evidence and do not re-apply the policy.
+- Native repository-add refuses a dependency from a signed-SHA256-only
+  repository unless that target repository opts in.
 
 Native execution carries that identity without truncation through explicit
 successor documents: authorization v2, program v2, execution request v4,

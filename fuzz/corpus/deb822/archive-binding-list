@@ -1,0 +1,1 @@
+deb [arch=amd64 signed-by=/usr/share/keyrings/debian.gpg debz-archive-binding=signed_sha256_derived_sha512] https://deb.example/debian stable main

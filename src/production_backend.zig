@@ -6106,6 +6106,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
             ),
             .caller_policy_sha256 = planningPolicyDigest(.native, requested.options),
             .projection = if (external.withhold_projection) null else projection,
+            .archive_digest_policy = backend.native_archive_digest_policy,
         };
         const Check = struct {
             fn documents(result: anytype, owner: root_operation.DeferredAcknowledgment) !void {
@@ -8331,6 +8332,56 @@ test "production workflow signed SHA256 archive binding is a per-repository nati
         .cache = cache,
         .lock_input = stripped_path,
     }), .planning, .lock_verification_failed, "invalid");
+
+    // Relabelling: the same repository archive presented as a caller-pinned
+    // local artifact would fall in the policy-exempt local class, so the
+    // refusal must come from origin binding, not from the digest policy. A
+    // local origin only resolves against caller-supplied verified local
+    // artifact input, never against a repository candidate.
+    const relabelled_path = try path(allocator, workspace, "relabelled-lock.json");
+    {
+        const evidence: @import("package_origin.zig").LocalArtifactEvidenceV2 = .{
+            .artifact_id = .{ .sha256 = bound_package.archive_identity.digests.sha256.? },
+            .archive_identity = bound_package.archive_identity,
+            .size = bound_package.declared_size,
+            .package = bound_package.name,
+            .version = bound_package.version,
+            .architecture = bound_package.architecture,
+            .acquisition_url = "file:///relabelled/demo.deb",
+            .trust_mode = .pinned_content_digest,
+        };
+        var package = bound_package;
+        package.origin = .{ .local_artifact = evidence };
+        package.derived_sha512 = null;
+        var owned = try exact_lock_v3.create(allocator, .{
+            .target_architecture = bound_lock.target_architecture,
+            .request_sha256 = bound_lock.request_sha256,
+            .policy_sha256 = bound_lock.policy_sha256,
+            .repositories = &.{},
+            .local_artifacts = &.{evidence},
+            .packages = &.{package},
+            .verified_origins = true,
+        });
+        defer owned.deinit();
+        try std.testing.expectEqual(
+            exact_lock_v3.ArchiveAuthentication.local_artifact_sha256_only,
+            owned.lock.archiveAuthentication(owned.lock.packages[0]),
+        );
+        try owned.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+        try writeLockVersion(exact_lock_v3, allocator, io, relabelled_path, owned.lock);
+    }
+    for ([_]*Backend{ &native, &relaxed }) |consumer|
+        for ([_]WorkflowMode{ .plan_only, .download_only }) |mode|
+            for ([_][]const []const u8{ &bound_configs, &default_configs }) |configs|
+                try expectWorkflowFailure(try run(allocator, &fixture, .{
+                    .backend = consumer,
+                    .mode = mode,
+                    .configs = configs,
+                    .cache = try path(allocator, workspace, "cache-relabelled"),
+                    .lock_input = relabelled_path,
+                    .lock_output = if (mode == .plan_only) replay_path else null,
+                }), .planning, .planning_failed, "locked local artifact is unavailable");
+    try expectNoFile(&directory, "replay-lock.json");
 
     // Opt-in off: native lock production for a SHA256-only repository is
     // refused by default and writes nothing.

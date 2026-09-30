@@ -156,6 +156,8 @@ pub const ExpectedCaller = struct {
     policy_sha256: [32]u8,
     foreign_architectures: []const []const u8,
     completion: ?product_api.NativeCompletionEvidence = null,
+    /// Native consumer default (#261); relaxed only by an explicit caller.
+    archive_digest_policy: exact_lock_v3.ArchiveDigestPolicy = .sha512_identity_required,
 };
 
 /// Describes already-verified documents; this does not verify a root or
@@ -238,6 +240,17 @@ pub fn verifyForCallerLegacyV2(
     );
 }
 
+/// Exact-lock v3 result consumers re-check the archive digest policy (#261)
+/// before comparing any evidence, so a lock whose derived-SHA512 binding was
+/// stripped after planning cannot verify under the native default. The
+/// historical exact-lock v2 routes keep their SHA256-only semantics.
+fn requireArchiveDigestPolicy(
+    lock: anytype,
+    policy: exact_lock_v3.ArchiveDigestPolicy,
+) error{Sha512IdentityRequired}!void {
+    if (@TypeOf(lock) == exact_lock_v3.Lock) try lock.requireArchiveDigestPolicy(policy);
+}
+
 fn verifyInternal(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -247,6 +260,10 @@ fn verifyInternal(
     expected: ?ExpectedCaller,
     locks: root_operation.LockBackend,
 ) anyerror!Summary {
+    try requireArchiveDigestPolicy(
+        lock,
+        if (expected) |caller| caller.archive_digest_policy else .sha512_identity_required,
+    );
     var held = try VerificationLock.acquire(root, install_root, locks, null);
     defer held.deinit();
     if (try root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) != null or
@@ -305,6 +322,8 @@ pub const OwnedRequest = struct {
     caller_policy_sha256: [32]u8,
     review_owner: ?root_operation.DeferredAcknowledgment = null,
     projection: ?*const live_root.Projection = null,
+    /// Native consumer default (#261); relaxed only by an explicit caller.
+    archive_digest_policy: exact_lock_v3.ArchiveDigestPolicy = .sha512_identity_required,
 };
 
 pub fn validateReviewOwner(
@@ -414,6 +433,7 @@ fn verifyRepositoryHistoryInternal(
     completion: root_operation_completion.Document,
     receipt: native_provenance.Document,
 ) anyerror!void {
+    try requireArchiveDigestPolicy(lock, .sha512_identity_required);
     try validateRepositoryHistoryCaller(allocator, attempt);
     const caller = attempt.record();
     const bytes = try completion.canonicalJson(allocator);
@@ -600,6 +620,7 @@ fn verifyOwnedInternal(
 ) anyerror!OwnedResult(expected_outcome) {
     if (expected_outcome == .failed and state != .pending)
         return error.PendingOwnerRequired;
+    try requireArchiveDigestPolicy(lock, expected.archive_digest_policy);
     const owner_bytes = try expected.owner.canonicalJson(allocator);
     defer allocator.free(owner_bytes);
     try validateReviewOwner(allocator, expected.owner, expected.review_owner);
@@ -2084,6 +2105,136 @@ test "native_transaction_result.test.historical v2 lock evidence stays explicit 
             .full_closure,
         ),
     );
+}
+
+fn archiveBindingTestLock(bound: bool) !exact_lock_v3.OwnedLock {
+    return exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{.{
+            .id = @splat('a'),
+            .snapshot_sha256 = @splat(3),
+            .release_sha256 = @splat(4),
+            .index_identity = .{ .digests = .{ .sha256 = @splat(5) }, .primary = .sha256 },
+            .signer_fingerprints = &.{@splat(6)},
+            .archive_binding = if (bound) .signed_sha256_derived_sha512 else .published_digests,
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "debian-only",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = @splat('a'),
+                .repository_snapshot_sha256 = @splat(3),
+            } },
+            .archive_identity = .{ .digests = .{ .sha256 = @splat(7) }, .primary = .sha256 },
+            .derived_sha512 = if (bound) @splat('8') else null,
+            .declared_size = 9,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+}
+
+test "native_transaction_result.test.v3 result routes re-check a stripped archive binding before evidence" {
+    const allocator = std.testing.allocator;
+    var bound = try archiveBindingTestLock(true);
+    defer bound.deinit();
+    // The binding was removed after planning: a well-formed v3 lock over the
+    // same signed SHA256 archive, but with no derived-SHA512 provenance.
+    var stripped = try archiveBindingTestLock(false);
+    defer stripped.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &bound.lock.digest_sha256, &stripped.lock.digest_sha256));
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(std.testing.io, temporary.dir);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buffer[0..try temporary.dir.realPath(std.testing.io, &path_buffer)];
+    var locks: root_operation.TestLockBackend = .{ .allocator = allocator };
+    defer locks.deinit();
+
+    const caller: ExpectedCaller = .{
+        .operation = .install,
+        .request_sha256 = @splat(0x81),
+        .policy_sha256 = @splat(0x82),
+        .foreign_architectures = &.{},
+    };
+    const owner = try root_operation.createDeferredAcknowledgment(.{
+        .state = .pending,
+        .attempt_id = @splat(3),
+        .acknowledgment_id = @splat(4),
+        .completion_sha256 = @splat(5),
+        .provenance_sha256 = @splat(5),
+    });
+    const released_owner = try root_operation.createDeferredAcknowledgment(.{
+        .state = .released,
+        .attempt_id = @splat(3),
+        .acknowledgment_id = @splat(4),
+    });
+    const owned: OwnedRequest = .{
+        .owner = owner,
+        .operation = .install,
+        .caller_request_sha256 = @splat(6),
+        .caller_policy_sha256 = @splat(7),
+    };
+    var released = owned;
+    released.owner = released_owner;
+
+    try std.testing.expectError(error.Sha512IdentityRequired, verify(allocator, root, path, stripped.lock, "amd64", locks.interface()));
+    try std.testing.expectError(error.Sha512IdentityRequired, verifyForCaller(allocator, root, path, stripped.lock, "amd64", caller, locks.interface()));
+    try std.testing.expectError(error.Sha512IdentityRequired, verifyPendingSuccess(allocator, root, path, stripped.lock, "amd64", owned, locks.interface()));
+    try std.testing.expectError(error.Sha512IdentityRequired, verifyPendingFailure(allocator, root, path, stripped.lock, "amd64", owned, locks.interface()));
+    try std.testing.expectError(error.Sha512IdentityRequired, verifyReleasedSuccess(allocator, root, path, stripped.lock, "amd64", released, locks.interface()));
+    // The refusal precedes the verification lock and every evidence read.
+    try std.testing.expectEqual(@as(usize, 0), locks.acquisitions);
+
+    // The bound lock passes the policy and reaches ordinary evidence checks.
+    try std.testing.expectError(error.CompletionMissing, verify(allocator, root, path, bound.lock, "amd64", locks.interface()));
+    try std.testing.expectError(error.CompletionMissing, verifyForCaller(allocator, root, path, bound.lock, "amd64", caller, locks.interface()));
+    try std.testing.expectError(error.CompletionMissing, verifyPendingSuccess(allocator, root, path, bound.lock, "amd64", owned, locks.interface()));
+
+    // Only an explicit caller relaxation reaches evidence with the stripped lock.
+    var relaxed_caller = caller;
+    relaxed_caller.archive_digest_policy = .published_digests;
+    try std.testing.expectError(error.CompletionMissing, verifyForCaller(allocator, root, path, stripped.lock, "amd64", relaxed_caller, locks.interface()));
+    var relaxed_owned = owned;
+    relaxed_owned.archive_digest_policy = .published_digests;
+    try std.testing.expectError(error.CompletionMissing, verifyPendingSuccess(allocator, root, path, stripped.lock, "amd64", relaxed_owned, locks.interface()));
+
+    // The historical exact-lock v2 route keeps its SHA256-only semantics.
+    var legacy = try exact_lock_v2.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .repositories = &.{.{
+            .id = @splat('a'),
+            .snapshot_sha256 = @splat(3),
+            .release_sha256 = @splat(4),
+            .index_sha256 = @splat(5),
+            .signer_fingerprints = &.{@splat(6)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "debian-only",
+            .version = "1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = @splat('a'),
+                .repository_snapshot_sha256 = @splat(3),
+            } },
+            .sha256 = @splat(7),
+            .declared_size = 9,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+    defer legacy.deinit();
+    try std.testing.expectError(error.CompletionMissing, verifyLegacyV2(allocator, root, path, legacy.lock, "amd64", locks.interface()));
 }
 
 test "native_transaction_result.test.repository locks preserve unlocked packages without weakening full closures" {

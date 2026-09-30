@@ -373,7 +373,10 @@ with `0 < N <= 2678400`. For example, Microsoft's Ubuntu 24.04 feed uses the
 reviewed `1209600` (14 days). `archive_binding` is a per-repository opt-in for
 repositories that sign only SHA256 archive digests. Its only non-default value,
 `signed_sha256_derived_sha512`, makes native exact locks record a derived,
-never signed, SHA512 bound to the verified SHA256. Native consumers otherwise
+never signed, SHA512 bound to the verified SHA256. The same opt-in can be
+declared on the source itself (`X-Debz-Archive-Binding:` in DEB822 or the
+`debz-archive-binding=` one-line option); a declaration that contradicts the
+`--config` value refuses the configuration. Native consumers otherwise
 require a SHA-512 archive identity
 ([exact locks](exact-locks-and-provenance.md)). Unknown fields or tokens refuse
 the configuration. Installed state

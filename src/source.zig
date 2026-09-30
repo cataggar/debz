@@ -35,6 +35,18 @@ pub const RepositoryId = struct {
     }
 };
 
+/// Per-repository debz archive binding declaration (#261), spelled
+/// `X-Debz-Archive-Binding:` in DEB822 and `debz-archive-binding=` in a
+/// one-line option block. APT does not act on either spelling. Only these
+/// exact tokens are accepted; anything else is a diagnostic.
+pub const ArchiveBinding = enum {
+    published_digests,
+    signed_sha256_derived_sha512,
+};
+
+pub const archive_binding_field = "X-Debz-Archive-Binding";
+pub const archive_binding_option = "debz-archive-binding";
+
 pub const Repository = struct {
     id: RepositoryId,
     types: []SourceType,
@@ -45,6 +57,8 @@ pub const Repository = struct {
     architectures: []LocatedString,
     signed_by: []LocatedString,
     trusted: ?bool,
+    /// Null when the declaration does not mention a binding.
+    archive_binding: ?ArchiveBinding = null,
     span: Span,
 };
 
@@ -95,6 +109,7 @@ pub const DiagnosticCode = enum {
     invalid_component,
     invalid_architecture,
     invalid_signed_by,
+    invalid_archive_binding,
     components_for_exact_suite,
     missing_components,
     malformed_legacy_entry,
@@ -133,6 +148,7 @@ pub const Diagnostic = struct {
             .invalid_component => "component must use Debian component token characters",
             .invalid_architecture => "architecture must contain only letters, digits, or '-'",
             .invalid_signed_by => "Signed-By values must be absolute keyring paths",
+            .invalid_archive_binding => "archive binding must be exactly 'published_digests' or 'signed_sha256_derived_sha512'",
             .components_for_exact_suite => "an exact-path suite ending in '/' cannot have components",
             .missing_components => "a non-exact suite requires at least one component",
             .malformed_legacy_entry => "expected a legacy 'deb' or 'deb-src' entry",
@@ -300,6 +316,7 @@ fn repositoryFromParagraph(
     var signed_by: []LocatedString = &.{};
     var enabled = true;
     var trusted: ?bool = null;
+    var archive_binding: ?ArchiveBinding = null;
     var complete = false;
     defer if (!complete) {
         allocator.free(types);
@@ -370,6 +387,23 @@ fn repositoryFromParagraph(
                 .value => |word| trusted = parseBoolean(word.value) orelse
                     return .{ .diagnostic = .{ .code = .invalid_boolean, .span = word.span } },
             }
+        } else if (std.ascii.eqlIgnoreCase(field.name, archive_binding_field)) {
+            const result = try fieldWords(allocator, field, limits);
+            switch (result) {
+                .diagnostic => |diagnostic| return .{ .diagnostic = diagnostic },
+                .values => |words| {
+                    defer allocator.free(words);
+                    if (words.len != 1) return .{ .diagnostic = .{
+                        .code = .invalid_archive_binding,
+                        .span = fromDeb822Span(field.span),
+                    } };
+                    archive_binding = parseArchiveBinding(words[0].value) orelse
+                        return .{ .diagnostic = .{
+                            .code = .invalid_archive_binding,
+                            .span = words[0].span,
+                        } };
+                },
+            }
         } else {
             return .{ .diagnostic = .{
                 .code = .unknown_field,
@@ -404,6 +438,7 @@ fn repositoryFromParagraph(
         .architectures = architectures,
         .signed_by = signed_by,
         .trusted = trusted,
+        .archive_binding = archive_binding,
         .span = paragraph_span,
     };
     repository.id = repositoryId(repository);
@@ -443,6 +478,7 @@ fn parseLegacyLine(
 
     var enabled = !comment_disabled;
     var trusted: ?bool = null;
+    var archive_binding: ?ArchiveBinding = null;
     var architectures: []LocatedString = &.{};
     var signed_by: []LocatedString = &.{};
     var complete = false;
@@ -469,6 +505,7 @@ fn parseLegacyLine(
                     enabled = option_enabled;
                 }
                 trusted = options.trusted;
+                archive_binding = options.archive_binding;
             },
         }
     }
@@ -525,6 +562,7 @@ fn parseLegacyLine(
         .architectures = architectures,
         .signed_by = signed_by,
         .trusted = trusted,
+        .archive_binding = archive_binding,
         .span = .{ .start = absolute_start, .end = absolute_start + line.len },
     };
     repository.id = repositoryId(repository);
@@ -539,6 +577,7 @@ const LegacyOptions = struct {
     enabled_span: ?Span = null,
     trusted: ?bool = null,
     trusted_span: ?Span = null,
+    archive_binding: ?ArchiveBinding = null,
 };
 
 const LegacyOptionsResult = union(enum) {
@@ -574,6 +613,7 @@ fn parseLegacyOptions(
     var enabled_span: ?Span = null;
     var trusted: ?bool = null;
     var trusted_span: ?Span = null;
+    var archive_binding: ?ArchiveBinding = null;
     var complete = false;
     defer if (!complete) {
         allocator.free(architectures);
@@ -619,6 +659,10 @@ fn parseLegacyOptions(
             trusted = parseBoolean(value) orelse
                 return .{ .diagnostic = .{ .code = .invalid_boolean, .span = value_span } };
             trusted_span = value_span;
+        } else if (std.mem.eql(u8, name, archive_binding_option)) {
+            if (archive_binding != null) return duplicateOption(option.span);
+            archive_binding = parseArchiveBinding(value) orelse
+                return .{ .diagnostic = .{ .code = .invalid_archive_binding, .span = value_span } };
         } else {
             return .{ .diagnostic = .{ .code = .unsupported_option, .span = option.span } };
         }
@@ -634,6 +678,7 @@ fn parseLegacyOptions(
         .enabled_span = enabled_span,
         .trusted = trusted,
         .trusted_span = trusted_span,
+        .archive_binding = archive_binding,
     };
     complete = true;
     return .{ .options = options };
@@ -802,6 +847,13 @@ fn parseType(value: []const u8) ?SourceType {
     return null;
 }
 
+fn parseArchiveBinding(value: []const u8) ?ArchiveBinding {
+    inline for (std.meta.fields(ArchiveBinding)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
 fn parseBoolean(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "yes")) return true;
     if (std.mem.eql(u8, value, "no")) return false;
@@ -849,6 +901,11 @@ fn repositoryId(repository: Repository) RepositoryId {
     hashPart(&hash, "signed-by");
     hashCount(&hash, repository.signed_by.len);
     for (repository.signed_by) |value| hashPart(&hash, value.value);
+    // Hashed only when declared, so existing declarations keep their IDs.
+    if (repository.archive_binding) |binding| {
+        hashPart(&hash, "archive-binding");
+        hashPart(&hash, @tagName(binding));
+    }
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return .{ .bytes = std.fmt.bytesToHex(digest, .lower) };
@@ -884,6 +941,7 @@ fn collisionDiagnostic(existing: []const Repository, candidate: Repository) ?Dia
 
 fn repositoriesEqual(a: Repository, b: Repository) bool {
     return a.enabled == b.enabled and a.trusted == b.trusted and
+        a.archive_binding == b.archive_binding and
         std.mem.eql(SourceType, a.types, b.types) and
         equalValues(a.uris, b.uris) and equalValues(a.suites, b.suites) and
         equalValues(a.components, b.components) and
@@ -1081,6 +1139,65 @@ test "rejects malformed legacy options and ambiguous disabled entries" {
     _ = try expectDiagnostic("deb [arch=amd64 arch=arm64] https://x stable main\n", .legacy, .duplicate_option);
     _ = try expectDiagnostic("# deb [enabled=yes] https://x stable main\n", .legacy, .ambiguous_enabled_state);
     _ = try expectDiagnostic("deb [arch=amd64]https://x stable main\n", .legacy, .trailing_content);
+}
+
+test "per-repository archive binding declarations parse in both formats" {
+    const plain_deb822 = "Types: deb\nURIs: https://deb.example\nSuites: stable\nComponents: main\n";
+    const bound_deb822 = plain_deb822 ++ "X-Debz-Archive-Binding: signed_sha256_derived_sha512\n";
+    const inputs = [_]struct { bytes: []const u8, format: Format, binding: ?ArchiveBinding }{
+        .{ .bytes = plain_deb822, .format = .deb822, .binding = null },
+        .{ .bytes = bound_deb822, .format = .deb822, .binding = .signed_sha256_derived_sha512 },
+        .{
+            .bytes = plain_deb822 ++ "x-debz-archive-binding: published_digests\n",
+            .format = .deb822,
+            .binding = .published_digests,
+        },
+        .{ .bytes = "deb https://deb.example stable main\n", .format = .legacy, .binding = null },
+        .{
+            .bytes = "deb [arch=amd64 debz-archive-binding=signed_sha256_derived_sha512] https://deb.example stable main\n",
+            .format = .legacy,
+            .binding = .signed_sha256_derived_sha512,
+        },
+    };
+    var ids: [inputs.len]RepositoryId = undefined;
+    for (inputs, &ids) |input, *id| {
+        const result = try parse(std.testing.allocator, input.bytes, input.format, .{});
+        var sources = switch (result) {
+            .sources => |value| value,
+            .diagnostic => return error.UnexpectedDiagnostic,
+        };
+        defer sources.deinit();
+        try std.testing.expectEqual(1, sources.repositories.len);
+        try std.testing.expectEqual(input.binding, sources.repositories[0].archive_binding);
+        id.* = sources.repositories[0].id;
+    }
+    // A declaration is source identity input only when present.
+    try std.testing.expect(!std.mem.eql(u8, ids[0].slice(), ids[1].slice()));
+    try std.testing.expect(!std.mem.eql(u8, ids[1].slice(), ids[2].slice()));
+    try std.testing.expect(!std.mem.eql(u8, ids[3].slice(), ids[4].slice()));
+}
+
+test "rejects unknown, repeated, and multi-valued archive binding declarations" {
+    const base = "Types: deb\nURIs: https://x\nSuites: stable\nComponents: main\n";
+    _ = try expectDiagnostic(base ++ "X-Debz-Archive-Binding: signed_sha512\n", .deb822, .invalid_archive_binding);
+    _ = try expectDiagnostic(base ++ "X-Debz-Archive-Binding: Signed_Sha256_Derived_Sha512\n", .deb822, .invalid_archive_binding);
+    _ = try expectDiagnostic(
+        base ++ "X-Debz-Archive-Binding: signed_sha256_derived_sha512 published_digests\n",
+        .deb822,
+        .invalid_archive_binding,
+    );
+    _ = try expectDiagnostic(
+        base ++ "X-Debz-Archive-Binding: published_digests\nX-Debz-Archive-Binding: signed_sha256_derived_sha512\n",
+        .deb822,
+        .duplicate_field,
+    );
+    _ = try expectDiagnostic("deb [debz-archive-binding=sha256] https://x stable main\n", .legacy, .invalid_archive_binding);
+    _ = try expectDiagnostic(
+        "deb [debz-archive-binding=published_digests debz-archive-binding=signed_sha256_derived_sha512] https://x stable main\n",
+        .legacy,
+        .duplicate_option,
+    );
+    _ = try expectDiagnostic("deb [x-debz-archive-binding=published_digests] https://x stable main\n", .legacy, .unsupported_option);
 }
 
 test "rejects invalid paths, exact-suite components, and duplicate IDs" {

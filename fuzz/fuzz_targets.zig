@@ -5,6 +5,8 @@ const fuzz_options = @import("fuzz_options");
 const max_input = 32 * 1024;
 const text_corpus = &.{
     @embedFile("corpus/deb822/basic"),
+    @embedFile("corpus/deb822/archive-binding-sources"),
+    @embedFile("corpus/deb822/archive-binding-list"),
     @embedFile("corpus/control/basic"),
     @embedFile("corpus/release/basic"),
     @embedFile("corpus/packages/basic"),
