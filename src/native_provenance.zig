@@ -269,7 +269,7 @@ fn directoryPermissions() std.Io.File.Permissions {
         .fromMode(0o700);
 }
 
-fn evidenceDigest(files: []const EvidenceFile) Digest {
+pub fn evidenceDigest(files: []const EvidenceFile) Digest {
     var buffer: [4096]u8 = undefined;
     var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
     sink.writer.writeAll("debz-native-retained-evidence-v1\x00") catch

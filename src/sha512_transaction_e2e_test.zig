@@ -33,13 +33,13 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
 const Ed25519 = std.crypto.sign.Ed25519;
 
-const repository_id: source.RepositoryId = .{ .bytes = @splat('a') };
-const base_uri_text = "https://sha512.invalid/debian";
+pub const repository_id: source.RepositoryId = .{ .bytes = @splat('a') };
+pub const base_uri_text = "https://sha512.invalid/debian";
 const package_path = "pool/main/d/demo/demo_1.0_amd64.deb";
 const created: u32 = 1_790_100_000;
-const verification_time: i64 = 1_790_109_000;
+pub const verification_time: i64 = 1_790_109_000;
 
-const SignedRepository = struct {
+pub const SignedRepository = struct {
     allocator: std.mem.Allocator,
     archive: []u8,
     substitute_archive: []u8,
@@ -49,7 +49,7 @@ const SignedRepository = struct {
     keyring: []u8,
     fingerprint: [20]u8,
 
-    fn init(allocator: std.mem.Allocator) !SignedRepository {
+    pub fn init(allocator: std.mem.Allocator) !SignedRepository {
         const uid: u64 = if (builtin.os.tag == .linux) std.os.linux.getuid() else 0;
         const gid: u64 = if (builtin.os.tag == .linux) std.os.linux.getgid() else 0;
         var data = [_]archive_application.test_fixtures.Entry{
@@ -137,7 +137,7 @@ const SignedRepository = struct {
         };
     }
 
-    fn deinit(self: *SignedRepository) void {
+    pub fn deinit(self: *SignedRepository) void {
         self.allocator.free(self.keyring);
         self.allocator.free(self.signature);
         self.allocator.free(self.release);
@@ -337,11 +337,11 @@ fn appendInt(
     try output.appendSlice(allocator, &bytes);
 }
 
-const RepositoryTransport = struct {
+pub const RepositoryTransport = struct {
     fixture: *const SignedRepository,
     requests: usize = 0,
 
-    fn dependencies(self: *RepositoryTransport) repository_acquisition.Dependencies {
+    pub fn dependencies(self: *RepositoryTransport) repository_acquisition.Dependencies {
         return .{
             .transport = .{ .context = self, .requestFn = request },
             .files = .{ .context = self, .readFn = readFile },
@@ -396,11 +396,11 @@ const RepositoryTransport = struct {
     fn sleepMs(_: ?*anyopaque, _: u64) !void {}
 };
 
-fn refreshNow(_: ?*anyopaque) i64 {
+pub fn refreshNow(_: ?*anyopaque) i64 {
     return verification_time;
 }
 
-fn refreshPolicy() repository_refresh.RefreshPolicy {
+pub fn refreshPolicy() repository_refresh.RefreshPolicy {
     return .{
         .mode = .online,
         .compression_order = &.{.uncompressed},
@@ -413,7 +413,7 @@ fn refreshPolicy() repository_refresh.RefreshPolicy {
     };
 }
 
-fn acquisitionPolicy() repository_refresh.AcquisitionPolicy {
+pub fn acquisitionPolicy() repository_refresh.AcquisitionPolicy {
     return .{
         .deadlines = .{ .connect_ms = 100, .read_ms = 100, .overall_ms = 1000 },
         .redirect_limit = 0,
@@ -430,7 +430,7 @@ fn packagePolicy(mode: package_acquisition.Mode) package_acquisition.Policy {
     };
 }
 
-fn createLock(
+pub fn createLock(
     allocator: std.mem.Allocator,
     refresh: *const repository_refresh.AuthenticatedResult,
     action: solver.PlanAction,
@@ -467,7 +467,7 @@ fn createLock(
     });
 }
 
-fn initializeRoot(root: root_fs.Root) !void {
+pub fn initializeRoot(root: root_fs.Root) !void {
     for ([_][]const u8{
         "var",
         "var/lib",
@@ -518,10 +518,10 @@ const RecoveryClock = struct {
     }
 };
 
-const HermeticMechanics = struct {
+pub const HermeticMechanics = struct {
     probes: usize = 0,
 
-    fn probe(
+    pub fn probe(
         context: ?*anyopaque,
         allocator: std.mem.Allocator,
         root: root_fs.Root,
@@ -1269,4 +1269,8 @@ test "sha512_e2e.test.hermetic signed SHA512-only transaction verifies recovery 
         "\"final_verification_status\":\"exact_match\"",
     ) != null);
     try expectLegacySha256RequestBytes(allocator);
+}
+
+test {
+    _ = @import("native_provenance_binding_test.zig");
 }

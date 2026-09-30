@@ -1971,6 +1971,19 @@ fn ownedSuccess(
         try fixture.write(item.path, original, 0o644);
     }
     const receipt_before = try support.read(fixture, receipt_path, 16 * 1024 * 1024);
+    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{
+        .owner_evidence = released_path,
+        .state = "released",
+        .outcome = .succeeded,
+        .scripts = false,
+        .root_relative = scenario.native_root[fixture.path.len + 1 ..],
+        .receipt = receipt_path,
+        .owner = owner_path,
+        .bound_owner = "executed/workflow-owned-success/bound.owner.json",
+        .record = null,
+        .original_receipt = receipt_before,
+        .original_record = null,
+    });
     for ([_][]const u8{ "finalize", "finalize-again" }) |label| {
         var finalized = try workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, label), .{
             .ordinary_mode = "recover",
@@ -2839,6 +2852,19 @@ fn ownedKnownFailure(
         try fixture.write(item.path, original, 0o644);
         try std.testing.expectEqualSlices(u8, original_record, try support.read(fixture, record, 64 * 1024));
     }
+    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{
+        .owner_evidence = pending_file,
+        .state = "pending",
+        .outcome = .failed,
+        .scripts = true,
+        .root_relative = root_relative,
+        .receipt = receipt_path,
+        .owner = owner,
+        .bound_owner = try support.path(fixture.allocator, name, "bound.owner.json"),
+        .record = record,
+        .original_receipt = original_receipt,
+        .original_record = original_record,
+    });
     try publicVerify(fixture, cli, scenario.native_root, lock, arch, try support.path(fixture.allocator, name, "verify-public-pending-failure"), false);
     if (try referenceSingleFailure(fixture, reference, scenario.reference_root, arch, name) != 1) return error.ReferenceOwnedFailureNotReproduced;
     const comparison = try support.path(fixture.allocator, name, "comparison");
@@ -2886,6 +2912,167 @@ fn ownedKnownFailure(
     try std.testing.expectEqualSlices(u8, original_receipt, try support.read(fixture, receipt_path, 16 * 1024 * 1024));
     try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);
     std.debug.print("ordinary owned failed receipt: unpublished refusal, status/intent corruption, honest failure acknowledgment and byte-exact single-invocation dpkg parity passed\n", .{});
+}
+
+const OwnedComponentCheck = struct {
+    owner_evidence: []const u8,
+    state: []const u8,
+    outcome: debz.native_provenance.Outcome,
+    scripts: bool,
+    root_relative: []const u8,
+    receipt: []const u8,
+    owner: []const u8,
+    bound_owner: []const u8,
+    record: ?[]const u8,
+    original_receipt: []const u8,
+    original_record: ?[]const u8,
+};
+
+/// Issue #269 owned-attempt matrix: a completed or known-failed attempt binds
+/// every retained component and its terminal receipt fields. Each change or
+/// omission is refused with the component's typed error, is never verified as
+/// either terminal outcome, and leaves the owed record byte-identical.
+fn ownedComponents(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    scenario: *const support.Scenario,
+    arch: []const u8,
+    name: []const u8,
+    selected: []const Selector,
+    lock: []const u8,
+    check: OwnedComponentCheck,
+) !void {
+    const provenance = debz.native_provenance;
+    var receipt = try provenance.decode(fixture.allocator, check.original_receipt);
+    defer receipt.deinit();
+    try std.testing.expectEqual(check.outcome, receipt.document.outcome);
+    const retained_kinds = [_]provenance.EvidenceKind{ .authorization, .program, .execution_request, .intent, .progress, .managed_state, .trigger_events, .script_outcome };
+    var observed_kinds = std.EnumSet(provenance.EvidenceKind).initEmpty();
+    var retained_cases: usize = 0;
+    for (receipt.document.evidence_files, 0..) |file, index| {
+        if (std.mem.indexOfScalar(provenance.EvidenceKind, &retained_kinds, file.kind) == null) continue;
+        observed_kinds.insert(file.kind);
+        const retained_path = try support.path(fixture.allocator, check.root_relative, file.path);
+        const retained = try support.read(fixture, retained_path, 16 * 1024 * 1024);
+        const changed = try fixture.allocator.dupe(u8, retained);
+        changed[changed.len - 1] ^= 1;
+        try fixture.write(retained_path, changed, 0o600);
+        try ownedComponentRefused(fixture, driver, scenario, arch, name, try std.fmt.allocPrint(fixture.allocator, "retained-{s}-{d}", .{ @tagName(file.kind), index }), selected, lock, check, "EvidenceChanged");
+        try fixture.write(retained_path, retained, 0o600);
+        try expectOwnedRecord(fixture, check);
+        retained_cases += 1;
+    }
+    for (retained_kinds) |kind|
+        if (!observed_kinds.contains(kind) and (kind != .script_outcome or check.scripts))
+            return error.OwnedComponentNotRetained;
+
+    const ReceiptTamper = enum {
+        outcome_other_terminal,
+        outcome_recovery_required,
+        request,
+        policy,
+        exact_lock,
+        artifact_evidence,
+        authorization,
+        program,
+        execution_intent,
+        progress_head,
+        script_outcomes,
+        trigger_evidence,
+        final_database_generation,
+        final_state,
+    };
+    for (std.enums.values(ReceiptTamper)) |tamper| {
+        var forged = receipt.document;
+        const target: ?*provenance.Digest = switch (tamper) {
+            .outcome_other_terminal, .outcome_recovery_required => null,
+            .request => &forged.request_sha256,
+            .policy => &forged.policy_sha256,
+            .exact_lock => &forged.exact_lock_sha256,
+            .artifact_evidence => &forged.artifact_evidence_sha256,
+            .authorization => &forged.authorization_sha256,
+            .program => &forged.program_sha256,
+            .execution_intent => &forged.execution_intent_sha256,
+            .progress_head => &forged.progress_head_sha256,
+            .script_outcomes => &forged.script_outcomes_sha256,
+            .trigger_evidence => &forged.trigger_evidence_sha256,
+            .final_database_generation => &forged.final_database_generation_sha256,
+            .final_state => &forged.final_state_sha256,
+        };
+        if (target) |digest| digest[0] = if (digest[0] == '0') '1' else '0';
+        switch (tamper) {
+            .outcome_other_terminal => forged.outcome = if (check.outcome == .failed) .succeeded else .failed,
+            .outcome_recovery_required => forged.outcome = .recovery_required,
+            else => {},
+        }
+        provenance.seal(&forged);
+        try fixture.write(check.receipt, try forged.canonicalJson(fixture.allocator), 0o600);
+        try ownedComponentRefused(fixture, driver, scenario, arch, name, try std.fmt.allocPrint(fixture.allocator, "receipt-{s}", .{@tagName(tamper)}), selected, lock, check, switch (tamper) {
+            .outcome_other_terminal, .outcome_recovery_required => if (check.outcome == .failed) "TransactionNotFailed" else "TransactionNotSuccessful",
+            // The completion binds the receipt digest, so a resealed field
+            // cannot be re-bound without a new completion.
+            else => "EvidenceMismatch",
+        });
+    }
+    try fixture.write(check.receipt, check.original_receipt, 0o600);
+
+    const bound_owner = try support.read(fixture, check.bound_owner, 64 * 1024);
+    const current_owner = try support.read(fixture, check.owner, 64 * 1024);
+    const completion = try support.path(fixture.allocator, check.root_relative, debz.root_operation_completion.document_path);
+    const original_completion = try support.read(fixture, completion, 64 * 1024);
+    for ([_]struct { name: []const u8, path: []const u8, replacement: ?[]const u8, original: []const u8, expected_error: []const u8 }{
+        .{ .name = "receipt-missing", .path = check.receipt, .replacement = null, .original = check.original_receipt, .expected_error = "ReceiptMissing" },
+        .{ .name = "completion-missing", .path = completion, .replacement = null, .original = original_completion, .expected_error = "CompletionMissing" },
+        .{ .name = "stale-owner", .path = check.owner, .replacement = bound_owner, .original = current_owner, .expected_error = "OwnershipMismatch" },
+    }) |item| {
+        if (item.replacement) |bytes|
+            try fixture.write(item.path, bytes, 0o600)
+        else
+            try fixture.dir.deleteFile(fixture.io, item.path);
+        try ownedComponentRefused(fixture, driver, scenario, arch, name, item.name, selected, lock, check, item.expected_error);
+        try fixture.write(item.path, item.original, 0o600);
+    }
+    try expectOwnedRecord(fixture, check);
+    try std.testing.expectEqualSlices(u8, check.original_receipt, try support.read(fixture, check.receipt, 16 * 1024 * 1024));
+    std.debug.print("owned {s} component matrix: {d} retained, {d} receipt and 3 settlement tampers refused\n", .{
+        @tagName(check.outcome), retained_cases, std.enums.values(ReceiptTamper).len,
+    });
+}
+
+fn expectOwnedRecord(fixture: *foundation.Fixture, check: OwnedComponentCheck) !void {
+    if (check.record) |record|
+        try std.testing.expectEqualSlices(u8, check.original_record.?, try support.read(fixture, record, 64 * 1024))
+    else if (check.original_record == null) {} else return error.InvalidOwnedComponentCheck;
+}
+
+fn ownedComponentRefused(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    scenario: *const support.Scenario,
+    arch: []const u8,
+    name: []const u8,
+    label: []const u8,
+    selected: []const Selector,
+    lock: []const u8,
+    check: OwnedComponentCheck,
+    expected_error: []const u8,
+) !void {
+    var refused = try workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, label), .{
+        .ordinary_mode = "recover",
+        .selectors = selected,
+        .cache_path = try fixture.absolute(try support.path(fixture.allocator, name, "unused-cache")),
+        .state_path = try fixture.absolute(try support.path(fixture.allocator, name, "unused-state")),
+        .orchestration_id = @splat(17),
+        .owner_evidence = check.owner_evidence,
+        .owned_verification = .{
+            .lock_path = lock,
+            .state = check.state,
+            .outcome = if (check.outcome == .failed) "failed" else "succeeded",
+            .expected_error = expected_error,
+        },
+    });
+    defer refused.deinit();
+    try std.testing.expect(!(try field(refused.report.value, "verified")).bool);
 }
 
 fn ownedFinalizationBoundaries(

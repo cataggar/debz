@@ -945,6 +945,7 @@ pub fn build(b: *std.Build) void {
         .root_module = sha512_e2e_module,
         .filters = &.{
             "sha512_e2e.test.hermetic signed SHA512-only transaction verifies recovery and fail-closed identities",
+            "native_provenance_binding.test.",
         },
     });
     const run_sha512_e2e_tests = b.addRunArtifact(sha512_e2e_tests);

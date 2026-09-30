@@ -2550,6 +2550,16 @@ def native_exercise_final_wiring_failures(
     ):
         if token not in production:
             failures.append(f"native_unpack.zig: proof-bound post-provenance completion lost {token}")
+    completion_read = unpack.split("fn readProductionCompletion(", 1)[-1].split("\nfn ", 1)[0]
+    for token in (
+        "nativeAction(.provenance, std.math.maxInt(u32), 0, 0),\n    ) orelse return error.InvalidRecoveryProvenance;",
+        "if (terminal.stage != .terminal or switch (receipt.document.outcome) {",
+        ".succeeded => terminal.result != .succeeded and terminal.result != .recovered,",
+        ".failed => terminal.result != .failed,",
+        ".recovery_required => true,\n    }) return error.InvalidRecoveryProvenance;",
+    ):
+        if token not in completion_read:
+            failures.append(f"native_unpack.zig: terminal receipt must bind retained terminal provenance progress lost {token}")
     return failures
 
 
@@ -2823,6 +2833,61 @@ def native_workflow_acceptance_wiring_failures(
             failures.append(f"native_recovery_projected_workflows.zig: private projected workflow execution lost {token}")
     if projected.count('"/usr/bin/unshare", "--mount", "--pid", "--fork"') != 2:
         failures.append("native_recovery_projected_workflows.zig: read-only and signed workflow children both require private PID/mount projections")
+    components = family.split("\nfn ownedComponents(", 1)[-1].split("\nfn ", 1)[0]
+    for token in (
+        "const retained_kinds = [_]provenance.EvidenceKind{ .authorization, .program, .execution_request, .intent, .progress, .managed_state, .trigger_events, .script_outcome };",
+        "if (!observed_kinds.contains(kind) and (kind != .script_outcome or check.scripts))",
+        '"retained-{s}-{d}"',
+        '"EvidenceChanged"',
+        "outcome_other_terminal,\n        outcome_recovery_required,",
+        "final_database_generation,\n        final_state,",
+        'if (check.outcome == .failed) "TransactionNotFailed" else "TransactionNotSuccessful"',
+        'else => "EvidenceMismatch",',
+        '.expected_error = "ReceiptMissing"',
+        '.expected_error = "CompletionMissing"',
+        '.expected_error = "OwnershipMismatch"',
+    ):
+        if token not in components:
+            failures.append(f"native_recovery_family.zig: owned component tamper matrix lost {token}")
+    for token in (
+        '        .state = "released",\n        .outcome = .succeeded,\n        .scripts = false,',
+        '        .state = "pending",\n        .outcome = .failed,\n        .scripts = true,',
+    ):
+        if "    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{\n        .owner_evidence = " not in family or token not in family:
+            failures.append(f"native_recovery_family.zig: owned success and failed attempts require component tamper coverage lost {token}")
+    if family.count("    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{") != 2:
+        failures.append("native_recovery_family.zig: owned success and failed attempts both require the component tamper matrix")
+    return failures
+
+
+def native_provenance_binding_wiring_failures(
+    build: str, e2e: str, binding: str,
+) -> list[str]:
+    failures: list[str] = []
+    if '            "native_provenance_binding.test.",\n        },\n    });\n    const run_sha512_e2e_tests = b.addRunArtifact(sha512_e2e_tests);' not in build:
+        failures.append("build.zig: hermetic native provenance binding tests lost their sha512 e2e filter")
+    if "    workload_native.dependOn(&run_sha512_e2e_tests.step);" not in build:
+        failures.append("build.zig: hermetic native provenance binding tests lost required test wiring")
+    if 'test {\n    _ = @import("native_provenance_binding_test.zig");\n}' not in e2e:
+        failures.append("sha512_transaction_e2e_test.zig: hermetic native provenance binding tests are no longer imported")
+    for token in (
+        'test "native_provenance_binding.test.completed attempt binds every acceptance component" {',
+        'test "native_provenance_binding.test.recovered attempt binds every acceptance component" {',
+        'test "native_provenance_binding.test.recovery_required attempt keeps typed evidence without success-shaped settlement" {',
+        "try testing.expect(settled.recovered_phase_count >= 1);",
+        "for ([_]native_provenance.Outcome{ .succeeded, .failed }) |outcome| {",
+        '"receipt.evidence_files[{s}] omitted"',
+        '"retained {s} bytes"',
+        '"completion.transaction_provenance=provenanceDigest"',
+        '"live pending trigger claim"',
+        '"deferred owner reinstated"',
+        "try testing.expect(!std.mem.eql(u8, &receipt_digest, &provenance_digest));",
+    ):
+        if token not in binding:
+            failures.append(f"native_provenance_binding_test.zig: component tamper coverage lost {token}")
+    for token in ("try tamperSettled(&env, &settled);", "try env.expectSecondOperationRefused();"):
+        if binding.count(token) != 2:
+            failures.append(f"native_provenance_binding_test.zig: completed/recovered and recovery_required coverage requires two {token}")
     return failures
 
 
@@ -3002,6 +3067,12 @@ def audit_ci_pins() -> None:
         (ROOT / "build.zig").read_text(),
         (ROOT / "test/native_recovery_family.zig").read_text(),
         (ROOT / "test/native_recovery_projected_workflows.zig").read_text(),
+    ):
+        fail(failure)
+    for failure in native_provenance_binding_wiring_failures(
+        (ROOT / "build.zig").read_text(),
+        (ROOT / "src/sha512_transaction_e2e_test.zig").read_text(),
+        (ROOT / "src/native_provenance_binding_test.zig").read_text(),
     ):
         fail(failure)
     for failure in native_report_path_wiring_failures({
@@ -4032,7 +4103,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
     elif kind in {
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
-        "native-lifecycle", "native-fixtures", "native-gate",
+        "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -4043,6 +4114,10 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-workflow": ("build.zig", "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig"),
             "native-report": REPORT_PATH_ORACLE_FILES,
             "native-lifecycle": ("build.zig", "test/native_trigger_acceptance.zig"),
+            "native-provenance": (
+                "build.zig", "src/sha512_transaction_e2e_test.zig",
+                "src/native_provenance_binding_test.zig",
+            ),
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
@@ -4093,6 +4168,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_lifecycle_migration_failures(*(texts[path] for path in paths))
         elif kind == "native-gate":
             failures = native_recovery_gate_wiring_failures(*(texts[path] for path in paths))
+        elif kind == "native-provenance":
+            failures = native_provenance_binding_wiring_failures(*(texts[path] for path in paths))
         else:
             failures = native_lifecycle_fixture_failures(texts)
     elif kind == "release-install-metadata":

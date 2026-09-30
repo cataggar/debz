@@ -153,6 +153,7 @@
         "src/native_diversion.zig",
         "src/native_helper.zig",
         "src/native_program.zig",
+        "src/native_provenance_binding_test.zig",
         "src/native_recovery.zig",
         "src/native_transaction_result.zig",
         "src/native_trigger.zig",
@@ -179,8 +180,8 @@
         "src/transaction_provenance_v3.zig",
         "src/transaction_result_summary.zig"
       ],
-      "count": 364,
-      "sha512": "56a0f5e01028294c1895800fec1dbc5412f4c0ad8aeb7e5e14feb0b678d6fe760f6369cd71e8fde4154094f7a5a9d1d2983c95ad46a041cdddd36d490283a9de"
+      "count": 368,
+      "sha512": "1ab8f74b21352a55256c6cf4f86694b36881b7289cd4395337b88dd32fd4aef767eeaa49f0283cb5fda5c7531830085ac400d014b96cc43b2647143d233330ee"
     },
     {
       "id": "schema-historical-authority-fields",

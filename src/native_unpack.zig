@@ -28994,6 +28994,17 @@ fn readProductionCompletion(
         retained_progress.document,
         request.bootstrap(),
     );
+    // A recovery_required publication retains progress without the terminal
+    // provenance record; a resealed outcome cannot stand in for that record.
+    const terminal = native_recovery.latest(
+        retained_progress.document,
+        nativeAction(.provenance, std.math.maxInt(u32), 0, 0),
+    ) orelse return error.InvalidRecoveryProvenance;
+    if (terminal.stage != .terminal or switch (receipt.document.outcome) {
+        .succeeded => terminal.result != .succeeded and terminal.result != .recovered,
+        .failed => terminal.result != .failed,
+        .recovery_required => true,
+    }) return error.InvalidRecoveryProvenance;
     if (request.bootstrap()) |bootstrap|
         try native_helper.verifyBootstrapTarget(allocator, root, bootstrap.target);
     const program_bytes = try retainedNativeBytes(allocator, root, receipt.document, .program);
