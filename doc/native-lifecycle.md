@@ -22,6 +22,27 @@ version, and
 `SystemMaintainerScriptLauncher` applies the existing root, environment, argv,
 timeout, output, and descendant policies.
 
+The pinned-dpkg [root import acceptance](../test/native_root_import.zig)
+starts with an already installed, configured package in two independently
+seeded disposable roots. It compares the prestate and an additional native
+install against pinned dpkg, including status and status-old, owned info files,
+conffiles, active alternatives, diversions, statoverrides, file triggers,
+script traces, and the complete filesystem/database snapshot. The native
+invocation uses durable recovery-backed receipts: its initial/final database
+generations, script outcomes, and retained evidence are verified after success.
+Independent copies with corrupt or duplicate status, an update fragment,
+unclassified top-level metadata, and unsafe modes must refuse before mutation.
+Test-only edits to status and an installed script *after compilation* must
+refuse on the locked database-generation check; the only change left in each
+root is the injected edit. Each refused copy has no active mutation evidence.
+Use `zig build test-native-root-import -Dnative-reference-dpkg=/absolute/path/to/verified/dpkg -j2`
+in Debug and ReleaseSafe. This test requires root for guarded chroot fixtures
+and rejects an unpinned reference. CI runs it in both modes on amd64 and arm64
+in the required `native-recovery-zig-workflows` shard, which gates
+`Build and test`; the security audit rejects a missing, skipped, duplicated,
+unpinned or relocated invocation. This bounded fixture-level parity does not
+replace the signed-root gates in the migration acceptance plan.
+
 Arguments preserve empty strings. In particular, a package that has never been
 configured receives `postinst configure ""`; the unpacked package's `Version`
 is not a substitute for its last configured version. Upgrade preinst and the

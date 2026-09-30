@@ -30,7 +30,7 @@ target in Debug and ReleaseSafe:
 
 | Required job | Zig targets (prefix `test-native-recovery-` unless shown) |
 | --- | --- |
-| `native-recovery-zig-workflows` | `zig`, `zig-repository`, `helper-zig`, `zig-bootstrap`, `zig-parity`, `zig-rollback-clock` |
+| `native-recovery-zig-workflows` | `zig`, `zig-repository`, `helper-zig`, `zig-bootstrap`, `zig-parity`, `zig-rollback-clock`, `test-native-root-import` |
 | `native-recovery-zig-family` | `zig-family` |
 | `native-recovery-zig-scenarios` | `zig-scriptless`, `zig-statoverride`, `zig-literal`, `zig-metadata`, `zig-conffile`, `zig-final-gaps`, `zig-diversions` |
 

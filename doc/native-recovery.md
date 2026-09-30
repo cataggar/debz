@@ -1006,6 +1006,9 @@ rollback-clock and signed-parity Zig acceptance; independent core, repository
 and FAMILY shards run their corresponding acceptance. All use pinned dpkg on
 both architectures in Debug and ReleaseSafe. The core shard creates `.tmp`
 as the runner user before its Zig unit tests or privileged fixtures run;
+it also runs the bounded pinned-dpkg `test-native-root-import` healthy-root
+import and copied-root refusal parity in both modes, reusing the lifecycle
+fixture driver its recovery target already builds;
 the repository, helper and FAMILY shards also create it before privileged
 fixtures. The standalone repository target orders workspace creation ahead
 of both its privileged acceptance process and unprivileged unit tests. This prepared

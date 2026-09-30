@@ -8999,11 +8999,29 @@ fn captureDatabaseSnapshot(
     return captureDatabaseSnapshotBounded(allocator, root, options, 256 * 1024 * 1024, false);
 }
 
+fn capturePreflightDatabaseSnapshot(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    options: package_database.Options,
+) !CapturedDatabase {
+    try validateImportedDatabaseLayout(root);
+    return captureDatabaseSnapshot(allocator, root, options);
+}
+
 fn captureInitialDatabaseSnapshot(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
 ) !CapturedDatabase {
     return captureDatabaseSnapshotBounded(allocator, root, .{}, 256 * 1024 * 1024, true);
+}
+
+fn capturePreflightInitialDatabaseSnapshot(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+) !CapturedDatabase {
+    if (try root.entryIfExists(try root_fs.Path.init(package_database.database_directory)) != null)
+        try validateImportedDatabaseLayout(root);
+    return captureInitialDatabaseSnapshot(allocator, root);
 }
 
 fn captureDatabaseSnapshotBounded(
@@ -9248,6 +9266,129 @@ fn captureDatabaseSnapshotInto(
     }.less);
     snapshot.updates = try owned.dupe(package_database.UpdateEntry, updates.items);
     return snapshot;
+}
+
+fn validateImportedDatabaseLayout(root: root_fs.Root) !void {
+    var admin = try root.openDirectory(try root_fs.Path.init(package_database.database_directory));
+    defer admin.close(root.io);
+    var entries = admin.iterate();
+    while (try entries.next(root.io)) |entry| {
+        const name = entry.name;
+        // The control staging slot has its own typed collision check after
+        // archive admission, including non-directory and occupied cases.
+        if (std.mem.eql(u8, name, "tmp.ci")) continue;
+        const directory = std.mem.eql(u8, name, "info") or
+            std.mem.eql(u8, name, "updates") or
+            std.mem.eql(u8, name, "triggers") or
+            std.mem.eql(u8, name, "alternatives") or
+            std.mem.eql(u8, name, "parts");
+        const file = std.mem.eql(u8, name, "status") or
+            std.mem.eql(u8, name, "status-old") or
+            std.mem.eql(u8, name, "arch") or
+            std.mem.eql(u8, name, "diversions") or
+            std.mem.eql(u8, name, "diversions-old") or
+            std.mem.eql(u8, name, "statoverride") or
+            std.mem.eql(u8, name, "statoverride-old") or
+            std.mem.eql(u8, name, "available") or
+            std.mem.eql(u8, name, "available-old") or
+            std.mem.eql(u8, name, "lock") or
+            std.mem.eql(u8, name, "lock-frontend");
+        if (!directory and !file) return error.UnsupportedDatabaseEntry;
+        var path_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{
+            package_database.database_directory, name,
+        });
+        const observed = (try root.entryIfExists(try root_fs.Path.init(path))) orelse
+            return error.DatabaseCaptureChanged;
+        if ((directory and !observed.isDirectory()) or
+            (file and !observed.isRegularFile()) or
+            (observed.mode & 0o022) != 0)
+            return error.UnsafeDatabaseEntry;
+        if (std.mem.eql(u8, name, "parts")) {
+            var child = try root.openDirectory(try root_fs.Path.init(path));
+            defer child.close(root.io);
+            var iterator = child.iterate();
+            if (try iterator.next(root.io) != null) return error.UnsupportedDatabaseEntry;
+        }
+    }
+}
+
+test "native_unpack.test.live database layout refuses unclassified and unsafe entries" {
+    for ([_]enum { unknown_file, unknown_directory, occupied_parts, linked_available }{
+        .unknown_file, .unknown_directory, .occupied_parts, .linked_available,
+    }) |kind| {
+        var fixture: Fixture = undefined;
+        try fixture.init(empty_status, &.{});
+        defer fixture.deinit();
+        const root = fixture.root();
+        switch (kind) {
+            .unknown_file => try root.publishFile(
+                try root_fs.Path.init("var/lib/dpkg/future-state"),
+                "unknown\n",
+                .{},
+            ),
+            .unknown_directory => try root.ensureDirectory(
+                try root_fs.Path.init("var/lib/dpkg/future-state"),
+                root_fs.default_directory_permissions,
+            ),
+            .occupied_parts => {
+                try root.ensureDirectory(
+                    try root_fs.Path.init("var/lib/dpkg/parts"),
+                    root_fs.default_directory_permissions,
+                );
+                try root.publishFile(
+                    try root_fs.Path.init("var/lib/dpkg/parts/0000"),
+                    "unclassified\n",
+                    .{},
+                );
+            },
+            .linked_available => try fixture.tmp.dir.symLink(
+                testing.io,
+                "status",
+                "var/lib/dpkg/available",
+                .{},
+            ),
+        }
+        try testing.expectError(
+            if (kind == .linked_available)
+                error.UnsafeDatabaseEntry
+            else
+                error.UnsupportedDatabaseEntry,
+            capturePreflightInitialDatabaseSnapshot(testing.allocator, root),
+        );
+    }
+}
+
+test "native_unpack.test.imported live database detects external same-byte mode change" {
+    var fixture: Fixture = undefined;
+    try fixture.init(empty_status, &.{});
+    defer fixture.deinit();
+    const root = fixture.root();
+    var captured = try captureInitialDatabaseSnapshot(testing.allocator, root);
+    defer captured.deinit();
+    var imported = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer imported.deinit();
+    try fixture.tmp.dir.setFilePermissions(
+        testing.io,
+        "var/lib/dpkg/info/format",
+        .fromMode(0o600),
+        .{},
+    );
+    var changed = try capturePreflightInitialDatabaseSnapshot(testing.allocator, root);
+    defer changed.deinit();
+    const diagnostic = (try package_database.verifyGeneration(
+        testing.allocator,
+        imported,
+        changed.snapshot,
+    )) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(package_database.Code.external_generation_change, diagnostic.code);
 }
 
 test "native_unpack.test.absent database is distinct from partial foreign and healthy roots" {
@@ -14610,6 +14751,7 @@ const ExternalLifecycleRequest = struct {
     isolated_helper: bool = false,
     deadline_after_ms: ?u64 = null,
     helper_bootstrap_expectation: ?HelperBootstrapExpectation = null,
+    fixture_import_drift: ?enum { status_mode, installed_script_mode } = null,
 };
 
 const LifecycleOutcome = enum {
@@ -27339,7 +27481,7 @@ pub const Runtime = struct {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        var captured = try captureInitialDatabaseSnapshot(allocator, root);
+        var captured = try capturePreflightInitialDatabaseSnapshot(allocator, root);
         defer captured.deinit();
         if (captured.absent and request.plan.actions.len == 0)
             return error.DatabaseStatusMissing;
@@ -27842,7 +27984,7 @@ fn executePreparedNativeProgramWithHelper(
     const scratch = arena.allocator();
     const document = try native_execution_request.create(root, attempt, program, operation);
     const archives = try productionArchives(scratch, program.artifacts, archive_bytes);
-    var captured = try captureInitialDatabaseSnapshot(allocator, root);
+    var captured = try capturePreflightInitialDatabaseSnapshot(allocator, root);
     defer captured.deinit();
     if (captured.absent != requiresDatabaseInitialization(program))
         return error.DatabasePresenceChanged;
@@ -29326,7 +29468,10 @@ fn executeLifecycleProgramWithRequest(
         requiresDatabaseInitialization(program.*))
         null
     else
-        captureInitialDatabaseSnapshot(allocator, root) catch |err| {
+        (if (recovery_intent == null)
+            capturePreflightInitialDatabaseSnapshot(allocator, root)
+        else
+            captureInitialDatabaseSnapshot(allocator, root)) catch |err| {
             if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
             return err;
         };
@@ -29412,7 +29557,6 @@ fn executeLifecycleProgramWithRequest(
         alternatives.deinit();
     }
     if (recovery_intent == null and
-        hasConfigMembers(models) and
         try root.entryIfExists(try root_fs.Path.init(
             dpkg_control_staging_directory,
         )) != null)
@@ -33768,7 +33912,15 @@ test "native_unpack.test.lifecycle external fixture" {
         }
     }
 
-    var captured = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    var captured = capturePreflightDatabaseSnapshot(testing.allocator, root, .{}) catch |err| {
+        try writeLifecycleReport(
+            testing.allocator,
+            testing.io,
+            external.report,
+            .{ .outcome = .refused, .detail = @errorName(err) },
+        );
+        return;
+    };
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, external.architecture);
     var database = switch (try package_database.importSnapshot(
@@ -33780,17 +33932,14 @@ test "native_unpack.test.lifecycle external fixture" {
         .{},
     )) {
         .database => |value| value,
-        .diagnostic => {
-            if (external.triggers) {
-                try writeLifecycleReport(
-                    testing.allocator,
-                    testing.io,
-                    external.report,
-                    .{ .outcome = .refused, .detail = "database_rejected" },
-                );
-                return;
-            }
-            return error.InvalidExternalDatabase;
+        .diagnostic => |diagnostic| {
+            try writeLifecycleReport(
+                testing.allocator,
+                testing.io,
+                external.report,
+                .{ .outcome = .refused, .detail = @tagName(diagnostic.code) },
+            );
+            return;
         },
     };
     defer database.deinit();
@@ -33960,6 +34109,22 @@ test "native_unpack.test.lifecycle external fixture" {
         return;
     };
     defer compiled.deinit();
+    if (external.fixture_import_drift) |drift| {
+        const path = switch (drift) {
+            .status_mode => "var/lib/dpkg/status",
+            .installed_script_mode => "var/lib/dpkg/info/import-keeper.postinst",
+        };
+        const before = try root.entry(try root_fs.Path.init(path));
+        if (!before.isRegularFile() or
+            before.mode != @as(u32, if (drift == .status_mode) 0o644 else 0o755))
+            return error.InvalidImportDriftFixture;
+        try root.dir.setFilePermissions(
+            root.io,
+            path,
+            .fromMode(if (drift == .status_mode) 0o600 else 0o700),
+            .{},
+        );
+    }
     var locks: root_operation.SystemLockBackend = .{
         .allocator = testing.allocator,
         .io = testing.io,

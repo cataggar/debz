@@ -154,6 +154,17 @@ a freshly captured snapshot against an imported database and reports
 `external_generation_change`, so an authorization can never survive an external
 database change between preflight and mutation.
 
+The live native preflight classifies the dpkg directory before importing the
+selected files. Known compatibility members such as `available` and `*-old`
+are preserved, not rewritten. An unclassified top-level member, nonempty
+`parts/`, or a linked, special, or writable-by-others known member refuses
+before a native mutation. `tmp.ci` is checked separately by the existing
+control-staging collision guard, which also refuses occupied and non-directory
+entries before mutation. This complements the typed snapshot importer: a
+healthy modeled subset cannot mask unsupported state elsewhere in an existing
+dpkg root. In-flight native publication still uses its own journal-bound
+checks rather than treating an authorized staging slot as a new import.
+
 ## Staged change sets
 
 `planPackageDatabaseChanges` compiles typed changes into a `Plan`:

@@ -994,6 +994,38 @@ pub fn build(b: *std.Build) void {
     native_lifecycle_step.dependOn(&lifecycle_zig.step);
     b.step("test-native-lifecycle-zig", "Run Zig-owned lifecycle and diversion acceptance against dpkg")
         .dependOn(&lifecycle_zig.step);
+    const root_import_module = b.createModule(.{
+        .root_source_file = b.path("test/native_root_import.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    root_import_module.addImport("debz", debz);
+    root_import_module.addOptions("native_test_options", native_fixture_options);
+    const root_import_tests = b.addTest(.{ .root_module = root_import_module });
+    const run_root_import_tests = b.addRunArtifact(root_import_tests);
+    const root_import_capture_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "native_unpack.test.live database",
+            "native_unpack.test.imported live database",
+        },
+    });
+    const run_root_import_capture_tests = b.addRunArtifact(root_import_capture_tests);
+    const root_import_executable = b.addExecutable(.{
+        .name = "native-root-import-acceptance",
+        .root_module = root_import_module,
+    });
+    const root_import = b.addSystemCommand(&.{
+        "sudo", "-n", "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}),
+        b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+    });
+    root_import.addArtifactArg(root_import_executable);
+    root_import.addArtifactArg(native_lifecycle_tests);
+    root_import.step.dependOn(&run_root_import_tests.step);
+    root_import.step.dependOn(&run_root_import_capture_tests.step);
+    b.step("test-native-root-import", "Compare healthy pinned-dpkg root import and copied-root refusals")
+        .dependOn(&root_import.step);
     const lifecycle_oracle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
@@ -1565,6 +1597,7 @@ pub fn build(b: *std.Build) void {
         }
     }
     if (b.option([]const u8, "native-reference-dpkg", "Absolute path to the pinned private dpkg fixture reference")) |path| {
+        root_import.addArgs(&.{ "--reference-dpkg", path });
         run_native_fixture.addArgs(&.{ "--reference-dpkg", path });
         run_native_conffile_zig.addArgs(&.{ "--reference-dpkg", path });
         run_native_differential_zig.addArgs(&.{ "--reference-dpkg", path });
