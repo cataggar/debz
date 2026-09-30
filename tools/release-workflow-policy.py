@@ -38,6 +38,7 @@ CI_GHR_ZIG_JOBS = (
     "native-recovery-zig-helper",
     "native-recovery-zig-family",
     "native-recovery-zig-scenarios",
+    "native-recovery-zig-diversions",
     "security-audit",
     "release-dry-run",
     "fuzz",

@@ -1232,6 +1232,8 @@ def workflow_failure_handling_failures(text: str, label: str) -> list[str]:
     return failures
 
 
+DIVERSION_CASE_SHARDS = ((1, 25), (26, 50), (51, 75), (76, 100))
+
 RECOVERY_ZIG_SHARDS = {
     "native-recovery-zig-workflows": (
         "Native crash recovery Zig core (${{ matrix.name }})",
@@ -1260,7 +1262,7 @@ RECOVERY_ZIG_SHARDS = {
     ),
     "native-recovery-zig-scenarios": (
         "Native crash recovery Zig scenario matrices (${{ matrix.name }})",
-        "Exercise Zig recovery scenario and diversion matrices",
+        "Exercise Zig recovery scenario and mutation matrices",
         (
             "test-native-recovery-zig-scriptless",
             "test-native-recovery-zig-statoverride",
@@ -1269,16 +1271,21 @@ RECOVERY_ZIG_SHARDS = {
             "test-native-recovery-zig-publication",
             "test-native-recovery-zig-conffile",
             "test-native-recovery-zig-final-gaps",
-            "test-native-recovery-zig-diversions",
             "test-native-recovery-zig-mutation-boundaries",
         ),
+    ),
+    "native-recovery-zig-diversions": (
+        "Native crash recovery Zig diversion shard (${{ matrix.name }} / ${{ matrix.shard }})",
+        "Exercise counted Zig diversion recovery shard",
+        ("test-native-recovery-zig-diversions",),
     ),
 }
 
 
-def recovery_zig_commands(targets: tuple[str, ...]) -> list[str]:
+def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) -> list[str]:
+    shard_option = ' -Dnative-zig-recovery-diversion-shard="${{ matrix.shard }}"' if sharded else ""
     return [
-        f'zig build {target} -Dnative-reference-dpkg="$reference_dpkg"{mode} -j2 --summary all'
+        f'zig build {target}{shard_option} -Dnative-reference-dpkg="$reference_dpkg"{mode} -j2 --summary all'
         for target in targets
         for mode in ("", " -Doptimize=ReleaseSafe")
     ]
@@ -1436,6 +1443,11 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         "          - os: ubuntu-24.04-arm\n"
         "            name: linux-arm64\n"
     )
+    diversion_architectures = "".join(
+        f"          - os: {os}\n            name: {arch}\n            shard: {shard}\n"
+        for os, arch in (("ubuntu-24.04", "linux-x64"), ("ubuntu-24.04-arm", "linux-arm64"))
+        for shard in range(1, len(DIVERSION_CASE_SHARDS) + 1)
+    )
     if "native-recovery" in jobs or re.search(
         r"(?m)^\s+zig build test-native-recovery(?:\s|$)", text,
     ):
@@ -1462,15 +1474,21 @@ def native_recovery_ci_failures(text: str) -> list[str]:
                     "native-recovery-zig-family",
                 ) else []),
                 'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-                *recovery_zig_commands(targets),
+                *recovery_zig_commands(targets, sharded=name == "native-recovery-zig-diversions"),
             ],
         )
-        recovery_jobs[name] = (display_name, architectures, expected_steps)
+        recovery_jobs[name] = (
+            display_name,
+            diversion_architectures if name == "native-recovery-zig-diversions" else architectures,
+            expected_steps,
+        )
     expected_commands = []
     shared_setup = None
     for name, (display_name, matrix_rows, expected_steps) in recovery_jobs.items():
         body = jobs.get(name, "")
-        timeout_minutes = 75 if name == "native-recovery-zig-scenarios" else 35
+        timeout_minutes = 75 if name in (
+            "native-recovery-zig-scenarios", "native-recovery-zig-diversions",
+        ) else 35
         strategy = (
             "      fail-fast: false\n"
             "      matrix:\n"
@@ -1538,7 +1556,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         r"(?m)^[ \t]+(zig build test-native-recovery[^\n]+)$", text,
     )
     if sorted(actual_commands) != sorted(inventory_commands):
-        failures.append("ci.yml: recovery targets must execute only in the five required Zig shards")
+        failures.append("ci.yml: recovery targets must execute only in the six required Zig shards")
     gate = jobs.get("build-and-test", "")
     gate_steps = dict(re.findall(
         r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", gate,
@@ -1552,10 +1570,11 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         'test "$RECOVERY_HELPER_RESULT" = success',
         'test "$RECOVERY_FAMILY_RESULT" = success',
         'test "$RECOVERY_SCENARIOS_RESULT" = success',
+        'test "$RECOVERY_DIVERSIONS_RESULT" = success',
     ]
     if any(line not in gate.splitlines() for line in (
         "    name: Build and test (${{ matrix.name }})",
-        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios]",
+        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]",
         "    if: ${{ always() }}",
         "      fail-fast: false",
         "        name: [linux-x64, linux-arm64]",
@@ -1565,12 +1584,14 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         "          RECOVERY_HELPER_RESULT: ${{ needs.native-recovery-zig-helper.result }}",
         "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
         "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
+        "          RECOVERY_DIVERSIONS_RESULT: ${{ needs.native-recovery-zig-diversions.result }}",
         '          test "$BUILD_RESULT" = success',
         '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
         '          test "$RECOVERY_REPOSITORY_RESULT" = success',
         '          test "$RECOVERY_HELPER_RESULT" = success',
         '          test "$RECOVERY_FAMILY_RESULT" = success',
         '          test "$RECOVERY_SCENARIOS_RESULT" = success',
+        '          test "$RECOVERY_DIVERSIONS_RESULT" = success',
     )) or "continue-on-error:" in gate or re.search(r"(?m)^        if:", gate) or (
         len(gate_steps) != 1
         or len(gate_script) != 2
@@ -1642,7 +1663,7 @@ def native_report_path_wiring_failures(texts: dict[str, str]) -> list[str]:
     return failures
 
 def native_recovery_gate_wiring_failures(
-    build: str, helper: str, family: str, projected: str, repository: str,
+    build: str, helper: str, family: str, projected: str, repository: str, diversions: str,
 ) -> list[str]:
     failures: list[str] = []
     for path in ("tools/test-native-recovery.py", "tools/test_native_recovery.py"):
@@ -1666,7 +1687,10 @@ def native_recovery_gate_wiring_failures(
         "if (selected > 1 or focused)",
         "focused Zig case options cannot narrow the complete test-native-recovery gate",
         "zig_core_only or zig_deadline_only or family_executed_only or",
-        "parity_case != null or bootstrap_case != null or repository_case != null or diversion_case != null",
+        "parity_case != null or bootstrap_case != null or repository_case != null or",
+        "diversion_case != null or route_case != null or diversion_shard != null or mutation_boundary_case != null",
+        'b.option([]const u8, "native-zig-recovery-diversion-shard",',
+        'recovery_diversions.addArgs(&.{ "--shard", shard });',
         'if (native_core_only or zig_core_only) recovery_zig.addArg("--core-only");',
         'if (native_deadline_only or zig_deadline_only) recovery_zig.addArg("--deadline-only");',
         'if (native_script_failure_only or native_core_only) recovery_helper.addArg("--script-failure-only");',
@@ -1724,6 +1748,33 @@ def native_recovery_gate_wiring_failures(
     )
     if pinned_runners is None or tuple(re.findall(r"[a-z_]+", pinned_runners[1])) != expected[-1]:
         failures.append("build.zig: pinned dpkg must reach every default recovery acceptance runner")
+    shard_block = diversions.partition("const case_shards = [_]CaseShard{")[2].partition("\n};")[0]
+    actual_shards = tuple(
+        (int(first), int(last))
+        for first, last in re.findall(r"\.\{ \.first = (\d+), \.last = (\d+) \},", shard_block)
+    )
+    if actual_shards != DIVERSION_CASE_SHARDS:
+        failures.append("test/native_recovery_diversions.zig: numbered shard partitions must cover 001-100 exactly once")
+    for token in (
+        "if (cases.len != 100) @compileError(",
+        "if (c.number <= previous or c.number > 100) @compileError(",
+        "if (shard.first != next or shard.last < shard.first or shard.last > cases.len)",
+        "if (next != cases.len + 1) @compileError(",
+        "if (route_cases.len != 2) @compileError(",
+        '.{ .name = "cache-refresh", .crash = "after_upgrade_postrm_cache_refresh" },',
+        '.{ .name = "route-checkpoint", .crash = "after_upgrade_postrm_route_checkpoint" },',
+        "if (selected != null or selected_route != null or selected_shard != null) return error.DuplicateCase;",
+        "if (selected_shard.? == 0 or selected_shard.? > case_shards.len) return error.InvalidDiversionShard;",
+        "const shard = if (selected_shard) |number| case_shards[number - 1] else null;",
+        "if (c.number < bounds.first or c.number > bounds.last) continue;",
+        "if (executed != expected_cases)",
+        "const run_routes = selected == null and (selected_shard == null or selected_shard.? == case_shards.len);",
+        "if (run_routes) for (route_cases) |c| {",
+        "if (route_executed != (if (!run_routes)",
+        "try lifecycle.assertHostUnchanged(a, init.io, reference.before);",
+    ):
+        if token not in diversions:
+            failures.append(f"test/native_recovery_diversions.zig: required numbered or named shard behavior lost {token}")
     for option, variable, runner in (
         ("native-zig-recovery-family-fixture-python", "path", "recovery_family"),
         ("native-zig-recovery-parity-fixture-python", "path", "recovery_parity"),
@@ -2369,6 +2420,7 @@ def audit_ci_pins() -> None:
         (ROOT / "test/native_recovery_family.zig").read_text(),
         (ROOT / "test/native_recovery_projected_workflows.zig").read_text(),
         (ROOT / "test/native_recovery_repository.zig").read_text(),
+        (ROOT / "test/native_recovery_diversions.zig").read_text(),
     ):
         fail(failure)
     for failure in native_lifecycle_migration_failures(
@@ -2415,7 +2467,7 @@ def audit_ci_pins() -> None:
         if workflow.name == "ci.yml":
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 15, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 16, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -3372,7 +3424,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 15)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 16)
     elif kind == "ghr-release":
         failures = ghr_zig_workflow_failures(text, "release.yml", 1)
     elif kind == "workflow-failure":
@@ -3397,6 +3449,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
                 "test/native_recovery_repository.zig",
+                "test/native_recovery_diversions.zig",
             ),
             "native-fixtures": (
                 "tools/native-lifecycle-fixtures.py", "tools/native-trigger-fixtures.py",
