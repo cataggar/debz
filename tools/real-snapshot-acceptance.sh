@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z
+readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
 readonly pinned_suite=stonking
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 readonly max_download_bytes=$((1536 * 1024 * 1024))

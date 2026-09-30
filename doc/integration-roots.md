@@ -108,7 +108,7 @@ The real-snapshot candidate is selected explicitly with
 through the default legacy executor. The opt-in `ubuntu-real-snapshot` job in
 the existing manual `.github/workflows/ci.yml` dispatch runs on
 `ubuntu-24.04` amd64 and `ubuntu-24.04-arm` arm64 against
-`https://snapshot.ubuntu.com/ubuntu/20260923T000000Z`, suite `stonking`,
+`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z`, suite `stonking`,
 component `main`, and the explicit Ubuntu archive keyring. Inputs remain fixed to that reviewed snapshot until its signed validity
 window requires a fresh reviewed pin.
 Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
@@ -163,9 +163,11 @@ retains available diagnostics even after earlier failure.
 This gate is not a completed parity claim until both architecture captures
 compare successfully. The previously pinned `resolute` release is frozen with
 an InRelease dated 2026-04-23 and expired under the finite policy. The newly
-pinned `stonking` release advertises Date 2026-09-22 and Valid-Until
-2026-10-06; repository authentication must verify those signed fields
-before planning. The repository config explicitly selects
+pinned `stonking` release is signed by
+`F6ECB3762474EDA9D21B7022871920D1991BC93C` and advertises Date
+Wed, 30 Sep 2026 20:37:08 UTC and Valid-Until Wed, 14 Oct 2026
+20:37:08 UTC; repository authentication must
+verify those signed fields before planning. The repository config explicitly selects
 `allow_missing_valid_until_with_max_age_seconds` with the unchanged 31-day
 maximum. That policy is part of normalized repository identity, authenticated
 snapshot provenance, and exact-lock identity. Current exact-lock v3 and

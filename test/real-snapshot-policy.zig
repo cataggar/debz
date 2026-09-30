@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const support = @import("tooling-test-support.zig");
 
-const uri = "https://snapshot.ubuntu.com/ubuntu/20260923T000000Z";
+const uri = "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z";
 
 const Scenario = struct {
     name: []const u8 = "",

@@ -7,8 +7,10 @@ limited to the pinned architectures, tool digests, bounded literal script
 commands, typed canonical records, and authenticated root topology described
 below; all state outside that boundary remains fail-closed.
 
-The 2026-09-23 Ubuntu `stonking` amd64 snapshot has a separate executable
-pin for `dpkg` 1.23.7ubuntu2. Its authenticated exact lock names the archive
+The 2026-10-01 Ubuntu `stonking` amd64 snapshot, signed by
+`F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
+20:37:08 UTC and Valid-Until Wed, 14 Oct 2026 20:37:08 UTC, has a separate
+executable pin for `dpkg` 1.23.7ubuntu2. Its authenticated exact lock names the archive
 SHA-512
 `e2de124c6741eddc498badd81b0bf0fee0845e617d81e90ca8cb28dba16946cd23a193cc5e67dbc3dc50f3f9b0b6eab31318a9172b69282586d8bdc20fc9f19c`;
 the archive's `usr/bin/update-alternatives` has SHA-256
@@ -387,10 +389,10 @@ alternatives group. It later refused **before launching** the unrelated
 `sudo.ws`. This partial-state refusal does not grant authority to replace
 that symlink, nor does the earlier procps success establish full parity.
 
-The signed `sudo-rs:amd64` 0.2.14-1ubuntu2 archive (SHA-512
-`0d4aba12d8a354c6bae762c81c95573c5d9e6d40046e415955da73c32c4e86d6d9923efeffcb0aefc12cbc59591a1348e8e094cbe957a2e765b85e5575681364`)
+The signed `sudo-rs:amd64` 0.2.14-1ubuntu4 archive (SHA-512
+`aeff8aeba736d791c7a2c12b6a46ba7964c5729e63d46bf457700db221d54aa1672beec0df1b15ae584852a57d9607c7a370d041469a24e8192dc84d2b332ea2`)
 ships the exact 2,100-byte `postinst` (SHA-256
-`a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17`).
+`38c229561b765f727b9b995af9e35c7ae43756761c2018f974efd678b4a06fd1`).
 For `["configure", ""]`, it calls `set_perms root root 4755` on both
 `/usr/lib/cargo/bin/sudo` and `/usr/lib/cargo/bin/su`, then invokes a literal
 `update-alternatives --install /usr/bin/sudo sudo /usr/lib/cargo/bin/sudo 50`
@@ -639,10 +641,10 @@ authenticated native outcome does not establish pinned-reference
 parity or authorize the separate glib settlement; the interrupted
 root is never reused.
 
-The signed `util-linux:amd64` 2.41.3-3ubuntu2 archive (SHA-512
-`4eaf57ecba59a3497f69e87e2622a82f1f4495d8b6c215ecc6509a57eb4015e864215c7d1ea92c09e09b8c3e864f60d18b1f984d04525189f076cd7d034cb3b9`)
-ships the exact 2,112-byte `postinst` (SHA-256
-`31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9`).
+The signed `util-linux:amd64` 2.42.2-1ubuntu2 archive (SHA-512
+`5001310ad3c9236ca3e9910f047dfb3a73696d3b4d4fcd919a241d8694588f9af46ac2237aba8fe8313b524f7cf4f3b1236a86f6942746c68beed68d6a13df62`)
+ships the exact 2,155-byte `postinst` (SHA-256
+`306c812b4cbdca94057f55e0e8c45a2bf80d7ab86d0e60a915b1f2ac6901a6df`).
 It assigns `OS=linux`, tests that constant and `command -v
 update-alternatives`, then runs one literal, continued command:
 `update-alternatives --install /usr/bin/pager pager /bin/more 50 --slave

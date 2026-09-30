@@ -1124,10 +1124,10 @@ const snapshot_procps_postinst_sha256 = digestLiteral(
     "7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
 );
 const snapshot_sudo_rs_postinst_sha256 = digestLiteral(
-    "a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17",
+    "38c229561b765f727b9b995af9e35c7ae43756761c2018f974efd678b4a06fd1",
 );
 const snapshot_util_linux_postinst_sha256 = digestLiteral(
-    "31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
+    "306c812b4cbdca94057f55e0e8c45a2bf80d7ab86d0e60a915b1f2ac6901a6df",
 );
 const snapshot_console_setup_linux_postinst_sha256 = digestLiteral(
     "5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a",
@@ -4034,7 +4034,7 @@ test "native_alternatives.test.snapshot less postinst registers only the pinned 
 test "native_alternatives.test.snapshot util-linux postinst pins the guarded pager install" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-util-linux-2.41.3-3ubuntu2.postinst",
+        "fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst",
     );
     try testing.expect(matchesSnapshotUtilLinuxPostinst(bytes));
     var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
@@ -4094,7 +4094,7 @@ test "native_alternatives.test.snapshot util-linux preserves the selected less p
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-util-linux-2.41.3-3ubuntu2.postinst"),
+        @embedFile("fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst"),
         .{},
     );
     defer script.deinit();
@@ -4797,7 +4797,7 @@ test "native_alternatives.test.signed procps only admits absent providers and im
 test "native_alternatives.test.signed sudo-rs replaces only two owned structural links" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst",
+        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst",
     );
     try testing.expect(matchesSnapshotSudoRsPostinst(bytes));
     var sha256: [32]u8 = undefined;
@@ -4805,7 +4805,7 @@ test "native_alternatives.test.signed sudo-rs replaces only two owned structural
     try testing.expectEqualSlices(
         u8,
         &digestLiteral(
-            "a7c37986e0ad87565b1639a0131f7b382aac7e637c20a606d8258f314737ea17",
+            "38c229561b765f727b9b995af9e35c7ae43756761c2018f974efd678b4a06fd1",
         ),
         &sha256,
     );
@@ -5009,7 +5009,7 @@ test "native_alternatives.test.signed sudo-rs permits only setuid target ctime" 
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu2.postinst"),
+        @embedFile("fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst"),
         .{},
     );
     defer script.deinit();
