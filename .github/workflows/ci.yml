@@ -236,7 +236,7 @@ jobs:
           mkdir -p "$workspace/plan-root" "$workspace/plan-cache" "$workspace/plan-state"
           python3 tools/generate-integration-repository.py \
             --output "$workspace/repository" --suite debian-stable \
-            --architecture "$ARCHITECTURE"
+            --architecture "$ARCHITECTURE" --sha256-only
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -303,7 +303,10 @@ jobs:
           workspace="$PWD/.zig-cache/download-action"
           mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
           python3 tools/generate-integration-repository.py \
-            --output "$workspace/repository" --suite debian-stable --architecture amd64
+            --output "$workspace/repository" --suite debian-stable --architecture amd64 \
+            --sha256-only
+          python3 tools/generate-integration-repository.py \
+            --output "$workspace/native-repository" --suite debian-stable --architecture amd64
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository
@@ -311,6 +314,14 @@ jobs:
           Components: main
           Architectures: amd64
           Signed-By: $workspace/repository/fixture-keyring.gpg
+          EOF
+          cat >"$workspace/native.sources" <<EOF
+          Types: deb
+          URIs: file://$workspace/native-repository
+          Suites: debian-stable
+          Components: main
+          Architectures: amd64
+          Signed-By: $workspace/native-repository/fixture-keyring.gpg
           EOF
           common=(
             --install-root "$workspace/root"
@@ -325,9 +336,18 @@ jobs:
             --lock-output "$workspace/base.lock.json" base-dep >/dev/null
           zig-out/bin/debz plan "${common[@]}" \
             --lock-output "$workspace/scenario.lock.json" scenario-main >/dev/null
-          zig-out/bin/debz plan "${common[@]}" --transaction-backend native \
+          native_common=(
+            --install-root "$workspace/root"
+            --cache-path "$workspace/metadata"
+            --state-path "$workspace/state"
+            --architecture amd64
+            --source "$workspace/native.sources"
+            --keyring "$workspace/native-repository/fixture-keyring.gpg"
+            --json
+          )
+          zig-out/bin/debz plan "${native_common[@]}" --transaction-backend native \
             --lock-output "$workspace/base.native.lock.json" base-dep >/dev/null
-          zig-out/bin/debz plan "${common[@]}" --transaction-backend native \
+          zig-out/bin/debz plan "${native_common[@]}" --transaction-backend native \
             --lock-output "$workspace/scenario.native.lock.json" scenario-main >/dev/null
           python3 - "$workspace/base.native.lock.json" "$workspace/empty.native.lock.json" <<'PY'
           from hashlib import sha256
@@ -361,6 +381,9 @@ jobs:
           printf 'native_base_lock=%s\nnative_scenario_lock=%s\nnative_empty_lock=%s\n' \
             "$workspace/base.native.lock.json" "$workspace/scenario.native.lock.json" \
             "$workspace/empty.native.lock.json" >>"$GITHUB_OUTPUT"
+          printf 'native_source=%s\nnative_keyring=%s\n' \
+            "$workspace/native.sources" \
+            "$workspace/native-repository/fixture-keyring.gpg" >>"$GITHUB_OUTPUT"
           printf '%s\n' "$PWD/zig-out/bin" >>"$GITHUB_PATH"
       - name: Populate cold exact-lock cache
         id: cold
@@ -472,8 +495,8 @@ jobs:
         with:
           transaction-backend: native
           lock-input: ${{ steps.fixture.outputs.native_base_lock }}
-          source: ${{ steps.fixture.outputs.source }}
-          keyring: ${{ steps.fixture.outputs.keyring }}
+          source: ${{ steps.fixture.outputs.native_source }}
+          keyring: ${{ steps.fixture.outputs.native_keyring }}
           architecture: amd64
           cache-root: ${{ runner.temp }}/debz-download-native-cold
       - name: Restore native partial cache
@@ -482,8 +505,8 @@ jobs:
         with:
           transaction-backend: native
           lock-input: ${{ steps.fixture.outputs.native_scenario_lock }}
-          source: ${{ steps.fixture.outputs.source }}
-          keyring: ${{ steps.fixture.outputs.keyring }}
+          source: ${{ steps.fixture.outputs.native_source }}
+          keyring: ${{ steps.fixture.outputs.native_keyring }}
           architecture: amd64
           cache-root: ${{ runner.temp }}/debz-download-native-partial
       - name: Restore native exact cache
@@ -492,8 +515,8 @@ jobs:
         with:
           transaction-backend: native
           lock-input: ${{ steps.fixture.outputs.native_scenario_lock }}
-          source: ${{ steps.fixture.outputs.source }}
-          keyring: ${{ steps.fixture.outputs.keyring }}
+          source: ${{ steps.fixture.outputs.native_source }}
+          keyring: ${{ steps.fixture.outputs.native_keyring }}
           architecture: amd64
           cache-root: ${{ runner.temp }}/debz-download-native-exact
       - name: Validate native cache lifecycle
@@ -573,8 +596,8 @@ jobs:
         uses: ./actions/download
         with:
           lock-input: ${{ steps.fixture.outputs.native_base_lock }}
-          source: ${{ steps.fixture.outputs.source }}
-          keyring: ${{ steps.fixture.outputs.keyring }}
+          source: ${{ steps.fixture.outputs.native_source }}
+          keyring: ${{ steps.fixture.outputs.native_keyring }}
           architecture: amd64
           cache-root: ${{ runner.temp }}/debz-download-legacy-foreign-lock
       - name: Validate explicit backend refusal
@@ -615,7 +638,7 @@ jobs:
             release-install --prefix "$PWD/out/download-container/release"
           python3 tools/generate-integration-repository.py \
             --output "$PWD/out/download-container/repository" \
-            --suite debian-stable --architecture amd64
+            --suite debian-stable --architecture amd64 --sha256-only
       - name: Upload container fixture
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

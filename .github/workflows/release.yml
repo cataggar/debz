@@ -234,7 +234,7 @@ jobs:
           mkdir -p "$workspace/root" "$workspace/metadata" "$workspace/state"
           python3 tools/generate-integration-repository.py \
             --output "$workspace/repository" --suite debian-stable \
-            --architecture "$ARCHITECTURE"
+            --architecture "$ARCHITECTURE" --sha256-only
           cat >"$workspace/fixture.sources" <<EOF
           Types: deb
           URIs: file://$workspace/repository

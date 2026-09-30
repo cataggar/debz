@@ -119,7 +119,11 @@ keeps repository identity constant for independent runs in one checkout;
 the per-workspace config digest naturally differs because `source_path`
 contains the workspace. Cross-machine byte-identical lock comparisons will
 require the same reviewed absolute `Signed-By` path (it is part of
-repository identity) once bound Debian locks are produced.
+repository identity) once bound Debian locks are produced. The read-only
+preflight config deliberately omits `archive_binding`, so its recorded
+repository identity stays valid. A lock-producing run adds
+`"archive_binding":"signed_sha256_derived_sha512"` to the same config,
+which is an additional repository identity input.
 
 Before the #261 decision, two fresh, independent **native arm64** ReleaseSafe
 preflights returned `refresh.exit_status=0`. They retained the same Release
@@ -155,13 +159,19 @@ acceptance or externally attested workflow artifacts.
    cache hit, tagged CAS import, native unpack) verify the signed SHA256
    before the derived SHA512 and refuse any mismatch. Do not synthesize
    signed SHA512 values, backdate verification, or switch to Ubuntu.
-2. **P0, product lock publication:** `download --lock-output` still writes
-   an unbound v3 lock before acquisition. It has no source, configuration,
-   or CLI opt-in for a SHA256-signed repository. The remaining step must
-   acquire every locked archive, verify its signed SHA256, bind the derived
-   SHA512 through the library above, and publish only the bound lock. An
-   unbound SHA256-only lock is not an acceptance artifact under
-   `sha512_identity_required`.
+2. **Resolved, product lock publication:** the opt-in is the per-repository
+   `--config` setting `"archive_binding":"signed_sha256_derived_sha512"`
+   (no CLI flag). For an opted-in repository, native `plan`/`download
+   --lock-output` and package-family `resolve_lock` do three things before
+   publishing anything: acquire every locked archive, verify its size and
+   signed SHA256, and bind the derived SHA512 through the library above.
+   Only the admitted bound lock is written, and a mismatch writes none.
+   Native engine / exact-lock v3 consumers enforce
+   `sha512_identity_required` by default. An unbound SHA256-only lock is
+   refused and is not an acceptance artifact. Legacy consumers are
+   unchanged. Hermetic Zig and integration lanes prove this with a
+   Debian-shaped signed-SHA256 repository. The real snapshot still needs
+   step 3.
 3. **P1, native evidence:** run independently on native amd64 and arm64
    with one normalized keyring path and fresh roots/caches. Repeat
    signed refresh, resolve a representative closure, and bind complete

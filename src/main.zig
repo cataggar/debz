@@ -1275,7 +1275,12 @@ fn packageCacheFailure(err: anyerror) PackageCacheFailure {
         error.AmbiguousPackage,
         error.PackageEvidenceMismatch,
         error.LockPackageMismatch,
+        error.ArchiveBindingMismatch,
         => .{ .status = @intFromEnum(api.ExitStatus.planning), .id = "lock_evidence_mismatch" },
+        error.Sha512IdentityRequired => .{
+            .status = @intFromEnum(api.ExitStatus.planning),
+            .id = "sha512_identity_required",
+        },
         error.RepositoryAuthenticationFailed,
         error.NoValidAcceptedSignature,
         error.WrongSigningKey,

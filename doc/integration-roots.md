@@ -39,6 +39,23 @@ and package evidence with the legacy closure, verifies its independent digest
 and backend-bound policy, and exercises cold download and cache-only replay.
 It rejects v1 input and changed policy. A missing helper target refuses native
 execution without changing package state or leaving an active root record.
+
+The generated repository publishes signed SHA256 and SHA512 for every archive
+by default, so native lanes satisfy the native default
+`sha512_identity_required` policy. `tools/generate-integration-repository.py
+--sha256-only` (incompatible with `--signed-parity`) instead generates a
+Debian-shaped repository that signs only SHA256. The legacy archive and
+package-cache lanes, including the GitHub Action fixtures, use it: the legacy
+package cache keys SHA256-pinned v1/v2 locks and cannot yet match records that
+also publish SHA512. The same repository exercises the #261 binding
+end to end:
+
+- a native lock without the opt-in is refused and none is written;
+- the legacy lock is unchanged;
+- an opted-in `--config` (`archive_binding`) plans a bound lock, and its
+  derived SHA512 must equal the CAS object;
+- a forged lock and a tampered CAS object are refused;
+- native mode installs from the bound lock.
 The focused `native` mode and full lane use a real package-owned helper target
 to exercise native install, exact-lock reinstall, no-op upgrade, retained-package
 closure, receipt/evidence hashes, receipt-bound outer completion, and recovery

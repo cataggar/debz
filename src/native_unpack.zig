@@ -27960,6 +27960,10 @@ pub const Runtime = struct {
         exact_lock: *const exact_lock_v3.Lock,
         archives: []const []const u8,
         policy: transaction_executor.Policy,
+        /// Native engine default (#261): every archive needs a SHA-512
+        /// identity, either signed or derived from a lock-recorded signed
+        /// SHA256 binding. Only an explicit embedder choice relaxes it.
+        archive_digest_policy: exact_lock_v3.ArchiveDigestPolicy = .sha512_identity_required,
     };
 
     pub const Request = struct {
@@ -28061,6 +28065,7 @@ pub const Runtime = struct {
         request: PrepareRequest,
         unchanged: ?*UnchangedState,
     ) !native_preparation.ResultWithNoChanges {
+        try request.exact_lock.requireArchiveDigestPolicy(request.archive_digest_policy);
         const root = try validateAttempt(request.attempt);
         if (unchanged == null and !request.attempt.record().state.provenPreMutation())
             return error.OperationNotMutable;
@@ -35588,6 +35593,7 @@ fn testFreshDatabaseInstall(crash_at: ?native_recovery.CrashPoint) !void {
             .exact_lock = &lock.lock,
             .archives = &.{bytes},
             .policy = .{ .conffile = .keep_existing },
+            .archive_digest_policy = .published_digests,
         }),
     );
     try testing.expect(!attempt.record().mutation_started);
@@ -35606,6 +35612,7 @@ fn testFreshDatabaseInstall(crash_at: ?native_recovery.CrashPoint) !void {
         .exact_lock = &lock.lock,
         .archives = &.{bytes},
         .policy = .{ .conffile = .keep_existing },
+        .archive_digest_policy = .published_digests,
     });
     defer prepared.deinit();
     if (prepared != .prepared) return error.TestUnexpectedResult;
@@ -36048,6 +36055,7 @@ fn testMultiConfigInstall(
         .exact_lock = &lock.lock,
         .archives = &.{ first_bytes, second_bytes },
         .policy = .{ .conffile = .keep_existing },
+        .archive_digest_policy = .published_digests,
     });
     defer prepared.deinit();
     if (prepared != .prepared) return error.TestUnexpectedResult;
@@ -36781,6 +36789,7 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
             .exact_lock = &lock.lock,
             .archives = &.{bytes},
             .policy = preparation_policy,
+            .archive_digest_policy = .published_digests,
         };
         var captured_preparation = try Runtime.prepare(testing.allocator, request);
         defer captured_preparation.deinit();
@@ -36820,6 +36829,33 @@ fn testPreparedMixedLifecycle(purge: bool, case: MixedLifecycleCase) !void {
         var changed_request = request;
         changed_request.exact_lock = &changed_lock;
         try testing.expectError(error.ArchiveEvidenceMismatch, Runtime.prepare(testing.allocator, changed_request));
+        if (case == .captured_preparation) {
+            // #261: the native default refuses this SHA256-only lock and
+            // admits it only once the lock records the signed-SHA256 binding.
+            var required = request;
+            required.archive_digest_policy = .sha512_identity_required;
+            try testing.expectError(error.Sha512IdentityRequired, Runtime.prepare(testing.allocator, required));
+            var bound = try exact_lock_v3.bindSignedSha256Repositories(
+                testing.allocator,
+                lock.lock,
+                &.{repository_id},
+                &.{bytes},
+            );
+            defer bound.deinit();
+            var bound_request = required;
+            bound_request.exact_lock = &bound.lock;
+            var bound_preparation = try Runtime.prepare(testing.allocator, bound_request);
+            defer bound_preparation.deinit();
+            try testing.expect(bound_preparation == .prepared);
+            var derived_lock = bound.lock;
+            var derived_package = bound.lock.packages[0];
+            derived_package.derived_sha512.?[0] ^= 1;
+            derived_lock.packages = &.{derived_package};
+            var derived_request = bound_request;
+            derived_request.exact_lock = &derived_lock;
+            try testing.expectError(error.ArchiveEvidenceMismatch, Runtime.prepare(testing.allocator, derived_request));
+            try testing.expectEqual(original, caller.record().digest_sha256);
+        }
         if (scoped) {
             try testing.expectEqual(original, caller.record().digest_sha256);
             try testing.expectEqualStrings(status, try root.readFileAlloc(arena.allocator(), try root_fs.Path.init("var/lib/dpkg/status"), 1024 * 1024));

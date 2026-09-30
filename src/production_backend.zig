@@ -234,6 +234,10 @@ pub const Backend = struct {
     completion_crash: ?CompletionCrash = null,
     /// Test-only synchronization around the root lock and initial binding.
     root_binding_sync: ?RootBindingSync = null,
+    /// Archive identity policy for native engine and exact-lock v3 consumers
+    /// (#261). There is deliberately no CLI override; repositories that publish
+    /// only signed SHA256 opt into a derived SHA-512 binding per repository.
+    native_archive_digest_policy: exact_lock_v3.ArchiveDigestPolicy = .sha512_identity_required,
 
     pub fn interface(self: *Backend) api.Backend {
         return .{ .context = self, .executeFn = executeOpaque };
@@ -547,6 +551,8 @@ pub const Backend = struct {
             for (repository.signed_by) |path| if (!containsString(request.keyring_paths, path))
                 return error.NoKeyrings;
         }
+        if (kind == .native)
+            try admitNativeLock(&lock, configuration.repositories, self.native_archive_digest_policy);
         for (request.keyring_paths) |path| try validateRegularFile(self.io, path);
         if (request.credential_reference) |path| try validateRegularFile(self.io, path);
 
@@ -1274,6 +1280,16 @@ pub const Backend = struct {
         defer if (lock) |*value| value.deinit();
         const legacy_lock = if (lock) |*value| value.legacyLock() else null;
         const native_lock = if (lock) |*value| value.nativeLock() else null;
+        if (native_lock) |value| admitNativeLock(
+            value,
+            configuration.repositories,
+            self.native_archive_digest_policy,
+        ) catch |err| return api.failure(
+            request.operation,
+            .planning,
+            .lock_verification_failed,
+            nativeLockAdmissionMessage(err),
+        );
         const selectors = try allocator.alloc(solver.PackageSelector, effective_request.packages.len);
         defer allocator.free(selectors);
         for (effective_request.packages, 0..) |value, index| selectors[index] = parseSelector(value);
@@ -1352,6 +1368,36 @@ pub const Backend = struct {
                             try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
                         ),
                     };
+                if (generated_lock.?.nativeLock() != null) {
+                    self.bindConfiguredArchiveIdentities(
+                        allocator,
+                        &generated_lock.?,
+                        request,
+                        configuration.repositories,
+                        refreshed.universe.repositories,
+                        cache_root,
+                        acquisition.dependencies(),
+                        credentials,
+                    ) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return api.failure(
+                            request.operation,
+                            .download,
+                            .download_failed,
+                            try std.fmt.allocPrint(allocator, "signed SHA256 archive binding refused: {s}", .{@errorName(err)}),
+                        ),
+                    };
+                    admitNativeLock(
+                        generated_lock.?.nativeLock().?,
+                        configuration.repositories,
+                        self.native_archive_digest_policy,
+                    ) catch |err| return api.failure(
+                        request.operation,
+                        .planning,
+                        .planning_failed,
+                        nativeLockAdmissionMessage(err),
+                    );
+                }
                 try generated_lock.?.write(allocator, self.io, path);
             }
         }
@@ -1506,6 +1552,7 @@ pub const Backend = struct {
                 .exact_lock = native_lock orelse return error.NativeExactLockRequired,
                 .archives = archives,
                 .policy = executor_policy,
+                .archive_digest_policy = self.native_archive_digest_policy,
             });
             defer preparation.deinit();
             const prepared = switch (preparation) {
@@ -3158,6 +3205,93 @@ pub const Backend = struct {
         return true;
     }
 
+    /// Binds every repository of a freshly resolved native lock whose
+    /// per-repository configuration opts into `signed_sha256_derived_sha512`
+    /// (#261). Each archive of those repositories, including retained installed
+    /// packages, is acquired and verified against its signed SHA256 and size
+    /// before its SHA-512 is derived; any mismatch refuses lock publication.
+    fn bindConfiguredArchiveIdentities(
+        self: *Backend,
+        allocator: std.mem.Allocator,
+        generated: *ProductLock,
+        request: api.Request,
+        configured: []const repository_policy.NormalizedRepository,
+        universe: []const solver.RepositoryInput,
+        cache_root: std.Io.Dir,
+        dependencies: repository_acquisition.Dependencies,
+        credentials: repository_acquisition.CredentialsProvider,
+    ) !void {
+        const unbound = generated.nativeLock() orelse return;
+        var bound_ids: std.ArrayList([64]u8) = .empty;
+        defer bound_ids.deinit(allocator);
+        for (unbound.repositories) |repository| {
+            const normalized = findNormalized(configured, .{ .bytes = repository.id }) orelse
+                return error.MissingRepository;
+            if (normalized.archive_binding == .signed_sha256_derived_sha512)
+                try bound_ids.append(allocator, repository.id);
+        }
+        if (bound_ids.items.len == 0) return;
+
+        var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
+            .maximum_object_bytes = 1024 * 1024 * 1024,
+        });
+        defer package_cache.deinit();
+        const archives = try allocator.alloc(?[]const u8, unbound.packages.len);
+        defer allocator.free(archives);
+        @memset(archives, null);
+        var acquired: std.ArrayList(package_acquisition.VerifiedPackage) = .empty;
+        defer {
+            for (acquired.items) |*package| package.deinit();
+            acquired.deinit(allocator);
+        }
+        try acquired.ensureTotalCapacity(allocator, unbound.packages.len);
+        for (unbound.packages, archives) |package, *archive| {
+            const origin = switch (package.origin) {
+                .authenticated_repository => |value| value,
+                .local_artifact => continue,
+            };
+            if (!containsRepositoryId(bound_ids.items, origin.repository_id)) continue;
+            const id: source.RepositoryId = .{ .bytes = origin.repository_id };
+            const repository_input = findRepositoryInput(universe, id) orelse return error.MissingRepository;
+            const normalized = findNormalized(configured, id) orelse return error.MissingRepository;
+            const selection = findLockedRecordOrigin(repository_input, package) orelse
+                return error.MissingPackage;
+            const selected = try package_acquisition.SelectedPackage.fromSolverSelection(
+                repository_input,
+                selection,
+                try repository_acquisition.Uri.parse(normalized.uri),
+            );
+            acquired.appendAssumeCapacity(try package_acquisition.acquirePackage(
+                allocator,
+                &package_cache,
+                .{
+                    .selected = selected,
+                    .policy = .{
+                        .mode = if (request.options.offline or request.options.cache_only) .cache_only else .online,
+                        .workflow = .download_only,
+                        .maximum_package_bytes = 1024 * 1024 * 1024,
+                        .deadlines = deadlines(request.options.deadline_ms),
+                        .redirect_limit = 8,
+                        .retry = productionRetryPolicy(),
+                        .proxy = try proxyPolicy(request.options.proxy),
+                        .credentials = credentials,
+                    },
+                    .exact_lock_v3_package = package,
+                },
+                dependencies,
+            ));
+            archive.* = acquired.items[acquired.items.len - 1].bytes;
+        }
+        const bound = try exact_lock_v3.bindSignedSha256Repositories(
+            allocator,
+            unbound.*,
+            bound_ids.items,
+            archives,
+        );
+        generated.deinit();
+        generated.* = .{ .native = bound };
+    }
+
     fn loadRepositoryDocuments(
         self: *Backend,
         allocator: std.mem.Allocator,
@@ -3177,10 +3311,13 @@ pub const Backend = struct {
         for (options.config_paths) |path| {
             const config_bytes = try readFile(allocator, self.io, path, 1024 * 1024);
             defer allocator.free(config_bytes);
-            var parsed = try std.json.parseFromSlice(WireRepositoryConfig, allocator, config_bytes, .{
+            var parsed = std.json.parseFromSlice(WireRepositoryConfig, allocator, config_bytes, .{
                 .allocate = .alloc_always,
                 .ignore_unknown_fields = false,
-            });
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidRepositoryConfig,
+            };
             defer parsed.deinit();
             if (parsed.value.source_path.len == 0 or parsed.value.source_path[0] != '/')
                 return error.InvalidRepositoryConfig;
@@ -3195,6 +3332,7 @@ pub const Backend = struct {
             policy.immutability.kind = if (parsed.value.immutable) .immutable_url else .moving;
             if (parsed.value.freshness) |freshness|
                 policy.freshness = try configuredFreshness(freshness);
+            policy.archive_binding = parsed.value.archive_binding;
             try documents.append(allocator, .{
                 .bytes = contents,
                 .format = sourceFormat(parsed.value.source_path),
@@ -4380,6 +4518,9 @@ const WireRepositoryConfig = struct {
     default_release: ?[]const u8 = null,
     immutable: bool = false,
     freshness: ?ConfigFreshness = null,
+    /// Per-repository opt-in (#261); only the exact wire token
+    /// `signed_sha256_derived_sha512` changes the default.
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
 };
 
 fn configuredFreshness(
@@ -5574,6 +5715,7 @@ fn mapRuntimeError(operation: api.Operation, err: anyerror) api.Result {
         => api.failure(operation, .authentication, .repository_authentication_failed, @errorName(err)),
         error.PackageTooLarge, error.SizeMismatch, error.DigestMismatch, error.DerivedDigestMismatch => api.failure(operation, .download, .download_failed, @errorName(err)),
         error.InvalidPackagePayload => api.failure(operation, .download, .download_failed, @errorName(err)),
+        error.Sha512IdentityRequired, error.ArchiveBindingMismatch => api.failure(operation, .planning, .lock_verification_failed, @errorName(err)),
         else => api.failure(operation, .internal, .internal_error, @errorName(err)),
     };
 }
@@ -5688,6 +5830,9 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         native_evidence_output: ?[]const u8 = null,
         family_execution: ?@import("package_family_backend.zig").Request = null,
         family_update_planning: bool = false,
+        /// Explicit relaxation for static SHA256-only fixtures (#261); null
+        /// keeps the native default.
+        archive_digest_policy: ?exact_lock_v3.ArchiveDigestPolicy = null,
         family_verification: ?struct {
             request: @import("package_family_backend.zig").Request,
             expect_failure: bool = false,
@@ -5821,10 +5966,11 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
     if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
         return error.InvalidExternalWorkflowRequest;
     if (external.family_execution) |request| {
-        const family: @import("package_family_backend.zig").NativeBackend = .{
+        var family: @import("package_family_backend.zig").NativeBackend = .{
             .io = std.testing.io,
             .now_unix = 1_788_796_860,
         };
+        if (external.archive_digest_policy) |policy| family.archive_digest_policy = policy;
         var result = if (external.family_update_planning)
             try family.resolveUpdateLock(std.testing.allocator, request)
         else
@@ -5877,6 +6023,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         .completion_crash = .{ .context = &crash, .hitFn = Crash.hit },
         .process_runner = .{ .context = &crash, .runFn = Crash.rejectLegacy },
     };
+    if (external.archive_digest_policy) |policy| backend.native_archive_digest_policy = policy;
     var requested = external.workflow;
     if (external.review_evidence) |path|
         requested.recovery_review_claim = try root_operation.decodeRecoveryReviewClaim(
@@ -6501,6 +6648,60 @@ fn findNormalized(
 ) ?repository_policy.NormalizedRepository {
     for (repositories) |repository|
         if (std.mem.eql(u8, repository.id.slice(), id.slice())) return repository;
+    return null;
+}
+
+/// Admits a native exact-lock v3 only when every locked repository's archive
+/// binding matches its configured per-repository `archive_binding` and the
+/// lock satisfies the native archive identity policy (#261).
+fn admitNativeLock(
+    lock: *const exact_lock_v3.Lock,
+    repositories: []const repository_policy.NormalizedRepository,
+    policy: exact_lock_v3.ArchiveDigestPolicy,
+) error{ ArchiveBindingMismatch, Sha512IdentityRequired }!void {
+    for (lock.repositories) |repository| {
+        const configured = findNormalized(repositories, .{ .bytes = repository.id }) orelse continue;
+        if (configured.archive_binding != repository.archive_binding)
+            return error.ArchiveBindingMismatch;
+    }
+    try lock.requireArchiveDigestPolicy(policy);
+}
+
+fn nativeLockAdmissionMessage(err: error{ ArchiveBindingMismatch, Sha512IdentityRequired }) []const u8 {
+    return switch (err) {
+        error.ArchiveBindingMismatch => "exact lock archive binding does not match the configured repository archive_binding",
+        error.Sha512IdentityRequired => "native exact lock requires a SHA-512 archive identity: the repository must publish signed SHA512 or opt in with archive_binding signed_sha256_derived_sha512",
+    };
+}
+
+fn containsRepositoryId(ids: []const [64]u8, id: [64]u8) bool {
+    for (ids) |candidate| if (std.mem.eql(u8, &candidate, &id)) return true;
+    return false;
+}
+
+/// Finds the authenticated record that a freshly resolved lock package was
+/// taken from, matching its identity, digest set, and declared size.
+fn findLockedRecordOrigin(
+    repository: solver.RepositoryInput,
+    package: exact_lock_v3.Package,
+) ?solver.AuthenticatedRepositoryPackageOrigin {
+    for (repository.packages.records, 0..) |record, index| {
+        if (!std.mem.eql(u8, record.control.package.text, package.name) or
+            !std.mem.eql(u8, record.control.version.value.original, package.version) or
+            !std.mem.eql(u8, record.control.architecture.text, package.architecture) or
+            record.transport.size.value != package.declared_size or
+            !content_digest.Identity.eql(record.transport.identity, package.archive_identity))
+            continue;
+        return .{
+            .repository_id = repository.repository_id,
+            .repository_priority = repository.priority,
+            .record_index = index,
+            .package = record.control.package.text,
+            .version = record.control.version.value.original,
+            .architecture = record.control.architecture.text,
+            .source_location = record.location.source,
+        };
+    }
     return null;
 }
 
@@ -7269,6 +7470,7 @@ test "production package family native resolution emits genuine v3 locks and reu
     const backend: family.NativeBackend = .{
         .io = std.testing.io,
         .now_unix = 1_788_796_860,
+        .archive_digest_policy = .published_digests,
     };
     var request: family.Request = .{
         .schema = family.native_request_schema,
@@ -7283,6 +7485,19 @@ test "production package family native resolution emits genuine v3 locks and reu
         .package = "alpha",
         .lock_output = fixture.lock_path,
     };
+    // #261: the native family default requires a SHA-512 archive identity and
+    // refuses this SHA256-only repository without the per-repository opt-in.
+    const default_backend: family.NativeBackend = .{
+        .io = std.testing.io,
+        .now_unix = 1_788_796_860,
+    };
+    var refused = try default_backend.execute(allocator, request);
+    defer refused.deinit();
+    try std.testing.expectEqual(api.ExitStatus.planning, refused.result.exit_status);
+    try std.testing.expect(!refused.result.succeeded);
+    try std.testing.expectEqual(family.ErrorId.backend_failed, refused.result.diagnostic.?.id);
+    try std.testing.expect(std.mem.indexOf(u8, refused.result.diagnostic.?.message, "SHA-512 archive identity") != null);
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "batch-lock.json", .{}));
     var planned = try backend.execute(allocator, request);
     defer planned.deinit();
     try std.testing.expectEqual(api.ExitStatus.success, planned.result.exit_status);
@@ -7383,7 +7598,11 @@ test "production package family update resolution binds selectors and replays of
             @embedFile("fixtures/batch_workflow/keyring.gpg"),
         );
         defer fixture.deinit();
-        const backend: family.NativeBackend = .{ .io = std.testing.io, .now_unix = 1_788_796_860 };
+        const backend: family.NativeBackend = .{
+            .io = std.testing.io,
+            .now_unix = 1_788_796_860,
+            .archive_digest_policy = .published_digests,
+        };
         var request: family.Request = .{
             .schema = family.native_request_schema,
             .version = family.native_schema_version,
@@ -7682,6 +7901,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
         .transaction_backend = kind,
         .now_unix = 1_788_796_860,
         .process_runner = process.interface(),
+        .native_archive_digest_policy = .published_digests,
     };
     const selectors = [_]solver.PackageSelector{ .{ .name = "beta" }, .{ .name = "alpha" } };
     var options = fixture.options();
@@ -7794,6 +8014,480 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     defer root.close();
     try std.testing.expect(try root.root.entryIfExists(try root_fs.Path.init(root_operation.record_path)) == null);
     try std.testing.expectEqual(@as(usize, 0), process.calls);
+}
+
+/// Debian-shaped repository whose clearsigned InRelease and Packages publish
+/// only SHA256 archive digests, backed by a real `.deb` in the pool.
+const SignedSha256Repository = struct {
+    const archive_application = @import("archive_application.zig");
+    const test_openpgp_signer = @import("test_openpgp_signer.zig");
+
+    archive: []u8,
+    packages: []u8,
+    in_release: []u8,
+    keyring: []u8,
+
+    const package_path = "pool/main/d/demo/demo_1.0_amd64.deb";
+    const now_unix: i64 = 1_790_109_000;
+
+    fn init(allocator: std.mem.Allocator) !SignedSha256Repository {
+        const data = [_]archive_application.test_fixtures.Entry{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share/demo", .content = "signed SHA256 binding\n" },
+        };
+        const archive = try archive_application.test_fixtures.build(allocator, .{
+            .package = "demo",
+            .version = "1.0",
+            .architecture = "amd64",
+            .data = &data,
+        });
+        var archive_hex: [128]u8 = undefined;
+        const packages = try std.fmt.allocPrint(
+            allocator,
+            "Package: demo\n" ++
+                "Version: 1.0\n" ++
+                "Architecture: amd64\n" ++
+                "Maintainer: debz fixture <fixture.invalid>\n" ++
+                "Description: Debian-shaped signed SHA256 fixture\n" ++
+                "Filename: " ++ package_path ++ "\n" ++
+                "Size: {d}\n" ++
+                "Installed-Size: 1\n" ++
+                "SHA256: {s}\n\n",
+            .{ archive.len, content_digest.Value.of(.sha256, archive).hex(&archive_hex) },
+        );
+        var index_hex: [128]u8 = undefined;
+        const release = try std.fmt.allocPrint(
+            allocator,
+            "Origin: Debian\n" ++
+                "Label: Debian\n" ++
+                "Suite: stable\n" ++
+                "Codename: stable\n" ++
+                "Date: Tue, 22 Sep 2026 20:00:00 UTC\n" ++
+                "Valid-Until: Wed, 23 Sep 2026 20:00:00 UTC\n" ++
+                "Architectures: amd64\n" ++
+                "Components: main\n" ++
+                "Acquire-By-Hash: no\n" ++
+                "SHA256:\n {s} {d} main/binary-amd64/Packages\n",
+            .{ content_digest.Value.of(.sha256, packages).hex(&index_hex), packages.len },
+        );
+        const signer = try test_openpgp_signer.Signer.init(allocator, .{
+            .uid = "debz signed SHA256 fixture <fixture.invalid>",
+            .created = 1_790_100_000,
+        });
+        return .{
+            .archive = archive,
+            .packages = packages,
+            .in_release = try signer.clearsign(allocator, release),
+            .keyring = signer.keyring,
+        };
+    }
+};
+
+fn writeArchiveBindingConfig(
+    allocator: std.mem.Allocator,
+    directory: *std.testing.TmpDir,
+    name: []const u8,
+    source_path: []const u8,
+    archive_binding: ?[]const u8,
+) ![]const u8 {
+    const bytes = if (archive_binding) |binding|
+        try std.fmt.allocPrint(allocator, "{{\"source_path\":\"{s}\",\"archive_binding\":\"{s}\"}}\n", .{ source_path, binding })
+    else
+        try std.fmt.allocPrint(allocator, "{{\"source_path\":\"{s}\"}}\n", .{source_path});
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.fs.path.dirname(source_path).?, name });
+}
+
+fn expectWorkflowFailure(
+    result: api.Result,
+    status: api.ExitStatus,
+    id: api.ErrorId,
+    detail: []const u8,
+) !void {
+    if (result.exit_status != status and result.diagnostic_count != 0)
+        std.debug.print("unexpected diagnostic: {s}\n", .{result.diagnostics[0].message});
+    try std.testing.expectEqual(status, result.exit_status);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostic_count);
+    try std.testing.expectEqual(id, result.diagnostics[0].id);
+    if (std.mem.indexOf(u8, result.diagnostics[0].message, detail) == null) {
+        std.debug.print("unexpected diagnostic: {s}\n", .{result.diagnostics[0].message});
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectNoFile(directory: *std.testing.TmpDir, name: []const u8) !void {
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.access(std.testing.io, name, .{}),
+    );
+}
+
+test "production workflow signed SHA256 archive binding is a per-repository native opt-in" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+    const repository = try SignedSha256Repository.init(allocator);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.initWithRepository(
+        allocator,
+        &directory,
+        "",
+        repository.in_release,
+        repository.packages,
+        repository.keyring,
+    );
+    defer fixture.deinit();
+    try directory.dir.createDirPath(io, "repo/pool/main/d/demo");
+    const pool_path = "repo/" ++ SignedSha256Repository.package_path;
+    try directory.dir.writeFile(io, .{ .sub_path = pool_path, .data = repository.archive });
+    const workspace = std.fs.path.dirname(fixture.source_path).?;
+    const path = struct {
+        fn of(a: std.mem.Allocator, base: []const u8, name: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(a, "{s}/{s}", .{ base, name });
+        }
+    }.of;
+    const bound_configs = [_][]const u8{try writeArchiveBindingConfig(
+        allocator,
+        &directory,
+        "bound.json",
+        fixture.source_path,
+        "signed_sha256_derived_sha512",
+    )};
+    const default_configs = [_][]const u8{try writeArchiveBindingConfig(
+        allocator,
+        &directory,
+        "default.json",
+        fixture.source_path,
+        null,
+    )};
+    const invalid_configs = [_][]const u8{try writeArchiveBindingConfig(
+        allocator,
+        &directory,
+        "invalid.json",
+        fixture.source_path,
+        "signed_sha512",
+    )};
+    var process = TestProcess{ .io = io, .dir = directory.dir };
+    var native: Backend = .{
+        .io = io,
+        .transaction_backend = .native,
+        .now_unix = SignedSha256Repository.now_unix,
+        .process_runner = process.interface(),
+    };
+    var legacy = native;
+    legacy.transaction_backend = .legacy_dpkg;
+    var relaxed = native;
+    relaxed.native_archive_digest_policy = .published_digests;
+    const Run = struct {
+        backend: *Backend,
+        mode: WorkflowMode,
+        configs: []const []const u8,
+        cache: []const u8,
+        lock_input: ?[]const u8 = null,
+        lock_output: ?[]const u8 = null,
+    };
+    const run = struct {
+        fn call(a: std.mem.Allocator, base: *const ProductionWorkflowFixture, request: Run) !api.Result {
+            var options = base.options();
+            options.source_paths = &.{};
+            options.config_paths = request.configs;
+            options.cache_path = request.cache;
+            options.lock_input_path = request.lock_input;
+            options.lock_output_path = request.lock_output;
+            return request.backend.executeWorkflow(a, .{
+                .operation = .install,
+                .mode = request.mode,
+                .selectors = &.{.{ .name = "demo" }},
+                .options = options,
+            });
+        }
+    }.call;
+    const cache = try path(allocator, workspace, "cache-bound");
+    const replay_path = try path(allocator, workspace, "replay-lock.json");
+    const bound_path = try path(allocator, workspace, "bound-lock.json");
+
+    // Opt-in on: the native lock records the signed SHA256 binding and a
+    // SHA-512 derived from archive bytes that matched that signed SHA256.
+    const planned = try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .plan_only,
+        .configs = &bound_configs,
+        .cache = cache,
+        .lock_output = bound_path,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+    const bound = try readProductLock(allocator, io, bound_path, .native);
+    const bound_lock = bound.nativeLock().?;
+    try std.testing.expectEqual(@as(usize, 1), bound_lock.repositories.len);
+    try std.testing.expectEqual(
+        exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512,
+        bound_lock.repositories[0].archive_binding,
+    );
+    const bound_package = bound_lock.packages[0];
+    try std.testing.expectEqual(content_digest.Algorithm.sha256, bound_package.archive_identity.primary);
+    try std.testing.expect(bound_package.archive_identity.digests.sha512 == null);
+    try std.testing.expectEqual(
+        content_digest.Value.of(.sha256, repository.archive).sha256,
+        bound_package.archive_identity.digests.sha256.?,
+    );
+    try std.testing.expectEqual(
+        content_digest.Value.of(.sha512, repository.archive).sha512,
+        bound_package.derived_sha512.?,
+    );
+    try bound_lock.requireArchiveDigestPolicy(.sha512_identity_required);
+    const bound_bytes = try readFile(allocator, io, bound_path, exact_lock_v3.maximum_document_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bound_bytes, "\"provenance\":\"derived_from_signed_sha256\"") != null);
+
+    const downloaded = try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .download_only,
+        .configs = &bound_configs,
+        .cache = cache,
+        .lock_input = bound_path,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, downloaded.exit_status);
+
+    // The bound lock is refused once the repository no longer opts in.
+    try expectWorkflowFailure(try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .download_only,
+        .configs = &default_configs,
+        .cache = cache,
+        .lock_input = bound_path,
+    }), .planning, .planning_failed, "exact lock repository is unavailable");
+
+    // A derived SHA-512 that does not match the verified bytes is refused.
+    const derived_path = try path(allocator, workspace, "derived-lock.json");
+    {
+        var package = bound_package;
+        package.derived_sha512.?[0] ^= 1;
+        var changed = bound_lock.*;
+        changed.packages = &.{package};
+        var owned = try exact_lock_v3.create(allocator, .{
+            .target_architecture = changed.target_architecture,
+            .request_sha256 = changed.request_sha256,
+            .policy_sha256 = changed.policy_sha256,
+            .repositories = changed.repositories,
+            .local_artifacts = changed.local_artifacts,
+            .packages = changed.packages,
+            .verified_origins = true,
+        });
+        defer owned.deinit();
+        try writeLockVersion(exact_lock_v3, allocator, io, derived_path, owned.lock);
+    }
+    try expectWorkflowFailure(try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .download_only,
+        .configs = &bound_configs,
+        .cache = cache,
+        .lock_input = derived_path,
+    }), .download, .download_failed, "DerivedDigestMismatch");
+
+    // Forged provenance: the derived SHA-512 re-labelled as a signed digest.
+    const forged_path = try path(allocator, workspace, "forged-lock.json");
+    {
+        var package = bound_package;
+        package.archive_identity.digests.sha512 = package.derived_sha512;
+        package.archive_identity.primary = .sha512;
+        package.derived_sha512 = null;
+        var repositories = [_]exact_lock_v3.Repository{bound_lock.repositories[0]};
+        repositories[0].archive_binding = .published_digests;
+        var owned = try exact_lock_v3.create(allocator, .{
+            .target_architecture = bound_lock.target_architecture,
+            .request_sha256 = bound_lock.request_sha256,
+            .policy_sha256 = bound_lock.policy_sha256,
+            .repositories = &repositories,
+            .local_artifacts = bound_lock.local_artifacts,
+            .packages = &.{package},
+            .verified_origins = true,
+        });
+        defer owned.deinit();
+        try writeLockVersion(exact_lock_v3, allocator, io, forged_path, owned.lock);
+    }
+    for ([_]WorkflowMode{ .plan_only, .download_only }) |mode|
+        try expectWorkflowFailure(try run(allocator, &fixture, .{
+            .backend = &native,
+            .mode = mode,
+            .configs = &bound_configs,
+            .cache = cache,
+            .lock_input = forged_path,
+            .lock_output = if (mode == .plan_only) replay_path else null,
+        }), .planning, .lock_verification_failed, "archive binding does not match");
+    // Stripping only the binding leaves an unbound derived digest.
+    const stripped_path = try path(allocator, workspace, "stripped-lock.json");
+    {
+        const needle = "\"archive_binding\":\"signed_sha256_derived_sha512\",";
+        try std.testing.expect(std.mem.indexOf(u8, bound_bytes, needle) != null);
+        const stripped = try std.mem.replaceOwned(u8, allocator, bound_bytes, needle, "");
+        try directory.dir.writeFile(io, .{ .sub_path = "stripped-lock.json", .data = stripped });
+    }
+    try expectWorkflowFailure(try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .download_only,
+        .configs = &bound_configs,
+        .cache = cache,
+        .lock_input = stripped_path,
+    }), .planning, .lock_verification_failed, "invalid");
+
+    // Opt-in off: native lock production for a SHA256-only repository is
+    // refused by default and writes nothing.
+    const unbound_path = try path(allocator, workspace, "unbound-lock.json");
+    try expectWorkflowFailure(try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .plan_only,
+        .configs = &default_configs,
+        .cache = try path(allocator, workspace, "cache-default"),
+        .lock_output = unbound_path,
+    }), .planning, .planning_failed, "SHA-512 archive identity");
+    try expectNoFile(&directory, "unbound-lock.json");
+    // An embedder that explicitly relaxes the policy may produce the unbound
+    // lock, but a default native consumer refuses it.
+    const relaxed_result = try run(allocator, &fixture, .{
+        .backend = &relaxed,
+        .mode = .plan_only,
+        .configs = &default_configs,
+        .cache = try path(allocator, workspace, "cache-default"),
+        .lock_output = unbound_path,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, relaxed_result.exit_status);
+    const unbound = try readProductLock(allocator, io, unbound_path, .native);
+    try std.testing.expectError(
+        error.Sha512IdentityRequired,
+        unbound.nativeLock().?.requireArchiveDigestPolicy(.sha512_identity_required),
+    );
+    for ([_]WorkflowMode{ .plan_only, .download_only }) |mode|
+        try expectWorkflowFailure(try run(allocator, &fixture, .{
+            .backend = &native,
+            .mode = mode,
+            .configs = &default_configs,
+            .cache = try path(allocator, workspace, "cache-default"),
+            .lock_input = unbound_path,
+            .lock_output = if (mode == .plan_only) replay_path else null,
+        }), .planning, .lock_verification_failed, "SHA-512 archive identity");
+    try expectNoFile(&directory, "replay-lock.json");
+
+    // Legacy consumers are unchanged: the opted-in config still produces and
+    // replays an ordinary legacy lock without binding fields.
+    const legacy_path = try path(allocator, workspace, "legacy-lock.json");
+    const legacy_planned = try run(allocator, &fixture, .{
+        .backend = &legacy,
+        .mode = .plan_only,
+        .configs = &bound_configs,
+        .cache = try path(allocator, workspace, "cache-legacy"),
+        .lock_output = legacy_path,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, legacy_planned.exit_status);
+    const legacy_bytes = try readFile(allocator, io, legacy_path, exact_lock.maximum_document_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_bytes, "archive_binding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_bytes, "derived") == null);
+    _ = try readProductLock(allocator, io, legacy_path, .legacy_dpkg);
+    const legacy_downloaded = try run(allocator, &fixture, .{
+        .backend = &legacy,
+        .mode = .download_only,
+        .configs = &bound_configs,
+        .cache = try path(allocator, workspace, "cache-legacy"),
+        .lock_input = legacy_path,
+    });
+    try std.testing.expectEqual(api.ExitStatus.success, legacy_downloaded.exit_status);
+
+    // A tampered archive is refused against the signed SHA256 before any
+    // SHA-512 is derived, both when producing and when replaying a lock.
+    const tampered = try allocator.dupe(u8, repository.archive);
+    tampered[tampered.len - 1] ^= 1;
+    try directory.dir.writeFile(io, .{ .sub_path = pool_path, .data = tampered });
+    const tampered_path = try path(allocator, workspace, "tampered-lock.json");
+    try expectWorkflowFailure(try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .plan_only,
+        .configs = &bound_configs,
+        .cache = try path(allocator, workspace, "cache-tampered-plan"),
+        .lock_output = tampered_path,
+    }), .download, .download_failed, "signed SHA256 archive binding refused");
+    try expectNoFile(&directory, "tampered-lock.json");
+    try expectWorkflowFailure(try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .download_only,
+        .configs = &bound_configs,
+        .cache = try path(allocator, workspace, "cache-tampered-download"),
+        .lock_input = bound_path,
+    }), .download, .download_failed, "package acquisition failed");
+
+    // Only the exact opt-in token is accepted.
+    try expectWorkflowFailure(try run(allocator, &fixture, .{
+        .backend = &native,
+        .mode = .plan_only,
+        .configs = &invalid_configs,
+        .cache = cache,
+        .lock_output = replay_path,
+    }), .usage, .configuration_required, "InvalidRepositoryConfig");
+    try expectNoFile(&directory, "replay-lock.json");
+    try std.testing.expectEqual(@as(usize, 0), process.calls);
+}
+
+test "production package family native resolution binds an opted-in signed SHA256 repository" {
+    const family = @import("package_family_backend.zig");
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const repository = try SignedSha256Repository.init(allocator);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.initWithRepository(
+        allocator,
+        &directory,
+        "",
+        repository.in_release,
+        repository.packages,
+        repository.keyring,
+    );
+    defer fixture.deinit();
+    try directory.dir.createDirPath(std.testing.io, "repo/pool/main/d/demo");
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "repo/" ++ SignedSha256Repository.package_path,
+        .data = repository.archive,
+    });
+    const configs = [_][]const u8{try writeArchiveBindingConfig(
+        allocator,
+        &directory,
+        "bound.json",
+        fixture.source_path,
+        "signed_sha256_derived_sha512",
+    )};
+    const backend: family.NativeBackend = .{
+        .io = std.testing.io,
+        .now_unix = SignedSha256Repository.now_unix,
+    };
+    var planned = try backend.execute(allocator, .{
+        .schema = family.native_request_schema,
+        .version = family.native_schema_version,
+        .operation = .resolve_lock,
+        .root = fixture.install_root,
+        .architecture = .amd64,
+        .sources = &.{},
+        .keyrings = &fixture.keyring_paths,
+        .configs = &configs,
+        .cache = fixture.cache_path,
+        .state = fixture.state_path,
+        .package = "demo",
+        .lock_output = fixture.lock_path,
+    });
+    defer planned.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, planned.result.exit_status);
+    const bytes = try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock_v3.maximum_document_bytes);
+    var lock = try exact_lock_v3.decode(allocator, bytes, exact_lock_v3.maximum_document_bytes);
+    defer lock.deinit();
+    try std.testing.expectEqual(
+        exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512,
+        lock.lock.repositories[0].archive_binding,
+    );
+    try std.testing.expectEqual(
+        content_digest.Value.of(.sha512, repository.archive).sha512,
+        lock.lock.packages[0].derived_sha512.?,
+    );
+    try lock.lock.requireArchiveDigestPolicy(.sha512_identity_required);
 }
 
 test "production workflow native empty removal locks do not grant reconciliation ownership" {

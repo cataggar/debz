@@ -89,12 +89,62 @@ explicitly and additively:
 - `Lock.archiveAuthentication` reports each package's authority
   (`signed_sha512`, `signed_sha256_derived_sha512`, `signed_sha256_only`, or a
   local variant). `Lock.requireArchiveDigestPolicy(.sha512_identity_required)`
-  accepts signed/pinned SHA512 or the explicit binding. It refuses an unbound
-  SHA256-only archive.
+  governs repository archives. It accepts a signed SHA512 or the explicit
+  binding, and refuses an unbound signed-SHA256-only repository archive.
+  Local artifacts keep the caller-pinned digest set they were admitted with,
+  such as a repository-add descriptor pinned by SHA256. Their exact class
+  stays visible as `local_artifact_sha256_only` or `local_artifact_sha512`.
 
 Locks that do not opt in, including every Ubuntu signed-SHA512 lock, keep
 identical bytes, digests, and meaning. Older decoders reject bound locks as
 unknown fields, so a derived SHA512 can never be read as signed.
+
+**Opting in and native enforcement.** The opt-in is a per-repository source
+setting in the `--config` JSON; there is no CLI flag:
+
+```json
+{"source_path":"/etc/apt/sources.list.d/debian.sources","archive_binding":"signed_sha256_derived_sha512"}
+```
+
+- `archive_binding` defaults to `published_digests`. Any other token refuses
+  the configuration (`configuration_required`). The binding is repository
+  identity input. Only an opted-in repository adds it to the repository ID and
+  to canonical sources (`# X-Debz-Archive-Binding: …`), so existing IDs,
+  configuration identities, and locks stay byte-identical. The same source
+  declared with and without the opt-in is a conflicting repository.
+- Native lock production (`plan`/`download --lock-output`, package-family
+  `resolve_lock`) acquires each opted-in repository's locked archives through
+  the package cache. With `--offline`/`--cache-only` it reads only the cache.
+  Every archive must match its declared size and signed SHA256 before any
+  SHA512 is derived. The lock is written only after the bound lock passes
+  admission. A tampered or substituted archive refuses with `download_failed`
+  and writes no lock.
+- Native engine consumers enforce `sha512_identity_required` by default. This
+  covers product native lock input and output, native preparation
+  (`Runtime.prepare`), the package-family `NativeBackend`, and native locks in
+  package-cache workflows. The following are refused:
+  - an unbound SHA256-only native lock: `lock_verification_failed` on input,
+    `planning_failed` on output, with no lock written;
+  - a lock whose repository `archive_binding` differs from the configured one,
+    which covers a derived SHA512 relabelled as signed (`lock_verification_failed`);
+  - a derived SHA512 that does not match the verified bytes
+    (`download_failed`, `DerivedDigestMismatch`).
+
+  The policy governs repository archives. Caller-pinned local artifacts, such
+  as a repository-add descriptor pinned by SHA256, stay admissible. Embedders
+  can relax the default only explicitly, through
+  `Backend.native_archive_digest_policy`, `NativeBackend.archive_digest_policy`,
+  `Runtime.PrepareRequest.archive_digest_policy`, or the repository-add
+  `NativePreparationRequest`/`NativeCachePreparationRequest` field.
+- Legacy consumers are unchanged. The legacy backend ignores the binding and
+  writes ordinary v1 locks with no binding or derived fields. The only effect
+  of opting in is the repository ID change.
+- Known gaps:
+  - target-APT configuration import and repository-add `.list` descriptors
+    cannot carry the opt-in yet. Native repository-add therefore refuses a
+    dependency from a signed-SHA256-only repository;
+  - native transaction-result verification and recovery consume
+    already-admitted evidence and do not re-apply the policy.
 
 Native execution carries that identity without truncation through explicit
 successor documents: authorization v2, program v2, execution request v4,

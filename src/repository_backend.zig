@@ -57,6 +57,11 @@ pub const NativePreparationRequest = struct {
     plan: *const solver.Plan,
     exact_lock: *const exact_lock_v2.Lock,
     archives: []const []const u8,
+    /// Native engine default (#261). It governs authenticated repository
+    /// dependencies; the descriptor artifact is admitted by its caller pin.
+    /// Repository-add sources cannot yet carry the per-repository binding
+    /// opt-in, so a signed-SHA256-only dependency is refused.
+    archive_digest_policy: exact_lock_v2.ArchiveDigestPolicy = .sha512_identity_required,
 };
 
 pub const NativeCachePreparationRequest = struct {
@@ -70,6 +75,7 @@ pub const NativeCachePreparationRequest = struct {
     retained_archives: []const []const u8,
     /// The existing operation deadline, never a new timeout for this phase.
     deadline: transaction_executor.Deadline,
+    archive_digest_policy: exact_lock_v2.ArchiveDigestPolicy = .sha512_identity_required,
 };
 
 pub const NativeCachedPreparation = struct {
@@ -1797,6 +1803,7 @@ pub fn prepareNativeFromCache(
         .plan = input.plan,
         .exact_lock = input.exact_lock,
         .archives = &.{},
+        .archive_digest_policy = input.archive_digest_policy,
     };
     try validateNativePreparationCaller(preparation);
     const request = input.repository;
@@ -1868,6 +1875,7 @@ pub fn prepareNative(
         .exact_lock = input.exact_lock,
         .archives = input.archives,
         .policy = repositoryExecutionPolicy(input.repository),
+        .archive_digest_policy = input.archive_digest_policy,
     });
     errdefer result.deinit();
     switch (result) {
@@ -7664,6 +7672,18 @@ fn testNativePreparation(case: NativePreparationCase) !void {
     if (expected_error) |expected| {
         try std.testing.expectError(expected, prepareNative(allocator, input));
     } else {
+        if (case == .prepared) {
+            // #261: the native default governs repository archives; the
+            // caller-pinned SHA256 descriptor artifact stays admissible.
+            try std.testing.expectEqual(
+                exact_lock_v2.ArchiveDigestPolicy.sha512_identity_required,
+                input.archive_digest_policy,
+            );
+            try std.testing.expectEqual(
+                exact_lock_v2.ArchiveAuthentication.local_artifact_sha256_only,
+                lock.lock.archiveAuthentication(lock.lock.packages[0]),
+            );
+        }
         var result = try prepareNative(allocator, input);
         defer result.deinit();
         switch (case) {
@@ -10739,6 +10759,8 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
         .cache = &cache,
         .retained_archives = &.{descriptor_bytes},
         .deadline = .{ .context = &clock, .nowMsFn = NativeCacheClock.now, .expires_at_ms = 10 },
+        // Mixed closures carry signed-SHA256-only repository dependencies.
+        .archive_digest_policy = .published_digests,
     };
     var oversized = packages;
     const local_identity = @import("content_digest.zig").Identity.init(
@@ -10821,13 +10843,22 @@ fn testNativeCachePreparation(case: NativeCacheCase) !void {
                 try native_operation.evidence(result.preparation.prepared.program.program),
                 attempt.record().evidence(),
             );
-            var repeated = try prepareNative(allocator, .{
+            const repeated_input: NativePreparationRequest = .{
                 .repository = request,
                 .attempt = &attempt,
                 .plan = &plan,
                 .exact_lock = &lock.lock,
                 .archives = result.archives,
-            });
+                .archive_digest_policy = .published_digests,
+            };
+            if (case == .mixed) {
+                // #261: repository-add cannot opt a dependency repository in,
+                // so the native default refuses its signed-SHA256-only archive.
+                var required = repeated_input;
+                required.archive_digest_policy = .sha512_identity_required;
+                try std.testing.expectError(error.Sha512IdentityRequired, prepareNative(allocator, required));
+            } else try lock.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+            var repeated = try prepareNative(allocator, repeated_input);
             defer repeated.deinit();
             try std.testing.expect(repeated == .prepared);
             try std.testing.expectEqualStrings(

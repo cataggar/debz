@@ -47,8 +47,10 @@ pub const ArchiveAuthentication = enum {
 pub const ArchiveDigestPolicy = enum {
     /// Original v3 acceptance: the signed published digest set, whatever it is.
     published_digests,
-    /// Every archive is bound by a signed (or pinned) SHA512, or by a signed
+    /// Every repository archive is bound by a signed SHA512, or by a signed
     /// SHA256 whose repository explicitly records the derived-SHA512 binding.
+    /// Local artifacts keep the caller-pinned digest set they were admitted
+    /// with; `archiveAuthentication` still reports their exact class.
     sha512_identity_required,
 };
 
@@ -199,8 +201,8 @@ pub const Lock = struct {
         };
     }
 
-    /// Refuses a SHA256-only archive authority under a SHA512 policy unless
-    /// its repository explicitly records the signed-SHA256 derived binding.
+    /// Refuses a signed SHA256-only repository archive under a SHA512 policy
+    /// unless its repository explicitly records the derived binding.
     pub fn requireArchiveDigestPolicy(
         self: Lock,
         policy: ArchiveDigestPolicy,
@@ -210,10 +212,9 @@ pub const Lock = struct {
             .signed_sha512,
             .signed_sha256_derived_sha512,
             .local_artifact_sha512,
-            => {},
-            .signed_sha256_only,
             .local_artifact_sha256_only,
-            => return error.Sha512IdentityRequired,
+            => {},
+            .signed_sha256_only => return error.Sha512IdentityRequired,
         };
     }
 
@@ -1315,6 +1316,17 @@ test "exact_lock_v3.test.mixed origins canonical roundtrip and tamper rejection"
         .verified_origins = true,
     });
     defer owned.deinit();
+    // #261 scope: the SHA-512 policy governs repository archives. A
+    // caller-pinned local artifact keeps its reported SHA256-only class.
+    try std.testing.expectEqual(
+        ArchiveAuthentication.local_artifact_sha256_only,
+        owned.lock.archiveAuthentication(owned.lock.findPackage("vendor-repo", "1.0", "all").?),
+    );
+    try std.testing.expectEqual(
+        ArchiveAuthentication.signed_sha512,
+        owned.lock.archiveAuthentication(owned.lock.findPackage("dependency", "2", "amd64").?),
+    );
+    try owned.lock.requireArchiveDigestPolicy(.sha512_identity_required);
     const json = try owned.lock.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"local_artifact\"") != null);
