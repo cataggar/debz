@@ -167,10 +167,12 @@ def configure_batch(
     environment: dict[str, str],
     stdout: Path,
     stderr: Path,
+    selectors: tuple[str, ...] = (),
 ) -> None:
+    operation = selectors or ("--pending",)
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         result = subprocess.run(
-            dpkg_command(dpkg, root, "--no-triggers", "--configure", "--pending"),
+            dpkg_command(dpkg, root, "--no-triggers", "--configure", *operation),
             env=environment,
             stdin=subprocess.DEVNULL,
             stdout=output,
@@ -206,8 +208,158 @@ def configure_batch(
             raise RuntimeError(f"reference dpkg configuration failed: {observed_errors[:4096]!r}")
 
 
-def install(dpkg: Path, root: Path, cache: Path, evidence: Path) -> None:
+@dataclass(frozen=True)
+class Prestate:
+    selector: str
+    status: str
+    destination: Path
+
+
+PRESTATE = re.compile(
+    r"(?P<selector>[a-z0-9][a-z0-9+.-]*:[a-z0-9][a-z0-9-]*)="
+    r"(?P<status>half-configured|unpacked):(?P<destination>/.+)\Z"
+)
+
+
+def parse_prestate(value: str) -> Prestate:
+    match = PRESTATE.fullmatch(value)
+    if not match:
+        raise argparse.ArgumentTypeError(f"invalid prestate: {value}")
+    return Prestate(
+        match["selector"], match["status"], Path(match["destination"]),
+    )
+
+
+def package_status(root: Path, selector: str, environment: dict[str, str]) -> str:
+    result = subprocess.run(
+        [
+            "dpkg-query", f"--admindir={root / 'var/lib/dpkg'}", "-W",
+            "-f=${Version} ${Status}", selector,
+        ],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    if len(result.stdout) > 4096 or result.stderr:
+        raise ValueError(f"invalid reference status query: {selector}")
+    return result.stdout.decode("utf-8")
+
+
+def interrupt_postinst(
+    dpkg: Path,
+    root: Path,
+    package: Package,
+    environment: dict[str, str],
+    stdout: Path,
+    stderr: Path,
+) -> None:
+    """Let dpkg start configuring, but deny execution of the installed postinst.
+
+    A private read-only, noexec bind of the unchanged script onto itself makes
+    dpkg's own chrooted exec fail with EACCES after it recorded half-configured
+    and installed conffiles, so no maintainer-script code runs.
+    """
+    script = root / "var/lib/dpkg/info" / f"{package.name}.postinst"
+    if script.is_symlink() or not script.is_file():
+        raise ValueError(f"prestate postinst is not a regular file: {package.selector}")
+    before = hashlib.sha256(script.read_bytes()).hexdigest()
+    subprocess.run(["mount", "--bind", "--", str(script), str(script)], check=True, timeout=30)
+    try:
+        subprocess.run(
+            ["mount", "-o", "remount,bind,ro,noexec,nosuid,nodev", "--", str(script)],
+            check=True, timeout=30,
+        )
+        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+            result = subprocess.run(
+                dpkg_command(dpkg, root, "--no-triggers", "--configure", package.selector),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=errors,
+                check=False,
+                timeout=120,
+            )
+            if output.tell() > MAXIMUM_PROBE_OUTPUT or errors.tell() > MAXIMUM_PROBE_OUTPUT:
+                raise ValueError("interrupted configure output exceeds limit")
+            output.seek(0)
+            errors.seek(0)
+            observed_output, observed_errors = output.read(), errors.read()
+    finally:
+        subprocess.run(["umount", "--", str(script)], check=True, timeout=30)
+    with stdout.open("ab") as out, stderr.open("ab") as err:
+        out.write(observed_output)
+        err.write(observed_errors)
+    if (
+        result.returncode == 0
+        or b"post-installation script" not in observed_errors
+        or b"Permission denied" not in observed_errors
+    ):
+        raise RuntimeError(
+            f"prestate postinst was not denied before execution: {observed_errors[:4096]!r}"
+        )
+    if hashlib.sha256(script.read_bytes()).hexdigest() != before:
+        raise RuntimeError(f"prestate postinst changed: {package.selector}")
+
+
+def capture_prestate(
+    dpkg: Path,
+    root: Path,
+    package: Package,
+    prestate: Prestate,
+    environment: dict[str, str],
+    stdout: Path,
+    stderr: Path,
+) -> None:
+    destination = prestate.destination
+    if destination.exists() or destination.is_symlink() or not destination.parent.is_dir():
+        raise ValueError(f"prestate destination must be new: {destination}")
+    if prestate.status == "half-configured":
+        interrupt_postinst(dpkg, root, package, environment, stdout, stderr)
+    expected = f"{package.version} install ok {prestate.status}"
+    if package_status(root, package.selector, environment) != expected:
+        raise RuntimeError(f"unexpected prestate status for {package.selector}")
+    proc = root / "proc"
+    mounted = proc.is_mount()
+    if mounted:
+        subprocess.run(["umount", "--", str(proc)], check=True, timeout=30)
+    try:
+        if proc.is_mount() or any(proc.iterdir()):
+            raise RuntimeError("prestate proc mountpoint is not empty")
+        subprocess.run(
+            ["cp", "-a", "--one-file-system", "--", str(root), str(destination)],
+            check=True, timeout=600,
+        )
+        # Signed replay fixtures are pinned as root-owned mode-0700 roots.
+        destination.chmod(0o700)
+    finally:
+        if mounted:
+            subprocess.run(
+                ["mount", "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", str(proc)],
+                check=True, timeout=30,
+            )
+    with (destination.parent / "prestates.tsv").open("a") as record:
+        record.write(f"{package.selector}\t{expected}\t{destination}\n")
+
+
+def install(
+    dpkg: Path,
+    root: Path,
+    cache: Path,
+    evidence: Path,
+    prestates: tuple[Prestate, ...] = (),
+) -> None:
     packages = packages_from_manifest(evidence / "reference-archives.tsv", cache)
+    targets = {prestate.selector: prestate for prestate in prestates}
+    if len(targets) != len(prestates):
+        raise ValueError("duplicate prestate selector")
+    destinations = {prestate.destination for prestate in prestates}
+    if len(destinations) != len(prestates):
+        raise ValueError("duplicate prestate destination")
+    selectors = {package.selector for package in packages}
+    if any(selector not in selectors for selector in targets):
+        raise ValueError("prestate package is not in the verified closure")
     pending = packages[:]
     unpacked: list[Package] = []
     configured: set[tuple[str, str]] = set()
@@ -248,6 +400,11 @@ def install(dpkg: Path, root: Path, cache: Path, evidence: Path) -> None:
                     raise RuntimeError(f"reference dpkg configure refused {package.selector}: {output[:4096]!r}")
                 deferred.append(package.selector)
                 continue
+            prestate = targets.pop(package.selector, None)
+            if prestate is not None:
+                capture_prestate(dpkg, root, package, prestate, environment, stdout, stderr)
+                if not targets:
+                    return
             apply(
                 dpkg_command(dpkg, root, "--no-triggers", "--configure", package.selector),
                 environment, stdout, stderr,
@@ -258,7 +415,18 @@ def install(dpkg: Path, root: Path, cache: Path, evidence: Path) -> None:
         if not progressed:
             if unpacked:
                 before = set(configured)
-                configure_batch(dpkg, root, environment, stdout, stderr)
+                if targets:
+                    # Break ordinary dependency cycles without configuring a
+                    # package whose exact prestate has not been copied yet.
+                    selectors = tuple(
+                        package.selector for package in unpacked
+                        if package.selector not in targets
+                    )
+                    if not selectors:
+                        raise RuntimeError("prestate packages form an unordered dependency cycle")
+                    configure_batch(dpkg, root, environment, stdout, stderr, selectors)
+                else:
+                    configure_batch(dpkg, root, environment, stdout, stderr)
                 observed = configured_packages(root, environment)
                 for package in unpacked[:]:
                     if (package.name, package.architecture) in observed:
@@ -269,6 +437,8 @@ def install(dpkg: Path, root: Path, cache: Path, evidence: Path) -> None:
             raise RuntimeError(
                 "reference dependency ordering stalled: " + ", ".join(deferred[:20])
             )
+    if targets:
+        raise RuntimeError("prestate package was never configured")
     if len(configured) != len(packages):
         raise ValueError("reference closure not fully configured")
     apply(
@@ -283,10 +453,15 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument(
+        "--prestate", type=parse_prestate, action="append", default=[],
+        metavar="PACKAGE:ARCH=STATUS:DESTINATION",
+        help="copy the root just before configuring PACKAGE, then stop after the last copy",
+    )
     args = parser.parse_args()
     if not args.dpkg.is_absolute() or not args.root.is_absolute() or not args.cache.is_absolute():
         raise ValueError("reference inputs must be absolute paths")
-    install(args.dpkg, args.root, args.cache, args.evidence)
+    install(args.dpkg, args.root, args.cache, args.evidence, tuple(args.prestate))
 
 
 if __name__ == "__main__":

@@ -62,6 +62,10 @@ A spawned script runs with:
   is inherited.
 - **No shell.** The script is executed with `execve` on an absolute in-root
   path and an exact argv; no `sh -c` string is ever constructed.
+- **Child capability gate.** After any helper/proc mounts and chroot, but
+  before `execve`, every native script child applies the same closed
+  filesystem/account capability and syscall policy described below. Failed
+  setup never executes the script.
 - **Stdin.** Standard input is `/dev/null`, so scripts cannot block on input.
 - **Standard descriptors.** Every descriptor the child still needs is first
   moved above the standard range, so installing stdin, stdout, and stderr is
@@ -162,9 +166,9 @@ mounts a fresh read-only, nosuid, nodev, noexec procfs with `hidepid=2`,
 single read-only copy of the actual kernel boot ID at
 `/proc/sys/kernel/random/boot_id`, then remounts the mask read-only. No
 maintainer script runs between the first mount and the completed mask; the
-other sysctl entries remain absent. Before `execve`, the child drops
-`CAP_SYS_ADMIN` from bounding, effective, permitted, inheritable and ambient
-sets and sets `no_new_privs`; it cannot unmount the mask. Every descriptor
+other sysctl entries remain absent. Before `execve`, the child applies the closed script capability and syscall
+policy below, including the removal of `CAP_SYS_ADMIN` and `no_new_privs`;
+it cannot unmount the mask. Every descriptor
 above the standard streams is marked close-on-exec (including any inherited
 host-root descriptor); if the kernel rejects this seal, the script does not
 launch. A parent-death signal is established before setup with a control-pipe
@@ -176,9 +180,10 @@ script or the deferred procps trigger can run. A setup failure is a typed
 non-spawned `snapshot_proc` outcome, never a successful script exit. Helper overlay
 setup retains its own existing `root_isolation` stage and failure claim.
 
-The opt-in uses a distinct v2 policy domain and exact invocation digest
-extension containing the SHA-256 of the kernel boot ID; default requests keep
-their v1 policy digest. Native program and script-outcome recovery retain
+The opt-in previously used a distinct v2 policy domain and exact invocation
+digest extension containing the SHA-256 of the kernel boot ID; after the
+capability gate it uses v3 and default requests use v2. Native program and
+script-outcome recovery retain
 their existing program-policy and unknown-outcome claims. Synthetic positive
 and negative namespace tests run in the privileged
 `test-native-helper-namespace` target; the signed postinst test additionally
@@ -191,7 +196,8 @@ The capability syscall header uses the kernel's 8-byte layout with its
 32-bit PID at offset 4; Zig's `linux.cap_user_header_t` instead pads a
 machine-width PID to offset 8, which can send an uninitialized PID and yield
 `ESRCH` in Debug builds. The scoped runner checks the exact header layout
-and verifies that `CAP_SYS_ADMIN` is absent after dropping it. These
+and verifies both 32-bit capability words and the bounding and ambient sets
+after dropping them. These
 requirements passed on the local Linux 6.18.31 privileged runner. Missing
 support refuses the exact invocation without a proc or mount fallback.
 Workflow-dispatch CI run
@@ -223,15 +229,16 @@ launch. This does not admit udev triggers, other
 scripts, other architectures, or other package versions.
 
 The child reuses the isolated PID-1/chroot boundary, descriptor seal,
-private mount propagation, privilege drop, no-new-privileges setting,
+private mount propagation, closed capability and syscall policy,
 supervision and teardown described above, but mounts a fresh
 `ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs. It never mounts
 the broader procfs or creates a boot-ID mask: `/proc/sys` and its boot-ID
 path must both be absent before exec. PID 1's proc-visible root must
 match the pinned fixture. The script cannot remount proc after
-`CAP_SYS_ADMIN` is dropped, and a failed setup records the existing typed
-non-spawned `snapshot_proc` outcome. The policy has its own v3 digest
-domain and pins the exact provider paths and hashes; systemd's v2
+mount authority is dropped, and a failed setup records the existing typed
+non-spawned `snapshot_proc` outcome. The policy previously had its own v3 digest
+domain and now uses v4 with the capability gate; its original v3
+domain pins the exact provider paths and hashes; systemd's boot-ID
 boot-ID admission and its one-file `/proc/sys` representation remain
 separate. This environment passed protected amd64 pinned-dpkg and
 signed-script comparisons; it does not authorize a broader proc view
@@ -259,12 +266,13 @@ The namespace helper uses the same fresh, private
 `ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs as the udev mode,
 without granting either script the other's identity. PID 1 and its
 descendants stay in the same pinned chroot; `/proc/sys` and boot ID are
-absent, inherited host-root descriptors are sealed, and `CAP_SYS_ADMIN`
-and remount authority are dropped before the script runs. Setup failure
+absent, inherited host-root descriptors are sealed, and mount and kernel
+authority are dropped before the script runs. Setup failure
 records a typed non-spawned result; exit, deadline, crash and recovery
 preserve ordinary durable outcomes and private mount teardown. The
-invocation uses a separate v4 policy digest; the earlier systemd v2 and
-udev v3 invocation digests remain unchanged. This is no grant to sudo
+invocation originally used a separate v4 policy digest; it is v5 with the
+capability gate, as are the separately bumped systemd v3 and udev v4
+invocation digests. This is no grant to sudo
 triggers, other scripts or package versions, and does not establish
 CI arm64 or WSL namespace capability.
 From the root-owned protected checkout on final #252 squash plus sudo-only
@@ -276,6 +284,310 @@ authenticated root persisted sudo step 1376 exit 0 and installed. The
 next refusal was python3 preinst at step 1383, before its script launched.
 This local proof does not substitute for hosted arm64 namespace coverage
 or authorize python3.
+
+## Pre-cutover child capability gate (#257)
+
+The **native** launcher now applies this gate to ordinary scripts and to the
+three separately authorized, unchanged systemd boot-ID, udev PID-only and
+sudo PID-only proc views. It runs only *after* required helper overlays, root
+entry and proc mounts/masking; no child runs between mounting and restriction.
+No new script digest, root identity, helper, proc entry or host-root admission
+is authorized. The pinned reference runner remains a separate policy; this
+change is not a native-only cutover or a claim of reference parity.
+
+The closed list of potentially usable capabilities is `CAP_CHOWN` (signed
+sudo's `chown` and account/file ownership), `CAP_DAC_OVERRIDE` (root-owned
+file updates), `CAP_FOWNER` (ownership/permission repairs), `CAP_FSETID`
+(file modes), `CAP_SETGID` and `CAP_SETUID` (signed udev
+`systemd-sysusers` and ordinary account changes), and `CAP_SETFCAP`
+(account/file capability metadata). No `CAP_MKNOD`, `CAP_SYS_CHROOT`,
+`CAP_SYS_ADMIN`, `CAP_SYS_MODULE`, `CAP_NET_ADMIN`, `CAP_NET_RAW`,
+`CAP_BPF` or `CAP_CHECKPOINT_RESTORE` survives a privileged parent.
+This list permits only capabilities the parent already held; it never grants
+any. In the child, `capget` uses the 8-byte v3 kernel header (32-bit PID at
+offset 4), `capset` masks **both** 32-bit effective, permitted and inheritable
+words, and a readback verifies them. Every supported capability outside the
+list is dropped from the bounding set and read back; all ambient capabilities
+are cleared and individually checked, and `no_new_privs` is verified.
+A parent without *any* usable or inheritable capability cannot drop its
+bounding set; that case is accepted only after verifying all six current
+capability words are zero and `no_new_privs` is set, so neither setuid
+executables nor file capabilities can promote it. A partially privileged
+parent that cannot drop its bounding set fails closed.
+
+After the capset readback, a mandatory arch-checked seccomp filter rejects
+mount/unmount, namespace entry/creation, pivot/chroot, new mount API,
+open-by-handle, device creation, module loading, reboot/kexec, swap and
+kernel BPF/perf/userfault/ptrace/write-foreign-process syscalls with `EPERM`;
+it rejects namespace-flavored `clone`, and returns `ENOSYS` for `clone3` so
+ordinary libc forks can use the filtered `clone` path. Wrong-architecture and
+x32 syscall aliases kill the child. Missing capset, bounding, ambient, NNP,
+or seccomp support refuses the script with a typed non-successful
+`capability_policy` setup outcome (the existing `snapshot_proc` setup stage
+applies to its three scoped modes). This syscall denylist supplements, rather
+than replaces, the capability bounding contract.
+
+The policy changes the on-disk script policy and invocation evidence: default
+policy v1 becomes v2; systemd v2 becomes v3, udev v3 becomes v4 and sudo v4
+becomes v5, each with an additional `script-capability-seccomp-v1` marker.
+Preexisting durable programs/receipts must not be reinterpreted using the new
+contract; prepare new policy-bound programs. Debug and ReleaseSafe
+`test-maintainer-script`, privileged `test-native-helper-namespace`, and
+`security-audit` exercise the new boundary. The privileged Zig probe checks
+denied mount/namespace/module operations with a fully capable parent, both
+capability words and readbacks, and permitted ownership, file-mode and
+UID/GID changes on a disposable test file; it never attempts a real host
+mutation.
+
+### Non-skipped signed replay prerequisite
+
+The ordinary required CI matrix (`build-and-test-workload`, native lifecycle
+and recovery shards, and required disposable roots) builds **repository-local
+signed synthetic packages**, not the exact snapshot systemd, udev or sudo
+scripts. `test-native-helper-namespace` also runs the three signed tests
+without roots, so those individual tests are reported as **SKIP**. Its
+other passing results are capability/proc probe coverage, **not**
+signed-script parity.
+`ubuntu-real-snapshot` is an opt-in `workflow_dispatch` job (`run_native_real_snapshot
+= true`) on amd64 and arm64, currently ReleaseSafe only. It performs a fresh,
+authenticated snapshot install, but does not publish independently reusable
+**pre-script** roots or run the three direct-script tests in Debug and
+ReleaseSafe. A failed/interrupted install cannot be retried as fresh.
+
+On an **amd64** runner, prepare three *independent*, protected, root-owned,
+mode-0700 disposable copies from authenticated snapshot prestates, with
+empty root-owned `/proc` directories and the exact pinned signed inputs.
+The systemd copy must be before its configure; the udev copy must include
+the signed sidecars and the expected regular-file `/dev` test targets; the
+sudo copy must retain the pre-repair alternatives record and signed links.
+The three `Snapshot*Proc.init` bindings revalidate exact bytes, owners,
+paths and proc mountpoints before execution. Do not pass the historical
+interrupted sources to the test, use the same copy for two variants, or
+copy from a writable checkout as protected evidence. On each **new** set
+of copies (Debug and ReleaseSafe separately), run:
+
+```sh
+zig build test-native-signed-proc -Doptimize=Debug -j2 \
+  -Dsigned-systemd-proc-root=/root/protected/fixture/debug-systemd-before \
+  -Dsigned-udev-proc-root=/root/protected/fixture/debug-udev-before \
+  -Dsigned-sudo-proc-root=/root/protected/fixture/debug-sudo-before
+```
+
+Use `-Doptimize=ReleaseSafe` and *different fresh prestate copies* for
+the ReleaseSafe run. The build target rejects missing, relative, duplicate
+or wrong-architecture root paths and runs only the three positive signed
+tests as root with `DEBZ_REQUIRE_SIGNED_PROC_ROOTS=1`; a missing environment
+binding is an error, not a skip. Check each outcome and the retained root
+bytes against a **separate** pinned-dpkg proof copy. From the root of a
+**root-owned, non-group-writable checkout** with root-owned mode-0700
+`.real-snapshot`, where `PINNED_DPKG`, all three `PRE_*` sources and
+the new `*_PROOF` destinations are beneath that `.real-snapshot`, run
+before mutating the native replay copies:
+
+```sh
+sudo -n tools/real-snapshot-systemd-proc-reference.sh \
+  "$PINNED_DPKG" "$PRE_SYSTEMD" "$SYSTEMD_PROOF"
+sudo -n tools/real-snapshot-udev-reference.sh \
+  "$PINNED_DPKG" "$PRE_UDEV" "$UDEV_PROOF"
+sudo -n tools/real-snapshot-sudo-reference.sh \
+  "$PINNED_DPKG" "$PRE_SUDO" "$SUDO_PROOF"
+```
+
+The proof harnesses drop capabilities with the closure's `setpriv`, so
+each proof source (never a native replay copy) needs `usr/bin/setpriv`
+from the pinned util-linux; see below.
+
+#### Generated signed prestates
+
+`tools/real-snapshot-signed-proc-prestates.sh PINNED_DPKG WORKSPACE`
+manufactures the three before-script sources. Run it **as root on amd64**
+from the protected checkout root, after
+`tools/real-snapshot-signed-proc-bindings.sh` has authenticated the pinned
+closure into the same `WORKSPACE`. It reuses that closure and does not
+fetch anything. It:
+
+- verifies the pinned dpkg 1.22.22 binary and receipt, and the
+  exact systemd and udev (261.2-1ubuntu2), sudo (1.9.17p2-7ubuntu3),
+  sudo-rs (0.2.14-1ubuntu2) and util-linux versions. It binds the lock to
+  the authenticated `stonking` Release (SHA-256 `0b2bb351…`, signer
+  `f6ecb376…`) and to the sorted 175-package closure of name, version,
+  architecture, SHA-512 and size (`7773e7c4…`). It does not bind the lock
+  document digest, which also covers the local keyring path. It then
+  rehashes every locked archive by size and SHA-512;
+- bootstraps the same unregistered tool root as
+  `tools/real-snapshot-reference.sh`, then lets **pinned dpkg** install the
+  closure in the reviewed order with
+  `tools/real-snapshot-reference-order.py --prestate`. Non-target packages
+  are configured in explicit batches, so no target is configured
+  implicitly. Before systemd and udev are configured, the order tool binds
+  each unchanged signed postinst `noexec`: dpkg records `half-configured`
+  without running the script, and the root is copied at that point. sudo
+  is copied while `unpacked`, after sudo-rs registered its alternatives;
+- checks each copy: root-owned mode 0700, an empty `proc`, the dpkg
+  status, the signed postinst and `usr/bin/dpkg` bytes, and no `setpriv`.
+
+It then applies three reviewed normalizations:
+
+- pinned dpkg writes `sudo.list` in extraction order, with symbolic links
+  last. The signed sudo binding pins the C-sorted list, so the script sorts
+  it and requires the pinned digest (2376 bytes, `92f90d6a…`). This proves
+  that only the order changed.
+- udev's static-node permissions only adjust existing paths. `dev/kvm`,
+  `dev/fuse` and `dev/snd/seq` are created as empty **regular files**,
+  `root:root` 0600, never as device nodes, as in the recorded pinned proof.
+- util-linux is not yet unpacked in these states. The script therefore
+  extracts only its `usr/bin/setpriv` (SHA-256 `9e0d70d2…`) into
+  `WORKSPACE/reference-tools` for the pinned-dpkg proof sources.
+
+The prestates are disposable fixtures, not native installation results.
+The build tree is removed; `WORKSPACE/prestate-build/evidence` keeps the
+reference order logs.
+
+`tools/real-snapshot-signed-proc-compare.py TARGET NATIVE PROOF REPORT`
+inventories a replayed native root and its pinned-dpkg proof. It records
+type, owner, mode, size, link count, link target, device number and SHA-256
+for every entry, requires `proc` to be empty and refuses mount crossings.
+The native test runs only the signed postinst, while the proof runs
+`dpkg --configure`, so a few differences are expected. Each is accepted
+only by an exact rule, derived from the first hosted amd64 reports and
+covered by `tools/test_real_snapshot_signed_proc_compare.py`:
+
+- **proof harness files:** `usr/bin/setpriv` (only in the proof, SHA-256
+  `9e0d70d2…`) and pinned dpkg (`0a20f601…`). For udev and sudo that is
+  proof-only `usr/local/sbin/dpkg`; for systemd it replaces the snapshot
+  `usr/bin/dpkg` (`6587ef9e…`). Also `run/mount`, the empty root-owned
+  0700 directory that the chrooted `mount -t proc` (libmount) creates;
+- **dpkg bookkeeping:** `var/log/dpkg.log` exists only in the proof and
+  may record only its configure of the target. In `status` only the
+  target stanza may change: `unpacked` or `half-configured` becomes
+  `installed`, `Config-Version` may equal only `Version`, and each
+  `newconffile` hash becomes the MD5 of the proof's installed conffile.
+  The proof's `status-old` must equal the native (unconfigured) `status`;
+- **new conffiles:** each `newconffile` in the target's native status
+  (sudo's `/etc/sudo.conf` and `/etc/sudo_logsrvd.conf`) stays
+  `NAME.dpkg-new` natively and must be byte- and metadata-identical to the
+  proof's installed `NAME`. dpkg installs new conffiles before the
+  postinst; the native test replays the postinst alone;
+- **nondeterminism:** systemd's `etc/machine-id` may differ only in
+  content, and each copy must be one lowercase 32-hex-digit line;
+  `var/log/alternatives.log` may differ only in its `update-alternatives
+  YYYY-MM-DD HH:MM:SS:` stamps.
+
+Any other difference, or an unreadable or changed file, fails.
+
+#### Hosted protected amd64 replay
+
+The CI job **Signed proc replay in protected amd64 roots**
+(`signed-proc-protected-replay`) runs on hosted `ubuntu-24.04` x86_64 for
+every push and pull request. Debug and ReleaseSafe each run on their own
+runner with fresh roots, within 35 minutes. Each run:
+
+1. runs the prestate and binding scripts from the runner-owned checkout
+   and requires both to refuse the writable ancestry. It also requires
+   `test-native-signed-proc` to reject missing and relative roots;
+2. stages the reviewed commit (`git archive HEAD`), the verified Zig 0.16.0
+   installation, the pinned dpkg prefix and the pinned
+   `ubuntu-archive-keyring.gpg` (ubuntu-keyring 2023.11.28.1) beneath
+   `/srv/debz-protected/signed-proc`. Every staged entry and every
+   ancestor must be `root:root` and not group- or world-writable; the
+   runner's own `/usr/share` is writable, so the keyring is copied and pinned;
+3. as root, builds `debz`, authenticates the closure with the binding
+   script and generates the prestates;
+4. copies each prestate twice: once as a native root and once as a proof
+   source with `setpriv`. The sudo proof harness restores the two signed
+   `sudoedit` payload links (`-> sudo.ws`, `-> sudo.ws.8.gz`) before
+   configure. The job applies the same two links to the native sudo root, so
+   both start in the same state. The prestate itself keeps the
+   `/etc/alternatives` links that sudo-rs registered. It runs the three
+   pinned-dpkg proof harnesses on the proof sources, and runs
+   `test-native-signed-proc` on the native roots. It requires `All 4 tests passed.`, with each of the three signed
+   replays reported `OK`; the fourth is the root module's reference test.
+   A skip therefore fails the job;
+5. runs the comparison unit tests, compares each native root with its
+   proof, and fails on any unexpected difference. It then executes the signed
+   binding refusal fixtures from the same workspace. Only the three positive
+   replays may skip there, because step 4 ran them;
+6. always copies bounded evidence (logs, the lock, `prestates.tsv`,
+   reference order logs, comparison reports, the proofs' `dpkg.log` and
+   both sudo `alternatives.log` files) into the
+   `signed-proc-protected-replay-*` artifact. It fails if a mount under
+   the staged path survives, then removes the staged path.
+
+The job is **not** part of the `Build and test` aggregate. The pinned
+`stonking` snapshot Release is `Valid-Until: Tue, 06 Oct 2026 22:41:59 UTC`.
+After that date, authentication fails closed. The #262 repin also changes
+the signed identities that these bindings pin. Make the job required only
+after that repin, with refreshed pins and a green run in both modes.
+`tools/security-audit.py` (`check ci-signed-proc`) and
+`test/security-policy.zig` keep its runner, modes, timeout, staging,
+refusals and no-skip assertions fixed.
+
+#### Signed binding refusal fixtures
+
+The udev and sudo refusal and changed-after-binding tests read
+`DEBZ_REQUIRE_SIGNED_{UDEV,SUDO}_PROC_*_ROOT` variables and **return
+without assertions** when those are unset, so the ordinary suite counts
+them as passes without evidence. To execute them with the exact signed
+bytes on either native architecture, build a fresh set of root-owned
+binding roots per optimization mode from the protected checkout root
+(including its root-owned `.real-snapshot` and a root-owned `debz` build):
+
+```sh
+sudo -n tools/real-snapshot-signed-proc-bindings.sh \
+  zig-out/bin/debz .real-snapshot/debug-bindings
+sudo -n env -i PATH="$PROTECTED_ZIG_DIR:/usr/sbin:/usr/bin:/sbin:/bin" \
+  HOME=/root DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1 \
+  $(sudo -n cat .real-snapshot/debug-bindings/bindings.env) \
+  zig build test-maintainer-script -Doptimize=Debug -j2
+```
+
+The script plans and downloads the authenticated amd64 `ubuntu-minimal`
+closure from the pinned `stonking` snapshot, rehashes every locked
+archive by size and SHA-512, extracts each pinned input from its single
+providing archive, and writes 6 udev and 9 sudo variants: one valid
+binding for each changed-after-binding test and one mutation per refusal.
+The Zig bindings, not the script, compare exact bytes, owners, modes and
+links. These roots contain only the signed inputs. They **cannot** run a
+script and do not satisfy `test-native-signed-proc`. The changed variants
+are mutated by their tests; do not reuse a set.
+
+To replay **ordinary** signed lifecycle fixtures on either native
+architecture, the existing CI uses
+`zig build test-native-lifecycle-zig -Dnative-reference-dpkg=PATH
+-Doptimize=Debug -j2` and its ReleaseSafe variant; `PATH` is prepared
+with `python3 tools/prepare-native-dpkg.py --architecture amd64` or
+`--architecture arm64` in that runner's worktree. These fixtures prove
+script execution and pinned-dpkg parity for the selected native architecture
+but **cannot** substitute for exact Ubuntu signed systemd/udev/sudo bytes.
+Those three native proc identities and their pinned sidecars are deliberately
+**amd64-only** in the current admission; no arm64 signed proc replay is
+possible without a separately reviewed arm64 identity/profile and protected
+arm64 inputs. In the authenticated arm64 `ubuntu-minimal` closure of the
+same snapshot, all three postinst scripts and the ten pinned interpreted,
+data or file-list inputs are byte-identical to amd64; the 12 pinned ELF
+inputs differ. Do not weaken the amd64 identity checks or use emulation as
+native-arm64 proof. The opt-in snapshot job may be invoked with:
+
+```sh
+gh workflow run ci.yml --repo cataggar/debz \
+  --ref copilot/issue-257-fleet-capabilities \
+  -f run_native_real_snapshot=true \
+  -f ubuntu_snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z \
+  -f ubuntu_snapshot_suite=stonking
+```
+
+This dispatch can provide fresh-root ReleaseSafe observations but does
+**not** satisfy the direct signed prestate replay gate. That gate is the
+hosted protected amd64 replay job described above; a skipped or non-zero
+script outcome there remains an explicit blocker.
+The shared network boundary still belongs to #278.
+
+**Separate network boundary (#278):** dropping `CAP_NET_ADMIN` and
+`CAP_NET_RAW` does *not* disable ordinary socket or host-network access.
+The current `/proc/net` view and inherited socket/namespace boundary must
+be investigated and decided **for both** engines in #278. Do not infer host
+network isolation from this gate, silently adjust one signed proc view, or
+authorize any new network connectivity on this evidence.
 
 ## Exact signed python3 preinst inert alternatives call
 
@@ -315,7 +627,8 @@ absolute name elsewhere or the signed script's upgrade branch.
 `cancelled`, `output_limit_exceeded`, `setup_failed` (with the exact stage —
 `pipe`, `stdin_device`, `fork`, `session`, `standard_streams`,
 `root_isolation`, `working_directory`, `execute`, `launcher`, `wait` — and the
-operating-system error number), and `rejected`. `Outcome.spawned()` states
+operating-system error number; `snapshot_proc` and `capability_policy` both
+represent non-executed child setup failures), and `rejected`. `Outcome.spawned()` states
 whether a child process actually existed, which separates pre-fork setup
 failures from in-child failures. `Report.succeeded()` is true only for exit
 code 0.
