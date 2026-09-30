@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# Generate fresh pre-script roots for the positive signed systemd, udev and
+# sudo proc replays from the authenticated amd64 closure that
+# tools/real-snapshot-signed-proc-bindings.sh downloaded into WORKSPACE.
+# Pinned dpkg installs that exact closure in the reviewed reference order;
+# tools/real-snapshot-reference-order.py copies the root just before each
+# target is configured. Systemd and udev are copied after dpkg recorded
+# half-configured and was denied execution of the unchanged signed postinst;
+# sudo is copied while it is still unpacked. The copies are disposable
+# fixtures, not native installation results.
+set -euo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# The lock document digest also covers the local keyring path, so bind the
+# authenticated snapshot Release, its signer and the exact archive closure.
+readonly release_sha256=0b2bb35161122b6ef79e8f05f1b14934494db80d7b1d40c46174dc44d95f8ee9
+readonly release_signer=f6ecb3762474eda9d21b7022871920d1991bc93c
+readonly closure_sha256=7773e7c4473bf7f3e51351d6a7192d693daf74aa1fdbc3704734aca8d66a2b13
+readonly pinned_dpkg_sha256=0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5
+readonly signed_dpkg='usr/bin/dpkg:322728:755:6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f'
+readonly setpriv_sha256=9e0d70d26a02c1cb4b984ab6f49a582b7a2c3508b1063ac23adc60073292ae7e
+
+[[ $# == 2 && $(id -u) == 0 ]] || {
+  echo "usage (as root): $0 PINNED_DPKG BINDING_WORKSPACE" >&2
+  exit 2
+}
+[[ $(uname -m) == x86_64 ]] || {
+  echo "the signed systemd/udev/sudo prestates are amd64-only" >&2
+  exit 2
+}
+
+require_protected_path() {
+  local path=$1 current=/ remainder=${1#/} component owner mode metadata
+  [[ "$path" == /* ]] || return 2
+  while :; do
+    [[ -d "$current" && ! -L "$current" ]] || {
+      echo "prestate path is not a real directory: $current" >&2
+      return 2
+    }
+    metadata=$(stat -c '%u:%a' -- "$current")
+    owner=${metadata%%:*}
+    mode=${metadata#*:}
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] &&
+      (( (8#$mode & 022) == 0 )) || {
+      echo "prestate path is writable by an unprivileged user: $current" >&2
+      return 2
+    }
+    [[ -n "$remainder" ]] || break
+    component=${remainder%%/*}
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 2
+    current="${current%/}/$component"
+    if [[ "$remainder" == "$component" ]]; then
+      remainder=
+    else
+      remainder=${remainder#*/}
+    fi
+  done
+}
+
+require_protected_file() {
+  local path=$1 metadata owner mode
+  require_protected_path "$(dirname -- "$path")"
+  [[ -f "$path" && ! -L "$path" ]] || return 2
+  metadata=$(stat -c '%u:%a' -- "$path")
+  owner=${metadata%%:*}
+  mode=${metadata#*:}
+  [[ "$owner" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] &&
+    (( (8#$mode & 022) == 0 )) || {
+    echo "prestate file is writable by an unprivileged user: $path" >&2
+    return 2
+  }
+}
+
+repository_root=$(pwd -P)
+script_path=$(realpath -- "${BASH_SOURCE[0]}")
+[[ "$script_path" == "$repository_root/tools/real-snapshot-signed-proc-prestates.sh" ]] || {
+  echo "run the protected prestate script from its checkout root" >&2
+  exit 2
+}
+require_protected_file "$script_path"
+require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
+require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
+require_protected_path "$repository_root/.real-snapshot"
+[[ $(stat -c '%u:%g:%a' "$repository_root/.real-snapshot") == 0:0:700 ]] || {
+  echo "the fixture directory must be root-owned and mode 0700" >&2
+  exit 2
+}
+pinned=$(realpath -- "$1")
+workspace=$(realpath -- "$2")
+for path in "$pinned" "$workspace"; do
+  case "$path" in
+    "$repository_root"/.real-snapshot/*) ;;
+    *) echo "prestate inputs must be beneath this checkout's .real-snapshot" >&2; exit 2 ;;
+  esac
+done
+[[ ! -L "$1" && ! -L "$2" ]]
+require_protected_file "$pinned"
+[[ -x "$pinned" && $(sha256sum "$pinned" | cut -d' ' -f1) == "$pinned_dpkg_sha256" ]]
+require_protected_path "$workspace"
+[[ $(stat -c '%u:%g:%a' "$workspace") == 0:0:700 ]]
+snapshot=$workspace/snapshot
+lock=$snapshot/evidence/ubuntu-minimal.lock.json
+cache=$snapshot/cache
+require_protected_file "$lock"
+require_protected_path "$cache/packages-v2/objects"
+prestates=$workspace/prestates
+build=$workspace/prestate-build
+tools=$workspace/reference-tools
+for path in "$prestates" "$build" "$tools" "$workspace/prestates.env"; do
+  [[ ! -e "$path" && ! -L "$path" ]] || {
+    echo "prestate output must be new: $path" >&2
+    exit 2
+  }
+done
+python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
+
+# The signed proc profiles bind these exact package identities.
+jq -e --arg release "$release_sha256" --arg signer "$release_signer" '
+  .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
+  .version == 3 and .target_architecture == "amd64" and
+  (.repositories | length) == 1 and
+  .repositories[0].release_sha256 == $release and
+  .repositories[0].signer_fingerprints == [$signer] and
+  all(.packages[]; .archive_identity.primary == "sha512" and
+    ([.archive_identity.digests[] | select(.algorithm == "sha512")] | length) == 1) and
+  ([.packages[] | select(.architecture == "amd64" and (
+    (.name == "systemd" and .version == "261.2-1ubuntu2") or
+    (.name == "udev" and .version == "261.2-1ubuntu2") or
+    (.name == "sudo" and .version == "1.9.17p2-7ubuntu3") or
+    (.name == "sudo-rs" and .version == "0.2.14-1ubuntu2") or
+    (.name == "util-linux" and .version == "2.41.3-3ubuntu2")))] | length) == 5
+' "$lock" >/dev/null
+
+install -d -o root -g root -m 0700 "$build" "$build/evidence" "$build/tmp" "$prestates" "$tools"
+evidence=$build/evidence
+jq -r '
+  .packages[] |
+  [.name, .version, .architecture,
+   (.archive_identity.digests[] | select(.algorithm == "sha512") | .digest),
+   .declared_size] | @tsv
+' "$lock" >"$evidence/reference-archives.tsv"
+[[ $(LC_ALL=C sort -- "$evidence/reference-archives.tsv" | sha256sum | cut -d' ' -f1) == "$closure_sha256" ]] || {
+  echo "prestate closure differs from the reviewed snapshot closure" >&2
+  exit 1
+}
+
+bootstrap=()
+util_linux=
+while IFS=$'\t' read -r name version package_arch digest size; do
+  [[ "$name" =~ ^[a-z0-9][a-z0-9+.-]*$ &&
+     "$version" != *$'\t'* && "$version" != *$'\n'* &&
+     ( "$package_arch" == amd64 || "$package_arch" == all ) ]] || {
+    echo "invalid prestate package identity" >&2
+    exit 1
+  }
+  [[ "$digest" =~ ^[a-f0-9]{128}$ && "$size" =~ ^[0-9]+$ ]]
+  archive=$cache/packages-v2/objects/sha512-$digest
+  [[ -f "$archive" && ! -L "$archive" ]]
+  [[ $(stat -c '%s' "$archive") == "$size" ]]
+  printf '%s  %s\n' "$digest" "$archive" | sha512sum --check --status
+  case "$name" in
+    libc6|dash|bash|gnu-coreutils|coreutils|coreutils-from-gnu|dpkg|libmd0|libbz2-1.0|liblzma5|libselinux1|libzstd1|zlib1g|libacl1|libattr1|libgmp10|libssl4|libsystemd0|libpcre2-8-0|libgcc-s1|libcrypt1|perl-base|mawk|sed|grep|findutils|tar|gzip|debianutils|debconf)
+      bootstrap+=("$archive") ;;
+    util-linux) util_linux=$archive ;;
+  esac
+done <"$evidence/reference-archives.tsv"
+(( ${#bootstrap[@]} == 30 )) && [[ -n "$util_linux" ]] || {
+  echo "prestate bootstrap tool closure is incomplete" >&2
+  exit 1
+}
+
+# Same unregistered bootstrap as tools/real-snapshot-reference.sh.
+root=$build/root
+mkdir -p "$root/usr/bin" "$root/usr/sbin" "$root/usr/lib" "$root/usr/lib64" \
+  "$root/var/lib/dpkg/"{info,triggers,updates} "$root/dev" "$root/proc" \
+  "$root/tmp" "$root/var/tmp"
+chmod 755 "$root/dev" "$root/proc"
+chmod 1777 "$root/tmp" "$root/var/tmp"
+mknod -m 666 "$root/dev/null" c 1 3
+ln -s usr/bin "$root/bin"
+ln -s usr/sbin "$root/sbin"
+ln -s usr/lib "$root/lib"
+ln -s usr/lib64 "$root/lib64"
+: >"$root/var/lib/dpkg/status"
+for archive in "${bootstrap[@]}"; do
+  dpkg-deb --extract "$archive" "$root"
+done
+printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nrelease_sha256=%s\nclosure_sha256=%s\nbootstrap_archives=%s\n' \
+  "$(sha256sum "$pinned" | cut -d' ' -f1)" "$(sha256sum "$lock" | cut -d' ' -f1)" \
+  "$release_sha256" "$closure_sha256" "${#bootstrap[@]}" >"$evidence/reference-identity.txt"
+
+env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
+  unshare --mount --propagation private -- \
+  sh -c 'mount -t proc -o nosuid,nodev,noexec proc "$1/proc" && shift && exec "$@"' \
+  sh "$root" timeout --signal=TERM --kill-after=30s 20m \
+  python3 tools/real-snapshot-reference-order.py \
+    --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
+    --prestate "systemd:amd64=half-configured:$prestates/systemd" \
+    --prestate "udev:amd64=half-configured:$prestates/udev" \
+    --prestate "sudo:amd64=unpacked:$prestates/sudo"
+dpkg-query --admindir="$root/var/lib/dpkg" \
+  -W -f='${db:Status-Abbrev} ${binary:Package} ${Version}\n' >"$evidence/stopped-installed.txt"
+[[ -z $(find "$root/proc" -mindepth 1 -print -quit) ]]
+rm -rf --one-file-system -- "$root" "$build/tmp"
+
+expected_record=$(printf '%s\t%s\t%s\n' \
+  systemd:amd64 '261.2-1ubuntu2 install ok half-configured' "$prestates/systemd" \
+  udev:amd64 '261.2-1ubuntu2 install ok half-configured' "$prestates/udev" \
+  sudo:amd64 '1.9.17p2-7ubuntu3 install ok unpacked' "$prestates/sudo")
+[[ $(cat "$prestates/prestates.tsv") == "$expected_record" ]]
+
+require_control() { # root name:size:mode:sha256
+  local name size mode digest file
+  IFS=: read -r name size mode digest <<<"$2"
+  file=$1/$name
+  require_protected_file "$file"
+  [[ $(stat -c '%u:%g:%s:%a:%h' "$file") == "0:0:$size:$mode:1" &&
+     $(sha256sum "$file" | cut -d' ' -f1) == "$digest" ]] || {
+    echo "prestate control changed: $file" >&2
+    return 1
+  }
+}
+require_prestate() { # package status control
+  local target=$prestates/$1
+  require_protected_path "$target"
+  [[ $(stat -c '%u:%g:%a' "$target") == 0:0:700 ]]
+  [[ ! -L "$target/proc" && $(stat -c '%u:%g:%a' "$target/proc") == 0:0:755 ]]
+  [[ -z $(find "$target/proc" -mindepth 1 -print -quit) ]]
+  [[ $(dpkg-query --admindir="$target/var/lib/dpkg" -W -f='${Version} ${Status}' "$1") == "$2" ]]
+  require_control "$target" "$3"
+  require_control "$target" "$signed_dpkg"
+  [[ ! -e "$target/usr/bin/setpriv" && ! -L "$target/usr/bin/setpriv" ]]
+}
+require_prestate systemd '261.2-1ubuntu2 install ok half-configured' \
+  'var/lib/dpkg/info/systemd.postinst:4942:755:39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412'
+require_prestate udev '261.2-1ubuntu2 install ok half-configured' \
+  'var/lib/dpkg/info/udev.postinst:2533:755:861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee'
+require_prestate sudo '1.9.17p2-7ubuntu3 install ok unpacked' \
+  'var/lib/dpkg/info/sudo.postinst:1927:755:e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8'
+
+# Pinned dpkg writes sudo.list in extraction order, symbolic links last; the
+# signed sudo binding pins the native engine's C-sorted list. Only the order
+# changes: the pinned digest proves the sorted list is the exact path set.
+list=$prestates/sudo/var/lib/dpkg/info/sudo.list
+require_protected_file "$list"
+[[ $(stat -c '%u:%g:%a:%h' "$list") == 0:0:644:1 ]]
+LC_ALL=C sort -- "$list" >"$list.sorted"
+chmod 0644 "$list.sorted"
+mv -- "$list.sorted" "$list"
+# The pre-sudo record is sudo-rs's registration before sudo's postinst.
+require_control "$prestates/sudo" \
+  'var/lib/dpkg/info/sudo.list:2376:644:92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f'
+require_control "$prestates/sudo" \
+  'var/lib/dpkg/alternatives/sudo:464:644:4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6'
+[[ $(dpkg-query --admindir="$prestates/sudo/var/lib/dpkg" -W \
+  -f='${Version} ${Status}' sudo-rs) == '0.2.14-1ubuntu2 install ok installed' ]]
+for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit' \
+  'usr/share/man/man8/sudoedit.8.gz:/etc/alternatives/sudoedit.8.gz'; do
+  [[ -L "$prestates/sudo/${link%%:*}" &&
+     $(readlink -- "$prestates/sudo/${link%%:*}") == "${link#*:}" ]]
+done
+
+# Udev's signed static-node permissions only adjust existing paths. These are
+# regular files, never host device nodes, as in the recorded pinned proof.
+for node in dev/kvm dev/fuse dev/snd/seq; do
+  [[ ! -e "$prestates/udev/$node" && ! -L "$prestates/udev/$node" ]]
+done
+install -d -o root -g root -m 0755 "$prestates/udev/dev/snd"
+for node in dev/kvm dev/fuse dev/snd/seq; do
+  install -o root -g root -m 0600 /dev/null "$prestates/udev/$node"
+done
+
+# Reference-only: the pinned-dpkg proof harnesses drop CAP_SYS_ADMIN with the
+# closure's setpriv, which util-linux has not unpacked yet in these states.
+dpkg-deb --fsys-tarfile "$util_linux" | tar -xO ./usr/bin/setpriv >"$tools/setpriv"
+chmod 0755 "$tools/setpriv"
+[[ $(sha256sum "$tools/setpriv" | cut -d' ' -f1) == "$setpriv_sha256" ]]
+
+printf 'SIGNED_SYSTEMD_PRESTATE=%s\nSIGNED_UDEV_PRESTATE=%s\nSIGNED_SUDO_PRESTATE=%s\nREFERENCE_SETPRIV=%s\n' \
+  "$prestates/systemd" "$prestates/udev" "$prestates/sudo" "$tools/setpriv" \
+  >"$workspace/prestates.env"
+printf 'release_sha256=%s\nclosure_sha256=%s\nprestates=3\n' "$release_sha256" "$closure_sha256"
+cat "$prestates/prestates.tsv"

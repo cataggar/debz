@@ -431,9 +431,134 @@ sudo -n tools/real-snapshot-sudo-reference.sh \
   "$PINNED_DPKG" "$PRE_SUDO" "$SUDO_PROOF"
 ```
 
-Prepare and verify the pinned dpkg 1.22.22 and its receipt in the protected
-checkout; these procedures verify the paths and signed source identity and
-create proof roots, but do **not** manufacture the before-script sources.
+The proof harnesses drop capabilities with the closure's `setpriv`, so
+each proof source (never a native replay copy) needs `usr/bin/setpriv`
+from the pinned util-linux; see below.
+
+#### Generated signed prestates
+
+`tools/real-snapshot-signed-proc-prestates.sh PINNED_DPKG WORKSPACE`
+manufactures the three before-script sources. Run it **as root on amd64**
+from the protected checkout root, after
+`tools/real-snapshot-signed-proc-bindings.sh` has authenticated the pinned
+closure into the same `WORKSPACE`. It reuses that closure and does not
+fetch anything. It:
+
+- verifies the pinned dpkg 1.22.22 binary and receipt, and the
+  exact systemd and udev (261.2-1ubuntu2), sudo (1.9.17p2-7ubuntu3),
+  sudo-rs (0.2.14-1ubuntu2) and util-linux versions. It binds the lock to
+  the authenticated `stonking` Release (SHA-256 `0b2bb351…`, signer
+  `f6ecb376…`) and to the sorted 175-package closure of name, version,
+  architecture, SHA-512 and size (`7773e7c4…`). It does not bind the lock
+  document digest, which also covers the local keyring path. It then
+  rehashes every locked archive by size and SHA-512;
+- bootstraps the same unregistered tool root as
+  `tools/real-snapshot-reference.sh`, then lets **pinned dpkg** install the
+  closure in the reviewed order with
+  `tools/real-snapshot-reference-order.py --prestate`. Non-target packages
+  are configured in explicit batches, so no target is configured
+  implicitly. Before systemd and udev are configured, the order tool binds
+  each unchanged signed postinst `noexec`: dpkg records `half-configured`
+  without running the script, and the root is copied at that point. sudo
+  is copied while `unpacked`, after sudo-rs registered its alternatives;
+- checks each copy: root-owned mode 0700, an empty `proc`, the dpkg
+  status, the signed postinst and `usr/bin/dpkg` bytes, and no `setpriv`.
+
+It then applies three reviewed normalizations:
+
+- pinned dpkg writes `sudo.list` in extraction order, with symbolic links
+  last. The signed sudo binding pins the C-sorted list, so the script sorts
+  it and requires the pinned digest (2376 bytes, `92f90d6a…`). This proves
+  that only the order changed.
+- udev's static-node permissions only adjust existing paths. `dev/kvm`,
+  `dev/fuse` and `dev/snd/seq` are created as empty **regular files**,
+  `root:root` 0600, never as device nodes, as in the recorded pinned proof.
+- util-linux is not yet unpacked in these states. The script therefore
+  extracts only its `usr/bin/setpriv` (SHA-256 `9e0d70d2…`) into
+  `WORKSPACE/reference-tools` for the pinned-dpkg proof sources.
+
+The prestates are disposable fixtures, not native installation results.
+The build tree is removed; `WORKSPACE/prestate-build/evidence` keeps the
+reference order logs.
+
+`tools/real-snapshot-signed-proc-compare.py TARGET NATIVE PROOF REPORT`
+inventories a replayed native root and its pinned-dpkg proof. It records
+type, owner, mode, size, link count, link target, device number and SHA-256
+for every entry, requires `proc` to be empty and refuses mount crossings.
+The native test runs only the signed postinst, while the proof runs
+`dpkg --configure`, so a few differences are expected. Each is accepted
+only by an exact rule, derived from the first hosted amd64 reports and
+covered by `tools/test_real_snapshot_signed_proc_compare.py`:
+
+- **proof harness files:** `usr/bin/setpriv` (only in the proof, SHA-256
+  `9e0d70d2…`) and pinned dpkg (`0a20f601…`). For udev and sudo that is
+  proof-only `usr/local/sbin/dpkg`; for systemd it replaces the snapshot
+  `usr/bin/dpkg` (`6587ef9e…`). Also `run/mount`, the empty root-owned
+  0700 directory that the chrooted `mount -t proc` (libmount) creates;
+- **dpkg bookkeeping:** `var/log/dpkg.log` exists only in the proof and
+  may record only its configure of the target. In `status` only the
+  target stanza may change: `unpacked` or `half-configured` becomes
+  `installed`, `Config-Version` may equal only `Version`, and each
+  `newconffile` hash becomes the MD5 of the proof's installed conffile.
+  The proof's `status-old` must equal the native (unconfigured) `status`;
+- **new conffiles:** each `newconffile` in the target's native status
+  (sudo's `/etc/sudo.conf` and `/etc/sudo_logsrvd.conf`) stays
+  `NAME.dpkg-new` natively and must be byte- and metadata-identical to the
+  proof's installed `NAME`. dpkg installs new conffiles before the
+  postinst; the native test replays the postinst alone;
+- **nondeterminism:** systemd's `etc/machine-id` may differ only in
+  content, and each copy must be one lowercase 32-hex-digit line;
+  `var/log/alternatives.log` may differ only in its `update-alternatives
+  YYYY-MM-DD HH:MM:SS:` stamps.
+
+Any other difference, or an unreadable or changed file, fails.
+
+#### Hosted protected amd64 replay
+
+The CI job **Signed proc replay in protected amd64 roots**
+(`signed-proc-protected-replay`) runs on hosted `ubuntu-24.04` x86_64 for
+every push and pull request. Debug and ReleaseSafe each run on their own
+runner with fresh roots, within 35 minutes. Each run:
+
+1. runs the prestate and binding scripts from the runner-owned checkout
+   and requires both to refuse the writable ancestry. It also requires
+   `test-native-signed-proc` to reject missing and relative roots;
+2. stages the reviewed commit (`git archive HEAD`), the verified Zig 0.16.0
+   installation, the pinned dpkg prefix and the pinned
+   `ubuntu-archive-keyring.gpg` (ubuntu-keyring 2023.11.28.1) beneath
+   `/srv/debz-protected/signed-proc`. Every staged entry and every
+   ancestor must be `root:root` and not group- or world-writable; the
+   runner's own `/usr/share` is writable, so the keyring is copied and pinned;
+3. as root, builds `debz`, authenticates the closure with the binding
+   script and generates the prestates;
+4. copies each prestate twice: once as a native root and once as a proof
+   source with `setpriv`. The sudo proof harness restores the two signed
+   `sudoedit` payload links (`-> sudo.ws`, `-> sudo.ws.8.gz`) before
+   configure. The job applies the same two links to the native sudo root, so
+   both start in the same state. The prestate itself keeps the
+   `/etc/alternatives` links that sudo-rs registered. It runs the three
+   pinned-dpkg proof harnesses on the proof sources, and runs
+   `test-native-signed-proc` on the native roots. It requires `All 4 tests passed.`, with each of the three signed
+   replays reported `OK`; the fourth is the root module's reference test.
+   A skip therefore fails the job;
+5. runs the comparison unit tests, compares each native root with its
+   proof, and fails on any unexpected difference. It then executes the signed
+   binding refusal fixtures from the same workspace. Only the three positive
+   replays may skip there, because step 4 ran them;
+6. always copies bounded evidence (logs, the lock, `prestates.tsv`,
+   reference order logs, comparison reports, the proofs' `dpkg.log` and
+   both sudo `alternatives.log` files) into the
+   `signed-proc-protected-replay-*` artifact. It fails if a mount under
+   the staged path survives, then removes the staged path.
+
+The job is **not** part of the `Build and test` aggregate. The pinned
+`stonking` snapshot Release is `Valid-Until: Tue, 06 Oct 2026 22:41:59 UTC`.
+After that date, authentication fails closed. The #262 repin also changes
+the signed identities that these bindings pin. Make the job required only
+after that repin, with refreshed pins and a green run in both modes.
+`tools/security-audit.py` (`check ci-signed-proc`) and
+`test/security-policy.zig` keep its runner, modes, timeout, staging,
+refusals and no-skip assertions fixed.
 
 #### Signed binding refusal fixtures
 
@@ -490,8 +615,9 @@ gh workflow run ci.yml --repo cataggar/debz \
 ```
 
 This dispatch can provide fresh-root ReleaseSafe observations but does
-**not** automatically satisfy the direct signed prestate replay gate; absent
-prestate fixtures or non-zero script outcomes remain explicit blockers.
+**not** satisfy the direct signed prestate replay gate. That gate is the
+hosted protected amd64 replay job described above; a skipped or non-zero
+script outcome there remains an explicit blocker.
 The shared network boundary still belongs to #278.
 
 **Separate network boundary (#278):** dropping `CAP_NET_ADMIN` and

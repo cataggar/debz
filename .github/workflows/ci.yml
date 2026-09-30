@@ -1612,6 +1612,256 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  signed-proc-protected-replay:
+    name: Signed proc replay in protected amd64 roots (${{ matrix.optimize }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [Debug, ReleaseSafe]
+    env:
+      OPTIMIZE: ${{ matrix.optimize }}
+      PROTECTED: /srv/debz-protected/signed-proc
+      # ubuntu-keyring 2023.11.28.1 ubuntu-archive-keyring.gpg authenticates the pinned snapshot.
+      UBUNTU_ARCHIVE_KEYRING_SHA256: 80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: v0.8.1
+          tools: >-
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      - name: Validate Zig version
+        run: test "$(zig version)" = 0.16.0
+      - name: Bind the reviewed commit to a hosted amd64 runner
+        run: |
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -m)" = x86_64
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test ! -e "$PROTECTED" && test ! -L "$PROTECTED"
+      - name: Install metadata decompression dependency
+        run: |
+          if ! command -v pkg-config >/dev/null ||
+             ! pkg-config --exists liblzma libzstd ||
+             ! command -v jq >/dev/null; then
+            if [ -f /etc/apt/apt-mirrors.txt ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/apt-mirrors.txt
+            fi
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+            sudo apt-get install --yes --no-install-recommends jq liblzma-dev libzstd-dev pkg-config
+          fi
+      - name: Prepare pinned dpkg as the runner user
+        id: reference
+        run: |
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"
+          test "$reference_dpkg" = "$PWD/.cache/native-dpkg-reference/1.22.22/amd64/usr/bin/dpkg"
+          printf 'dpkg=%s\n' "$reference_dpkg" >>"$GITHUB_OUTPUT"
+      - name: Refuse unprotected and incomplete signed replay inputs
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          if sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            tools/real-snapshot-signed-proc-prestates.sh "$PWD/.real-snapshot/dpkg" \
+            "$PWD/.real-snapshot/ws" 2>.tmp/unprotected-prestates.log; then exit 1; fi
+          grep -Fq 'prestate path is writable by an unprivileged user' .tmp/unprotected-prestates.log
+          if sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \
+            "$PWD/.real-snapshot/ws" 2>.tmp/unprotected-bindings.log; then exit 1; fi
+          grep -Fq 'fixture path is writable by an unprivileged user' .tmp/unprotected-bindings.log
+          if zig build test-native-signed-proc -j2 2>.tmp/missing-roots.log; then exit 1; fi
+          grep -Fq 'signed proc replay requires -Dsigned-systemd-proc-root' .tmp/missing-roots.log
+          if zig build test-native-signed-proc -j2 -Dsigned-systemd-proc-root=relative \
+            -Dsigned-udev-proc-root=/protected/udev -Dsigned-sudo-proc-root=/protected/udev \
+            2>.tmp/relative-roots.log; then exit 1; fi
+          grep -Fq 'three distinct absolute disposable root paths' .tmp/relative-roots.log
+      - name: Stage the reviewed commit, Zig and pinned dpkg under root-owned ancestry
+        env:
+          REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
+        run: |
+          set -euo pipefail
+          git -c tar.umask=0022 archive --format=tar -o .tmp/protected-checkout.tar HEAD
+          zig_binary="$(readlink -f "$(command -v zig)")"
+          zig_home="$(dirname "$zig_binary")"
+          test -f "$zig_home/lib/std/std.zig"
+          reference_prefix="$(dirname "$(dirname "$(dirname "$REFERENCE_DPKG")")")"
+          sudo -n install -d -o root -g root -m 0755 /srv/debz-protected
+          sudo -n install -d -o root -g root -m 0755 "$PROTECTED" "$PROTECTED/checkout"
+          sudo -n install -d -o root -g root -m 0700 "$PROTECTED/zig-global-cache"
+          sudo -n install -o root -g root -m 0644 .tmp/protected-checkout.tar "$PROTECTED/checkout.tar"
+          sudo -n tar -C "$PROTECTED/checkout" --no-same-owner -xf "$PROTECTED/checkout.tar"
+          sudo -n cp -R -- "$zig_home" "$PROTECTED/zig"
+          sudo -n install -d -o root -g root -m 0700 "$PROTECTED/checkout/.real-snapshot" \
+            "$PROTECTED/checkout/.tmp" "$PROTECTED/checkout/.cache"
+          sudo -n cp -R -- "$reference_prefix" "$PROTECTED/checkout/.real-snapshot/pinned-dpkg"
+          sudo -n install -d -o root -g root -m 0755 "$PROTECTED/keyrings"
+          sudo -n install -o root -g root -m 0644 /usr/share/keyrings/ubuntu-archive-keyring.gpg \
+            "$PROTECTED/keyrings/ubuntu-archive-keyring.gpg"
+          sha256sum --check --strict \
+            <<<"$UBUNTU_ARCHIVE_KEYRING_SHA256  $PROTECTED/keyrings/ubuntu-archive-keyring.gpg"
+          sudo -n chmod -R go-w "$PROTECTED"
+          sudo -n find "$PROTECTED" -xdev \( ! -uid 0 -o ! -gid 0 -o -perm /022 \) ! -type l \
+            -print >.tmp/protected-writable.txt
+          test ! -s .tmp/protected-writable.txt
+          for path in / /srv /srv/debz-protected "$PROTECTED"; do
+            test "$(stat -c '%u:%g' "$path")" = 0:0
+            test $(( 8#$(stat -c '%a' "$path") & 022 )) -eq 0
+          done
+          sudo -n cmp -- "$zig_binary" "$PROTECTED/zig/zig"
+          test "$(sudo -n env -i "$PROTECTED/zig/zig" version)" = 0.16.0
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 \
+            python3 "$PROTECTED/checkout/tools/prepare-native-dpkg.py" --architecture amd64 \
+            --verify-only "$PROTECTED/checkout/.real-snapshot/pinned-dpkg/usr/bin/dpkg"
+          sha256sum .tmp/protected-checkout.tar "$zig_binary"
+      - name: Build the protected snapshot client
+        timeout-minutes: 12
+        working-directory: ${{ env.PROTECTED }}/checkout
+        run: |
+          sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \
+            ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
+            zig build -Doptimize=Debug -j2 --summary all
+      - name: Authenticate the snapshot closure and generate fresh signed prestates
+        timeout-minutes: 12
+        working-directory: ${{ env.PROTECTED }}/checkout
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 \
+            DEBZ_REAL_SNAPSHOT_KEYRING="$PROTECTED/keyrings/ubuntu-archive-keyring.gpg" \
+            tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \
+            "$PWD/.real-snapshot/ws"
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 \
+            tools/real-snapshot-signed-proc-prestates.sh \
+            "$PWD/.real-snapshot/pinned-dpkg/usr/bin/dpkg" "$PWD/.real-snapshot/ws"
+      - name: Run pinned dpkg proofs on separate prestate copies
+        timeout-minutes: 8
+        working-directory: ${{ env.PROTECTED }}/checkout
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 \
+            bash -euo pipefail -c '
+              ws=$1/.real-snapshot/ws
+              pinned=$1/.real-snapshot/pinned-dpkg/usr/bin/dpkg
+              install -d -o root -g root -m 0700 "$ws/native" "$ws/proof-sources" "$ws/proofs"
+              for target in systemd udev sudo; do
+                cp -a -- "$ws/prestates/$target" "$ws/native/$target"
+                cp -a -- "$ws/prestates/$target" "$ws/proof-sources/$target"
+                install -o root -g root -m 0755 "$ws/reference-tools/setpriv" \
+                  "$ws/proof-sources/$target/usr/bin/setpriv"
+              done
+              # The sudo proof first restores the two signed payload links that
+              # sudo unpack leaves; start the native replay from that state too.
+              ln -sfn -- sudo.ws "$ws/native/sudo/usr/bin/sudoedit"
+              ln -sfn -- sudo.ws.8.gz "$ws/native/sudo/usr/share/man/man8/sudoedit.8.gz"
+              test "$(readlink -- "$ws/native/sudo/usr/bin/sudoedit")" = sudo.ws
+              test "$(readlink -- "$ws/native/sudo/usr/share/man/man8/sudoedit.8.gz")" = sudo.ws.8.gz
+              tools/real-snapshot-systemd-proc-reference.sh "$pinned" \
+                "$ws/proof-sources/systemd" "$ws/proofs/systemd"
+              tools/real-snapshot-udev-reference.sh "$pinned" \
+                "$ws/proof-sources/udev" "$ws/proofs/udev"
+              tools/real-snapshot-sudo-reference.sh "$pinned" \
+                "$ws/proof-sources/sudo" "$ws/proofs/sudo"
+            ' bash "$PWD"
+      - name: Replay signed systemd, udev and sudo postinsts natively without skips
+        timeout-minutes: 25
+        working-directory: ${{ env.PROTECTED }}/checkout
+        run: |
+          set -euo pipefail
+          ws="$PWD/.real-snapshot/ws"
+          sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \
+            ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
+            zig build test-native-signed-proc -Doptimize="$OPTIMIZE" -j2 --summary all \
+              -Dsigned-systemd-proc-root="$ws/native/systemd" \
+              -Dsigned-udev-proc-root="$ws/native/udev" \
+              -Dsigned-sudo-proc-root="$ws/native/sudo" \
+              >"$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log" 2>&1 || status=$?
+          cat "$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log"
+          test "${status:-0}" -eq 0
+          # debz.test_0 is the root module's reference test; the other three are the signed replays.
+          grep -Fxq 'All 4 tests passed.' "$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log"
+          for name in 'systemd postinst uses scoped masked proc' \
+            'udev postinst uses only PID proc and applies static permissions' \
+            'sudo postinst repairs only pinned alternatives with PID-only proc'; do
+            grep -Fq "maintainer_script.test.signed $name...OK" "$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log"
+          done
+      - name: Compare native replays with pinned dpkg proofs
+        timeout-minutes: 5
+        working-directory: ${{ env.PROTECTED }}/checkout
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C.UTF-8 \
+            PYTHONDONTWRITEBYTECODE=1 bash -euo pipefail -c '
+              ws=$1/.real-snapshot/ws
+              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py
+              install -d -o root -g root -m 0700 "$ws/compare"
+              for target in systemd udev sudo; do
+                python3 tools/real-snapshot-signed-proc-compare.py "$target" \
+                  "$ws/native/$target" "$ws/proofs/$target" "$ws/compare/$target.json"
+              done
+            ' bash "$PWD"
+      - name: Execute signed binding refusal fixtures
+        timeout-minutes: 25
+        working-directory: ${{ env.PROTECTED }}/checkout
+        run: |
+          set -euo pipefail
+          sudo -n env -i PATH="$PROTECTED/zig:/usr/sbin:/usr/bin:/sbin:/bin" HOME=/root \
+            ZIG_GLOBAL_CACHE_DIR="$PROTECTED/zig-global-cache" \
+            DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1 \
+            sh -c 'set -a && . "$1" && set +a && exec zig build test-maintainer-script \
+              -Doptimize="$2" -j2 --summary all' \
+            sh "$PWD/.real-snapshot/ws/bindings.env" "$OPTIMIZE" \
+            >"$GITHUB_WORKSPACE/.tmp/signed-bindings.log" 2>&1 || status=$?
+          cat "$GITHUB_WORKSPACE/.tmp/signed-bindings.log"
+          test "${status:-0}" -eq 0
+          grep -Eq 'run test [0-9]+ pass, 3 skip \([0-9]+ total\)' "$GITHUB_WORKSPACE/.tmp/signed-bindings.log"
+      - name: Copy bounded evidence and remove named protected roots
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/signed-proc-evidence"
+          mkdir -p "$evidence"
+          cp .tmp/*.log "$evidence/" 2>/dev/null || true
+          if sudo -n test -d "$PROTECTED/checkout/.real-snapshot/ws"; then
+            sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin bash -euo pipefail -c '
+              ws=$1 out=$2
+              for file in bindings.env prestates.env prestates/prestates.tsv \
+                snapshot/evidence/ubuntu-minimal.lock.json \
+                prestate-build/evidence/reference-archives.tsv \
+                prestate-build/evidence/reference-identity.txt \
+                prestate-build/evidence/stopped-installed.txt \
+                prestate-build/evidence/reference-install.stdout \
+                prestate-build/evidence/reference-install.stderr \
+                compare/systemd.json compare/udev.json compare/sudo.json \
+                proofs/systemd/var/log/dpkg.log proofs/udev/var/log/dpkg.log \
+                proofs/sudo/var/log/dpkg.log proofs/sudo/var/log/alternatives.log \
+                native/sudo/var/log/alternatives.log; do
+                if [ -f "$ws/$file" ] && [ ! -L "$ws/$file" ]; then
+                  tail -c 4194304 -- "$ws/$file" >"$out/${file//\//_}"
+                fi
+              done
+            ' bash "$PROTECTED/checkout/.real-snapshot/ws" "$evidence"
+          fi
+          sudo -n chown -R "$(id -u):$(id -g)" "$evidence"
+          findmnt -rn -o TARGET >.tmp/signed-proc-mounts.txt
+          if grep -F "$PROTECTED" .tmp/signed-proc-mounts.txt; then
+            echo "a protected fixture mount survived" >&2
+            exit 1
+          fi
+          sudo -n rm -rf --one-file-system -- "$PROTECTED"
+          test ! -e "$PROTECTED"
+      - name: Upload bounded signed replay evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-proc-protected-replay-${{ matrix.optimize }}-${{ github.sha }}
+          path: .tmp/signed-proc-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
   build-and-test:
     name: Build and test (${{ matrix.name }})
     needs: [build-and-test-workload, build-and-test-workload-production, build-and-test-workload-apt-system, build-and-test-workload-native, build-and-test-workload-release, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]

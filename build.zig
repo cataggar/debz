@@ -1025,6 +1025,10 @@ pub fn build(b: *std.Build) void {
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_oracle_evidence.py" },
     );
     workload_native.dependOn(&dpkg_oracle_evidence_tests.step);
+    const signed_proc_compare_tests = b.addSystemCommand(
+        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_real_snapshot_signed_proc_compare.py" },
+    );
+    workload_native.dependOn(&signed_proc_compare_tests.step);
 
     const native_lifecycle_tests = b.addTest(.{
         .root_module = debz,
@@ -1184,9 +1188,8 @@ pub fn build(b: *std.Build) void {
         .root_module = root_import_module,
     });
     const root_import = b.addSystemCommand(&.{
-        "sudo", "-n", "env",
-        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}),
-        b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
+        "sudo",                                         "-n",                                                     "env",
+        b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
     });
     root_import.addArtifactArg(root_import_executable);
     root_import.addArtifactArg(native_lifecycle_tests);

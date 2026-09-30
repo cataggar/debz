@@ -652,6 +652,56 @@ test "security: required CI modes, architecture and aggregate failure propagatio
     }
 }
 
+test "security: hosted amd64 signed proc replay refuses skips, weakened staging and hidden failures" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const valid = try f.check("ci-signed-proc", workflow);
+    defer valid.deinit();
+    try valid.ok();
+    const signed = try job(workflow, "signed-proc-protected-replay", "\n  build-and-test:\n");
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "    timeout-minutes: 35", .after = "    timeout-minutes: 90" },
+        .{ .before = "    runs-on: ubuntu-24.04", .after = "    runs-on: ubuntu-24.04-arm" },
+        .{ .before = "optimize: [Debug, ReleaseSafe]", .after = "optimize: [Debug]" },
+        .{ .before = "      PROTECTED: /srv/debz-protected/signed-proc", .after = "      PROTECTED: /home/runner/signed-proc" },
+        .{ .before = "      UBUNTU_ARCHIVE_KEYRING_SHA256: 80a36b0a", .after = "      UBUNTU_ARCHIVE_KEYRING_SHA256: 00a36b0a" },
+        .{ .before = "            DEBZ_REAL_SNAPSHOT_KEYRING=\"$PROTECTED/keyrings/ubuntu-archive-keyring.gpg\" \\\n", .after = "" },
+        .{ .before = "    strategy:\n", .after = "    if: false\n    strategy:\n" },
+        .{ .before = "    strategy:\n", .after = "    continue-on-error: true\n    strategy:\n" },
+        .{ .before = "          test \"$RUNNER_ARCH\" = X64\n", .after = "" },
+        .{ .before = "grep -Fq 'prestate path is writable by an unprivileged user'", .after = "true" },
+        .{ .before = "grep -Fq 'fixture path is writable by an unprivileged user'", .after = "true" },
+        .{ .before = "grep -Fq 'three distinct absolute disposable root paths'", .after = "true" },
+        .{ .before = "--no-same-owner", .after = "--same-owner" },
+        .{ .before = "          test ! -s .tmp/protected-writable.txt\n", .after = "" },
+        .{ .before = "for path in / /srv /srv/debz-protected \"$PROTECTED\"; do", .after = "for path in \"$PROTECTED\"; do" },
+        .{ .before = "            tools/real-snapshot-signed-proc-prestates.sh \\", .after = "            true \\" },
+        .{ .before = "cp -a -- \"$ws/prestates/$target\" \"$ws/proof-sources/$target\"", .after = "ln -s -- \"$ws/native/$target\" \"$ws/proof-sources/$target\"" },
+        .{ .before = "              ln -sfn -- sudo.ws \"$ws/native/sudo/usr/bin/sudoedit\"\n", .after = "" },
+        .{ .before = "-Dsigned-udev-proc-root=\"$ws/native/udev\"", .after = "-Dsigned-udev-proc-root=\"$ws/native/systemd\"" },
+        .{ .before = "          test \"${status:-0}\" -eq 0\n", .after = "" },
+        .{ .before = "grep -Fxq 'All 4 tests passed.'", .after = "grep -Fq 'passed'" },
+        .{ .before = "            'udev postinst uses only PID proc and applies static permissions' \\\n", .after = "" },
+        .{ .before = "grep -Fq \"maintainer_script.test.signed $name...OK\"", .after = "true" },
+        .{ .before = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n", .after = "      - name: Replay signed systemd, udev and sudo postinsts natively without skips\n        if: false\n" },
+        .{ .before = "        timeout-minutes: 25\n", .after = "        timeout-minutes: 25\n        continue-on-error: true\n" },
+        .{ .before = "python3 tools/real-snapshot-signed-proc-compare.py \"$target\"", .after = "python3 tools/real-snapshot-signed-proc-compare.py --report-only \"$target\"" },
+        .{ .before = "              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py\n", .after = "" },
+        .{ .before = "      - name: Execute signed binding refusal fixtures\n", .after = "      - name: Skip signed binding refusal fixtures\n" },
+        .{ .before = "grep -Eq 'run test [0-9]+ pass, 3 skip", .after = "grep -Eq 'run test [0-9]+ pass, [0-9]+ skip" },
+        .{ .before = "        if: ${{ always() }}\n        run: |", .after = "        run: |" },
+        .{ .before = "sudo -n rm -rf --one-file-system -- \"$PROTECTED\"", .after = "true" },
+    }) |mutation| {
+        const changed_job = try f.replace(signed, mutation.before, mutation.after);
+        const changed = try f.replace(workflow, signed, changed_job);
+        const rejected = try f.check("ci-signed-proc", changed);
+        defer rejected.deinit();
+        if (rejected.code == 0) std.debug.print("signed proc CI mutation missed: {s}\n", .{mutation.before});
+        try rejected.failsWith("ci.yml: signed proc replay");
+    }
+}
+
 test "security: every split build workload job, mode and step fails closed under mutation" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -1409,14 +1459,13 @@ test "security: apt import and native child-process owners retain explicit bound
     const runner = try f.source("src/maintainer_script.zig");
     try testing.expect(std.mem.indexOf(u8, runner, "std.process.run(") == null);
     for ([_][]const u8{
-        "linux.open(\"/dev/null\"",                            "linux.chroot(\".\")",                        "linux.unshare(linux.CLONE.NEWNS)",
-        "live_root.cloneMountDescriptor(",                     "live_root.setMountAttributes(",              "linux.move_mount(",
-        "const clone_flags = linux.CLONE.NEWNET |",            "linux.CLONE.NEWNS | linux.CLONE.NEWPID",     "fn setupPrivateLoopback() linux.E",
-        "\"private-network-loopback-v1\\x00\"",                "fn sealInheritedDescriptors() linux.E",      "linux.PR.CAPBSET_DROP",
-        "linux.PR.SET_NO_NEW_PRIVS",
-        "linux.PR.SET_PDEATHSIG",                              "linux.syscall2(\n        .capget,",          "linux.syscall2(\n        .capset,",
-        "linux.SECCOMP.SET_MODE_FILTER",                       "restrictScriptPrivileges(null, false)",      "restrictScriptPrivileges(failure_stage, true)",
-        "linux.syscall3(\n        .close_range,",              "@offsetOf(KernelCapabilityHeader, \"pid\")",
+        "linux.open(\"/dev/null\"",                      "linux.chroot(\".\")",                    "linux.unshare(linux.CLONE.NEWNS)",
+        "live_root.cloneMountDescriptor(",               "live_root.setMountAttributes(",          "linux.move_mount(",
+        "const clone_flags = linux.CLONE.NEWNET |",      "linux.CLONE.NEWNS | linux.CLONE.NEWPID", "fn setupPrivateLoopback() linux.E",
+        "\"private-network-loopback-v1\\x00\"",          "fn sealInheritedDescriptors() linux.E",  "linux.PR.CAPBSET_DROP",
+        "linux.PR.SET_NO_NEW_PRIVS",                     "linux.PR.SET_PDEATHSIG",                 "linux.syscall2(\n        .capget,",
+        "linux.syscall2(\n        .capset,",             "linux.SECCOMP.SET_MODE_FILTER",          "restrictScriptPrivileges(null, false)",
+        "restrictScriptPrivileges(failure_stage, true)", "linux.syscall3(\n        .close_range,", "@offsetOf(KernelCapabilityHeader, \"pid\")",
     }) |marker| try support.contains(runner, marker);
     const live = try f.source("src/live_root.zig");
     try testing.expect(std.mem.indexOf(u8, live, "std.process.run(") == null);
