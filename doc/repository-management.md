@@ -640,6 +640,79 @@ Architecture comes only from an explicit request or target-root dpkg
 configuration. Host `uname`, host APT configuration, environment proxies,
 netrc, prompts, and TTY input are not used.
 
+### Reviewed freshness profiles
+
+Every refresh requires a signed `Valid-Until` by default. Microsoft's signed
+Ubuntu 24.04 (Noble) `InRelease` carries `Date` but no `Valid-Until`, so
+`repo add` for its descriptor would otherwise stop at preflight with
+`ReleaseMissingValidUntil`. `debz.reviewed_repository_profile` defines one
+reviewed exception, `microsoft-ubuntu-24.04-prod`. It applies the existing
+bounded `allow_missing_valid_until_with_max_age_seconds` policy with a
+14-day maximum Release age (1,209,600 seconds, within the 31-day cap) only
+when all of the following hold:
+
+- the source is `/etc/apt/sources.list.d/microsoft-prod.list`, in one-line
+  format;
+- every normalized binary entry in that file is enabled and moving, is exactly
+  `https://packages.microsoft.com/ubuntu/24.04/prod`, suite `noble`, component
+  `main`, and uses architectures drawn from `amd64`, `arm64`, and `armhf`;
+- every entry declares exactly
+  `Signed-By: /usr/share/keyrings/microsoft-prod.gpg`, and that keyring's
+  complete primary-fingerprint set is exactly the Microsoft release-signing key
+  `BC52 8686 B50D 79E3 39D3 721C EB3E 94AD BE12 29CF`; and
+- the target's native architecture is `amd64` or `arm64` and is declared by
+  the source.
+
+The source and keyring shipped in the `packages-microsoft-prod` 24.04
+descriptor match this exactly. Any other path, format, host, mirror, scheme, suite, component, extra entry,
+extra or different key, or target architecture keeps the default. An
+unmatched feed without `Valid-Until` is therefore still refused. The profile
+is matched against the actual bytes: the descriptor payload keyring for the
+dry and final refreshes, and the imported target-root source and keyring for
+target snapshots. Hostnames alone never grant it. A present `Valid-Until`
+remains authoritative. Signatures, the signed `Date`, suite identity, and
+index digests stay mandatory, and a Release older than signed `Date + 14 days`
+fails with `ReleaseExpired`. This is not a CLI flag or a global relaxation.
+
+A matching profile is applied to the dry refresh, the final refresh of the
+installed source, refresh of already imported target repositories, and native
+resume. Target import reads the root, derives the policy from those exact
+bytes, then imports again and requires byte-identical sources and keyrings.
+The operation's target manifest therefore becomes the canonical
+`apt-config-snapshot-v2` document. Its file name,
+`apt-config-snapshot-v1.json`, is unchanged. That document records the source
+and repository freshness policies, and import fails if they differ from the
+policy the descriptor payload earned. The policy also enters the normalized
+repository IDs and the refresh cache evidence.
+
+Embedders may replace the shipped set through
+`ProductionRepositoryBackend.reviewed_repository_profiles`. Every profile must
+use an HTTPS URI, absolute source and keyring paths whose suffix matches the
+source format, at least one pinned primary fingerprint, target architectures
+that are also published, a unique source path, and a nonzero age of at most
+31 days. An invalid set fails with `invalid_request` before root access.
+
+This closes the Release-freshness gap for adding the Microsoft Noble
+repository, the first step toward SymCrypt packages:
+
+```sh
+sudo debz repo add \
+  --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
+```
+
+The current upstream descriptor is still refused before any refresh by
+separate structural checks that this profile does not relax. Its control
+archive root has mode `0775`, which fails validation with `descriptor_invalid`.
+It also ships a second copy of `microsoft-prod.list` under `usr/share/doc/`,
+which descriptor material inspection refuses as `descriptor_dynamic`.
+Resolving those is separate follow-up work for issue #68.
+
+The profile is not yet applied by the `debz apt` system facade, product API v1,
+or package installation, so those still refuse this feed unless a product API
+`--config` explicitly selects the same bounded freshness for its source.
+Installed packages do not replace the pinned build inputs that zig-symcrypt
+uses.
+
 The CLI default `/` is intentionally safe only because it enters this typed
 operation, whose executor policy enables host-root mutation for repository add
 alone. Product API v1 and every generic product command continue to reject

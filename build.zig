@@ -307,7 +307,7 @@ pub fn build(b: *std.Build) void {
     repository_add_step.dependOn(&run_repository_cli_tests.step);
     const repository_backend_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{ "repository_backend.test.", "repository_command.test.", "repository_api.test.", "repository_plan.test.", "target_apt_config.test." },
+        .filters = &.{ "repository_backend.test.", "repository_command.test.", "repository_api.test.", "repository_plan.test.", "target_apt_config.test.", "reviewed_repository_profile.test." },
     });
     const run_repository_backend_tests = b.addRunArtifact(repository_backend_tests);
     repository_add_step.dependOn(&run_repository_backend_tests.step);

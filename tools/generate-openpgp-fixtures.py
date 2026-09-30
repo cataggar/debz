@@ -91,6 +91,38 @@ RELEASE = (
     + str(len(PACKAGES)).encode()
     + b" main/binary-amd64/Packages\n"
 )
+NOBLE_PACKAGES = (
+    b"Package: symcrypt-fixture\n"
+    b"Version: 1.0-1\n"
+    b"Architecture: all\n"
+    b"Maintainer: Test <test@example.invalid>\n"
+    b"Description: Microsoft-shaped moving feed fixture\n"
+    b"Filename: pool/main/s/symcrypt-fixture/symcrypt-fixture_1.0-1_all.deb\n"
+    b"Size: 4\n"
+    b"SHA256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+)
+# Microsoft's signed Noble Release carries Date but no Valid-Until.
+NOBLE_RELEASE = (
+    b"Origin: debz Microsoft-shaped fixture noble\n"
+    b"Label: debz Microsoft-shaped fixture noble\n"
+    b"Suite: noble\n"
+    b"Codename: noble\n"
+    b"Date: Tue, 14 Nov 2023 22:13:20 +0000\n"
+    b"Architectures: amd64 arm64 armhf all\n"
+    b"Components: main\n"
+    b"Acquire-By-Hash: no\n"
+    b"SHA256:\n"
+    + b"".join(
+        b" "
+        + sha256(NOBLE_PACKAGES).hexdigest().encode()
+        + b" "
+        + str(len(NOBLE_PACKAGES)).encode()
+        + b" main/binary-"
+        + architecture
+        + b"/Packages\n"
+        for architecture in (b"amd64", b"arm64", b"armhf")
+    )
+)
 UID = b"debz hermetic archive fixture <fixture.invalid>"
 
 
@@ -278,6 +310,16 @@ def main():
         + RELEASE
         + armor_signature(release_text_signature)
     )
+    canonical_noble_release = (
+        NOBLE_RELEASE.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n").removesuffix(b"\r\n")
+    )
+    noble_text_signature = signature(subkey, 0x01, [canonical_noble_release], subkey_fp)
+    noble_in_release = (
+        b"-----BEGIN PGP SIGNED MESSAGE-----\n"
+        b"Hash: SHA256\n\n"
+        + NOBLE_RELEASE
+        + armor_signature(noble_text_signature)
+    )
 
     values = {
         "message": MESSAGE,
@@ -301,6 +343,8 @@ def main():
         "repository_release_sha512_signature": release_sha512_signature,
         "repository_release_expired_signature": release_expired_signature,
         "repository_in_release": in_release,
+        "noble_repository_packages": NOBLE_PACKAGES,
+        "noble_repository_in_release": noble_in_release,
         "primary_fingerprint": primary_fp,
         "subkey_fingerprint": subkey_fp,
         "ed25519_fingerprint": ed_fp,

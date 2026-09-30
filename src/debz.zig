@@ -244,6 +244,7 @@ pub const repository_plan = @import("repository_plan.zig");
 pub const repository_refresh = @import("repository_refresh.zig");
 pub const repository_policy = @import("repository_policy.zig");
 pub const target_apt_config = @import("target_apt_config.zig");
+pub const reviewed_repository_profile = @import("reviewed_repository_profile.zig");
 pub const signed_release_envelope = @import("signed_release_envelope.zig");
 pub const openpgp_verifier = @import("openpgp_verifier.zig");
 pub const maintainer_script = @import("maintainer_script.zig");
@@ -639,6 +640,7 @@ test {
     _ = repository_refresh;
     _ = repository_policy;
     _ = target_apt_config;
+    _ = reviewed_repository_profile;
     _ = signed_release_envelope;
     _ = openpgp_verifier;
     _ = maintainer_script;

@@ -35,7 +35,9 @@ arithmetic and rejects the Release after that inclusive boundary. A present
 regardless of the missing-expiry policy. Signed dates may be at most the
 configured future skew (currently bounded to 24 hours); overflow and larger
 policy values fail closed. The production callers currently use a five-minute
-future bound.
+future bound. `repo add` selects the exception automatically only for exact
+[reviewed freshness profiles](repository-management.md#reviewed-freshness-profiles).
+Currently that is Microsoft's Ubuntu 24.04 feed, with a 14-day maximum.
 
 Provenance records the authentication mode, signature digest, verification
 time, accepted signature index, primary/signing fingerprints, public-key and
