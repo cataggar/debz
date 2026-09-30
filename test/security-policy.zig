@@ -643,6 +643,33 @@ test "security: required recovery shards keep every mode, selector, setup and ag
                 defer repeated.deinit();
                 try repeated.failsWith("ci.yml:");
             }
+            const root_import = try step(body, "Compare pinned-dpkg root import and copied-root refusals");
+            for ([_][]const u8{
+                "          zig build test-native-root-import -Dnative-reference-dpkg=\"$reference_dpkg\" -j2 --summary all",
+                "          zig build test-native-root-import -Dnative-reference-dpkg=\"$reference_dpkg\" -Doptimize=ReleaseSafe -j2 --summary all",
+            }) |command| {
+                try testing.expectEqual(@as(usize, 1), std.mem.count(u8, workflow, command));
+                const absent = try f.replace(workflow, root_import, try f.replace(root_import, command, ""));
+                const removed = try f.check("ci-recovery", absent);
+                defer removed.deinit();
+                try removed.failsWith("ci.yml: native-recovery-zig-workflows must execute Compare pinned-dpkg root import");
+                const duplicate = try f.replace(workflow, root_import, try f.replace(root_import, command, try std.fmt.allocPrint(f.arena.allocator(), "{s}\n{s}", .{ command, command })));
+                const repeated = try f.check("ci-recovery", duplicate);
+                defer repeated.deinit();
+                try repeated.failsWith("ci.yml: pinned-dpkg root import must run once per mode only in the required core shard");
+                const untrusted = try f.replace(workflow, root_import, try f.replace(root_import, command, try f.replace(command, "\"$reference_dpkg\"", "\"$untrusted_dpkg\"")));
+                const unpinned = try f.check("ci-recovery", untrusted);
+                defer unpinned.deinit();
+                try unpinned.failsWith("ci.yml: native-recovery-zig-workflows must execute Compare pinned-dpkg root import");
+                const moved = try std.fmt.allocPrint(f.arena.allocator(), "{s}\n  duplicate-root-import:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: Duplicate root import\n        run: |\n{s}\n", .{ workflow, command });
+                const elsewhere = try f.check("ci-recovery", moved);
+                defer elsewhere.deinit();
+                try elsewhere.failsWith("ci.yml: pinned-dpkg root import must run once per mode only in the required core shard");
+            }
+            const without_step = try f.replace(workflow, root_import, "");
+            const dropped = try f.check("ci-recovery", without_step);
+            defer dropped.deinit();
+            try dropped.failsWith("ci.yml: native-recovery-zig-workflows has an unreviewed recovery step");
         }
         for (shard.targets) |target| {
             for ([_][]const u8{ "", " -Doptimize=ReleaseSafe" }) |mode| {
@@ -660,7 +687,7 @@ test "security: required recovery shards keep every mode, selector, setup and ag
             }
         }
         const exercises: []const []const u8 = if (std.mem.eql(u8, shard.name, "native-recovery-zig-workflows"))
-            &.{ "Exercise Zig recovery units in both modes", "Exercise Zig core recovery" }
+            &.{ "Exercise Zig recovery units in both modes", "Exercise Zig core recovery", "Compare pinned-dpkg root import and copied-root refusals" }
         else if (std.mem.eql(u8, shard.name, "native-recovery-zig-repository"))
             &.{"Exercise Zig repository recovery"}
         else if (std.mem.eql(u8, shard.name, "native-recovery-zig-helper"))

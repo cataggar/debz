@@ -948,6 +948,12 @@ jobs:
           reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
           zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
           zig build test-native-recovery-zig -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
+      - name: Compare pinned-dpkg root import and copied-root refusals
+        run: |
+          mkdir -p .tmp
+          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"
+          zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all
+          zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   native-recovery-zig-repository:
     name: Native crash recovery Zig repository (${{ matrix.name }})

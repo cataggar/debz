@@ -1282,6 +1282,15 @@ RECOVERY_ZIG_SHARDS = {
 }
 
 
+ROOT_IMPORT_STEP = "Compare pinned-dpkg root import and copied-root refusals"
+ROOT_IMPORT_COMMANDS = [
+    "mkdir -p .tmp",
+    'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
+    'zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -j2 --summary all',
+    'zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all',
+]
+
+
 def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) -> list[str]:
     shard_option = ' -Dnative-zig-recovery-diversion-shard="${{ matrix.shard }}"' if sharded else ""
     return [
@@ -1477,6 +1486,8 @@ def native_recovery_ci_failures(text: str) -> list[str]:
                 *recovery_zig_commands(targets, sharded=name == "native-recovery-zig-diversions"),
             ],
         )
+        if name == "native-recovery-zig-workflows":
+            expected_steps[ROOT_IMPORT_STEP] = (None, ROOT_IMPORT_COMMANDS)
         recovery_jobs[name] = (
             display_name,
             diversion_architectures if name == "native-recovery-zig-diversions" else architectures,
@@ -1557,6 +1568,11 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     )
     if sorted(actual_commands) != sorted(inventory_commands):
         failures.append("ci.yml: recovery targets must execute only in the six required Zig shards")
+    if re.findall(r"(?m)^[ \t]+(zig build test-native-root-import[^\n]*)$", text) != [
+        command for command in ROOT_IMPORT_COMMANDS
+        if command.startswith("zig build test-native-root-import")
+    ]:
+        failures.append("ci.yml: pinned-dpkg root import must run once per mode only in the required core shard")
     gate = jobs.get("build-and-test", "")
     gate_steps = dict(re.findall(
         r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", gate,

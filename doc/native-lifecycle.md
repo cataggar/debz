@@ -37,8 +37,11 @@ refuse on the locked database-generation check; the only change left in each
 root is the injected edit. Each refused copy has no active mutation evidence.
 Use `zig build test-native-root-import -Dnative-reference-dpkg=/absolute/path/to/verified/dpkg -j2`
 in Debug and ReleaseSafe. This test requires root for guarded chroot fixtures
-and rejects an unpinned reference; it does not replace the signed-root gates
-in the migration acceptance plan.
+and rejects an unpinned reference. CI runs it in both modes on amd64 and arm64
+in the required `native-recovery-zig-workflows` shard, which gates
+`Build and test`; the security audit rejects a missing, skipped, duplicated,
+unpinned or relocated invocation. This bounded fixture-level parity does not
+replace the signed-root gates in the migration acceptance plan.
 
 Arguments preserve empty strings. In particular, a package that has never been
 configured receives `postinst configure ""`; the unpacked package's `Version`
