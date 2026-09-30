@@ -1300,152 +1300,380 @@ def recovery_zig_commands(targets: tuple[str, ...], *, sharded: bool = False) ->
     ]
 
 
+WORKLOAD_TIMEOUT_MINUTES = 45
+WORKLOAD_PARTITIONS = {
+    "workload_core": ("test-workload-core", (
+        "run_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
+        "positional_help", "removed_version_flag", "consumer_tests",
+        "run_real_snapshot_comparator_tests", "run_apt_acceptance_unit_tests",
+        "repository_add_tests",
+    )),
+    "workload_production": ("test-workload-production", (
+        "run_package_family_tests", "run_production_backend_tests",
+        "run_required_production_security_tests", "run_production_customize_tests",
+    )),
+    "workload_apt_system": ("test-workload-apt-system", (
+        "run_system_profile_tests", "run_apt_system_api_tests", "run_apt_system_cli_tests",
+        "run_apt_system_command_tests", "run_apt_system_state_tests",
+        "run_apt_system_orchestrator_tests", "run_required_orchestrator_security_tests",
+    )),
+    "workload_native": ("test-workload-native", (
+        "run_native_alternatives_tests", "run_native_alternatives_oracle_tests",
+        "run_native_snapshot_tests", "run_native_differential_zig_tests",
+        "run_native_fixture_tests", "run_native_conffile_zig_tests",
+        "dpkg_config_reference_tests", "dpkg_alternatives_reference_tests",
+        "dpkg_oracle_evidence_tests", "run_sha512_e2e_tests",
+        "run_native_trigger_queue_tests", "run_lifecycle_zig_tests",
+        "run_trigger_zig_tests", "run_settlement_tests", "run_recovery_unit_tests",
+        "run_native_recovery_tests", "run_repository_recovery_unit",
+        "run_package_cache_archive_tests",
+    )),
+    "workload_release": ("test-workload-release", (
+        "run_apt_schema_tests", "native_only_rehearsal",
+    )),
+}
+WORKLOAD_HELP_BINDING = "addHelpFlagTests(b, workload_core, cli, case.args, case.usage);"
+
+
+def workload_partition_failures(build: str) -> list[str]:
+    """Prove `zig build test` is exactly the disjoint union of the CI partitions."""
+    failures: list[str] = []
+    if build.count('const test_step = b.step("test", ') != 1:
+        failures.append("build.zig: aggregate test step must be declared exactly once")
+    aggregate = re.findall(r"(?m)^[ \t]*test_step\.dependOn\(([^\n]*)\);[ \t]*$", build)
+    if aggregate != list(WORKLOAD_PARTITIONS) or len(re.findall(r"\btest_step\b", build)) != 1 + len(WORKLOAD_PARTITIONS):
+        failures.append("build.zig: aggregate test step must depend only on every workload partition")
+    expected = []
+    for variable, (step_name, members) in WORKLOAD_PARTITIONS.items():
+        declaration = f'const {variable} = b.step("{step_name}", '
+        if build.count(declaration) != 1 or build.count(f'"{step_name}"') != 1:
+            failures.append(f"build.zig: workload partition {step_name} must be declared exactly once")
+        references = len(re.findall(rf"\b{variable}\b", build))
+        if references != 2 + len(members) + (variable == "workload_core"):
+            failures.append(f"build.zig: workload partition {step_name} has an unreviewed binding")
+        expected.extend((variable, member) for member in members)
+    actual = re.findall(
+        r"(?m)^[ \t]*(workload_[a-z_]+)\.dependOn\(&?([A-Za-z_][A-Za-z0-9_]*)(?:\.step)?\);[ \t]*$",
+        build,
+    )
+    members = [member for _, member in actual]
+    if sorted(actual) != sorted(expected) or len(members) != len(set(members)):
+        failures.append("build.zig: every former test member must run in exactly one workload partition")
+    if build.count(WORKLOAD_HELP_BINDING) != 1 or build.count("addHelpFlagTests(") != 2:
+        failures.append("build.zig: CLI help flag tests must run only in the core workload partition")
+    return failures
+
+
+WORKLOAD_MATRIX = (
+    "      fail-fast: false\n"
+    "      matrix:\n"
+    "        name: [linux-x64, linux-arm64]\n"
+    "        optimize: [Debug, ReleaseSafe]\n"
+    "        include:\n"
+    "          - os: ubuntu-24.04\n"
+    "            name: linux-x64\n"
+    "            architecture: amd64\n"
+    "          - os: ubuntu-24.04-arm\n"
+    "            name: linux-arm64\n"
+    "            architecture: arm64\n"
+)
+WORKLOAD_SETUP_STEPS = (
+    "Install Zig via ghr", "Validate Zig version", "Install metadata decompression dependency",
+)
+WORKLOAD_SETUP_LINES = (
+    "          persist-credentials: false",
+    "        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1",
+    "          ghr-version: v0.8.1",
+    "            cataggar/zig@v0.16.0",
+    "            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
+    '        run: test "$(zig version)" = 0.16.0',
+    "            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema",
+)
+WORKLOAD_DEBUG = "${{ matrix.optimize == 'Debug' }}"
+WORKLOAD_RELEASESAFE = "${{ matrix.optimize == 'ReleaseSafe' }}"
+WORKLOAD_PREPARE_DPKG = 'reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"'
+WORKLOAD_DPKG_MODE = '-Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all'
+WORKLOAD_MODE = '-Doptimize="$OPTIMIZE" -j2 --summary all'
+WORKLOAD_SELECTOR_COMMANDS = [
+    WORKLOAD_PREPARE_DPKG,
+    f"zig build build-native-acceptance-zig {WORKLOAD_MODE}",
+    'lifecycle="$PWD/.tmp/zig-lifecycle-workspace-$OPTIMIZE"',
+    'trigger="$PWD/.tmp/zig-trigger-workspace-$OPTIMIZE"',
+    'sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" '
+    "zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only "
+    '--reference-dpkg "$reference_dpkg" --workspace "$lifecycle"',
+    'sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" '
+    "zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only "
+    '--reference-dpkg "$reference_dpkg" --workspace "$trigger"',
+    'test -d "$lifecycle" && test -d "$trigger"',
+    'if sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" '
+    "zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only "
+    '--diversions-only --reference-dpkg "$reference_dpkg" '
+    '2>"$PWD/.tmp/zig-invalid-selector.log"; then exit 1; fi',
+    "grep -Fxq 'error: InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"",
+    'if sudo -n env TMPDIR="$PWD/.tmp" XDG_CACHE_HOME="$PWD/.cache" '
+    "zig-out/bin/native-lifecycle-zig-acceptance --oracle-only "
+    '--reference-dpkg "$reference_dpkg" --workspace "$lifecycle" '
+    '2>"$PWD/.tmp/zig-existing-workspace.log"; then exit 1; fi',
+    "grep -Fxq 'error: PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"",
+]
+# Every step after the shared setup: (condition, exact logical commands or None, required lines).
+WORKLOAD_JOBS = {
+    "build-and-test-workload": ("core", {
+        "Build and test workload core": (None, [
+            f"zig build {WORKLOAD_MODE}",
+            f"zig build test-workload-core {WORKLOAD_MODE}",
+        ], ()),
+        "Check ReleaseSafe CLI help": (WORKLOAD_RELEASESAFE, [
+            "zig build -Doptimize=ReleaseSafe -j2 run -- --help",
+        ], ()),
+        "Prepare native download action fixture": (WORKLOAD_RELEASESAFE, None, (
+            "        id: download-fixture",
+            "          python3 tools/generate-integration-repository.py \\",
+            "          zig-out/bin/debz plan \\",
+            '          printf \'%s\\n\' "$PWD/zig-out/bin" >>"$GITHUB_PATH"',
+        )),
+        "Prepare native exact-lock package closure": (WORKLOAD_RELEASESAFE, None, (
+            "        id: download",
+            "        uses: ./actions/download",
+            "          lock-input: ${{ steps.download-fixture.outputs.lock }}",
+            "          cache: 'false'",
+        )),
+        "Validate native download action outputs": (WORKLOAD_RELEASESAFE, [
+            'test "$CACHE_HIT" = false',
+            'test -d "$CACHE_PATH"',
+            'test "$DOWNLOADED" -gt 0',
+            'test "$REUSED" -eq 0',
+        ], ()),
+    }),
+    "build-and-test-workload-production": ("production", {
+        "Build and test workload production": (None, [
+            f"zig build test-workload-production {WORKLOAD_MODE}",
+        ], ()),
+        "Compare native triggers and diversion settlement with dpkg": (None, [
+            "mkdir -p .tmp",
+            WORKLOAD_PREPARE_DPKG,
+            f"zig build test-native-triggers-zig test-native-diversion-settlement-zig {WORKLOAD_DPKG_MODE}",
+        ], ()),
+    }),
+    "build-and-test-workload-apt-system": ("apt system", {
+        "Build and test workload apt system": (None, [
+            f"zig build test-workload-apt-system {WORKLOAD_MODE}",
+        ], ()),
+        "Run required real apt facade acceptance": (None, [
+            'sudo env PATH="$PATH" TMPDIR="$PWD/.zig-cache" '
+            'PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" '
+            'ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-global" '
+            'ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-local" '
+            f'"$(command -v zig)" build test-apt-system-acceptance {WORKLOAD_MODE}',
+        ], ()),
+        "Normalize apt facade acceptance diagnostics": ("${{ always() }}", [
+            'sudo chown -R "$USER:$USER" .zig-cache/apt-system-acceptance-global '
+            ".zig-cache/apt-system-acceptance-local 2>/dev/null || true",
+        ], ()),
+        "Run required privileged orchestration crash suite": (WORKLOAD_DEBUG, [
+            "sudo rm -rf /run/debz",
+            'sudo env ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache-orchestration-required" '
+            'ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache-orchestration-required" '
+            '"$(command -v zig)" build test-apt-system '
+            "-Drequire-privileged-orchestration-tests=true -j2 --summary all",
+        ], ()),
+        "Normalize privileged orchestration diagnostics": ("${{ always() && matrix.optimize == 'Debug' }}", [
+            'sudo chown -R "$USER:$USER" .zig-cache-orchestration-required '
+            ".zig-global-cache-orchestration-required 2>/dev/null || true",
+            "sudo rm -rf /run/debz",
+        ], ()),
+    }),
+    "build-and-test-workload-native": ("native", {
+        "Build and test workload native": (None, [
+            f"zig build test-workload-native {WORKLOAD_MODE}",
+        ], ()),
+        "Compare native materialization, conffiles, differential, and lifecycle with dpkg": (None, [
+            "mkdir -p .tmp",
+            WORKLOAD_PREPARE_DPKG,
+            "zig build test-native-materialization test-native-conffiles test-native-differential "
+            f"{WORKLOAD_DPKG_MODE}",
+            f"zig build test-native-lifecycle-zig {WORKLOAD_DPKG_MODE}",
+        ], ()),
+        "Require private native helper namespaces": (None, [
+            f"zig build test-native-helper-namespace {WORKLOAD_MODE}",
+        ], ()),
+    }),
+    "build-and-test-workload-release": ("release", {
+        "Build and test workload release": (None, [
+            f"zig build test-workload-release {WORKLOAD_MODE}",
+            f"zig build fuzz {WORKLOAD_MODE}",
+        ], ()),
+        "Test release packaging": (WORKLOAD_DEBUG, [
+            "zig build test-release -j2 --summary all",
+        ], ()),
+        "Run pinned dpkg lifecycle and trigger reference oracles": (None, [
+            "mkdir -p .tmp",
+            WORKLOAD_PREPARE_DPKG,
+            "zig build test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle "
+            f"test-native-triggers-zig-settlement-reference {WORKLOAD_DPKG_MODE}",
+        ], ()),
+        "Exercise standalone Zig workspace selectors and fail-closed combinations": (
+            None, WORKLOAD_SELECTOR_COMMANDS, (),
+        ),
+    }),
+}
+# The retired single workload ran these Zig targets once per mode; each must stay exactly once.
+WORKLOAD_ZIG_TARGETS = (
+    "install", "run", "test-release", "fuzz", "build-native-acceptance-zig",
+    "test-native-materialization", "test-native-conffiles", "test-native-differential",
+    "test-native-lifecycle-zig", "test-native-triggers-zig", "test-native-diversion-settlement-zig",
+    "test-native-lifecycle-zig-oracle", "test-native-triggers-zig-oracle",
+    "test-native-triggers-zig-settlement-reference", "test-native-helper-namespace",
+    "test-apt-system-acceptance", "test-apt-system",
+    *(step_name for step_name, _ in WORKLOAD_PARTITIONS.values()),
+)
+WORKLOAD_RESULTS = (
+    ("BUILD_RESULT", "build-and-test-workload"),
+    ("BUILD_PRODUCTION_RESULT", "build-and-test-workload-production"),
+    ("BUILD_APT_SYSTEM_RESULT", "build-and-test-workload-apt-system"),
+    ("BUILD_NATIVE_RESULT", "build-and-test-workload-native"),
+    ("BUILD_RELEASE_RESULT", "build-and-test-workload-release"),
+)
+
+
+def workflow_logical_commands(step: str) -> list[str] | None:
+    """Return a step's shell commands with continuations joined and comments dropped."""
+    single = re.findall(r"(?m)^        run: (?!\|)([^\n]+)$", step)
+    if single:
+        return [single[0].strip()] if len(single) == 1 and "        run: |\n" not in step else None
+    script = step.split("        run: |\n")
+    if len(script) != 2:
+        return None
+    commands: list[str] = []
+    pending = ""
+    for raw in script[1].splitlines():
+        line = raw.strip()
+        if not line or (not pending and line.startswith("#")):
+            continue
+        pending = f"{pending} {line}".strip() if pending else line
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        commands.append(pending)
+        pending = ""
+    if pending:
+        commands.append(pending)
+    return commands
+
+
+def workload_zig_targets(command: str) -> list[str] | None:
+    match = re.search(r'(?:^|\s)(?:zig|"\$\(command -v zig\)") build(?=\s|$)(.*)$', command)
+    if match is None:
+        return None
+    targets = []
+    tokens = iter(match.group(1).split())
+    for token in tokens:
+        if token == "--":
+            break
+        if token in ("--summary", "--prefix", "--cache-dir", "--global-cache-dir", "--build-file", "-p"):
+            next(tokens, None)
+        elif not token.startswith("-"):
+            targets.append(token)
+    return targets or ["install"]
+
+
+def workflow_zig_invocations(text: str) -> list[list[str]]:
+    """Return the targets of every zig build invocation in a workflow."""
+    invocations: list[list[str]] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not pending and line.startswith("#"):
+            continue
+        pending = f"{pending} {line}".strip() if pending else line
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        targets = workload_zig_targets(pending)
+        if targets is not None:
+            invocations.append(targets)
+        pending = ""
+    return invocations
+
+
+def workload_ci_failures(jobs: dict[str, str], text: str) -> list[str]:
+    failures: list[str] = []
+    shared_setup = None
+    inventory: list[str] = []
+    for name, (label, expected_steps) in WORKLOAD_JOBS.items():
+        body = jobs.get(name, "")
+        lines = body.splitlines()
+        header = body.split("    steps:\n", 1)[0]
+        if (
+            f"    name: Build and test workload {label} (${{{{ matrix.name }}}}, ${{{{ matrix.optimize }}}})" not in lines
+            or "    runs-on: ${{ matrix.os }}" not in lines
+            or re.findall(r"(?m)^    timeout-minutes:[^\n]*$", body)
+            != [f"    timeout-minutes: {WORKLOAD_TIMEOUT_MINUTES}"]
+            or header.count("    strategy:\n") != 1
+            or body.count("    steps:\n") != 1
+            or header.split("    strategy:\n", 1)[-1].split("    env:\n", 1)[0] != WORKLOAD_MATRIX
+            or header.split("    env:\n", 1)[-1] != "      OPTIMIZE: ${{ matrix.optimize }}\n"
+            or re.search(r"(?m)^    (?:if|needs|continue-on-error):", body)
+            or "continue-on-error:" in body
+        ):
+            failures.append(
+                f"ci.yml: {name} must require both architectures and optimization modes "
+                f"within {WORKLOAD_TIMEOUT_MINUTES} minutes"
+            )
+        first_step = next(iter(expected_steps))
+        setup = body.split("    steps:\n", 1)[-1].split(f"      - name: {first_step}\n", 1)[0]
+        if shared_setup is None:
+            shared_setup = setup
+        if setup != shared_setup or not setup.startswith(
+            "      - uses: actions/checkout@"
+        ) or any(f"      - name: {step}\n" not in setup for step in WORKLOAD_SETUP_STEPS) or any(
+            line not in setup.splitlines() for line in WORKLOAD_SETUP_LINES
+        ) or re.search(r"(?m)^        if:", setup):
+            failures.append(f"ci.yml: {name} must retain pinned Zig and metadata dependencies")
+        steps = re.findall(r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", body)
+        if [step for step, _ in steps] != [*WORKLOAD_SETUP_STEPS, *expected_steps]:
+            failures.append(f"ci.yml: {name} has a missing, reordered or unreviewed workload step")
+        actual_steps = dict(steps)
+        for step_name, (condition, commands, required) in expected_steps.items():
+            step = actual_steps.get(step_name, "")
+            conditions = re.findall(r"(?m)^        if: ([^\n]*)$", step)
+            actual = workflow_logical_commands(step)
+            if (
+                conditions != ([condition] if condition else [])
+                or (commands is not None and actual != commands)
+                or (commands is None and actual is not None and any(
+                    workload_zig_targets(command) is not None for command in actual
+                ))
+                or any(line not in step.splitlines() for line in required)
+            ):
+                mode = {
+                    WORKLOAD_DEBUG: "Debug", WORKLOAD_RELEASESAFE: "ReleaseSafe",
+                }.get(condition, "every mode")
+                failures.append(f"ci.yml: {name} must execute {step_name} exactly as reviewed in {mode}")
+        for step in actual_steps.values():
+            for command in workflow_logical_commands(step) or []:
+                targets = workload_zig_targets(command)
+                if targets is not None:
+                    inventory.extend(targets)
+    if sorted(inventory) != sorted(WORKLOAD_ZIG_TARGETS):
+        failures.append("ci.yml: every former build workload target must execute exactly once across the workload jobs")
+    invocations = [target for targets in workflow_zig_invocations(text) for target in targets]
+    for step_name, _ in WORKLOAD_PARTITIONS.values():
+        if invocations.count(step_name) != 1:
+            failures.append(f"ci.yml: workload partition {step_name} must execute exactly once")
+    if "test" in invocations:
+        failures.append("ci.yml: aggregate zig build test must not duplicate the workload partitions")
+    return failures
+
+
 def native_recovery_ci_failures(text: str) -> list[str]:
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
         text,
     ))
     failures = []
-    timeout_lines = {
-        "build-and-test-workload": "    timeout-minutes: 90",
-    }
-    for name, timeout_line in timeout_lines.items():
-        body = jobs.get(name, "")
-        lines = body.splitlines()
-        if any(line not in lines for line in (
-            timeout_line,
-            "      fail-fast: false",
-            "          - os: ubuntu-24.04",
-            "            name: linux-x64",
-            "          - os: ubuntu-24.04-arm",
-            "            name: linux-arm64",
-        )) or re.search(r"(?m)^    if:", body) or "continue-on-error:" in body:
-            failures.append(f"ci.yml: {name} must require both architectures within its reviewed job limit")
-    workload = jobs.get("build-and-test-workload", "")
-    if any(line not in workload.splitlines() for line in (
-        "    name: Build and test workload (${{ matrix.name }}, ${{ matrix.optimize }})",
-        "        name: [linux-x64, linux-arm64]",
-        "        optimize: [Debug, ReleaseSafe]",
-        "      OPTIMIZE: ${{ matrix.optimize }}",
-    )) or re.search(r"(?m)^        exclude:", workload):
-        failures.append("ci.yml: build workloads must require both optimization modes on both architectures")
-    steps = dict(re.findall(
-        r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", workload,
-    ))
-    shared_steps = {
-        "Build and test": (
-            '          zig build -Doptimize="$OPTIMIZE" -j2 --summary all',
-            '          zig build test -Doptimize="$OPTIMIZE" -j2 --summary all',
-            '          zig build fuzz -Doptimize="$OPTIMIZE" -j2 --summary all',
-        ),
-        "Run required real apt facade acceptance": (
-            "        run: |",
-            "          sudo env \\",
-            '            PATH="$PATH" \\',
-            '            TMPDIR="$PWD/.zig-cache" \\',
-            '            PYTHONPYCACHEPREFIX="$PWD/.zig-cache/pycache" \\',
-            '            ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-global" \\',
-            '            ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache/apt-system-acceptance-local" \\',
-            '            "$(command -v zig)" build test-apt-system-acceptance \\',
-            '              -Doptimize="$OPTIMIZE" -j2 --summary all',
-        ),
-        "Compare native materialization, conffiles, differential, lifecycle, and triggers with dpkg": (
-            '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-            "          zig build test-native-materialization test-native-conffiles test-native-differential \\",
-            '            -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all',
-        ),
-        "Require private native helper namespaces": (
-            '          zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all',
-        ),
-    }
-    for name, commands in shared_steps.items():
-        body = steps.get(name, "")
-        if any(line not in body.splitlines() for line in commands) or re.search(r"(?m)^        if:", body):
-            failures.append(f"ci.yml: {name} must run in every build workload")
-    normalized = steps.get("Normalize apt facade acceptance diagnostics", "")
-    if any(line not in normalized.splitlines() for line in (
-        "        if: ${{ always() }}",
-        '            .zig-cache/apt-system-acceptance-global \\',
-        '            .zig-cache/apt-system-acceptance-local 2>/dev/null || true',
-    )):
-        failures.append("ci.yml: apt acceptance caches must be normalized for both modes")
-    compare_name = (
-        "Compare native materialization, conffiles, differential, "
-        "lifecycle, and triggers with dpkg"
-    )
-    compare = steps.get(compare_name, "")
-    script = compare.split("        run: |\n", 1)
-    compare_commands = (
-        [
-            line.strip() for line in script[1].splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
-        if len(script) == 2
-        else []
-    )
-    expected_compare_commands = [
-        *(line.strip() for line in shared_steps[compare_name]),
-        "zig build test-native-lifecycle-zig test-native-triggers-zig test-native-diversion-settlement-zig \\",
-        shared_steps[compare_name][2].strip(),
-        "zig build test-native-lifecycle-zig-oracle test-native-triggers-zig-oracle test-native-triggers-zig-settlement-reference \\",
-        shared_steps[compare_name][2].strip(),
-    ]
-    if compare_commands != expected_compare_commands:
-        failures.append(
-            "ci.yml: both native differential suites must execute with "
-            "the pinned dpkg in every build workload"
-        )
-    selectors = steps.get(
-        "Exercise standalone Zig workspace selectors and fail-closed combinations", ""
-    )
-    if re.search(r"(?m)^        if:", selectors) or selectors.count(
-        '            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\'
-    ) != 2 or any(
-        command not in selectors.splitlines()
-        for command in (
-            '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py)"',
-            '          zig build build-native-acceptance-zig -Doptimize="$OPTIMIZE" -j2 --summary all',
-            '            zig-out/bin/native-lifecycle-zig-acceptance --oracle-only --diversions-only \\',
-            '            zig-out/bin/native-trigger-zig-acceptance --oracle-only --diversion-settlement-reference-only \\',
-            '            --reference-dpkg "$reference_dpkg" --workspace "$lifecycle"',
-            '            --reference-dpkg "$reference_dpkg" --workspace "$trigger"',
-            '          test -d "$lifecycle" && test -d "$trigger"',
-            "          grep -Fxq 'error: InvalidSettlementSelection' \"$PWD/.tmp/zig-invalid-selector.log\"",
-            "          grep -Fxq 'error: PathAlreadyExists' \"$PWD/.tmp/zig-existing-workspace.log\"",
-        )
-    ):
-        failures.append("ci.yml: standalone Zig workspace selectors and refusals must run in every mode")
-    selected_steps = {
-        "Test release packaging": ("Debug", (
-            "        run: zig build test-release -j2 --summary all",
-        )),
-        "Check ReleaseSafe CLI help": ("ReleaseSafe", (
-            "        run: zig build -Doptimize=ReleaseSafe -j2 run -- --help",
-        )),
-        "Run required privileged orchestration crash suite": ("Debug", (
-            '            "$(command -v zig)" build test-apt-system \\',
-            "              -Drequire-privileged-orchestration-tests=true \\",
-            "              -j2 --summary all",
-        )),
-        "Prepare native download action fixture": ("ReleaseSafe", (
-            "          python3 tools/generate-integration-repository.py \\",
-        )),
-        "Prepare native exact-lock package closure": ("ReleaseSafe", (
-            "        uses: ./actions/download",
-        )),
-        "Validate native download action outputs": ("ReleaseSafe", (
-            '          test "$CACHE_HIT" = false',
-            '          test -d "$CACHE_PATH"',
-            '          test "$DOWNLOADED" -gt 0',
-            '          test "$REUSED" -eq 0',
-        )),
-    }
-    for name, (mode, commands) in selected_steps.items():
-        lines = steps.get(name, "").splitlines()
-        if any(line not in lines for line in (
-            f"        if: ${{{{ matrix.optimize == '{mode}' }}}}", *commands,
-        )):
-            failures.append(f"ci.yml: {name} must remain required in {mode}")
+    failures.extend(workload_ci_failures(jobs, text))
     architectures = (
         "          - os: ubuntu-24.04\n"
         "            name: linux-x64\n"
@@ -1580,7 +1808,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     gate_step = gate_steps.get("Require every build and native recovery shard", "")
     gate_script = gate_step.split("        run: |\n", 1)
     required_results = [
-        'test "$BUILD_RESULT" = success',
+        *(f'test "${variable}" = success' for variable, _ in WORKLOAD_RESULTS),
         'test "$RECOVERY_WORKFLOWS_RESULT" = success',
         'test "$RECOVERY_REPOSITORY_RESULT" = success',
         'test "$RECOVERY_HELPER_RESULT" = success',
@@ -1590,18 +1818,18 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     ]
     if any(line not in gate.splitlines() for line in (
         "    name: Build and test (${{ matrix.name }})",
-        "    needs: [build-and-test-workload, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]",
+        "    needs: [build-and-test-workload, build-and-test-workload-production, build-and-test-workload-apt-system, build-and-test-workload-native, build-and-test-workload-release, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]",
         "    if: ${{ always() }}",
         "      fail-fast: false",
         "        name: [linux-x64, linux-arm64]",
-        "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
+        *(f"          {variable}: ${{{{ needs.{job}.result }}}}" for variable, job in WORKLOAD_RESULTS),
         "          RECOVERY_WORKFLOWS_RESULT: ${{ needs.native-recovery-zig-workflows.result }}",
         "          RECOVERY_REPOSITORY_RESULT: ${{ needs.native-recovery-zig-repository.result }}",
         "          RECOVERY_HELPER_RESULT: ${{ needs.native-recovery-zig-helper.result }}",
         "          RECOVERY_FAMILY_RESULT: ${{ needs.native-recovery-zig-family.result }}",
         "          RECOVERY_SCENARIOS_RESULT: ${{ needs.native-recovery-zig-scenarios.result }}",
         "          RECOVERY_DIVERSIONS_RESULT: ${{ needs.native-recovery-zig-diversions.result }}",
-        '          test "$BUILD_RESULT" = success',
+        *(f'          test "${variable}" = success' for variable, _ in WORKLOAD_RESULTS),
         '          test "$RECOVERY_WORKFLOWS_RESULT" = success',
         '          test "$RECOVERY_REPOSITORY_RESULT" = success',
         '          test "$RECOVERY_HELPER_RESULT" = success',
@@ -2310,9 +2538,9 @@ def native_lifecycle_migration_failures(build: str, trigger: str) -> list[str]:
         "trigger_zig.addArtifactArg(native_lifecycle_tests);",
         'trigger_zig.addArg("--native-helper");',
         "trigger_zig.addArtifactArg(native_trigger_helper);",
-        "test_step.dependOn(&run_lifecycle_zig_tests.step);",
-        "test_step.dependOn(&run_trigger_zig_tests.step);",
-        "test_step.dependOn(&run_settlement_tests.step);",
+        "workload_native.dependOn(&run_lifecycle_zig_tests.step);",
+        "workload_native.dependOn(&run_trigger_zig_tests.step);",
+        "workload_native.dependOn(&run_settlement_tests.step);",
         'b.step("test-native-lifecycle-zig-oracle",',
         'b.step("test-native-triggers-zig-oracle",',
         'b.step("test-native-triggers-zig-settlement-reference",',
@@ -2457,6 +2685,8 @@ def audit_ci_pins() -> None:
         (ROOT / "test/native_trigger_acceptance.zig").read_text(),
     ):
         fail(failure)
+    for failure in workload_partition_failures((ROOT / "build.zig").read_text()):
+        fail(failure)
     fixture_paths = (
         "tools/test-native-lifecycle.py",
         "tools/test_native_lifecycle.py",
@@ -2496,7 +2726,7 @@ def audit_ci_pins() -> None:
         if workflow.name == "ci.yml":
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 16, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -3453,13 +3683,15 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 16)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 20)
     elif kind == "ghr-release":
         failures = ghr_zig_workflow_failures(text, "release.yml", 1)
     elif kind == "workflow-failure":
         failures = workflow_failure_handling_failures(text, "ci.yml")
     elif kind == "ci-recovery":
         failures = native_recovery_ci_failures(text)
+    elif kind == "workload-build":
+        failures = workload_partition_failures(text)
     elif kind in {
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",

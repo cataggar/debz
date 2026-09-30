@@ -40,7 +40,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
         return match.group()
 
     def test_reviewed_jobs_have_one_exact_verified_install_each(self) -> None:
-        self.assertEqual(len(policy.CI_GHR_ZIG_JOBS), 16)
+        self.assertEqual(len(policy.CI_GHR_ZIG_JOBS), 20)
         self.assertEqual(self.failures(self.ci), [])
 
     def test_balanced_move_between_new_jobs_still_fails(self) -> None:
@@ -49,7 +49,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
         changed = self.ci.replace(
             repository, repository.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
         ).replace(helper, helper + policy.GHR_ZIG_INSTALL, 1)
-        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 16)
+        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 20)
         self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
 
     def test_balanced_move_out_of_diversion_shard_still_fails(self) -> None:
@@ -58,8 +58,23 @@ class ZigInstallPolicyTests(unittest.TestCase):
         changed = self.ci.replace(
             diversions, diversions.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
         ).replace(helper, helper + policy.GHR_ZIG_INSTALL, 1)
-        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 16)
+        self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 20)
         self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
+
+    def test_balanced_move_between_workload_jobs_still_fails(self) -> None:
+        jobs = (
+            "build-and-test-workload",
+            *(f"build-and-test-workload-{name}" for name in ("production", "apt-system", "native", "release")),
+        )
+        for source, target in zip(jobs, jobs[1:] + jobs[:1]):
+            with self.subTest(source=source, target=target):
+                moved_from = self.job(source)
+                moved_to = self.job(target)
+                changed = self.ci.replace(
+                    moved_from, moved_from.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
+                ).replace(moved_to, moved_to + policy.GHR_ZIG_INSTALL, 1)
+                self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 20)
+                self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
 
     def test_unverified_or_duplicate_install_refuses(self) -> None:
         changed = self.ci.replace("ghr-version: v0.8.1", "ghr-version: v0.8.0", 1)

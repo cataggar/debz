@@ -9,7 +9,8 @@ Releases are immutable `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tags on commits
 3. Confirm all required CI checks are green, including setup-action unit/bundle, native, and bare-container lanes; both native build/test lanes; both `Required release dry-run` lanes; `Required release workflow policy`; required disposable-root integration; security audit; and fuzzing.
    The release workflow policy verifies an exact pinned and version-checked
    ghr Zig install in each reviewed CI job, including the separate native
-   core, repository, helper, and diversion recovery jobs.
+   core, repository, helper, and diversion recovery jobs and the five split
+   build workload jobs.
 4. Run the separate `CI` workflow manually with the pinned immutable Ubuntu snapshot URI and suite selected for the release. Require both native real-snapshot acceptance jobs to pass, retain their architecture-tagged `vendor-state-inventory-v1.json` review artifacts, and compare them with the indexed references under `tools/fixtures/vendor-state/`. Require `python3 tools/derive-vendor-state-reference.py --index tools/fixtures/vendor-state/index-v1.json --check tools/fixtures/vendor-state/reference-v1.json` to reproduce the bounded typed reference. Refresh the manifests, index, and derived reference only in a separately reviewed change that records the exact workflow run, source commit, artifact and manifest digests, capture schema version, and inventory differences. Normal pull-request CI intentionally does not download real Ubuntu archives.
 5. Review `security/dependency-policy.json`, including the exact Zig-provided musl snapshot and reviewed vulnerability dispositions, runtime library versions reported by CI, `THIRD_PARTY_NOTICES`, and the exact four-archive plan from `python3 tools/release.py dry-run --tag v0.3.0`.
    Also review `security/digest-cutover-policy.json` and

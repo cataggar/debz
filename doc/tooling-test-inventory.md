@@ -63,7 +63,7 @@ share one Zig test with independent mutations.
 | `test_native_workflow_acceptance_wiring_is_mutation_enforced` | signed FAMILY and projected workflow acceptance refuse unwired evidence; signed FAMILY allocation boundaries retain every scenario reset and long-lived receipt |
 | `test_lifecycle_migration_retires_four_python_gates_without_weakening_reference_refusal` | lifecycle gates retain reference refusals and required Zig selectors |
 | `test_lifecycle_migration_removes_entrypoints_and_preserves_fixture_imports` | six retired lifecycle and recovery Python entry points stay absent, fixture modules remain import-only, and remaining consumers stay wired |
-| `test_build_workloads_keep_both_modes_and_all_existing_suites` | all required CI workloads and optimized-mode selections fail closed under mutation, including both-mode apt acceptance, isolated root caches, and diagnostic normalization; Debug and ReleaseSafe build workloads execute all commands and propagate failures |
+| `test_build_workloads_keep_both_modes_and_all_existing_suites` | every split build workload job, mode and step fails closed under mutation, including both-mode apt acceptance, isolated root caches, diagnostic normalization, and 45-minute limits; every former workload target runs exactly once across the split jobs; build.zig test is exactly the disjoint union of the CI workload partitions; Debug and ReleaseSafe build workloads execute all commands and propagate failures |
 | `test_install_action_reuses_pinned_bundles_and_never_short_circuits` | install action uses pinned bundles and validates before emitting result |
 
 ## Offline snapshot (`tools/test_real_snapshot_acceptance.py`)

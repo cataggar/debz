@@ -13,14 +13,35 @@ scheduled campaign. x64 runs the longer campaign; x64 and arm64 run all
 deterministic corpora and Debug/ReleaseSafe builds and tests. A failing
 deterministic mutation logs its seed and case indexes for exact replay.
 
-Required build workloads use separate architecture and optimization-mode jobs,
-each bounded by a 90-minute limit. The earlier 60-minute limit cancelled an
-x64 ReleaseSafe workload after its build, tests, and native differential checks
-passed but before the required facade acceptance could complete. Every
-combination runs the complete build, test, fuzz, native differential, and
-private helper namespace targets with `-j2` and timing summaries. Debug jobs
-also run release packaging and privileged orchestration; ReleaseSafe jobs run
-installed-CLI facade acceptance and the download action fixture.
+Required build workloads run as five disjoint jobs. Each job runs for both
+architectures and both optimization modes, so there are 20 rows, and each row
+has a 45-minute limit. The former single workload job had a 90-minute limit
+and took 34–90 minutes per row. It timed out on x64 ReleaseSafe at 90.1
+minutes. `zig build test` now depends only on five partition steps. Every
+former `test` member belongs to exactly one partition, and every former
+workload command runs in exactly one job:
+
+| Required job | Commands (`-j2 --summary all`; pinned dpkg where marked) |
+| --- | --- |
+| `build-and-test-workload` (core) | install; `test-workload-core` (unit, CLI, help-flag, consumer, snapshot comparator, apt acceptance unit and repository-add tests); ReleaseSafe `run -- --help` and download action fixture |
+| `build-and-test-workload-production` | `test-workload-production` (package family, production backend, required security and customize tests); pinned `test-native-triggers-zig` and `test-native-diversion-settlement-zig` |
+| `build-and-test-workload-apt-system` | `test-workload-apt-system` (system profile, apt system API/CLI/command/state/orchestrator and required orchestrator security tests); installed-CLI `test-apt-system-acceptance` in both modes; Debug privileged `test-apt-system` |
+| `build-and-test-workload-native` | `test-workload-native` (native alternatives, snapshot, differential, fixture, conffile, dpkg reference/evidence, SHA-512, trigger queue, lifecycle/trigger/settlement unit and recovery unit tests); pinned `test-native-materialization`, `test-native-conffiles`, `test-native-differential` and `test-native-lifecycle-zig`; `test-native-helper-namespace` |
+| `build-and-test-workload-release` | `test-workload-release` (apt schema and native-only rehearsal); `fuzz`; Debug `test-release`; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
+
+The security audit enforces this inventory in three ways:
+
+- `build.zig` must bind the aggregate `test` step to exactly the five
+  partitions, and every former member to exactly one of them.
+- The workload jobs together must run every former Zig target exactly once.
+- CI must run each partition once and must never run the aggregate
+  `zig build test`.
+
+Mutation tests reject every moved, dropped or duplicated partition member or
+target. A few small unit prerequisites of the pinned compare and oracle
+targets still run as build dependencies inside the job that owns each target:
+the lifecycle, trigger and settlement unit runs, each under a minute. No CI
+command runs twice.
 
 The prepared Zig-only recovery transition has three required jobs on each
 architecture, each bounded to 35 minutes. The `native-recovery-zig-*` jobs
@@ -43,7 +64,7 @@ runner after about 21 minutes during FAMILY, so FAMILY runs in its own shard.
 Sharding both legacy modes and Zig targets preserves every pre-retirement
 CI command exactly once per mode and architecture on the published parent,
 which still requires both Python gates. Only this prepared transition removes
-its legacy job. Its `Build and test` checks require all four build rows and
+its legacy job. Its `Build and test` checks require all 20 workload rows and
 all three Zig recovery shards on each architecture; failure, cancellation,
 or a skipped row of any shard cannot make either architecture's aggregate
 pass. The audit also rejects any recovery command duplicated outside its
