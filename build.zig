@@ -858,6 +858,10 @@ pub fn build(b: *std.Build) void {
         &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_dpkg_oracle_evidence.py" },
     );
     test_step.dependOn(&dpkg_oracle_evidence_tests.step);
+    const signed_proc_compare_tests = b.addSystemCommand(
+        &.{ "env", "PYTHONDONTWRITEBYTECODE=1", "python3", "-m", "unittest", "tools/test_real_snapshot_signed_proc_compare.py" },
+    );
+    test_step.dependOn(&signed_proc_compare_tests.step);
 
     const native_lifecycle_tests = b.addTest(.{
         .root_module = debz,

@@ -37,34 +37,34 @@
   },
   "inventory": {
     "tracked_files": {
-      "count": 482,
-      "sha512": "1f424af87716578e7046ee7efb9518dbc9d15b9fe474c101961fd4c41bdb1cb5c2a7a4389c98e6a76957535dd5dcb3a944d9616bbdf72a1b9fef788d5d5370ef"
+      "count": 486,
+      "sha512": "4c81bbc9170ffd36d37fdc28909971f00dec4770a68f911bcd650c823988a555ca332a39ece9a04014cca47f2d5693b68b7e06a6eb0ec2baabfd331fa1f06623"
     },
     "findings": {
-      "count": 21547,
+      "count": 21616,
       "counts": {
-        "cas_layout": 194,
+        "cas_layout": 197,
         "digest_version": 103,
         "fixed_64_hex": 179,
         "raw_32_byte": 1210,
-        "sha256_token": 19861
+        "sha256_token": 19927
       },
-      "sha512": "22f12c219c73a04e8d691cb4435fa065ba0cc768f724f06a9fb665347e20ff96bbbe810efd91959e3d6fda7af392affe48591cd8a393a1e6ed4cb841a8141032"
+      "sha512": "be1b79774ccc4e6622261d3975f6ec1589b03cc320942a7710ee84bb8fa786d808e0438f503b373d17d50498f8980b9e2e7ed0344f086a505af26788cf8b5f3d"
     },
     "classifications": [
       {
         "scope": ".github",
         "classification": "external_integrity_protocol",
         "rationale": "Workflow SHA256 values are frozen installer and CI compatibility inputs; package authorities are independently rejected by semantic checks.",
-        "count": 16,
+        "count": 20,
         "counts": {
           "cas_layout": 1,
           "digest_version": 0,
           "fixed_64_hex": 0,
           "raw_32_byte": 0,
-          "sha256_token": 15
+          "sha256_token": 19
         },
-        "sha512": "221642ebc38b36c5a373b2a7981c741c1b41999b0b82f5286f9842d34e018bfbc2d7faee3494ed83bd6674a9124e5e52fa25638ec85667879f3728ed0c0ca70d"
+        "sha512": "74289532cd7a7d6d633f99db6626d9158ea253a907c1480fefc5c9ebdf39c25b19b3c93b27360cde0bdcc4d0d31aa012f37cd1323b1e6185d233983d9de41cbb"
       },
       {
         "scope": "actions",
@@ -98,15 +98,15 @@
         "scope": "doc",
         "classification": "documented_compatibility",
         "rationale": "Documentation names typed current identities and explicitly described historical or control SHA256 contracts; prose never grants runtime authority.",
-        "count": 341,
+        "count": 345,
         "counts": {
           "cas_layout": 24,
           "digest_version": 7,
           "fixed_64_hex": 0,
           "raw_32_byte": 1,
-          "sha256_token": 309
+          "sha256_token": 313
         },
-        "sha512": "5676d2869bea268e5d91eae44e5c864adf0d354bb07a5f93272405f73118bb295eff9c0b53d39feae8c748acd53a098be00abf1a19dfb94c2894ceea9ed3cb02"
+        "sha512": "d86b3a09ceed790516e5644dcc5cf2f488e5227c95709e1c34cda31c91a8226a54c7b4fea0aa32172808a3571dcbd712910d3d672c8fc0e6e33f14b5b1e1bf5a"
       },
       {
         "scope": "fuzz",
@@ -168,29 +168,29 @@
         "scope": "test",
         "classification": "test_and_fixture_coverage",
         "rationale": "Tracked test sources exercise current typed identities and frozen compatibility fields without defining production digest authority. Recovery selector mutation controls protect both journal/staging and publication runners and their pinned dpkg handoffs.",
-        "count": 961,
+        "count": 963,
         "counts": {
           "cas_layout": 4,
           "digest_version": 0,
           "fixed_64_hex": 8,
           "raw_32_byte": 78,
-          "sha256_token": 871
+          "sha256_token": 873
         },
-        "sha512": "e6314e53090fd20dad23076ecd30155ac3ea8e3373a0424b733d97df7ffd0c7dbf4c52604a0fef3b8d05b99f72b3bba7c7075386109413410176b6ed405de1b0"
+        "sha512": "50f44352f456273651221c6c7fc61ae9f539a255cdf38c56c00d5eb2f7bf7b87fb24bcc24eb8dcf12287b13f6b2a2716bd70b083c3940468d2147de85fc87560"
       },
       {
         "scope": "tools",
         "classification": "release_and_reference_tooling",
         "rationale": "Release, reference, fixture, and audit tooling retains reviewed external or control hashes, including protected disposable pinned systemd proc, signed chrony, PID-only udev, signed sudo and python3 preinst reference harnesses; production authorities remain typed and versioned.",
-        "count": 5055,
+        "count": 5114,
         "counts": {
-          "cas_layout": 19,
+          "cas_layout": 22,
           "digest_version": 1,
           "fixed_64_hex": 4,
           "raw_32_byte": 0,
-          "sha256_token": 5031
+          "sha256_token": 5087
         },
-        "sha512": "dbba72aa48be7793bbbaa99f6c1bafcc9c88761933ce2d99820f46c7b5c61e58a8fb3551895fbbfb54264c77dca3e63cf54614b9ea5b18a51e6fdd93285ac0c9"
+        "sha512": "97a1a1628a1e926b1835cb4e8974e9b49a0071d7e1c9478c4dd990543e5131cb8384c172a472dd884f0637cd2fa817884e7fd7d8f79e28b9d82dd8e2cfc59646"
       }
     ]
   },
