@@ -397,6 +397,35 @@ Prepare and verify the pinned dpkg 1.22.22 and its receipt in the protected
 checkout; these procedures verify the paths and signed source identity and
 create proof roots, but do **not** manufacture the before-script sources.
 
+#### Signed binding refusal fixtures
+
+The udev and sudo refusal and changed-after-binding tests read
+`DEBZ_REQUIRE_SIGNED_{UDEV,SUDO}_PROC_*_ROOT` variables and **return
+without assertions** when those are unset, so the ordinary suite counts
+them as passes without evidence. To execute them with the exact signed
+bytes on either native architecture, build a fresh set of root-owned
+binding roots per optimization mode from the protected checkout root
+(including its root-owned `.real-snapshot` and a root-owned `debz` build):
+
+```sh
+sudo -n tools/real-snapshot-signed-proc-bindings.sh \
+  zig-out/bin/debz .real-snapshot/debug-bindings
+sudo -n env -i PATH="$PROTECTED_ZIG_DIR:/usr/sbin:/usr/bin:/sbin:/bin" \
+  HOME=/root DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1 \
+  $(sudo -n cat .real-snapshot/debug-bindings/bindings.env) \
+  zig build test-maintainer-script -Doptimize=Debug -j2
+```
+
+The script plans and downloads the authenticated amd64 `ubuntu-minimal`
+closure from the pinned `stonking` snapshot, rehashes every locked
+archive by size and SHA-512, extracts each pinned input from its single
+providing archive, and writes 6 udev and 9 sudo variants: one valid
+binding for each changed-after-binding test and one mutation per refusal.
+The Zig bindings, not the script, compare exact bytes, owners, modes and
+links. These roots contain only the signed inputs. They **cannot** run a
+script and do not satisfy `test-native-signed-proc`. The changed variants
+are mutated by their tests; do not reuse a set.
+
 To replay **ordinary** signed lifecycle fixtures on either native
 architecture, the existing CI uses
 `zig build test-native-lifecycle-zig -Dnative-reference-dpkg=PATH
@@ -408,7 +437,10 @@ but **cannot** substitute for exact Ubuntu signed systemd/udev/sudo bytes.
 Those three native proc identities and their pinned sidecars are deliberately
 **amd64-only** in the current admission; no arm64 signed proc replay is
 possible without a separately reviewed arm64 identity/profile and protected
-arm64 inputs. Do not weaken the amd64 identity checks or use emulation as
+arm64 inputs. In the authenticated arm64 `ubuntu-minimal` closure of the
+same snapshot, all three postinst scripts and the ten pinned interpreted,
+data or file-list inputs are byte-identical to amd64; the 12 pinned ELF
+inputs differ. Do not weaken the amd64 identity checks or use emulation as
 native-arm64 proof. The opt-in snapshot job may be invoked with:
 
 ```sh
