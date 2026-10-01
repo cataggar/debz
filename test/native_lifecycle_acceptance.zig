@@ -9,6 +9,7 @@ const statoverride = @import("native_lifecycle_statoverride.zig");
 const diversions = @import("native_lifecycle_diversions.zig");
 const metadata = @import("native_lifecycle_metadata.zig");
 const alternatives = @import("native_lifecycle_alternatives.zig");
+const dpkg_query = @import("native_dpkg_query.zig");
 const negative = @import("native_lifecycle_negative.zig");
 const options = @import("native_test_options");
 
@@ -213,6 +214,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (!diversions_only) runLifecycle(&fixture, selected, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only and !oracle_only and pinned != null) dpkg_query.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };

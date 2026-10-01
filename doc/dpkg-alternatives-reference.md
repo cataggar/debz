@@ -7,6 +7,11 @@ limited to the pinned architectures, tool digests, bounded literal script
 commands, typed canonical records, and authenticated root topology described
 below; all state outside that boundary remains fail-closed.
 
+The same `tools/prepare-native-dpkg.py` receipt also binds the sibling
+`dpkg-query` 1.22.22 binary for test-only fresh-root query parity checks. That
+pin does not admit a production `dpkg-query` dependency or broaden the separate
+signed-maintainer-script exception.
+
 The 2026-10-01 Ubuntu `stonking` amd64 snapshot, signed by
 `F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
 23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC, has a separate
@@ -32,8 +37,8 @@ The canonical result is
 - the reviewed vendor index, amd64 and arm64 manifests, and derived reference;
 - all 14 pinned group identities, 72 master/slave relationships, 189 requested
   paths, and 190 linked entries;
-- the dpkg archives and architecture-specific dpkg and
-  `update-alternatives` executable SHA-256 digests;
+- the dpkg archives and architecture-specific dpkg, test-only `dpkg-query`,
+  and `update-alternatives` executable SHA-256 digests;
 - deterministic synthetic package identities and archive bytes;
 - the task invocation clock and the runtime clock/timestamp classification;
 - every executed command, argument, exit, bounded output/log delta, package
