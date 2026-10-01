@@ -16,7 +16,11 @@ from datetime import date
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FAILURES: list[str] = []
 
+DIGEST_POLICY_SCHEMA = "https://debz.dev/security/digest-cutover-policy-v2"
+DIGEST_POLICY_VERSION = 2
 DIGEST_POLICY_PATH = pathlib.Path("security/digest-cutover-policy.json")
+DIGEST_INVENTORY_PATH = pathlib.Path("security/digest-inventory-v1.tsv")
+DIGEST_INVENTORY_FORMAT = "tsv-v1"
 DIGEST_SCOPE_ROOTS = (
     ".github",
     "actions",
@@ -39,8 +43,15 @@ DIGEST_FINDING_KINDS = (
 )
 DIGEST_POLICY_EXCLUDED_FINDINGS = {
     DIGEST_POLICY_PATH.as_posix(),
+    DIGEST_INVENTORY_PATH.as_posix(),
     "tools/security-audit.py",
 }
+DIGEST_INVENTORY_COLUMNS = (
+    "path",
+    "scope",
+    *DIGEST_FINDING_KINDS,
+    "sha512",
+)
 REMOVED_TEST_ENTRY_POINTS = {
     "tools/test_release.py",
     "tools/test_security_audit.py",
@@ -175,10 +186,11 @@ def untracked_files() -> list[pathlib.Path]:
 
 
 def repository_digest_files(files: list[pathlib.Path]) -> list[pathlib.Path]:
-    required_policy = ROOT / DIGEST_POLICY_PATH
     candidates = [*files, *untracked_files()]
-    if required_policy.is_file():
-        candidates.append(required_policy)
+    for required in (DIGEST_POLICY_PATH, DIGEST_INVENTORY_PATH):
+        required_path = ROOT / required
+        if required_path.is_file():
+            candidates.append(required_path)
     return sorted(set(candidates))
 
 
@@ -359,43 +371,123 @@ def exact_policy_path(value: object) -> bool:
     return ".." not in path.parts and path.as_posix() == value
 
 
-def digest_inventory_failures(
-    texts: dict[str, str],
-    policy: dict[str, object],
-) -> list[str]:
-    failures: list[str] = []
-    scoped_paths = sorted(texts)
-    findings = digest_findings(texts)
-    inventory = policy.get("inventory")
-    if not isinstance(inventory, dict):
-        return ["digest policy inventory is missing"]
-    expected_files = inventory.get("tracked_files")
-    if not isinstance(expected_files, dict):
-        failures.append("digest policy tracked-file inventory is missing")
-    elif (
-        expected_files.get("count") != len(scoped_paths)
-        or expected_files.get("sha512") != canonical_sha512(scoped_paths)
+def digest_policy_identity_failure(policy: dict[str, object]) -> str | None:
+    if (
+        policy.get("schema") != DIGEST_POLICY_SCHEMA
+        or policy.get("version") != DIGEST_POLICY_VERSION
+        or policy.get("fingerprint_algorithm") != "sha512"
     ):
-        failures.append(
-            "digest policy tracked-file inventory changed "
-            f"(count={len(scoped_paths)}, sha512={canonical_sha512(scoped_paths)})"
-        )
-    expected_findings = inventory.get("findings")
-    actual_counts = {
+        return "digest cutover policy identity changed"
+    return None
+
+
+def digest_count_by_kind(findings: list[dict[str, str]]) -> dict[str, int]:
+    return {
         kind: sum(finding["kind"] == kind for finding in findings)
         for kind in DIGEST_FINDING_KINDS
     }
-    if not isinstance(expected_findings, dict):
-        failures.append("digest policy finding inventory is missing")
-    elif (
-        expected_findings.get("count") != len(findings)
-        or expected_findings.get("counts") != actual_counts
-        or expected_findings.get("sha512") != canonical_sha512(findings)
+
+
+def digest_inventory_record_map(texts: dict[str, str]) -> dict[str, dict[str, object]]:
+    records: dict[str, dict[str, object]] = {}
+    findings_by_path: dict[str, list[dict[str, str]]] = {}
+    for finding in digest_findings(texts):
+        findings_by_path.setdefault(finding["path"], []).append(finding)
+    for path, findings in sorted(findings_by_path.items()):
+        records[path] = {
+            "path": path,
+            "scope": digest_scope(path),
+            "counts": digest_count_by_kind(findings),
+            "sha512": canonical_sha512(findings),
+        }
+    return records
+
+
+def digest_inventory_line(record: dict[str, object]) -> str:
+    counts = record["counts"]
+    assert isinstance(counts, dict)
+    return "\t".join(
+        [
+            str(record["path"]),
+            str(record["scope"]),
+            *(str(counts[kind]) for kind in DIGEST_FINDING_KINDS),
+            str(record["sha512"]),
+        ]
+    )
+
+
+def render_digest_inventory(texts: dict[str, str]) -> str:
+    lines = [
+        digest_inventory_line(record)
+        for _, record in sorted(digest_inventory_record_map(texts).items())
+    ]
+    return "".join(f"{line}\n" for line in lines)
+
+
+def parse_digest_inventory(text: str) -> tuple[dict[str, dict[str, object]], list[str]]:
+    failures: list[str] = []
+    records: dict[str, dict[str, object]] = {}
+    paths: list[str] = []
+    if text and not text.endswith("\n"):
+        failures.append("digest inventory is not line-oriented")
+    for line_number, line in enumerate(text.splitlines(), 1):
+        fields = line.split("\t")
+        if len(fields) != len(DIGEST_INVENTORY_COLUMNS):
+            failures.append(f"digest inventory line {line_number} is malformed")
+            continue
+        path, scope, *count_fields, sha512 = fields
+        if not exact_policy_path(path) or not digest_relevant_path(path):
+            failures.append(f"digest inventory line {line_number} has an invalid path")
+            continue
+        if scope != digest_scope(path):
+            failures.append(f"digest inventory line {line_number} has an invalid scope")
+            continue
+        if not re.fullmatch(r"[0-9a-f]{128}", sha512):
+            failures.append(f"digest inventory line {line_number} has an invalid sha512")
+            continue
+        counts: dict[str, int] = {}
+        malformed_count = False
+        for kind, count in zip(DIGEST_FINDING_KINDS, count_fields):
+            if not re.fullmatch(r"(?:0|[1-9][0-9]*)", count):
+                malformed_count = True
+                break
+            counts[kind] = int(count)
+        if malformed_count:
+            failures.append(f"digest inventory line {line_number} has an invalid count")
+            continue
+        if path in records:
+            failures.append(f"digest inventory contains a duplicate record: {path}")
+        paths.append(path)
+        records[path] = {
+            "path": path,
+            "scope": scope,
+            "counts": counts,
+            "sha512": sha512,
+        }
+    if paths != sorted(paths):
+        failures.append("digest inventory records are not sorted")
+    return records, failures
+
+
+def digest_inventory_failures(
+    texts: dict[str, str],
+    policy: dict[str, object],
+    inventory_text: str,
+) -> list[str]:
+    failures: list[str] = []
+    identity_failure = digest_policy_identity_failure(policy)
+    if identity_failure is not None:
+        return [identity_failure]
+    scoped_paths = sorted(texts)
+    inventory = policy.get("inventory")
+    if not isinstance(inventory, dict):
+        return ["digest policy inventory is missing"]
+    if (
+        inventory.get("file") != DIGEST_INVENTORY_PATH.as_posix()
+        or inventory.get("format") != DIGEST_INVENTORY_FORMAT
+        or inventory.get("columns") != list(DIGEST_INVENTORY_COLUMNS)
     ):
-        failures.append(
-            "digest policy finding inventory changed "
-            f"(count={len(findings)}, sha512={canonical_sha512(findings)})"
-        )
+        failures.append("digest policy inventory metadata changed")
 
     classifications = inventory.get("classifications")
     if not isinstance(classifications, list):
@@ -422,25 +514,21 @@ def digest_inventory_failures(
             failures.append("digest policy contains an invalid or duplicate classification")
             continue
         seen_scopes.add(scope)
-        scoped_findings = [
-            finding for finding in findings if digest_scope(finding["path"]) == scope
-        ]
-        scoped_counts = {
-            kind: sum(finding["kind"] == kind for finding in scoped_findings)
-            for kind in DIGEST_FINDING_KINDS
-        }
-        if (
-            entry.get("count") != len(scoped_findings)
-            or entry.get("counts") != scoped_counts
-            or entry.get("sha512") != canonical_sha512(scoped_findings)
-        ):
-            failures.append(
-                f"digest policy classification changed: {scope} "
-                f"(count={len(scoped_findings)}, "
-                f"sha512={canonical_sha512(scoped_findings)})"
-            )
     if sorted(seen_scopes) != actual_scopes:
         failures.append("digest policy does not classify every tracked audit scope")
+    expected_records, parse_failures = parse_digest_inventory(inventory_text)
+    failures.extend(parse_failures)
+    actual_records = digest_inventory_record_map(texts)
+    for path in sorted(set(actual_records) - set(expected_records)):
+        failures.append(f"digest inventory is missing a record: {path}")
+    for path in sorted(set(expected_records) - set(actual_records)):
+        failures.append(f"digest inventory contains an unexpected record: {path}")
+    for path in sorted(set(actual_records) & set(expected_records)):
+        if expected_records[path] != actual_records[path]:
+            failures.append(
+                f"digest inventory record changed: {path} "
+                f"({digest_inventory_line(actual_records[path])})"
+            )
     return failures
 
 
@@ -610,8 +698,9 @@ def typed_digest_authority_failures(texts: dict[str, str]) -> list[str]:
 def digest_cutover_failures(
     texts: dict[str, str],
     policy: dict[str, object],
+    inventory_text: str,
 ) -> list[str]:
-    failures = digest_inventory_failures(texts, policy)
+    failures = digest_inventory_failures(texts, policy, inventory_text)
     failures.extend(
         semantic_allowlist_failures(digest_semantic_candidates(texts), policy)
     )
@@ -621,21 +710,21 @@ def digest_cutover_failures(
 
 def audit_digest_cutover(files: list[pathlib.Path]) -> None:
     policy_path = ROOT / DIGEST_POLICY_PATH
+    inventory_path = ROOT / DIGEST_INVENTORY_PATH
     if not policy_path.is_file():
         fail("digest cutover policy is missing")
+        return
+    if not inventory_path.is_file():
+        fail("digest inventory is missing")
         return
     try:
         policy = json.loads(policy_path.read_text())
     except json.JSONDecodeError:
         fail("digest cutover policy is invalid JSON")
         return
-    if (
-        policy.get("schema")
-        != "https://debz.dev/security/digest-cutover-policy-v1"
-        or policy.get("version") != 1
-        or policy.get("fingerprint_algorithm") != "sha512"
-    ):
-        fail("digest cutover policy identity changed")
+    identity_failure = digest_policy_identity_failure(policy)
+    if identity_failure is not None:
+        fail(identity_failure)
         return
     if policy.get("scope") != {
         "roots": list(DIGEST_SCOPE_ROOTS),
@@ -644,9 +733,9 @@ def audit_digest_cutover(files: list[pathlib.Path]) -> None:
         "exclusion_rationale": (
             "The repository manifest includes tracked and non-ignored untracked "
             "files so pre-commit audit results remain stable after commit. The "
-            "policy and its audit/canary implementation are excluded from token "
-            "findings to avoid recursive self-classification; they do not define "
-            "repository digest authority."
+            "policy, per-file inventory, and audit/canary implementation are "
+            "excluded from token findings to avoid recursive self-classification; "
+            "they do not define repository digest authority."
         ),
     }:
         fail("digest cutover policy scope or self-exclusion changed")
@@ -668,8 +757,256 @@ def audit_digest_cutover(files: list[pathlib.Path]) -> None:
         fail("digest cutover authority policy changed")
         return
     texts = tracked_digest_texts(files)
-    for message in digest_cutover_failures(texts, policy):
+    try:
+        inventory_text = inventory_path.read_text()
+    except UnicodeDecodeError:
+        fail("digest inventory is not UTF-8")
+        return
+    for message in digest_cutover_failures(texts, policy, inventory_text):
         fail(message)
+
+
+def normalized_digest_policy_for_inventory(policy: dict[str, object]) -> dict[str, object]:
+    inventory = policy.get("inventory")
+    classifications = inventory.get("classifications") if isinstance(inventory, dict) else []
+    normalized_classifications: list[dict[str, str]] = []
+    if isinstance(classifications, list):
+        for entry in classifications:
+            if not isinstance(entry, dict):
+                normalized_classifications.append({})
+                continue
+            normalized_classifications.append(
+                {
+                    "scope": entry.get("scope"),
+                    "classification": entry.get("classification"),
+                    "rationale": entry.get("rationale"),
+                }
+            )
+    policy = dict(policy)
+    policy["schema"] = DIGEST_POLICY_SCHEMA
+    policy["version"] = DIGEST_POLICY_VERSION
+    policy["fingerprint_algorithm"] = "sha512"
+    policy["scope"] = {
+        "roots": list(DIGEST_SCOPE_ROOTS),
+        "top_level_files": sorted(DIGEST_TOP_LEVEL_FILES),
+        "excluded_finding_paths": sorted(DIGEST_POLICY_EXCLUDED_FINDINGS),
+        "exclusion_rationale": (
+            "The repository manifest includes tracked and non-ignored untracked "
+            "files so pre-commit audit results remain stable after commit. The "
+            "policy, per-file inventory, and audit/canary implementation are "
+            "excluded from token findings to avoid recursive self-classification; "
+            "they do not define repository digest authority."
+        ),
+    }
+    policy["inventory"] = {
+        "file": DIGEST_INVENTORY_PATH.as_posix(),
+        "format": DIGEST_INVENTORY_FORMAT,
+        "columns": list(DIGEST_INVENTORY_COLUMNS),
+        "classifications": normalized_classifications,
+    }
+    return policy
+
+
+def write_digest_inventory(check: bool) -> int:
+    policy_path = ROOT / DIGEST_POLICY_PATH
+    inventory_path = ROOT / DIGEST_INVENTORY_PATH
+    try:
+        original_policy = policy_path.read_text()
+        policy = json.loads(original_policy)
+    except FileNotFoundError:
+        print("security-audit: digest cutover policy is missing", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as error:
+        print(f"security-audit: digest cutover policy is invalid JSON: {error}", file=sys.stderr)
+        return 2
+    if not isinstance(policy, dict):
+        print("security-audit: digest cutover policy is malformed", file=sys.stderr)
+        return 2
+    texts = tracked_digest_texts(tracked_files())
+    inventory_text = render_digest_inventory(texts)
+    normalized_policy = normalized_digest_policy_for_inventory(policy)
+    policy_text = json.dumps(normalized_policy, indent=2) + "\n"
+    try:
+        original_inventory = inventory_path.read_text()
+    except FileNotFoundError:
+        original_inventory = ""
+    changed = policy_text != original_policy or inventory_text != original_inventory
+    failures = digest_cutover_failures(
+        texts,
+        json.loads(policy_text),
+        inventory_text,
+    )
+    if check:
+        print("stale" if changed else "unchanged")
+        for failure in failures:
+            print("remaining:", failure)
+        return int(changed or bool(failures))
+    policy_path.write_text(policy_text)
+    inventory_path.write_text(inventory_text)
+    print("rewritten" if changed else "unchanged")
+    for failure in failures:
+        print("remaining:", failure)
+    return int(bool(failures))
+
+
+def synthetic_digest_inventory_policy(
+    texts: dict[str, str],
+    *,
+    omit_scope: str | None = None,
+    old_schema: bool = False,
+) -> dict[str, object]:
+    classifications = []
+    for scope in sorted({digest_scope(path) for path in texts}):
+        if scope == omit_scope:
+            continue
+        classifications.append(
+            {
+                "scope": scope,
+                "classification": "synthetic_test_scope",
+                "rationale": (
+                    f"Synthetic digest inventory test classification for {scope}; "
+                    "this rationale is intentionally long enough for policy checks."
+                ),
+            }
+        )
+    return {
+        "schema": (
+            "https://debz.dev/security/digest-cutover-policy-v1"
+            if old_schema
+            else DIGEST_POLICY_SCHEMA
+        ),
+        "version": 1 if old_schema else DIGEST_POLICY_VERSION,
+        "fingerprint_algorithm": "sha512",
+        "inventory": {
+            "file": DIGEST_INVENTORY_PATH.as_posix(),
+            "format": DIGEST_INVENTORY_FORMAT,
+            "columns": list(DIGEST_INVENTORY_COLUMNS),
+            "classifications": classifications,
+        },
+    }
+
+
+def digest_inventory_line_for_path(inventory_text: str, path: str) -> str:
+    for line in inventory_text.splitlines():
+        if line.startswith(path + "\t"):
+            return line
+    raise ValueError(f"missing synthetic inventory line: {path}")
+
+
+def replace_digest_inventory_line(
+    inventory_text: str,
+    path: str,
+    replacement: str,
+) -> str:
+    lines = inventory_text.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(path + "\t"):
+            lines[index] = replacement
+            return "\n".join(lines) + "\n"
+    raise ValueError(f"missing synthetic inventory line: {path}")
+
+
+def replace_digest_inventory_path(
+    inventory_text: str,
+    path: str,
+    replacement_path: str,
+) -> str:
+    line = digest_inventory_line_for_path(inventory_text, path)
+    fields = line.split("\t")
+    fields[0] = replacement_path
+    return replace_digest_inventory_line(inventory_text, path, "\t".join(fields))
+
+
+def replace_digest_inventory_scope(
+    inventory_text: str,
+    path: str,
+    replacement_scope: str,
+) -> str:
+    line = digest_inventory_line_for_path(inventory_text, path)
+    fields = line.split("\t")
+    fields[1] = replacement_scope
+    return replace_digest_inventory_line(inventory_text, path, "\t".join(fields))
+
+
+def digest_inventory_synthetic_failures(case: str) -> list[str]:
+    texts = {
+        "doc/digest-synthetic.md": "Documentation sha256 compatibility marker.\n",
+        "doc/empty-digest-synthetic.md": "Plain documentation without findings.\n",
+        "src/digest_synthetic.zig": (
+            "pub const package_sha256 = \"sha256\";\n"
+            "pub const digest_bytes: [32]u8 = undefined;\n"
+        ),
+        "tools/digest_synthetic.py": "sha256 = 'fixture'\n",
+    }
+    expected_texts = dict(texts)
+    policy = synthetic_digest_inventory_policy(texts)
+    inventory_text = render_digest_inventory(expected_texts)
+    zero_sha512 = "0" * 128
+
+    if case == "valid":
+        pass
+    elif case == "added":
+        texts["src/digest_synthetic.zig"] += "\n// added sha256 canary\n"
+    elif case == "removed":
+        texts["src/digest_synthetic.zig"] = texts["src/digest_synthetic.zig"].replace(
+            "sha256", "sha-512", 1
+        )
+    elif case == "edited":
+        texts["src/digest_synthetic.zig"] = texts["src/digest_synthetic.zig"].replace(
+            "package_sha256", "package_sha256_changed", 1
+        )
+    elif case == "missing-record":
+        line = digest_inventory_line_for_path(inventory_text, "src/digest_synthetic.zig")
+        inventory_text = inventory_text.replace(line + "\n", "")
+    elif case == "extra-missing-file":
+        inventory_text += (
+            "tools/zzzz_digest_inventory_canary.py\ttools\t0\t0\t0\t0\t1\t"
+            f"{zero_sha512}\n"
+        )
+    elif case == "extra-no-findings":
+        lines = inventory_text.splitlines()
+        lines.insert(
+            1,
+            "doc/empty-digest-synthetic.md\tdoc\t0\t0\t0\t0\t0\t"
+            f"{zero_sha512}",
+        )
+        inventory_text = "\n".join(lines) + "\n"
+    elif case == "unsorted":
+        first, second, *rest = inventory_text.splitlines()
+        inventory_text = "\n".join([second, first, *rest]) + "\n"
+    elif case == "duplicate":
+        first = inventory_text.splitlines()[0]
+        inventory_text += first + "\n"
+    elif case == "malformed":
+        inventory_text += "malformed\n"
+    elif case == "absolute-path":
+        inventory_text = replace_digest_inventory_path(
+            inventory_text, "src/digest_synthetic.zig", "/absolute"
+        )
+    elif case == "parent-path":
+        inventory_text = replace_digest_inventory_path(
+            inventory_text, "src/digest_synthetic.zig", "../escape"
+        )
+    elif case == "glob-path":
+        inventory_text = replace_digest_inventory_path(
+            inventory_text, "src/digest_synthetic.zig", "src/*.zig"
+        )
+    elif case == "outside-scope-path":
+        inventory_text = replace_digest_inventory_path(
+            inventory_text, "src/digest_synthetic.zig", "LICENSE"
+        )
+    elif case == "invalid-scope":
+        inventory_text = replace_digest_inventory_scope(
+            inventory_text, "src/digest_synthetic.zig", "tools"
+        )
+    elif case == "old-schema":
+        policy = synthetic_digest_inventory_policy(texts, old_schema=True)
+    elif case == "unclassified-scope":
+        policy = synthetic_digest_inventory_policy(texts, omit_scope="src")
+    else:
+        raise ValueError(f"unknown digest inventory synthetic case: {case}")
+
+    return digest_inventory_failures(texts, policy, inventory_text)
 
 
 def dependency_options(build: str, dependency: str) -> dict[str, str] | None:
@@ -3788,16 +4125,45 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         failures = semantic_allowlist_failures(candidates, policy)
     elif kind == "digest-inventory":
         fixture = json.loads(text)
-        if not isinstance(fixture, dict) or set(fixture) != {"path", "append"} or not isinstance(fixture["path"], str) or not isinstance(fixture["append"], str) or len(fixture["append"]) > 4096:
+        if (
+            not isinstance(fixture, dict)
+            or "path" not in fixture
+            or not isinstance(fixture["path"], str)
+            or ("append" in fixture and "text" in fixture)
+            or ("append" not in fixture and "text" not in fixture)
+            or ("append" in fixture and (not isinstance(fixture["append"], str) or len(fixture["append"]) > 4096))
+            or ("text" in fixture and not isinstance(fixture["text"], str))
+            or ("policy" in fixture and not isinstance(fixture["policy"], str))
+            or ("inventory" in fixture and not isinstance(fixture["inventory"], str))
+            or not set(fixture).issubset({"path", "append", "text", "policy", "inventory"})
+        ):
             print("security-audit: invalid digest inventory input", file=sys.stderr)
             return 2
-        policy = json.loads((ROOT / DIGEST_POLICY_PATH).read_text())
+        policy = json.loads(fixture.get("policy", (ROOT / DIGEST_POLICY_PATH).read_text()))
+        inventory_text = fixture.get("inventory", (ROOT / DIGEST_INVENTORY_PATH).read_text())
         texts = tracked_digest_texts(tracked_files())
         if fixture["path"] not in texts:
             print("security-audit: digest inventory path is not audited", file=sys.stderr)
             return 2
-        texts[fixture["path"]] += fixture["append"]
-        failures = digest_inventory_failures(texts, policy)
+        if "append" in fixture:
+            texts[fixture["path"]] += fixture["append"]
+        else:
+            texts[fixture["path"]] = fixture["text"]
+        failures = digest_inventory_failures(texts, policy, inventory_text)
+    elif kind == "digest-inventory-synthetic":
+        fixture = json.loads(text)
+        if (
+            not isinstance(fixture, dict)
+            or set(fixture) != {"case"}
+            or not isinstance(fixture["case"], str)
+        ):
+            print("security-audit: invalid digest inventory synthetic input", file=sys.stderr)
+            return 2
+        try:
+            failures = digest_inventory_synthetic_failures(fixture["case"])
+        except ValueError as error:
+            print(f"security-audit: {error}", file=sys.stderr)
+            return 2
     elif kind == "digest-allowlist":
         policy = json.loads(text)
         texts = tracked_digest_texts(tracked_files())
@@ -3878,6 +4244,10 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--write-digest-inventory":
+        raise SystemExit(write_digest_inventory(check=False))
+    if len(sys.argv) == 2 and sys.argv[1] == "--check-digest-inventory":
+        raise SystemExit(write_digest_inventory(check=True))
     if len(sys.argv) == 4 and sys.argv[1] == "check":
         raise SystemExit(check_policy_input(sys.argv[2], pathlib.Path(sys.argv[3])))
     if len(sys.argv) == 2 and sys.argv[1] == "native-only-candidate":

@@ -22,6 +22,8 @@ import zlib
 
 PLATFORMS = ("linux-x64", "linux-arm64")
 FORMATS = ("tar.gz", "tar.xz")
+DIGEST_POLICY_SCHEMA = "https://debz.dev/security/digest-cutover-policy-v2"
+DIGEST_INVENTORY_NAME = "digest-inventory-v1.tsv"
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-((?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*))*))?"
@@ -498,8 +500,10 @@ def binary_entries(prefix: pathlib.Path, root_name: str) -> tuple[list[tuple[str
         pathlib.PurePosixPath("share/doc/debz/LICENSE"),
         pathlib.PurePosixPath("share/doc/debz/THIRD_PARTY_NOTICES"),
         pathlib.PurePosixPath("share/debz/digest-cutover-policy.json"),
+        pathlib.PurePosixPath(f"share/debz/{DIGEST_INVENTORY_NAME}"),
         pathlib.PurePosixPath("share/debz/legacy-cutover-policy.json"),
         pathlib.PurePosixPath("share/doc/debz/digest-cutover-policy.json"),
+        pathlib.PurePosixPath(f"share/doc/debz/{DIGEST_INVENTORY_NAME}"),
         pathlib.PurePosixPath("share/doc/debz/legacy-cutover-policy.json"),
         pathlib.PurePosixPath("share/debz/runtime-dependencies.json"),
     }
@@ -514,6 +518,8 @@ def binary_entries(prefix: pathlib.Path, root_name: str) -> tuple[list[tuple[str
     validate_installed_policies(
         installed[pathlib.PurePosixPath("share/debz/digest-cutover-policy.json")],
         installed[pathlib.PurePosixPath("share/doc/debz/digest-cutover-policy.json")],
+        installed[pathlib.PurePosixPath(f"share/debz/{DIGEST_INVENTORY_NAME}")],
+        installed[pathlib.PurePosixPath(f"share/doc/debz/{DIGEST_INVENTORY_NAME}")],
         installed[pathlib.PurePosixPath("share/debz/legacy-cutover-policy.json")],
         installed[pathlib.PurePosixPath("share/doc/debz/legacy-cutover-policy.json")],
     )
@@ -532,31 +538,41 @@ def expected_asset_names(version: str) -> list[str]:
 def validate_installed_policies(
     digest_policy: bytes,
     digest_policy_documentation: bytes,
+    digest_inventory: bytes,
+    digest_inventory_documentation: bytes,
     legacy_policy: bytes,
     legacy_policy_documentation: bytes,
 ) -> None:
     if digest_policy != digest_policy_documentation:
         raise ReleaseError("installed digest cutover policy copies differ")
+    if digest_inventory != digest_inventory_documentation:
+        raise ReleaseError("installed digest inventory copies differ")
     if legacy_policy != legacy_policy_documentation:
         raise ReleaseError("installed legacy cutover policy copies differ")
-    for name, data, schema in (
+    for name, data, schema, version in (
         (
             "digest cutover",
             digest_policy,
-            "https://debz.dev/security/digest-cutover-policy-v1",
+            DIGEST_POLICY_SCHEMA,
+            2,
         ),
         (
             "legacy cutover",
             legacy_policy,
             "https://debz.dev/schema/legacy-compatibility-policy-v1",
+            1,
         ),
     ):
         try:
             document = json.loads(data)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ReleaseError(f"installed {name} policy is invalid JSON") from error
-        if document.get("schema") != schema or document.get("version") != 1:
+        if document.get("schema") != schema or document.get("version") != version:
             raise ReleaseError(f"installed {name} policy identity is invalid")
+        if name == "digest cutover":
+            inventory = document.get("inventory")
+            if not isinstance(inventory, dict) or inventory.get("file") != f"security/{DIGEST_INVENTORY_NAME}":
+                raise ReleaseError("installed digest cutover policy inventory is invalid")
 
 
 def release_plan(tag: str) -> dict[str, object]:
@@ -586,8 +602,10 @@ def audit_archive(
         f"{root}/share/doc/debz/LICENSE",
         f"{root}/share/doc/debz/THIRD_PARTY_NOTICES",
         f"{root}/share/debz/digest-cutover-policy.json",
+        f"{root}/share/debz/{DIGEST_INVENTORY_NAME}",
         f"{root}/share/debz/legacy-cutover-policy.json",
         f"{root}/share/doc/debz/digest-cutover-policy.json",
+        f"{root}/share/doc/debz/{DIGEST_INVENTORY_NAME}",
         f"{root}/share/doc/debz/legacy-cutover-policy.json",
         f"{root}/share/debz/runtime-dependencies.json",
     }
@@ -625,6 +643,8 @@ def validate_archived_binary(
     validate_installed_policies(
         files[f"{root}/share/debz/digest-cutover-policy.json"],
         files[f"{root}/share/doc/debz/digest-cutover-policy.json"],
+        files[f"{root}/share/debz/{DIGEST_INVENTORY_NAME}"],
+        files[f"{root}/share/doc/debz/{DIGEST_INVENTORY_NAME}"],
         files[f"{root}/share/debz/legacy-cutover-policy.json"],
         files[f"{root}/share/doc/debz/legacy-cutover-policy.json"],
     )

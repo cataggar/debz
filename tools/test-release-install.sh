@@ -20,9 +20,12 @@ mkdir -p "$root"
 test -x "$gnu_prefix/bin/debz"
 test ! -e "$gnu_prefix/share/debz/runtime-dependencies.json"
 test -f "$gnu_prefix/share/debz/digest-cutover-policy.json"
+test -f "$gnu_prefix/share/debz/digest-inventory-v1.tsv"
 test -f "$gnu_prefix/share/debz/legacy-cutover-policy.json"
 cmp "$gnu_prefix/share/debz/digest-cutover-policy.json" \
   "$gnu_prefix/share/doc/debz/digest-cutover-policy.json"
+cmp "$gnu_prefix/share/debz/digest-inventory-v1.tsv" \
+  "$gnu_prefix/share/doc/debz/digest-inventory-v1.tsv"
 cmp "$gnu_prefix/share/debz/legacy-cutover-policy.json" \
   "$gnu_prefix/share/doc/debz/legacy-cutover-policy.json"
 if "$zig" build \
@@ -46,9 +49,12 @@ fi
 test -x "$release_prefix/bin/debz"
 test -f "$release_prefix/share/debz/runtime-dependencies.json"
 test -f "$release_prefix/share/debz/digest-cutover-policy.json"
+test -f "$release_prefix/share/debz/digest-inventory-v1.tsv"
 test -f "$release_prefix/share/debz/legacy-cutover-policy.json"
 cmp "$release_prefix/share/debz/digest-cutover-policy.json" \
   "$release_prefix/share/doc/debz/digest-cutover-policy.json"
+cmp "$release_prefix/share/debz/digest-inventory-v1.tsv" \
+  "$release_prefix/share/doc/debz/digest-inventory-v1.tsv"
 cmp "$release_prefix/share/debz/legacy-cutover-policy.json" \
   "$release_prefix/share/doc/debz/legacy-cutover-policy.json"
 source_schemas=$(cd schema && ls -- *.json | sort)
