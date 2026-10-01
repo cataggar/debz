@@ -1080,6 +1080,10 @@ fn digestInventorySyntheticFixture(f: *Fixture, case: []const u8) ![]const u8 {
     return std.json.Stringify.valueAlloc(f.arena.allocator(), .{ .case = case }, .{});
 }
 
+fn digestSemanticAllowlistSyntheticFixture(f: *Fixture, case: []const u8) ![]const u8 {
+    return std.json.Stringify.valueAlloc(f.arena.allocator(), .{ .case = case }, .{});
+}
+
 test "security: frozen digest inventory, typed authority, and narrow reviewed compatibility" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -1118,10 +1122,29 @@ test "security: frozen digest inventory, typed authority, and narrow reviewed co
     const baseline = try f.check("digest-allowlist", policy);
     defer baseline.deinit();
     try baseline.ok();
-    const overbroad = try f.replace(policy, "\"src/content_digest.zig\"\n      ],", "\"src/*\"\n      ],");
+    const overbroad = try f.replace(policy, "\"src/content_digest.zig\"", "\"src/*\"");
     const widened = try f.check("digest-allowlist", overbroad);
     defer widened.deinit();
     try widened.failsWith("digest semantic allowlist contains an invalid or overbroad entry");
+    const semantic_valid = try f.check("digest-semantic-allowlist-synthetic", try digestSemanticAllowlistSyntheticFixture(&f, "valid"));
+    defer semantic_valid.deinit();
+    try semantic_valid.ok();
+    for ([_]struct { case: []const u8, diagnostic: []const u8 }{
+        .{ .case = "missing", .diagnostic = "digest semantic allowlist is missing a record: synthetic-raw-controls:src/member.zig" },
+        .{ .case = "extra", .diagnostic = "digest semantic allowlist contains an unexpected record: synthetic-raw-controls:src/not-member.zig" },
+        .{ .case = "unsorted", .diagnostic = "digest semantic allowlist records are not sorted" },
+        .{ .case = "duplicate", .diagnostic = "digest semantic allowlist contains a duplicate record" },
+        .{ .case = "malformed", .diagnostic = "digest semantic allowlist line" },
+        .{ .case = "non-member-candidate", .diagnostic = "src/not_member.zig:new_control: unreviewed raw 32 byte field" },
+        .{ .case = "member-without-candidates", .diagnostic = "digest semantic allowlist changed: synthetic-raw-controls" },
+        .{ .case = "changed-count", .diagnostic = "digest semantic allowlist record changed: synthetic-raw-controls:src/member.zig" },
+        .{ .case = "changed-sha512", .diagnostic = "digest semantic allowlist record changed: synthetic-raw-controls:src/member.zig" },
+        .{ .case = "missing-entry", .diagnostic = "digest semantic allowlist contains an unexpected record: missing-entry:src/member.zig" },
+    }) |mutation| {
+        const result = try f.check("digest-semantic-allowlist-synthetic", try digestSemanticAllowlistSyntheticFixture(&f, mutation.case));
+        defer result.deinit();
+        try result.failsWith(mutation.diagnostic);
+    }
     try support.contains(policy, "\"historical_versioned_compatibility\"");
     try support.contains(try f.source("src/content_digest.zig"), "pub const Identity = struct");
 }
@@ -1134,6 +1157,7 @@ test "security: digest audit includes nonignored untracked files and reviewed po
     try f.work.write(".gitignore", "*.ignore\n");
     try f.work.write("security/digest-cutover-policy.json", "{}\n");
     try f.work.write("security/digest-inventory-v1.tsv", "");
+    try f.work.write("security/digest-semantic-allowlist-v1.tsv", "");
     const created = try support.run(&.{ "git", "init", "-q", f.work.root });
     defer created.deinit();
     try created.ok();
@@ -1144,6 +1168,7 @@ test "security: digest audit includes nonignored untracked files and reviewed po
     try support.contains(discovered.stdout, "src/sha512_transaction_e2e_test.zig\n");
     try support.contains(discovered.stdout, "security/digest-cutover-policy.json\n");
     try support.contains(discovered.stdout, "security/digest-inventory-v1.tsv\n");
+    try support.contains(discovered.stdout, "security/digest-semantic-allowlist-v1.tsv\n");
     try testing.expect(std.mem.indexOf(u8, discovered.stdout, "ignored.ignore") == null);
 }
 

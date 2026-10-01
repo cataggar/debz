@@ -25,6 +25,7 @@ const Fixture = struct {
         const runtime = try self.source("security/runtime-dependencies.json");
         const digest_policy = try self.source("security/digest-cutover-policy.json");
         const digest_inventory = try self.source("security/digest-inventory-v1.tsv");
+        const digest_semantic_allowlist = try self.source("security/digest-semantic-allowlist-v1.tsv");
         const legacy_policy = try self.source("security/legacy-cutover-policy.json");
         var buffer: [256]u8 = @splat(0);
         buffer[0] = 0x7f;
@@ -55,6 +56,8 @@ const Fixture = struct {
         try self.write(name, "share/doc/debz/digest-cutover-policy.json", digest_policy);
         try self.write(name, "share/debz/digest-inventory-v1.tsv", digest_inventory);
         try self.write(name, "share/doc/debz/digest-inventory-v1.tsv", digest_inventory);
+        try self.write(name, "share/debz/digest-semantic-allowlist-v1.tsv", digest_semantic_allowlist);
+        try self.write(name, "share/doc/debz/digest-semantic-allowlist-v1.tsv", digest_semantic_allowlist);
         try self.write(name, "share/debz/legacy-cutover-policy.json", legacy_policy);
         try self.write(name, "share/doc/debz/legacy-cutover-policy.json", legacy_policy);
         try self.write(name, "share/debz/runtime-dependencies.json", runtime);
@@ -178,10 +181,17 @@ fn auditSyntheticTar(f: *Fixture, entries: []const TarEntry, expected: []const u
 
 fn decompressedArchive(f: *Fixture) ![]u8 {
     const path = try f.path("assets/debz-0.1.0-linux-x64.tar.gz");
-    const uncompressed = try support.run(&.{ "gzip", "-dc", path });
-    defer support.allocator.free(uncompressed.stderr);
-    try testing.expectEqual(@as(u8, 0), uncompressed.code);
-    return uncompressed.stdout;
+    const output = try f.path("assets/debz-0.1.0-linux-x64.tar");
+    const uncompressed = try support.run(&.{
+        "python3",
+        "-c",
+        "import gzip, pathlib, sys\npathlib.Path(sys.argv[2]).write_bytes(gzip.open(sys.argv[1], 'rb').read())",
+        path,
+        output,
+    });
+    defer uncompressed.deinit();
+    try uncompressed.ok();
+    return f.work.read("assets/debz-0.1.0-linux-x64.tar");
 }
 
 fn tarEntryData(tar: []u8, name: []const u8) ![]u8 {
@@ -331,6 +341,9 @@ test "release: missing and divergent installed licenses, cutover policies, and r
     const missing_inventory = try f.prefix("missing-inventory", 62);
     try f.work.directory.dir.deleteFile(support.io, "missing-inventory/share/debz/digest-inventory-v1.tsv");
     try checkBinaryFailure(&f, missing_inventory, "missing required files");
+    const missing_semantic_allowlist = try f.prefix("missing-semantic-allowlist", 62);
+    try f.work.directory.dir.deleteFile(support.io, "missing-semantic-allowlist/share/debz/digest-semantic-allowlist-v1.tsv");
+    try checkBinaryFailure(&f, missing_semantic_allowlist, "missing required files");
     const different = try f.prefix("different", 62);
     try f.write("different", "share/doc/debz/legacy-cutover-policy.json", "{}");
     try checkBinaryFailure(&f, different, "policy copies differ");
@@ -549,12 +562,14 @@ test "release: complete archive with unexpected installation path is rejected af
         .{ .name = prefix ++ "bin/debz", .bytes = binary, .mode = 0o755 },
         .{ .name = prefix ++ "share/debz/digest-cutover-policy.json", .bytes = try f.source("security/digest-cutover-policy.json") },
         .{ .name = prefix ++ "share/debz/digest-inventory-v1.tsv", .bytes = try f.source("security/digest-inventory-v1.tsv") },
+        .{ .name = prefix ++ "share/debz/digest-semantic-allowlist-v1.tsv", .bytes = try f.source("security/digest-semantic-allowlist-v1.tsv") },
         .{ .name = prefix ++ "share/debz/legacy-cutover-policy.json", .bytes = try f.source("security/legacy-cutover-policy.json") },
         .{ .name = prefix ++ "share/debz/runtime-dependencies.json", .bytes = try f.source("security/runtime-dependencies.json") },
         .{ .name = prefix ++ "share/doc/debz/LICENSE", .bytes = "Apache-2.0\n" },
         .{ .name = prefix ++ "share/doc/debz/THIRD_PARTY_NOTICES", .bytes = "libsolv BSD-3-Clause\n" },
         .{ .name = prefix ++ "share/doc/debz/digest-cutover-policy.json", .bytes = try f.source("security/digest-cutover-policy.json") },
         .{ .name = prefix ++ "share/doc/debz/digest-inventory-v1.tsv", .bytes = try f.source("security/digest-inventory-v1.tsv") },
+        .{ .name = prefix ++ "share/doc/debz/digest-semantic-allowlist-v1.tsv", .bytes = try f.source("security/digest-semantic-allowlist-v1.tsv") },
         .{ .name = prefix ++ "share/doc/debz/legacy-cutover-policy.json", .bytes = try f.source("security/legacy-cutover-policy.json") },
         .{ .name = prefix ++ "z/passwd" },
     }, "unexpected install path");

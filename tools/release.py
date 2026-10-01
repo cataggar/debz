@@ -22,8 +22,9 @@ import zlib
 
 PLATFORMS = ("linux-x64", "linux-arm64")
 FORMATS = ("tar.gz", "tar.xz")
-DIGEST_POLICY_SCHEMA = "https://debz.dev/security/digest-cutover-policy-v2"
+DIGEST_POLICY_SCHEMA = "https://debz.dev/security/digest-cutover-policy-v3"
 DIGEST_INVENTORY_NAME = "digest-inventory-v1.tsv"
+DIGEST_SEMANTIC_ALLOWLIST_NAME = "digest-semantic-allowlist-v1.tsv"
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-((?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[A-Za-z-][0-9A-Za-z-]*))*))?"
@@ -501,9 +502,11 @@ def binary_entries(prefix: pathlib.Path, root_name: str) -> tuple[list[tuple[str
         pathlib.PurePosixPath("share/doc/debz/THIRD_PARTY_NOTICES"),
         pathlib.PurePosixPath("share/debz/digest-cutover-policy.json"),
         pathlib.PurePosixPath(f"share/debz/{DIGEST_INVENTORY_NAME}"),
+        pathlib.PurePosixPath(f"share/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}"),
         pathlib.PurePosixPath("share/debz/legacy-cutover-policy.json"),
         pathlib.PurePosixPath("share/doc/debz/digest-cutover-policy.json"),
         pathlib.PurePosixPath(f"share/doc/debz/{DIGEST_INVENTORY_NAME}"),
+        pathlib.PurePosixPath(f"share/doc/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}"),
         pathlib.PurePosixPath("share/doc/debz/legacy-cutover-policy.json"),
         pathlib.PurePosixPath("share/debz/runtime-dependencies.json"),
     }
@@ -520,6 +523,8 @@ def binary_entries(prefix: pathlib.Path, root_name: str) -> tuple[list[tuple[str
         installed[pathlib.PurePosixPath("share/doc/debz/digest-cutover-policy.json")],
         installed[pathlib.PurePosixPath(f"share/debz/{DIGEST_INVENTORY_NAME}")],
         installed[pathlib.PurePosixPath(f"share/doc/debz/{DIGEST_INVENTORY_NAME}")],
+        installed[pathlib.PurePosixPath(f"share/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}")],
+        installed[pathlib.PurePosixPath(f"share/doc/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}")],
         installed[pathlib.PurePosixPath("share/debz/legacy-cutover-policy.json")],
         installed[pathlib.PurePosixPath("share/doc/debz/legacy-cutover-policy.json")],
     )
@@ -540,6 +545,8 @@ def validate_installed_policies(
     digest_policy_documentation: bytes,
     digest_inventory: bytes,
     digest_inventory_documentation: bytes,
+    digest_semantic_allowlist: bytes,
+    digest_semantic_allowlist_documentation: bytes,
     legacy_policy: bytes,
     legacy_policy_documentation: bytes,
 ) -> None:
@@ -547,6 +554,8 @@ def validate_installed_policies(
         raise ReleaseError("installed digest cutover policy copies differ")
     if digest_inventory != digest_inventory_documentation:
         raise ReleaseError("installed digest inventory copies differ")
+    if digest_semantic_allowlist != digest_semantic_allowlist_documentation:
+        raise ReleaseError("installed digest semantic allowlist copies differ")
     if legacy_policy != legacy_policy_documentation:
         raise ReleaseError("installed legacy cutover policy copies differ")
     for name, data, schema, version in (
@@ -554,7 +563,7 @@ def validate_installed_policies(
             "digest cutover",
             digest_policy,
             DIGEST_POLICY_SCHEMA,
-            2,
+            3,
         ),
         (
             "legacy cutover",
@@ -573,6 +582,9 @@ def validate_installed_policies(
             inventory = document.get("inventory")
             if not isinstance(inventory, dict) or inventory.get("file") != f"security/{DIGEST_INVENTORY_NAME}":
                 raise ReleaseError("installed digest cutover policy inventory is invalid")
+            semantic = document.get("semantic_allowlist_inventory")
+            if not isinstance(semantic, dict) or semantic.get("file") != f"security/{DIGEST_SEMANTIC_ALLOWLIST_NAME}":
+                raise ReleaseError("installed digest cutover semantic allowlist inventory is invalid")
 
 
 def release_plan(tag: str) -> dict[str, object]:
@@ -603,9 +615,11 @@ def audit_archive(
         f"{root}/share/doc/debz/THIRD_PARTY_NOTICES",
         f"{root}/share/debz/digest-cutover-policy.json",
         f"{root}/share/debz/{DIGEST_INVENTORY_NAME}",
+        f"{root}/share/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}",
         f"{root}/share/debz/legacy-cutover-policy.json",
         f"{root}/share/doc/debz/digest-cutover-policy.json",
         f"{root}/share/doc/debz/{DIGEST_INVENTORY_NAME}",
+        f"{root}/share/doc/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}",
         f"{root}/share/doc/debz/legacy-cutover-policy.json",
         f"{root}/share/debz/runtime-dependencies.json",
     }
@@ -645,6 +659,8 @@ def validate_archived_binary(
         files[f"{root}/share/doc/debz/digest-cutover-policy.json"],
         files[f"{root}/share/debz/{DIGEST_INVENTORY_NAME}"],
         files[f"{root}/share/doc/debz/{DIGEST_INVENTORY_NAME}"],
+        files[f"{root}/share/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}"],
+        files[f"{root}/share/doc/debz/{DIGEST_SEMANTIC_ALLOWLIST_NAME}"],
         files[f"{root}/share/debz/legacy-cutover-policy.json"],
         files[f"{root}/share/doc/debz/legacy-cutover-policy.json"],
     )

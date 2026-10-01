@@ -14,11 +14,13 @@ Releases are immutable `vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]` tags on commits
 4. Run the separate `CI` workflow manually with the pinned immutable Ubuntu snapshot URI and suite selected for the release. Require both native real-snapshot acceptance jobs to pass, retain their architecture-tagged `vendor-state-inventory-v1.json` review artifacts, and compare them with the indexed references under `tools/fixtures/vendor-state/`. Require `python3 tools/derive-vendor-state-reference.py --index tools/fixtures/vendor-state/index-v1.json --check tools/fixtures/vendor-state/reference-v1.json` to reproduce the bounded typed reference. Refresh the manifests, index, and derived reference only in a separately reviewed change that records the exact workflow run, source commit, artifact and manifest digests, capture schema version, and inventory differences. Normal pull-request CI intentionally does not download real Ubuntu archives.
 5. Review `security/dependency-policy.json`, including the exact Zig-provided musl snapshot and reviewed vulnerability dispositions, runtime library versions reported by CI, `THIRD_PARTY_NOTICES`, and the exact four-archive plan from `python3 tools/release.py dry-run --tag v0.3.0`.
    Also review `security/digest-cutover-policy.json`,
-   `security/digest-inventory-v1.tsv`, and
+   `security/digest-inventory-v1.tsv`,
+   `security/digest-semantic-allowlist-v1.tsv`, and
    `security/legacy-cutover-policy.json`. The sorted per-file digest inventory
-   must reproduce exactly after `zig build write-digest-inventory`, current
-   content authority must remain algorithm-tagged, and every retained SHA256
-   control or historical field must stay explicitly classified. A
+   and per-path semantic allowlist inventory must reproduce exactly after
+   `zig build write-digest-inventory`, current content authority must remain
+   algorithm-tagged, and every retained SHA256 control or historical field must
+   stay explicitly classified. A
    legacy-capable release must keep
    `native_only_cutover_ready: false`, retain every inventoried production
    selector, and ship generated Actions capability evidence. A later

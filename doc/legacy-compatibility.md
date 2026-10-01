@@ -95,7 +95,9 @@ default changes here.
 The tracked repository digest policy is
 [`security/digest-cutover-policy.json`](../security/digest-cutover-policy.json);
 the merge-friendly per-file finding inventory is
-[`security/digest-inventory-v1.tsv`](../security/digest-inventory-v1.tsv).
+[`security/digest-inventory-v1.tsv`](../security/digest-inventory-v1.tsv), and
+the per-membership semantic allowlist inventory is
+[`security/digest-semantic-allowlist-v1.tsv`](../security/digest-semantic-allowlist-v1.tsv).
 Current package, repository-index, artifact, and package-CAS authority must use
 `content_digest.Identity`, `Value`, or `Set`, or the equivalent versioned
 algorithm-tagged wire form. SHA256-only fields and raw `[32]u8` widths remain
@@ -103,7 +105,11 @@ allowlisted only for frozen version-specific compatibility or unrelated
 document, policy, signature, state, and transport controls. Each exception has
 an exact path, a per-scope classification/rationale in the JSON policy, and a
 sorted TSV inventory line with per-kind counts plus the SHA512 of that file's
-canonical findings. The audit derives repository and scope totals at run time;
+canonical findings. Semantic allowlist membership remains only in the JSON
+policy; the allowlist TSV stores one reviewed `(entry id, path)` count and
+canonical SHA512 line, so changing findings in different member files merges
+cleanly without automatically adding new membership. The audit derives
+repository, scope, and semantic totals at run time;
 there is no repository-wide `tracked_files` aggregate to repin because every
 scoped path is still checked against the classified scope list. Path globs,
 malformed, duplicate, unsorted, missing, extra, stale, or unreviewed inventory
