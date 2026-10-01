@@ -1104,12 +1104,22 @@ pub const pinned_tools = [_]ToolBinding{
     },
 };
 
-pub const snapshot_tools = [_]ToolBinding{.{
-    .architecture = "amd64",
-    .sha256 = digestLiteral(
-        "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d",
-    ),
-}};
+// update-alternatives from signed stonking 20261001T000000Z dpkg
+// 1.23.7ubuntu2 archives. The digests are architecture-specific.
+pub const snapshot_tools = [_]ToolBinding{
+    .{
+        .architecture = "amd64",
+        .sha256 = digestLiteral(
+            "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d",
+        ),
+    },
+    .{
+        .architecture = "arm64",
+        .sha256 = digestLiteral(
+            "456f8a6940e8915c6b05bba7cb751df8836b9a14f5c1da2137e767aa6a867643",
+        ),
+    },
+};
 
 const snapshot_less_preinst_sha256 = digestLiteral(
     "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94",
@@ -1220,12 +1230,12 @@ pub fn matchesSnapshotTool(
     architecture: []const u8,
     sha256: [32]u8,
 ) bool {
-    return std.mem.eql(u8, architecture, "amd64") and
-        std.crypto.timing_safe.eql(
-            [32]u8,
-            snapshot_tools[0].sha256,
-            sha256,
-        );
+    for (snapshot_tools) |binding| {
+        if (std.mem.eql(u8, binding.architecture, architecture) and
+            std.crypto.timing_safe.eql([32]u8, binding.sha256, sha256))
+            return true;
+    }
+    return false;
 }
 
 pub fn pinnedTool(architecture: []const u8) ?ToolBinding {
@@ -3326,22 +3336,86 @@ pub fn validateSnapshotConsoleSetupLinuxSuccess(
 
 test "native_alternatives.test.snapshot tool pin is exact and architecture bound" {
     const testing = std.testing;
-    const snapshot = snapshot_tools[0].sha256;
+    const amd64_snapshot = snapshot_tools[0].sha256;
+    const arm64_snapshot = snapshot_tools[1].sha256;
     try testing.expect(matchesPinnedTool("amd64", pinned_tools[0].sha256));
     try testing.expect(matchesPinnedTool("arm64", pinned_tools[1].sha256));
-    try testing.expect(matchesPinnedTool("amd64", snapshot));
-    try testing.expect(!matchesPinnedTool("arm64", snapshot));
-    try testing.expect(!matchesPinnedTool("i386", snapshot));
-    try testing.expect(matchesSnapshotTool("amd64", snapshot));
+    try testing.expect(matchesPinnedTool("amd64", amd64_snapshot));
+    try testing.expect(matchesPinnedTool("arm64", arm64_snapshot));
+    try testing.expect(!matchesPinnedTool("arm64", amd64_snapshot));
+    try testing.expect(!matchesPinnedTool("amd64", arm64_snapshot));
+    try testing.expect(!matchesPinnedTool("i386", amd64_snapshot));
+    try testing.expect(matchesSnapshotTool("amd64", amd64_snapshot));
+    try testing.expect(matchesSnapshotTool("arm64", arm64_snapshot));
     try testing.expect(!matchesSnapshotTool(
         "amd64",
         pinned_tools[0].sha256,
     ));
-    try testing.expect(!matchesSnapshotTool("arm64", snapshot));
-    var changed = snapshot;
+    try testing.expect(!matchesSnapshotTool("arm64", amd64_snapshot));
+    var changed = amd64_snapshot;
     changed[0] ^= 1;
     try testing.expect(!matchesPinnedTool("amd64", changed));
     try testing.expect(!matchesSnapshotTool("amd64", changed));
+}
+
+test "native_alternatives.test.snapshot arm64 mawk postinst matches reference tool" {
+    const testing = std.testing;
+    const bytes = @embedFile(
+        "fixtures/ubuntu-stonking-mawk-1.3.4.20260302-1.postinst",
+    );
+    var script_sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &script_sha256, .{});
+    try testing.expectEqualSlices(
+        u8,
+        &digestLiteral(
+            "6bdd4d52304d03e08c1280568a6c1549ef56a74d4e8592b5a27403bb16d70704",
+        ),
+        &script_sha256,
+    );
+    try testing.expect(matchesSnapshotTool(
+        "arm64",
+        digestLiteral(
+            "456f8a6940e8915c6b05bba7cb751df8836b9a14f5c1da2137e767aa6a867643",
+        ),
+    ));
+    var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
+    defer script.deinit();
+    try testing.expectEqual(@as(usize, 1), script.groups.len);
+    try testing.expectEqualStrings("awk", script.groups[0].name);
+    try testing.expectEqual(@as(usize, 1), script.commands.len);
+    try testing.expectEqualStrings("awk", script.commands[0].name);
+    switch (script.commands[0].command) {
+        .install => |install| {
+            try testing.expectEqualStrings("/usr/bin/awk", install.master_link);
+            try testing.expectEqualStrings("/usr/bin/mawk", install.path);
+            try testing.expectEqual(@as(i32, 5), install.priority);
+            try testing.expectEqual(@as(usize, 3), install.slaves.len);
+            try testing.expectEqualStrings("awk.1.gz", install.slaves[0].name);
+            try testing.expectEqualStrings("nawk", install.slaves[1].name);
+            try testing.expectEqualStrings("nawk.1.gz", install.slaves[2].name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var installed = try mutate(testing.allocator, .{
+        .name = script.commands[0].name,
+        .current = null,
+        .selected = null,
+        .command = script.commands[0].command,
+    });
+    defer installed.deinit();
+    const actual = try canonicalBytes(testing.allocator, installed.record.?);
+    defer testing.allocator.free(actual);
+    const reference =
+        "auto\n/usr/bin/awk\n" ++
+        "awk.1.gz\n/usr/share/man/man1/awk.1.gz\n" ++
+        "nawk\n/usr/bin/nawk\n" ++
+        "nawk.1.gz\n/usr/share/man/man1/nawk.1.gz\n\n" ++
+        "/usr/bin/mawk\n5\n" ++
+        "/usr/share/man/man1/mawk.1.gz\n" ++
+        "/usr/bin/mawk\n" ++
+        "/usr/share/man/man1/mawk.1.gz\n\n";
+    try testing.expectEqualStrings(reference, actual);
 }
 
 test "native_alternatives.test.staged dpkg README retains exact immutable metadata" {
