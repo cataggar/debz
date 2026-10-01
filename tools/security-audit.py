@@ -16,11 +16,13 @@ from datetime import date
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FAILURES: list[str] = []
 
-DIGEST_POLICY_SCHEMA = "https://debz.dev/security/digest-cutover-policy-v2"
-DIGEST_POLICY_VERSION = 2
+DIGEST_POLICY_SCHEMA = "https://debz.dev/security/digest-cutover-policy-v3"
+DIGEST_POLICY_VERSION = 3
 DIGEST_POLICY_PATH = pathlib.Path("security/digest-cutover-policy.json")
 DIGEST_INVENTORY_PATH = pathlib.Path("security/digest-inventory-v1.tsv")
 DIGEST_INVENTORY_FORMAT = "tsv-v1"
+DIGEST_SEMANTIC_ALLOWLIST_PATH = pathlib.Path("security/digest-semantic-allowlist-v1.tsv")
+DIGEST_SEMANTIC_ALLOWLIST_FORMAT = "tsv-v1"
 DIGEST_SCOPE_ROOTS = (
     ".github",
     "actions",
@@ -44,12 +46,19 @@ DIGEST_FINDING_KINDS = (
 DIGEST_POLICY_EXCLUDED_FINDINGS = {
     DIGEST_POLICY_PATH.as_posix(),
     DIGEST_INVENTORY_PATH.as_posix(),
+    DIGEST_SEMANTIC_ALLOWLIST_PATH.as_posix(),
     "tools/security-audit.py",
 }
 DIGEST_INVENTORY_COLUMNS = (
     "path",
     "scope",
     *DIGEST_FINDING_KINDS,
+    "sha512",
+)
+DIGEST_SEMANTIC_ALLOWLIST_COLUMNS = (
+    "id",
+    "path",
+    "count",
     "sha512",
 )
 REMOVED_TEST_ENTRY_POINTS = {
@@ -187,7 +196,11 @@ def untracked_files() -> list[pathlib.Path]:
 
 def repository_digest_files(files: list[pathlib.Path]) -> list[pathlib.Path]:
     candidates = [*files, *untracked_files()]
-    for required in (DIGEST_POLICY_PATH, DIGEST_INVENTORY_PATH):
+    for required in (
+        DIGEST_POLICY_PATH,
+        DIGEST_INVENTORY_PATH,
+        DIGEST_SEMANTIC_ALLOWLIST_PATH,
+    ):
         required_path = ROOT / required
         if required_path.is_file():
             candidates.append(required_path)
@@ -532,19 +545,143 @@ def digest_inventory_failures(
     return failures
 
 
+def semantic_allowlist_record(
+    identifier: str,
+    path: str,
+    candidates: list[dict[str, str]],
+) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "path": path,
+        "count": len(candidates),
+        "sha512": canonical_sha512(candidates),
+    }
+
+
+def semantic_allowlist_line(record: dict[str, object]) -> str:
+    return "\t".join(
+        [
+            str(record["id"]),
+            str(record["path"]),
+            str(record["count"]),
+            str(record["sha512"]),
+        ]
+    )
+
+
+def parse_semantic_allowlist_inventory(
+    text: str,
+) -> tuple[dict[tuple[str, str], dict[str, object]], list[str]]:
+    failures: list[str] = []
+    records: dict[tuple[str, str], dict[str, object]] = {}
+    keys: list[tuple[str, str]] = []
+    if text and not text.endswith("\n"):
+        failures.append("digest semantic allowlist inventory is not line-oriented")
+    for line_number, line in enumerate(text.splitlines(), 1):
+        fields = line.split("\t")
+        if len(fields) != len(DIGEST_SEMANTIC_ALLOWLIST_COLUMNS):
+            failures.append(f"digest semantic allowlist line {line_number} is malformed")
+            continue
+        identifier, path, count_text, sha512 = fields
+        if not identifier or any(character.isspace() for character in identifier):
+            failures.append(f"digest semantic allowlist line {line_number} has an invalid id")
+            continue
+        if not exact_policy_path(path) or not digest_relevant_path(path):
+            failures.append(f"digest semantic allowlist line {line_number} has an invalid path")
+            continue
+        if not re.fullmatch(r"(?:0|[1-9][0-9]*)", count_text):
+            failures.append(f"digest semantic allowlist line {line_number} has an invalid count")
+            continue
+        if not re.fullmatch(r"[0-9a-f]{128}", sha512):
+            failures.append(f"digest semantic allowlist line {line_number} has an invalid sha512")
+            continue
+        key = (identifier, path)
+        if key in records:
+            failures.append(
+                f"digest semantic allowlist contains a duplicate record: {identifier}:{path}"
+            )
+        keys.append(key)
+        records[key] = {
+            "id": identifier,
+            "path": path,
+            "count": int(count_text),
+            "sha512": sha512,
+        }
+    if keys != sorted(keys):
+        failures.append("digest semantic allowlist records are not sorted")
+    return records, failures
+
+
+def semantic_allowlist_inventory_records(
+    candidates_by_kind: dict[str, list[tuple[int, dict[str, str]]]],
+    entries: list[dict[str, object]],
+) -> dict[tuple[str, str], dict[str, object]]:
+    records: dict[tuple[str, str], dict[str, object]] = {}
+    for entry in entries:
+        identifier = entry.get("id")
+        kind = entry.get("kind")
+        paths = entry.get("paths")
+        if not isinstance(identifier, str) or not isinstance(kind, str) or not isinstance(paths, list):
+            continue
+        for path in paths:
+            if not isinstance(path, str):
+                continue
+            selected = [
+                candidate
+                for _, candidate in candidates_by_kind.get(kind, [])
+                if candidate["path"] == path
+            ]
+            records[(identifier, path)] = semantic_allowlist_record(
+                identifier,
+                path,
+                selected,
+            )
+    return records
+
+
+def render_semantic_allowlist_inventory(
+    candidates: list[dict[str, str]],
+    policy: dict[str, object],
+) -> str:
+    candidates_by_kind: dict[str, list[tuple[int, dict[str, str]]]] = {}
+    for index, candidate in enumerate(candidates):
+        candidates_by_kind.setdefault(candidate["kind"], []).append((index, candidate))
+    entries = policy.get("semantic_allowlist")
+    records = semantic_allowlist_inventory_records(
+        candidates_by_kind,
+        entries if isinstance(entries, list) else [],
+    )
+    return "".join(
+        f"{semantic_allowlist_line(record)}\n"
+        for _, record in sorted(records.items())
+    )
+
+
 def semantic_allowlist_failures(
     candidates: list[dict[str, str]],
     policy: dict[str, object],
+    inventory_text: str,
 ) -> list[str]:
     failures: list[str] = []
     entries = policy.get("semantic_allowlist")
     if not isinstance(entries, list) or not entries:
         return ["digest semantic allowlist is missing"]
+    metadata = policy.get("semantic_allowlist_inventory")
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("file") != DIGEST_SEMANTIC_ALLOWLIST_PATH.as_posix()
+        or metadata.get("format") != DIGEST_SEMANTIC_ALLOWLIST_FORMAT
+        or metadata.get("columns") != list(DIGEST_SEMANTIC_ALLOWLIST_COLUMNS)
+    ):
+        failures.append("digest semantic allowlist inventory metadata changed")
     candidates_by_kind: dict[str, list[tuple[int, dict[str, str]]]] = {}
     for index, candidate in enumerate(candidates):
         candidates_by_kind.setdefault(candidate["kind"], []).append(
             (index, candidate)
         )
+    expected_records, parse_failures = parse_semantic_allowlist_inventory(inventory_text)
+    failures.extend(parse_failures)
+    actual_records: dict[tuple[str, str], dict[str, object]] = {}
     covered: set[int] = set()
     seen_ids: set[str] = set()
     allowed_classes = {
@@ -567,7 +704,7 @@ def semantic_allowlist_failures(
             not isinstance(identifier, str)
             or not identifier
             or identifier in seen_ids
-            or kind not in candidates_by_kind
+            or not isinstance(kind, str)
             or classification not in allowed_classes
             or not isinstance(rationale, str)
             or len(rationale.strip()) < 40
@@ -575,24 +712,30 @@ def semantic_allowlist_failures(
             or not paths
             or paths != sorted(set(paths))
             or not all(exact_policy_path(path) for path in paths)
+            or "count" in entry
+            or "sha512" in entry
         ):
             failures.append("digest semantic allowlist contains an invalid or overbroad entry")
             continue
         seen_ids.add(identifier)
         selected_pairs = [
             (index, candidate)
-            for index, candidate in candidates_by_kind[kind]
+            for index, candidate in candidates_by_kind.get(kind, [])
             if candidate["path"] in paths
         ]
         selected = [candidate for _, candidate in selected_pairs]
-        if (
-            not selected
-            or {candidate["path"] for candidate in selected} != set(paths)
-            or entry.get("count") != len(selected)
-            or entry.get("sha512") != canonical_sha512(selected)
-        ):
+        if not selected or {candidate["path"] for candidate in selected} != set(paths):
             failures.append(f"digest semantic allowlist changed: {identifier}")
             continue
+        for path in paths:
+            path_selected = [
+                candidate for candidate in selected if candidate["path"] == path
+            ]
+            actual_records[(identifier, path)] = semantic_allowlist_record(
+                identifier,
+                path,
+                path_selected,
+            )
         for index, candidate in selected_pairs:
             if index in covered:
                 failures.append(
@@ -615,6 +758,20 @@ def semantic_allowlist_failures(
                         f"{candidate['path']}:{candidate['selector']}: "
                         "fixed SHA256 CAS layout is forbidden"
                     )
+    for key in sorted(set(actual_records) - set(expected_records)):
+        failures.append(
+            f"digest semantic allowlist is missing a record: {key[0]}:{key[1]}"
+        )
+    for key in sorted(set(expected_records) - set(actual_records)):
+        failures.append(
+            f"digest semantic allowlist contains an unexpected record: {key[0]}:{key[1]}"
+        )
+    for key in sorted(set(actual_records) & set(expected_records)):
+        if expected_records[key] != actual_records[key]:
+            failures.append(
+                f"digest semantic allowlist record changed: {key[0]}:{key[1]} "
+                f"({semantic_allowlist_line(actual_records[key])})"
+            )
     if covered != set(range(len(candidates))):
         for index, candidate in enumerate(candidates):
             if index not in covered:
@@ -699,10 +856,15 @@ def digest_cutover_failures(
     texts: dict[str, str],
     policy: dict[str, object],
     inventory_text: str,
+    semantic_inventory_text: str,
 ) -> list[str]:
     failures = digest_inventory_failures(texts, policy, inventory_text)
     failures.extend(
-        semantic_allowlist_failures(digest_semantic_candidates(texts), policy)
+        semantic_allowlist_failures(
+            digest_semantic_candidates(texts),
+            policy,
+            semantic_inventory_text,
+        )
     )
     failures.extend(typed_digest_authority_failures(texts))
     return failures
@@ -711,11 +873,15 @@ def digest_cutover_failures(
 def audit_digest_cutover(files: list[pathlib.Path]) -> None:
     policy_path = ROOT / DIGEST_POLICY_PATH
     inventory_path = ROOT / DIGEST_INVENTORY_PATH
+    semantic_inventory_path = ROOT / DIGEST_SEMANTIC_ALLOWLIST_PATH
     if not policy_path.is_file():
         fail("digest cutover policy is missing")
         return
     if not inventory_path.is_file():
         fail("digest inventory is missing")
+        return
+    if not semantic_inventory_path.is_file():
+        fail("digest semantic allowlist inventory is missing")
         return
     try:
         policy = json.loads(policy_path.read_text())
@@ -733,9 +899,10 @@ def audit_digest_cutover(files: list[pathlib.Path]) -> None:
         "exclusion_rationale": (
             "The repository manifest includes tracked and non-ignored untracked "
             "files so pre-commit audit results remain stable after commit. The "
-            "policy, per-file inventory, and audit/canary implementation are "
-            "excluded from token findings to avoid recursive self-classification; "
-            "they do not define repository digest authority."
+            "policy, per-file inventory, semantic allowlist inventory, and "
+            "audit/canary implementation are excluded from token findings to "
+            "avoid recursive self-classification; they do not define repository "
+            "digest authority."
         ),
     }:
         fail("digest cutover policy scope or self-exclusion changed")
@@ -762,7 +929,17 @@ def audit_digest_cutover(files: list[pathlib.Path]) -> None:
     except UnicodeDecodeError:
         fail("digest inventory is not UTF-8")
         return
-    for message in digest_cutover_failures(texts, policy, inventory_text):
+    try:
+        semantic_inventory_text = semantic_inventory_path.read_text()
+    except UnicodeDecodeError:
+        fail("digest semantic allowlist inventory is not UTF-8")
+        return
+    for message in digest_cutover_failures(
+        texts,
+        policy,
+        inventory_text,
+        semantic_inventory_text,
+    ):
         fail(message)
 
 
@@ -782,6 +959,22 @@ def normalized_digest_policy_for_inventory(policy: dict[str, object]) -> dict[st
                     "rationale": entry.get("rationale"),
                 }
             )
+    semantic_entries = policy.get("semantic_allowlist")
+    normalized_semantic_entries: list[dict[str, object]] = []
+    if isinstance(semantic_entries, list):
+        for entry in semantic_entries:
+            if not isinstance(entry, dict):
+                normalized_semantic_entries.append({})
+                continue
+            normalized_semantic_entries.append(
+                {
+                    "id": entry.get("id"),
+                    "kind": entry.get("kind"),
+                    "classification": entry.get("classification"),
+                    "rationale": entry.get("rationale"),
+                    "paths": entry.get("paths"),
+                }
+            )
     policy = dict(policy)
     policy["schema"] = DIGEST_POLICY_SCHEMA
     policy["version"] = DIGEST_POLICY_VERSION
@@ -793,9 +986,10 @@ def normalized_digest_policy_for_inventory(policy: dict[str, object]) -> dict[st
         "exclusion_rationale": (
             "The repository manifest includes tracked and non-ignored untracked "
             "files so pre-commit audit results remain stable after commit. The "
-            "policy, per-file inventory, and audit/canary implementation are "
-            "excluded from token findings to avoid recursive self-classification; "
-            "they do not define repository digest authority."
+            "policy, per-file inventory, semantic allowlist inventory, and "
+            "audit/canary implementation are excluded from token findings to "
+            "avoid recursive self-classification; they do not define repository "
+            "digest authority."
         ),
     }
     policy["inventory"] = {
@@ -804,12 +998,19 @@ def normalized_digest_policy_for_inventory(policy: dict[str, object]) -> dict[st
         "columns": list(DIGEST_INVENTORY_COLUMNS),
         "classifications": normalized_classifications,
     }
+    policy["semantic_allowlist_inventory"] = {
+        "file": DIGEST_SEMANTIC_ALLOWLIST_PATH.as_posix(),
+        "format": DIGEST_SEMANTIC_ALLOWLIST_FORMAT,
+        "columns": list(DIGEST_SEMANTIC_ALLOWLIST_COLUMNS),
+    }
+    policy["semantic_allowlist"] = normalized_semantic_entries
     return policy
 
 
 def write_digest_inventory(check: bool) -> int:
     policy_path = ROOT / DIGEST_POLICY_PATH
     inventory_path = ROOT / DIGEST_INVENTORY_PATH
+    semantic_inventory_path = ROOT / DIGEST_SEMANTIC_ALLOWLIST_PATH
     try:
         original_policy = policy_path.read_text()
         policy = json.loads(original_policy)
@@ -825,16 +1026,29 @@ def write_digest_inventory(check: bool) -> int:
     texts = tracked_digest_texts(tracked_files())
     inventory_text = render_digest_inventory(texts)
     normalized_policy = normalized_digest_policy_for_inventory(policy)
+    semantic_inventory_text = render_semantic_allowlist_inventory(
+        digest_semantic_candidates(texts),
+        normalized_policy,
+    )
     policy_text = json.dumps(normalized_policy, indent=2) + "\n"
     try:
         original_inventory = inventory_path.read_text()
     except FileNotFoundError:
         original_inventory = ""
-    changed = policy_text != original_policy or inventory_text != original_inventory
+    try:
+        original_semantic_inventory = semantic_inventory_path.read_text()
+    except FileNotFoundError:
+        original_semantic_inventory = ""
+    changed = (
+        policy_text != original_policy
+        or inventory_text != original_inventory
+        or semantic_inventory_text != original_semantic_inventory
+    )
     failures = digest_cutover_failures(
         texts,
         json.loads(policy_text),
         inventory_text,
+        semantic_inventory_text,
     )
     if check:
         print("stale" if changed else "unchanged")
@@ -843,6 +1057,7 @@ def write_digest_inventory(check: bool) -> int:
         return int(changed or bool(failures))
     policy_path.write_text(policy_text)
     inventory_path.write_text(inventory_text)
+    semantic_inventory_path.write_text(semantic_inventory_text)
     print("rewritten" if changed else "unchanged")
     for failure in failures:
         print("remaining:", failure)
@@ -871,11 +1086,11 @@ def synthetic_digest_inventory_policy(
         )
     return {
         "schema": (
-            "https://debz.dev/security/digest-cutover-policy-v1"
+            "https://debz.dev/security/digest-cutover-policy-v2"
             if old_schema
             else DIGEST_POLICY_SCHEMA
         ),
-        "version": 1 if old_schema else DIGEST_POLICY_VERSION,
+        "version": 2 if old_schema else DIGEST_POLICY_VERSION,
         "fingerprint_algorithm": "sha512",
         "inventory": {
             "file": DIGEST_INVENTORY_PATH.as_posix(),
@@ -1007,6 +1222,98 @@ def digest_inventory_synthetic_failures(case: str) -> list[str]:
         raise ValueError(f"unknown digest inventory synthetic case: {case}")
 
     return digest_inventory_failures(texts, policy, inventory_text)
+
+
+def synthetic_semantic_allowlist_policy() -> dict[str, object]:
+    return {
+        "semantic_allowlist_inventory": {
+            "file": DIGEST_SEMANTIC_ALLOWLIST_PATH.as_posix(),
+            "format": DIGEST_SEMANTIC_ALLOWLIST_FORMAT,
+            "columns": list(DIGEST_SEMANTIC_ALLOWLIST_COLUMNS),
+        },
+        "semantic_allowlist": [
+            {
+                "id": "synthetic-raw-controls",
+                "kind": "raw_32_byte_field",
+                "classification": "fixed_control_protocol",
+                "rationale": (
+                    "Synthetic semantic allowlist control fields are reviewed "
+                    "test-only controls and not package authority."
+                ),
+                "paths": [
+                    "src/member.zig",
+                    "tools/member.py",
+                ],
+            }
+        ],
+    }
+
+
+def synthetic_semantic_allowlist_candidates() -> list[dict[str, str]]:
+    return [
+        {
+            "context": "control_bytes: [32]u8",
+            "kind": "raw_32_byte_field",
+            "path": "src/member.zig",
+            "selector": "control_bytes",
+        },
+        {
+            "context": "other_control: [32]u8",
+            "kind": "raw_32_byte_field",
+            "path": "tools/member.py",
+            "selector": "other_control",
+        },
+    ]
+
+
+def semantic_allowlist_synthetic_failures(case: str) -> list[str]:
+    policy = synthetic_semantic_allowlist_policy()
+    candidates = synthetic_semantic_allowlist_candidates()
+    inventory_text = render_semantic_allowlist_inventory(candidates, policy)
+    first = inventory_text.splitlines()[0]
+    zero_sha512 = "0" * 128
+
+    if case == "valid":
+        pass
+    elif case == "missing":
+        inventory_text = inventory_text.replace(first + "\n", "")
+    elif case == "extra":
+        inventory_text += (
+            "synthetic-raw-controls\tsrc/not-member.zig\t1\t"
+            f"{zero_sha512}\n"
+        )
+    elif case == "unsorted":
+        first_line, second_line = inventory_text.splitlines()
+        inventory_text = f"{second_line}\n{first_line}\n"
+    elif case == "duplicate":
+        inventory_text += first + "\n"
+    elif case == "malformed":
+        inventory_text += "malformed\n"
+    elif case == "non-member-candidate":
+        candidates.append(
+            {
+                "context": "new_control: [32]u8",
+                "kind": "raw_32_byte_field",
+                "path": "src/not_member.zig",
+                "selector": "new_control",
+            }
+        )
+    elif case == "member-without-candidates":
+        candidates = candidates[:1]
+    elif case == "changed-count":
+        fields = first.split("\t")
+        fields[2] = str(int(fields[2]) + 1)
+        inventory_text = inventory_text.replace(first, "\t".join(fields), 1)
+    elif case == "changed-sha512":
+        fields = first.split("\t")
+        fields[3] = zero_sha512
+        inventory_text = inventory_text.replace(first, "\t".join(fields), 1)
+    elif case == "missing-entry":
+        inventory_text += f"missing-entry\tsrc/member.zig\t1\t{zero_sha512}\n"
+    else:
+        raise ValueError(f"unknown digest semantic allowlist synthetic case: {case}")
+
+    return semantic_allowlist_failures(candidates, policy, inventory_text)
 
 
 def dependency_options(build: str, dependency: str) -> dict[str, str] | None:
@@ -4225,7 +4532,11 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         texts = tracked_digest_texts(tracked_files())
         texts[fixture["path"]] = fixture["text"]
         candidates = digest_semantic_candidates(texts)
-        failures = semantic_allowlist_failures(candidates, policy)
+        failures = semantic_allowlist_failures(
+            candidates,
+            policy,
+            (ROOT / DIGEST_SEMANTIC_ALLOWLIST_PATH).read_text(),
+        )
     elif kind == "digest-inventory":
         fixture = json.loads(text)
         if (
@@ -4267,10 +4578,28 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         except ValueError as error:
             print(f"security-audit: {error}", file=sys.stderr)
             return 2
+    elif kind == "digest-semantic-allowlist-synthetic":
+        fixture = json.loads(text)
+        if (
+            not isinstance(fixture, dict)
+            or set(fixture) != {"case"}
+            or not isinstance(fixture["case"], str)
+        ):
+            print("security-audit: invalid digest semantic allowlist synthetic input", file=sys.stderr)
+            return 2
+        try:
+            failures = semantic_allowlist_synthetic_failures(fixture["case"])
+        except ValueError as error:
+            print(f"security-audit: {error}", file=sys.stderr)
+            return 2
     elif kind == "digest-allowlist":
         policy = json.loads(text)
         texts = tracked_digest_texts(tracked_files())
-        failures = semantic_allowlist_failures(digest_semantic_candidates(texts), policy)
+        failures = semantic_allowlist_failures(
+            digest_semantic_candidates(texts),
+            policy,
+            (ROOT / DIGEST_SEMANTIC_ALLOWLIST_PATH).read_text(),
+        )
     elif kind == "digest-untracked":
         fixture = json.loads(text)
         if not isinstance(fixture, dict) or set(fixture) != {"root"} or not isinstance(fixture["root"], str):

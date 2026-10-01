@@ -160,10 +160,14 @@ workflow tests alongside the production Python audit utility. It does not
 download or execute the live snapshot; see the
 [test inventory](tooling-test-inventory.md) for the preserved negative cases.
 Digest cutover drift is reviewed in `security/digest-inventory-v1.tsv`, a
-sorted TSV with one line per file that has findings. After rebasing a change
-that adds, edits, or removes SHA256-shaped findings, run
-`zig build write-digest-inventory` and review the per-file line diff before
-running `zig build security-audit`.
+sorted TSV with one line per file that has findings, and in
+`security/digest-semantic-allowlist-v1.tsv`, a sorted TSV with one line per
+reviewed allowlist entry/path membership. After rebasing a change that adds,
+edits, or removes SHA256-shaped findings, run `zig build write-digest-inventory`
+and review the per-file and per-membership line diffs before running
+`zig build security-audit`. The command updates counts and hashes only for
+existing allowlist memberships; new member paths require an explicit JSON
+policy edit.
 
 Zig's Debug and ReleaseSafe modes provide bounds, overflow and safety checks.
 The repository does not claim a C sanitizer gate: libsolv and libzstd are

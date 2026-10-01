@@ -1,6 +1,6 @@
 {
-  "schema": "https://debz.dev/security/digest-cutover-policy-v2",
-  "version": 2,
+  "schema": "https://debz.dev/security/digest-cutover-policy-v3",
+  "version": 3,
   "issue": 86,
   "fingerprint_algorithm": "sha512",
   "scope": {
@@ -24,9 +24,10 @@
     "excluded_finding_paths": [
       "security/digest-cutover-policy.json",
       "security/digest-inventory-v1.tsv",
+      "security/digest-semantic-allowlist-v1.tsv",
       "tools/security-audit.py"
     ],
-    "exclusion_rationale": "The repository manifest includes tracked and non-ignored untracked files so pre-commit audit results remain stable after commit. The policy, per-file inventory, and audit/canary implementation are excluded from token findings to avoid recursive self-classification; they do not define repository digest authority."
+    "exclusion_rationale": "The repository manifest includes tracked and non-ignored untracked files so pre-commit audit results remain stable after commit. The policy, per-file inventory, semantic allowlist inventory, and audit/canary implementation are excluded from token findings to avoid recursive self-classification; they do not define repository digest authority."
   },
   "authority_policy": {
     "current_package_repository_artifact_authority": "content_digest.Identity, content_digest.Value, content_digest.Set, or their versioned algorithm-tagged serialized forms",
@@ -110,9 +111,7 @@
       "rationale": "The algorithm-tagged Value and Set representations contain exact algorithm widths internally; callers receive typed values and never raw-width package authority.",
       "paths": [
         "src/content_digest.zig"
-      ],
-      "count": 2,
-      "sha512": "82453a8b7b4c9b541255f8b076aec6a3851fa4200b14ef4eccd16753c9d1d44dc92735401b64fa4c3b8d8fff0010cb1609d5d3923b6dea642d265ddb0d40ebb9"
+      ]
     },
     {
       "id": "raw-historical-authority-fields",
@@ -129,9 +128,7 @@
         "src/transaction_provenance.zig",
         "src/transaction_provenance_v2.zig",
         "src/transaction_recovery.zig"
-      ],
-      "count": 96,
-      "sha512": "6373fc090711ee25d21fb03801a466dd20e83ee2c8a2cefaf772f1b5395c2d78d151cd9a9dd88da456b1b5e97df1d5640e9baec4179cd8a4a49d8de2db83d1a6"
+      ]
     },
     {
       "id": "raw-control-and-compatibility-fields",
@@ -179,9 +176,7 @@
         "src/target_apt_config.zig",
         "src/transaction_provenance_v3.zig",
         "src/transaction_result_summary.zig"
-      ],
-      "count": 368,
-      "sha512": "1ab8f74b21352a55256c6cf4f86694b36881b7289cd4395337b88dd32fd4aef767eeaa49f0283cb5fda5c7531830085ac400d014b96cc43b2647143d233330ee"
+      ]
     },
     {
       "id": "schema-historical-authority-fields",
@@ -198,9 +193,7 @@
         "schema/transaction-result-v1.json",
         "schema/transaction-result-v2.json",
         "schema/transaction-result-v3.json"
-      ],
-      "count": 140,
-      "sha512": "24595ff47363eeeef081e8ef063374cb03a7c27379a191026b2868ac220e8e77439077379eb5257077bdfdc00c4748d3ef35d7a79c3b5eeb34cfb11ae3ddbfcc"
+      ]
     },
     {
       "id": "schema-control-and-compatibility-fields",
@@ -255,9 +248,7 @@
         "schema/transaction-result-summary-v2.json",
         "schema/vendor-state-inventory-v1.json",
         "schema/vendor-state-reference-v1.json"
-      ],
-      "count": 442,
-      "sha512": "10c6cd1a01fe16f450a2ab6f1e1b32faaeaf614ced44b9eb97e94ad7144e56a8ad9a6898d6766be4f4cd6c27958fab5f61c1d392b47415ada6ef70ff04826ffd"
+      ]
     },
     {
       "id": "fixed-64-hex-controls-and-compatibility",
@@ -359,9 +350,7 @@
         "tools/derive-vendor-state-reference.py",
         "tools/native-lifecycle-fixtures.py",
         "tools/test_vendor_state_capture.py"
-      ],
-      "count": 172,
-      "sha512": "e823fcd186cb384f08c6a65e02b77fd75b9ebe04c8f359f9d535cafafa3e058ea7ac22c5203da6f8b0c59f790bc00626480afe2ae90cd6b3feb5b3354eaea4fe"
+      ]
     },
     {
       "id": "fixed-lifecycle-control-assertions",
@@ -374,9 +363,7 @@
         "test/native_lifecycle_negative.zig",
         "test/native_lifecycle_removal.zig",
         "test/native_lifecycle_support.zig"
-      ],
-      "count": 6,
-      "sha512": "a668292eace874f4f9cbf77dfa05e609fb52a297fa9c6621a046373fe2aaf87e37cf986177c44b94a5badeaeb83b6448e481a454d89f0f6cb1a0d807bcb97ecd"
+      ]
     },
     {
       "id": "fixed-recovery-handler-schema-control",
@@ -385,9 +372,7 @@
       "rationale": "The exact Zig recovery oracle checks the frozen lowercase SHA256 handler-schema digest pattern; it cannot authorize package, repository, or artifact content.",
       "paths": [
         "test/native_recovery_oracle.zig"
-      ],
-      "count": 1,
-      "sha512": "590590a536c126c6c7c6e33268efcd14f444132860bd0827a679cd5bcd6d292ff3fe1726e5524b8e5855bedf6dba25607c298a379cdd2f58510888b419840926"
+      ]
     },
     {
       "id": "projected-workflow-lock-control",
@@ -396,9 +381,7 @@
       "rationale": "These exact projected workflow fields serialize the frozen v3 exact-lock and native-receipt SHA256 controls into real owner verification and marker-clear review requests; they do not authorize package archive content.",
       "paths": [
         "test/native_recovery_projected_workflows.zig"
-      ],
-      "count": 4,
-      "sha512": "a80263d8351df26e83c53850a030adb508187e5ab2469a7b2cd4d7db8fbdd3b3217a42fee823b47c0777ce4fffbb07a5275d5493c018029aeeaef7fa7d44d6ee"
+      ]
     },
     {
       "id": "historical-fixed-cas-layouts",
@@ -414,9 +397,17 @@
         "src/local_artifact.zig",
         "src/metadata_cache.zig",
         "src/package_acquisition.zig"
-      ],
-      "count": 14,
-      "sha512": "85ccf7ef8d83c83f6fede9ab5700f12f6e46c07db13e25def94f2dbf3e65d1f03b5dba8a15c90d7e5d87aef4dc4a73cfb20f8748d3cbc0c4334d6f9712fc639b"
+      ]
     }
-  ]
+  ],
+  "semantic_allowlist_inventory": {
+    "file": "security/digest-semantic-allowlist-v1.tsv",
+    "format": "tsv-v1",
+    "columns": [
+      "id",
+      "path",
+      "count",
+      "sha512"
+    ]
+  }
 }
