@@ -1322,6 +1322,9 @@ pub const ManagedKind = enum {
     regular,
     symlink,
     directory,
+    /// A named pipe. It is observed by name and never opened, so its whole
+    /// recorded state is its metadata.
+    fifo,
 };
 
 pub const ManagedEntry = struct {
@@ -1459,7 +1462,7 @@ fn observeManagedEntry(
         .path = path_text,
         .kind = .absent,
     };
-    if (!found.modeled or !found.isSupportedKind())
+    if (!found.modeled or !(found.isSupportedKind() or found.kind == .named_pipe))
         return error.UnmodeledManagedState;
     const base: ManagedEntry = .{
         .path = path_text,
@@ -1467,6 +1470,8 @@ fn observeManagedEntry(
             .regular
         else if (found.isSymbolicLink())
             .symlink
+        else if (found.kind == .named_pipe)
+            .fifo
         else
             .directory,
         .mode = found.mode,
@@ -1548,6 +1553,21 @@ fn observeManagedEntry(
             result.directory_entries = observation.members.len;
             break :block result;
         },
+        .fifo => block: {
+            const observation = try root.observeNamedPipe(path);
+            var result = base;
+            result.mode = observation.entry.mode;
+            result.uid = observation.entry.uid;
+            result.gid = observation.entry.gid;
+            result.device = observation.entry.device;
+            result.inode = observation.entry.inode;
+            result.link_count = observation.entry.link_count;
+            result.modified_nanoseconds =
+                observation.entry.modified_nanoseconds;
+            result.change_nanoseconds = observation.change_nanoseconds;
+            result.size = observation.entry.size;
+            break :block result;
+        },
     };
 }
 
@@ -1592,6 +1612,10 @@ fn validateManagedSnapshot(snapshot: ManagedSnapshot) !void {
                 parseDigest(entry.directory_sha256.?) == null or
                 entry.directory_entries == null or
                 entry.content_sha256 != null or entry.link_target != null)
+                return error.InvalidManagedState,
+            .fifo => if (entry.content_sha256 != null or
+                entry.link_target != null or entry.directory_sha256 != null or
+                entry.directory_entries != null or entry.size != 0)
                 return error.InvalidManagedState,
         }
     }
@@ -1978,7 +2002,8 @@ pub fn checkpointRolledBackMutation(
                 if (entry.kind == .regular and previous.kind == .regular and entry.inode == previous.inode)
                     try linked.put(allocator, (@as(u128, entry.device) << 64) | entry.inode, {});
                 if ((entry.kind == .symlink and previous.kind == .symlink) or
-                    (entry.kind == .directory and previous.kind == .directory))
+                    (entry.kind == .directory and previous.kind == .directory) or
+                    (entry.kind == .fifo and previous.kind == .fifo))
                 {
                     const identity = try restored.getOrPut(allocator, step.path);
                     if (!identity.found_existing) identity.value_ptr.* = false;
@@ -2232,6 +2257,7 @@ fn journalDirectoryMembership(
             .regular => "file",
             .symlink => "sym_link",
             .directory => "directory",
+            .fifo => "named_pipe",
             .absent => unreachable,
         } });
     }
@@ -2263,6 +2289,7 @@ fn restoredJournalEntry(
             .regular => .regular,
             .symlink => .symlink,
             .directory => .directory,
+            .fifo => .fifo,
         },
         .mode = previous.metadata.mode,
         .uid = previous.metadata.uid,

@@ -168,6 +168,26 @@ feature inventory as a cutover gate. Encountering a rejected feature in a
 required Debian or Ubuntu closure requires a contract revision and an
 implementation, never a silent approximation.
 
+### FIFO payloads (#288)
+
+`deb_payload.validateForApplication` (repository archives) and
+`deb_payload.inspectLocalForApplication` (local artifacts) enforce exactly the
+authentication of `validate` and `inspectLocal` and additionally inventory
+data-member FIFOs (tar typeflag `6`). A FIFO entry must have zero size and
+empty link fields and a safe normalized path; its mode, numeric uid/gid, USTAR
+owner/group names, and mtime are retained. A control-member FIFO, a device, a
+socket, and every other special-file type remain `unsupported_file_type`.
+`archive_application.prepare` uses these entry points and models each FIFO as
+`FileKind.fifo`, reporting it in `Features.fifos`; FIFOs carry no `md5sums`
+line and cannot be the target of a hard link.
+
+Only the native application path accepts FIFOs, because only it can publish
+them through journaled [root mutation](root-mutation.md#fifos-288). Every other
+consumer keeps `deb_payload.validate` / `deb_payload.inspectLocal`, which still
+refuse FIFO-bearing archives with `unsupported_file_type` before any mutation;
+in particular, repository admission, the package cache, and the production and
+transaction backends do not yet admit FIFO-bearing repository archives.
+
 ## Limits
 
 `Limits` embeds the `deb_payload` limits and adds independent bounds on modeled

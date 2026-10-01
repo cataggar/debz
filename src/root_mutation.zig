@@ -236,18 +236,26 @@ pub const Error = error{
 // Modeled state
 // ---------------------------------------------------------------------------
 
-/// The only path kinds the native engine acts on. Every other kind fails
-/// closed during preflight.
+/// The only path kinds the native engine acts on. Every other kind - device
+/// nodes, sockets, and anything the platform cannot name - fails closed
+/// during preflight.
+///
+/// A FIFO carries no content: its whole state is its kind and metadata. It is
+/// only ever created, stat-ed, renamed, chowned, chmodded, stamped, and
+/// unlinked by name, never opened, so no step can block on a reader or
+/// writer that is not there.
 pub const Kind = enum {
     regular,
     directory,
     symlink,
+    fifo,
 
     fn fromFileKind(kind: Io.File.Kind) ?Kind {
         return switch (kind) {
             .file => .regular,
             .directory => .directory,
             .sym_link => .symlink,
+            .named_pipe => .fifo,
             else => null,
         };
     }
@@ -354,6 +362,9 @@ pub const StepKind = enum {
     copy_file,
     publish_symlink,
     publish_hard_link,
+    /// Publish a FIFO created in the private workspace with its exact final
+    /// metadata. The FIFO is never opened.
+    publish_fifo,
     create_directory,
     /// Change only the mode, ownership, or modification time of an existing
     /// path.
@@ -428,7 +439,7 @@ pub const Step = struct {
         if (self.kind == .assert_case_sensitive) return &.{.verified};
         if (self.satisfied()) return &.{.verified};
         return switch (self.kind) {
-            .publish_file, .copy_file, .publish_symlink, .publish_hard_link => if (self.needsBackup())
+            .publish_file, .copy_file, .publish_symlink, .publish_hard_link, .publish_fifo => if (self.needsBackup())
                 &.{ .staged, .backup_captured, .published, .parent_synced, .verified }
             else
                 &.{ .staged, .published, .parent_synced, .verified },
@@ -456,10 +467,10 @@ pub const Step = struct {
         };
         return switch (expected.kind) {
             // Only regular-file content needs a physical backup: a symbolic
-            // link and a directory are restored exactly from the journal, and
-            // hard-linking a symbolic link is not portable.
+            // link, a FIFO, and a directory are restored exactly from the
+            // journal, and hard-linking a symbolic link is not portable.
             .regular => self.kind != .set_metadata,
-            .symlink, .directory => false,
+            .symlink, .directory, .fifo => false,
         };
     }
 };
@@ -488,7 +499,7 @@ fn identityEqual(left: State, right: State) bool {
             const right_target = right.link_target orelse return false;
             if (!std.mem.eql(u8, left_target, right_target)) return false;
         },
-        .directory => {},
+        .directory, .fifo => {},
     }
     return true;
 }
@@ -520,7 +531,7 @@ fn identityEqual(left: State, right: State) bool {
 // a precondition that names such a state resolves to that binding rather than
 // to a zero. See `precondition`.
 
-/// The bits Linux can clear from a regular file's mode when it is chowned.
+/// The bits Linux can clear from a non-directory's mode when it is chowned.
 /// The set-user-ID bit always goes; the set-group-ID bit goes when the entry
 /// is group executable, and kernels have differed about the exact condition,
 /// so both outcomes are modeled rather than assumed. A directory keeps its
@@ -529,9 +540,10 @@ const privilege_bits: u32 = 0o6000;
 
 /// True when a `chown` of this kind and mode could drop a bit, which is
 /// exactly when the mode has to be rewritten afterwards even though it
-/// already equals the desired one.
+/// already equals the desired one. The kernel clears the bits on every
+/// non-directory, so a FIFO is modeled exactly like a regular file.
 fn privilegeBitsAtRisk(kind: Kind, mode: u32) bool {
-    return kind == .regular and mode & privilege_bits != 0;
+    return (kind == .regular or kind == .fifo) and mode & privilege_bits != 0;
 }
 
 /// True when applying `to` onto an entry of `kind` that currently holds
@@ -1327,6 +1339,12 @@ fn validateStepShape(step: Step) Error!void {
             const value = desired orelse return error.NonCanonicalDocument;
             if (value.kind != .symlink) return error.NonCanonicalDocument;
         },
+        .publish_fifo => {
+            const value = desired orelse return error.NonCanonicalDocument;
+            if (value.kind != .fifo) return error.NonCanonicalDocument;
+            if (step.source != null or step.source_sha256 != null or step.artifact != null)
+                return error.NonCanonicalDocument;
+        },
         .publish_hard_link => {
             const value = desired orelse return error.NonCanonicalDocument;
             if (value.kind != .regular) return error.NonCanonicalDocument;
@@ -1396,7 +1414,7 @@ fn validateStateShape(state: State) Error!void {
             if (state.link_target == null) return error.NonCanonicalDocument;
             if (state.content_sha256 != null) return error.NonCanonicalDocument;
         },
-        .directory => {
+        .directory, .fifo => {
             if (state.content_sha256 != null or state.link_target != null)
                 return error.NonCanonicalDocument;
             if (state.size != 0) return error.NonCanonicalDocument;
@@ -1915,6 +1933,18 @@ pub const SymlinkIntent = struct {
     overwrite: Overwrite = .replace,
 };
 
+/// A FIFO published by name. Only its mode, ownership, and modification time
+/// are state; it is created in the private workspace and renamed into place,
+/// and is never opened.
+pub const FifoIntent = struct {
+    path: []const u8,
+    mode: u32 = 0o644,
+    uid: u32 = 0,
+    gid: u32 = 0,
+    modified_nanoseconds: i128 = 0,
+    overwrite: Overwrite = .replace,
+};
+
 pub const HardLinkIntent = struct {
     path: []const u8,
     /// Root-relative path of the regular file whose inode is linked.
@@ -1957,6 +1987,7 @@ pub const Intent = union(enum) {
     copy: CopyIntent,
     symlink: SymlinkIntent,
     hard_link: HardLinkIntent,
+    fifo: FifoIntent,
     directory: DirectoryIntent,
     metadata: MetadataIntent,
     case_sensitive: CaseSensitiveIntent,
@@ -2357,6 +2388,7 @@ fn observe(builder: *Builder, path: []const u8) BuildError!Expectation {
             state.size = 0;
             state.metadata.modified_nanoseconds = 0;
         },
+        .fifo => state.size = 0,
     }
     return .{ .present = state };
 }
@@ -2554,6 +2586,25 @@ fn buildStep(
                     .link_target = try builder.arena.dupe(u8, value.target),
                 },
             };
+            step.staging_entry = staging_entry;
+        },
+        .fifo => |value| {
+            step.kind = .publish_fifo;
+            step.overwrite = value.overwrite;
+            try requireOverwrite(builder, expected, value.overwrite, path.text);
+            step.desired = .{ .present = .{
+                .kind = .fifo,
+                .metadata = .{
+                    .mode = try validMode(builder, value.mode, path.text),
+                    .uid = value.uid,
+                    .gid = value.gid,
+                    .modified_nanoseconds = try validTimestamp(
+                        builder,
+                        value.modified_nanoseconds,
+                        path.text,
+                    ),
+                },
+            } };
             step.staging_entry = staging_entry;
         },
         .hard_link => |value| {
@@ -3575,6 +3626,12 @@ fn stageStep(engine: *Engine, step: Step, content: Content) Error!void {
             engine.root.createHardLink(.{ .text = source }, staging.path()) catch
                 return engine.reject(.staging, .io_failed, step.index, .stage_create);
         },
+        .publish_fifo => {
+            if (desired.kind != .fifo)
+                return engine.reject(.staging, .precondition_failed, step.index, .stage_create);
+            engine.root.createNamedPipe(staging.path()) catch
+                return engine.reject(.staging, .io_failed, step.index, .stage_create);
+        },
         else => return,
     }
 
@@ -3950,14 +4007,37 @@ fn selfProduced(
 
     // A symbolic link the transaction re-created from the journal while
     // restoring. The link target is the whole content of a symbolic link, so
-    // an exact target plus a pending metadata write is the recorded old state
-    // part way through being republished.
+    // an exact identity plus a pending metadata write is the recorded old
+    // state part way through being republished. A FIFO is never republished
+    // part way: see `restoredFifo`.
     if (phase == .restore and found.kind == .symlink) {
         if (expected) |old| {
             if (old.kind == .symlink and identityEqual(found, old)) return true;
         }
     }
     return false;
+}
+
+/// True when a step whose recorded old state is a FIFO already holds exactly
+/// that state again. A FIFO has no content, and a restoration publishes it
+/// with every recorded attribute already written, so the only FIFO a
+/// restoration leaves at the name is one indistinguishable from the recorded
+/// one. The same is true of a FIFO somebody else put there with exactly the
+/// recorded attributes; either way nothing is owed, so the entry is left
+/// untouched rather than replaced. Any other FIFO is classified normally,
+/// and one this transaction did not publish forward is foreign.
+fn restoredFifo(engine: *const Engine, step: Step, observation: Observation) bool {
+    const old = switch (step.expected) {
+        .absent => return false,
+        .present => |value| value,
+    };
+    if (old.kind != .fifo) return false;
+    const found = switch (observation.state) {
+        .absent => return false,
+        .present => |value| value,
+    };
+    if (observation.modeled and observation.device != engine.owned.journal.device) return false;
+    return statesEqual(found, old);
 }
 
 /// The ordered metadata writes this step can be part way through on the inode
@@ -4243,7 +4323,9 @@ fn reachableLinkCounts(
     phase: Phase,
 ) LinkCounts {
     var counts: LinkCounts = .{ .lower = identity.link_count, .upper = identity.link_count };
-    if (old.kind == .symlink) return counts;
+    // No plan step links, stages, or backs up a symbolic link or a FIFO, so
+    // nothing this transaction does can move either one's link count.
+    if (old.kind == .symlink or old.kind == .fifo) return counts;
     const frontier = forwardFrontier(engine);
     for (engine.owned.journal.steps) |other| {
         const counted = if (identity.since) |already| other.index <= already else false;
@@ -4286,7 +4368,7 @@ fn reachableLinkCounts(
                         frontier,
                     ), counted);
             },
-            .symlink => unreachable,
+            .symlink, .fifo => unreachable,
         }
     }
     return counts;
@@ -4488,6 +4570,8 @@ fn observeTarget(
         .link_count = value.link_count,
     };
     switch (kind) {
+        // A FIFO is observed by name only; opening it could block.
+        .fifo => {},
         .regular => state.content_sha256 = hashPath(engine, path) catch
             return engine.reject(.publication, .io_failed, step.index, .precondition_check),
         .symlink => state.link_target = engine.root.readSymbolicLink(
@@ -4557,7 +4641,7 @@ fn publishStep(engine: *Engine, step: Step) Error!void {
         step.kind != .create_directory) return;
 
     switch (step.kind) {
-        .publish_file, .copy_file, .publish_symlink, .publish_hard_link => {
+        .publish_file, .copy_file, .publish_symlink, .publish_hard_link, .publish_fifo => {
             const staging = stagingFor(step) orelse
                 return engine.reject(.publication, .staging_missing, step.index, .publish_rename);
             if (engine.root.entryIfExists(staging.path()) catch null == null)
@@ -4667,7 +4751,9 @@ fn applyStepMetadata(engine: *Engine, step: Step) Error!void {
             return engine.reject(.metadata, .io_failed, step.index, .metadata_apply),
         .directory => engine.root.syncDirectory(targetPath(step)) catch
             return engine.reject(.metadata, .io_failed, step.index, .metadata_apply),
-        .symlink => {},
+        // Neither can be opened for an fsync without risk; their metadata is
+        // made durable with the parent directory like the name itself.
+        .symlink, .fifo => {},
     }
 }
 
@@ -4866,6 +4952,7 @@ fn revertStep(engine: *Engine, step: Step) Error!void {
     var observation: Observation = .{};
     try observeTarget(engine, step, targetPath(step), &observation);
     const actual = observation.state;
+    if (restoredFifo(engine, step, observation)) return;
     switch (try classify(engine, step, observation, .restore)) {
         // The recorded old state is already back in place.
         .expected => return,
@@ -4934,6 +5021,26 @@ fn revertStep(engine: *Engine, step: Step) Error!void {
                 try removeDirectoryTarget(engine, step, actual);
                 try engine.hook(.restore_create, step.index);
                 engine.root.publishSymbolicLink(targetPath(step), target, .{
+                    .overwrite = .replace,
+                    .durable = true,
+                }) catch return engine.reject(.recovery, .io_failed, step.index, .restore_create);
+            },
+            .fifo => {
+                // A FIFO has no content to back up: the journal records its
+                // whole state, so it is re-created under a private name,
+                // given every recorded attribute there, and only then
+                // renamed over whatever the forward pass published. The name
+                // therefore never holds a half-restored FIFO, which is what
+                // lets `restoredFifo` tell a finished restoration from
+                // anything else. A directory cannot be renamed over.
+                try removeDirectoryTarget(engine, step, actual);
+                try engine.hook(.restore_create, step.index);
+                engine.root.publishNamedPipe(targetPath(step), .{
+                    .mode = expected.metadata.mode,
+                    .uid = expected.metadata.uid,
+                    .gid = expected.metadata.gid,
+                    .modified_nanoseconds = expected.metadata.modified_nanoseconds,
+                }, .{
                     .overwrite = .replace,
                     .durable = true,
                 }) catch return engine.reject(.recovery, .io_failed, step.index, .restore_create);
@@ -5303,6 +5410,13 @@ pub fn archiveFileIntent(
         .hardlink => .{ .hard_link = .{
             .path = path,
             .source = file.link_target orelse return error.UnsupportedArchiveEntry,
+        } },
+        .fifo => .{ .fifo = .{
+            .path = path,
+            .mode = file.permissions() | (file.mode & 0o7000),
+            .uid = std.math.cast(u32, file.uid) orelse return error.UnsupportedArchiveEntry,
+            .gid = std.math.cast(u32, file.gid) orelse return error.UnsupportedArchiveEntry,
+            .modified_nanoseconds = @as(i128, file.mtime) * std.time.ns_per_s,
         } },
     };
 }
@@ -7555,20 +7669,37 @@ test "root_mutation.test.special files fail closed before mutation" {
     try fixture.init();
     defer fixture.deinit();
 
+    // FIFOs are modeled; every other special kind still fails closed. A
+    // socket node needs no privilege to create, unlike a device node.
     if (std.os.linux.errno(std.os.linux.mknodat(
         fixture.tmp.dir.handle,
-        "fifo",
-        std.posix.S.IFIFO | 0o600,
+        "socket",
+        std.posix.S.IFSOCK | 0o600,
         0,
     )) != .SUCCESS) return error.SkipZigTest;
 
-    try expectDiagnostic(&fixture, &.{fileIntent("fifo", "x")}, .unsupported_kind);
-    try expectDiagnostic(&fixture, &.{.{ .remove = .{ .path = "fifo" } }}, .unsupported_kind);
+    try expectDiagnostic(&fixture, &.{fileIntent("socket", "x")}, .unsupported_kind);
+    try expectDiagnostic(&fixture, &.{.{ .remove = .{ .path = "socket" } }}, .unsupported_kind);
     try expectDiagnostic(
         &fixture,
-        &.{.{ .metadata = .{ .path = "fifo", .mode = 0o600 } }},
+        &.{.{ .metadata = .{ .path = "socket", .mode = 0o600 } }},
         .unsupported_kind,
     );
+    try expectDiagnostic(&fixture, &.{.{ .fifo = .{ .path = "socket" } }}, .unsupported_kind);
+    if (std.os.linux.geteuid() == 0 and std.os.linux.errno(std.os.linux.mknodat(
+        fixture.tmp.dir.handle,
+        "device",
+        std.posix.S.IFCHR | 0o600,
+        makedev(1, 3),
+    )) == .SUCCESS) {
+        try expectDiagnostic(&fixture, &.{fileIntent("device", "x")}, .unsupported_kind);
+        try expectDiagnostic(&fixture, &.{.{ .remove = .{ .path = "device" } }}, .unsupported_kind);
+        try expectDiagnostic(&fixture, &.{.{ .fifo = .{ .path = "device" } }}, .unsupported_kind);
+    }
+}
+
+fn makedev(major: u32, minor: u32) u32 {
+    return (major << 8) | (minor & 0xff) | ((minor & 0xfff00) << 12);
 }
 
 test "root_mutation.test.repeated application of the same plan is idempotent" {
@@ -11055,6 +11186,481 @@ test "root_mutation.test.a symbolic link re-created while restoring is finished,
         "first",
         try root.readSymbolicLink(try root_fs.Path.init("etc/link"), &buffer),
     );
+    try expectAbsent(root, "etc/other");
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+}
+
+// ---------------------------------------------------------------------------
+// FIFOs
+// ---------------------------------------------------------------------------
+
+const fifo_seed_timestamp: i128 = 2_000_000_000;
+
+fn fifoIntent(path: []const u8, mode: u32) Intent {
+    return .{ .fifo = .{
+        .path = path,
+        .mode = mode,
+        .uid = currentUid(),
+        .gid = currentGid(),
+        .modified_nanoseconds = 1_000_000_000,
+    } };
+}
+
+fn seedFifo(root: root_fs.Root, path: []const u8, mode: u32) !void {
+    const resolved = try root_fs.Path.init(path);
+    try root.createNamedPipe(resolved);
+    try root.applyMetadata(resolved, .{ .mode = mode, .modified_nanoseconds = fifo_seed_timestamp });
+}
+
+fn expectFifo(root: root_fs.Root, path: []const u8, mode: u32, modified_nanoseconds: i128) !void {
+    const found = try root.entry(try root_fs.Path.init(path));
+    try testing.expectEqual(Io.File.Kind.named_pipe, found.kind);
+    try testing.expectEqual(mode, found.mode);
+    try testing.expectEqual(currentUid(), found.uid);
+    try testing.expectEqual(currentGid(), found.gid);
+    try testing.expectEqual(modified_nanoseconds, found.modified_nanoseconds);
+    try testing.expectEqual(@as(u64, 1), found.link_count);
+}
+
+/// Every FIFO transition dpkg makes: a fresh FIFO; a regular file, a symbolic
+/// link, and an empty directory replaced by a FIFO; a FIFO replaced by a
+/// regular file, by a FIFO with new metadata, and by a directory; and a FIFO
+/// removed.
+fn seedFifoRoot(root: root_fs.Root) !void {
+    try writeExisting(root, "etc/was-file", "old\n");
+    try root.createSymbolicLink(try root_fs.Path.init("etc/was-link"), "elsewhere");
+    try root.createDirectory(try root_fs.Path.init("etc/was-dir"), root_fs.default_directory_permissions);
+    try seedFifo(root, "etc/pipe-old", 0o644);
+    try seedFifo(root, "etc/pipe-meta", 0o620);
+    try seedFifo(root, "etc/pipe-gone", 0o640);
+    try seedFifo(root, "etc/pipe-dir", 0o600);
+}
+
+fn fifoIntents() [8]Intent {
+    return .{
+        fifoIntent("etc/new-pipe", 0o640),
+        fifoIntent("etc/was-file", 0o600),
+        fifoIntent("etc/was-link", 0o644),
+        fifoIntent("etc/was-dir", 0o644),
+        fileIntent("etc/pipe-old", "now regular\n"),
+        fifoIntent("etc/pipe-meta", 0o2660),
+        .{ .remove = .{ .path = "etc/pipe-gone" } },
+        directoryIntent("etc/pipe-dir"),
+    };
+}
+
+fn expectFifoSeeded(root: root_fs.Root) !void {
+    try expectAbsent(root, "etc/new-pipe");
+    try expectContent(root, "etc/was-file", "old\n");
+    var buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings(
+        "elsewhere",
+        try root.readSymbolicLink(try root_fs.Path.init("etc/was-link"), &buffer),
+    );
+    try testing.expect((try root.entry(try root_fs.Path.init("etc/was-dir"))).isDirectory());
+    try expectFifo(root, "etc/pipe-old", 0o644, fifo_seed_timestamp);
+    try expectFifo(root, "etc/pipe-meta", 0o620, fifo_seed_timestamp);
+    try expectFifo(root, "etc/pipe-gone", 0o640, fifo_seed_timestamp);
+    try expectFifo(root, "etc/pipe-dir", 0o600, fifo_seed_timestamp);
+}
+
+fn expectFifoApplied(root: root_fs.Root) !void {
+    try expectFifo(root, "etc/new-pipe", 0o640, 1_000_000_000);
+    try expectFifo(root, "etc/was-file", 0o600, 1_000_000_000);
+    try expectFifo(root, "etc/was-link", 0o644, 1_000_000_000);
+    try expectFifo(root, "etc/was-dir", 0o644, 1_000_000_000);
+    try expectContent(root, "etc/pipe-old", "now regular\n");
+    try expectFifo(root, "etc/pipe-meta", 0o2660, 1_000_000_000);
+    try expectAbsent(root, "etc/pipe-gone");
+    const directory = try root.entry(try root_fs.Path.init("etc/pipe-dir"));
+    try testing.expect(directory.isDirectory());
+    try testing.expectEqual(@as(u32, 0o755), directory.mode);
+}
+
+test "root_mutation.test.FIFOs publish, replace, and remove by name" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedFifoRoot(root);
+
+    const intents = fifoIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    for ([_]StepKind{
+        .publish_fifo, .publish_fifo, .publish_fifo, .publish_fifo,
+        .publish_file, .publish_fifo, .remove_path,  .create_directory,
+    }, plan.steps) |kind, step| {
+        try testing.expectEqual(kind, step.kind);
+        // No FIFO is ever backed up: the journal records its whole state.
+        if (step.kind == .publish_fifo or step.index == 6)
+            try testing.expect((step.backup_entry != null) == (step.index == 1));
+    }
+    const old_pipe = plan.steps[4].expected.present;
+    try testing.expectEqual(Kind.fifo, old_pipe.kind);
+    try testing.expectEqual(@as(u64, 0), old_pipe.size);
+    try testing.expect(old_pipe.content_sha256 == null and old_pipe.link_target == null);
+    try testing.expect(old_pipe.inode != 0);
+
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    defer engine.deinit();
+    const canonical = try engine.journal().canonicalJson(testing.allocator);
+    defer testing.allocator.free(canonical);
+    var decoded = try decode(testing.allocator, canonical, maximum_document_bytes);
+    defer decoded.deinit();
+    try testing.expectEqual(StepKind.publish_fifo, decoded.journal.steps[0].kind);
+    try testing.expectEqual(Kind.fifo, decoded.journal.steps[0].desired.present.kind);
+
+    const report = try apply(&engine, .fromPlan(&plan));
+    try testing.expectEqual(Outcome.applied, report.outcome);
+    try expectFifoApplied(root);
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+
+    // The completed transaction removes a FIFO it published, too.
+    var removal = try planFor(&fixture, &.{.{ .remove = .{ .path = "etc/new-pipe" } }});
+    defer removal.deinit();
+    var remover = try prepare(testing.allocator, root, &fixture.attempt, &removal, .{}, .{});
+    defer remover.deinit();
+    try testing.expectEqual(Outcome.applied, (try apply(&remover, .fromPlan(&removal))).outcome);
+    try expectAbsent(root, "etc/new-pipe");
+    try clear(&remover);
+}
+
+test "root_mutation.test.FIFO journal states have exactly one shape" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    var plan = try planFor(&fixture, &.{fifoIntent("etc/pipe", 0o640)});
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+    const canonical = try engine.journal().canonicalJson(testing.allocator);
+    defer testing.allocator.free(canonical);
+    engine.deinit();
+
+    for ([_]struct { marker: []const u8, replacement: []const u8 }{
+        // A FIFO step can only publish a FIFO, and a FIFO carries no
+        // content, size, or link target.
+        .{ .marker = "\"kind\":\"publish_fifo\"", .replacement = "\"kind\":\"publish_symlink\"" },
+        .{ .marker = "\"kind\":\"publish_fifo\"", .replacement = "\"kind\":\"publish_file\"" },
+        .{ .marker = "\"kind\":\"fifo\"", .replacement = "\"kind\":\"directory\"" },
+        .{ .marker = "\"link_target\":null", .replacement = "\"link_target\":\"x\"" },
+        .{ .marker = "\"size\":0", .replacement = "\"size\":1" },
+        .{ .marker = "\"kind\":\"fifo\"", .replacement = "\"kind\":\"socket\"" },
+    }) |case| {
+        const index = std.mem.indexOf(u8, canonical, case.marker) orelse return error.MissingMarker;
+        const tampered = try std.fmt.allocPrint(testing.allocator, "{s}{s}{s}", .{
+            canonical[0..index],
+            case.replacement,
+            canonical[index + case.marker.len ..],
+        });
+        defer testing.allocator.free(tampered);
+        if (decode(testing.allocator, tampered, maximum_document_bytes)) |value| {
+            var owned = value;
+            owned.deinit();
+            std.debug.print("accepted tampered FIFO journal: {s}\n", .{case.replacement});
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "root_mutation.test.a substituted FIFO or occupant is never adopted" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    for ([_]enum { fifo, regular, planted }{ .fifo, .regular, .planted }) |substitute| {
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const root = fixture.root();
+        try root.createDirectoryPath(try root_fs.Path.init("etc"), root_fs.default_directory_permissions);
+        try seedFifo(root, "etc/pipe", 0o640);
+        const intents = [_]Intent{
+            fifoIntent("etc/pipe", 0o600),
+            .{ .fifo = .{
+                .path = "etc/fresh",
+                .mode = 0o600,
+                .uid = currentUid(),
+                .gid = currentGid(),
+                .overwrite = .require_absent,
+            } },
+        };
+        var plan = try planFor(&fixture, &intents);
+        defer plan.deinit();
+        var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{});
+        defer engine.deinit();
+        switch (substitute) {
+            // Same kind and metadata on another inode is still somebody
+            // else's FIFO.
+            .fifo => {
+                try seedFifo(root, "etc/pipe.replacement", 0o640);
+                try root.rename(
+                    try root_fs.Path.init("etc/pipe.replacement"),
+                    try root_fs.Path.init("etc/pipe"),
+                    .replace,
+                );
+            },
+            .regular => try root.publishFile(try root_fs.Path.init("etc/pipe"), "", .{}),
+            .planted => try seedFifo(root, "etc/fresh", 0o644),
+        }
+        const substituted = try root.entry(try root_fs.Path.init(
+            if (substitute == .planted) "etc/fresh" else "etc/pipe",
+        ));
+        const report = try apply(&engine, .fromPlan(&plan));
+        // A FIFO carrying exactly the recorded attributes is refused going
+        // forward, but it is the recorded old state as far as any restoration
+        // can tell, so it is left in place and the transaction rolls back.
+        // Anything else stops the transaction where it stands.
+        try testing.expectEqual(
+            if (substitute == .fifo) Outcome.rolled_back else Outcome.recovery_required,
+            report.outcome,
+        );
+        try testing.expectEqual(Code.external_modification, report.diagnostic.?.code);
+        // The occupant nobody in this plan made is left exactly as found.
+        const after = try root.entry(try root_fs.Path.init(
+            if (substitute == .planted) "etc/fresh" else "etc/pipe",
+        ));
+        try testing.expectEqual(substituted.inode, after.inode);
+        try testing.expectEqual(substituted.kind, after.kind);
+        try testing.expectEqual(substituted.mode, after.mode);
+        try testing.expectEqual(substituted.modified_nanoseconds, after.modified_nanoseconds);
+    }
+}
+
+/// Records every hook arrival of one uninterrupted run, so a crash matrix
+/// can stop at each of them instead of at a hand-maintained guess.
+const Arrival = struct { boundary: Boundary, step: u32, occurrence: usize };
+
+const Recorder = struct {
+    faults: []const Fault = &.{},
+    injector: Injector = .{ .faults = &.{} },
+    arrivals: [512]Arrival = undefined,
+    len: usize = 0,
+    /// Only arrivals after the first injected fault are recorded, which is
+    /// how a restoration's own boundaries are told from the forward ones.
+    after_fault: bool = false,
+    faulted: bool = false,
+
+    fn interface(self: *Recorder) Hooks {
+        self.injector = .{ .faults = self.faults };
+        return .{ .context = self, .beforeFn = before };
+    }
+
+    fn before(context: ?*anyopaque, boundary: Boundary, index: u32) HookError!void {
+        const self: *Recorder = @ptrCast(@alignCast(context.?));
+        var occurrence: usize = 1;
+        for (self.arrivals[0..self.len]) |seen| {
+            if (seen.boundary == boundary and seen.step == index) occurrence += 1;
+        }
+        if (!self.after_fault or self.faulted) {
+            if (self.len == self.arrivals.len) return error.SimulatedCrash;
+            self.arrivals[self.len] = .{ .boundary = boundary, .step = index, .occurrence = occurrence };
+            self.len += 1;
+        }
+        Injector.before(&self.injector, boundary, index) catch |err| {
+            self.faulted = true;
+            return err;
+        };
+    }
+};
+
+fn recordFifoArrivals(recorder: *Recorder) !void {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedFifoRoot(root);
+    const intents = fifoIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    var engine = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = recorder.interface(),
+    });
+    defer engine.deinit();
+    const report = try apply(&engine, .fromPlan(&plan));
+    if (recorder.faults.len == 0) {
+        try testing.expectEqual(Outcome.applied, report.outcome);
+        try expectFifoApplied(root);
+    } else {
+        try testing.expectEqual(Outcome.rolled_back, report.outcome);
+        try expectFifoSeeded(root);
+    }
+    try expectWorkspaceEmpty(root);
+}
+
+/// The occurrence a fault needs to stop at `arrival` in a run whose earlier
+/// arrivals of the same boundary and step also count, which is every arrival
+/// of a restoration after its forward pass.
+fn countedOccurrence(earlier: []const Arrival, arrival: Arrival) usize {
+    var occurrence = arrival.occurrence;
+    for (earlier) |seen| {
+        if (seen.boundary == arrival.boundary and seen.step == arrival.step) occurrence += 1;
+    }
+    return occurrence;
+}
+
+fn runFifoCrashScenario(faults: []const Fault, resume_forward: bool) !void {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try seedFifoRoot(root);
+
+    var injector: Injector = .{ .faults = faults };
+    const intents = fifoIntents();
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+    const crashed_engine = prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    if (crashed_engine) |value| {
+        var crashed = value;
+        const outcome = apply(&crashed, .fromPlan(&plan));
+        crashed.deinit();
+        try testing.expectError(error.SimulatedCrash, outcome);
+    } else |err| try testing.expectEqual(error.SimulatedCrash, err);
+    // A fault that never fired would silently weaken the matrix.
+    try testing.expect(injector.allFired());
+
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})) orelse {
+        try expectFifoSeeded(root);
+        return;
+    };
+    defer engine.deinit();
+    // Re-running the same transaction finishes an interrupted forward pass;
+    // a recovery pass resolves it in whichever direction the journal chose.
+    const forward_resumable = resume_forward and
+        (engine.progress.stage == .prepared or engine.progress.stage == .applying);
+    const report = if (forward_resumable)
+        try apply(&engine, .fromPlan(&plan))
+    else
+        try recover(&engine);
+    // Whichever direction the journal chose, the root holds exactly one of
+    // the two recorded states and nothing in between.
+    switch (report.outcome) {
+        .rolled_back => try expectFifoSeeded(root),
+        .applied => try expectFifoApplied(root),
+        else => {
+            std.debug.print("FIFO recovery outcome {t}: {any}\n", .{ report.outcome, report.diagnostic });
+            return error.TestUnexpectedResult;
+        },
+    }
+    if (forward_resumable) try testing.expectEqual(Outcome.applied, report.outcome);
+    try expectWorkspaceEmpty(root);
+    try clear(&engine);
+    try expectAbsent(root, journal_path);
+}
+
+test "root_mutation.test.crash at every FIFO publication boundary recovers exactly" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var uninterrupted: Recorder = .{};
+    try recordFifoArrivals(&uninterrupted);
+    var reached: std.EnumSet(Boundary) = .initEmpty();
+    for (uninterrupted.arrivals[0..uninterrupted.len]) |arrival| {
+        reached.insert(arrival.boundary);
+        for ([_]bool{ false, true }) |resume_forward| {
+            const faults = [_]Fault{.{
+                .boundary = arrival.boundary,
+                .step = arrival.step,
+                .occurrence = arrival.occurrence,
+            }};
+            runFifoCrashScenario(&faults, resume_forward) catch |err| {
+                std.debug.print("FIFO crash at {t} step {d} #{d} (forward {}) failed\n", .{
+                    arrival.boundary, arrival.step, arrival.occurrence, resume_forward,
+                });
+                return err;
+            };
+        }
+    }
+    for ([_]Boundary{
+        .stage_create,    .stage_metadata, .metadata_chmod, .metadata_utimens,
+        .stage_dir_sync,  .backup_link,    .target_remove,  .publish_rename,
+        .publish_create,  .metadata_apply, .parent_sync,    .verify,
+        .release_staging, .release_backup,
+    }) |boundary| try testing.expect(reached.contains(boundary));
+
+    // Every boundary of the restoration that a failed last step forces.
+    const failure = [_]Fault{.{ .boundary = .verify, .step = 7, .err = error.RenameFailed }};
+    var restoring: Recorder = .{ .faults = &failure, .after_fault = true };
+    try recordFifoArrivals(&restoring);
+    var restored: std.EnumSet(Boundary) = .initEmpty();
+    for (restoring.arrivals[0..restoring.len]) |arrival| {
+        if (arrival.boundary == .verify and arrival.step == 7 and arrival.occurrence == 1) continue;
+        restored.insert(arrival.boundary);
+        const faults = [_]Fault{
+            failure[0],
+            .{
+                .boundary = arrival.boundary,
+                .step = arrival.step,
+                .occurrence = countedOccurrence(
+                    forwardArrivalsBefore(uninterrupted.arrivals[0..uninterrupted.len], 7),
+                    arrival,
+                ),
+            },
+        };
+        runFifoCrashScenario(&faults, false) catch |err| {
+            std.debug.print("FIFO restore crash at {t} step {d} #{d} failed\n", .{
+                arrival.boundary, arrival.step, arrival.occurrence,
+            });
+            return err;
+        };
+    }
+    // A restored FIFO is published with its recorded attributes already
+    // written, so no mode rewrite is ever left for the name itself.
+    for ([_]Boundary{
+        .restore_rename,   .restore_create, .target_remove,   .metadata_apply,
+        .metadata_utimens, .parent_sync,    .release_staging,
+    }) |boundary| try testing.expect(restored.contains(boundary));
+}
+
+/// The forward arrivals a run that fails verification of `failed_step` has
+/// already made when the failure turns it around.
+fn forwardArrivalsBefore(arrivals: []const Arrival, failed_step: u32) []const Arrival {
+    for (arrivals, 0..) |arrival, position| {
+        if (arrival.boundary == .verify and arrival.step == failed_step) return arrivals[0 .. position + 1];
+    }
+    return arrivals;
+}
+
+test "root_mutation.test.a FIFO restoration is published whole and never redone" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const root = fixture.root();
+    try root.createDirectoryPath(try root_fs.Path.init("etc"), root_fs.default_directory_permissions);
+    try seedFifo(root, "etc/pipe", 0o620);
+
+    const intents = [_]Intent{
+        fifoIntent("etc/pipe", 0o640),
+        fileIntent("etc/other", "payload\n"),
+    };
+    var plan = try planFor(&fixture, &intents);
+    defer plan.deinit();
+
+    // Power loss right after the restoration renamed the re-created FIFO
+    // into place: every recorded attribute is already on it.
+    var injector: Injector = .{ .faults = &.{
+        .{ .boundary = .verify, .step = 1, .err = error.RenameFailed },
+        .{ .boundary = .metadata_apply, .step = 0, .occurrence = 1 },
+    } };
+    var crashed = try prepare(testing.allocator, root, &fixture.attempt, &plan, .{}, .{
+        .hooks = injector.interface(),
+    });
+    try testing.expectError(error.SimulatedCrash, apply(&crashed, .fromPlan(&plan)));
+    crashed.deinit();
+    try testing.expect(injector.allFired());
+    try expectFifo(root, "etc/pipe", 0o620, fifo_seed_timestamp);
+    const republished = try root.entry(try root_fs.Path.init("etc/pipe"));
+
+    // Recovery recognizes the finished restoration and leaves that inode be.
+    var engine = (try open(testing.allocator, root, &fixture.attempt, .{})).?;
+    defer engine.deinit();
+    try testing.expectEqual(Outcome.rolled_back, (try recover(&engine)).outcome);
+    try expectFifo(root, "etc/pipe", 0o620, fifo_seed_timestamp);
+    try testing.expectEqual(republished.inode, (try root.entry(try root_fs.Path.init("etc/pipe"))).inode);
     try expectAbsent(root, "etc/other");
     try expectWorkspaceEmpty(root);
     try clear(&engine);

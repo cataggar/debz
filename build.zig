@@ -1479,10 +1479,10 @@ pub fn build(b: *std.Build) void {
     });
     mutation_boundaries.addArtifactArg(mutation_boundaries_executable);
     mutation_boundaries.addArtifactArg(native_lifecycle_tests);
-    const mutation_boundary_case = b.option([]const u8, "native-zig-recovery-mutation-boundary-case", "Run one named root-mutation journal/staging crash boundary");
+    const mutation_boundary_case = b.option([]const u8, "native-zig-recovery-mutation-boundary-case", "Run the regular and FIFO cases bound to one named root-mutation crash boundary");
     if (mutation_boundary_case) |boundary|
         mutation_boundaries.addArgs(&.{ "--case", boundary });
-    b.step("test-native-recovery-zig-mutation-boundaries", "Run thirteen real native root-mutation journal/staging crash boundaries")
+    b.step("test-native-recovery-zig-mutation-boundaries", "Run thirteen real native root-mutation journal/staging crash boundaries and 18 FIFO publication kills")
         .dependOn(&mutation_boundaries.step);
 
     const publication_recovery_module = b.createModule(.{

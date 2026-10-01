@@ -189,7 +189,7 @@ pub const Diagnostic = struct {
     }
 };
 
-pub const EntryKind = enum { regular, directory, symlink, hardlink };
+pub const EntryKind = enum { regular, directory, symlink, hardlink, fifo };
 
 pub const Entry = struct {
     path: []u8,
@@ -396,7 +396,32 @@ pub const Result = union(enum) {
 };
 
 pub fn validate(allocator: std.mem.Allocator, bytes: []const u8, expected: Expected, limits: Limits) Result {
-    return validateInternal(allocator, bytes, .{ .repository = expected }, limits);
+    return validateInternal(allocator, bytes, .{ .repository = expected }, limits, false);
+}
+
+/// Repository validation for the native application model. It enforces
+/// exactly the authentication `validate` does and additionally inventories
+/// data-member FIFOs, which only the application model can publish through
+/// journaled root mutation. Every other consumer keeps `validate`, which
+/// refuses FIFOs, and device nodes, sockets, and control-member FIFOs stay
+/// refused here too.
+pub fn validateForApplication(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected: Expected,
+    limits: Limits,
+) Result {
+    return validateInternal(allocator, bytes, .{ .repository = expected }, limits, true);
+}
+
+/// Local-artifact counterpart of `validateForApplication`.
+pub fn inspectLocalForApplication(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    expected: LocalExpected,
+    limits: Limits,
+) Result {
+    return validateInternal(allocator, bytes, .{ .local = expected }, limits, true);
 }
 
 /// Validates a standalone `.deb` without pretending it was selected from
@@ -409,7 +434,7 @@ pub fn inspectLocal(
     expected: LocalExpected,
     limits: Limits,
 ) Result {
-    return validateInternal(allocator, bytes, .{ .local = expected }, limits);
+    return validateInternal(allocator, bytes, .{ .local = expected }, limits, false);
 }
 
 const ValidationRequest = union(enum) {
@@ -422,6 +447,7 @@ fn validateInternal(
     bytes: []const u8,
     request: ValidationRequest,
     limits: Limits,
+    inventory_fifos: bool,
 ) Result {
     var ownership_transferred = false;
     const descriptor_profile = switch (request) {
@@ -492,7 +518,7 @@ fn validateInternal(
     defer if (!ownership_transferred) allocator.free(control_bytes);
 
     var tar_diagnostic: Diagnostic = undefined;
-    var control_tar = parseTar(allocator, control_bytes, outer.control, .control_tar, control_limits, &tar_diagnostic) catch
+    var control_tar = parseTar(allocator, control_bytes, outer.control, .control_tar, control_limits, false, &tar_diagnostic) catch
         return .{ .diagnostic = tar_diagnostic };
     defer if (!ownership_transferred) freeInventory(allocator, &control_tar);
 
@@ -507,7 +533,7 @@ fn validateInternal(
     const data_bytes = decompressMember(allocator, outer, outer.data, false, data_limits) catch |err|
         return decompressionFailure(.data_decompression, outer.data.content.start, err);
     defer if (!ownership_transferred) allocator.free(data_bytes);
-    var data_tar = parseTar(allocator, data_bytes, outer.data, .data_tar, data_limits, &tar_diagnostic) catch
+    var data_tar = parseTar(allocator, data_bytes, outer.data, .data_tar, data_limits, inventory_fifos, &tar_diagnostic) catch
         return .{ .diagnostic = tar_diagnostic };
     defer if (!ownership_transferred) freeInventory(allocator, &data_tar);
 
@@ -984,7 +1010,7 @@ fn decompressionFailure(stage: Stage, offset: usize, err: metadata_decompression
     return .{ .diagnostic = .{ .stage = stage, .code = .decompression_failed, .offset = offset, .decompression_error = err } };
 }
 
-fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive.Member, stage: Stage, limits: Limits, diagnostic: *Diagnostic) error{Invalid}!TarInventory {
+fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive.Member, stage: Stage, limits: Limits, inventory_fifos: bool, diagnostic: *Diagnostic) error{Invalid}!TarInventory {
     var entries: std.ArrayList(Entry) = .empty;
     errdefer {
         for (entries.items) |entry| freeEntry(allocator, entry);
@@ -1089,10 +1115,17 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
             '5' => .directory,
             '2' => .symlink,
             '1' => .hardlink,
+            '6' => if (inventory_fifos) .fifo else return setTarFailure(diagnostic, stage, .unsupported_file_type, member, offset + 156, entries.items.len),
             else => return setTarFailure(diagnostic, stage, .unsupported_file_type, member, offset + 156, entries.items.len),
         };
         if (kind != .regular and size != 0)
             return setTarFailure(diagnostic, stage, .tar_invalid_number, member, offset + 124, entries.items.len);
+        if (kind == .fifo) {
+            const link = fieldString(header[157..257]) orelse
+                return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
+            if (link.len != 0)
+                return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
+        }
         const raw_name = if (pending_long_name) |value| value else fieldString(header[0..100]) orelse
             return setTarFailure(diagnostic, stage, .unsafe_path, member, offset, entries.items.len);
         const root_prefix_empty = tar_format == .gnu or
@@ -2301,7 +2334,7 @@ test "accepts GNU base headers but rejects GNU and PAX extension records" {
 
 fn parseTarTest(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive.Member, limits: Limits) !void {
     var diagnostic: Diagnostic = undefined;
-    var inventory = parseTar(allocator, bytes, member, .data_tar, limits, &diagnostic) catch switch (diagnostic.code) {
+    var inventory = parseTar(allocator, bytes, member, .data_tar, limits, false, &diagnostic) catch switch (diagnostic.code) {
         .duplicate_path => return error.DuplicatePath,
         .unsupported_file_type, .unsupported_tar_extension => return error.Unsupported,
         .unsafe_path => return error.UnsafePath,

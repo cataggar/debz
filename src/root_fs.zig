@@ -349,6 +349,12 @@ const EntryIdentity = struct {
     change_nanoseconds: i128,
 };
 
+/// A FIFO observed by name, never opened.
+pub const NamedPipeObservation = struct {
+    entry: Entry,
+    change_nanoseconds: i128,
+};
+
 /// A read-only regular-file descriptor pinned beneath a root.
 ///
 /// The selected root, complete validated path, and parent descriptor are
@@ -1040,6 +1046,18 @@ pub const Root = struct {
             return mapLeafError(err);
     }
 
+    /// Creates a private, exclusive FIFO inside the opened root with mode
+    /// `0600` before the umask; callers publish the exact final metadata
+    /// with `applyMetadata`. Neither parent components nor the final name
+    /// follow symbolic links, an existing entry of any kind is refused, and
+    /// the FIFO is never opened, so this cannot block on a missing peer.
+    pub fn createNamedPipe(self: Root, path: Path) !void {
+        if (builtin.os.tag != .linux) return error.OperationUnsupported;
+        var parent = try self.openParent(try Path.init(path.text));
+        defer parent.close(self.io);
+        try createNamedPipeAt(parent.dir, parent.leaf);
+    }
+
     /// Creates a hard link at `path` naming the same inode as `existing`.
     /// Neither final component is followed, so a symbolic link is linked as
     /// itself and never as its target, and the name must be unused.
@@ -1239,6 +1257,60 @@ pub const Root = struct {
         if (options.durable) try syncDir(self.io, parent.dir);
     }
 
+    /// One no-follow `statx` of the FIFO at `path`, including its change
+    /// time. A FIFO is never opened - opening one with no peer blocks - and it
+    /// has no content that could change without its change time moving, so
+    /// the single observation of the name is the whole evidence.
+    pub fn observeNamedPipe(self: Root, path: Path) !NamedPipeObservation {
+        const identity = try rootedIdentity(self, path);
+        if (identity.entry.kind != .named_pipe) return error.NotNamedPipe;
+        return .{ .entry = identity.entry, .change_nanoseconds = identity.change_nanoseconds };
+    }
+
+    /// Publishes a fresh FIFO at `path` by creating it under a private name in
+    /// the same directory, writing `attributes` onto that private entry, and
+    /// renaming it over the final name, so the name holds either the old
+    /// entry or a complete FIFO with every requested attribute and never
+    /// nothing or a half-written one. Fields left null keep what `mknod`
+    /// produced (mode `0600` before the umask). The FIFO is never opened, and
+    /// no symbolic link is followed; a symbolic link at `path` is replaced as
+    /// itself.
+    pub fn publishNamedPipe(
+        self: Root,
+        path: Path,
+        attributes: MetadataUpdate,
+        options: PublishOptions,
+    ) !void {
+        if (builtin.os.tag != .linux) return error.OperationUnsupported;
+        var parent = try self.openParent(path);
+        defer parent.close(self.io);
+        var name_buffer: [staging_prefix.len + 16 + 4]u8 = undefined;
+        var attempt: usize = 0;
+        const staged = while (attempt < staging_attempts) : (attempt += 1) {
+            const candidate = stagingName(&name_buffer);
+            createNamedPipeAt(parent.dir, candidate) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return err,
+            };
+            break candidate;
+        } else return error.StagingNameExhausted;
+        errdefer parent.dir.deleteFile(self.io, staged) catch {};
+        try applyMetadataAt(self.io, parent.dir, staged, attributes);
+        switch (options.overwrite) {
+            .replace => try parent.dir.rename(staged, parent.dir, parent.leaf, self.io),
+            .fail_if_exists => parent.dir.renamePreserve(
+                staged,
+                parent.dir,
+                parent.leaf,
+                self.io,
+            ) catch |err| switch (err) {
+                error.OperationUnsupported => return error.AtomicPublicationUnsupported,
+                else => return err,
+            },
+        }
+        if (options.durable) try syncDir(self.io, parent.dir);
+    }
+
     /// Opens a private staging file in the destination directory. The result
     /// must be released with `deinit`, which removes an uncommitted entry.
     pub fn stageFile(self: Root, path: Path, options: PublishOptions) !StagedFile {
@@ -1389,6 +1461,31 @@ const private_staging_permissions: File.Permissions =
     if (builtin.os.tag == .windows) .default_file else .fromMode(0o600);
 
 var staging_counter: std.atomic.Value(u64) = .init(0);
+
+fn createNamedPipeAt(dir: Dir, leaf: []const u8) !void {
+    if (builtin.os.tag != .linux) return error.OperationUnsupported;
+    var name_buffer: [maximum_component_bytes + 1]u8 = undefined;
+    if (leaf.len > maximum_component_bytes) return error.PathTooLong;
+    @memcpy(name_buffer[0..leaf.len], leaf);
+    name_buffer[leaf.len] = 0;
+    const name: [*:0]const u8 = @ptrCast(&name_buffer);
+    const linux = std.os.linux;
+    switch (linux.errno(linux.mknodat(dir.handle, name, linux.S.IFIFO | 0o600, 0))) {
+        .SUCCESS => {},
+        .EXIST => return error.PathAlreadyExists,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .LOOP => return error.SymLinkLoop,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDirectory,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+}
 
 fn stagingName(buffer: *[staging_prefix.len + 16 + 4]u8) []const u8 {
     const written = std.fmt.bufPrint(buffer, staging_prefix ++ "{x:0>16}.tmp", .{
@@ -2476,6 +2573,100 @@ test "root_fs.test.unsupported path kinds fail closed before mutation" {
     try testing.expect((try root.supportedMetadata(try testPath("directory"))).isDirectory());
     try root.createSymbolicLink(try testPath("link"), "regular");
     try testing.expect((try root.supportedMetadata(try testPath("link"))).isSymbolicLink());
+}
+
+test "root_fs.test.exclusive FIFO creation is confined and does not widen supported kinds" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+    try root.createDirectory(try testPath("real"), default_directory_permissions);
+
+    const pipe = try testPath("real/pipe");
+    try root.createNamedPipe(pipe);
+    const observed = try root.entry(pipe);
+    try testing.expectEqual(std.Io.File.Kind.named_pipe, observed.kind);
+    try testing.expect(observed.modeled);
+    try testing.expect(observed.inode != 0);
+    try testing.expect(!observed.isSupportedKind());
+    try testing.expectError(error.UnsupportedPathKind, root.supportedMetadata(pipe));
+    try testing.expectError(error.PathAlreadyExists, root.createNamedPipe(pipe));
+
+    try root.createSymbolicLink(try testPath("parent-link"), "real");
+    try testing.expectError(
+        error.SymbolicLinkComponent,
+        root.createNamedPipe(try testPath("parent-link/other")),
+    );
+    try testing.expect(try root.entryIfExists(try testPath("real/other")) == null);
+
+    const planted = try testPath("real/planted");
+    try root.createSymbolicLink(planted, "other");
+    try testing.expectError(error.PathAlreadyExists, root.createNamedPipe(planted));
+    try testing.expect((try root.entry(planted)).isSymbolicLink());
+    try testing.expect(try root.entryIfExists(try testPath("real/other")) == null);
+    try testing.expectError(error.TraversingPath, root.createNamedPipe(.{ .text = "../outside" }));
+    try testing.expectError(error.AbsolutePath, root.createNamedPipe(.{ .text = "/outside" }));
+}
+
+test "root_fs.test.FIFO publication replaces names without following or opening" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = testRoot(&tmp);
+    try root.createDirectory(try testPath("real"), default_directory_permissions);
+
+    const fresh = try testPath("real/fresh");
+    try root.publishNamedPipe(fresh, .{}, .{ .overwrite = .fail_if_exists, .durable = true });
+    try testing.expectEqual(std.Io.File.Kind.named_pipe, (try root.entry(fresh)).kind);
+    try testing.expectError(
+        error.PathAlreadyExists,
+        root.publishNamedPipe(fresh, .{}, .{ .overwrite = .fail_if_exists }),
+    );
+
+    // Metadata is written by name; a FIFO with no peer is never opened, so
+    // none of these calls can block.
+    try root.applyMetadata(fresh, .{
+        .mode = 0o640,
+        .modified_nanoseconds = 1_700_000_000 * std.time.ns_per_s,
+    });
+    const stamped = try root.entry(fresh);
+    try testing.expectEqual(@as(u32, 0o640), stamped.mode);
+    try testing.expectEqual(@as(i128, 1_700_000_000 * std.time.ns_per_s), stamped.modified_nanoseconds);
+    try root.applyMetadata(fresh, .{ .uid = stamped.uid, .gid = stamped.gid });
+
+    const regular = try testPath("real/regular");
+    try root.publishFile(regular, "old bytes", .{});
+    const before = try root.entry(regular);
+    try root.publishNamedPipe(regular, .{ .mode = 0o640 }, .{ .overwrite = .replace, .durable = true });
+    const replaced = try root.entry(regular);
+    try testing.expectEqual(std.Io.File.Kind.named_pipe, replaced.kind);
+    try testing.expect(replaced.inode != before.inode);
+    // The metadata was written before the name was taken, so it is never
+    // observable part way through.
+    try testing.expectEqual(@as(u32, 0o640), replaced.mode);
+
+    try root.publishFile(try testPath("real/victim"), "victim", .{});
+    const planted = try testPath("real/planted");
+    try root.createSymbolicLink(planted, "victim");
+    try root.publishNamedPipe(planted, .{}, .{ .overwrite = .replace });
+    try testing.expectEqual(std.Io.File.Kind.named_pipe, (try root.entry(planted)).kind);
+    try testing.expect((try root.entry(try testPath("real/victim"))).isRegularFile());
+
+    try root.createSymbolicLink(try testPath("parent-link"), "real");
+    try testing.expectError(
+        error.SymbolicLinkComponent,
+        root.publishNamedPipe(try testPath("parent-link/other"), .{}, .{}),
+    );
+    try testing.expect(try root.entryIfExists(try testPath("real/other")) == null);
+    try testing.expectError(error.NotRegularFile, root.openRegularFile(fresh));
+    const observed = try root.observeNamedPipe(fresh);
+    try testing.expectEqual(std.Io.File.Kind.named_pipe, observed.entry.kind);
+    try testing.expectEqual(@as(u32, 0o640), observed.entry.mode);
+    try testing.expectError(error.NotNamedPipe, root.observeNamedPipe(try testPath("real/victim")));
+    try testing.expectError(error.NotNamedPipe, root.observeNamedPipe(try testPath("parent-link")));
+    try root.removeFile(fresh);
+    try testing.expect(try root.entryIfExists(fresh) == null);
+    try expectNoStagingResidue(&tmp);
 }
 
 fn expectNoStagingResidue(tmp: *std.testing.TmpDir) !void {

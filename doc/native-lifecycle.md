@@ -453,8 +453,16 @@ each run.
 | Conffile conflict decisions | `script-conffile-{keep_existing,use_package_version}`, `conffile-configure-retry-*` and signed `conffile-{keep,replace}`: edited conffiles, `.dpkg-*` companions, statuses and script trace are compared under both policies. |
 | `Pre-Depends` barrier and dependency cycle | `script-pre-depends-barrier`, `script-dependency-cycle`, signed `pre-depends` and `dependency-cycle`: script order/arguments and final root captures match. |
 | Competing ownership | `replaces-competing-file-owner` matches dpkg's displacement and installed database. In `unreplaced-competing-file-owner`, dpkg exits 1 with the actual path/owner diagnostic; native refuses `ownership_conflict` before mutation, clears its preflight operation record and runs no script. This unsupported failure is **not** claimed as dpkg-root parity. |
-| Unsupported archive path | `unsupported-fifo-payload` builds a real FIFO-bearing archive. Pinned dpkg exits 0 and installs a FIFO; native refuses `archive_payload_unsupported_file_type` before any root mutation/script. This is a measured difference, **not** normalized parity; FIFO support is tracked in [#288](https://github.com/cataggar/debz/issues/288) before any FIFO-bearing #270–#273 claim. |
+| FIFO payloads | `fifo-payload` builds real FIFO-bearing archives with `dpkg-deb` (tar typeflag `6`) and runs install → upgrade → downgrade → remove → purge: a FIFO whose mode changes from `0640` to set-group-ID `02660`, a FIFO that becomes a regular file and back, a FIFO that becomes a symbolic link and back, and an obsolete FIFO removed on upgrade. `fifo-payload-statoverride` seeds a `statoverride` record for the FIFO and runs install → upgrade → remove → purge. In `fifo-payload-replaces` a package that `Replaces:` the owner takes over one FIFO as a FIFO and another as a regular file; the displaced owner is removed and purged, then the replacer is purged directly. Every phase compares the whole root (kind, mode, owner, mtime), `status`, `info/*.list`/`*.md5sums`, exit status, and script trace with pinned dpkg 1.22.22 exactly. |
 | Unknown script return | `script-outcome-unknown` and `core-unknown-script-return` retain in-flight script identity/recovery ownership and refuse a second mutation; the known nonzero outcome above has dpkg parity. A pinned dpkg *post-return/pre-outcome-record* root is not a comparable dpkg terminal state, so unknown-outcome roots are not represented as parity matches; the transition inventory remains [#267](https://github.com/cataggar/debz/issues/267). |
+
+FIFO publication is journaled like every other node
+([root mutation](root-mutation.md#fifos-288)); its crash recovery is proven by
+the FIFO real-child cases of `test-native-recovery-zig-mutation-boundaries`
+([native recovery](native-recovery.md)). This is bounded fixture-level parity:
+FIFO-bearing repository archives are still refused at repository admission,
+and signed amd64/arm64 closure parity for FIFO-bearing packages remains
+tracked in [#288](https://github.com/cataggar/debz/issues/288).
 
 ### Removal and trigger failure inventory (#264)
 

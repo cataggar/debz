@@ -80,10 +80,11 @@ backup names, and the steps it depends on.
 | `copy_file` | regular-file content copied from another path before that path is republished |
 | `publish_symlink` | a symbolic link with an exact target |
 | `publish_hard_link` | a hard link to an existing regular file in the same root |
+| `publish_fifo` | a FIFO (named pipe) with an exact mode, ownership, and modification time; it is never opened |
 | `create_directory` | a directory with an exact mode and ownership |
 | `set_metadata` | a new mode, ownership, or modification time on an existing path |
 | `assert_case_sensitive` | no mutation: binds an exact directory and an existing regular-file witness to a distinct-case lookup |
-| `remove_path` | removal of a regular file, hard link, or symbolic link |
+| `remove_path` | removal of a regular file, hard link, symbolic link, or FIFO |
 | `remove_directory` | removal of an empty directory |
 
 Preflight refuses, before anything can change:
@@ -94,7 +95,7 @@ Preflight refuses, before anything can change:
 | `invalid_encoding` | a path, source, or link target that is not valid UTF-8 |
 | `path_collision` | a target or source inside `var/lib/debz` |
 | `symbolic_link_component` | any prefix component that is a symbolic link |
-| `unsupported_kind` | a device, socket, FIFO, or unknown kind on a target |
+| `unsupported_kind` | a device, socket, or unknown kind on a target |
 | `ancestor_conflict` | an ancestor the plan turns into a file, a link, or nothing |
 | `path_alias` | two distinct modeled paths, targets or sources, that resolve to one inode |
 | `hard_link_ambiguous` | a link to itself, or a link whose source the plan republishes later |
@@ -275,9 +276,9 @@ Application of one step:
    the step's recorded digest immediately before it is written, so a substituted
    or unavailable payload never reaches the staging area.
 2. **backup captured** — the replaceable regular-file content is hard-linked
-   into the backup area and the backup directory is `fsync`ed. A symbolic link
-   and a directory carry no content beyond what the journal already records, so
-   they need no physical backup.
+   into the backup area and the backup directory is `fsync`ed. A symbolic link,
+   a FIFO, and a directory carry no content beyond what the journal already
+   records, so they need no physical backup.
 3. **published** — the target is compared to its recorded precondition and then
    taken over with a single atomic rename. A transition a rename cannot express
    (a directory becoming a file, link, or hard link, or a non-directory becoming
@@ -292,6 +293,38 @@ Application of one step:
    exactly, including the content digest and link target. The entry that
    comparison proved is bound in the very record that publishes the boundary,
    so the state and the inode it landed on become durable together.
+
+### FIFOs (#288)
+
+A `publish_fifo` step follows the same staged path as a regular file. The new
+FIFO is created exclusively in the staging area with a no-follow, root-relative
+`mknodat` (`root_fs.createNamedPipe`); nothing ever opens it, so neither
+publication nor verification can block on a reader or writer. Its ownership,
+mode, and modification time are written onto the staged inode in the usual
+chown → chmod → utimens order, so a set-group-ID bit the kernel clears on
+`chown` is written back, and the staging directory is `fsync`ed. Publication is
+the same single atomic rename, which replaces a regular file, a symbolic link,
+or an older FIFO in place; a directory on either side is removed first exactly
+like every other directory transition. A FIFO whose recorded state already
+equals the desired one is satisfied without a mutation, like any other
+identical entry; any difference publishes a fresh inode rather than changing
+the old one in place. `remove_path` unlinks a recorded FIFO by name.
+
+A FIFO has no content to back up: the journal records its whole state. A
+restoration therefore recreates the recorded FIFO, never an adopted one. It
+uses `root_fs.publishNamedPipe`, which creates a private `.debz-stage-*`
+sibling, writes every recorded attribute onto it, and renames it over the name,
+so a FIFO is never visible half restored and an interrupted restoration never
+has to finish metadata on an inode it cannot prove it created. Observation is a
+single no-follow `statx` (`root_fs.observeNamedPipe`), which never opens the
+FIFO either. A FIFO at the name that already holds exactly the recorded kind,
+mode, ownership, and modification time — the only FIFO a restoration ever
+leaves there — is treated as restored and left untouched. Any other FIFO, a
+same-shape FIFO on another inode found going forward, and any other occupant
+are `external_modification`: an occupant that is not the recorded old state
+stops the transaction as `recovery_required`, and a same-shape substitute is
+indistinguishable from the recorded old state, so the transaction rolls back
+around it without touching it.
 
 The `workspace_create` injection hook precedes the private workspace
 `ensureWorkspace` in preflight. On the first phase there is no root-mutation

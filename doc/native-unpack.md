@@ -597,8 +597,32 @@ sets are hash-based, globally work- and memory-budgeted, and stop immediately
 at the deferred-item limit; irrelevant interests never expand package sets.
 
 Obsolete removal accepts only coherently observed regular files, symbolic
-links, and directories. FIFOs, sockets, devices, and unknown kinds are typed
+links, FIFOs, and directories. Sockets, devices, and unknown kinds are typed
 refusals rather than generic unlink descriptions.
+
+### FIFO payloads (#288)
+
+A data-member FIFO (tar typeflag `6`) that the
+[application model](archive-application-model.md#fifo-payloads-288) admits is
+planned as its own claim kind. It carries the archive's mode, numeric owner,
+and modification time exactly, and a `statoverride` record replaces the owner
+and mode exactly as it does for a regular file. It has no `md5sums` line and
+no content digest. Ownership, `Replaces`, shared `Multi-Arch: same` claims
+(which must agree on kind and exact metadata), diversions, and conflict checks
+treat it like any other non-directory claim; a hard link to a FIFO is refused
+as `hard_link_target_missing`. Root observation recognizes an installed FIFO
+through one no-follow `statx` and never opens it.
+
+Lowering emits one `root_mutation` `publish_fifo` intent per FIFO, so install,
+upgrade, downgrade, and reinstall create, replace, or re-mode a FIFO through
+the same journaled staging, publication, rollback, and recovery as every other
+node; FIFO ↔ regular file and FIFO ↔ symbolic link transitions follow the
+[root-mutation rules](root-mutation.md#fifos-288).
+Removal, purge, and obsolete-path removal unlink an installed FIFO by name with
+a recorded `remove_path` step. Post-materialization verification rechecks the
+kind, mode, ownership, and modification time of every published FIFO. Native
+recovery's managed-state model records a FIFO as its own `fifo` kind so a
+retained FIFO is restored and compared exactly.
 
 ## Typed handoffs
 
