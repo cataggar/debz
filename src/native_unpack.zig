@@ -21751,18 +21751,34 @@ fn snapshotLessPostinstIsBound(
     kind: maintainer_script.Kind,
     source: native_program.ScriptSource,
     arguments: []const []const u8,
+    artifacts: []const native_program.ProgramArtifact,
 ) !bool {
     if (!native_alternatives.matchesSnapshotLessPostinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
-        !std.mem.eql(u8, package.name, "less") or
+    const arm64_archive_sha512 =
+        "f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8";
+    if (!std.mem.eql(u8, package.name, "less") or
         !std.mem.eql(u8, package.version, "668-1build1") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
         arguments[1].len != 0)
         return error.InvalidAlternativesScriptAuthority;
-    return true;
+    if (std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, "amd64"))
+        return true;
+    if (std.mem.eql(u8, architecture, "arm64") and
+        std.mem.eql(u8, package.architecture, "arm64"))
+    {
+        try verifyAuthenticatedSnapshotArtifact(
+            artifacts,
+            package,
+            171138,
+            arm64_archive_sha512,
+            error.InvalidAlternativesScriptAuthority,
+        );
+        return true;
+    }
+    return error.InvalidAlternativesScriptAuthority;
 }
 
 fn snapshotBashPostinstIsBound(
@@ -23345,6 +23361,16 @@ test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" 
         .version = "668-1build1",
         .architecture = "amd64",
     };
+    const arm64_less: native_program.PackageIdentity = .{
+        .name = "less",
+        .version = "668-1build1",
+        .architecture = "arm64",
+    };
+    const arm64_artifact = try testAuthenticatedSnapshotArtifact(
+        arm64_less,
+        171138,
+        "f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8",
+    );
     try testing.expect(try snapshotLessPostinstIsBound(
         script,
         "amd64",
@@ -23352,6 +23378,16 @@ test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" 
         .postinst,
         .new_package,
         &.{ "configure", "" },
+        &.{},
+    ));
+    try testing.expect(try snapshotLessPostinstIsBound(
+        script,
+        "arm64",
+        arm64_less,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+        &.{arm64_artifact},
     ));
     try testing.expect(!(try snapshotLessPostinstIsBound(
         "#!/bin/sh\nexit 0\n",
@@ -23360,7 +23396,34 @@ test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" 
         .postinst,
         .new_package,
         &.{ "configure", "" },
+        &.{},
     )));
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPostinstIsBound(
+            script,
+            "arm64",
+            arm64_less,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+            &.{},
+        ),
+    );
+    var wrong_artifact = arm64_artifact;
+    wrong_artifact.size += 1;
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPostinstIsBound(
+            script,
+            "arm64",
+            arm64_less,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+            &.{wrong_artifact},
+        ),
+    );
     var other = less;
     for ([_]struct {
         architecture: []const u8,
@@ -23384,24 +23447,25 @@ test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" 
             case.kind,
             case.source,
             case.arguments,
+            &.{},
         ),
     );
     other.name = "most";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
-        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }, &.{}),
     );
     other = less;
     other.version = "668-1build2";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
-        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }, &.{}),
     );
     other = less;
     other.architecture = "arm64";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
-        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+        snapshotLessPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }, &.{}),
     );
 }
 
@@ -23663,6 +23727,7 @@ fn prepareAlternativesScriptBoundary(
         kind,
         source,
         arguments,
+        program.artifacts,
     );
     const snapshot_bash_postinst = try snapshotBashPostinstIsBound(
         script_bytes,
