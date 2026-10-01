@@ -21788,18 +21788,34 @@ fn snapshotBashPostinstIsBound(
     kind: maintainer_script.Kind,
     source: native_program.ScriptSource,
     arguments: []const []const u8,
+    artifacts: []const native_program.ProgramArtifact,
 ) !bool {
     if (!native_alternatives.matchesSnapshotBashPostinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
-        !std.mem.eql(u8, package.name, "bash") or
+    const arm64_archive_sha512 =
+        "9e4e61621a0f447dd7f8cbe533609375451b3c0b06dde119b6155d5a5ad4812a699c583b0e1e253b59aa7672ead0e9c80e99192976ca80d6b55e466378639b2d";
+    if (!std.mem.eql(u8, package.name, "bash") or
         !std.mem.eql(u8, package.version, "5.3-3ubuntu1") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
         arguments[1].len != 0)
         return error.InvalidAlternativesScriptAuthority;
-    return true;
+    if (std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, "amd64"))
+        return true;
+    if (std.mem.eql(u8, architecture, "arm64") and
+        std.mem.eql(u8, package.architecture, "arm64"))
+    {
+        try verifyAuthenticatedSnapshotArtifact(
+            artifacts,
+            package,
+            826992,
+            arm64_archive_sha512,
+            error.InvalidAlternativesScriptAuthority,
+        );
+        return true;
+    }
+    return error.InvalidAlternativesScriptAuthority;
 }
 
 fn snapshotProcpsPostinstIsInert(
@@ -23284,15 +23300,35 @@ test "native_unpack.test.signed procps trigger requires bound callback and absen
     try testing.expect(!native_alternatives.matchesSnapshotTool("arm64", tool));
 }
 
-test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" {
+test "native_unpack.test.snapshot bash postinst requires fresh architecture-bound configure" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst",
+    );
+    var script_sha256: [32]u8 = undefined;
+    Sha256.hash(script, &script_sha256, .{});
+    const expected_script_sha256 = native_recovery.parseDigest(
+        "e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff".*,
+    ).?;
+    try testing.expectEqualSlices(
+        u8,
+        &expected_script_sha256,
+        &script_sha256,
     );
     const bash: native_program.PackageIdentity = .{
         .name = "bash",
         .version = "5.3-3ubuntu1",
         .architecture = "amd64",
     };
+    const arm64_bash: native_program.PackageIdentity = .{
+        .name = "bash",
+        .version = "5.3-3ubuntu1",
+        .architecture = "arm64",
+    };
+    const arm64_artifact = try testAuthenticatedSnapshotArtifact(
+        arm64_bash,
+        826992,
+        "9e4e61621a0f447dd7f8cbe533609375451b3c0b06dde119b6155d5a5ad4812a699c583b0e1e253b59aa7672ead0e9c80e99192976ca80d6b55e466378639b2d",
+    );
     try testing.expect(try snapshotBashPostinstIsBound(
         script,
         "amd64",
@@ -23300,6 +23336,16 @@ test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" 
         .postinst,
         .new_package,
         &.{ "configure", "" },
+        &.{},
+    ));
+    try testing.expect(try snapshotBashPostinstIsBound(
+        script,
+        "arm64",
+        arm64_bash,
+        .postinst,
+        .new_package,
+        &.{ "configure", "" },
+        &.{arm64_artifact},
     ));
     try testing.expect(!(try snapshotBashPostinstIsBound(
         "#!/bin/sh\nexit 0\n",
@@ -23308,47 +23354,76 @@ test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" 
         .postinst,
         .new_package,
         &.{ "configure", "" },
+        &.{},
     )));
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotBashPostinstIsBound(
+            script,
+            "arm64",
+            arm64_bash,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+            &.{},
+        ),
+    );
+    var wrong_artifact = arm64_artifact;
+    wrong_artifact.size += 1;
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotBashPostinstIsBound(
+            script,
+            "arm64",
+            arm64_bash,
+            .postinst,
+            .new_package,
+            &.{ "configure", "" },
+            &.{wrong_artifact},
+        ),
+    );
     for ([_]struct {
         architecture: []const u8,
+        package: native_program.PackageIdentity,
         kind: maintainer_script.Kind,
         source: native_program.ScriptSource,
         arguments: []const []const u8,
     }{
-        .{ .architecture = "arm64", .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
-        .{ .architecture = "amd64", .kind = .preinst, .source = .new_package, .arguments = &.{ "configure", "" } },
-        .{ .architecture = "amd64", .kind = .postinst, .source = .installed_package, .arguments = &.{ "configure", "" } },
-        .{ .architecture = "amd64", .kind = .postinst, .source = .new_package, .arguments = &.{"configure"} },
-        .{ .architecture = "amd64", .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "1" } },
-        .{ .architecture = "amd64", .kind = .postinst, .source = .new_package, .arguments = &.{ "abort-upgrade", "" } },
+        .{ .architecture = "arm64", .package = bash, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = bash, .kind = .preinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = bash, .kind = .postinst, .source = .installed_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = bash, .kind = .postinst, .source = .new_package, .arguments = &.{"configure"} },
+        .{ .architecture = "amd64", .package = bash, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "1" } },
+        .{ .architecture = "amd64", .package = bash, .kind = .postinst, .source = .new_package, .arguments = &.{ "abort-upgrade", "" } },
     }) |case| try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
         snapshotBashPostinstIsBound(
             script,
             case.architecture,
-            bash,
+            case.package,
             case.kind,
             case.source,
             case.arguments,
+            &.{},
         ),
     );
     var other = bash;
     other.name = "dash";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
-        snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+        snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }, &.{}),
     );
     other = bash;
     other.version = "5.3-3ubuntu2";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
-        snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+        snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }, &.{}),
     );
     other = bash;
     other.architecture = "arm64";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
-        snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
+        snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }, &.{}),
     );
 }
 
@@ -23736,6 +23811,7 @@ fn prepareAlternativesScriptBoundary(
         kind,
         source,
         arguments,
+        program.artifacts,
     );
     const snapshot_sudo_rs_postinst = try snapshotSudoRsPostinstIsBound(
         script_bytes,
