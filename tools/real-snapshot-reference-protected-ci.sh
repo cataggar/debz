@@ -26,7 +26,10 @@ readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 # (Size 12718, SHA512 22078b3cf6a876d87cb7e3bffa97999fc87023b890788006fc78c952e2861b655d941be7563c307caa3fcce3b78f75b5f62b8cdd993f0dd646c7775955860fd4).
 # The pinned artifact is usr/share/keyrings/ubuntu-archive-keyring.gpg extracted
 # from that deb, deliberately committed as a reviewed trust root.
-readonly archive_keyring_source=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2026.08.18_all.deb
+readonly archive_keyring_deb_sha512=22078b3cf6a876d87cb7e3bffa97999fc87023b890788006fc78c952e2861b655d941be7563c307caa3fcce3b78f75b5f62b8cdd993f0dd646c7775955860fd4
+readonly archive_keyring_deb_size=12718
+readonly archive_keyring_member=./usr/share/keyrings/ubuntu-archive-keyring.gpg
 readonly archive_keyring_sha256=655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835
 readonly archive_keyring_size=2334
 
@@ -134,10 +137,11 @@ step() {
 }
 
 stage_verified_archive_keyring() {
-  local trust_dir target
+  local trust_dir package target
   trust_dir=$tree/trust
+  package=$trust_dir/ubuntu-keyring.deb
   target=$trust_dir/ubuntu-archive-keyring.gpg
-  printf 'path\trole\tuid:gid:mode:size\tsha256\n' >"$evidence/archive-keyring-path.tsv"
+  printf 'path\trole\tuid:gid:mode:size\talgorithm\tdigest\n' >"$evidence/archive-keyring-path.tsv"
   [[ ! -e "$trust_dir" && ! -L "$trust_dir" ]] || {
     echo "trusted keyring staging directory must be new: $trust_dir" >&2
     exit 2
@@ -148,115 +152,300 @@ stage_verified_archive_keyring() {
     echo "trusted keyring copy must be new: $target" >&2
     exit 2
   }
-  python3 -I - "$archive_keyring_source" "$target" "$archive_keyring_sha256" \
-    "$archive_keyring_size" "$evidence/archive-keyring-path.tsv" <<'PY'
+  [[ ! -e "$package" && ! -L "$package" ]] || {
+    echo "trusted keyring package must be new: $package" >&2
+    exit 2
+  }
+  python3 -I - "$archive_keyring_deb_url" "$package" "$archive_keyring_deb_sha512" \
+    "$archive_keyring_deb_size" "$archive_keyring_member" "$target" \
+    "$archive_keyring_sha256" "$archive_keyring_size" \
+    "$evidence/archive-keyring-path.tsv" <<'PY'
+import ctypes
+import ctypes.util
 import hashlib
+import io
 import os
 import stat
 import sys
+import tarfile
+import urllib.request
 
-source, target, expected_sha256, expected_size_text, evidence_path = sys.argv[1:]
-expected_size = int(expected_size_text)
+(
+    deb_url,
+    deb_path,
+    expected_deb_sha512,
+    expected_deb_size_text,
+    member,
+    target,
+    expected_keyring_sha256,
+    expected_keyring_size_text,
+    evidence_path,
+) = sys.argv[1:]
+expected_deb_size = int(expected_deb_size_text)
+expected_keyring_size = int(expected_keyring_size_text)
+decompressed_limit = 1024 * 1024
 
 
 def metadata(entry: os.stat_result) -> str:
     return f"{entry.st_uid}:{entry.st_gid}:{stat.S_IMODE(entry.st_mode):03o}:{entry.st_size}"
 
 
-def append_evidence(role: str, path: str, entry: os.stat_result, sha256: str) -> None:
+def append_evidence(role: str, path: str, entry: os.stat_result, algorithm: str, digest: str) -> None:
     with open(evidence_path, "a", encoding="utf-8") as evidence:
-        evidence.write(f"{path}\t{role}\t{metadata(entry)}\t{sha256}\n")
+        evidence.write(f"{path}\t{role}\t{metadata(entry)}\t{algorithm}\t{digest}\n")
 
 
-def require_root_owned(role: str, path: str, entry: os.stat_result) -> None:
-    if (entry.st_uid, entry.st_gid) != (0, 0):
-        append_evidence(role, path, entry, "-")
+def require_root_owned_file(role: str, path: str, entry: os.stat_result, mode: int) -> None:
+    if (
+        (entry.st_uid, entry.st_gid) != (0, 0)
+        or not stat.S_ISREG(entry.st_mode)
+        or stat.S_IMODE(entry.st_mode) != mode
+    ):
+        append_evidence(role, path, entry, "-", "-")
         raise SystemExit(
-            f"Ubuntu archive keyring path is not root-owned: {path} "
-            f"(uid:gid:mode:size={metadata(entry)})"
+            f"Ubuntu archive keyring artifact is not a protected regular file: {path} "
+            f"(uid:gid:mode:size={metadata(entry)}; expected 0:0:{mode:03o})"
         )
 
 
-flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-directory_flags = flags | os.O_DIRECTORY
-if source != "/usr/share/keyrings/ubuntu-archive-keyring.gpg":
-    raise SystemExit(f"unexpected Ubuntu archive keyring source path: {source}")
-opened_directories: list[int] = []
-directory_fd = os.open("/", directory_flags)
-opened_directories.append(directory_fd)
-root_stat = os.fstat(directory_fd)
-require_root_owned("ancestor-fd", "/", root_stat)
-append_evidence("ancestor-fd", "/", root_stat, "-")
-current_path = ""
-for component in ("usr", "share", "keyrings"):
-    current_path = f"{current_path}/{component}"
+def unlink_then_fail(path: str, message: str) -> None:
     try:
-        next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
-    except OSError as error:
-        raise SystemExit(
-            f"failed to open Ubuntu archive keyring ancestor without following symlinks: {current_path}: {error}"
-        ) from error
-    opened_directories.append(next_fd)
-    directory_fd = next_fd
-    directory_stat = os.fstat(directory_fd)
-    if not stat.S_ISDIR(directory_stat.st_mode):
-        raise SystemExit(f"Ubuntu archive keyring ancestor is not a directory: {current_path}")
-    require_root_owned("ancestor-fd", current_path, directory_stat)
-    append_evidence("ancestor-fd", current_path, directory_stat, "-")
-try:
-    source_fd = os.open("ubuntu-archive-keyring.gpg", flags, dir_fd=directory_fd)
-except OSError as error:
-    raise SystemExit(f"failed to open Ubuntu archive keyring without following symlinks: {source}: {error}") from error
-try:
-    source_stat = os.fstat(source_fd)
-    if not stat.S_ISREG(source_stat.st_mode):
-        raise SystemExit(f"Ubuntu archive keyring source is not a regular file: {source}")
-    require_root_owned("source-fd", source, source_stat)
-    out_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
-    digest = hashlib.sha256()
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    raise SystemExit(message)
+
+
+def write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while staging Ubuntu archive keyring")
+        view = view[written:]
+
+
+def read_verified_deb() -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(deb_path, flags)
+    digest = hashlib.sha512()
+    parts: list[bytes] = []
     size = 0
     try:
-        os.fchown(out_fd, 0, 0)
         while True:
-            block = os.read(source_fd, 1 << 20)
+            block = os.read(fd, 1 << 20)
             if not block:
                 break
             size += len(block)
             digest.update(block)
-            view = memoryview(block)
-            while view:
-                written = os.write(out_fd, view)
-                if written <= 0:
-                    raise OSError("short write while copying Ubuntu archive keyring")
-                view = view[written:]
-        os.fchmod(out_fd, 0o644)
+            parts.append(block)
     finally:
-        os.close(out_fd)
-finally:
-    os.close(source_fd)
-    for directory in reversed(opened_directories):
-        os.close(directory)
+        os.close(fd)
+    actual = digest.hexdigest()
+    if size != expected_deb_size or actual != expected_deb_sha512:
+        unlink_then_fail(
+            deb_path,
+            "Ubuntu archive keyring package pin mismatch after reopen: "
+            f"expected size={expected_deb_size} sha512={expected_deb_sha512}; "
+            f"read size={size} sha512={actual}",
+        )
+    return b"".join(parts)
 
-actual_sha256 = digest.hexdigest()
-target_stat = os.stat(target, follow_symlinks=False)
-append_evidence("source-fd", source, source_stat, actual_sha256)
-append_evidence("staged-copy", target, target_stat, actual_sha256)
-if (
-    size != expected_size
-    or target_stat.st_size != expected_size
-    or actual_sha256 != expected_sha256
-    or (target_stat.st_uid, target_stat.st_gid) != (0, 0)
-    or stat.S_IMODE(target_stat.st_mode) != 0o644
-):
+
+def parse_ar_member(archive: bytes, expected_name: str) -> bytes:
+    if not archive.startswith(b"!<arch>\n"):
+        raise SystemExit("Ubuntu archive keyring package is not an ar archive")
+    offset = 8
+    found: bytes | None = None
+    while offset < len(archive):
+        if offset + 60 > len(archive):
+            raise SystemExit("truncated ar member header in Ubuntu archive keyring package")
+        header = archive[offset : offset + 60]
+        offset += 60
+        if header[58:60] != b"`\n":
+            raise SystemExit("invalid ar member header in Ubuntu archive keyring package")
+        raw_name = header[:16].decode("ascii", "strict").strip()
+        if raw_name.startswith("//") or raw_name.startswith("/"):
+            raise SystemExit(f"unsupported ar member name in Ubuntu archive keyring package: {raw_name}")
+        name = raw_name.rstrip("/")
+        try:
+            size = int(header[48:58].decode("ascii", "strict").strip())
+        except ValueError as error:
+            raise SystemExit("invalid ar member size in Ubuntu archive keyring package") from error
+        if size < 0 or offset + size > len(archive):
+            raise SystemExit("truncated ar member payload in Ubuntu archive keyring package")
+        payload = archive[offset : offset + size]
+        offset += size + (size % 2)
+        if name == expected_name:
+            if found is not None:
+                raise SystemExit(f"duplicate ar member in Ubuntu archive keyring package: {expected_name}")
+            found = payload
+    if found is None:
+        raise SystemExit(f"missing ar member in Ubuntu archive keyring package: {expected_name}")
+    return found
+
+
+def zstd_decompress(payload: bytes) -> bytes:
+    library_name = ctypes.util.find_library("zstd") or "libzstd.so.1"
+    library = ctypes.CDLL(library_name)
+    library.ZSTD_getFrameContentSize.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+    library.ZSTD_getFrameContentSize.restype = ctypes.c_ulonglong
+    library.ZSTD_decompress.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    )
+    library.ZSTD_decompress.restype = ctypes.c_size_t
+    library.ZSTD_isError.argtypes = (ctypes.c_size_t,)
+    library.ZSTD_isError.restype = ctypes.c_uint
+    library.ZSTD_getErrorName.argtypes = (ctypes.c_size_t,)
+    library.ZSTD_getErrorName.restype = ctypes.c_char_p
+    source = ctypes.create_string_buffer(payload)
+    frame_size = library.ZSTD_getFrameContentSize(source, len(payload))
+    content_size_unknown = (1 << 64) - 1
+    content_size_error = (1 << 64) - 2
+    if frame_size == content_size_error:
+        raise SystemExit("invalid zstd frame in Ubuntu archive keyring package")
+    output_limit = decompressed_limit if frame_size == content_size_unknown else frame_size
+    if output_limit > decompressed_limit:
+        raise SystemExit(
+            f"Ubuntu archive keyring data archive exceeds limit: {output_limit} > {decompressed_limit}"
+        )
+    output = ctypes.create_string_buffer(output_limit)
+    result = library.ZSTD_decompress(output, output_limit, source, len(payload))
+    if library.ZSTD_isError(result):
+        error = library.ZSTD_getErrorName(result).decode("utf-8", "replace")
+        raise SystemExit(f"failed to decompress Ubuntu archive keyring data archive: {error}")
+    return output.raw[:result]
+
+
+def extract_tar_member(archive: bytes, expected_name: str) -> bytes:
+    if expected_name.startswith("/") or "/../" in f"/{expected_name}/":
+        raise SystemExit(f"unsafe expected tar member name: {expected_name}")
+    result: bytes | None = None
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+        for member_info in tar:
+            if member_info.name != expected_name:
+                continue
+            if result is not None:
+                raise SystemExit(f"duplicate tar member in Ubuntu archive keyring package: {expected_name}")
+            if not member_info.isfile() or member_info.issym() or member_info.islnk():
+                raise SystemExit(f"Ubuntu archive keyring tar member is not a regular file: {expected_name}")
+            if member_info.size != expected_keyring_size:
+                raise SystemExit(
+                    f"Ubuntu archive keyring tar member size mismatch: "
+                    f"expected {expected_keyring_size}; archive has {member_info.size}"
+                )
+            extracted = tar.extractfile(member_info)
+            if extracted is None:
+                raise SystemExit(f"failed to read Ubuntu archive keyring tar member: {expected_name}")
+            result = extracted.read()
+            if len(result) != member_info.size:
+                raise SystemExit(f"short read for Ubuntu archive keyring tar member: {expected_name}")
+    if result is None:
+        raise SystemExit(f"missing Ubuntu archive keyring tar member: {expected_name}")
+    return result
+
+
+request = urllib.request.Request(deb_url, headers={"User-Agent": "debz-protected-reference/1"})
+download_sha512 = hashlib.sha512()
+download_size = 0
+try:
+    package_fd = os.open(deb_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    try:
+        os.fchown(package_fd, 0, 0)
+        with urllib.request.urlopen(request, timeout=300) as response:
+            while True:
+                block = response.read(1 << 20)
+                if not block:
+                    break
+                download_size += len(block)
+                download_sha512.update(block)
+                write_all(package_fd, block)
+        os.fchmod(package_fd, 0o600)
+    finally:
+        os.close(package_fd)
+except BaseException:
+    try:
+        os.unlink(deb_path)
+    except FileNotFoundError:
+        pass
+    raise
+package_stat = os.stat(deb_path, follow_symlinks=False)
+actual_deb_sha512 = download_sha512.hexdigest()
+append_evidence("downloaded-package", deb_path, package_stat, "sha512", actual_deb_sha512)
+if download_size != expected_deb_size or package_stat.st_size != expected_deb_size or actual_deb_sha512 != expected_deb_sha512:
+    unlink_then_fail(
+        deb_path,
+        "Ubuntu archive keyring package pin mismatch: "
+        f"expected size={expected_deb_size} sha512={expected_deb_sha512}; "
+        f"downloaded size={download_size} file_size={package_stat.st_size} sha512={actual_deb_sha512}",
+    )
+require_root_owned_file("downloaded-package", deb_path, package_stat, 0o600)
+
+deb_bytes = read_verified_deb()
+debian_binary = parse_ar_member(deb_bytes, "debian-binary")
+if debian_binary != b"2.0\n":
+    unlink_then_fail(deb_path, "Ubuntu archive keyring package has unexpected debian-binary member")
+data_archive = parse_ar_member(deb_bytes, "data.tar.zst")
+data_tar = zstd_decompress(data_archive)
+keyring = extract_tar_member(data_tar, member)
+actual_keyring_sha256 = hashlib.sha256(keyring).hexdigest()
+if len(keyring) != expected_keyring_size or actual_keyring_sha256 != expected_keyring_sha256:
+    unlink_then_fail(
+        deb_path,
+        "Ubuntu archive keyring member pin mismatch: "
+        f"expected size={expected_keyring_size} sha256={expected_keyring_sha256}; "
+        f"extracted size={len(keyring)} sha256={actual_keyring_sha256}",
+    )
+
+try:
+    target_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
+    try:
+        os.fchown(target_fd, 0, 0)
+        write_all(target_fd, keyring)
+        os.fchmod(target_fd, 0o644)
+    finally:
+        os.close(target_fd)
+    target_stat = os.stat(target, follow_symlinks=False)
+    append_evidence("staged-keyring", target, target_stat, "sha256", actual_keyring_sha256)
+    require_root_owned_file("staged-keyring", target, target_stat, 0o644)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    verify_fd = os.open(target, flags)
+    try:
+        target_bytes = b""
+        while True:
+            block = os.read(verify_fd, 1 << 20)
+            if not block:
+                break
+            target_bytes += block
+    finally:
+        os.close(verify_fd)
+    target_sha256 = hashlib.sha256(target_bytes).hexdigest()
+    if (
+        len(target_bytes) != expected_keyring_size
+        or target_stat.st_size != expected_keyring_size
+        or target_sha256 != expected_keyring_sha256
+    ):
+        unlink_then_fail(
+            target,
+            "Ubuntu archive keyring staged-copy pin mismatch: "
+            f"expected size={expected_keyring_size} sha256={expected_keyring_sha256}; "
+            f"read size={len(target_bytes)} target_size={target_stat.st_size} sha256={target_sha256}",
+        )
+except BaseException:
     try:
         os.unlink(target)
+    except FileNotFoundError:
+        pass
     finally:
-        raise SystemExit(
-            "Ubuntu archive keyring pin mismatch: "
-            f"expected size={expected_size} sha256={expected_sha256}; "
-            f"copied size={size} target_size={target_stat.st_size} sha256={actual_sha256}"
-        )
-print(f"verified Ubuntu archive keyring copy: {target} size={size} sha256={actual_sha256}")
+        raise
+print(
+    f"verified Ubuntu archive keyring from pinned package: {target} "
+    f"package_size={download_size} package_sha512={actual_deb_sha512} "
+    f"keyring_size={len(keyring)} keyring_sha256={actual_keyring_sha256}"
+)
 PY
   staged_archive_keyring=$target
 }
