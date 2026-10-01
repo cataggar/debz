@@ -60,9 +60,20 @@ cannot be changed after preparation.
 
 Unhealthy unrelated packages refuse preparation. Pending or awaited trigger
 states require explicit trigger authority even when their trigger-name arrays
-are empty, including on the unchanged path. An empty operation-scoped lock with
-no actions or trigger work may report unchanged only for a healthy captured
-database; it does not produce an execution authorization or receipt.
+are empty, including on the unchanged path. So do non-empty package
+`Triggers-Pending`/`Triggers-Awaited` lists and unincorporated activations in
+`triggers/Unincorp`. A plan with zero actions does only what dpkg's
+`--configure --pending` and `--triggers-only -a` do: it processes pending
+trigger work. Installed interest and activation declarations alone are not
+work, so a configured root that declares triggers with nothing pending needs no
+authority and is unchanged. Supplying an authority anyway when nothing is
+pending is refused with `TriggerAuthorityWithoutPendingWork`, rather than
+compiling an empty `process_triggers` pass that would publish a receipt and
+provenance. Plans with actions still require authority for every installed or
+archive declaration, because those actions can activate them. An empty
+operation-scoped lock with no actions or trigger work may report unchanged only
+for a healthy captured database; it does not produce an execution authorization
+or receipt.
 
 Preparation has no mutation or command dependencies. Successful output owns
 both documents; compiler diagnostics own their text, including after temporary

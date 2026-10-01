@@ -28158,13 +28158,16 @@ pub const Runtime = struct {
             identities,
             origins,
         );
-        var triggers = database.model.triggers.interests.len != 0 or
-            database.model.triggers.pending.len != 0;
-        for (installed) |package| {
-            triggers = triggers or package.triggers.len != 0 or
-                package.triggers_pending.len != 0 or package.triggers_awaited.len != 0;
+        const unincorporated = database.model.triggers.pending.len != 0;
+        // A zero-action plan processes only pending trigger work, exactly as
+        // dpkg's `--configure --pending`; declarations alone need authority
+        // only when actions or archives can activate them.
+        var triggers = native_preparation.pendingTriggerWork(installed, unincorporated);
+        if (request.plan.actions.len != 0 or archives.len != 0) {
+            triggers = triggers or database.model.triggers.interests.len != 0;
+            for (installed) |package| triggers = triggers or package.triggers.len != 0;
+            for (archives) |archive| triggers = triggers or archive.triggers.len != 0;
         }
-        for (archives) |archive| triggers = triggers or archive.triggers.len != 0;
         const authority = try lifecycleTriggerAuthority(
             temporary,
             .{ .enabled = triggers, .mode = if (request.plan.actions.len == 0) .process_pending else .transaction },
@@ -28193,6 +28196,7 @@ pub const Runtime = struct {
             .removal_retry = retry,
             .archives = archives,
             .trigger_authority = authority,
+            .unincorporated_triggers = unincorporated,
         });
         if (result == .unchanged) {
             if (unchanged) |state| state.* = .{
