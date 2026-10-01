@@ -115,6 +115,8 @@ const ExecutionState = struct {
     phase_steps: ?[]const root_mutation.Step = null,
     bounds: ?*RuntimeBounds = null,
     stat_overrides: ?native_statoverride.Resolved = null,
+    stat_override_allocator: ?std.mem.Allocator = null,
+    stat_override_database_bytes: ?[]const u8 = null,
     diversion_observation: ?native_diversion.Observation = null,
     diversion_cache: ?*native_diversion.Session = null,
     route_settlement: ?ActiveRouteSettlement = null,
@@ -1337,6 +1339,83 @@ fn refreshExecutionDiversions(
     const next = try native_diversion.observe(allocator, root);
     try native_diversion.validateUpdate(execution.diversion_observation, next, in_progress);
     execution.diversion_observation = next;
+}
+
+fn cloneStatOverrideRecords(
+    allocator: std.mem.Allocator,
+    records: []const package_database.StatOverrideRecord,
+) ![]const package_database.StatOverrideRecord {
+    const cloned = try allocator.alloc(package_database.StatOverrideRecord, records.len);
+    for (records, 0..) |record, index| {
+        cloned[index] = .{
+            .user = try allocator.dupe(u8, record.user),
+            .group = try allocator.dupe(u8, record.group),
+            .mode = record.mode,
+            .path = try allocator.dupe(u8, record.path),
+        };
+    }
+    return cloned;
+}
+
+fn copyStatOverrideDatabaseBytes(
+    allocator: std.mem.Allocator,
+    entry: ?package_database.FileEntry,
+) !?[]const u8 {
+    const file = entry orelse return null;
+    if (file.kind != .regular) return null;
+    return try allocator.dupe(u8, file.bytes);
+}
+
+fn statOverrideDatabaseMatches(
+    previous: ?[]const u8,
+    entry: ?package_database.FileEntry,
+) bool {
+    const file = entry orelse return previous == null;
+    if (file.kind != .regular) return false;
+    const bytes = previous orelse return false;
+    return std.mem.eql(u8, bytes, file.bytes);
+}
+
+fn refreshExecutionStatOverrides(
+    execution: *ExecutionState,
+    temporary: std.mem.Allocator,
+    root: root_fs.Root,
+    native_architecture: []const u8,
+) !void {
+    var captured = try captureDatabaseSnapshot(temporary, root, .{});
+    defer captured.deinit();
+    normalizeCapturedNativeArchitecture(&captured.snapshot, native_architecture);
+    if (statOverrideDatabaseMatches(
+        execution.stat_override_database_bytes,
+        captured.snapshot.statoverride,
+    )) return;
+
+    var database = switch (try package_database.importSnapshot(temporary, .{
+        .native_architecture = native_architecture,
+        .snapshot = captured.snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidStatOverrideUpdate,
+    };
+    defer database.deinit();
+
+    const persistent = execution.stat_override_allocator orelse
+        return error.InvalidLifecycleProgram;
+    const records = try cloneStatOverrideRecords(
+        persistent,
+        database.model.stat_overrides,
+    );
+    const resolved = native_statoverride.read(
+        persistent,
+        root,
+        records,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidStatOverrideUpdate,
+    };
+    execution.stat_overrides = resolved;
+    execution.stat_override_database_bytes =
+        try copyStatOverrideDatabaseBytes(persistent, captured.snapshot.statoverride);
 }
 
 const CombinedMutationHooks = struct {
@@ -23781,7 +23860,19 @@ fn runLifecycleScript(
                     );
                 }
             }
-            return nativeScriptDisposition(owned.outcome);
+            const disposition = nativeScriptDisposition(owned.outcome);
+            switch (disposition) {
+                .exited => |code| if (code == 0 and kind != .preinst) {
+                    try refreshExecutionStatOverrides(
+                        execution,
+                        allocator,
+                        root,
+                        program.target_architecture,
+                    );
+                },
+                else => {},
+            }
+            return disposition;
         }
         if (try runtime.latest(recovery_action)) |record| {
             if (record.stage == .in_flight or record.stage == .outcome or
@@ -24055,6 +24146,11 @@ fn runLifecycleScript(
             checkpoint_paths.items,
         );
     }
+    const successful_script = switch (report.outcome) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    const refresh_stat_overrides = successful_script and kind != .preinst;
     if (snapshot_python3_preinst) switch (report.outcome) {
         .exited => |code| if (code == 0) {
             verifySnapshotPython3NullOutput(allocator, root) catch |err| {
@@ -24100,6 +24196,15 @@ fn runLifecycleScript(
                 allocator,
                 root,
                 mid_unpack,
+            ) catch |err| {
+                try attempt.requireRecovery(allocator, .script);
+                return err;
+            };
+            if (refresh_stat_overrides) refreshExecutionStatOverrides(
+                execution,
+                allocator,
+                root,
+                program.target_architecture,
             ) catch |err| {
                 try attempt.requireRecovery(allocator, .script);
                 return err;
@@ -24172,6 +24277,15 @@ fn runLifecycleScript(
             runtime.crash.hit(.after_trigger_outcome);
     } else {
         refreshExecutionDiversions(execution, allocator, root, mid_unpack) catch |err| {
+            try attempt.requireRecovery(allocator, .script);
+            return err;
+        };
+        if (refresh_stat_overrides) refreshExecutionStatOverrides(
+            execution,
+            allocator,
+            root,
+            program.target_architecture,
+        ) catch |err| {
             try attempt.requireRecovery(allocator, .script);
             return err;
         };
@@ -29552,6 +29666,10 @@ fn lifecycleExecutionError(err: anyerror) !LifecycleResult {
             .outcome = .recovery_required,
             .detail = "invalid_diversion_update",
         },
+        error.InvalidStatOverrideUpdate => .{
+            .outcome = .recovery_required,
+            .detail = "invalid_stat_override_update",
+        },
         else => err,
     };
 }
@@ -29847,6 +29965,11 @@ fn executeLifecycleProgramWithRequest(
         .bounds = bounds,
         .removal_retry = compiled.removal_retry != null or retry_on_recovery,
         .stat_overrides = stat_overrides,
+        .stat_override_allocator = scratch,
+        .stat_override_database_bytes = try copyStatOverrideDatabaseBytes(
+            scratch,
+            initial_snapshot.statoverride,
+        ),
         .diversion_observation = try native_diversion.observe(allocator, root),
         .diversion_cache = if (diversion_session) |*session| session else null,
         .recovery_models = models,

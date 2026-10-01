@@ -101,12 +101,80 @@ fn installAlias(case: *support.Scenario, record: []const u8) !void {
     try seed(case, record);
 }
 
+fn expectPathMetadata(case: *support.Scenario, target: []const u8, expected: Expected) !void {
+    for ([_][]const u8{ case.reference_root, case.native_root }) |path| {
+        var dir = try foundation.guardedRoot(case.fixture.io, path);
+        defer dir.close(case.fixture.io);
+        const entry = try (root_fs.Root.init(case.fixture.io, dir)).entry(try root_fs.Path.initPackage(target));
+        if (entry.mode != expected.mode or entry.uid != expected.uid or entry.gid != expected.gid)
+            return error.WrongStatoverrideMetadata;
+    }
+}
+
+fn installDpkgStatoverride(case: *support.Scenario, dpkg: []const u8) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const root_path = try support.path(case.fixture.allocator, case.name, side);
+        defer case.fixture.allocator.free(root_path);
+        try support.copyReferenceTool(case.fixture, root_path, dpkg, "dpkg-statoverride", "/usr/bin/dpkg-statoverride");
+    }
+}
+
+fn genuineToolRefresh(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const provider = "statoverride-refresh-provider";
+    const consumer = "statoverride-refresh-consumer";
+    const target = "usr/share/statoverride-refresh-consumer/mode";
+    const postinst = try std.fmt.allocPrint(fixture.allocator,
+        \\if [ "$1" = configure ]; then
+        \\    /usr/bin/dpkg-statoverride --update --add _debzstat _debzstat 4750 /{s} || exit 31
+        \\fi
+        \\
+    , .{target});
+    defer fixture.allocator.free(postinst);
+    const provider_archive = try support.makePackage(fixture, arch, "1", provider, "packages/statoverride-refresh-provider", .{
+        .postinst_append = postinst,
+    });
+    defer fixture.allocator.free(provider_archive);
+    const consumer_archive = try support.makePackage(fixture, arch, "1", consumer, "packages/statoverride-refresh-consumer", .{
+        .control_fields = "Pre-Depends: " ++ provider ++ " (= 1)\n",
+        .no_scripts = true,
+        .extra_files = &.{.{ .path = target, .content = "permission-sensitive payload\n" }},
+    });
+    defer fixture.allocator.free(consumer_archive);
+    const selected = [_]foundation.PackageIdentity{
+        .{ .name = provider, .architecture = arch },
+        .{ .name = consumer, .architecture = arch },
+    };
+    const actions = [_]support.Action{
+        .{ .sequence = 0, .kind = "unpack", .package = provider, .architecture = arch },
+        .{ .sequence = 1, .kind = "configure_pending", .package = consumer, .architecture = arch },
+        .{ .sequence = 2, .kind = "unpack", .package = consumer, .architecture = arch },
+        .{ .sequence = 3, .kind = "configure_pending", .package = consumer, .architecture = arch },
+    };
+    const groups = [_][]const []const u8{ &.{provider_archive}, &.{consumer_archive} };
+    var case = try support.Scenario.init(fixture, "statoverride-genuine-refresh", driver, dpkg, arch, false);
+    defer case.deinit();
+    try seed(&case, "");
+    try installDpkgStatoverride(&case, dpkg);
+    try case.phase(.{
+        .operation = "install",
+        .archives = &.{ provider_archive, consumer_archive },
+        .reference_groups = &groups,
+        .packages = &selected,
+        .ordered_actions = &actions,
+    }, false);
+    try expectPathMetadata(&case, target, .{ .mode = 0o4750, .uid = 42420, .gid = 42421 });
+    try support.assertDatabaseBytes(&case, "statoverride");
+    try support.assertDatabaseBytes(&case, "statoverride-old");
+}
+
 pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const first = try archive(fixture, arch, "1");
     defer fixture.allocator.free(first);
     const second = try archive(fixture, arch, "2");
     defer fixture.allocator.free(second);
     const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+
+    try genuineToolRefresh(fixture, driver, dpkg, arch);
 
     const table = [_]struct {
         label: []const u8,
