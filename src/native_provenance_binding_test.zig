@@ -451,6 +451,7 @@ fn finish(
     stale[0] = if (stale[0] == '0') '1' else '0';
     try testing.expectError(error.InvalidRecoveryProvenance, Runtime.acknowledge(allocator, attempt, stale));
     try testing.expect(try Runtime.hasActiveEvidence(allocator, env.root));
+    try expectCallerPayloadBound(env, attempt, receipt.digest_sha256);
 
     const record_bytes = try env.read(root_operation.record_path);
     errdefer allocator.free(record_bytes);
@@ -477,6 +478,31 @@ fn finish(
         .provenance_digest = provenance_digest,
         .recovered_phase_count = receipt.recovered_phase_count,
     };
+}
+
+/// The held caller's in-attempt verification binds the live payload before
+/// acknowledgment: a changed payload is refused and nothing is acknowledged.
+fn expectCallerPayloadBound(env: *Environment, attempt: *root_operation.Attempt, receipt_digest: Digest) !void {
+    const allocator = env.allocator;
+    {
+        var verified = try native_transaction_result.verifyCallerSuccess(allocator, attempt, receipt_digest);
+        verified.deinit();
+    }
+    const original = try env.read(payload_path);
+    defer allocator.free(original);
+    const changed = try allocator.dupe(u8, original);
+    defer allocator.free(changed);
+    changed[0] ^= 0x01;
+    try env.write(payload_path, changed);
+    try testing.expectError(
+        error.LivePayloadChanged,
+        native_transaction_result.verifyCallerSuccess(allocator, attempt, receipt_digest),
+    );
+    try testing.expect(try Runtime.hasActiveEvidence(allocator, env.root));
+    try testing.expect(try env.exists(root_operation.record_path));
+    try env.write(payload_path, original);
+    var verified = try native_transaction_result.verifyCallerSuccess(allocator, attempt, receipt_digest);
+    verified.deinit();
 }
 
 fn flipHex(value: []u8) void {
@@ -647,7 +673,48 @@ const Matrix = struct {
             return error.UnboundProvenanceComponent;
         }
     }
+
+    /// Replaces the live payload with another kind or mode, then restores
+    /// the original bytes and mode.
+    fn payloadCase(self: *Matrix, replacement: PayloadReplacement, original: []const u8) !void {
+        const env = self.env;
+        const path = try root_fs.Path.init(payload_path);
+        const metadata = (try env.root.metadataIfExists(path)).?;
+        const entry = try env.root.entry(path);
+        const copy = try root_fs.Path.init(payload_path ++ ".real");
+        try env.remove(payload_path);
+        switch (replacement) {
+            // The link names identical bytes; only a following reader would
+            // accept it.
+            .symlink => {
+                try env.root.publishFile(copy, original, .{ .permissions = metadata.permissions, .durable = false });
+                try env.root.createSymbolicLink(path, "sha512-e2e.real");
+            },
+            .directory => try env.root.createDirectory(path, root_fs.default_directory_permissions),
+            .mode => try env.root.publishFile(path, original, .{
+                .permissions = .fromMode(if (entry.mode & 0o7777 == 0o600) 0o640 else 0o600),
+                .durable = false,
+            }),
+        }
+        try self.refused(switch (replacement) {
+            .symlink => "live payload replaced by symlink",
+            .directory => "live payload replaced by directory",
+            .mode => "live payload mode",
+        }, error.LivePayloadChanged, env.verify());
+        switch (replacement) {
+            .symlink => {
+                try env.remove(payload_path);
+                try env.remove(payload_path ++ ".real");
+            },
+            .directory => try env.root.removeDirectory(path),
+            .mode => try env.remove(payload_path),
+        }
+        try env.root.publishFile(path, original, .{ .permissions = metadata.permissions, .durable = false });
+        try self.restore();
+    }
 };
+
+const PayloadReplacement = enum { symlink, directory, mode };
 
 fn omittedEvidenceError(kind: native_provenance.EvidenceKind) anyerror {
     return switch (kind) {
@@ -845,6 +912,53 @@ fn tamperSettled(env: *Environment, settled: *const Settled) !void {
     defer allocator.free(extended);
     try matrix.fileCase("live dpkg info list", error.FinalStateMismatch, "var/lib/dpkg/info/demo.list", extended);
     try matrix.fileCase("live pending trigger claim", error.FinalStateMismatch, "var/lib/dpkg/triggers/Unincorp", "forged-trigger demo\n");
+
+    // Live managed payload: the final managed snapshot binds each covered
+    // path's kind, mode, owner and bytes, not only the database records.
+    const payload = try env.read(payload_path);
+    defer allocator.free(payload);
+    const flipped = try allocator.dupe(u8, payload);
+    defer allocator.free(flipped);
+    flipped[0] ^= 0x01;
+    try matrix.fileCase("live payload bytes", error.LivePayloadChanged, payload_path, flipped);
+    const grown = try std.mem.concat(allocator, u8, &.{ payload, "forged\n" });
+    defer allocator.free(grown);
+    try matrix.fileCase("live payload resized", error.LivePayloadChanged, payload_path, grown);
+    try matrix.fileCase("live payload removed", error.LivePayloadChanged, payload_path, null);
+    for (std.enums.values(PayloadReplacement)) |replacement|
+        try matrix.payloadCase(replacement, payload);
+    {
+        // Settlement does not claim unrelated members of shared directories.
+        const unrelated = "usr/share/administrator-file";
+        try env.write(unrelated, "administrator\n");
+        try matrix.expectVerified();
+        try env.remove(unrelated);
+    }
+    {
+        // Each verify variant shares the live payload binding.
+        try env.write(payload_path, flipped);
+        var outer_live = try matrix.completion();
+        defer outer_live.deinit();
+        var receipt_owned = try matrix.receipt();
+        defer receipt_owned.deinit();
+        try matrix.refused("caller verify of live payload", error.LivePayloadChanged, native_transaction_result.verifyForCaller(
+            allocator,
+            env.root,
+            env.installRoot(),
+            env.lock.lock,
+            "amd64",
+            .{
+                .operation = .install,
+                .request_sha256 = env.request_sha256,
+                .policy_sha256 = env.policy_sha256,
+                .foreign_architectures = &.{},
+                .completion = try native_transaction_result.describeCompletion(outer_live.document, receipt_owned.document, .cleared),
+            },
+            env.locks.interface(),
+        ));
+        try env.write(payload_path, payload);
+        try matrix.restore();
+    }
 
     // Settlement and terminal acknowledgment: evidence must be complete and
     // no active record, owner, or native intent may survive acknowledgment.

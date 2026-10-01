@@ -8895,15 +8895,13 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
         try root.publishFile(state_path, original, .{ .permissions = .fromMode(0o600) });
         const source_path = try root_fs.Path.init(state.state.managed_files[0].logical_path[1..]);
         try root.rename(source_path, saved, .fail_if_exists);
-        try std.testing.expectError(error.ManagedFileMissing, importAndRefreshNative(allocator, input, dependencies));
+        // Settled native verification binds the live payload (#317), so the
+        // removed managed file is refused before any repository checkpoint.
+        try std.testing.expectError(error.LivePayloadChanged, importAndRefreshNative(allocator, input, dependencies));
         try root.rename(saved, source_path, .fail_if_exists);
-        const failed_bytes = try root.readFileAlloc(allocator, state_path, state_module.maximum_document_bytes);
-        defer allocator.free(failed_bytes);
-        var failed = try state_module.decode(allocator, failed_bytes, state_module.maximum_document_bytes);
-        defer failed.deinit();
-        try std.testing.expect(failed.state.installed);
-        try std.testing.expectEqual(state_module.Phase.installed, failed.state.phase);
-        try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, failed.state.diagnostic_id.?);
+        const refused_bytes = try root.readFileAlloc(allocator, state_path, state_module.maximum_document_bytes);
+        defer allocator.free(refused_bytes);
+        try std.testing.expectEqualStrings(original, refused_bytes);
         var crash: NativeReceiptTestCrash = .{ .point = .after_rename };
         try std.testing.expectError(error.InjectedNativeReceiptPublicationFailure, nativeRepositoryCheckpoint(allocator, input, crash.observer(), .{ .post_install = dependencies }));
         try std.testing.expect(try root.entryIfExists(manifest_path) != null);

@@ -1007,17 +1007,31 @@ fn verifyStateEvidence(
     if (managed.document.transient != null) return error.InvalidManagedState;
     try verifyDiversionCacheEvidence(allocator, root, proof, managed.document);
     try verifyUnpackDiversionEvidence(allocator, root, proof, managed.document, program.program, progress.document);
+    var route_arena = std.heap.ArenaAllocator.init(allocator);
+    defer route_arena.deinit();
+    var route_conffiles: std.ArrayList([]const u8) = .empty;
     try verifyUnpackRouteSettlementEvidence(
         allocator,
         root,
         proof,
         managed.document,
         program.program,
+        route_arena.allocator(),
+        &route_conffiles,
     );
     switch (expected_outcome) {
         .succeeded => try native_runtime.verifyCompletedState(allocator, root, authorized, proof),
         .failed => try native_runtime.verifyFailedState(allocator, root, authorized, proof),
     }
+    // The database generation above binds the dpkg records; this binds the
+    // live payload the attempt's final managed snapshot covers.
+    _ = try native_runtime.verifySettledPayload(
+        allocator,
+        root,
+        program.program,
+        managed.document,
+        route_conffiles.items,
+    );
 }
 
 fn verifyRetainedScriptOutcomes(
@@ -1227,6 +1241,8 @@ fn verifyUnpackRouteSettlementEvidence(
     proof: native_provenance.Document,
     managed: native_recovery.ManagedStateDocument,
     program: native_program.Program,
+    route_arena: std.mem.Allocator,
+    route_conffiles: *std.ArrayList([]const u8),
 ) !void {
     const entries = if (managed.stable) |snapshot| snapshot.entries else &.{};
     var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
@@ -1308,12 +1324,17 @@ fn verifyUnpackRouteSettlementEvidence(
         defer cache.deinit();
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        _ = try native_unpack_route_settlement.lowerSuccess(
+        const lowered = try native_unpack_route_settlement.lowerSuccess(
             arena.allocator(),
             route.contract,
             &parent,
             &cache,
         );
+        // A route-settled conffile stays at its unpack route.
+        for (lowered.routes) |lowered_route| {
+            if (lowered_route.conffile == null) continue;
+            try route_conffiles.append(route_arena, try route_arena.dupe(u8, lowered_route.payload_route));
+        }
     }
     for (proof.evidence_files) |file| {
         if (file.kind != .unpack_route_settlement) continue;

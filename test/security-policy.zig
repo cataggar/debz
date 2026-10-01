@@ -1743,6 +1743,16 @@ test "security: native provenance component tamper coverage stays wired" {
         "\"live pending trigger claim\"",
         "\"deferred owner reinstated\"",
         "try testing.expect(!std.mem.eql(u8, &receipt_digest, &provenance_digest));",
+        "\"live payload bytes\", error.LivePayloadChanged",
+        "\"live payload removed\", error.LivePayloadChanged",
+        "for (std.enums.values(PayloadReplacement)) |replacement|",
+        "\"caller verify of live payload\", error.LivePayloadChanged",
+        "try expectCallerPayloadBound(env, attempt, receipt.digest_sha256);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/native_transaction_result.zig", "\nfn verifyStateEvidence(", "\nfn ", &.{
+        "        &route_conffiles,\n    );",
+        "    _ = try native_runtime.verifySettledPayload(",
+        "        route_conffiles.items,\n",
     });
     try nativeMutationsIn(&f, "native-workflow", "test/native_recovery_family.zig", "\nfn ownedComponents(", "\nfn ", &.{
         "const retained_kinds = [_]provenance.EvidenceKind{ .authorization, .program, .execution_request, .intent, .progress, .managed_state, .trigger_events, .script_outcome };",
@@ -1755,6 +1765,9 @@ test "security: native provenance component tamper coverage stays wired" {
         ".expected_error = \"ReceiptMissing\"",
         ".expected_error = \"CompletionMissing\"",
         ".expected_error = \"OwnershipMismatch\"",
+        "\"live-payload-bytes\", selected, lock, check, \"LivePayloadChanged\"",
+        "\"live-payload-removed\", selected, lock, check, \"LivePayloadChanged\"",
+        "\"administrator-conffile-edit\", selected, lock, check",
     });
     try nativeMutations(&f, "native-workflow", "test/native_recovery_family.zig", &.{
         "    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{",

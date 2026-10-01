@@ -3528,6 +3528,9 @@ def native_workflow_acceptance_wiring_failures(
         '.expected_error = "ReceiptMissing"',
         '.expected_error = "CompletionMissing"',
         '.expected_error = "OwnershipMismatch"',
+        '"live-payload-bytes", selected, lock, check, "LivePayloadChanged"',
+        '"live-payload-removed", selected, lock, check, "LivePayloadChanged"',
+        '"administrator-conffile-edit", selected, lock, check',
     ):
         if token not in components:
             failures.append(f"native_recovery_family.zig: owned component tamper matrix lost {token}")
@@ -3543,7 +3546,7 @@ def native_workflow_acceptance_wiring_failures(
 
 
 def native_provenance_binding_wiring_failures(
-    build: str, e2e: str, binding: str,
+    build: str, e2e: str, binding: str, transaction: str,
 ) -> list[str]:
     failures: list[str] = []
     if '            "native_provenance_binding.test.",\n        },\n    });\n    const run_sha512_e2e_tests = b.addRunArtifact(sha512_e2e_tests);' not in build:
@@ -3564,12 +3567,24 @@ def native_provenance_binding_wiring_failures(
         '"live pending trigger claim"',
         '"deferred owner reinstated"',
         "try testing.expect(!std.mem.eql(u8, &receipt_digest, &provenance_digest));",
+        '"live payload bytes", error.LivePayloadChanged',
+        '"live payload removed", error.LivePayloadChanged',
+        "for (std.enums.values(PayloadReplacement)) |replacement|",
+        '"caller verify of live payload", error.LivePayloadChanged',
+        "try expectCallerPayloadBound(env, attempt, receipt.digest_sha256);",
     ):
         if token not in binding:
             failures.append(f"native_provenance_binding_test.zig: component tamper coverage lost {token}")
     for token in ("try tamperSettled(&env, &settled);", "try env.expectSecondOperationRefused();"):
         if binding.count(token) != 2:
             failures.append(f"native_provenance_binding_test.zig: completed/recovered and recovery_required coverage requires two {token}")
+    state = transaction.split("\nfn verifyStateEvidence(", 1)[-1].split("\nfn ", 1)[0]
+    for token in (
+        "        &route_conffiles,\n    );",
+        "    _ = try native_runtime.verifySettledPayload(\n        allocator,\n        root,\n        program.program,\n        managed.document,\n        route_conffiles.items,\n    );\n}",
+    ):
+        if token not in state:
+            failures.append(f"native_transaction_result.zig: settled verification must bind the live managed payload lost {token}")
     return failures
 
 
@@ -3777,6 +3792,7 @@ def audit_ci_pins() -> None:
         (ROOT / "build.zig").read_text(),
         (ROOT / "src/sha512_transaction_e2e_test.zig").read_text(),
         (ROOT / "src/native_provenance_binding_test.zig").read_text(),
+        (ROOT / "src/native_transaction_result.zig").read_text(),
     ):
         fail(failure)
     for failure in native_report_path_wiring_failures({
@@ -4836,6 +4852,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-provenance": (
                 "build.zig", "src/sha512_transaction_e2e_test.zig",
                 "src/native_provenance_binding_test.zig",
+                "src/native_transaction_result.zig",
             ),
             "reference-root": REFERENCE_ROOT_PATHS,
             "protected-reference": PROTECTED_REFERENCE_PATHS,

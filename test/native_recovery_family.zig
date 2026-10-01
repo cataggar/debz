@@ -2022,6 +2022,8 @@ fn ownedSuccess(
         .record = null,
         .original_receipt = receipt_before,
         .original_record = null,
+        .payload = "usr/share/debz-fixtures/scenario-main",
+        .conffile = "etc/debz-fixture.conf",
     });
     for ([_][]const u8{ "finalize", "finalize-again" }) |label| {
         var finalized = try workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, label), .{
@@ -2903,6 +2905,7 @@ fn ownedKnownFailure(
         .record = record,
         .original_receipt = original_receipt,
         .original_record = original_record,
+        .payload = "usr/share/debz-fixtures/fail-script",
     });
     try publicVerify(fixture, cli, scenario.native_root, lock, arch, try support.path(fixture.allocator, name, "verify-public-pending-failure"), false);
     if (try referenceSingleFailure(fixture, reference, scenario.reference_root, arch, name) != 1) return error.ReferenceOwnedFailureNotReproduced;
@@ -2965,6 +2968,10 @@ const OwnedComponentCheck = struct {
     record: ?[]const u8,
     original_receipt: []const u8,
     original_record: ?[]const u8,
+    /// Root-relative payload the attempt left published.
+    payload: []const u8,
+    /// Root-relative conffile an administrator may edit after settlement.
+    conffile: ?[]const u8 = null,
 };
 
 /// Issue #269 owned-attempt matrix: a completed or known-failed attempt binds
@@ -3055,6 +3062,31 @@ fn ownedComponents(
     }
     try fixture.write(check.receipt, check.original_receipt, 0o600);
 
+    // Issue #317: the final managed snapshot binds the live payload; changed
+    // or removed bytes are refused, while an administrator's conffile edit
+    // stays administrator state. Originals are moved aside and renamed back,
+    // so the later pinned-dpkg comparison still sees their original metadata.
+    const payload = try support.path(fixture.allocator, check.root_relative, check.payload);
+    const changed_payload = try support.read(fixture, payload, 1024 * 1024);
+    changed_payload[changed_payload.len - 1] ^= 1;
+    const moved_payload = try std.fmt.allocPrint(fixture.allocator, "{s}.moved", .{payload});
+    try fixture.dir.rename(payload, fixture.dir, moved_payload, fixture.io);
+    try ownedComponentRefused(fixture, driver, scenario, arch, name, "live-payload-removed", selected, lock, check, "LivePayloadChanged");
+    try fixture.write(payload, changed_payload, 0o644);
+    try ownedComponentRefused(fixture, driver, scenario, arch, name, "live-payload-bytes", selected, lock, check, "LivePayloadChanged");
+    try fixture.dir.deleteFile(fixture.io, payload);
+    try fixture.dir.rename(moved_payload, fixture.dir, payload, fixture.io);
+    if (check.conffile) |relative| {
+        const conffile = try support.path(fixture.allocator, check.root_relative, relative);
+        const moved_conffile = try std.fmt.allocPrint(fixture.allocator, "{s}.moved", .{conffile});
+        try fixture.dir.rename(conffile, fixture.dir, moved_conffile, fixture.io);
+        try fixture.write(conffile, "administrator edit\n", 0o644);
+        try ownedComponentVerified(fixture, driver, scenario, arch, name, "administrator-conffile-edit", selected, lock, check);
+        try fixture.dir.deleteFile(fixture.io, conffile);
+        try fixture.dir.rename(moved_conffile, fixture.dir, conffile, fixture.io);
+    }
+    try expectOwnedRecord(fixture, check);
+
     const bound_owner = try support.read(fixture, check.bound_owner, 64 * 1024);
     const current_owner = try support.read(fixture, check.owner, 64 * 1024);
     const completion = try support.path(fixture.allocator, check.root_relative, debz.root_operation_completion.document_path);
@@ -3073,7 +3105,7 @@ fn ownedComponents(
     }
     try expectOwnedRecord(fixture, check);
     try std.testing.expectEqualSlices(u8, check.original_receipt, try support.read(fixture, check.receipt, 16 * 1024 * 1024));
-    std.debug.print("owned {s} component matrix: {d} retained, {d} receipt and 3 settlement tampers refused\n", .{
+    std.debug.print("owned {s} component matrix: {d} retained, {d} receipt, 2 live payload and 3 settlement tampers refused\n", .{
         @tagName(check.outcome), retained_cases, std.enums.values(ReceiptTamper).len,
     });
 }
@@ -3112,6 +3144,35 @@ fn ownedComponentRefused(
     });
     defer refused.deinit();
     try std.testing.expect(!(try field(refused.report.value, "verified")).bool);
+}
+
+fn ownedComponentVerified(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    scenario: *const support.Scenario,
+    arch: []const u8,
+    name: []const u8,
+    label: []const u8,
+    selected: []const Selector,
+    lock: []const u8,
+    check: OwnedComponentCheck,
+) !void {
+    var verified = try workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, label), .{
+        .ordinary_mode = "recover",
+        .selectors = selected,
+        .cache_path = try fixture.absolute(try support.path(fixture.allocator, name, "unused-cache")),
+        .state_path = try fixture.absolute(try support.path(fixture.allocator, name, "unused-state")),
+        .orchestration_id = @splat(17),
+        .owner_evidence = check.owner_evidence,
+        .owned_verification = .{
+            .lock_path = lock,
+            .state = check.state,
+            .outcome = if (check.outcome == .failed) "failed" else "succeeded",
+            .expected_error = null,
+        },
+    });
+    defer verified.deinit();
+    try std.testing.expect((try field(verified.report.value, "verified")).bool);
 }
 
 fn ownedFinalizationBoundaries(
