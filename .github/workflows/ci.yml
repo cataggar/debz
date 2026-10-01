@@ -2066,6 +2066,8 @@ jobs:
           # if the wrapper stopped before its own audit.
           forbidden_exec_status=0
           allowed_script_dpkg_exec=0
+          allowed_script_dpkg_divert_exec=0
+          allowed_script_dpkg_statoverride_exec=0
           candidate="$(realpath zig-out/bin/debz)"
           : >"$evidence/exec-reaudit.txt"
           for trace in "$evidence"/*.execve; do
@@ -2081,6 +2083,12 @@ jobs:
             allowed=$(sed -n 's/^allowed_script_dpkg_exec=\([0-9][0-9]*\)$/\1/p' \
               "$evidence/exec-reaudit.part")
             allowed_script_dpkg_exec=$((allowed_script_dpkg_exec + ${allowed:-0}))
+            allowed=$(sed -n 's/^allowed_script_dpkg_divert_exec=\([0-9][0-9]*\)$/\1/p' \
+              "$evidence/exec-reaudit.part")
+            allowed_script_dpkg_divert_exec=$((allowed_script_dpkg_divert_exec + ${allowed:-0}))
+            allowed=$(sed -n 's/^allowed_script_dpkg_statoverride_exec=\([0-9][0-9]*\)$/\1/p' \
+              "$evidence/exec-reaudit.part")
+            allowed_script_dpkg_statoverride_exec=$((allowed_script_dpkg_statoverride_exec + ${allowed:-0}))
             if [ "$audit_status" -ne 0 ]; then
               forbidden_exec_status=1
             fi
@@ -2090,12 +2098,15 @@ jobs:
             grep -h '^forbidden_exec' "$evidence/exec-reaudit.txt" \
               >"$evidence/forbidden-exec.txt" || true
           fi
-          printf '%s exec re-audit: %s allowed read-only script dpkg execs; forbidden=%s\n' \
-            "$ARCHITECTURE" "$allowed_script_dpkg_exec" \
+          printf '%s exec re-audit: %s allowed read-only script dpkg execs, %s dpkg-divert, %s dpkg-statoverride; forbidden=%s\n' \
+            "$ARCHITECTURE" "$allowed_script_dpkg_exec" "$allowed_script_dpkg_divert_exec" \
+            "$allowed_script_dpkg_statoverride_exec" \
             "$([ "$forbidden_exec_status" -eq 0 ] && echo false || echo true)" |
             tee -a "$GITHUB_STEP_SUMMARY"
           sudo cp -a "$work/state/." "$work/evidence/state/" 2>/dev/null || true
           sudo cp "$work/root/var/lib/dpkg/status" "$work/evidence/status-final" 2>/dev/null || true
+          sudo cp "$work/root/var/lib/dpkg/diversions" "$work/evidence/diversions-final" 2>/dev/null || true
+          sudo cp "$work/root/var/lib/dpkg/statoverride" "$work/evidence/statoverride-final" 2>/dev/null || true
           sudo cp "$work/ubuntu.sources" "$work/evidence/" 2>/dev/null || true
           sudo cp "$work/ubuntu.json" "$work/evidence/" 2>/dev/null || true
           sudo du -sh "$work" 2>/dev/null \

@@ -205,11 +205,14 @@ at exec that the command could not use. The maintainer-script sandbox already
 sets the flag for every script.
 
 **Native exec audit.** Every traced `execve` or `execveat` of a path named
-`dpkg` or `dpkg-deb` fails the wrapper with exit 90, even when the command
-failed, with one exception. A maintainer script may query the target root's
-own dpkg read-only, as it would under dpkg; for example,
+`dpkg`, `dpkg-deb`, `dpkg-divert` or `dpkg-statoverride` fails the wrapper
+with exit 90, even when the command failed, with one exception. A maintainer
+script may run the target root's own dpkg tools as it would under dpkg: dpkg
+for read-only queries, and `dpkg-divert` or `dpkg-statoverride` in the exact
+argument shapes that the closure's scripts use. For example,
 `dpkg-maintscript-helper` runs `dpkg --validate-version` and
-`--compare-versions`. Such an exec is allowed only when all of these hold:
+`--compare-versions`, and libc6's preinst adds DEP17 protective diversions.
+Such an exec is allowed only when all of these hold:
 
 - It descends, through traced `fork`, `vfork`, `clone` or `clone3` children,
   from a successful exec of `/var/lib/debz-lifecycle-scripts/<package>.<action>`
@@ -218,45 +221,92 @@ own dpkg read-only, as it would under dpkg; for example,
   candidate `debz` binary. That process must itself descend from the traced
   command. A script path alone is never enough: a process that runs such a
   script without this lineage is refused.
-- It is a successful plain `execve` whose filename is exactly `/usr/bin/dpkg`,
-  with `argv[0]` `dpkg` or `/usr/bin/dpkg` and no truncated string. `argv[0]`
-  is only a label; the filename and the identity check below decide which
-  binary ran.
-- `argv[1]` is `--compare-versions`, `--validate-version`,
-  `--print-architecture`, `-s`, `-L` or `-l`. No later argument starts with
-  `--root`, `--admindir`, `--instdir` or `--force`, and no other option comes
-  before `--`.
+- It is a successful plain `execve` whose filename is exactly
+  `/usr/bin/dpkg`, `/usr/bin/dpkg-divert` or `/usr/bin/dpkg-statoverride`,
+  with `argv[0]` either that tool's bare name or the same absolute filename,
+  and no truncated string. `argv[0]` is only a label; the filename and the
+  identity check below decide which binary ran.
+- For dpkg, `argv[1]` is `--compare-versions`, `--validate-version`,
+  `--print-architecture`, `-s`, `-L` or `-l`, and no other option comes
+  before `--`. For `dpkg-divert` and `dpkg-statoverride`, the arguments after
+  `argv[0]` are exactly one of the reviewed shapes below, in the same order.
+  For every tool, no argument after the action starts with `--root`,
+  `--admindir`, `--instdir` or `--force`; for the two new tools that includes
+  `argv[1]`.
 - No PID in its lineage was reused or superseded within the trace.
-- After the command, the root's `/usr/bin/dpkg` is a regular file, opened
-  without following a symlink in any path component, with the reviewed size
-  and SHA-256 for the runner's architecture. No `dpkg` exists in
-  `usr/local/sbin`, `usr/local/bin`, `usr/sbin` or `sbin`, with symlinks
+- After the command, the root's `/usr/bin/<tool>` is a regular file, opened
+  without following a symlink in any path component, with that tool's
+  reviewed size and SHA-256 for the runner's architecture. No `<tool>` exists
+  in `usr/local/sbin`, `usr/local/bin`, `usr/sbin` or `sbin`, with symlinks
   resolved inside the root. The scripts' `PATH` is
   `/usr/sbin:/usr/bin:/sbin:/bin`, so this covers every directory searched
-  before `/usr/bin`, and a few more. The status database records `dpkg` at
-  the reviewed version and architecture.
+  before `/usr/bin`, and a few more. The status database records `dpkg`, the
+  package that ships all three tools, at the reviewed version and
+  architecture. Each tool is checked separately: a wrong `dpkg-statoverride`
+  refuses only the `dpkg-statoverride` calls, and the audit still fails.
 
-The reviewed identity is dpkg `1.23.7ubuntu2` from the `20261001T000000Z`
-snapshot. Each digest was taken from that architecture's authenticated
-archive and is never shared across architectures:
+The reviewed identities are from dpkg `1.23.7ubuntu2` in the
+`20261001T000000Z` snapshot. Each digest was taken from that architecture's
+authenticated archive, whose SHA-512 matched the signed lock, and is never
+shared across architectures or tools:
 
-| Architecture | `/usr/bin/dpkg` bytes | SHA-256 |
-| --- | ---: | --- |
-| amd64 | 322,728 | `6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f` |
-| arm64 | 330,816 | `d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4` |
+| Architecture | File | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| amd64 | `/usr/bin/dpkg` | 322,728 | `6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f` |
+| amd64 | `/usr/bin/dpkg-divert` | 125,768 | `a509fc1a363946770295b613924e2bfa902ddbf76ec2826128685df1569c57d8` |
+| amd64 | `/usr/bin/dpkg-statoverride` | 55,936 | `6c08816ff0b12106e969537cab83ac4b3358a72b425fe8bf1fc961e2e82ce2ce` |
+| arm64 | `/usr/bin/dpkg` | 330,816 | `d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4` |
+| arm64 | `/usr/bin/dpkg-divert` | 133,872 | `6daba35904a8885a334c33e6b4c7c7bc42f501f3f36032a374dfe40e842ed75b` |
+| arm64 | `/usr/bin/dpkg-statoverride` | 68,184 | `b837c9d99518225f5b238b215179559a87e7d012072ae0ff414fdc0ea891c3b9` |
 
 The pins are bound to that snapshot. A different pinned snapshot makes the
 audit fail with exit 91 until the pins are reviewed again, as does an
-unreadable trace or root. `execveat`, `dpkg-deb`, every other action and
-option, and any dpkg exec that does not descend from such a script still
-fail with exit 90.
+unreadable trace or root. `execveat`, `dpkg-deb`, every other action, option
+and argument shape, and any exec of these tools that does not descend from
+such a script still fail with exit 90.
 
-These queries hand no transaction step to dpkg. dpkg would run the same
-scripts the same way, and the reviewed actions only compare or validate
-versions or read the root's architecture and package database. `debz` still
-performs every unpack, configuration, trigger and state update itself.
-Script-invoked dpkg-family tools that change state, such as `dpkg-divert` and
-`dpkg-statoverride`, are tracked separately in #334.
+The reviewed `dpkg-divert` and `dpkg-statoverride` shapes are every call
+that a fresh install of the amd64 `20261001T000000Z` ubuntu-minimal closure
+can make, taken from its 175 packages' control scripts. `PATH` is an absolute path of printable ASCII without spaces, empty
+components, `.` or `..`. `NAME` is a lowercase package name, `ACCOUNT` a
+lowercase user or group name (never `#<id>`), and `MODE` a four-digit octal
+mode without setuid, setgid or sticky bits. `PATH.usr-is-merged` names a
+DEP17 diversion of the same path; for a top-level directory such as `/lib32`,
+`/.lib32.usr-is-merged` is also accepted.
+
+| Tool | Arguments after `argv[0]` | Scripts |
+| --- | --- | --- |
+| `dpkg-divert` | `--quiet --package NAME --add --no-rename --divert MERGED PATH` | base-files preinst |
+| `dpkg-divert` | `--quiet --package NAME --remove --no-rename --divert MERGED PATH` | base-files postinst, libc6 preinst |
+| `dpkg-divert` | `--quiet --add --no-rename --package NAME --divert MERGED PATH` | libc6 preinst |
+| `dpkg-divert` | `--quiet --add --no-rename --divert MERGED PATH` | libc6 preinst |
+| `dpkg-divert` | `--package NAME --no-rename --divert MERGED --add PATH` | libext2fs2t64, libreadline8t64 preinst |
+| `dpkg-divert` | `--package NAME --no-rename --divert MERGED PATH` | libtirpc3t64 preinst |
+| `dpkg-divert` | `--no-rename --divert MERGED --add PATH` | netplan-generator preinst |
+| `dpkg-divert` | `--no-rename --divert MERGED --remove PATH` | netplan-generator postinst |
+| `dpkg-divert` | `--package NAME --divert PATH.remove-bak --no-rename --remove PATH` | coreutils-from-gnu preinst |
+| `dpkg-divert` | `--truename PATH` | libc6 preinst, iputils-ping postinst, dash and gzip preinst and postinst |
+| `dpkg-divert` | `--listpackage PATH` | dash and gzip preinst and postinst |
+| `dpkg-statoverride` | `--list PATH` | sudo-rs and chrony postinst |
+| `dpkg-statoverride` | `--update --add ACCOUNT ACCOUNT MODE PATH` | chrony postinst |
+
+Shapes that only upgrades, removals or local administrator setups reach stay
+refused: any `--rename` (gzip, dash and coreutils-from-gnu), `--local` and
+`--list` (init-system-helpers), dash's `--remove` without `--divert`,
+`dpkg-statoverride --remove` (postrm only), and `--test`. Widening the list
+needs new evidence and review.
+
+None of these calls hands a transaction step to dpkg. dpkg would run the same
+scripts the same way. The reviewed dpkg actions only compare or validate
+versions or read the root's architecture and package database. The reviewed
+`dpkg-divert` and `dpkg-statoverride` calls read or edit only the root's
+`diversions` and `statoverride` databases, plus, for
+`dpkg-statoverride --update`, the named path's owner and mode, exactly as
+they would under dpkg; they never unpack, configure or record package state.
+`debz` still performs every unpack, configuration, trigger and status update
+itself. It re-reads the diversions after each script, and the final database
+generation binds both databases; the remaining parity gaps for script-written
+statoverrides are tracked in #334.
 
 `argv[0]` `/usr/bin/dpkg` is accepted because `py3compile -p` runs
 `/usr/bin/dpkg -L` with that absolute `argv[0]` (`debpython/files.py` in
@@ -273,20 +323,25 @@ would add a root symlink lookup to the decision, which gains nothing.
 
 For each audited operation, `native-exec-audit.txt` records:
 
-- a `script_dpkg_exec` line for each allowed call, with its trace line, PID,
-  script, script PID, PID lineage and argv;
-- a `forbidden_exec` line for each refusal, with its reason;
-- the `dpkg` identity that was checked;
-- the `allowed_script_dpkg_exec` and `forbidden_dpkg_exec` totals.
+- a `script_dpkg_exec`, `script_dpkg_divert_exec` or
+  `script_dpkg_statoverride_exec` line for each allowed call, with its trace
+  line, PID, script, script PID, PID lineage and argv;
+- a `forbidden_exec` line for each refusal, with its reason, such as `shape`
+  or `dpkg-divert-identity:digest`;
+- a `script_<tool>_identity` line for each tool whose calls were allowed;
+- the `allowed_script_dpkg_exec`, `allowed_script_dpkg_divert_exec`,
+  `allowed_script_dpkg_statoverride_exec` and `forbidden_dpkg_exec` totals.
 
-`exec-audit-summary.txt` totals the audited operations and allowed calls.
-The CI diagnostics step re-audits every retained trace against the
+`exec-audit-summary.txt` totals the audited operations and allowed calls per
+tool. The CI diagnostics step re-audits every retained trace against the
 still-present root, using the production pins. It records the results in
 `exec-reaudit.txt`, writes `forbidden-exec.txt` on refusal, and adds the
-allowed count to the job summary. The candidate root is root-owned with mode
-0700, so the step tests for its dpkg database as root before capturing vendor
-state. In run 36836176163 an unprivileged test could not enter the root and
-skipped that capture.
+allowed counts per tool to the job summary. The candidate root is root-owned
+with mode 0700, so the step tests for its dpkg database as root before
+capturing vendor state. In run 36836176163 an unprivileged test could not
+enter the root and skipped that capture. It also keeps the root's final
+`diversions` and `statoverride` databases as `diversions-final` and
+`statoverride-final`.
 
 The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
 the native wrapper step (the 180-minute install ceiling plus refresh,

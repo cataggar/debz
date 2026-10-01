@@ -153,17 +153,27 @@ proof. Bounded evidence is always uploaded, and the tree is always removed.
 [integration roots](integration-roots.md).
 Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
 dpkg/helper/package state, selects `native` explicitly, and exec-traces
-candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.
-The only exception is a read-only query by a maintainer script that `debz`
-started. The call must be a plain `execve` of the filename `/usr/bin/dpkg`,
-with `argv[0]` `dpkg` or `/usr/bin/dpkg` and an action of `--compare-versions`,
-`--validate-version`, `--print-architecture`, `-s`, `-L` or `-l`, and no
-`--root`, `--admindir`, `--instdir` or `--force*` option. That `dpkg` must
-also match the reviewed per-architecture `1.23.7ubuntu2` digest, with no
-`PATH` shadow. Each allowed call is logged with its script and PID lineage.
-These calls hand no transaction step to dpkg; dpkg would run the same scripts
-the same way. `execveat`, `dpkg-deb` and every other dpkg exec still fail with
-exit 90; see "Native exec audit" in [integration roots](integration-roots.md).
+candidate commands to reject `dpkg`, `dpkg-deb`, `dpkg-divert` or
+`dpkg-statoverride`, including failed commands. The only exception is a
+maintainer script that `debz` started running the root's own tool as it would
+under dpkg. The call must be a plain `execve` of the filename `/usr/bin/dpkg`,
+`/usr/bin/dpkg-divert` or `/usr/bin/dpkg-statoverride`, with `argv[0]` the
+tool's bare name or that filename. A dpkg call needs an action of
+`--compare-versions`, `--validate-version`, `--print-architecture`, `-s`, `-L`
+or `-l`; a `dpkg-divert` or `dpkg-statoverride` call must match one of the
+exact argument shapes that the closure's scripts use on a fresh install, such
+as DEP17 `--no-rename` diversions, `--truename`, `--list` and chrony's
+`--update --add`. No call may pass a `--root`, `--admindir`, `--instdir` or
+`--force*` option. The tool must also match its reviewed per-architecture
+`1.23.7ubuntu2` digest, with no `PATH` shadow. Each allowed call is logged
+with its script and PID lineage. These calls hand no transaction step to
+dpkg: dpkg would run the same scripts the same way, the diversion and
+statoverride tools only edit their own databases (and, for `--update`, the
+named path's owner and mode), and `debz` still performs every unpack,
+configuration and status update.
+`execveat`, `dpkg-deb`, `--rename` and every other dpkg-tool exec still fail
+with exit 90; see "Native exec audit" in
+[integration roots](integration-roots.md).
 Evidence members are capped at 128 MiB and the artifact at 512 MiB before
 upload. Bounded, recognized acquisition retry diagnostics remain in the
 evidence; unexpected candidate stderr still fails the gate. Repository

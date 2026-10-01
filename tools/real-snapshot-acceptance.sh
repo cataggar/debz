@@ -19,15 +19,19 @@ readonly maximum_install_ceiling_seconds=$((180 * 60))
 readonly progress_sample_seconds=60
 readonly native_progress_log=var/lib/debz/native-execution-progress-v1.log
 readonly mutation_progress_log=var/lib/debz/root-mutation-v2.log
-# Reviewed identity of the target root's /usr/bin/dpkg, which maintainer
-# scripts may run for read-only queries; see "Native exec audit" in
-# doc/integration-roots.md. Bytes, size and version come from each
-# architecture's authenticated dpkg archive in the pinned snapshot, never from
-# another architecture or snapshot.
+# Reviewed identities of the target root's /usr/bin/dpkg, dpkg-divert and
+# dpkg-statoverride, which maintainer scripts may run in reviewed argument
+# shapes; see "Native exec audit" in doc/integration-roots.md. Bytes, size and
+# version come from each architecture's authenticated dpkg archive in the
+# pinned snapshot, never from another architecture or snapshot.
 readonly script_dpkg_snapshot=20261001T000000Z
 readonly script_dpkg_version=1.23.7ubuntu2
 readonly script_dpkg_amd64='6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f 322728'
 readonly script_dpkg_arm64='d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4 330816'
+readonly script_dpkg_divert_amd64='a509fc1a363946770295b613924e2bfa902ddbf76ec2826128685df1569c57d8 125768'
+readonly script_dpkg_divert_arm64='6daba35904a8885a334c33e6b4c7c7bc42f501f3f36032a374dfe40e842ed75b 133872'
+readonly script_dpkg_statoverride_amd64='6c08816ff0b12106e969537cab83ac4b3358a72b425fe8bf1fc961e2e82ce2ce 55936'
+readonly script_dpkg_statoverride_arm64='b837c9d99518225f5b238b215179559a87e7d012072ae0ff414fdc0ea891c3b9 68184'
 
 validate_values() {
   local uri=$1 suite=$2 architecture=$3
@@ -81,48 +85,95 @@ install_bound() {
   echo "$value"
 }
 
-# Prints the reviewed "DIGEST SIZE" of the root's dpkg for an architecture.
-reviewed_script_dpkg() {
+# Prints the reviewed "DIGEST SIZE" of the root's /usr/bin/TOOL for an
+# architecture.
+reviewed_script_tool() {
   [[ "$pinned_uri" == */"$script_dpkg_snapshot" ]] || {
     echo "reviewed script dpkg identity is not bound to the pinned snapshot" >&2
     return 91
   }
-  case "$1" in
-    amd64) echo "$script_dpkg_amd64" ;;
-    arm64) echo "$script_dpkg_arm64" ;;
-    *) echo "no reviewed script dpkg identity for $1" >&2; return 91 ;;
+  case "$1:$2" in
+    amd64:dpkg) echo "$script_dpkg_amd64" ;;
+    arm64:dpkg) echo "$script_dpkg_arm64" ;;
+    amd64:dpkg-divert) echo "$script_dpkg_divert_amd64" ;;
+    arm64:dpkg-divert) echo "$script_dpkg_divert_arm64" ;;
+    amd64:dpkg-statoverride) echo "$script_dpkg_statoverride_amd64" ;;
+    arm64:dpkg-statoverride) echo "$script_dpkg_statoverride_arm64" ;;
+    *) echo "no reviewed script $2 identity for $1" >&2; return 91 ;;
   esac
 }
 
+# Prints the reviewed identities of every script-callable tool for an
+# architecture as the TOOL=DIGEST:SIZE words that audit_exec_trace takes.
+reviewed_script_tools() {
+  local tool identity words=()
+  for tool in dpkg dpkg-divert dpkg-statoverride; do
+    identity=$(reviewed_script_tool "$1" "$tool") || return 91
+    words+=("$tool=${identity% *}:${identity#* }")
+  done
+  echo "${words[*]}"
+}
+
 # Audits one strace exec trace of a candidate command. Every execve or
-# execveat of dpkg or dpkg-deb fails (exit 90) unless it is a successful plain
-# execve of exactly the filename /usr/bin/dpkg, with argv[0] "dpkg" or
-# "/usr/bin/dpkg" and a reviewed read-only action, made by a descendant of a
-# lifecycle script that the candidate itself executed, and the root's
-# /usr/bin/dpkg then has the reviewed identity with no PATH shadow. argv[0] is
-# only a label; the filename and identity decide which binary ran, so /bin/dpkg
-# is refused even when /bin links to usr/bin. Exit 91 means the trace or root
-# could not be audited. Prints one record per allowed or refused exec.
+# execveat of dpkg, dpkg-deb, dpkg-divert or dpkg-statoverride fails (exit 90)
+# unless it is a successful plain execve of exactly the filename /usr/bin/TOOL
+# for dpkg, dpkg-divert or dpkg-statoverride, with argv[0] "TOOL" or
+# "/usr/bin/TOOL" and reviewed arguments (a read-only dpkg action, or one of
+# the exact dpkg-divert and dpkg-statoverride shapes that the closure's
+# scripts use), made by a descendant of a lifecycle script that the candidate
+# itself executed, and the root's /usr/bin/TOOL then has the reviewed identity
+# with no PATH shadow. argv[0] is only a label; the filename and identity
+# decide which binary ran, so /bin/TOOL is refused even when /bin links to
+# usr/bin. Exit 91 means the trace or root could not be audited. Prints one
+# record per allowed or refused exec.
 audit_exec_trace() {
-  local trace=$1 audit_root=$2 audit_architecture=$3 candidate=$4 digest=$5 size=$6 version=$7
+  local trace=$1 audit_root=$2 audit_architecture=$3 candidate=$4 version=$5 identities=$6
   local status=0
   python3 - "$trace" "$audit_root" "$audit_architecture" "$candidate" \
-    "$digest" "$size" "$version" <<'PY' || status=$?
+    "$version" "$identities" <<'PY' || status=$?
 import errno, hashlib, json, os, re, stat, sys
 
-trace, root, architecture, candidate, digest, size, version = sys.argv[1:8]
-size = int(size)
-ARGV0 = ("dpkg", "/usr/bin/dpkg")
+trace, root, architecture, candidate, version, identities = sys.argv[1:7]
+TOOLS = ("dpkg", "dpkg-divert", "dpkg-statoverride")
 ACTIONS = ("--compare-versions", "--validate-version", "--print-architecture", "-s", "-L", "-l")
 REFUSED_OPTIONS = ("--root", "--admindir", "--instdir", "--force")
 SHADOWS = ("usr/local/sbin", "usr/local/bin", "usr/sbin", "sbin")
+# The exact argument lists, after argv[0], that the 20261001T000000Z
+# ubuntu-minimal closure's maintainer scripts pass on a fresh install. Words
+# starting with "--" are literal; the rest are operands checked by operand().
+SHAPES = {
+    "dpkg-divert": (
+        ("--quiet", "--package", "NAME", "--add", "--no-rename", "--divert", "MERGED", "PATH"),
+        ("--quiet", "--package", "NAME", "--remove", "--no-rename", "--divert", "MERGED", "PATH"),
+        ("--quiet", "--add", "--no-rename", "--package", "NAME", "--divert", "MERGED", "PATH"),
+        ("--quiet", "--add", "--no-rename", "--divert", "MERGED", "PATH"),
+        ("--package", "NAME", "--no-rename", "--divert", "MERGED", "--add", "PATH"),
+        ("--package", "NAME", "--no-rename", "--divert", "MERGED", "PATH"),
+        ("--no-rename", "--divert", "MERGED", "--add", "PATH"),
+        ("--no-rename", "--divert", "MERGED", "--remove", "PATH"),
+        ("--package", "NAME", "--divert", "BACKUP", "--no-rename", "--remove", "PATH"),
+        ("--truename", "PATH"),
+        ("--listpackage", "PATH"),
+    ),
+    "dpkg-statoverride": (
+        ("--list", "PATH"),
+        ("--update", "--add", "ACCOUNT", "ACCOUNT", "MODE", "PATH"),
+    ),
+}
+OPERANDS = {
+    "NAME": re.compile(r"[a-z0-9][a-z0-9+.-]+"),
+    "ACCOUNT": re.compile(r"[a-z_][a-z0-9_-]*"),
+    "MODE": re.compile(r"0[0-7][0-7][0-7]"),
+    "PATH": re.compile(r"(?:/[!-.0-~]+)+"),
+}
 SCRIPT = re.compile(
     r"/var/lib/(?:debz-lifecycle-scripts|dpkg/info)/[a-z0-9][a-z0-9+.-]*"
     r"(?::[a-z0-9-]+)?\.(?:preinst|postinst|prerm|postrm)"
 )
 DPKG_EXEC = re.compile(
-    r'execve\("([^"]*/)?dpkg(-deb)?"|execveat\([^,]+, "([^"]*/)?dpkg(-deb)?"|'
-    r'execveat\([^,]*</[^>]+/dpkg(-deb)?>, ""'
+    r'execve\("([^"]*/)?dpkg(-deb|-divert|-statoverride)?"|'
+    r'execveat\([^,]+, "([^"]*/)?dpkg(-deb|-divert|-statoverride)?"|'
+    r'execveat\([^,]*</[^>]+/dpkg(-deb|-divert|-statoverride)?>, ""'
 )
 LINE = re.compile(r"(\d+) +(.*)")
 RESUMED = re.compile(r"<\.\.\. ([a-z0-9_]+) resumed>(.*)")
@@ -135,6 +186,15 @@ EXECVE_TAIL = re.compile(
 )
 ESCAPES = {"n": 10, "t": 9, "r": 13, "v": 11, "f": 12, "a": 7, "b": 8, "\\": 92, '"': 34, "'": 39}
 UNFINISHED = " <unfinished ...>"
+
+reviewed = {}
+for word in identities.split():
+    tool, _, value = word.partition("=")
+    digest, _, size = value.partition(":")
+    reviewed[tool] = (digest, int(size))
+if sorted(reviewed) != sorted(TOOLS) or len(identities.split()) != len(TOOLS):
+    print("reviewed script tool identities are incomplete", file=sys.stderr)
+    sys.exit(91)
 
 
 def c_string(text, index):
@@ -302,6 +362,31 @@ def operands_before_separator(values):
     return values[:values.index("--")] if "--" in values else values
 
 
+def operand(word, value, target):
+    if word == "MERGED":
+        # A DEP17 protective diversion: next to the path, or a dotted
+        # top-level name for a top-level directory such as /lib32.
+        merged = [target + ".usr-is-merged"]
+        if target.count("/") == 1:
+            merged.append("/." + target[1:] + ".usr-is-merged")
+        return value in merged
+    if word == "BACKUP":
+        return value == target + ".remove-bak"
+    if word == "PATH" and any(part in (".", "..") for part in value.split("/")):
+        return False
+    return OPERANDS[word].fullmatch(value) is not None
+
+
+def reviewed_shape(tool, values):
+    for shape in SHAPES[tool]:
+        if len(shape) == len(values) and all(
+            word == value if word.startswith("--") else operand(word, value, values[-1])
+            for word, value in zip(shape, values)
+        ):
+            return True
+    return False
+
+
 def refusal(seq):
     pid, text = events.get(seq, (None, ""))
     if not text.startswith("execve("):
@@ -311,21 +396,24 @@ def refusal(seq):
         return "unparsed", pid, None, None, [], None
     path, argv, result, truncated = parsed
     script, lineage, ambiguous = lineage_state(pid, seq)
+    tool = path[len("/usr/bin/"):] if path.startswith("/usr/bin/") else None
     reason = None
     if truncated:
         reason = "truncated"
-    elif path != "/usr/bin/dpkg":
+    elif tool not in TOOLS:
         reason = "path"
     elif result != "0":
         reason = "exec-result"
-    elif not argv or argv[0] not in ARGV0:
+    elif not argv or argv[0] not in (tool, path):
         reason = "argv0"
-    elif len(argv) < 2 or argv[1] not in ACTIONS:
+    elif tool == "dpkg" and (len(argv) < 2 or argv[1] not in ACTIONS):
         reason = "action"
-    elif any(value.startswith(REFUSED_OPTIONS) for value in argv[2:]):
+    elif any(value.startswith(REFUSED_OPTIONS) for value in argv[2 if tool == "dpkg" else 1:]):
         reason = "option"
-    elif any(value.startswith("-") for value in operands_before_separator(argv[2:])):
+    elif tool == "dpkg" and any(value.startswith("-") for value in operands_before_separator(argv[2:])):
         reason = "option"
+    elif tool != "dpkg" and not reviewed_shape(tool, argv[1:]):
+        reason = "shape"
     elif ambiguous:
         reason = "ambiguous-lineage"
     elif script is None:
@@ -380,46 +468,48 @@ def exists_beneath(relative):
     return True
 
 
-def identity_refusal():
+def identity_refusal(tool):
+    label = tool + "-identity:"
+    digest, size = reviewed[tool]
     try:
         try:
-            descriptor = open_beneath("usr/bin/dpkg")
+            descriptor = open_beneath("usr/bin/" + tool)
         except OSError as error:
             if error.errno in (errno.ELOOP, errno.ENOTDIR):
-                return "dpkg-identity:not-regular"
+                return label + "not-regular"
             raise
         try:
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode):
-                return "dpkg-identity:not-regular"
+                return label + "not-regular"
             hasher = hashlib.sha256()
             while chunk := os.read(descriptor, 1 << 20):
                 hasher.update(chunk)
         finally:
             os.close(descriptor)
         if info.st_size != size or hasher.hexdigest() != digest:
-            return "dpkg-identity:digest"
+            return label + "digest"
         for directory in SHADOWS:
-            if exists_beneath(directory + "/dpkg"):
-                return "dpkg-identity:shadow:/" + directory + "/dpkg"
+            if exists_beneath(directory + "/" + tool):
+                return label + "shadow:/" + directory + "/" + tool
         descriptor = open_beneath("var/lib/dpkg/status")
         try:
             status = b""
             while chunk := os.read(descriptor, 1 << 20):
                 status += chunk
                 if len(status) > 64 << 20:
-                    return "dpkg-identity:status"
+                    return label + "status"
         finally:
             os.close(descriptor)
     except OSError:
-        return "dpkg-identity:unreadable"
+        return label + "unreadable"
     for stanza in status.decode("utf-8", "replace").split("\n\n"):
         fields = dict(line.split(": ", 1) for line in stanza.split("\n") if ": " in line and not line.startswith(" "))
         if fields.get("Package") == "dpkg":
             if fields.get("Version") == version and fields.get("Architecture") == architecture:
                 return None
-            return "dpkg-identity:version"
-    return "dpkg-identity:version"
+            return label + "version"
+    return label + "version"
 
 
 allowed = []
@@ -429,19 +519,26 @@ for seq in candidates:
     record = {"line": seq + 1, "pid": pid, "argv": argv, "path": path,
               "script": script, "lineage": lineage}
     (refused if reason else allowed).append((reason, record))
-if allowed:
-    reason = identity_refusal()
+calls = {tool: [record for _, record in allowed if record["path"] == "/usr/bin/" + tool] for tool in TOOLS}
+for tool in TOOLS:
+    reason = identity_refusal(tool) if calls[tool] else None
     if reason:
-        refused = sorted(refused + [(reason, record) for _, record in allowed], key=lambda item: item[1]["line"])
-        allowed = []
+        refused += [(reason, record) for record in calls[tool]]
+        calls[tool] = []
+allowed = sorted((record for tool in TOOLS for record in calls[tool]), key=lambda record: record["line"])
+refused.sort(key=lambda item: item[1]["line"])
 
 
 def show(value):
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
 
 
-for _, record in allowed:
-    print(f"script_dpkg_exec line={record['line']} pid={record['pid']} "
+def record_name(tool):
+    return "script_" + tool.replace("-", "_")
+
+
+for record in allowed:
+    print(f"{record_name(record['path'][len('/usr/bin/'):])}_exec line={record['line']} pid={record['pid']} "
           f"script={record['script'][0]} script_pid={record['script'][1]} "
           f"lineage={'>'.join(record['lineage'])} argv={show(record['argv'])}")
 for reason, record in refused[:200]:
@@ -451,9 +548,13 @@ for reason, record in refused[:200]:
           f"lineage={'>'.join(record['lineage'] or [])} argv={show(record['argv'])}")
 if len(refused) > 200:
     print(f"forbidden_exec_records_omitted={len(refused) - 200}")
-if allowed:
-    print(f"script_dpkg_identity version={version} architecture={architecture} size={size} digest={digest}")
-print(f"allowed_script_dpkg_exec={len(allowed)}")
+for tool in TOOLS:
+    if calls[tool]:
+        digest, size = reviewed[tool]
+        print(f"{record_name(tool)}_identity version={version} "
+              f"architecture={architecture} size={size} digest={digest}")
+for tool in TOOLS:
+    print(f"allowed_{record_name(tool)}_exec={len(calls[tool])}")
 print(f"forbidden_dpkg_exec={'true' if refused else 'false'}")
 sys.exit(90 if refused else 0)
 PY
@@ -465,18 +566,19 @@ PY
 
 if [[ ${1:-} == --audit-exec-trace ]]; then
   [[ $# == 5 ]] || { echo "usage: $0 --audit-exec-trace TRACE ROOT ARCHITECTURE DEBZ" >&2; exit 2; }
-  identity=$(reviewed_script_dpkg "$4") || exit 91
-  audit_exec_trace "$2" "$3" "$4" "$5" "${identity% *}" "${identity#* }" "$script_dpkg_version"
+  identities=$(reviewed_script_tools "$4") || exit 91
+  audit_exec_trace "$2" "$3" "$4" "$5" "$script_dpkg_version" "$identities"
   exit
 fi
-# Tests only: the same audit against an explicit fixture identity. Production
+# Tests only: the same audit against explicit fixture identities, given as
+# "TOOL=DIGEST:SIZE ..." for dpkg, dpkg-divert and dpkg-statoverride. Production
 # and CI audits use --audit-exec-trace, which accepts only the reviewed pins.
 if [[ ${1:-} == --audit-exec-trace-fixture ]]; then
-  [[ $# == 8 ]] || {
-    echo "usage: $0 --audit-exec-trace-fixture TRACE ROOT ARCHITECTURE DEBZ DIGEST SIZE VERSION" >&2
+  [[ $# == 7 ]] || {
+    echo "usage: $0 --audit-exec-trace-fixture TRACE ROOT ARCHITECTURE DEBZ VERSION IDENTITIES" >&2
     exit 2
   }
-  audit_exec_trace "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+  audit_exec_trace "$2" "$3" "$4" "$5" "$6" "$7"
   exit
 fi
 if [[ ${1:-} == --validate-values ]]; then
@@ -730,32 +832,35 @@ run_candidate() {
       echo "candidate execution trace missing for $name" >&2
       exit 91
     }
-    local identity records allowed
-    identity=$(reviewed_script_dpkg "$architecture") || exit 91
+    local identities records tool count
+    identities=$(reviewed_script_tools "$architecture") || exit 91
     records=$(audit_exec_trace "$evidence/$name.execve" "$root" "$architecture" "$debz" \
-      "${identity% *}" "${identity#* }" "$script_dpkg_version") || audit_status=$?
+      "$script_dpkg_version" "$identities") || audit_status=$?
     if (( audit_status != 0 && audit_status != 90 )); then
       echo "candidate execution trace unreadable for $name" >&2
       exit 91
     fi
     printf 'operation=%s\nexit_status=%s\n%s\n' "$name" "$status" "$records" \
       >>"$evidence/native-exec-audit.txt"
-    allowed=$(sed -n 's/^allowed_script_dpkg_exec=\([0-9][0-9]*\)$/\1/p' <<<"$records")
     audited_operations=$((audited_operations + 1))
-    allowed_script_dpkg_execs=$((allowed_script_dpkg_execs + ${allowed:-0}))
-    printf 'audited_operations=%s\nallowed_script_dpkg_exec=%s\nforbidden_dpkg_exec=%s\n' \
-      "$audited_operations" "$allowed_script_dpkg_execs" \
+    for tool in dpkg dpkg_divert dpkg_statoverride; do
+      count=$(sed -n "s/^allowed_script_${tool}_exec=\([0-9][0-9]*\)\$/\1/p" <<<"$records")
+      allowed_script_execs[$tool]=$((allowed_script_execs[$tool] + ${count:-0}))
+    done
+    printf 'audited_operations=%s\nallowed_script_dpkg_exec=%s\nallowed_script_dpkg_divert_exec=%s\nallowed_script_dpkg_statoverride_exec=%s\nforbidden_dpkg_exec=%s\n' \
+      "$audited_operations" "${allowed_script_execs[dpkg]}" \
+      "${allowed_script_execs[dpkg_divert]}" "${allowed_script_execs[dpkg_statoverride]}" \
       "$( (( audit_status == 0 )) && echo false || echo true)" \
       >"$evidence/exec-audit-summary.txt"
     if (( audit_status == 90 )); then
-      echo "native candidate invoked dpkg or dpkg-deb outside the reviewed script exception during $name" >&2
+      echo "native candidate invoked a dpkg tool outside the reviewed script exception during $name" >&2
       exit 90
     fi
   fi
   return "$status"
 }
 audited_operations=0
-allowed_script_dpkg_execs=0
+declare -A allowed_script_execs=([dpkg]=0 [dpkg_divert]=0 [dpkg_statoverride]=0)
 
 run() {
   local name=$1 bound=$operation_limit

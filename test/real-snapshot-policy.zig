@@ -3,6 +3,7 @@ const testing = std.testing;
 const support = @import("tooling-test-support.zig");
 
 const uri = "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z";
+const audit_no_calls = "allowed_script_dpkg_exec=0\nallowed_script_dpkg_divert_exec=0\nallowed_script_dpkg_statoverride_exec=0\n";
 
 const Scenario = struct {
     name: []const u8 = "",
@@ -12,6 +13,7 @@ const Scenario = struct {
     no_trace: bool = false,
     execveat: bool = false,
     script_dpkg: bool = false,
+    script_tools: bool = false,
     progress_limit_seconds: []const u8 = "",
     ceiling_seconds: []const u8 = "",
 };
@@ -135,6 +137,15 @@ const Driver = struct {
             \\      '9001 vfork() = 9002' \
             \\      '9002 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0' >>"$output"
             \\  fi
+            \\  if [[ ${SNAPSHOT_TEST_SCRIPT_TOOLS:-0} == 1 ]]; then
+            \\    script=/var/lib/debz-lifecycle-scripts/chrony.postinst
+            \\    printf '%s\n' "$$ clone(child_stack=NULL, flags=SIGCHLD) = 9011" \
+            \\      "9011 execve(\"$script\", [\"$script\", \"configure\", \"\"], 0x1 /* 1 var */) = 0" \
+            \\      '9011 vfork() = 9012' \
+            \\      '9012 execve("/usr/bin/dpkg-divert", ["dpkg-divert", "--truename", "/bin/ping"], 0x1 /* 1 var */) = 0' \
+            \\      '9011 vfork() = 9013' \
+            \\      '9013 execve("/usr/bin/dpkg-statoverride", ["dpkg-statoverride", "--list", "/var/lib/chrony"], 0x1 /* 1 var */) = 0' >>"$output"
+            \\  fi
             \\fi
             \\exec "$@"
             ++ "\n");
@@ -176,6 +187,7 @@ const Driver = struct {
             if (config.no_trace) "SNAPSHOT_TEST_NO_TRACE=1" else "SNAPSHOT_TEST_NO_TRACE=0",
             if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0",
             if (config.script_dpkg) "SNAPSHOT_TEST_SCRIPT_DPKG=1" else "SNAPSHOT_TEST_SCRIPT_DPKG=0",
+            if (config.script_tools) "SNAPSHOT_TEST_SCRIPT_TOOLS=1" else "SNAPSHOT_TEST_SCRIPT_TOOLS=0",
             "bash", self.script, self.executable, uri, "stonking", self.arch, self.workspace,
         }, .{ .path = self.work.root });
     }
@@ -543,7 +555,7 @@ test "snapshot: stalled install stops at its progress limit before verification"
     try support.contains(watchdog, " install --install-root ");
     const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
     defer support.allocator.free(audit);
-    try support.contains(audit, "operation=create\nexit_status=124\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n");
+    try support.contains(audit, "operation=create\nexit_status=124\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=false\n");
     try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-summary.json"));
 }
 
@@ -637,10 +649,10 @@ test "snapshot: failed traced refresh reports freshness while no forbidden nativ
     try expectOperations(&f, &.{"refresh"});
     const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
     defer support.allocator.free(audit);
-    try testing.expectEqualStrings("operation=refresh\nexit_status=4\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n", audit);
+    try testing.expectEqualStrings("operation=refresh\nexit_status=4\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=false\n", audit);
     const summary = try f.work.read(".real-snapshot/fresh/evidence/exec-audit-summary.txt");
     defer support.allocator.free(summary);
-    try testing.expectEqualStrings("audited_operations=1\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n", summary);
+    try testing.expectEqualStrings("audited_operations=1\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=false\n", summary);
     const refresh = try f.work.read(".real-snapshot/fresh/evidence/refresh.json");
     defer support.allocator.free(refresh);
     try support.contains(refresh, "\"summary\":\"ReleaseExpired\"");
@@ -672,10 +684,10 @@ test "snapshot: trace rejects forbidden dpkg execve and descriptor execveat even
         defer support.allocator.free(audit);
         try testing.expect(std.mem.startsWith(u8, audit, "operation=refresh\nexit_status=4\n"));
         try support.contains(audit, case.record);
-        try testing.expect(std.mem.endsWith(u8, audit, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
+        try testing.expect(std.mem.endsWith(u8, audit, "\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=true\n"));
         const summary = try f.work.read(".real-snapshot/fresh/evidence/exec-audit-summary.txt");
         defer support.allocator.free(summary);
-        try testing.expectEqualStrings("audited_operations=1\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n", summary);
+        try testing.expectEqualStrings("audited_operations=1\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=true\n", summary);
     }
 }
 
@@ -694,7 +706,30 @@ test "snapshot: wrapper binds script dpkg calls to the reviewed root identity" {
     try support.contains(audit, " pid=9002 path=\"/usr/bin/dpkg\" script=/var/lib/debz-lifecycle-scripts/tzdata.postinst script_pid=9001 lineage=");
     try support.contains(audit, ">9001>9002 argv=[\"dpkg\",\"-s\",\"tzdata\"]\n");
     try testing.expect(std.mem.indexOf(u8, audit, "script_dpkg_exec ") == null);
-    try testing.expect(std.mem.endsWith(u8, audit, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
+    try testing.expect(std.mem.endsWith(u8, audit, "\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=true\n"));
+}
+
+test "snapshot: wrapper binds script dpkg-divert and dpkg-statoverride calls to their reviewed root identities" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const refused = try f.offline(.{ .name = "freshness-failure", .trace = true, .script_tools = true });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 90), refused.code);
+    try support.contains(refused.stderr, "invoked a dpkg tool outside the reviewed script exception");
+    try expectOperations(&f, &.{"refresh"});
+    const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
+    defer support.allocator.free(audit);
+    try support.contains(audit, "forbidden_exec reason=dpkg-divert-identity:");
+    try support.contains(audit, " pid=9012 path=\"/usr/bin/dpkg-divert\" script=/var/lib/debz-lifecycle-scripts/chrony.postinst script_pid=9011 lineage=");
+    try support.contains(audit, ">9011>9012 argv=[\"dpkg-divert\",\"--truename\",\"/bin/ping\"]\n");
+    try support.contains(audit, "forbidden_exec reason=dpkg-statoverride-identity:");
+    try support.contains(audit, " pid=9013 path=\"/usr/bin/dpkg-statoverride\" script=/var/lib/debz-lifecycle-scripts/chrony.postinst script_pid=9011 lineage=");
+    try support.contains(audit, ">9011>9013 argv=[\"dpkg-statoverride\",\"--list\",\"/var/lib/chrony\"]\n");
+    try testing.expect(std.mem.indexOf(u8, audit, "\nscript_") == null);
+    try testing.expect(std.mem.endsWith(u8, audit, "\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=true\n"));
+    const summary = try f.work.read(".real-snapshot/fresh/evidence/exec-audit-summary.txt");
+    defer support.allocator.free(summary);
+    try testing.expectEqualStrings("audited_operations=1\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=true\n", summary);
 }
 
 test "snapshot: traced acceptance without dpkg execs records a passing exec audit summary" {
@@ -705,7 +740,7 @@ test "snapshot: traced acceptance without dpkg execs records a passing exec audi
     try accepted.ok();
     const summary = try f.work.read(".real-snapshot/fresh/evidence/exec-audit-summary.txt");
     defer support.allocator.free(summary);
-    try support.contains(summary, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n");
+    try support.contains(summary, "\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=false\n");
     try testing.expect(std.mem.startsWith(u8, summary, "audited_operations="));
     try testing.expect(try numberBetween(summary, "audited_operations=", "\n") >= 8);
 }
@@ -730,7 +765,7 @@ test "snapshot: missing trace refuses failed command and invalid-lock probe audi
         defer support.allocator.free(audit);
         try support.contains(audit, "operation=injected-failure\nexit_status=5\nforbidden_exec reason=path line=1 ");
         try support.contains(audit, " path=\"/opt/pinned/bin/dpkg-deb\" ");
-        try testing.expect(std.mem.endsWith(u8, audit, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
+        try testing.expect(std.mem.endsWith(u8, audit, "\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=true\n"));
         try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/injected-failure.txt"));
     }
 }
@@ -742,14 +777,49 @@ const audit_version = "1.23.7ubuntu2";
 const audit_script = "/var/lib/debz-lifecycle-scripts/tzdata.postinst";
 const audit_lineage = " script=" ++ audit_script ++ " script_pid=702 lineage=700>701>702>703 argv=";
 
+/// The fixture root's script-callable tools; each has its own identity.
+const audit_tools = [_]struct { name: []const u8, bytes: []const u8 }{
+    .{ .name = "dpkg", .bytes = audit_dpkg },
+    .{ .name = "dpkg-divert", .bytes = "reviewed fixture dpkg-divert\n" },
+    .{ .name = "dpkg-statoverride", .bytes = "reviewed fixture dpkg-statoverride\n" },
+};
+
+fn auditToolBytes(tool: []const u8) []const u8 {
+    for (audit_tools) |entry| {
+        if (std.mem.eql(u8, entry.name, tool)) return entry.bytes;
+    }
+    unreachable;
+}
+
 fn auditHex(bytes: []const u8) [2 * std.crypto.hash.sha2.Sha256.digest_length]u8 {
     var hashed: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &hashed, .{});
     return std.fmt.bytesToHex(hashed, .lower);
 }
 
+/// The fixture identities as "TOOL=DIGEST:SIZE ..." words, with TOOL's
+/// identity replaced by OVERRIDE.
+fn auditIdentities(tool: []const u8, override: []const u8) ![]u8 {
+    var parts: [audit_tools.len][]u8 = undefined;
+    var made: usize = 0;
+    defer for (parts[0..made]) |part| support.allocator.free(part);
+    for (audit_tools) |entry| {
+        const digest = auditHex(entry.bytes);
+        parts[made] = if (std.mem.eql(u8, entry.name, tool))
+            try std.fmt.allocPrint(support.allocator, "{s}={s}", .{ entry.name, override })
+        else
+            try std.fmt.allocPrint(support.allocator, "{s}={s}:{d}", .{ entry.name, &digest, entry.bytes.len });
+        made += 1;
+    }
+    return std.fmt.allocPrint(support.allocator, "{s} {s} {s}", .{ parts[0], parts[1], parts[2] });
+}
+
 fn writeAuditRoot(f: *Driver, version: []const u8, status_architecture: []const u8) !void {
-    try f.work.write("audit-root/usr/bin/dpkg", audit_dpkg);
+    for (audit_tools) |entry| {
+        const relative = try std.fmt.allocPrint(support.allocator, "audit-root/usr/bin/{s}", .{entry.name});
+        defer support.allocator.free(relative);
+        try f.work.write(relative, entry.bytes);
+    }
     try f.work.directory.dir.createDirPath(support.io, "audit-root/usr/sbin");
     try f.work.directory.dir.createDirPath(support.io, "audit-root/usr/local/bin");
     const status = try std.fmt.allocPrint(support.allocator, "Package: dpkg-dev\nStatus: install ok installed\nVersion: {s}\nArchitecture: all\n\n" ++
@@ -767,7 +837,7 @@ fn auditLink(f: *Driver, target: []const u8, relative: []const u8) !void {
     try linked.ok();
 }
 
-fn auditWith(f: *Driver, mode: []const u8, trace: []const u8, digest: []const u8, size: []const u8) !support.Result {
+fn auditWith(f: *Driver, mode: []const u8, trace: []const u8, identities: []const u8) !support.Result {
     try f.work.write("audit.trace", trace);
     const trace_path = try f.work.path("audit.trace");
     defer support.allocator.free(trace_path);
@@ -775,12 +845,13 @@ fn auditWith(f: *Driver, mode: []const u8, trace: []const u8, digest: []const u8
     defer support.allocator.free(root);
     if (std.mem.eql(u8, mode, "--audit-exec-trace"))
         return f.run(f.keyring, &.{ mode, trace_path, root, f.arch, audit_debz });
-    return f.run(f.keyring, &.{ mode, trace_path, root, f.arch, audit_debz, digest, size, audit_version });
+    return f.run(f.keyring, &.{ mode, trace_path, root, f.arch, audit_debz, audit_version, identities });
 }
 
 fn auditFixture(f: *Driver, trace: []const u8) !support.Result {
-    const digest = auditHex(audit_dpkg);
-    return auditWith(f, "--audit-exec-trace-fixture", trace, &digest, audit_dpkg_size);
+    const identities = try auditIdentities("", "");
+    defer support.allocator.free(identities);
+    return auditWith(f, "--audit-exec-trace-fixture", trace, identities);
 }
 
 /// A debz thread forks a lifecycle script, which vforks CALL(ARGS); strace
@@ -803,10 +874,16 @@ fn dpkgArgs(path: []const u8, argv: []const u8) ![]u8 {
     return std.fmt.allocPrint(support.allocator, "\"{s}\", [{s}], 0x7ffd2 /* 2 vars */", .{ path, argv });
 }
 
-fn scriptDpkg(argv: []const u8) ![]u8 {
-    const args = try dpkgArgs("/usr/bin/dpkg", argv);
+fn scriptTool(tool: []const u8, argv: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(support.allocator, "/usr/bin/{s}", .{tool});
+    defer support.allocator.free(path);
+    const args = try dpkgArgs(path, argv);
     defer support.allocator.free(args);
     return scriptTrace(audit_script, "execve", args, "0");
+}
+
+fn scriptDpkg(argv: []const u8) ![]u8 {
+    return scriptTool("dpkg", argv);
 }
 
 fn expectRefused(result: support.Result, reason: []const u8) !void {
@@ -815,18 +892,39 @@ fn expectRefused(result: support.Result, reason: []const u8) !void {
     errdefer std.debug.print("expected refusal {s}, got {d}:\n{s}{s}\n", .{ reason, result.code, result.stdout, result.stderr });
     try testing.expectEqual(@as(u8, 90), result.code);
     try testing.expect(std.mem.startsWith(u8, result.stdout, record));
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "script_dpkg_exec ") == null);
-    try testing.expect(std.mem.indexOf(u8, result.stdout, "script_dpkg_identity ") == null);
-    try testing.expect(std.mem.endsWith(u8, result.stdout, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "\nscript_") == null);
+    try testing.expect(std.mem.endsWith(u8, result.stdout, "\n" ++ audit_no_calls ++ "forbidden_dpkg_exec=true\n"));
 }
 
 fn expectAllowed(result: support.Result, record: []const u8) !void {
+    return expectAllowedTool(result, "dpkg", record);
+}
+
+/// Expects exactly one allowed call, of TOOL, printed as RECORD, with TOOL's
+/// fixture identity recorded.
+fn expectAllowedTool(result: support.Result, tool: []const u8, record: []const u8) !void {
     errdefer std.debug.print("expected allowed {s}, got {d}:\n{s}{s}\n", .{ record, result.code, result.stdout, result.stderr });
     try result.ok();
     try testing.expect(std.mem.startsWith(u8, result.stdout, record));
     try testing.expect(std.mem.indexOf(u8, result.stdout, "forbidden_exec") == null);
-    try support.contains(result.stdout, "\nscript_dpkg_identity version=" ++ audit_version ++ " architecture=");
-    try testing.expect(std.mem.endsWith(u8, result.stdout, "\nallowed_script_dpkg_exec=1\nforbidden_dpkg_exec=false\n"));
+    const name = try std.mem.replaceOwned(u8, support.allocator, tool, "-", "_");
+    defer support.allocator.free(name);
+    const bytes = auditToolBytes(tool);
+    const digest = auditHex(bytes);
+    const identity = try std.fmt.allocPrint(support.allocator, "\nscript_{s}_identity version=" ++ audit_version ++ " architecture=", .{name});
+    defer support.allocator.free(identity);
+    try support.contains(result.stdout, identity);
+    const pinned = try std.fmt.allocPrint(support.allocator, " size={d} digest={s}\n", .{ bytes.len, &digest });
+    defer support.allocator.free(pinned);
+    try support.contains(result.stdout, pinned);
+    const counts = try std.fmt.allocPrint(support.allocator, "\nallowed_script_dpkg_exec={d}\nallowed_script_dpkg_divert_exec={d}\n" ++
+        "allowed_script_dpkg_statoverride_exec={d}\nforbidden_dpkg_exec=false\n", .{
+        @intFromBool(std.mem.eql(u8, tool, "dpkg")),
+        @intFromBool(std.mem.eql(u8, tool, "dpkg-divert")),
+        @intFromBool(std.mem.eql(u8, tool, "dpkg-statoverride")),
+    });
+    defer support.allocator.free(counts);
+    try testing.expect(std.mem.endsWith(u8, result.stdout, counts));
 }
 
 test "snapshot: exec audit allows each reviewed read-only dpkg action and argv[0] label from a debz-started script" {
@@ -1064,51 +1162,83 @@ test "snapshot: exec audit refuses dpkg outside a debz-started script or with un
 }
 
 test "snapshot: exec audit refuses script dpkg calls unless the root dpkg has the reviewed identity" {
-    for ([_][]const u8{ "dpkg", "/usr/bin/dpkg" }) |argv0| try expectIdentityBound(argv0);
+    for ([_][]const u8{ "dpkg", "/usr/bin/dpkg" }) |argv0| try expectIdentityBound("dpkg", argv0, "\"-s\", \"tzdata\"");
 }
 
-fn expectIdentityBound(argv0: []const u8) !void {
-    const argv = try std.fmt.allocPrint(support.allocator, "\"{s}\", \"-s\", \"tzdata\"", .{argv0});
+test "snapshot: exec audit refuses script dpkg-divert and dpkg-statoverride calls unless each root tool has its reviewed identity" {
+    for ([_][]const u8{ "dpkg-divert", "/usr/bin/dpkg-divert" }) |argv0|
+        try expectIdentityBound("dpkg-divert", argv0, "\"--truename\", \"/bin/ping\"");
+    for ([_][]const u8{ "dpkg-statoverride", "/usr/bin/dpkg-statoverride" }) |argv0|
+        try expectIdentityBound("dpkg-statoverride", argv0, "\"--list\", \"/var/lib/chrony\"");
+}
+
+fn expectIdentityBound(tool: []const u8, argv0: []const u8, arguments: []const u8) !void {
+    const argv = try std.fmt.allocPrint(support.allocator, "\"{s}\", {s}", .{ argv0, arguments });
     defer support.allocator.free(argv);
-    const allowed = try scriptDpkg(argv);
+    const allowed = try scriptTool(tool, argv);
     defer support.allocator.free(allowed);
-    const recorded = try std.fmt.allocPrint(support.allocator, audit_lineage ++ "[\"{s}\",\"-s\",\"tzdata\"]\n", .{argv0});
+    const compact = try std.mem.replaceOwned(u8, support.allocator, argv, "\", \"", "\",\"");
+    defer support.allocator.free(compact);
+    const recorded = try std.fmt.allocPrint(support.allocator, audit_lineage ++ "[{s}]\n", .{compact});
     defer support.allocator.free(recorded);
-    const allowed_record = try std.fmt.allocPrint(support.allocator, "script_dpkg_exec line=6 pid=703{s}", .{recorded});
+    const name = try std.mem.replaceOwned(u8, support.allocator, tool, "-", "_");
+    defer support.allocator.free(name);
+    const allowed_record = try std.fmt.allocPrint(support.allocator, "script_{s}_exec line=6 pid=703{s}", .{ name, recorded });
     defer support.allocator.free(allowed_record);
-    const Change = enum { none, merged_sbin, digest, size, reviewed_pins, usr_sbin, dangling_local, absolute_sbin, symlinked_dpkg, symlinked_bin_dir, version, status_architecture, no_root };
+    const bytes = auditToolBytes(tool);
+    const other_tool = if (std.mem.eql(u8, tool, "dpkg")) "dpkg-divert" else "dpkg";
+    const Change = enum { none, merged_sbin, digest, size, other_tool_pin, other_tool_bytes, reviewed_pins, usr_sbin, dangling_local, absolute_sbin, symlinked_tool, symlinked_bin_dir, version, status_architecture, no_root };
     for ([_]struct { change: Change, reason: ?[]const u8 }{
         .{ .change = .none, .reason = null },
         .{ .change = .merged_sbin, .reason = null },
-        .{ .change = .digest, .reason = "dpkg-identity:digest" },
-        .{ .change = .size, .reason = "dpkg-identity:digest" },
-        .{ .change = .reviewed_pins, .reason = "dpkg-identity:digest" },
-        .{ .change = .usr_sbin, .reason = "dpkg-identity:shadow:/usr/sbin/dpkg" },
-        .{ .change = .dangling_local, .reason = "dpkg-identity:shadow:/usr/local/bin/dpkg" },
-        .{ .change = .absolute_sbin, .reason = "dpkg-identity:shadow:/sbin/dpkg" },
-        .{ .change = .symlinked_dpkg, .reason = "dpkg-identity:not-regular" },
-        .{ .change = .symlinked_bin_dir, .reason = "dpkg-identity:not-regular" },
-        .{ .change = .version, .reason = "dpkg-identity:version" },
-        .{ .change = .status_architecture, .reason = "dpkg-identity:version" },
-        .{ .change = .no_root, .reason = "dpkg-identity:unreadable" },
+        .{ .change = .digest, .reason = "digest" },
+        .{ .change = .size, .reason = "digest" },
+        .{ .change = .other_tool_pin, .reason = "digest" },
+        .{ .change = .other_tool_bytes, .reason = "digest" },
+        .{ .change = .reviewed_pins, .reason = "digest" },
+        .{ .change = .usr_sbin, .reason = "shadow:/usr/sbin/" },
+        .{ .change = .dangling_local, .reason = "shadow:/usr/local/bin/" },
+        .{ .change = .absolute_sbin, .reason = "shadow:/sbin/" },
+        .{ .change = .symlinked_tool, .reason = "not-regular" },
+        .{ .change = .symlinked_bin_dir, .reason = "not-regular" },
+        .{ .change = .version, .reason = "version" },
+        .{ .change = .status_architecture, .reason = "version" },
+        .{ .change = .no_root, .reason = "unreadable" },
     }) |case| {
         var f = try Driver.init();
         defer f.deinit();
         const wrong_arch = if (std.mem.eql(u8, f.arch, "amd64")) "arm64" else "amd64";
         if (case.change != .no_root)
             try writeAuditRoot(&f, if (case.change == .version) "1.23.7ubuntu1" else audit_version, if (case.change == .status_architecture) wrong_arch else f.arch);
+        const in_bin = try std.fmt.allocPrint(support.allocator, "audit-root/usr/bin/{s}", .{tool});
+        defer support.allocator.free(in_bin);
         switch (case.change) {
             .merged_sbin => try auditLink(&f, "usr/sbin", "audit-root/sbin"),
-            .usr_sbin => try f.work.write("audit-root/usr/sbin/dpkg", audit_dpkg),
-            .dangling_local => try auditLink(&f, "/nonexistent/dpkg", "audit-root/usr/local/bin/dpkg"),
+            .other_tool_bytes => try f.work.write(in_bin, auditToolBytes(other_tool)),
+            .usr_sbin => {
+                const shadow = try std.fmt.allocPrint(support.allocator, "audit-root/usr/sbin/{s}", .{tool});
+                defer support.allocator.free(shadow);
+                try f.work.write(shadow, bytes);
+            },
+            .dangling_local => {
+                const shadow = try std.fmt.allocPrint(support.allocator, "audit-root/usr/local/bin/{s}", .{tool});
+                defer support.allocator.free(shadow);
+                try auditLink(&f, "/nonexistent/tool", shadow);
+            },
             .absolute_sbin => {
-                try f.work.write("audit-root/opt/alternate/dpkg", audit_dpkg);
+                const alternate = try std.fmt.allocPrint(support.allocator, "audit-root/opt/alternate/{s}", .{tool});
+                defer support.allocator.free(alternate);
+                try f.work.write(alternate, bytes);
                 try auditLink(&f, "/opt/alternate", "audit-root/sbin");
             },
-            .symlinked_dpkg => {
-                try f.work.write("audit-root/usr/lib/dpkg/dpkg", audit_dpkg);
-                try f.work.directory.dir.deleteFile(support.io, "audit-root/usr/bin/dpkg");
-                try auditLink(&f, "../lib/dpkg/dpkg", "audit-root/usr/bin/dpkg");
+            .symlinked_tool => {
+                const moved = try std.fmt.allocPrint(support.allocator, "audit-root/usr/lib/dpkg/{s}", .{tool});
+                defer support.allocator.free(moved);
+                try f.work.write(moved, bytes);
+                try f.work.directory.dir.deleteFile(support.io, in_bin);
+                const target = try std.fmt.allocPrint(support.allocator, "../lib/dpkg/{s}", .{tool});
+                defer support.allocator.free(target);
+                try auditLink(&f, target, in_bin);
             },
             .symlinked_bin_dir => {
                 const bin = try f.work.path("audit-root/usr/bin");
@@ -1122,20 +1252,33 @@ fn expectIdentityBound(argv0: []const u8) !void {
             },
             else => {},
         }
-        const reviewed = auditHex(audit_dpkg);
-        const other = auditHex("unreviewed dpkg\n");
-        const result = switch (case.change) {
-            .digest => try auditWith(&f, "--audit-exec-trace-fixture", allowed, &other, audit_dpkg_size),
-            .size => try auditWith(&f, "--audit-exec-trace-fixture", allowed, &reviewed, "23"),
-            .reviewed_pins => try auditWith(&f, "--audit-exec-trace", allowed, "", ""),
-            else => try auditFixture(&f, allowed),
+        const reviewed = auditHex(bytes);
+        const other = auditHex("unreviewed tool\n");
+        const other_bytes = auditToolBytes(other_tool);
+        const other_digest = auditHex(other_bytes);
+        const override = switch (case.change) {
+            .digest => try std.fmt.allocPrint(support.allocator, "{s}:{d}", .{ &other, bytes.len }),
+            .size => try std.fmt.allocPrint(support.allocator, "{s}:23", .{&reviewed}),
+            .other_tool_pin => try std.fmt.allocPrint(support.allocator, "{s}:{d}", .{ &other_digest, other_bytes.len }),
+            else => try std.fmt.allocPrint(support.allocator, "{s}:{d}", .{ &reviewed, bytes.len }),
         };
+        defer support.allocator.free(override);
+        const identities = try auditIdentities(tool, override);
+        defer support.allocator.free(identities);
+        const result = if (case.change == .reviewed_pins)
+            try auditWith(&f, "--audit-exec-trace", allowed, "")
+        else
+            try auditWith(&f, "--audit-exec-trace-fixture", allowed, identities);
         defer result.deinit();
         if (case.reason) |reason| {
-            try expectRefused(result, reason);
+            const full = try std.fmt.allocPrint(support.allocator, "{s}-identity:{s}{s}", .{
+                tool, reason, if (std.mem.startsWith(u8, reason, "shadow:")) tool else "",
+            });
+            defer support.allocator.free(full);
+            try expectRefused(result, full);
             try support.contains(result.stdout, recorded);
         } else {
-            try expectAllowed(result, allowed_record);
+            try expectAllowedTool(result, tool, allowed_record);
         }
     }
 }
@@ -1174,6 +1317,359 @@ test "snapshot: exec audit accepts only the /usr/bin/dpkg filename even when /bi
     }
 }
 
+test "snapshot: exec audit allows each dpkg-divert and dpkg-statoverride shape that the closure's scripts use" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    for ([_]struct { tool: []const u8, argv: []const u8 }{
+        // base-files preinst and postinst
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--quiet\", \"--package\", \"base-files\", \"--add\", \"--no-rename\", \"--divert\", \"/.lib32.usr-is-merged\", \"/lib32\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--quiet\", \"--package\", \"base-files\", \"--remove\", \"--no-rename\", \"--divert\", \"/.lib64.usr-is-merged\", \"/lib64\"" },
+        // libc6 preinst (amd64 and arm64)
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--truename\", \"/lib64\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--quiet\", \"--package\", \"base-files\", \"--remove\", \"--no-rename\", \"--divert\", \"/lib64.usr-is-merged\", \"/lib64\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--package\", \"base-files\", \"--divert\", \"/.lib64.usr-is-merged\", \"/lib64\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/lib64/ld-linux-x86-64.so.2.usr-is-merged\", \"/lib64/ld-linux-x86-64.so.2\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/lib/ld-linux-aarch64.so.1.usr-is-merged\", \"/lib/ld-linux-aarch64.so.1\"" },
+        // libext2fs2t64 and libreadline8t64, then libtirpc3t64's implicit --add
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--package\", \"libext2fs2t64\", \"--no-rename\", \"--divert\", \"/lib/x86_64-linux-gnu/libe2p.so.2.usr-is-merged\", \"--add\", \"/lib/x86_64-linux-gnu/libe2p.so.2\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--package\", \"libreadline8t64\", \"--no-rename\", \"--divert\", \"/lib/aarch64-linux-gnu/libreadline.so.8.usr-is-merged\", \"--add\", \"/lib/aarch64-linux-gnu/libreadline.so.8\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--package\", \"libtirpc3t64\", \"--no-rename\", \"--divert\", \"/lib/x86_64-linux-gnu/libtirpc.so.3.usr-is-merged\", \"/lib/x86_64-linux-gnu/libtirpc.so.3\"" },
+        // netplan-generator preinst and postinst
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--no-rename\", \"--divert\", \"/lib/systemd/system-generators/netplan.usr-is-merged\", \"--add\", \"/lib/systemd/system-generators/netplan\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--no-rename\", \"--divert\", \"/lib/systemd/system-generators/netplan.usr-is-merged\", \"--remove\", \"/lib/systemd/system-generators/netplan\"" },
+        // coreutils-from-gnu preinst
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/bin/[.remove-bak\", \"--no-rename\", \"--remove\", \"/usr/bin/[\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/share/man/man8/chroot.8.gz.remove-bak\", \"--no-rename\", \"--remove\", \"/usr/share/man/man8/chroot.8.gz\"" },
+        // iputils-ping postinst, dash postinst and gzip preinst queries
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"dpkg-divert\", \"--listpackage\", \"/bin/sh\"" },
+        .{ .tool = "dpkg-divert", .argv = "\"/usr/bin/dpkg-divert\", \"--truename\", \"/usr/share/man/man1/sh.1.gz\"" },
+        // sudo-rs and chrony postinst
+        .{ .tool = "dpkg-statoverride", .argv = "\"dpkg-statoverride\", \"--list\", \"/usr/lib/cargo/bin/sudo\"" },
+        .{ .tool = "dpkg-statoverride", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"root\", \"_chrony\", \"0640\", \"/etc/chrony/chrony.keys\"" },
+        .{ .tool = "dpkg-statoverride", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"_chrony\", \"_chrony\", \"0750\", \"/var/lib/chrony\"" },
+        .{ .tool = "dpkg-statoverride", .argv = "\"/usr/bin/dpkg-statoverride\", \"--list\", \"/var/log/chrony\"" },
+    }) |case| {
+        const trace = try scriptTool(case.tool, case.argv);
+        defer support.allocator.free(trace);
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        const compact = try std.mem.replaceOwned(u8, support.allocator, case.argv, "\", \"", "\",\"");
+        defer support.allocator.free(compact);
+        const name = try std.mem.replaceOwned(u8, support.allocator, case.tool, "-", "_");
+        defer support.allocator.free(name);
+        const record = try std.fmt.allocPrint(support.allocator, "script_{s}_exec line=6 pid=703" ++ audit_lineage ++ "[{s}]\n", .{ name, compact });
+        defer support.allocator.free(record);
+        try expectAllowedTool(result, case.tool, record);
+    }
+}
+
+test "snapshot: exec audit follows the traced debconf re-exec lineage of libc6's preinst dpkg-divert" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    // From the local arm64 20261001T000000Z trace, with the candidate path shortened.
+    const trace =
+        \\30634 execve("/opt/debz/bin/debz", ["/opt/debz/bin/debz", "install"], 0x2f827ed0 /* 11 vars */) = 0
+        \\30634 clone(child_stack=NULL, flags=SIGCHLD) = 29901
+        \\29901 execve("/var/lib/debz-lifecycle-scripts/libc6.preinst", ["/var/lib/debz-lifecycle-scripts/libc6.preinst", "install"], 0x2d882060 /* 11 vars */) = 0
+        \\29901 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0xf79f9a8b80b0) = 29902
+        \\29902 execve("/usr/bin/perl", ["perl", "-e", ""], 0xc97f61450098 /* 12 vars */) = 0
+        \\29901 execve("/usr/share/debconf/frontend", ["/usr/share/debconf/frontend", "/var/lib/debz-lifecycle-scripts/libc6.preinst", "install"], 0xc97f61452810 /* 13 vars */) = 0
+        \\29901 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0xe09c8c2500f0) = 29904
+        \\29904 execve("/var/lib/debz-lifecycle-scripts/libc6.preinst", ["/var/lib/debz-lifecycle-scripts/libc6.preinst", "install"], 0xb82fe8096db0 /* 14 vars */) = 0
+        \\29904 clone(child_stack=0xffffe3b8e010, flags=CLONE_VM|CLONE_VFORK|SIGCHLD <unfinished ...>
+        \\29923 execve("/usr/bin/dpkg-divert", ["dpkg-divert", "--quiet", "--add", "--no-rename", "--divert", "/lib/ld-linux-aarch64.so.1.usr-is-merged", "/lib/ld-linux-aarch64.so.1"], 0xbb789ce99bd8 /* 16 vars */ <unfinished ...>
+        \\29904 <... clone resumed>)              = 29923
+        \\29923 <... execve resumed>)             = 0
+        \\
+    ;
+    const result = try auditFixture(&f, trace);
+    defer result.deinit();
+    try expectAllowedTool(result, "dpkg-divert", "script_dpkg_divert_exec line=10 pid=29923 script=/var/lib/debz-lifecycle-scripts/libc6.preinst " ++
+        "script_pid=29901 lineage=30634>29901>29904>29923 argv=[\"dpkg-divert\",\"--quiet\",\"--add\",\"--no-rename\",\"--divert\"," ++
+        "\"/lib/ld-linux-aarch64.so.1.usr-is-merged\",\"/lib/ld-linux-aarch64.so.1\"]\n");
+}
+
+test "snapshot: exec audit refuses dpkg-divert and dpkg-statoverride outside the reviewed shapes" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    for ([_]struct { tool: []const u8, argv: []const u8, reason: []const u8 }{
+        // Shapes the closure uses only on upgrade or removal, or not at all.
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--rename\", \"--package\", \"zutils\", \"--divert\", \"/usr/bin/zcat.usr-is-merged\", \"--remove\", \"/usr/bin/zcat\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--package\", \"dash\", \"--rename\", \"--remove\", \"/bin/sh\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/bin/cat.remove-bak\", \"--rename\", \"--remove\", \"/usr/bin/cat\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--package\", \"dash\", \"--no-rename\", \"--remove\", \"/bin/sh\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--quiet\", \"--local\", \"--remove\", \"--no-rename\", \"/etc/os-release\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--list\", \"/etc/os-release\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--add\", \"/usr/bin/sudo\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--test\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/lib64/x.usr-is-merged\", \"/lib64/x\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--add\", \"--quiet\", \"--no-rename\", \"--divert\", \"/lib64/x.usr-is-merged\", \"/lib64/x\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/lib64/x.usr-is-merged\", \"/lib64/x\", \"/lib64/y\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--truename\"" },
+        // Diversion targets other than the DEP17 or coreutils-switch name of the same path.
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/usr/bin/sudo.real\", \"/usr/bin/sudo\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/tmp/sudo.usr-is-merged\", \"/usr/bin/sudo\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/.usr/bin.usr-is-merged\", \"/usr/bin\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/bin/cat.remove-bak\", \"--no-rename\", \"--add\", \"/usr/bin/cat\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/bin/cat.usr-is-merged\", \"--no-rename\", \"--remove\", \"/usr/bin/cat\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--package\", \"coreutils-switch\", \"--divert\", \"/usr/bin/sudo.remove-bak\", \"--no-rename\", \"--remove\", \"/usr/bin/cat\"" },
+        // Operands outside the reviewed grammar.
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--quiet\", \"--package\", \"Base-Files\", \"--add\", \"--no-rename\", \"--divert\", \"/.lib32.usr-is-merged\", \"/lib32\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--truename\", \"bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--truename\", \"/bin/../etc/shadow\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--truename\", \"/bin/./ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--truename\", \"/bin//ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--truename\", \"/bin/ping\\n\"" },
+        .{ .tool = "dpkg-divert", .reason = "shape", .argv = "\"dpkg-divert\", \"--truename\", \"/bin/p ing\"" },
+        .{ .tool = "dpkg-divert", .reason = "option", .argv = "\"dpkg-divert\", \"--admindir\", \"/x\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "option", .argv = "\"dpkg-divert\", \"--root=/x\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "option", .argv = "\"dpkg-divert\", \"--instdir\", \"/x\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "option", .argv = "\"dpkg-divert\", \"--quiet\", \"--add\", \"--no-rename\", \"--divert\", \"/lib64/x.usr-is-merged\", \"--force-all\", \"/lib64/x\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--remove\", \"/var/lib/chrony\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--list\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--list\", \"/etc/a\", \"/etc/b\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--quiet\", \"--list\", \"/var/lib/chrony\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--add\", \"root\", \"_chrony\", \"0640\", \"/etc/chrony/chrony.keys\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--add\", \"--update\", \"root\", \"_chrony\", \"0640\", \"/etc/chrony/chrony.keys\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"root\", \"root\", \"4755\", \"/usr/bin/sudo\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"root\", \"root\", \"2755\", \"/usr/bin/x\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"root\", \"root\", \"755\", \"/usr/bin/x\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"#0\", \"root\", \"0640\", \"/etc/x\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"root\", \"_chrony\", \"0640\", \"etc/chrony/chrony.keys\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\", \"--update\", \"--add\", \"root\", \"_chrony\", \"0640\", \"/etc/../etc/shadow\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "shape", .argv = "\"dpkg-statoverride\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "option", .argv = "\"dpkg-statoverride\", \"--force-statoverride-add\", \"--update\", \"--add\", \"root\", \"_chrony\", \"0640\", \"/etc/chrony/chrony.keys\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "option", .argv = "\"dpkg-statoverride\", \"--admindir=/x\", \"--list\", \"/var/lib/chrony\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "option", .argv = "\"dpkg-statoverride\", \"--root\", \"/x\", \"--list\", \"/var/lib/chrony\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "option", .argv = "\"dpkg-statoverride\", \"--list\", \"/var/lib/chrony\", \"--instdir=/x\"" },
+        // argv[0] must name the same tool as the filename.
+        .{ .tool = "dpkg-divert", .reason = "argv0", .argv = "\"dpkg\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "argv0", .argv = "\"dpkg-statoverride\", \"--list\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "argv0", .argv = "\"/bin/dpkg-divert\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "argv0", .argv = "\"./dpkg-divert\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-divert", .reason = "argv0", .argv = "\"/usr/sbin/dpkg-divert\", \"--truename\", \"/bin/ping\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "argv0", .argv = "\"/usr/bin/dpkg-divert\", \"--list\", \"/var/lib/chrony\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "argv0", .argv = "\"/bin/dpkg-statoverride\", \"--list\", \"/var/lib/chrony\"" },
+        .{ .tool = "dpkg-statoverride", .reason = "argv0", .argv = "" },
+        .{ .tool = "dpkg-statoverride", .reason = "truncated", .argv = "\"dpkg-statoverride\", \"--list\", \"/var/lib/chrony\"..." },
+    }) |case| {
+        const trace = try scriptTool(case.tool, case.argv);
+        defer support.allocator.free(trace);
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        try expectRefused(result, case.reason);
+    }
+    for ([_][]const u8{ "dpkg-divert", "dpkg-statoverride" }) |tool| {
+        const arguments = if (std.mem.eql(u8, tool, "dpkg-divert")) "\"--truename\", \"/bin/ping\"" else "\"--list\", \"/var/lib/chrony\"";
+        for ([_][]const u8{ "/bin/{s}", "/usr/sbin/{s}", "/sbin/{s}", "/usr/local/bin/{s}", "/tmp/{s}", "{s}", "./{s}", "/usr/bin//{s}", "/usr/bin/../bin/{s}" }) |pattern| {
+            const path = try std.mem.replaceOwned(u8, support.allocator, pattern, "{s}", tool);
+            defer support.allocator.free(path);
+            for ([_][]const u8{ "{s}", "/usr/bin/{s}" }) |label| {
+                const argv0 = try std.mem.replaceOwned(u8, support.allocator, label, "{s}", tool);
+                defer support.allocator.free(argv0);
+                const argv = try std.fmt.allocPrint(support.allocator, "\"{s}\", {s}", .{ argv0, arguments });
+                defer support.allocator.free(argv);
+                const args = try dpkgArgs(path, argv);
+                defer support.allocator.free(args);
+                const trace = try scriptTrace(audit_script, "execve", args, "0");
+                defer support.allocator.free(trace);
+                const result = try auditFixture(&f, trace);
+                defer result.deinit();
+                try expectRefused(result, "path");
+            }
+        }
+        const path = try std.fmt.allocPrint(support.allocator, "/usr/bin/{s}", .{tool});
+        defer support.allocator.free(path);
+        const at = try std.fmt.allocPrint(support.allocator, "AT_FDCWD, \"{s}\", [\"{s}\", {s}], 0x1 /* 1 var */, 0", .{ path, tool, arguments });
+        defer support.allocator.free(at);
+        const descriptor = try std.fmt.allocPrint(support.allocator, "3<{s}>, \"\", [\"{s}\", {s}], 0x1 /* 1 var */, AT_EMPTY_PATH", .{ path, tool, arguments });
+        defer support.allocator.free(descriptor);
+        const failed = try std.fmt.allocPrint(support.allocator, "\"{s}\", [\"{s}\", {s}], 0x1 /* 1 var */", .{ path, tool, arguments });
+        defer support.allocator.free(failed);
+        for ([_]struct { call: []const u8, args: []const u8, result: []const u8, reason: []const u8 }{
+            .{ .call = "execveat", .args = at, .result = "0", .reason = "execveat" },
+            .{ .call = "execveat", .args = descriptor, .result = "0", .reason = "execveat" },
+            .{ .call = "execve", .args = failed, .result = "-1 ENOENT (No such file or directory)", .reason = "exec-result" },
+        }) |case| {
+            const trace = try scriptTrace(audit_script, case.call, case.args, case.result);
+            defer support.allocator.free(trace);
+            const result = try auditFixture(&f, trace);
+            defer result.deinit();
+            try expectRefused(result, case.reason);
+        }
+    }
+}
+
+test "snapshot: exec audit refuses dpkg-divert and dpkg-statoverride outside a debz-started script" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    for ([_]struct { trace: []const u8, reason: []const u8 }{
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/usr/bin/dpkg-divert", ["dpkg-divert", "--truename", "/bin/ping"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/usr/bin/dpkg-statoverride", ["dpkg-statoverride", "--update", "--add", "root", "_chrony", "0640", "/etc/chrony/chrony.keys"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\900 execve("/var/lib/dpkg/info/chrony.postinst", ["/var/lib/dpkg/info/chrony.postinst", "configure"], 0x1 /* 1 var */) = 0
+        \\900 vfork() = 901
+        \\901 execve("/usr/bin/dpkg-statoverride", ["dpkg-statoverride", "--list", "/var/lib/chrony"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\900 execve("/var/lib/dpkg/info/libc6.preinst", ["/var/lib/dpkg/info/libc6.preinst", "install"], 0x1 /* 1 var */) = 0
+        \\900 vfork() = 901
+        \\901 execve("/usr/bin/dpkg-divert", ["dpkg-divert", "--truename", "/lib64"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/bin/sh", ["sh", "-c", "/var/lib/dpkg/info/libc6.preinst install"], 0x1 /* 1 var */) = 0
+        \\702 execve("/var/lib/dpkg/info/libc6.preinst", ["/var/lib/dpkg/info/libc6.preinst", "install"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg-divert", ["dpkg-divert", "--truename", "/lib64"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/chrony.config", ["/var/lib/debz-lifecycle-scripts/chrony.config"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg-statoverride", ["dpkg-statoverride", "--list", "/var/lib/chrony"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "ambiguous-lineage", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 703
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/libc6.preinst", ["/var/lib/debz-lifecycle-scripts/libc6.preinst", "install"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg-divert", ["dpkg-divert", "--truename", "/lib64"], 0x1 /* 1 var */) = 0
+        \\
+        },
+    }) |case| {
+        const result = try auditFixture(&f, case.trace);
+        defer result.deinit();
+        try expectRefused(result, case.reason);
+    }
+}
+
+test "snapshot: exec audit checks each script tool's identity separately and records every allowed call" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    const trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/chrony.postinst", ["/var/lib/debz-lifecycle-scripts/chrony.postinst", "configure", ""], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg", ["dpkg", "--compare-versions", "", "lt", "4.8"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 704
+        \\704 execve("/usr/bin/dpkg-statoverride", ["dpkg-statoverride", "--list", "/var/lib/chrony"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 705
+        \\705 execve("/usr/bin/dpkg-statoverride", ["dpkg-statoverride", "--update", "--add", "_chrony", "_chrony", "0750", "/var/lib/chrony"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 706
+        \\706 execve("/usr/bin/dpkg-divert", ["dpkg-divert", "--truename", "/bin/ping"], 0x1 /* 1 var */) = 0
+        \\
+    ;
+    const lineage = " script=/var/lib/debz-lifecycle-scripts/chrony.postinst script_pid=702 lineage=700>702>";
+    {
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        try result.ok();
+        const reviewed = [_][]const u8{ "dpkg", "dpkg-divert", "dpkg-statoverride" };
+        var identities: [reviewed.len][]u8 = undefined;
+        var made: usize = 0;
+        defer for (identities[0..made]) |identity| support.allocator.free(identity);
+        for (reviewed) |tool| {
+            const name = try std.mem.replaceOwned(u8, support.allocator, tool, "-", "_");
+            defer support.allocator.free(name);
+            const digest = auditHex(auditToolBytes(tool));
+            identities[made] = try std.fmt.allocPrint(support.allocator, "script_{s}_identity version={s} architecture={s} size={d} digest={s}\n", .{
+                name, audit_version, f.arch, auditToolBytes(tool).len, &digest,
+            });
+            made += 1;
+        }
+        const expected = try std.fmt.allocPrint(support.allocator, "script_dpkg_exec line=5 pid=703" ++ lineage ++ "703 argv=[\"dpkg\",\"--compare-versions\",\"\",\"lt\",\"4.8\"]\n" ++
+            "script_dpkg_statoverride_exec line=7 pid=704" ++ lineage ++ "704 argv=[\"dpkg-statoverride\",\"--list\",\"/var/lib/chrony\"]\n" ++
+            "script_dpkg_statoverride_exec line=9 pid=705" ++ lineage ++ "705 argv=[\"dpkg-statoverride\",\"--update\",\"--add\",\"_chrony\",\"_chrony\",\"0750\",\"/var/lib/chrony\"]\n" ++
+            "script_dpkg_divert_exec line=11 pid=706" ++ lineage ++ "706 argv=[\"dpkg-divert\",\"--truename\",\"/bin/ping\"]\n" ++
+            "{s}{s}{s}allowed_script_dpkg_exec=1\nallowed_script_dpkg_divert_exec=1\nallowed_script_dpkg_statoverride_exec=2\nforbidden_dpkg_exec=false\n", .{
+            identities[0], identities[1], identities[2],
+        });
+        defer support.allocator.free(expected);
+        try testing.expectEqualStrings(expected, result.stdout);
+    }
+    {
+        // Only dpkg-statoverride's root identity is wrong: its two calls are
+        // refused, while the other tools' calls stay recorded as allowed.
+        try f.work.write("audit-root/usr/bin/dpkg-statoverride", auditToolBytes("dpkg"));
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 90), result.code);
+        try testing.expect(std.mem.startsWith(u8, result.stdout, "script_dpkg_exec line=5 pid=703 " ++
+            "script=/var/lib/debz-lifecycle-scripts/chrony.postinst script_pid=702 lineage=700>702>703 argv=["));
+        try support.contains(result.stdout, "\nscript_dpkg_divert_exec line=11 pid=706 ");
+        try support.contains(result.stdout, "\nforbidden_exec reason=dpkg-statoverride-identity:digest line=7 pid=704 path=\"/usr/bin/dpkg-statoverride\" ");
+        try support.contains(result.stdout, "\nforbidden_exec reason=dpkg-statoverride-identity:digest line=9 pid=705 path=\"/usr/bin/dpkg-statoverride\" ");
+        try testing.expect(std.mem.indexOf(u8, result.stdout, "\nscript_dpkg_statoverride_") == null);
+        try testing.expect(std.mem.endsWith(u8, result.stdout, "\nallowed_script_dpkg_exec=1\nallowed_script_dpkg_divert_exec=1\nallowed_script_dpkg_statoverride_exec=0\nforbidden_dpkg_exec=true\n"));
+    }
+}
+
+test "snapshot: exec audit refuses /bin dpkg-divert and dpkg-statoverride filenames even when /bin is the usrmerge link" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    try auditLink(&f, "usr/bin", "audit-root/bin");
+    for ([_][]const u8{ "dpkg-divert", "dpkg-statoverride" }) |tool| {
+        const arguments = if (std.mem.eql(u8, tool, "dpkg-divert")) "\"--truename\", \"/bin/ping\"" else "\"--list\", \"/var/lib/chrony\"";
+        for ([_]struct { path: []const u8, argv0: []const u8, reason: ?[]const u8 }{
+            .{ .path = "/usr/bin/", .argv0 = "", .reason = null },
+            .{ .path = "/usr/bin/", .argv0 = "/usr/bin/", .reason = null },
+            .{ .path = "/bin/", .argv0 = "", .reason = "path" },
+            .{ .path = "/bin/", .argv0 = "/bin/", .reason = "path" },
+            .{ .path = "/bin/", .argv0 = "/usr/bin/", .reason = "path" },
+            .{ .path = "/usr/bin/", .argv0 = "/bin/", .reason = "argv0" },
+        }) |case| {
+            const path = try std.fmt.allocPrint(support.allocator, "{s}{s}", .{ case.path, tool });
+            defer support.allocator.free(path);
+            const argv = try std.fmt.allocPrint(support.allocator, "\"{s}{s}\", {s}", .{ case.argv0, tool, arguments });
+            defer support.allocator.free(argv);
+            const args = try dpkgArgs(path, argv);
+            defer support.allocator.free(args);
+            const trace = try scriptTrace(audit_script, "execve", args, "0");
+            defer support.allocator.free(trace);
+            const result = try auditFixture(&f, trace);
+            defer result.deinit();
+            if (case.reason) |reason| {
+                try expectRefused(result, reason);
+            } else {
+                const compact = try std.mem.replaceOwned(u8, support.allocator, argv, "\", \"", "\",\"");
+                defer support.allocator.free(compact);
+                const name = try std.mem.replaceOwned(u8, support.allocator, tool, "-", "_");
+                defer support.allocator.free(name);
+                const record = try std.fmt.allocPrint(support.allocator, "script_{s}_exec line=6 pid=703" ++ audit_lineage ++ "[{s}]\n", .{ name, compact });
+                defer support.allocator.free(record);
+                try expectAllowedTool(result, tool, record);
+            }
+        }
+    }
+}
+
 test "snapshot: exec audit without dpkg needs no root and unauditable input fails closed" {
     var f = try Driver.init();
     defer f.deinit();
@@ -1184,12 +1680,26 @@ test "snapshot: exec audit without dpkg needs no root and unauditable input fail
         \\702 execve("/usr/bin/dpkg-split-helper", ["dpkg-split-helper"], 0x1 /* 1 var */) = 0
         \\
     ;
+    const identities = try auditIdentities("", "");
+    defer support.allocator.free(identities);
     for ([_][]const u8{ "--audit-exec-trace", "--audit-exec-trace-fixture" }) |mode| {
-        const digest = auditHex(audit_dpkg);
-        const passed = try auditWith(&f, mode, quiet, &digest, audit_dpkg_size);
+        const passed = try auditWith(&f, mode, quiet, identities);
         defer passed.deinit();
         try passed.ok();
-        try testing.expectEqualStrings("allowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n", passed.stdout);
+        try testing.expectEqualStrings(audit_no_calls ++ "forbidden_dpkg_exec=false\n", passed.stdout);
+    }
+    const digest = auditHex(audit_dpkg);
+    const dpkg_only = try std.fmt.allocPrint(support.allocator, "dpkg={s}:{s}", .{ &digest, audit_dpkg_size });
+    defer support.allocator.free(dpkg_only);
+    const duplicated = try std.fmt.allocPrint(support.allocator, "{s} {s} {s}", .{ dpkg_only, dpkg_only, dpkg_only });
+    defer support.allocator.free(duplicated);
+    const unsized = try auditIdentities("dpkg-statoverride", "00:x");
+    defer support.allocator.free(unsized);
+    for ([_][]const u8{ dpkg_only, duplicated, unsized, "" }) |incomplete| {
+        const refused = try auditWith(&f, "--audit-exec-trace-fixture", quiet, incomplete);
+        defer refused.deinit();
+        try testing.expectEqual(@as(u8, 91), refused.code);
+        try testing.expectEqualStrings("", refused.stdout);
     }
     const missing_trace = try f.run(f.keyring, &.{ "--audit-exec-trace", "/nonexistent/trace", "/nonexistent/root", f.arch, audit_debz });
     defer missing_trace.deinit();
@@ -1213,14 +1723,24 @@ test "snapshot: script dpkg pins are per architecture and bound to the pinned sn
         "readonly script_dpkg_version=1.23.7ubuntu2\n",
         "readonly script_dpkg_amd64='6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f 322728'\n",
         "readonly script_dpkg_arm64='d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4 330816'\n",
+        "readonly script_dpkg_divert_amd64='a509fc1a363946770295b613924e2bfa902ddbf76ec2826128685df1569c57d8 125768'\n",
+        "readonly script_dpkg_divert_arm64='6daba35904a8885a334c33e6b4c7c7bc42f501f3f36032a374dfe40e842ed75b 133872'\n",
+        "readonly script_dpkg_statoverride_amd64='6c08816ff0b12106e969537cab83ac4b3358a72b425fe8bf1fc961e2e82ce2ce 55936'\n",
+        "readonly script_dpkg_statoverride_arm64='b837c9d99518225f5b238b215179559a87e7d012072ae0ff414fdc0ea891c3b9 68184'\n",
         "[[ \"$pinned_uri\" == */\"$script_dpkg_snapshot\" ]]",
-        "    amd64) echo \"$script_dpkg_amd64\" ;;\n",
-        "    arm64) echo \"$script_dpkg_arm64\" ;;\n",
+        "    amd64:dpkg) echo \"$script_dpkg_amd64\" ;;\n",
+        "    arm64:dpkg) echo \"$script_dpkg_arm64\" ;;\n",
+        "    amd64:dpkg-divert) echo \"$script_dpkg_divert_amd64\" ;;\n",
+        "    arm64:dpkg-divert) echo \"$script_dpkg_divert_arm64\" ;;\n",
+        "    amd64:dpkg-statoverride) echo \"$script_dpkg_statoverride_amd64\" ;;\n",
+        "    arm64:dpkg-statoverride) echo \"$script_dpkg_statoverride_arm64\" ;;\n",
+        "  for tool in dpkg dpkg-divert dpkg-statoverride; do\n",
+        "TOOLS = (\"dpkg\", \"dpkg-divert\", \"dpkg-statoverride\")\n",
         "ACTIONS = (\"--compare-versions\", \"--validate-version\", \"--print-architecture\", \"-s\", \"-L\", \"-l\")\n",
         "REFUSED_OPTIONS = (\"--root\", \"--admindir\", \"--instdir\", \"--force\")\n",
-        "ARGV0 = (\"dpkg\", \"/usr/bin/dpkg\")\n",
-        "elif not argv or argv[0] not in ARGV0:",
-        "elif path != \"/usr/bin/dpkg\":",
+        "tool = path[len(\"/usr/bin/\"):] if path.startswith(\"/usr/bin/\") else None\n",
+        "elif tool not in TOOLS:",
+        "elif not argv or argv[0] not in (tool, path):",
         "native-exec-audit.txt",
         "exec-audit-summary.txt",
     }) |required| try support.contains(runner, required);
@@ -1234,6 +1754,23 @@ test "snapshot: script dpkg pins are per architecture and bound to the pinned sn
     try support.contains(job, "tee -a \"$GITHUB_STEP_SUMMARY\"");
     try testing.expect(std.mem.indexOf(u8, workflow, "--audit-exec-trace-fixture") == null);
     try testing.expect(std.mem.indexOf(u8, workflow, "execveat\\(") == null);
+    for ([_][]const u8{ "dpkg", "dpkg_divert", "dpkg_statoverride" }) |tool| {
+        const counted = try std.fmt.allocPrint(support.allocator, "sed -n 's/^allowed_script_{s}_exec=", .{tool});
+        defer support.allocator.free(counted);
+        try support.contains(job, counted);
+    }
+    // No identity is shared across architectures or tools.
+    var seen: [6][]const u8 = undefined;
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, runner, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "readonly script_dpkg_") or std.mem.indexOfScalar(u8, line, '\'') == null) continue;
+        const value = line[std.mem.indexOfScalar(u8, line, '\'').? + 1 ..];
+        for (seen[0..count]) |other| try testing.expect(!std.mem.eql(u8, other[0..16], value[0..16]));
+        seen[count] = value;
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 6), count);
 }
 
 test "snapshot: reference rejects corrupt cached archive before creating root or snapshot" {
