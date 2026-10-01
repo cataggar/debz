@@ -20755,7 +20755,7 @@ fn verifyAuthenticatedSnapshotArtifact(
     package: native_program.PackageIdentity,
     expected_size: u64,
     sha512: []const u8,
-    invalid: SignedSnapshotControlError,
+    invalid: anyerror,
 ) !void {
     const expected = (try content_digest.Value.parse(
         .sha512,
@@ -21693,17 +21693,33 @@ fn snapshotLessPreinstIsInert(
     kind: maintainer_script.Kind,
     source: native_program.ScriptSource,
     arguments: []const []const u8,
+    artifacts: []const native_program.ProgramArtifact,
 ) !bool {
     if (!native_alternatives.matchesSnapshotLessPreinst(bytes)) return false;
-    if (!std.mem.eql(u8, architecture, "amd64") or
-        !std.mem.eql(u8, package.architecture, "amd64") or
-        !std.mem.eql(u8, package.name, "less") or
+    const arm64_archive_sha512 =
+        "f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8";
+    if (!std.mem.eql(u8, package.name, "less") or
         !std.mem.eql(u8, package.version, "668-1build1") or
         kind != .preinst or source != .new_package or
         arguments.len != 1 or
         !std.mem.eql(u8, arguments[0], "install"))
         return error.InvalidAlternativesScriptAuthority;
-    return true;
+    if (std.mem.eql(u8, architecture, "amd64") and
+        std.mem.eql(u8, package.architecture, "amd64"))
+        return true;
+    if (std.mem.eql(u8, architecture, "arm64") and
+        std.mem.eql(u8, package.architecture, "arm64"))
+    {
+        try verifyAuthenticatedSnapshotArtifact(
+            artifacts,
+            package,
+            171138,
+            arm64_archive_sha512,
+            error.InvalidAlternativesScriptAuthority,
+        );
+        return true;
+    }
+    return error.InvalidAlternativesScriptAuthority;
 }
 
 fn snapshotPython3PreinstIsInert(
@@ -23389,15 +23405,56 @@ test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" 
     );
 }
 
-test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
+fn testAuthenticatedSnapshotArtifact(
+    package: native_program.PackageIdentity,
+    size: u64,
+    sha512_text: []const u8,
+) !native_program.ProgramArtifact {
+    const sha512 = (try content_digest.Value.parse(.sha512, sha512_text)).sha512;
+    return .{
+        .index = 0,
+        .package = package,
+        .archive_identity = content_digest.JsonIdentity.init(
+            try content_digest.Identity.init(.{ .sha512 = sha512 }, .sha512),
+        ),
+        .size = size,
+        .application_sha256 = @splat('0'),
+        .origin_v2 = .{ .authenticated_repository = .{
+            .repository_id = @splat('0'),
+            .repository_snapshot_sha256 = @splat('0'),
+        } },
+    };
+}
+
+test "native_unpack.test.snapshot less preinst requires fresh architecture-bound install" {
     const script = @embedFile(
         "fixtures/ubuntu-stonking-less-668-1build1.preinst",
+    );
+    var script_sha256: [32]u8 = undefined;
+    Sha256.hash(script, &script_sha256, .{});
+    const expected_script_sha256 = native_recovery.parseDigest(
+        "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94".*,
+    ).?;
+    try testing.expectEqualSlices(
+        u8,
+        &expected_script_sha256,
+        &script_sha256,
     );
     const less: native_program.PackageIdentity = .{
         .name = "less",
         .version = "668-1build1",
         .architecture = "amd64",
     };
+    const arm64_less: native_program.PackageIdentity = .{
+        .name = "less",
+        .version = "668-1build1",
+        .architecture = "arm64",
+    };
+    const arm64_artifact = try testAuthenticatedSnapshotArtifact(
+        arm64_less,
+        171138,
+        "f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8",
+    );
     try testing.expect(try snapshotLessPreinstIsInert(
         script,
         "amd64",
@@ -23405,6 +23462,16 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
         .preinst,
         .new_package,
         &.{"install"},
+        &.{},
+    ));
+    try testing.expect(try snapshotLessPreinstIsInert(
+        script,
+        "arm64",
+        arm64_less,
+        .preinst,
+        .new_package,
+        &.{"install"},
+        &.{arm64_artifact},
     ));
     try testing.expect(!(try snapshotLessPreinstIsInert(
         "#!/bin/sh\nexit 0\n",
@@ -23413,6 +23480,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
         .preinst,
         .new_package,
         &.{"install"},
+        &.{},
     )));
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
@@ -23423,6 +23491,33 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
             .preinst,
             .new_package,
             &.{"install"},
+            &.{},
+        ),
+    );
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "arm64",
+            arm64_less,
+            .preinst,
+            .new_package,
+            &.{"install"},
+            &.{},
+        ),
+    );
+    var wrong_artifact = arm64_artifact;
+    wrong_artifact.size += 1;
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotLessPreinstIsInert(
+            script,
+            "arm64",
+            arm64_less,
+            .preinst,
+            .new_package,
+            &.{"install"},
+            &.{wrong_artifact},
         ),
     );
     var other = less;
@@ -23436,6 +23531,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
             .preinst,
             .new_package,
             &.{"install"},
+            &.{},
         ),
     );
     other = less;
@@ -23449,6 +23545,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
             .preinst,
             .new_package,
             &.{"install"},
+            &.{},
         ),
     );
     other = less;
@@ -23462,6 +23559,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
             .preinst,
             .new_package,
             &.{"install"},
+            &.{},
         ),
     );
     try testing.expectError(
@@ -23473,6 +23571,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
             .postinst,
             .new_package,
             &.{"install"},
+            &.{},
         ),
     );
     try testing.expectError(
@@ -23484,6 +23583,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
             .preinst,
             .installed_package,
             &.{"install"},
+            &.{},
         ),
     );
     for ([_][]const []const u8{
@@ -23500,6 +23600,7 @@ test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
             .preinst,
             .new_package,
             arguments,
+            &.{},
         ),
     );
 }
@@ -23524,6 +23625,7 @@ fn prepareAlternativesScriptBoundary(
         kind,
         source,
         arguments,
+        program.artifacts,
     );
     const python3_inert = try snapshotPython3PreinstIsInert(
         script_bytes,
