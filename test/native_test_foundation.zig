@@ -1,5 +1,6 @@
 const std = @import("std");
 const root_fs = @import("debz").root_fs;
+const package_path = @import("debz").package_path;
 
 pub const guard = ".debz-native-disposable";
 pub const guard_content = "debz native materialization fixture v1\n";
@@ -649,7 +650,10 @@ fn normalizedMd5(allocator: std.mem.Allocator, content: []const u8) ![]const u8 
             line[34] == '/' or
             std.mem.indexOfScalar(u8, line, 0) != null)
             return error.InvalidMd5sums;
-        _ = root_fs.Path.initPackage(line[34..]) catch return error.InvalidMd5sums;
+        // dpkg resolves a shipped `./usr/x` to `usr/x`, but installs a shipped
+        // manifest verbatim, so the listed spelling is compared as written.
+        _ = root_fs.Path.initPackage(package_path.skipDotSlash(line[34..])) catch
+            return error.InvalidMd5sums;
         for (line[0..32]) |digit| {
             if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f'))
                 return error.InvalidMd5sums;

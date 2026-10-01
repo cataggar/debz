@@ -172,6 +172,16 @@ The checked-in OpenPGP fixture bytes were generated with Python cryptography
 regeneration tool only: it is not fetched, linked, imported, or executed by the
 debz build or test graph, and none of its source code is distributed here.
 
+Microsoft repository descriptor fixture
+=======================================
+
+src/fixtures/packages-microsoft-prod_1.2-ubuntu24.04_all.deb is the unmodified
+packages-microsoft-prod 1.2-ubuntu24.04 package published at
+https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb.
+It is Copyright 2023 Microsoft Corporation under the MIT license, as its
+usr/share/doc/packages-microsoft-prod/copyright file states. It is test data
+only and is embedded in test binaries, not in the debz executable.
+
 GitHub setup action bundles
 ===========================
 

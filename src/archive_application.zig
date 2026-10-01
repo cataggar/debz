@@ -14,6 +14,7 @@
 //! preflight with a typed diagnostic instead of being approximated.
 
 const std = @import("std");
+const package_path = @import("package_path.zig");
 const content_digest = @import("content_digest.zig");
 const deb_archive = @import("deb_archive.zig");
 const deb_payload = @import("deb_payload.zig");
@@ -175,6 +176,8 @@ pub const Checksum = struct {
     path: []const u8,
     md5: [16]u8,
     file_index: usize,
+    /// Exact spelling in the shipped manifest, such as `./usr/x` for `usr/x`.
+    listed: []const u8,
 };
 
 pub const TriggerDirective = enum {
@@ -260,6 +263,9 @@ pub const Features = struct {
     conffiles: bool = false,
     remove_on_upgrade_conffiles: bool = false,
     checksums: bool = false,
+    /// The archive ships an `md5sums` control member, possibly empty. dpkg
+    /// installs such a member verbatim instead of generating one.
+    checksum_manifest: bool = false,
     lifecycle_scripts: bool = false,
     debconf_config_script: bool = false,
     retained_metadata: bool = false,
@@ -1057,6 +1063,7 @@ fn buildChecksums(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
         return reject(diagnostic, .checksums, .invalid_checksums, entry.content_offset, null);
     if (content.len != 0 and content[content.len - 1] != '\n')
         return reject(diagnostic, .checksums, .invalid_checksums, entry.content_offset, null);
+    builder.features.checksum_manifest = true;
     builder.features.checksums = content.len != 0;
     var offset: usize = 0;
     while (offset < content.len) {
@@ -1075,7 +1082,8 @@ fn buildChecksums(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
         }
         if (!std.mem.eql(u8, line[32..34], "  "))
             return reject(diagnostic, .checksums, .invalid_checksums, record_offset, null);
-        const path = line[34..];
+        const listed = line[34..];
+        const path = package_path.skipDotSlash(listed);
         if (path.len == 0 or path[0] == '/' or path[path.len - 1] == '/')
             return reject(diagnostic, .checksums, .invalid_checksums, record_offset, null);
         for (path) |character| {
@@ -1124,6 +1132,7 @@ fn buildChecksums(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
             .path = file.path,
             .md5 = md5,
             .file_index = file_index,
+            .listed = listed,
         }) catch return reject(diagnostic, .checksums, .out_of_memory, record_offset, null);
     }
 }
@@ -1415,7 +1424,9 @@ fn computeDigest(model: *const Model) [32]u8 {
 
     writer.number(model.checksums.len);
     for (model.checksums) |checksum| {
-        writer.text(checksum.path);
+        // The listed spelling equals `path` unless it carries leading `./`
+        // pairs, so digests of canonical manifests are unchanged.
+        writer.text(checksum.listed);
         writer.digest(&checksum.md5);
     }
 
@@ -2009,6 +2020,98 @@ test "archive_application.test.duplicate checksums are rejected through the inde
     }, .checksum_target_missing, .checksum_manifest);
 }
 
+test "archive_application.test.checksum manifests resolve leading dot-slash pairs like dpkg" {
+    const payload = "payload\n";
+    // packages-microsoft-prod ships `./etc/...` md5sums over a data.tar
+    // without the prefix; dpkg resolves both spellings to one path.
+    for ([_][]const u8{ "./usr/share/demo", "././usr/share/demo" }) |spelling| {
+        const manifest = try md5Line(testing.allocator, payload, spelling);
+        defer testing.allocator.free(manifest);
+        var result = try prepareArchive(.{
+            .control = &.{.{ .path = "md5sums", .content = manifest }},
+            .data = &.{.{ .path = "usr/share/demo", .content = payload }},
+        });
+        switch (result) {
+            .diagnostic => return error.TestUnexpectedResult,
+            .model => |*model| {
+                defer model.deinit();
+                try testing.expectEqual(@as(usize, 1), model.checksums.len);
+                try testing.expectEqualStrings("usr/share/demo", model.checksums[0].path);
+                try testing.expectEqualStrings(spelling, model.checksums[0].listed);
+                try testing.expect(model.findFile("usr/share/demo").?.md5 != null);
+            },
+        }
+    }
+
+    // dpkg's path_skip_slash_dotslash also strips leading `/`, and its
+    // parser drops one trailing `/`; native keeps both spellings refused.
+    for ([_][]const u8{ ".//usr/share/demo", "./", "./usr/share/demo/", "./../usr/share/demo", "/usr/share/demo", "/./usr/share/demo", "usr/share/demo/" }) |spelling| {
+        const manifest = try md5Line(testing.allocator, payload, spelling);
+        defer testing.allocator.free(manifest);
+        const code: Code = if (std.mem.eql(u8, spelling, "./../usr/share/demo"))
+            .checksum_target_missing
+        else
+            .invalid_checksums;
+        try expectRejected(.{
+            .control = &.{.{ .path = "md5sums", .content = manifest }},
+            .data = &.{.{ .path = "usr/share/demo", .content = payload }},
+        }, code, .checksum_manifest);
+    }
+
+    const plain = try md5Line(testing.allocator, payload, "usr/share/demo");
+    defer testing.allocator.free(plain);
+    const prefixed = try md5Line(testing.allocator, payload, "./usr/share/demo");
+    defer testing.allocator.free(prefixed);
+    const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ plain, prefixed });
+    defer testing.allocator.free(both);
+    try expectRejected(.{
+        .control = &.{.{ .path = "md5sums", .content = both }},
+        .data = &.{.{ .path = "usr/share/demo", .content = payload }},
+    }, .duplicate_checksum, .checksum_manifest);
+
+    // The listed spelling is part of the modeled application, so the two
+    // equivalent manifests publish, and bind, different bytes.
+    var digests: [2][32]u8 = undefined;
+    for ([_][]const u8{ plain, prefixed }, 0..) |manifest, index| {
+        var result = try prepareArchive(.{
+            .control = &.{.{ .path = "md5sums", .content = manifest }},
+            .data = &.{.{ .path = "usr/share/demo", .content = payload }},
+        });
+        switch (result) {
+            .diagnostic => return error.TestUnexpectedResult,
+            .model => |*model| {
+                defer model.deinit();
+                digests[index] = model.digest;
+            },
+        }
+    }
+    try testing.expect(!std.mem.eql(u8, &digests[0], &digests[1]));
+
+    var empty = try prepareArchive(.{
+        .control = &.{.{ .path = "md5sums", .content = "" }},
+        .data = &.{.{ .path = "usr/share/demo", .content = payload }},
+    });
+    switch (empty) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .model => |*model| {
+            defer model.deinit();
+            try testing.expect(model.features.checksum_manifest);
+            try testing.expect(!model.features.checksums);
+            try testing.expectEqual(@as(usize, 0), model.checksums.len);
+        },
+    }
+    var absent = try prepareArchive(.{
+        .data = &.{.{ .path = "usr/share/demo", .content = payload }},
+    });
+    switch (absent) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .model => |*model| {
+            defer model.deinit();
+            try testing.expect(!model.features.checksum_manifest);
+        },
+    }
+}
+
 test "archive_application.test.large checksum manifests stay bounded and linear" {
     const payload = "shared payload\n";
     const file_count = 1024;
@@ -2489,6 +2592,35 @@ test "archive_application.test.pinned repository fixtures model without approxim
         try testing.expectEqual(ProvenanceKind.local_artifact, model.provenance().kind);
         try model.verifyArtifactBinding(bytes);
     }
+}
+
+test "archive_application.test.reviewed upstream Microsoft descriptor binds dot-slash md5sums" {
+    const bytes = @embedFile("fixtures/packages-microsoft-prod_1.2-ubuntu24.04_all.deb");
+    var model = switch (prepare(testing.allocator, bytes, localRequest(), testLimits())) {
+        .model => |value| value,
+        .diagnostic => |diagnostic| {
+            std.debug.print("unexpected diagnostic: {s}\n", .{diagnostic.message()});
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer model.deinit();
+    try testing.expect(model.features.checksums);
+    try testing.expect(model.features.checksum_manifest);
+    try testing.expect(model.features.conffiles);
+    try testing.expect(model.features.lifecycle_scripts);
+    try testing.expect(!model.features.symlinks);
+    try testing.expect(!model.features.hardlinks);
+    try testing.expectEqual(@as(usize, 10), model.checksums.len);
+    for (model.checksums) |checksum| {
+        try testing.expect(!std.mem.startsWith(u8, checksum.path, "./"));
+        try testing.expectEqualStrings(checksum.path, model.files[checksum.file_index].path);
+        try testing.expect(std.mem.startsWith(u8, checksum.listed, "./"));
+        try testing.expectEqualStrings(checksum.path, checksum.listed[2..]);
+    }
+    try testing.expectEqual(@as(usize, 3), model.conffiles.len);
+    for (model.conffiles) |conffile| try testing.expect(conffile.file_index != null);
+    try testing.expectEqual(@as(usize, 3), model.scripts.len);
+    try model.verifyArtifactBinding(bytes);
 }
 
 test "archive_application.test.fuzz boundary releases every result" {

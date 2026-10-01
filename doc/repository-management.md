@@ -642,6 +642,19 @@ is a malformed repository source. The declaration is part of the repository
 identity and is kept in the managed sources
 ([exact locks](exact-locks-and-provenance.md)).
 
+Sources under `usr/share/doc/` are never activated. Some vendor maintainer
+scripts restore a missing apt source or keyring from a documentation copy, so
+a documentation file named like a payload source or keyring is admitted only
+as a regular file byte-identical to that payload. A script could also promote
+an unpaired file into a trust location, so a differing copy fails with
+`descriptor_dynamic`. So does any other `usr/share/doc/` entry that looks
+like a source or keyring: a `.list`, `.sources`, `.gpg`, `.asc`, `.pgp`,
+`.kbx` or `.key` name or link target, or regular-file bytes that begin with
+OpenPGP armor or a public or secret key packet. Other documentation, such as
+`copyright`, changelogs and debsig policies, stays inert. After package
+execution, the installed sources and keyrings must still match the bytes
+inspected here.
+
 Architecture comes only from an explicit request or target-root dpkg
 configuration. Host `uname`, host APT configuration, environment proxies,
 netrc, prompts, and TTY input are not used.
@@ -706,12 +719,34 @@ sudo debz repo add \
   --url https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb
 ```
 
-The current upstream descriptor is still refused before any refresh by
-separate structural checks that this profile does not relax. Its control
-archive root has mode `0775`, which fails validation with `descriptor_invalid`.
-It also ships a second copy of `microsoft-prod.list` under `usr/share/doc/`,
-which descriptor material inspection refuses as `descriptor_dynamic`.
-Resolving those is separate follow-up work for issue #68.
+The current upstream descriptor, `packages-microsoft-prod`
+`1.2-ubuntu24.04`, also passes descriptor validation. Its control archive root
+has mode `0775`, which dpkg never applies and the
+[descriptor profile](deb-payload-validation.md) does not judge. Its `postinst`
+restores a missing source or keyring from the byte-identical copies under
+`usr/share/doc/packages-microsoft-prod/`, which the documentation-copy rule
+above admits. Its `md5sums` names paths as `./etc/...`. dpkg resolves that
+spelling to the unprefixed archive path, and so do the native archive model
+and dpkg database import. The reviewed bytes are checked in as
+`src/fixtures/packages-microsoft-prod_1.2-ubuntu24.04_all.deb`. Unit tests
+admit them with this profile on `amd64` and `arm64`. A privileged lifecycle
+scenario runs their real maintainer scripts through pinned dpkg and the native
+runtime; see [native lifecycle](native-lifecycle.md#upstream-repository-descriptor-341).
+
+#### Manual live evidence
+
+`zig build test-live-repository-add -Dlive-repository-tests=true` repeats
+this `repo add` against the live feed. The option is off by default; without
+it the step fails immediately, and CI never runs it. The step needs network
+access, passwordless `sudo` and a dpkg-based host. It prepares a disposable
+alternate root under `.zig-cache/` with the descriptor's script interpreter
+and a stub `ca-certificates`. It then runs the legacy backend with the
+reviewed `--sha256` and the host architecture. It requires an installed,
+refreshed result and the 14-day freshness profile on the source and on every
+repository policy. The result and the `apt-config-snapshot-v1.json` copy are
+kept in `.zig-cache/live-repository-add-evidence/` for review. A failure can
+reflect the live feed, such as a Release older than 14 days or a replaced
+descriptor, rather than a debz regression.
 
 The profile is not yet applied by the `debz apt` system facade, product API v1,
 or package installation, so those still refuse this feed unless a product API

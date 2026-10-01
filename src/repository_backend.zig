@@ -5726,6 +5726,62 @@ const DescriptorMaterial = struct {
     }
 };
 
+const descriptor_documentation_prefix = "usr/share/doc/";
+
+/// Vendor maintainer scripts may restore apt configuration from package
+/// documentation, so a documentation entry named like a primary source or
+/// keyring must be a byte-identical regular copy of it. The installed bytes
+/// are still bound after execution. Any other documentation entry that looks
+/// like a source list or keyring, by name, link target or OpenPGP content, is
+/// dynamic: a script could promote it into a trust location.
+fn verifyDocumentationCopies(
+    validation: *const deb_payload.Validation,
+    primaries: []const MaterialFile,
+) !void {
+    for (validation.data.entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.path, descriptor_documentation_prefix)) continue;
+        const name = std.fs.path.basenamePosix(entry.path);
+        var matched = false;
+        for (primaries) |primary| {
+            if (!std.mem.eql(u8, std.fs.path.basenamePosix(primary.logical_path), name)) continue;
+            matched = true;
+            if (entry.kind != .regular or entry.size != primary.bytes.len)
+                return error.DynamicRepositoryMaterial;
+            const bytes = validation.regularPayloadBytes(entry.path, primary.bytes.len) catch
+                return error.DynamicRepositoryMaterial;
+            if (!std.mem.eql(u8, &sha256(bytes), &primary.sha256))
+                return error.DynamicRepositoryMaterial;
+        }
+        if (matched) continue;
+        if (repositoryMaterialName(name)) return error.DynamicRepositoryMaterial;
+        if (entry.link_target) |target| {
+            if (repositoryMaterialName(std.fs.path.basenamePosix(target)))
+                return error.DynamicRepositoryMaterial;
+        }
+        if (entry.kind == .regular) {
+            const bytes = validation.regularPayloadBytes(entry.path, std.math.maxInt(usize)) catch
+                return error.DynamicRepositoryMaterial;
+            if (openpgpMaterial(bytes)) return error.DynamicRepositoryMaterial;
+        }
+    }
+}
+
+fn repositoryMaterialName(name: []const u8) bool {
+    for ([_][]const u8{ ".list", ".sources", ".gpg", ".asc", ".pgp", ".kbx", ".key" }) |suffix| {
+        if (std.mem.endsWith(u8, name, suffix)) return true;
+    }
+    return false;
+}
+
+/// Recognizes ASCII armor and a leading binary public or secret key packet in
+/// either OpenPGP packet format.
+fn openpgpMaterial(bytes: []const u8) bool {
+    if (std.mem.startsWith(u8, std.mem.trimStart(u8, bytes, " \t\r\n"), "-----BEGIN PGP")) return true;
+    if (bytes.len == 0 or bytes[0] & 0x80 == 0) return false;
+    const tag = if (bytes[0] & 0x40 != 0) bytes[0] & 0x3f else (bytes[0] >> 2) & 0x0f;
+    return tag == 5 or tag == 6;
+}
+
 fn inspectDescriptorMaterial(
     allocator: std.mem.Allocator,
     validation: *const deb_payload.Validation,
@@ -5746,8 +5802,10 @@ fn inspectDescriptorMaterial(
             (!std.mem.endsWith(u8, entry.path, ".list") and
                 !std.mem.endsWith(u8, entry.path, ".sources")))
             continue;
-        if (!std.mem.startsWith(u8, entry.path, "etc/apt/sources.list.d/"))
+        if (!std.mem.startsWith(u8, entry.path, "etc/apt/sources.list.d/")) {
+            if (std.mem.startsWith(u8, entry.path, descriptor_documentation_prefix)) continue;
             return error.DynamicRepositoryMaterial;
+        }
         if (source_files.items.len == resources.maximum_repositories)
             return error.ResourceBudgetExceeded;
         const logical_path = try std.fmt.allocPrint(allocator, "/{s}", .{entry.path});
@@ -5824,6 +5882,7 @@ fn inspectDescriptorMaterial(
             });
         }
     }
+    try verifyDocumentationCopies(validation, files.items);
     // Sources were appended first, in document order. A profile is judged
     // against the payload keyring that refresh will authenticate with.
     var reviewed = false;
@@ -12208,6 +12267,258 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             reviewed_repository_profile.production_profiles,
         ),
     );
+}
+
+const DocumentationCopyEntry = struct {
+    path: []const u8,
+    kind: deb_payload.EntryKind = .regular,
+    bytes: []const u8 = "",
+};
+
+fn expectDocumentationCopies(extra: []const DocumentationCopyEntry, expected: ?anyerror) !void {
+    const allocator = std.testing.allocator;
+    const fixture = @import("fixtures/openpgp.zig");
+    const source_bytes =
+        "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.test/noble prod main\n";
+    const primaries = [_]DocumentationCopyEntry{
+        .{ .path = "etc/apt/sources.list.d/microsoft-prod.list", .bytes = source_bytes },
+        .{ .path = "usr/share/keyrings/microsoft-prod.gpg", .bytes = &fixture.keyring },
+    };
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(allocator);
+    var entries: std.ArrayList(deb_payload.Entry) = .empty;
+    defer entries.deinit(allocator);
+    for (&[_][]const DocumentationCopyEntry{ &primaries, extra }) |group| {
+        for (group) |item| {
+            try entries.append(allocator, .{
+                .path = @constCast(item.path),
+                .link_target = if (item.kind == .symlink) @constCast(item.bytes) else null,
+                .link_literal = if (item.kind == .symlink) @constCast(item.bytes) else null,
+                .kind = item.kind,
+                .mode = 0o644,
+                .uid = 0,
+                .gid = 0,
+                .owner_name = null,
+                .group_name = null,
+                .mtime = 0,
+                .size = if (item.kind == .regular) item.bytes.len else 0,
+                .header_offset = payload.items.len,
+                .content_offset = payload.items.len,
+            });
+            if (item.kind == .regular) try payload.appendSlice(allocator, item.bytes);
+        }
+    }
+    const empty_entries: []deb_payload.Entry = &.{};
+    var validation: deb_payload.Validation = .{
+        .allocator = allocator,
+        .package = @constCast("packages-microsoft-prod"),
+        .version = @constCast("1.2-ubuntu24.04"),
+        .architecture = @constCast("all"),
+        .provenance = .{
+            .kind = .local_artifact,
+            .repository = @constCast("local"),
+            .filename = @constCast("packages-microsoft-prod.deb"),
+            .size = payload.items.len,
+            .sha256 = sha256(payload.items),
+        },
+        .relationships = .{ .depends = null, .pre_depends = null },
+        .control = .{
+            .compression = .uncompressed,
+            .compressed_bytes = 0,
+            .decompressed_bytes = 0,
+            .root = null,
+            .entries = empty_entries,
+            .entry_headers = 0,
+            .inventory_bytes = 0,
+            .regular_bytes = 0,
+        },
+        .data = .{
+            .compression = .uncompressed,
+            .compressed_bytes = payload.items.len,
+            .decompressed_bytes = payload.items.len,
+            .root = null,
+            .entries = entries.items,
+            .entry_headers = entries.items.len,
+            .inventory_bytes = payload.items.len,
+            .regular_bytes = payload.items.len,
+        },
+        .scripts = &.{},
+        .conffiles = &.{},
+        .control_bytes = @constCast(&.{}),
+        .data_bytes = payload.items,
+    };
+    const result = inspectDescriptorMaterial(
+        allocator,
+        &validation,
+        "amd64",
+        .{},
+        .{},
+        reviewed_repository_profile.production_profiles,
+    );
+    if (expected) |err| return std.testing.expectError(err, result);
+    var material = try result;
+    defer material.deinit();
+    try std.testing.expectEqual(@as(usize, 1), material.configuration.repositories.len);
+    try std.testing.expectEqual(@as(usize, 2), material.evidence.len);
+    try std.testing.expectEqualStrings("/etc" ++ "/apt/sources.list.d/microsoft-prod.list", material.evidence[0].logical_path);
+    try std.testing.expectEqualStrings("/usr/share/keyrings/microsoft-prod.gpg", material.evidence[1].logical_path);
+}
+
+test "repository backend admits only byte-identical documentation copies of descriptor material" {
+    const fixture = @import("fixtures/openpgp.zig");
+    const source_bytes =
+        "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.test/noble prod main\n";
+    const doc = "usr/share/doc/packages-microsoft-prod/";
+    try expectDocumentationCopies(&.{}, null);
+    try expectDocumentationCopies(&.{
+        .{ .path = doc ++ "copyright", .bytes = "MIT\n" },
+        .{ .path = doc ++ "microsoft.pol", .bytes = "<Policy/>\n" },
+        .{ .path = doc ++ "microsoft-prod.list", .bytes = source_bytes },
+        .{ .path = doc ++ "microsoft-prod.gpg", .bytes = &fixture.keyring },
+    }, null);
+
+    var changed_keyring = fixture.keyring;
+    changed_keyring[changed_keyring.len - 1] ^= 1;
+    const refused = [_][]const DocumentationCopyEntry{
+        &.{.{ .path = doc ++ "microsoft-prod.list", .bytes = "deb [signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.test/noble prod main contrib\n" }},
+        &.{.{ .path = doc ++ "microsoft-prod.list", .bytes = source_bytes[0 .. source_bytes.len - 1] }},
+        &.{.{ .path = doc ++ "microsoft-prod.gpg", .bytes = &changed_keyring }},
+        &.{.{ .path = doc ++ "other.list", .bytes = source_bytes }},
+        &.{.{ .path = doc ++ "microsoft-prod.sources", .bytes = "Types: deb\n" }},
+        &.{.{ .path = doc ++ "microsoft-prod.list", .kind = .symlink, .bytes = "/etc" ++ "/apt/sources.list.d/microsoft-prod.list" }},
+        &.{.{ .path = doc ++ "microsoft-prod.gpg", .kind = .symlink, .bytes = "/usr/share/keyrings/microsoft-prod.gpg" }},
+        &.{.{ .path = doc ++ "other.list", .kind = .symlink, .bytes = "/etc" ++ "/apt/sources.list.d/microsoft-prod.list" }},
+        &.{.{ .path = doc ++ "microsoft-prod.list", .kind = .directory }},
+        // A keyring with no installed counterpart could be promoted into a
+        // trust location by a maintainer script.
+        &.{.{ .path = doc ++ "other.gpg", .bytes = &fixture.keyring }},
+        &.{.{ .path = doc ++ "other.asc", .bytes = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n" }},
+        &.{.{ .path = doc ++ "other.pgp", .bytes = "x" }},
+        &.{.{ .path = doc ++ "other.kbx", .bytes = "x" }},
+        &.{.{ .path = doc ++ "other.key", .bytes = "x" }},
+        &.{.{ .path = doc ++ "trust", .bytes = &fixture.keyring }},
+        &.{.{ .path = doc ++ "README", .bytes = "\n-----BEGIN PGP PUBLIC KEY BLOCK-----\n" }},
+        &.{.{ .path = doc ++ "README", .bytes = &.{ 0xc6, 0x01, 0x00 } }},
+        &.{.{ .path = doc ++ "README", .bytes = &.{ 0x95, 0x00, 0x01, 0x00 } }},
+        &.{.{ .path = doc ++ "other.gpg", .kind = .symlink, .bytes = "/usr/share/keyrings/microsoft-prod.gpg" }},
+        &.{.{ .path = doc ++ "trust", .kind = .symlink, .bytes = "/usr/share/keyrings/microsoft-prod.gpg" }},
+        &.{.{ .path = doc ++ "other.gpg", .kind = .directory }},
+    };
+    for (refused) |extra| try expectDocumentationCopies(extra, error.DynamicRepositoryMaterial);
+
+    // Ordinary documentation, including gzip, XML and text, stays inert.
+    try expectDocumentationCopies(&.{
+        .{ .path = doc ++ "changelog.Debian.gz", .bytes = &.{ 0x1f, 0x8b, 0x08, 0x00 } },
+        .{ .path = doc ++ "README", .bytes = "Run apt update after installing.\n" },
+        .{ .path = doc ++ "README.link", .kind = .symlink, .bytes = "README" },
+        .{ .path = doc ++ "examples", .kind = .directory },
+    }, null);
+}
+
+/// The unmodified upstream descriptor reviewed for issue #341, fetched from
+/// https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb.
+const reviewed_microsoft_descriptor = @embedFile("fixtures/packages-microsoft-prod_1.2-ubuntu24.04_all.deb");
+
+fn inspectReviewedMicrosoftDescriptor(bytes: []const u8) !deb_payload.Validation {
+    return switch (deb_payload.inspectLocal(std.testing.allocator, bytes, .{
+        .source = "repository-descriptor",
+        .filename = "packages-microsoft-prod.deb",
+        .size = bytes.len,
+        .sha256 = sha256(bytes),
+        .profile = .repository_descriptor,
+    }, .{})) {
+        .diagnostic => |diagnostic| {
+            std.debug.print("descriptor diagnostic: {t} {t}\n", .{ diagnostic.stage, diagnostic.code });
+            return error.InvalidRepositoryDescriptor;
+        },
+        .validation => |value| value,
+    };
+}
+
+test "repository backend admits the reviewed upstream Microsoft Noble descriptor" {
+    const bytes = reviewed_microsoft_descriptor;
+    try std.testing.expectEqualStrings(
+        "c13f01ac7c3001b51a9281d40dde666db5e037e05512840c319832f7852bfec4",
+        &std.fmt.bytesToHex(sha256(bytes), .lower),
+    );
+    var validation = try inspectReviewedMicrosoftDescriptor(bytes);
+    defer validation.deinit();
+    try std.testing.expectEqualStrings("packages-microsoft-prod", validation.package);
+    try std.testing.expectEqualStrings("1.2-ubuntu24.04", validation.version);
+    try std.testing.expectEqualStrings("all", validation.architecture);
+    // dpkg never creates the control extraction root, so its upstream 0775
+    // mode is recorded but not judged.
+    try std.testing.expectEqual(@as(u32, 0o775), validation.control.root.?.mode);
+    try std.testing.expectEqual(@as(usize, 3), validation.scripts.len);
+
+    const doc = "usr/share/doc/packages-microsoft-prod/";
+    var copies: usize = 0;
+    for (validation.data.entries) |entry| {
+        if (std.mem.eql(u8, entry.path, doc ++ "microsoft-prod.list") or
+            std.mem.eql(u8, entry.path, doc ++ "microsoft-prod.gpg")) copies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), copies);
+
+    const managed = [_]struct { path: []const u8, sha256: []const u8 }{
+        .{ .path = "/etc" ++ "/apt/sources.list.d/microsoft-prod.list", .sha256 = "b1603241c9619c02611a77a663f55e726608bde079c4f559bcccdf73847a45c8" },
+        .{ .path = "/usr/share/keyrings/microsoft-prod.gpg", .sha256 = "098f10efd65c0d0a856a980144b5f37c05374eaa575a208d46913fd8f7eae951" },
+    };
+    for ([_][]const u8{ "amd64", "arm64" }) |architecture| {
+        var material = try inspectDescriptorMaterial(
+            std.testing.allocator,
+            &validation,
+            architecture,
+            .{},
+            .{},
+            reviewed_repository_profile.production_profiles,
+        );
+        defer material.deinit();
+        // One binary index per declared architecture: amd64, arm64 and armhf.
+        try std.testing.expectEqual(@as(usize, 3), material.configuration.repositories.len);
+        for (material.configuration.repositories) |repository| {
+            try std.testing.expectEqualStrings("noble", repository.suite);
+            try std.testing.expectEqualStrings("main", repository.component);
+            try std.testing.expectEqual(
+                @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
+                repository_refresh.expiryPolicyMaxAge(repository.freshness),
+            );
+        }
+        try std.testing.expectEqual(managed.len, material.evidence.len);
+        for (managed, material.evidence) |expected, actual| {
+            try std.testing.expectEqualStrings(expected.path, actual.logical_path);
+            try std.testing.expectEqualStrings(expected.sha256, &std.fmt.bytesToHex(actual.sha256, .lower));
+        }
+        const listed = material.find(managed[0].path) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(
+            @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
+            repository_refresh.expiryPolicyMaxAge(listed.freshness),
+        );
+    }
+    // Admitting the descriptor shape does not relax freshness on its own.
+    var unreviewed = try inspectDescriptorMaterial(std.testing.allocator, &validation, "amd64", .{}, .{}, &.{});
+    defer unreviewed.deinit();
+    for (unreviewed.configuration.repositories) |repository|
+        try std.testing.expectEqual(@as(?u64, null), repository_refresh.expiryPolicyMaxAge(repository.freshness));
+    try std.testing.expectEqual(
+        repository_refresh.ExpiryPolicy.require_valid_until,
+        (unreviewed.find(managed[0].path) orelse return error.TestUnexpectedResult).freshness,
+    );
+
+    // A single changed byte in either upstream documentation copy is dynamic.
+    for ([_][]const u8{ doc ++ "microsoft-prod.list", doc ++ "microsoft-prod.gpg" }) |copy| {
+        const content = try validation.regularPayloadBytes(copy, 1024 * 1024);
+        const at = @intFromPtr(content.ptr) - @intFromPtr(validation.data_bytes.ptr) + content.len / 2;
+        validation.data_bytes[at] ^= 0x20;
+        defer validation.data_bytes[at] ^= 0x20;
+        try std.testing.expectError(error.DynamicRepositoryMaterial, inspectDescriptorMaterial(
+            std.testing.allocator,
+            &validation,
+            "amd64",
+            .{},
+            .{},
+            reviewed_repository_profile.production_profiles,
+        ));
+    }
 }
 
 test "repository backend uses installed dependencies before requesting refresh" {

@@ -7981,9 +7981,13 @@ fn emitTriggerHandoff(
 /// The list is dpkg's exact ownership publication: every archive-owned path,
 /// including `/.` only when the archive has a root entry. Synthesized
 /// parent directories are not published, because the package does not own
-/// them. `md5sums` covers the regular payload files and the hard links that
-/// share their content, and never a directory or a symbolic link.
+/// them. A shipped `md5sums` member is published verbatim, in its order and
+/// spelling, as dpkg's `pkg_infodb_update` installs it. Otherwise, like
+/// dpkg's `write_filehash_except`, `md5sums` covers the regular payload files
+/// and the hard links that share their content, and never a directory or a
+/// symbolic link.
 fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
+    const shipped_md5sums = item.model.features.checksum_manifest;
     if (item.model.root != null)
         try item.list_paths.append(builder.allocator, package_database.root_list_path);
     for (item.paths.items) |planned| {
@@ -7997,12 +8001,22 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
             builder.allocator,
             try absoluteSpelling(builder, logical_path),
         );
+        if (shipped_md5sums) continue;
         switch (planned.kind) {
             .regular, .hardlink => try item.md5sums.append(builder.allocator, .{
                 .path = logical_path,
                 .digest = planned.md5.?,
             }),
             .directory, .symlink, .fifo => {},
+        }
+    }
+    if (shipped_md5sums) {
+        for (item.model.checksums) |checksum| {
+            try item.md5sums.append(builder.allocator, .{
+                .path = checksum.path,
+                .digest = checksum.md5,
+                .listed = if (checksum.listed.len == checksum.path.len) null else checksum.listed,
+            });
         }
     }
     for (item.conffiles.items) |conffile| {
@@ -8015,7 +8029,8 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
                 try absoluteSpelling(builder, conffile.path),
         );
     }
-    std.mem.sort(package_database.Md5sumEntry, item.md5sums.items, {}, lessMd5sum);
+    if (!shipped_md5sums)
+        std.mem.sort(package_database.Md5sumEntry, item.md5sums.items, {}, lessMd5sum);
 }
 
 fn lessMd5sum(
@@ -8510,6 +8525,8 @@ fn lower(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
         for (item.md5sums.items, 0..) |entry, md5_index| {
             md5sums[md5_index] = entry;
             md5sums[md5_index].path = try builder.arena.dupe(u8, entry.path);
+            if (entry.listed) |listed|
+                md5sums[md5_index].listed = try builder.arena.dupe(u8, listed);
         }
         const conffiles = try builder.arena.alloc(
             PlannedConffile,
@@ -38212,6 +38229,64 @@ test "native_unpack.test.planning is deterministic and descriptive only" {
     try testing.expect(first.database.find("status") != null);
     try testing.expect(first.database.find("info/demo.list") != null);
     try testing.expect(first.database.find("info/demo.md5sums") != null);
+}
+
+fn md5Line(allocator: std.mem.Allocator, content: []const u8, spelling: []const u8) ![]u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(content, &digest, .{});
+    return std.fmt.allocPrint(allocator, "{s}  {s}\n", .{ std.fmt.bytesToHex(digest, .lower), spelling });
+}
+
+test "native_unpack.test.shipped md5sums are published verbatim like dpkg" {
+    const first_content = "first\n";
+    const second_content = "second\n";
+    const unlisted_content = "unlisted\n";
+    const second_line = try md5Line(testing.allocator, second_content, "./usr/share/demo/second");
+    defer testing.allocator.free(second_line);
+    const first_line = try md5Line(testing.allocator, first_content, "usr/share/demo/first");
+    defer testing.allocator.free(first_line);
+    const unlisted_line = try md5Line(testing.allocator, unlisted_content, "usr/share/demo/unlisted");
+    defer testing.allocator.free(unlisted_line);
+    // Unsorted, mixed spellings, and one payload file left out, as a vendor
+    // may ship it; dpkg's pkg_infodb_update installs the member unchanged.
+    const shipped = try std.mem.concat(testing.allocator, u8, &.{ second_line, first_line });
+    defer testing.allocator.free(shipped);
+    const generated = try std.mem.concat(testing.allocator, u8, &.{ first_line, second_line[0..34], second_line[36..], unlisted_line });
+    defer testing.allocator.free(generated);
+
+    const Case = struct { control: []const Entry, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .control = &.{.{ .path = "md5sums", .content = shipped }}, .expected = shipped },
+        .{ .control = &.{.{ .path = "md5sums", .content = "" }}, .expected = "" },
+        .{ .control = &.{}, .expected = generated },
+    };
+    for (cases) |case| {
+        var fixture: Fixture = undefined;
+        try fixture.init(empty_status, &.{});
+        defer fixture.deinit();
+        var data = [_]Entry{
+            .{ .path = "usr", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share/demo", .kind = '5', .mode = 0o755 },
+            .{ .path = "usr/share/demo/unlisted", .content = unlisted_content },
+            .{ .path = "usr/share/demo/second", .content = second_content },
+            .{ .path = "usr/share/demo/first", .content = first_content },
+        };
+        const bytes = try buildOwnedArchive(.{ .package = "demo", .version = "1.0", .control = case.control }, &data);
+        defer testing.allocator.free(bytes);
+        var model = try modelOf(bytes);
+        defer model.deinit();
+        const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+        var artifacts: [1]native_program.ProgramArtifact = undefined;
+        const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+        var planned = try expectPlan(try planFor(
+            &fixture,
+            &program,
+            &.{.{ .artifact = 0, .bytes = bytes }},
+        ));
+        defer planned.deinit();
+        try testing.expectEqualStrings(case.expected, planned.database.find("info/demo.md5sums").?.bytes);
+    }
 }
 
 test "native_unpack.test.archive bytes and database generation are revalidated" {

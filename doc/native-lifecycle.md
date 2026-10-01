@@ -484,6 +484,33 @@ lock and pass retained-evidence verification. Install and upgrade must also
 pass `transaction-result verify`. The package-owned helper must be unchanged. Each architecture proves this for its
 own runner (linux-x64 and linux-arm64 in CI).
 
+### Upstream repository descriptor (#341)
+
+`native_lifecycle_repository_descriptor.zig` runs the unmodified upstream
+`packages-microsoft-prod` `1.2-ubuntu24.04` descriptor, with its real
+`preinst`, `postinst` and `prerm`. The checked-in archive's SHA-256 is
+verified first. `microsoft-repository-descriptor` installs it with a stub
+`ca-certificates` dependency, then deletes the apt source and reinstalls. On
+reinstall, the upstream `preinst` deletes the keyring, dpkg keeps the deleted
+conffiles deleted, and the `postinst` restores both from the
+`usr/share/doc/packages-microsoft-prod/` copies. The scenario then removes
+and purges the package. `microsoft-repository-descriptor-imported` seeds both
+roots with pinned dpkg instead, so native first imports dpkg's verbatim
+`./`-prefixed `md5sums`. Every phase compares the complete root, database and
+script trace with pinned dpkg. The `info/*.md5sums` comparison keeps each
+listed spelling. The installed source, keyring and documentation copies must
+equal the reviewed bytes. On both roots, `info/packages-microsoft-prod.md5sums`
+must equal the shipped control member's pinned SHA-256 after every install and
+reinstall. Pinned `dpkg --verify` must report the same result and exit status
+on both roots. It must be clean after each install. It must also flag the same
+`copyright` file after an identical edit on both sides. On the imported root,
+native is also interrupted during reinstall at `during_filesystem_publication`
+and during removal at `after_script_outcome`. `recover` must complete each
+operation exactly as pinned dpkg does. The restored files' wall-clock mtimes
+are the only normalization. `test-native-lifecycle-zig`
+includes both cases. To run only them, use `--repository-descriptor-only` in
+place of `--removal-only` in the focused command below.
+
 ### Removal and trigger failure inventory (#264)
 
 `test-native-lifecycle-zig` runs `native_lifecycle_removal.zig`; its

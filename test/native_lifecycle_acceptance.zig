@@ -11,6 +11,7 @@ const metadata = @import("native_lifecycle_metadata.zig");
 const alternatives = @import("native_lifecycle_alternatives.zig");
 const dpkg_query = @import("native_dpkg_query.zig");
 const negative = @import("native_lifecycle_negative.zig");
+const repository_descriptor = @import("native_lifecycle_repository_descriptor.zig");
 const options = @import("native_test_options");
 
 const package = foundation.package;
@@ -162,6 +163,7 @@ pub fn main(init: std.process.Init) !void {
     var diversions_only = false;
     var install_boundaries_only = false;
     var removal_only = false;
+    var repository_descriptor_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
@@ -181,6 +183,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--removal-only")) {
             if (removal_only) return error.DuplicateSelector;
             removal_only = true;
+        } else if (std.mem.eql(u8, option, "--repository-descriptor-only")) {
+            if (repository_descriptor_only) return error.DuplicateSelector;
+            repository_descriptor_only = true;
         } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
             driver = option;
         }
@@ -188,7 +193,8 @@ pub fn main(init: std.process.Init) !void {
     try validateSelection(driver, oracle_only);
     if (@as(u8, @intFromBool(diversions_only)) +
         @as(u8, @intFromBool(install_boundaries_only)) +
-        @as(u8, @intFromBool(removal_only)) > 1) return error.InvalidArguments;
+        @as(u8, @intFromBool(removal_only)) +
+        @as(u8, @intFromBool(repository_descriptor_only)) > 1) return error.InvalidArguments;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
@@ -198,6 +204,11 @@ pub fn main(init: std.process.Init) !void {
     const selected = driver orelse "";
     if (removal_only) {
         try removal.run(&fixture, selected, reference.executable, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
+    if (repository_descriptor_only) {
+        try repository_descriptor.run(&fixture, selected, reference.executable, reference.architecture);
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return;
     }
@@ -222,6 +233,10 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     if (!diversions_only) scripts.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return err;
+    };
+    if (!diversions_only) repository_descriptor.run(&fixture, selected, reference.executable, reference.architecture) catch |err| {
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return err;
     };

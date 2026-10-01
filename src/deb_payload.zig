@@ -734,8 +734,10 @@ fn validateDescriptorProfile(
             return fail(.descriptor_profile, .descriptor_limit, control_member.content.start, null, null).diagnostic;
         }
     }
-    if (validateDescriptorRoot(control.root, control_member)) |diagnostic| return diagnostic;
-    if (validateDescriptorRoot(data.root, data_member)) |diagnostic| return diagnostic;
+    // dpkg never materializes the control archive's extraction root, so only
+    // its ownership is checked. Control members keep the strict checks below.
+    if (validateDescriptorRoot(control.root, control_member, .ownership)) |diagnostic| return diagnostic;
+    if (validateDescriptorRoot(data.root, data_member, .mode_and_ownership)) |diagnostic| return diagnostic;
     for (control_entries, 0..) |entry, index| {
         if (entry.mode & 0o6022 != 0) {
             return profileFailure(.descriptor_unsafe_mode, control_member, entry, index);
@@ -813,9 +815,11 @@ fn descriptorControlEntryAllowed(entry: Entry) bool {
     return false;
 }
 
-fn validateDescriptorRoot(root: ?RootEntry, member: deb_archive.Member) ?Diagnostic {
+const DescriptorRootChecks = enum { ownership, mode_and_ownership };
+
+fn validateDescriptorRoot(root: ?RootEntry, member: deb_archive.Member, checks: DescriptorRootChecks) ?Diagnostic {
     const entry = root orelse return null;
-    if (entry.mode & 0o6022 != 0) {
+    if (checks == .mode_and_ownership and entry.mode & 0o6022 != 0) {
         return profileRootFailure(.descriptor_unsafe_mode, member, entry);
     }
     if (!hasUnambiguousRootOwnership(entry)) {
@@ -1664,6 +1668,7 @@ const DescriptorTestOptions = struct {
     extra_data_path: ?[]const u8 = null,
     extra_data_kind: u8 = '0',
     control_root_mode: u32 = 0o755,
+    control_root_kind: u8 = '5',
     data_root_mode: u32 = 0o755,
     script_mode: u32 = 0o755,
     source_mode: u32 = 0o644,
@@ -1690,7 +1695,7 @@ fn descriptorTestDeb(allocator: std.mem.Allocator, options: DescriptorTestOption
         .{options.extra_control_fields},
     );
     defer allocator.free(metadata);
-    try appendOwnedTarEntry(allocator, &control, "./", '5', options.control_root_mode, "", "", options.control_root_ownership);
+    try appendOwnedTarEntry(allocator, &control, "./", options.control_root_kind, options.control_root_mode, "", "", options.control_root_ownership);
     try appendTarEntry(allocator, &control, "./control", '0', 0o644, "", metadata);
     try appendTarEntry(allocator, &control, "./md5sums", '0', 0o644, "", "");
     try appendTarEntry(
@@ -2144,7 +2149,10 @@ test "repository descriptor rejects unsafe maintainer script ownership and modes
         code: Code,
     }{
         .{ .options = .{ .script_mode = 0o775 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .script_mode = 0o777 }, .code = .descriptor_unsafe_mode },
         .{ .options = .{ .script_mode = 0o4755 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .control_root_mode = 0o775, .script_mode = 0o775 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .control_root_mode = 0o777, .script_mode = 0o777 }, .code = .descriptor_unsafe_mode },
         .{ .options = .{ .script_ownership = .{ .uid = 1000 } }, .code = .descriptor_unsafe_owner },
         .{ .options = .{ .script_ownership = .{ .gid = 1000 } }, .code = .descriptor_unsafe_owner },
         .{ .options = .{ .script_ownership = .{ .owner_name = "builder" } }, .code = .descriptor_unsafe_owner },
@@ -2167,9 +2175,10 @@ test "repository descriptor rejects unsafe control and data extraction roots" {
         options: DescriptorTestOptions,
         code: Code,
     }{
-        .{ .options = .{ .control_root_mode = 0o775 }, .code = .descriptor_unsafe_mode },
+        .{ .options = .{ .data_root_mode = 0o775 }, .code = .descriptor_unsafe_mode },
         .{ .options = .{ .data_root_mode = 0o2755 }, .code = .descriptor_unsafe_mode },
         .{ .options = .{ .control_root_ownership = .{ .uid = 1000 } }, .code = .descriptor_unsafe_owner },
+        .{ .options = .{ .control_root_mode = 0o775, .control_root_ownership = .{ .group_name = "users" } }, .code = .descriptor_unsafe_owner },
         .{ .options = .{ .data_root_ownership = .{ .group_name = "users" } }, .code = .descriptor_unsafe_owner },
     };
     for (cases) |case| {
@@ -2180,6 +2189,44 @@ test "repository descriptor rejects unsafe control and data extraction roots" {
         }, .{});
         try std.testing.expectEqual(Stage.descriptor_profile, result.diagnostic.stage);
         try std.testing.expectEqual(case.code, result.diagnostic.code);
+    }
+}
+
+test "repository descriptor ignores only the control extraction root mode" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 0o775, 0o777, 0o2775 }) |mode| {
+        const bytes = try descriptorTestDeb(allocator, .{ .control_root_mode = mode });
+        defer allocator.free(bytes);
+        var result = inspectLocal(allocator, bytes, .{
+            .profile = .repository_descriptor,
+        }, .{});
+        switch (result) {
+            .diagnostic => |diagnostic| {
+                std.debug.print("{s} at {d}\n", .{ diagnostic.message(), diagnostic.offset });
+                return error.UnexpectedDiagnostic;
+            },
+            .validation => |*validation| {
+                defer validation.deinit();
+                const root = validation.control.root orelse return error.MissingControlRoot;
+                try std.testing.expectEqual(mode, root.mode);
+            },
+        }
+    }
+}
+
+test "repository descriptor rejects a non-directory control extraction root" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 0o644, 0o775 }) |mode| {
+        const bytes = try descriptorTestDeb(allocator, .{
+            .control_root_kind = '0',
+            .control_root_mode = mode,
+        });
+        defer allocator.free(bytes);
+        const result = inspectLocal(allocator, bytes, .{
+            .profile = .repository_descriptor,
+        }, .{});
+        try std.testing.expectEqual(Stage.control_tar, result.diagnostic.stage);
+        try std.testing.expectEqual(Code.unsafe_path, result.diagnostic.code);
     }
 }
 
