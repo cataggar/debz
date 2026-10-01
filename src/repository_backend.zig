@@ -12011,7 +12011,14 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
         const expected = declared.binding orelse {
             try std.testing.expectError(
                 error.MalformedRepositorySource,
-                inspectDescriptorMaterial(std.testing.allocator, &validation, "amd64", .{}, .{}),
+                inspectDescriptorMaterial(
+                    std.testing.allocator,
+                    &validation,
+                    "amd64",
+                    .{},
+                    .{},
+                    reviewed_repository_profile.production_profiles,
+                ),
             );
             continue;
         };
@@ -12021,6 +12028,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             "amd64",
             .{},
             .{},
+            reviewed_repository_profile.production_profiles,
         );
         defer declared_material.deinit();
         try std.testing.expectEqual(@as(usize, 1), declared_material.configuration.repositories.len);

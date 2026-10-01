@@ -42658,6 +42658,7 @@ test "native_unpack.test.verifyUnchanged preserves procps-shaped newconffile sta
         .exact_lock = &lock.lock,
         .archives = &.{},
         .policy = .{ .conffile = .keep_existing },
+        .archive_digest_policy = .published_digests,
     });
     const after = try fixture.root().readFileAlloc(
         testing.allocator,
