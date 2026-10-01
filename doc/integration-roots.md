@@ -127,8 +127,9 @@ receipt, and cleared root-operation evidence before it can proceed to the no-op 
 A failed verification leaves the installed root and provenance intact for
 diagnosis, but is never reported as wrapper completion.
 
-Every candidate command is time-bounded. Refresh, planning, download and the
-zero-action `upgrade-all` keep a fixed 30-minute limit; each
+**Acceptance time bounds.** Every candidate command is time-bounded.
+Refresh, planning, download and the zero-action `upgrade-all` keep a fixed
+30-minute limit; each
 `transaction-result verify` and the injected-failure probe keep 10 minutes.
 Native `install` is instead bounded by **durable progress**. Every second the
 wrapper fingerprints (inode, size and nanosecond mtime) the root, its
@@ -163,16 +164,98 @@ final verdict, exit status and longest progress gap. A stop also writes
 `create-watchdog.txt` with host load and the install process group's state,
 CPU time and wait channel.
 
-Traced candidate commands run under `strace -f --seccomp-bpf` with only
-`execve`/`execveat` selected. A seccomp filter stops the tracee only at those
-calls, so the audit sees the same exec records as before. Without the filter,
-ptrace stopped the install at every system call, and it spent most of its
-wall time in `ptrace_stop` (see run 36725228331 below).
+Traced candidate commands run under `strace -f --seccomp-bpf -qq -yy -s 4096
+--pidns-translation -e signal=none` with only `execve`, `execveat`, `fork`,
+`vfork`, `clone` and `clone3` selected. A seccomp filter stops the tracee only
+at those calls, so the audit sees every exec and the process that made it.
+Without the filter, ptrace stopped the install at every system call, and it
+spent most of its wall time in `ptrace_stop` (see run 36725228331 below).
 Before the `--seccomp-bpf` change, `strace` set no filter. `strace` now sets
 `no_new_privs` on the traced command before starting it. The command already
 runs as UID 0 with full capabilities, so the flag only blocks privilege gains
 at exec that the command could not use. The maintainer-script sandbox already
 sets the flag for every script.
+
+**Native exec audit.** Every traced `execve` or `execveat` of a path named
+`dpkg` or `dpkg-deb` fails the wrapper with exit 90, even when the command
+failed, with one exception. A maintainer script may query the target root's
+own dpkg read-only, as it would under dpkg; for example,
+`dpkg-maintscript-helper` runs `dpkg --validate-version` and
+`--compare-versions`. Such an exec is allowed only when all of these hold:
+
+- It descends, through traced `fork`, `vfork`, `clone` or `clone3` children,
+  from a successful exec of `/var/lib/debz-lifecycle-scripts/<package>.<action>`
+  (or the same script under `/var/lib/dpkg/info`), for a `preinst`,
+  `postinst`, `prerm` or `postrm` action, made by a process still running the
+  candidate `debz` binary. That process must itself descend from the traced
+  command. A script path alone is never enough: a process that runs such a
+  script without this lineage is refused.
+- It is a successful plain `execve` whose filename is exactly `/usr/bin/dpkg`,
+  with `argv[0]` `dpkg` or `/usr/bin/dpkg` and no truncated string. `argv[0]`
+  is only a label; the filename and the identity check below decide which
+  binary ran.
+- `argv[1]` is `--compare-versions`, `--validate-version`,
+  `--print-architecture`, `-s`, `-L` or `-l`. No later argument starts with
+  `--root`, `--admindir`, `--instdir` or `--force`, and no other option comes
+  before `--`.
+- No PID in its lineage was reused or superseded within the trace.
+- After the command, the root's `/usr/bin/dpkg` is a regular file, opened
+  without following a symlink in any path component, with the reviewed size
+  and SHA-256 for the runner's architecture. No `dpkg` exists in
+  `usr/local/sbin`, `usr/local/bin`, `usr/sbin` or `sbin`, with symlinks
+  resolved inside the root. The scripts' `PATH` is
+  `/usr/sbin:/usr/bin:/sbin:/bin`, so this covers every directory searched
+  before `/usr/bin`, and a few more. The status database records `dpkg` at
+  the reviewed version and architecture.
+
+The reviewed identity is dpkg `1.23.7ubuntu2` from the `20261001T000000Z`
+snapshot. Each digest was taken from that architecture's authenticated
+archive and is never shared across architectures:
+
+| Architecture | `/usr/bin/dpkg` bytes | SHA-256 |
+| --- | ---: | --- |
+| amd64 | 322,728 | `6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f` |
+| arm64 | 330,816 | `d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4` |
+
+The pins are bound to that snapshot. A different pinned snapshot makes the
+audit fail with exit 91 until the pins are reviewed again, as does an
+unreadable trace or root. `execveat`, `dpkg-deb`, every other action and
+option, and any dpkg exec that does not descend from such a script still
+fail with exit 90.
+
+These queries hand no transaction step to dpkg. dpkg would run the same
+scripts the same way, and the reviewed actions only compare or validate
+versions or read the root's architecture and package database. `debz` still
+performs every unpack, configuration, trigger and state update itself.
+Script-invoked dpkg-family tools that change state, such as `dpkg-divert` and
+`dpkg-statoverride`, are tracked separately in #334.
+
+`argv[0]` `/usr/bin/dpkg` is accepted because `py3compile -p` runs
+`/usr/bin/dpkg -L` with that absolute `argv[0]` (`debpython/files.py` in
+python3-minimal `3.14.7-3`). Six postinsts in the amd64 `20261001T000000Z`
+closure run it: python3-minimal, python3, python3-apt, python3-netplan,
+python3-yaml and ubuntu-pro-client. Any other `argv[0]`, such as `./dpkg`,
+`/bin/dpkg` or `/usr/bin//dpkg`, is refused.
+
+`/bin/dpkg` is refused as a filename and as `argv[0]`, even when `/bin` is the
+usrmerge link to `usr/bin` and the file it reaches is the reviewed one. No
+maintainer script in the amd64 `20261001T000000Z` control-script scan names
+it, and the scripts' `PATH` reaches `/usr/bin` before `/bin`. Accepting it
+would add a root symlink lookup to the decision, which gains nothing.
+
+For each audited operation, `native-exec-audit.txt` records:
+
+- a `script_dpkg_exec` line for each allowed call, with its trace line, PID,
+  script, script PID, PID lineage and argv;
+- a `forbidden_exec` line for each refusal, with its reason;
+- the `dpkg` identity that was checked;
+- the `allowed_script_dpkg_exec` and `forbidden_dpkg_exec` totals.
+
+`exec-audit-summary.txt` totals the audited operations and allowed calls.
+The CI diagnostics step re-audits every retained trace against the
+still-present root, using the production pins. It records the results in
+`exec-reaudit.txt`, writes `forbidden-exec.txt` on refusal, and adds the
+allowed count to the job summary.
 
 The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
 the native wrapper step (the 180-minute install ceiling plus refresh,
@@ -188,7 +271,8 @@ database, helper placeholder, package state, merged-/usr links, or private
 debz namespace is pre-created. It authenticates metadata, resolves a genuine
 v3 lock, and can bootstrap the private trigger helper only from the exact
 authenticated `dpkg` archive and final owner evidence. Candidate commands are
-optionally exec-traced and fail if they launch `dpkg` or `dpkg-deb`.
+optionally exec-traced and fail if they launch `dpkg` or `dpkg-deb` outside
+the read-only script exception in "Native exec audit" above.
 The isolated oracle is the architecture-pinned dpkg 1.22.22 payload prepared
 under `.cache`; its executable and receipt are reverified before reference
 execution. Python is transport for that reference artifact, not the
@@ -1788,6 +1872,12 @@ read-only, not retried as a new installation. A full pinned-reference
 root and bounded differential capture for this exact lock have **not**
 been compared; the manual two-architecture parity gate remains open.
 
+The wrapper runs below, from run 36434581928 through the local traced arm64
+run, used the earlier `20260923T000000Z` pin and its 175-package locks. The
+`20261001T000000Z` repin changes the closure, for example sudo-rs and
+util-linux. Their durations bound the current limits, but they are not
+evidence for the current pin's closure or exec audit.
+
 On source `3620f7ba36f6b839e79dcdfdae963bd3d67ebe3e`, a separate manual
 [CI run](https://github.com/cataggar/debz/actions/runs/36434581928) exercised
 the corrected wrapper on a **new** amd64 root. The authenticated signer was
@@ -1820,10 +1910,10 @@ The trace audit then refused the run with exit **90**. The xkb-data preinst,
 through `dpkg-maintscript-helper`, and the libc6 preinst ran the target
 root's `/usr/bin/dpkg --validate-version` and `--compare-versions`. These are
 maintainer-script utility calls inside the script sandbox, not `debz`
-delegating an installation to `dpkg`. The audit still matches every
-`dpkg`/`dpkg-deb` exec, so no traced fresh root can finish the wrapper until
-it distinguishes these calls. The workflow cleaned up the interrupted root,
-and it is not wrapper-completion proof.
+delegating an installation to `dpkg`. The audit then matched every
+`dpkg`/`dpkg-deb` exec. The native exec audit above now allows these script
+queries. The workflow cleaned up the interrupted root, and it is not
+wrapper-completion proof.
 
 A single-job probe (Actions run 36772399199, since deleted under CI runner
 rationing; its bounded artifact was retained offline) ran on source
@@ -1860,8 +1950,23 @@ within 6 minutes, and progress never paused for more than 3 seconds.
 an identical 398,143-byte ledger after 1,240 seconds, compared with 1,305
 seconds untraced. Seccomp-filtered tracing therefore adds no measurable
 install cost. `create.execve` still recorded each maintainer-script exec and
-its children, so the audit refused the run with exit **90** on the xkb-data
-`dpkg --validate-version` call described above.
+its children. The audit at that time matched every `dpkg` exec, so it refused
+the run with exit **90** on the xkb-data `dpkg --validate-version` call
+described above. The native exec audit now allows that call.
+
+On the `20261001T000000Z` pin, the same local arm64 host ran this wrapper,
+with the native exec audit and its trace flags, and a ReleaseSafe `debz`
+(SHA-256 `1a34be2e6392609307a72eeb4d9a05705af3d61229b541cda745138acb03705f`)
+built from unchanged source `d568d70d018f92177aeaf4b30292b7c1b9d0ff5b`.
+All 175 arm64 packages were unpacked. After 988 seconds, `install` again
+stopped at the mawk `InvalidAlternativesTool` step (exit 8, #262), with 24
+packages configured. The audit allowed exactly two script queries. Through
+`dpkg-maintscript-helper`, the xkb-data preinst and postinst each ran
+`dpkg --validate-version -- 2.46-2~`. Each has lineage
+`debz > script > helper > dpkg`, and the root's `/usr/bin/dpkg` matched the
+reviewed arm64 identity. Nothing was refused, so the wrapper exited with
+install's status 8 rather than 90. This is evidence for the audit only, not
+for wrapper completion.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
