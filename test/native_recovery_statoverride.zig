@@ -22,6 +22,10 @@ const Case = struct {
     drift: ?Drift = null,
 };
 
+const refresh_provider = "statoverride-refresh-provider";
+const refresh_consumer = "statoverride-refresh-consumer";
+const refresh_target = "usr/share/statoverride-refresh-consumer/mode";
+
 const cases = [_]Case{
     .{ .operation = "install", .boundary = "after_execution_intent" },
     .{ .operation = "install", .boundary = "during_filesystem_publication" },
@@ -310,6 +314,175 @@ fn runCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
         return error.RepeatedRecoveryReplacedReceipt;
 }
 
+fn installDpkgStatoverride(case: *support.Scenario, dpkg: []const u8) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const root_path = try support.path(case.fixture.allocator, case.name, side);
+        defer case.fixture.allocator.free(root_path);
+        try support.copyReferenceTool(case.fixture, root_path, dpkg, "dpkg-statoverride", "/usr/bin/dpkg-statoverride");
+    }
+}
+
+fn expectRefreshMetadata(fixture: *foundation.Fixture, root_path: []const u8) !void {
+    var dir = try foundation.guardedRoot(fixture.io, root_path);
+    defer dir.close(fixture.io);
+    const entry = try (root_fs.Root.init(fixture.io, dir)).entry(try root_fs.Path.initPackage(refresh_target));
+    if (entry.mode != 0o4750 or entry.uid != 42420 or entry.gid != 42421)
+        return error.WrongRecoveredStatoverrideMetadata;
+}
+
+fn makeRefreshPackages(
+    fixture: *foundation.Fixture,
+    arch: []const u8,
+    workspace: []const u8,
+) !struct { provider: []u8, consumer: []u8 } {
+    const provider_script = try std.fmt.allocPrint(fixture.allocator,
+        \\if [ "$1" = configure ]; then
+        \\    /usr/bin/dpkg-statoverride --update --add _debzstat _debzstat 4750 /{s} || exit 31
+        \\fi
+        \\
+    , .{refresh_target});
+    defer fixture.allocator.free(provider_script);
+    const provider_workspace = try support.path(fixture.allocator, workspace, "provider");
+    defer fixture.allocator.free(provider_workspace);
+    const provider_archive = try support.makePackage(fixture, arch, "1", refresh_provider, provider_workspace, .{
+        .scripts = .{ .only_postinst = true },
+        .postinst_append = provider_script,
+    });
+    errdefer fixture.allocator.free(provider_archive);
+    const consumer_workspace = try support.path(fixture.allocator, workspace, "consumer");
+    defer fixture.allocator.free(consumer_workspace);
+    const consumer_archive = try support.makePackage(fixture, arch, "1", refresh_consumer, consumer_workspace, .{
+        .control_fields = "Pre-Depends: " ++ refresh_provider ++ " (= 1)\n",
+        .no_scripts = true,
+        .extra_files = &.{.{ .path = refresh_target, .content = "permission-sensitive payload\n" }},
+    });
+    errdefer fixture.allocator.free(consumer_archive);
+    return .{ .provider = provider_archive, .consumer = consumer_archive };
+}
+
+fn refreshActions(arch: []const u8) [4]support.Action {
+    return .{
+        .{ .sequence = 0, .kind = "unpack", .package = refresh_provider, .architecture = arch },
+        .{ .sequence = 1, .kind = "configure_pending", .package = refresh_consumer, .architecture = arch },
+        .{ .sequence = 2, .kind = "unpack", .package = refresh_consumer, .architecture = arch },
+        .{ .sequence = 3, .kind = "configure_pending", .package = refresh_consumer, .architecture = arch },
+    };
+}
+
+fn runRefreshCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, tamper: bool) !void {
+    const name = try std.fmt.allocPrint(fixture.allocator, "statoverride-refresh-recovery{s}", .{
+        if (tamper) "-tamper" else "",
+    });
+    defer fixture.allocator.free(name);
+    const package_workspace = try support.path(fixture.allocator, name, "packages");
+    defer fixture.allocator.free(package_workspace);
+    const archives = try makeRefreshPackages(fixture, arch, package_workspace);
+    defer fixture.allocator.free(archives.provider);
+    defer fixture.allocator.free(archives.consumer);
+    const archive_list = [_][]const u8{ archives.provider, archives.consumer };
+    const selected = [_]foundation.PackageIdentity{
+        .{ .name = refresh_provider, .architecture = arch },
+        .{ .name = refresh_consumer, .architecture = arch },
+    };
+    const actions = refreshActions(arch);
+    const groups = [_][]const []const u8{ &.{archives.provider}, &.{archives.consumer} };
+
+    var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer case.deinit();
+    try statoverride.seed(&case, "");
+    try installDpkgStatoverride(&case, dpkg);
+
+    if (!tamper) {
+        const control_name = try std.fmt.allocPrint(fixture.allocator, "{s}-uncrashed", .{name});
+        defer fixture.allocator.free(control_name);
+        var control = try support.Scenario.init(fixture, control_name, driver, dpkg, arch, true);
+        defer control.deinit();
+        try statoverride.seed(&control, "");
+        try installDpkgStatoverride(&control, dpkg);
+        try control.phase(.{
+            .operation = "install",
+            .archives = &archive_list,
+            .reference_groups = &groups,
+            .packages = &selected,
+            .ordered_actions = &actions,
+            .triggers = false,
+        }, false);
+        try expectRefreshMetadata(fixture, control.native_root);
+    }
+
+    const reference_log = try support.path(fixture.allocator, name, "reference-execution");
+    defer fixture.allocator.free(reference_log);
+    try fixture.directory(reference_log);
+    for (groups, 0..) |group, index| {
+        const group_log = try std.fmt.allocPrint(fixture.allocator, "{s}/group-{d}", .{ reference_log, index });
+        defer fixture.allocator.free(group_log);
+        try fixture.directory(group_log);
+        const reference_status = try support.reference(fixture, dpkg, case.reference_root, .{
+            .operation = "install",
+            .archives = group,
+            .packages = &selected,
+            .triggers = false,
+        }, group_log);
+        if (reference_status != 0) return error.UnexpectedReferenceOutcome;
+    }
+
+    const crash_log = try support.path(fixture.allocator, name, "crash");
+    defer fixture.allocator.free(crash_log);
+    if (try process.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+        .operation = "install",
+        .archives = &archive_list,
+        .packages = &selected,
+        .ordered_actions = &actions,
+        .crash_at = "after_script_outcome",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) |value| {
+        var invalid = value;
+        invalid.deinit();
+        return error.MissingCrash;
+    }
+    for (archive_list) |path| {
+        try fixture.dir.deleteFile(fixture.io, path[fixture.path.len + 1 ..]);
+        try support.absent(fixture, path[fixture.path.len + 1 ..]);
+    }
+    if (tamper) {
+        const path = try process.rootPath(fixture, case.native_root, "var/lib/dpkg/statoverride");
+        defer fixture.allocator.free(path);
+        try support.fixtureFile(fixture, path, "#42422 #42423 0640 /" ++ refresh_target ++ "\n", 0o644);
+    }
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    const recovery_log = try support.path(fixture.allocator, name, "recover");
+    defer fixture.allocator.free(recovery_log);
+    var report = (try process.invoke(fixture, driver, case.native_root, arch, recovery_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer report.deinit();
+    if (tamper) {
+        if (!std.mem.eql(u8, report.value.outcome, "recovery_required") or
+            std.mem.indexOf(u8, report.value.detail, "managed_state_changed") == null)
+            return error.StatoverrideRefreshTamperAccepted;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        if (!std.mem.eql(u8, before, after)) return error.BlockedRecoveryMutatedRoot;
+        return;
+    }
+    try process.same(report.value.outcome, "applied");
+    const comparison = try support.path(fixture.allocator, name, "comparison");
+    defer fixture.allocator.free(comparison);
+    try fixture.directory(comparison);
+    try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+    try expectRefreshMetadata(fixture, case.native_root);
+    try support.assertDatabaseBytes(&case, "statoverride");
+    try support.assertDatabaseBytes(&case, "statoverride-old");
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var arguments = init.minimal.args.iterate();
@@ -328,6 +501,10 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after statoverride failure: {s}\n", .{@errorName(err)});
+    try runRefreshCase(&fixture, driver, reference.executable, reference.architecture, false);
+    std.debug.print("statoverride refresh after_script_outcome: recovered\n", .{});
+    try runRefreshCase(&fixture, driver, reference.executable, reference.architecture, true);
+    std.debug.print("statoverride refresh after_script_outcome: tamper blocked\n", .{});
     for (cases) |entry| {
         try runCase(&fixture, driver, reference.executable, reference.architecture, entry);
         std.debug.print("statoverride {s}/{s}: recovered or blocked\n", .{ entry.operation, entry.boundary });

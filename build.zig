@@ -1419,7 +1419,7 @@ pub fn build(b: *std.Build) void {
     });
     statoverride_recovery.addArtifactArg(statoverride_recovery_executable);
     statoverride_recovery.addArtifactArg(native_lifecycle_tests);
-    b.step("test-native-recovery-zig-statoverride", "Run 17 real statoverride crash/recovery cases")
+    b.step("test-native-recovery-zig-statoverride", "Run 19 real statoverride crash/recovery cases")
         .dependOn(&statoverride_recovery.step);
 
     const literal_recovery_module = b.createModule(.{

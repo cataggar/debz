@@ -1381,14 +1381,14 @@ fn refreshExecutionStatOverrides(
     temporary: std.mem.Allocator,
     root: root_fs.Root,
     native_architecture: []const u8,
-) !void {
+) !bool {
     var captured = try captureDatabaseSnapshot(temporary, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, native_architecture);
     if (statOverrideDatabaseMatches(
         execution.stat_override_database_bytes,
         captured.snapshot.statoverride,
-    )) return;
+    )) return false;
 
     var database = switch (try package_database.importSnapshot(temporary, .{
         .native_architecture = native_architecture,
@@ -1416,6 +1416,7 @@ fn refreshExecutionStatOverrides(
     execution.stat_overrides = resolved;
     execution.stat_override_database_bytes =
         try copyStatOverrideDatabaseBytes(persistent, captured.snapshot.statoverride);
+    return true;
 }
 
 const CombinedMutationHooks = struct {
@@ -23863,7 +23864,7 @@ fn runLifecycleScript(
             const disposition = nativeScriptDisposition(owned.outcome);
             switch (disposition) {
                 .exited => |code| if (code == 0 and kind != .preinst) {
-                    try refreshExecutionStatOverrides(
+                    _ = try refreshExecutionStatOverrides(
                         execution,
                         allocator,
                         root,
@@ -24200,7 +24201,7 @@ fn runLifecycleScript(
                 try attempt.requireRecovery(allocator, .script);
                 return err;
             };
-            if (refresh_stat_overrides) refreshExecutionStatOverrides(
+            const stat_overrides_refreshed = if (refresh_stat_overrides) refreshExecutionStatOverrides(
                 execution,
                 allocator,
                 root,
@@ -24208,7 +24209,7 @@ fn runLifecycleScript(
             ) catch |err| {
                 try attempt.requireRecovery(allocator, .script);
                 return err;
-            };
+            } else false;
             if (mid_unpack and execution.phase_steps == null)
                 validateManagedDiversionUpdate(
                     allocator,
@@ -24224,7 +24225,10 @@ fn runLifecycleScript(
                     runtime,
                     recovery_action,
                     execution.phase_steps orelse &.{},
-                    &.{},
+                    if (stat_overrides_refreshed)
+                        execution.stat_overrides.?.observed_paths
+                    else
+                        &.{},
                     execution.phase_steps != null,
                 ) catch |err| {
                     try attempt.requireRecovery(allocator, .script);
@@ -24280,7 +24284,7 @@ fn runLifecycleScript(
             try attempt.requireRecovery(allocator, .script);
             return err;
         };
-        if (refresh_stat_overrides) refreshExecutionStatOverrides(
+        if (refresh_stat_overrides) _ = refreshExecutionStatOverrides(
             execution,
             allocator,
             root,

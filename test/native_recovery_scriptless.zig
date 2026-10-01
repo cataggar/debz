@@ -25,6 +25,7 @@ pub const Invocation = struct {
     operation: []const u8,
     archives: []const []const u8 = &.{},
     packages: []const foundation.PackageIdentity = &.{},
+    ordered_actions: ?[]const support.Action = null,
     crash_at: ?[]const u8 = null,
     triggers: bool = true,
     defer_triggers: bool = false,
@@ -92,7 +93,7 @@ pub fn invoke(
     var guarded = try foundation.guardedRoot(fixture.io, root);
     guarded.close(fixture.io);
     if (std.mem.eql(u8, input.operation, "recover") and
-        (input.archives.len != 0 or input.packages.len != 0 or input.crash_at != null))
+        (input.archives.len != 0 or input.packages.len != 0 or input.ordered_actions != null or input.crash_at != null))
         return error.RecoveryMustUsePersistedEvidence;
     if (input.isolated_helper and !input.caller_owned) return error.IsolatedHelperRequiresCaller;
     try fixture.directory(destination);
@@ -111,6 +112,7 @@ pub fn invoke(
         .operation = input.operation,
         .archives = input.archives,
         .packages = input.packages,
+        .ordered_actions = input.ordered_actions,
         .report = response_absolute,
         .recovery = true,
         .triggers = input.triggers,
