@@ -294,7 +294,7 @@ pub fn build(b: *std.Build) void {
     debian_closure_inventory_step.dependOn(
         &install_debian_closure_inventory.step,
     );
-    test_step.dependOn(&run_debian_closure_inventory_tests.step);
+    workload_core.dependOn(&run_debian_closure_inventory_tests.step);
 
     const apt_system_acceptance_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-acceptance.zig"),

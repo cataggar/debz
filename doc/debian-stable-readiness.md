@@ -330,6 +330,14 @@ reviewed bounded policy expires at **2026-10-13T07:55:41Z**:
   and both indexes) in `tools/fixtures/debian-stable-readiness-v1.json`,
   then rerun and re-record.
 - Never override the clock or lengthen the bound.
+- A newer snapshot timestamp does not by itself extend the window. On
+  2026-10-01 the newest snapshot (`20261001T022342Z`) served a byte-identical
+  trixie `InRelease` (same SHA256, Date 2026-09-12, no `Valid-Until`).
+  Stable's Release is re-signed only at point releases, so the pin cannot be
+  refreshed until the next one (13.8). The `trixie-updates`,
+  `trixie-proposed-updates` and `trixie-security` Releases carry only a
+  7-day `Valid-Until`. A sustainable freshness policy for frozen stable
+  pockets is tracked in #330.
 
 **Fail-closed tests.**
 
