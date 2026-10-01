@@ -270,6 +270,12 @@ pub fn build(b: *std.Build) void {
             .{lock[1]},
         )),
     });
+    debian_closure_inventory_module.addAnonymousImport("debian_closure_evidence", .{
+        .root_source_file = b.path("tools/fixtures/debian-stable-closure-v1/evidence.json"),
+    });
+    debian_closure_inventory_module.addAnonymousImport("debian_stable_pin", .{
+        .root_source_file = b.path("tools/fixtures/debian-stable-readiness-v1.json"),
+    });
     const debian_closure_inventory = b.addExecutable(.{
         .name = "debian-closure-inventory",
         .root_module = debian_closure_inventory_module,

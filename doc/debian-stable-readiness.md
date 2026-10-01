@@ -322,10 +322,21 @@ clean runs per architecture. `policy_sha256`
 reviewed bounded policy expires at **2026-10-13T07:55:41Z**:
 
 - After that time, `run` refuses before any network access or workspace
-  creation, and debz `refresh` refuses on its own.
+  creation with the typed `pin_expired` result (`PinExpired`, exit status
+  75, distinct from verification failures, which exit 2), naming the next
+  point release or #330. debz `refresh` also refuses on its own.
 - The committed evidence remains an offline-verifiable, dated record; it
-  keeps both `recorded_on` and `expires_at`. `check` never consults the
-  clock.
+  keeps both `recorded_on` and `expires_at`. Neither required check reads
+  the wall clock, so CI does not start failing at expiry:
+  - `check` and the `security-audit` unit tests evaluate fixed instants;
+    a test traps any clock read during `check`.
+  - `zig build test-debian-closure-inventory` (in the required
+    `test-workload-core` partition) verifies the evidence at its recorded
+    day. A test runs it with now = 2026-10-14, at the exact boundary and a
+    decade later. The verdict never changes; only a diagnostic reports
+    `pin_expired_awaiting_point_release`.
+- Live re-resolution (`run`, and the `debian-stable-readiness.py`
+  preflight) is manual only. No CI workflow runs it.
 - To reproduce after expiry, review a newer snapshot pin (Release, signer
   and both indexes) in `tools/fixtures/debian-stable-readiness-v1.json`,
   then rerun and re-record.
@@ -362,7 +373,11 @@ reviewed bounded policy expires at **2026-10-13T07:55:41Z**:
     `sha512_identity_required`;
   - refuses them after Ubuntu signer substitution, binding stripping,
     relabelling the derived SHA512 as signed, or an architecture relabel;
-  - refuses tampered, truncated and forged-SHA512 archives before inventory.
+  - refuses tampered, truncated and forged-SHA512 archives before inventory;
+  - refuses committed evidence with a lengthened or inconsistent freshness
+    bound, a `recorded_on` outside the open window, a different pin, or
+    changed lock, digest, derived SHA512 or archive-byte records, whatever
+    the simulated now.
 - The debz `repository_refresh` tests independently refuse expired and
   future-dated Releases.
 

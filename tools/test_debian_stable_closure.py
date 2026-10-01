@@ -11,6 +11,7 @@ import os
 import pathlib
 import shutil
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -62,6 +63,26 @@ class CommittedEvidenceTests(unittest.TestCase):
         amd64 = {row["sha256"] for row in document["architectures"]["amd64"]["cas"] if row["architecture"] != "all"}
         arm64 = {row["sha256"] for row in document["architectures"]["arm64"]["cas"] if row["architecture"] != "all"}
         self.assertFalse(amd64 & arm64)
+
+    def test_committed_evidence_check_never_reads_the_clock(self):
+        class TrappedClock(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                raise AssertionError("check read the wall clock")
+
+            utcnow = today = now
+
+        trapped = types.SimpleNamespace(
+            datetime=TrappedClock, timezone=datetime.timezone, timedelta=datetime.timedelta,
+        )
+        with mock.patch.object(closure, "datetime", trapped), \
+                mock.patch.object(closure.readiness, "datetime", trapped), \
+                mock.patch.object(closure.readiness, "fetch", side_effect=AssertionError("network used")):
+            document = closure.check_evidence()
+        self.assertEqual(document["freshness"]["expires_at"], "2026-10-13T07:55:41Z")
+        # Only live re-resolution refuses after expiry, and with a typed result.
+        with self.assertRaises(closure.PinExpired):
+            closure.require_fresh(PIN, datetime.datetime(2026, 10, 14, tzinfo=UTC))
 
     def test_tampered_committed_evidence_is_refused(self):
         def mutated(change):
@@ -224,7 +245,7 @@ class FreshnessAndHostTests(unittest.TestCase):
             architecture="amd64", workspace=workspace,
         )
         with mock.patch.object(closure.readiness, "fetch", side_effect=AssertionError("network used")):
-            with self.assertRaisesRegex(ValueError, "expired at 2026-10-13T07:55:41"):
+            with self.assertRaisesRegex(closure.PinExpired, "pin_expired: .*expired at 2026-10-13T07:55:41.*#330"):
                 closure.run(args, expiry + datetime.timedelta(seconds=1))
         self.assertFalse(workspace.exists())
         pinned = copy.deepcopy(PIN)

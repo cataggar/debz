@@ -48,6 +48,8 @@ DERIVED_PROVENANCE = "derived_from_signed_sha256"
 MAX_PACKAGES_PER_LOCK = 128
 MAX_BYTES_PER_LOCK = 64 * 1024 * 1024
 DEADLINE_MS = 300000
+# Distinct from verification failures (2): the reviewed pin is intact but stale.
+PIN_EXPIRED_EXIT = 75
 RETRY_LINE = re.compile(
     r"^debz acquisition retry failed_attempt=[1-6]/6 delay_ms=[1-9][0-9]{0,5} "
     r"(?:http_status=(?:429|500|502|503|504)|error=[A-Z][A-Za-z]{0,63})$"
@@ -299,11 +301,23 @@ def new_workspace(path):
     return workspace
 
 
+class PinExpired(ValueError):
+    """Live re-resolution refused: the pin's bounded missing-Valid-Until freshness lapsed.
+
+    Debian stable's Release has no Valid-Until and is re-signed only at point
+    releases, so this awaits the next point release or the #330 policy. The
+    committed evidence stays valid; `check` never reads the clock.
+    """
+
+
 def require_fresh(pin, now):
     """Refuses before any network access once the reviewed pin's bounded freshness has lapsed."""
     expiry = release_expiry(pin)
     if now > expiry:
-        raise ValueError(f"pinned Release expired at {expiry.isoformat()}; review a newer snapshot pin")
+        raise PinExpired(
+            f"pin_expired: pinned Release expired at {expiry.isoformat()}; awaiting the next Debian "
+            "point release or the #330 frozen-pocket freshness policy, then review a newer snapshot pin"
+        )
     return expiry
 
 
@@ -669,6 +683,9 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except PinExpired as error:
+        print(f"debian-stable-closure: {error}", file=sys.stderr)
+        sys.exit(PIN_EXPIRED_EXIT)
     except (ValueError, KeyError, OSError, UnicodeError, lzma.LZMAError, subprocess.TimeoutExpired) as error:
         print(f"debian-stable-closure: {error}", file=sys.stderr)
         sys.exit(2)

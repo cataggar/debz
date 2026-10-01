@@ -31,6 +31,7 @@ pub const Error = error{
     SignedDigestMismatch,
     DerivedDigestMismatch,
     InventoryLimit,
+    InvalidEvidence,
 };
 
 /// Gap categories in priority order. The priority states how far the native
@@ -1108,4 +1109,358 @@ test "debian closure inventory: committed Debian locks are canonical signed-SHA2
             if (amd64) "\"target_architecture\":\"arm64\"" else "\"target_architecture\":\"amd64\"",
         ));
     }
+}
+
+// Offline verification of the committed #261 closure evidence. It runs in the
+// required `test-workload-core` partition and never reads the wall clock: the
+// evidence is evaluated at its recorded day, so required CI keeps passing after
+// the pin's bounded missing-Valid-Until freshness lapses (2026-10-13T07:55:41Z).
+// Live re-resolution is manual only (`tools/debian-stable-closure.py run`).
+
+const committed_evidence = @embedFile("debian_closure_evidence");
+const committed_pin = @embedFile("debian_stable_pin");
+const evidence_schema = "https://debz.dev/test/debian-stable-closure-evidence-v1";
+const bounded_missing_valid_until = "allow_missing_valid_until_with_max_age_seconds";
+const seconds_per_day: i64 = 24 * 60 * 60;
+
+pub const LiveFreshness = enum {
+    fresh,
+    /// Debian stable's Release has no Valid-Until and is re-signed only at
+    /// point releases; a frozen-pocket freshness policy is tracked in #330.
+    pin_expired_awaiting_point_release,
+};
+
+pub const EvidenceVerdict = struct {
+    /// The recorded day the evidence is evaluated at, never the caller's clock.
+    evaluated_at: i64,
+    expires_at: i64,
+    /// Diagnostic only: whether live re-resolution would still be admitted.
+    live: LiveFreshness,
+    locks: usize,
+    packages: usize,
+};
+
+const EvidenceLock = struct {
+    path: []const u8,
+    file_sha256: []const u8,
+    digest_sha256: []const u8,
+    packages: usize,
+    total_bytes: u64,
+};
+
+const EvidenceObject = struct {
+    package: []const u8,
+    version: []const u8,
+    size: u64,
+    sha256: []const u8,
+    derived_sha512: []const u8,
+};
+
+const EvidenceArchitecture = struct {
+    repository: struct { id: []const u8, archive_binding: []const u8 },
+    locks: struct { apt: EvidenceLock, @"systemd-sysv": EvidenceLock },
+    cas: []const EvidenceObject,
+    cas_objects: usize,
+    cas_bytes: u64,
+};
+
+const Evidence = struct {
+    schema: []const u8,
+    issue: u32,
+    pin_sha256: []const u8,
+    requests: []const []const u8,
+    freshness: struct {
+        release_date: []const u8,
+        valid_until: ?[]const u8,
+        mode: []const u8,
+        maximum_release_age_seconds: u64,
+        expires_at: []const u8,
+        recorded_on: []const u8,
+    },
+    architectures: struct { amd64: EvidenceArchitecture, arm64: EvidenceArchitecture },
+};
+
+const Pin = struct {
+    release: struct {
+        date: []const u8,
+        valid_until: ?[]const u8,
+        freshness_mode: []const u8,
+        maximum_release_age_seconds: u64,
+    },
+};
+
+/// Rechecks the committed evidence against the reviewed pin and the committed
+/// locks: pin binding, bounded freshness arithmetic, that the evidence was
+/// recorded while the window was open, lock bytes and digests, the signed
+/// SHA256 binding with derived SHA512, and that the archive objects are exactly
+/// the lock union. `now` only selects `live`; it can never change the verdict.
+pub fn verifyCommittedEvidence(
+    allocator: std.mem.Allocator,
+    evidence_bytes: []const u8,
+    pin_bytes: []const u8,
+    locks: []const CommittedLock,
+    now: i64,
+) !EvidenceVerdict {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
+    const evidence = try std.json.parseFromSliceLeaky(Evidence, arena, evidence_bytes, options);
+    const pin = try std.json.parseFromSliceLeaky(Pin, arena, pin_bytes, options);
+
+    if (!std.mem.eql(u8, evidence.schema, evidence_schema) or evidence.issue != 261)
+        return error.InvalidEvidence;
+    try requireHex(evidence.pin_sha256, &sha256Of(pin_bytes));
+    if (evidence.requests.len != 2 or
+        !std.mem.eql(u8, evidence.requests[0], "apt") or
+        !std.mem.eql(u8, evidence.requests[1], "systemd-sysv"))
+        return error.InvalidEvidence;
+
+    const freshness = evidence.freshness;
+    if (!std.mem.eql(u8, freshness.mode, bounded_missing_valid_until) or
+        !std.mem.eql(u8, pin.release.freshness_mode, bounded_missing_valid_until) or
+        freshness.valid_until != null or pin.release.valid_until != null or
+        !std.mem.eql(u8, freshness.release_date, pin.release.date) or
+        freshness.maximum_release_age_seconds != pin.release.maximum_release_age_seconds or
+        !debz.repository_refresh.validExpiryPolicy(.{
+            .allow_missing_valid_until_with_max_age_seconds = freshness.maximum_release_age_seconds,
+        }))
+        return error.InvalidEvidence;
+    const release_date = try parseReleaseDate(freshness.release_date);
+    const expires_at = try parseInstant(freshness.expires_at);
+    if (expires_at != release_date + @as(i64, @intCast(freshness.maximum_release_age_seconds)))
+        return error.InvalidEvidence;
+    const evaluated_at = try parseDay(freshness.recorded_on);
+    if (evaluated_at + seconds_per_day <= release_date or evaluated_at > expires_at)
+        return error.InvalidEvidence;
+
+    var verified_locks: usize = 0;
+    var verified_packages: usize = 0;
+    inline for (.{ "amd64", "arm64" }) |architecture| {
+        const entry = @field(evidence.architectures, architecture);
+        if (!std.mem.eql(u8, entry.repository.archive_binding, "signed_sha256_derived_sha512"))
+            return error.InvalidEvidence;
+        const seen = try arena.alloc(bool, entry.cas.len);
+        @memset(seen, false);
+        inline for (.{ "apt", "systemd-sysv" }) |request| {
+            const item = @field(entry.locks, request);
+            if (!std.mem.eql(u8, item.path, architecture ++ "-" ++ request ++ ".lock.json"))
+                return error.InvalidEvidence;
+            const committed = findCommitted(locks, architecture, request) orelse return error.InvalidEvidence;
+            try requireHex(item.file_sha256, &sha256Of(committed.bytes));
+            var decoded = try exact_lock_v3.decode(allocator, committed.bytes, exact_lock_v3.maximum_document_bytes);
+            defer decoded.deinit();
+            const lock = decoded.lock;
+            try requireHex(item.digest_sha256, &lock.digest_sha256);
+            if (!std.mem.eql(u8, lock.target_architecture, architecture) or
+                lock.repositories.len != 1 or lock.local_artifacts.len != 0 or
+                lock.packages.len != item.packages)
+                return error.InvalidEvidence;
+            const repository = lock.repositories[0];
+            if (repository.archive_binding != .signed_sha256_derived_sha512 or
+                !std.mem.eql(u8, &repository.id, entry.repository.id))
+                return error.InvalidEvidence;
+            try lock.requireArchiveDigestPolicy(.sha512_identity_required);
+            var total: u64 = 0;
+            for (lock.packages) |package| {
+                total = std.math.add(u64, total, package.declared_size) catch return error.InvalidEvidence;
+                const index = findObject(entry.cas, package.name) orelse return error.InvalidEvidence;
+                const object = entry.cas[index];
+                const signed = package.archive_identity.digests.sha256 orelse return error.InvalidEvidence;
+                const derived = package.derived_sha512 orelse return error.InvalidEvidence;
+                if (!std.mem.eql(u8, object.version, package.version) or object.size != package.declared_size)
+                    return error.InvalidEvidence;
+                try requireHex(object.sha256, &signed);
+                try requireHex(object.derived_sha512, &derived);
+                seen[index] = true;
+            }
+            if (total != item.total_bytes) return error.InvalidEvidence;
+            verified_locks += 1;
+            verified_packages += lock.packages.len;
+        }
+        var object_bytes: u64 = 0;
+        for (entry.cas, seen) |object, used| {
+            if (!used) return error.InvalidEvidence;
+            object_bytes = std.math.add(u64, object_bytes, object.size) catch return error.InvalidEvidence;
+        }
+        if (entry.cas_objects != entry.cas.len or entry.cas_bytes != object_bytes)
+            return error.InvalidEvidence;
+    }
+    if (verified_locks != locks.len) return error.InvalidEvidence;
+    return .{
+        .evaluated_at = evaluated_at,
+        .expires_at = expires_at,
+        .live = if (now > expires_at) .pin_expired_awaiting_point_release else .fresh,
+        .locks = verified_locks,
+        .packages = verified_packages,
+    };
+}
+
+fn findCommitted(locks: []const CommittedLock, architecture: []const u8, request: []const u8) ?CommittedLock {
+    for (locks) |committed| {
+        if (std.mem.eql(u8, committed.architecture, architecture) and std.mem.eql(u8, committed.request, request))
+            return committed;
+    }
+    return null;
+}
+
+fn findObject(objects: []const EvidenceObject, name: []const u8) ?usize {
+    for (objects, 0..) |object, index| {
+        if (std.mem.eql(u8, object.package, name)) return index;
+    }
+    return null;
+}
+
+fn sha256Of(bytes: []const u8) [Sha256.digest_length]u8 {
+    var out: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &out, .{});
+    return out;
+}
+
+/// Lowercase hex text must encode exactly `expected`.
+fn requireHex(text: []const u8, expected: []const u8) error{InvalidEvidence}!void {
+    var decoded: [Sha512.digest_length]u8 = undefined;
+    if (expected.len > decoded.len or text.len != 2 * expected.len) return error.InvalidEvidence;
+    for (text) |c| {
+        if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidEvidence;
+    }
+    const bytes = std.fmt.hexToBytes(decoded[0..expected.len], text) catch return error.InvalidEvidence;
+    if (!std.mem.eql(u8, bytes, expected)) return error.InvalidEvidence;
+}
+
+fn decimal(text: []const u8) error{InvalidEvidence}!i64 {
+    if (text.len == 0 or text.len > 4) return error.InvalidEvidence;
+    var value: i64 = 0;
+    for (text) |c| {
+        if (!std.ascii.isDigit(c)) return error.InvalidEvidence;
+        value = value * 10 + (c - '0');
+    }
+    return value;
+}
+
+fn daysInMonth(year: i64, month: i64) i64 {
+    return switch (month) {
+        2 => if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+}
+
+/// Days since 1970-01-01 in the proleptic Gregorian calendar.
+fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
+    const shifted_year = if (month <= 2) year - 1 else year;
+    const era = @divFloor(shifted_year, 400);
+    const year_of_era = shifted_year - era * 400;
+    const day_of_year = @divFloor(153 * @mod(month + 9, 12) + 2, 5) + day - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100) + day_of_year;
+    return era * 146097 + day_of_era - 719468;
+}
+
+fn civilDay(year: i64, month: i64, day: i64) error{InvalidEvidence}!i64 {
+    if (year < 1970 or month < 1 or month > 12 or day < 1 or day > daysInMonth(year, month))
+        return error.InvalidEvidence;
+    return daysFromCivil(year, month, day);
+}
+
+/// `HH:MM:SS`
+fn timeOfDay(text: []const u8) error{InvalidEvidence}!i64 {
+    if (text.len != 8 or text[2] != ':' or text[5] != ':') return error.InvalidEvidence;
+    const hour = try decimal(text[0..2]);
+    const minute = try decimal(text[3..5]);
+    const second = try decimal(text[6..8]);
+    if (hour > 23 or minute > 59 or second > 59) return error.InvalidEvidence;
+    return hour * 3600 + minute * 60 + second;
+}
+
+/// `YYYY-MM-DD`, at 00:00:00Z.
+fn parseDay(text: []const u8) error{InvalidEvidence}!i64 {
+    if (text.len != 10 or text[4] != '-' or text[7] != '-') return error.InvalidEvidence;
+    const days = try civilDay(try decimal(text[0..4]), try decimal(text[5..7]), try decimal(text[8..10]));
+    return days * seconds_per_day;
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ`
+fn parseInstant(text: []const u8) error{InvalidEvidence}!i64 {
+    if (text.len != 20 or text[10] != 'T' or text[19] != 'Z') return error.InvalidEvidence;
+    return try parseDay(text[0..10]) + try timeOfDay(text[11..19]);
+}
+
+/// The signed Release `Date` form `Sat, 12 Sep 2026 07:55:41 UTC`, including
+/// a weekday that must agree with the date.
+fn parseReleaseDate(text: []const u8) error{InvalidEvidence}!i64 {
+    const weekdays = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    if (text.len != 29 or !std.mem.eql(u8, text[3..5], ", ") or text[7] != ' ' or text[11] != ' ' or
+        text[16] != ' ' or !std.mem.eql(u8, text[25..], " UTC"))
+        return error.InvalidEvidence;
+    const month = for (months, 1..) |name, number| {
+        if (std.mem.eql(u8, text[8..11], name)) break @as(i64, @intCast(number));
+    } else return error.InvalidEvidence;
+    const days = try civilDay(try decimal(text[12..16]), month, try decimal(text[5..7]));
+    if (!std.mem.eql(u8, text[0..3], weekdays[@intCast(@mod(days, 7))])) return error.InvalidEvidence;
+    return days * seconds_per_day + try timeOfDay(text[17..25]);
+}
+
+fn replaceOnce(allocator: std.mem.Allocator, source: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, needle));
+    return std.mem.replaceOwned(u8, allocator, source, needle, replacement);
+}
+
+test "debian closure evidence: required offline checks pass at now = 2026-10-14, after the pin's bounded freshness lapsed" {
+    const after_expiry = try parseInstant("2026-10-14T00:00:00Z");
+    const verdict = try verifyCommittedEvidence(testing.allocator, committed_evidence, committed_pin, &committed_locks, after_expiry);
+    try testing.expectEqual(LiveFreshness.pin_expired_awaiting_point_release, verdict.live);
+    try testing.expectEqual(try parseInstant("2026-10-13T07:55:41Z"), verdict.expires_at);
+    try testing.expectEqual(try parseReleaseDate("Sat, 12 Sep 2026 07:55:41 UTC") + 31 * seconds_per_day, verdict.expires_at);
+    try testing.expectEqual(try parseDay("2026-09-30"), verdict.evaluated_at);
+    try testing.expectEqual(committed_locks.len, verdict.locks);
+    try testing.expectEqual(@as(usize, 73 + 69 + 73 + 69), verdict.packages);
+
+    // `now` is diagnostic only: the verdict is identical while fresh, at the
+    // exact boundary, one second later, and a decade later.
+    for (
+        [_][]const u8{ "2026-09-30T00:00:00Z", "2026-10-13T07:55:41Z", "2026-10-13T07:55:42Z", "2036-10-14T00:00:00Z" },
+        [_]LiveFreshness{ .fresh, .fresh, .pin_expired_awaiting_point_release, .pin_expired_awaiting_point_release },
+    ) |instant, live| {
+        const other = try verifyCommittedEvidence(testing.allocator, committed_evidence, committed_pin, &committed_locks, try parseInstant(instant));
+        try testing.expectEqual(live, other.live);
+        try testing.expectEqual(verdict.evaluated_at, other.evaluated_at);
+        try testing.expectEqual(verdict.expires_at, other.expires_at);
+        try testing.expectEqual(verdict.locks, other.locks);
+        try testing.expectEqual(verdict.packages, other.packages);
+    }
+}
+
+test "debian closure evidence: tampered freshness, pin, lock or archive evidence refuses whatever now is" {
+    const allocator = testing.allocator;
+    for ([_][]const u8{ "2026-10-01T00:00:00Z", "2026-10-14T00:00:00Z" }) |instant| {
+        const now = try parseInstant(instant);
+        for ([_][2][]const u8{
+            .{ "\"expires_at\": \"2026-10-13T07:55:41Z\"", "\"expires_at\": \"2027-01-01T00:00:00Z\"" },
+            .{ "\"recorded_on\": \"2026-09-30\"", "\"recorded_on\": \"2026-10-14\"" },
+            .{ "\"recorded_on\": \"2026-09-30\"", "\"recorded_on\": \"2026-09-11\"" },
+            .{ "\"maximum_release_age_seconds\": 2678400", "\"maximum_release_age_seconds\": 5356800" },
+            .{ "\"release_date\": \"Sat, 12 Sep 2026", "\"release_date\": \"Fri, 12 Sep 2026" },
+            .{ "\"digest_sha256\": \"1de06853", "\"digest_sha256\": \"0de06853" },
+            .{ "\"derived_sha512\": \"0bba33fb", "\"derived_sha512\": \"1bba33fb" },
+            .{ "\"cas_bytes\": 37313912", "\"cas_bytes\": 37313911" },
+        }) |edit| {
+            const changed = try replaceOnce(allocator, committed_evidence, edit[0], edit[1]);
+            defer allocator.free(changed);
+            try testing.expectError(error.InvalidEvidence, verifyCommittedEvidence(allocator, changed, committed_pin, &committed_locks, now));
+        }
+
+        // A different pin, even one only lengthening the bound, is not the reviewed pin.
+        const longer = try replaceOnce(allocator, committed_pin, "\"maximum_release_age_seconds\": 2678400", "\"maximum_release_age_seconds\": 2678401");
+        defer allocator.free(longer);
+        try testing.expectError(error.InvalidEvidence, verifyCommittedEvidence(allocator, committed_evidence, longer, &committed_locks, now));
+
+        // Locks swapped between architectures or missing are refused.
+        var swapped = committed_locks;
+        swapped[0].bytes = committed_locks[2].bytes;
+        try testing.expectError(error.InvalidEvidence, verifyCommittedEvidence(allocator, committed_evidence, committed_pin, &swapped, now));
+        try testing.expectError(error.InvalidEvidence, verifyCommittedEvidence(allocator, committed_evidence, committed_pin, committed_locks[0..3], now));
+    }
+    try testing.expectError(error.InvalidEvidence, parseReleaseDate("Sat, 31 Sep 2026 07:55:41 UTC"));
+    try testing.expectError(error.InvalidEvidence, parseInstant("2026-10-13T24:00:00Z"));
 }
