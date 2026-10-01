@@ -17,7 +17,7 @@ Compilation consumes exactly four kinds of evidence plus explicit policy:
 |---|---|
 | `authorization` | The reviewed [native transaction authorization](exact-locks-and-provenance.md), which binds the backend, exact closure lock v3 generation, request/solver-policy/executor-policy/plan digests, install root and root identity, target and foreign architectures, mutation policy, every ordered action, complete archive identities, and the exact intended final closure. |
 | `ordered_actions` | The reviewed plan's ordered lifecycle: bootstrap extraction, removals, purges, unpacks, and configure barriers. |
-| `installed` | The consumed installed-database generation: its digest plus, per package, the recorded version, last configured version, state, hold, essential flag, owned-path set digest, maintainer-script digests, conffile records with their recorded and observed digests, and trigger declarations. |
+| `installed` | The consumed installed-database generation: its digest plus, per package, the recorded version, last configured version, state, hold, essential flag, owned-path set digest, maintainer-script digests, conffile records with their recorded digest or dpkg's `newconffile` placeholder on disappearing records, observed digests, and trigger declarations. |
 | `archives` | One validated archive per archive-producing action: identity, digest, size, authenticated origin, application-inventory digest, maintainer-script digests, packaged conffiles with the digest each shipped file carries (absent exactly for `remove-on-upgrade`), trigger declarations, and `Replaces` names. |
 
 Preflight also supplies the ownership conflicts it found and any root feature it
@@ -197,9 +197,11 @@ artifact, because the maintainer shipped nothing new to reconcile.
 `remove-on-upgrade` takes precedence and ships no file at all, so the compiler
 requires the packaged digest to be absent for it and present for every other
 conffile. It deletes a recorded, unmodified file, preserves a locally modified
-one as `.dpkg-old`, and does nothing when nothing is recorded or nothing is
-present, including on a fresh install. A recorded conffile the new package no
-longer ships is marked obsolete rather than removed.
+one as `.dpkg-old`, removes a stale `.dpkg-dist`, and does nothing when nothing
+is recorded or nothing is present, including on a fresh install. If the status
+record carries dpkg's `newconffile` placeholder, any present file is treated as
+locally modified because no recorded md5 exists to match. A recorded conffile
+the new package no longer ships is marked obsolete rather than removed.
 
 ## Trigger processing
 

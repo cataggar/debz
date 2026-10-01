@@ -207,7 +207,9 @@ residual conffiles and the package status record. V1 also covers newly
 introduced, renamed, removed, obsolete, and
 missing conffiles, and `remove-on-upgrade`, which ships no file: it deletes an
 unmodified recorded file, preserves a modified one as `.dpkg-old`, and does
-nothing on a fresh install. Every decision and before/after digest is recorded.
+nothing on a fresh install. When dpkg records `newconffile remove-on-upgrade`,
+V1 preserves that disappearing record and treats any later present file as
+locally modified. Every decision and before/after digest is recorded.
 
 ## Triggers
 

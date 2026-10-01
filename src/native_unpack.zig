@@ -2363,6 +2363,9 @@ pub const PlannedConffile = struct {
     action: native_program.ConffileAction,
     packaged_md5: ?[16]u8 = null,
     recorded: ?package_database.ConffileEntry = null,
+    /// dpkg removes a stale `.dpkg-dist` side file before processing a
+    /// `remove-on-upgrade` conffile, unless another package owns the path.
+    remove_on_upgrade_cleanup: bool = false,
 };
 
 pub const PackagePlan = struct {
@@ -3202,7 +3205,8 @@ fn run(builder: *Builder, arena: *std.heap.ArenaAllocator) PlanError!Plan {
                 @intCast(index),
             );
     }
-    for (builder.work.items) |*item| try preparePackageClaims(builder, item);
+    for (builder.work.items, 0..) |*item, index|
+        try preparePackageClaims(builder, item, @intCast(index));
     try indexFinalClaims(builder);
     try indexInstalledConffiles(builder);
     try indexCaseGraph(builder);
@@ -4270,9 +4274,75 @@ fn validateGeneratedConffilePath(
     }
 }
 
+fn removeOnUpgradeApplies(
+    builder: *const Builder,
+    item: *const PackageWork,
+    path: []const u8,
+) bool {
+    const owners = builder.ownership.ownersOf(path);
+    if (owners.len == 0) return true;
+    const current = item.owner_index orelse return false;
+    for (owners) |owned| {
+        if (owned.owner != current) return false;
+    }
+    return true;
+}
+
+fn appendUnownedRemoveOnUpgradeRemoval(
+    builder: *Builder,
+    item: *PackageWork,
+    work_index: u32,
+    path: []const u8,
+) PlanError!void {
+    if (builder.ownership.owned(path)) return;
+    var observed = try observeRootState(
+        builder,
+        path,
+        item.identity.name,
+        false,
+        true,
+    ) orelse return;
+    defer observed.deinit();
+    if (observed.state.kind != .regular) {
+        try builder.deferFeature(.{
+            .feature = .unsupported_root_feature,
+            .package = item.identity.name,
+            .architecture = item.identity.architecture,
+            .detail = path,
+        });
+        return;
+    }
+    if (builder.removal_count >= builder.limits.max_removals)
+        return builder.fail(.{
+            .surface = .ownership,
+            .code = .path_limit,
+            .path = path,
+            .package = item.identity.name,
+        });
+    const diagnostic: Diagnostic = .{
+        .surface = .ownership,
+        .code = .path_limit,
+        .path = path,
+        .package = item.identity.name,
+    };
+    try builder.chargePath(diagnostic);
+    try builder.chargeIntent(diagnostic);
+    builder.removal_count += 1;
+    const owned = try builder.arena.dupe(u8, path);
+    try builder.planned_removals.put(builder.allocator, owned, observed.state.kind);
+    try item.removals.append(builder.allocator, .{
+        .path = owned,
+        .absolute = try absoluteSpelling(builder, owned),
+        .directory = false,
+        .package = work_index,
+        .previous = observed.state,
+    });
+}
+
 fn prepareUnpackConffiles(
     builder: *Builder,
     item: *PackageWork,
+    work_index: u32,
 ) PlanError!void {
     if (builder.request.conffiles != .unpack) return;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -4297,14 +4367,19 @@ fn prepareUnpackConffiles(
                 declaration,
             );
             var action: native_program.ConffileAction = .skip_not_shipped;
+            const applies = removeOnUpgradeApplies(builder, item, live);
             if (recorded) |old| {
                 var retained = old;
                 retained.obsolete = false;
                 retained.remove_on_upgrade = true;
                 try item.conffile_records.append(builder.allocator, retained);
-                action = switch (old.digest) {
-                    .new_conffile => .skip_not_shipped,
-                    .md5 => |digest| native_program.conffileDecision(
+                if (applies) {
+                    const observed = try observeConffileMd5(
+                        builder,
+                        live,
+                        item,
+                    );
+                    action = native_program.conffileDecision(
                         builder.request.conffile_policy,
                         .{
                             .path = conffile.path,
@@ -4313,16 +4388,16 @@ fn prepareUnpackConffiles(
                         },
                         .{
                             .path = old.path,
-                            .recorded_md5 = digest,
-                            .on_disk_md5 = try observeConffileMd5(
-                                builder,
-                                live,
-                                item,
-                            ),
+                            .recorded_md5 = switch (old.digest) {
+                                .new_conffile => null,
+                                .md5 => |digest| digest,
+                            },
+                            .on_disk_md5 = observed,
                             .obsolete = old.obsolete,
+                            .remove_on_upgrade = true,
                         },
-                    ),
-                };
+                    );
+                }
                 if (action == .remove_on_upgrade_stage_old) {
                     const old_path = try std.fmt.allocPrint(
                         builder.arena,
@@ -4336,6 +4411,14 @@ fn prepareUnpackConffiles(
                         false,
                     );
                 }
+                if (action == .remove_on_upgrade or
+                    action == .remove_on_upgrade_stage_old)
+                    try appendUnownedRemoveOnUpgradeRemoval(
+                        builder,
+                        item,
+                        work_index,
+                        live,
+                    );
             } else {
                 try item.conffile_records.append(builder.allocator, .{
                     .path = absolute,
@@ -4347,6 +4430,7 @@ fn prepareUnpackConffiles(
                 .path = live,
                 .action = action,
                 .recorded = recorded,
+                .remove_on_upgrade_cleanup = applies,
             });
             continue;
         }
@@ -4446,9 +4530,10 @@ fn prepareUnpackConffiles(
 fn preparePackageClaims(
     builder: *Builder,
     item: *PackageWork,
+    work_index: u32,
 ) PlanError!void {
     const model = item.model;
-    try prepareUnpackConffiles(builder, item);
+    try prepareUnpackConffiles(builder, item, work_index);
     try indexReplaces(builder, item, model);
     if (model.files.len > builder.limits.max_paths_per_package)
         return builder.fail(.{
@@ -8656,6 +8741,7 @@ pub fn planDigest(value: Plan) [32]u8 {
             hashOptionalText(&hash, conffile.staged_path);
             hashText(&hash, @tagName(conffile.action));
             hashOptionalDigest(16, &hash, conffile.packaged_md5);
+            hashBool(&hash, conffile.remove_on_upgrade_cleanup);
             if (conffile.recorded) |recorded| {
                 hashByte(&hash, 1);
                 hashText(&hash, recorded.path);
@@ -9757,6 +9843,21 @@ fn lowerMaterializationIntents(
                 !std.mem.eql(u8, planned.previous.?.link_target orelse "", alias.link_target))
                 return error.MaterializationPlanMismatch;
             try intents.append(allocator, .{ .metadata = .{ .path = planned.path } });
+        }
+    }
+
+    for (plan_value.packages) |package| {
+        for (package.conffiles) |conffile| {
+            if (!conffile.remove_on_upgrade_cleanup) continue;
+            const dist_path = try std.fmt.allocPrint(
+                owned,
+                "{s}.dpkg-dist",
+                .{conffile.path},
+            );
+            try intents.append(allocator, .{ .remove = .{
+                .path = dist_path,
+                .removal = .allow_absent,
+            } });
         }
     }
 
@@ -12380,8 +12481,7 @@ fn materializeConfigure(
             }
             var live_digest: ?RootConffileDigest = null;
             if (old) |entry| switch (entry.digest) {
-                .new_conffile => {},
-                .md5 => live_digest = try rootMd5ForConffile(
+                .new_conffile, .md5 => live_digest = try rootMd5ForConffile(
                     allocator,
                     request.root,
                     physical,
@@ -12392,7 +12492,16 @@ fn materializeConfigure(
             };
             const installed: ?native_program.InstalledConffile = if (old) |entry|
                 switch (entry.digest) {
-                    .new_conffile => null,
+                    .new_conffile => .{
+                        .path = entry.path,
+                        .recorded_md5 = null,
+                        .on_disk_md5 = if (live_digest) |observed|
+                            observed.md5
+                        else
+                            null,
+                        .obsolete = entry.obsolete,
+                        .remove_on_upgrade = entry.remove_on_upgrade,
+                    },
                     .md5 => |digest| .{
                         .path = entry.path,
                         .recorded_md5 = digest,
@@ -12401,6 +12510,7 @@ fn materializeConfigure(
                         else
                             null,
                         .obsolete = entry.obsolete,
+                        .remove_on_upgrade = entry.remove_on_upgrade,
                     },
                 }
             else
@@ -12884,6 +12994,9 @@ fn materializeRemoval(
                 .outcome = .refused,
                 .detail = "invalid_conffile",
             };
+            if (conffile.remove_on_upgrade and conffile.digest == .new_conffile and
+                (try request.root.entryIfExists(try root_fs.Path.initPackage(canonical))) == null)
+                continue;
             const stored = try owned.dupe(u8, canonical);
             if (diversions.redirected(relative, record.name) != null)
                 try observed_paths.append(allocator, stored);
@@ -13027,8 +13140,8 @@ fn materializeRemoval(
                 continue;
             }
             for ([_][]const u8{ "", ".dpkg-old", ".dpkg-dist", ".dpkg-new" }) |suffix| {
-                // dpkg deliberately leaves the saved administrator version
-                // created by remove-on-upgrade outside package ownership.
+                // dpkg removes non-owned remove-on-upgrade conffiles from the
+                // conffile list before this pass, leaving the saved local copy.
                 if (conffile.remove_on_upgrade and
                     std.mem.eql(u8, suffix, ".dpkg-old"))
                     continue;
@@ -14918,7 +15031,10 @@ fn lifecycleInstalledEvidence(
         for (record.conffiles, 0..) |conffile, conffile_index| {
             const recorded = switch (conffile.digest) {
                 .md5 => |value| value,
-                .new_conffile => return error.UnsupportedLifecycleConffile,
+                .new_conffile => if (conffile.remove_on_upgrade or conffile.obsolete)
+                    null
+                else
+                    return error.UnsupportedLifecycleConffile,
             };
             const relative = relativeListPath(conffile.path) orelse return error.UnsupportedLifecycleConffile;
             var path_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
@@ -14940,6 +15056,7 @@ fn lifecycleInstalledEvidence(
                 .recorded_md5 = recorded,
                 .on_disk_md5 = if (observed) |value| value.md5 else null,
                 .obsolete = conffile.obsolete,
+                .remove_on_upgrade = conffile.remove_on_upgrade,
             };
         }
         const triggers = try allocator.alloc(
@@ -41530,6 +41647,350 @@ test "native_unpack.test.all installed conffiles block touching claims" {
         "residual",
         "etc/residual.conf",
     );
+}
+
+test "native_unpack.test.lifecycle evidence carries disappearing newconffile records" {
+    const init_md5 = hex(16, digestMd5("init script\n"));
+    const status = try std.fmt.allocPrint(
+        testing.allocator,
+        \\Package: procps
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 2:4.0.6-3ubuntu1
+        \\Conffiles:
+        \\ /etc/sysctl.conf newconffile remove-on-upgrade
+        \\ /etc/init.d/procps {s}
+        \\Description: procps
+        \\
+        \\
+    ,
+        .{init_md5},
+    );
+    defer testing.allocator.free(status);
+    const info = [_]package_database.InfoEntry{.{
+        .name = "procps.list",
+        .bytes = "/.\n/etc\n/etc/init.d\n/etc/init.d/procps\n",
+    }};
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    try seedFile(fixture.root(), "etc/init.d/procps", "init script\n");
+    var database = try fixture.database();
+    defer database.deinit();
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const installed = try lifecycleInstalledEvidence(
+            arena.allocator(),
+            fixture.root(),
+            database.model,
+        );
+        try testing.expectEqual(@as(usize, 1), installed.len);
+        try testing.expectEqual(@as(usize, 2), installed[0].conffiles.len);
+        const sysctl = installed[0].conffiles[0];
+        try testing.expectEqualStrings("/etc/sysctl.conf", sysctl.path);
+        try testing.expect(sysctl.recorded_md5 == null);
+        try testing.expect(sysctl.on_disk_md5 == null);
+        try testing.expect(sysctl.remove_on_upgrade);
+        try testing.expect(!sysctl.obsolete);
+        const init = installed[0].conffiles[1];
+        try testing.expect(init.recorded_md5 != null);
+        try testing.expectEqualSlices(u8, &digestMd5("init script\n"), &init.recorded_md5.?);
+        try testing.expectEqualSlices(u8, &digestMd5("init script\n"), &init.on_disk_md5.?);
+    }
+    try seedFile(fixture.root(), "etc/sysctl.conf", "administrator sysctl\n");
+    {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const installed = try lifecycleInstalledEvidence(
+            arena.allocator(),
+            fixture.root(),
+            database.model,
+        );
+        const sysctl = installed[0].conffiles[0];
+        try testing.expect(sysctl.recorded_md5 == null);
+        try testing.expectEqualSlices(
+            u8,
+            &digestMd5("administrator sysctl\n"),
+            &sysctl.on_disk_md5.?,
+        );
+    }
+}
+
+test "native_unpack.test.lifecycle evidence only accepts newconffile when disappearing" {
+    const bare_status =
+        \\Package: bad
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Conffiles:
+        \\ /etc/bad.conf newconffile
+        \\Description: bad
+        \\
+        \\
+    ;
+    var bare_fixture: Fixture = undefined;
+    try bare_fixture.init(bare_status, &.{.{ .name = "bad.list", .bytes = "/.\n/etc\n/etc/bad.conf\n" }});
+    defer bare_fixture.deinit();
+    var bare_database = try bare_fixture.database();
+    defer bare_database.deinit();
+    var bare_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer bare_arena.deinit();
+    try testing.expectError(
+        error.UnsupportedLifecycleConffile,
+        lifecycleInstalledEvidence(bare_arena.allocator(), bare_fixture.root(), bare_database.model),
+    );
+
+    const obsolete_status =
+        \\Package: old
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Conffiles:
+        \\ /etc/old.conf newconffile obsolete
+        \\Description: old
+        \\
+        \\
+    ;
+    var obsolete_fixture: Fixture = undefined;
+    try obsolete_fixture.init(obsolete_status, &.{.{ .name = "old.list", .bytes = "/.\n/etc\n/etc/old.conf\n" }});
+    defer obsolete_fixture.deinit();
+    var obsolete_database = try obsolete_fixture.database();
+    defer obsolete_database.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const installed = try lifecycleInstalledEvidence(
+        arena.allocator(),
+        obsolete_fixture.root(),
+        obsolete_database.model,
+    );
+    try testing.expectEqual(@as(usize, 1), installed.len);
+    try testing.expectEqual(@as(usize, 1), installed[0].conffiles.len);
+    try testing.expect(installed[0].conffiles[0].recorded_md5 == null);
+    try testing.expect(installed[0].conffiles[0].obsolete);
+    try testing.expect(!installed[0].conffiles[0].remove_on_upgrade);
+}
+
+test "native_unpack.test.verifyUnchanged preserves procps-shaped newconffile status" {
+    const status =
+        \\Package: procps
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 2:4.0.6-3ubuntu1
+        \\Conffiles:
+        \\ /etc/sysctl.conf newconffile remove-on-upgrade
+        \\Description: procps
+        \\
+        \\
+    ;
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &.{.{ .name = "procps.list", .bytes = "/.\n" }});
+    defer fixture.deinit();
+
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(0x22);
+    var lock = try exact_lock_v3.create(testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(3),
+            .index_identity = .{
+                .digests = .{ .sha256 = @splat(4) },
+                .primary = .sha256,
+            },
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "procps",
+            .version = "2:4.0.6-3ubuntu1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } },
+            .archive_identity = .{
+                .digests = .{ .sha256 = @splat(0x31) },
+                .primary = .sha256,
+            },
+            .declared_size = 1,
+            .retention = .retained,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const solver_plan: solver.Plan = .{
+        .target_architecture = "amd64",
+        .mode = .plan_only,
+        .actions = &.{},
+        .ordered_actions = &.{},
+        .summary = .{},
+        .download_bytes = 0,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = testing.allocator,
+        .arena = undefined,
+    };
+    var root_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+    const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    var coordinator = try root_operation.Coordinator.open(
+        testing.io,
+        fixture.root(),
+        install_root,
+        locks.interface(),
+    );
+    var attempt = try coordinator.acquire(testing.allocator, .{
+        .backend = .native,
+        .operation = .{ .package_transaction = .upgrade_all },
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = "amd64",
+        .evidence = .{ .plan_sha256 = transaction_executor.planDigest(solver_plan) },
+    });
+    defer attempt.release();
+    const before = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/status"),
+        4096,
+    );
+    defer testing.allocator.free(before);
+    _ = try Runtime.verifyUnchanged(testing.allocator, .{
+        .attempt = &attempt,
+        .plan = &solver_plan,
+        .exact_lock = &lock.lock,
+        .archives = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    });
+    const after = try fixture.root().readFileAlloc(
+        testing.allocator,
+        try root_fs.Path.init("var/lib/dpkg/status"),
+        4096,
+    );
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "native_unpack.test.remove-on-upgrade newconffile upgrade matches dpkg file handling" {
+    const status =
+        \\Package: procps
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Conffiles:
+        \\ /etc/sysctl.conf newconffile remove-on-upgrade
+        \\Description: procps
+        \\
+        \\
+    ;
+    var data = [_]Entry{
+        .{ .path = "usr", .kind = '5', .mode = 0o755 },
+        .{ .path = "usr/share", .kind = '5', .mode = 0o755 },
+        .{
+            .path = "usr/share/procps",
+            .content = "payload\n",
+        },
+    };
+    const bytes = try buildOwnedArchive(.{
+        .package = "procps",
+        .version = "2",
+        .control = &.{.{ .path = "conffiles", .content = "remove-on-upgrade /etc/sysctl.conf\n" }},
+    }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const steps = [_]native_program.Step{
+        unpackStep(0, &model, 0, "1", false),
+    };
+
+    for ([_]struct {
+        name: []const u8,
+        sysctl: ?[]const u8,
+        dist: ?[]const u8,
+    }{
+        .{ .name = "absent", .sysctl = null, .dist = "stale dist\n" },
+        .{ .name = "present", .sysctl = "administrator sysctl\n", .dist = "stale dist\n" },
+    }) |case| {
+        var fixture: Fixture = undefined;
+        try fixture.init(status, &.{.{ .name = "procps.list", .bytes = "/.\n" }});
+        defer fixture.deinit();
+        if (case.sysctl) |content| try seedFile(fixture.root(), "etc/sysctl.conf", content);
+        if (case.dist) |content| try seedFile(fixture.root(), "etc/sysctl.conf.dpkg-dist", content);
+        var artifacts: [1]native_program.ProgramArtifact = undefined;
+        var program = try singleProgram(
+            &fixture,
+            &model,
+            bytes,
+            &steps,
+            &artifacts,
+        );
+        var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var root_buffer: [4096]u8 = undefined;
+        const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+        const root_identity = bindFixtureProgramRoot(&program, install_root);
+        const result = try materialize(testing.allocator, .{
+            .io = testing.io,
+            .root = fixture.root(),
+            .install_root = install_root,
+            .planning = .{
+                .program = &program,
+                .snapshot = fixture.snapshot(),
+                .archives = &.{.{ .artifact = 0, .bytes = bytes }},
+                .root = fixture.root(),
+                .root_identity_sha256 = root_identity,
+                .interoperability = .isolated_root,
+                .conffiles = .unpack,
+            },
+            .locks = locks.interface(),
+            .operation = .upgrade,
+        });
+        if (result.outcome != .applied) {
+            std.debug.print("{s}: unexpected outcome {s}: {s}\n", .{
+                case.name,
+                @tagName(result.outcome),
+                result.detail,
+            });
+            return error.TestUnexpectedResult;
+        }
+        try testing.expect(try fixture.root().entryIfExists(
+            try root_fs.Path.init("etc/sysctl.conf.dpkg-dist"),
+        ) == null);
+        if (case.sysctl) |content| {
+            try testing.expect(try fixture.root().entryIfExists(
+                try root_fs.Path.init("etc/sysctl.conf"),
+            ) == null);
+            const old = try fixture.root().readFileAlloc(
+                testing.allocator,
+                try root_fs.Path.init("etc/sysctl.conf.dpkg-old"),
+                4096,
+            );
+            defer testing.allocator.free(old);
+            try testing.expectEqualStrings(content, old);
+        } else {
+            try testing.expect(try fixture.root().entryIfExists(
+                try root_fs.Path.init("etc/sysctl.conf"),
+            ) == null);
+            try testing.expect(try fixture.root().entryIfExists(
+                try root_fs.Path.init("etc/sysctl.conf.dpkg-old"),
+            ) == null);
+        }
+        const written_status = try fixture.root().readFileAlloc(
+            testing.allocator,
+            try root_fs.Path.init("var/lib/dpkg/status"),
+            16 * 1024,
+        );
+        defer testing.allocator.free(written_status);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            written_status,
+            " /etc/sysctl.conf newconffile remove-on-upgrade\n",
+        ) != null);
+    }
 }
 
 test "native_unpack.test.final retirement authorizes replacement and ancestor synthesis" {

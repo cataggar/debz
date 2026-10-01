@@ -256,6 +256,8 @@ fn execute(
             defer case.deinit();
             try case.phase("install", removed, policy, null);
             try case.phase("configure", removed, policy, null);
+            try case.phase("remove", null, policy, null);
+            try case.phase("purge", null, policy, null);
             case.complete();
         }
     }
@@ -336,7 +338,7 @@ fn execute(
         try case.phase("purge", null, "keep_existing", &selection);
         case.complete();
     }
-    if (phases != 105) return error.IncompleteConffilePhaseMatrix;
+    if (phases != 109) return error.IncompleteConffilePhaseMatrix;
 
     var handoffs: usize = 0;
     for ([_][]const u8{
