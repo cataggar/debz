@@ -2418,7 +2418,7 @@ Test abbreviations:
 | Archive identities | exact-lock v3 package archive identity → receipt `exact_lock_sha256`, `artifact_evidence_sha256`; completion `exact_lock`, `artifact_evidence_sha256`; retained `authorization` | HC/HR `caller lock archive identity` (`LockEvidenceMismatch`), `receipt.exact_lock_sha256`, `receipt.artifact_evidence_sha256`, `completion.exact_lock`, `completion.artifact_evidence_sha256`, `retained authorization bytes`; FS `receipt-exact_lock`, `receipt-artifact_evidence`, `retained-authorization-*` | FF same cases | HQ keeps the original lock-bound attempt owed; resealed receipts refused |
 | DB generation / status | receipt `initial_database_generation_sha256`, `final_database_generation_sha256`, `final_state_sha256` (`package_database_closure_v1`); completion `database_generation_sha256` | HC/HR `receipt.final_database_generation_sha256`, `receipt.final_state_sha256` (`FinalStateMismatch`), `receipt.initial_database_generation_sha256`, `completion.database_generation_sha256`, `live dpkg status`, `live dpkg info list`; FS `receipt-final_database_generation`, `receipt-final_state`; FV `refuse-damaged-database` | FF `changed-database` (`FinalStateMismatch`), `receipt-final_*` | HQ receipt records its interrupted generation; never settles |
 | Filesystem decisions | retained `managed_state` (per-path decisions/digests), progress; diversion/route evidence when present | HC/HR `retained managed_state bytes`, `receipt.evidence_files[managed_state]` omitted/`.sha256`; FS `retained-managed_state-*` | FF `retained-managed_state-*` | HQ: changed payload during recovery → `managed_state_changed` receipt |
-| Live managed payload (#317) | final stable `managed_state` snapshot compared with the live root: kind, mode/owner, content SHA-256, symlink target; absent stays absent (`LivePayloadChanged`) | HC/HR `live payload bytes`, `live payload resized`, `live payload removed`, `live payload replaced by symlink`, `live payload replaced by directory`, `live payload mode`, `caller verify of live payload`, in-attempt `expectCallerPayloadBound`; unrelated directory member still verifies; FS `live-payload-bytes`, `live-payload-removed`, and `administrator-conffile-edit` still verifies; U3 | FF `live-payload-bytes`, `live-payload-removed` (published `fail-script` payload) | HQ: the same change during recovery → `managed_state_changed` receipt |
+| Live managed payload (#317) | final stable `managed_state` snapshot compared with the live root: kind, mode/owner, content SHA-256, symlink target; absent stays absent (`LivePayloadChanged`) | HC/HR `live payload bytes`, `live payload resized`, `live payload removed`, `live payload replaced by symlink`, `live payload replaced by directory`, `live payload mode`, `caller verify of live payload`, in-attempt `expectCallerPayloadBound`; unrelated directory member still verifies; FS `live-payload-bytes`, `live-payload-removed`, and `administrator-conffile-edit` still verifies; U3; repository `import` `success` pass 0 records `installed_verification_failed` | FF `live-payload-bytes`, `live-payload-removed` (published `fail-script` payload) | HQ: the same change during recovery → `managed_state_changed` receipt |
 | Maintainer-script launch / outcome | progress `in_flight`/`outcome` records, retained `script_outcome` documents, receipt `script_outcomes_sha256`, `progress_head_sha256`, `progress_record_count` | U1; HC/HR `receipt.script_outcomes_sha256`, `receipt.progress_head_sha256`, `receipt.progress_record_count`, `retained progress bytes`; FS `receipt-script_outcomes`, `retained-progress-*` | FF `retained-script_outcome-*`, `retained-progress-*`, `receipt-script_outcomes` | HQ (no script evidence consumed) |
 | Conffile choice | policy digest (conffile mode) → receipt/completion `policy_sha256`, exact-lock v3 policy (`AuthorizationMismatch`), `managed_state` conffile decisions; after settlement the live conffile is administrator state (see below) | HC/HR `caller conffile choice` (`CallerRequestMismatch`), `receipt.policy_sha256`, `completion.policy_sha256`; FS `receipt-policy`, `retained-managed_state-*` (`conffile-pkg`), `administrator-conffile-edit`; FV `refuse-request-conffile` | FF `receipt-policy`, `wrong-request` | HQ |
 | Trigger claims | retained `trigger_events`, receipt `trigger_evidence_sha256`; live `triggers/*` in the final closure | HC/HR `receipt.trigger_evidence_sha256`, `retained trigger_events bytes`, `live pending trigger claim`; FS `retained-trigger_events-*`, `receipt-trigger_evidence` | FF same | HQ |
@@ -2448,8 +2448,9 @@ before any final-state verification. HQ covers both resealed outcomes.
 matrix and both of its call sites, and the terminal-record binding in
 `readProductionCompletion`. It also refuses loss of the live payload
 cases in both matrices and of the `verifySettledPayload` call in
-`verifyStateEvidence` (#317). `test/security-policy.zig` mutation-tests
-those anchors.
+`verifyStateEvidence` (#317), and of the repository add's
+`installed_verification_failed` mapping and its assertions.
+`test/security-policy.zig` mutation-tests those anchors.
 
 **Live payload binding (#317).** Every settled verification variant
 (`verify`, `verifyForCaller`, the owned `verifyPending*` and
@@ -2510,6 +2511,40 @@ constant, and the same 1 GiB per-file and 8 GiB total limits as recovery
 observation apply. Payload listed in `info/*.md5sums` but outside the
 snapshot is never read. Building the exemption set reads only the program,
 `var/lib/dpkg/diversions` (database file limit) and the fixed alias table.
+
+**Repository add.** In a native `debz repo add`, settled verification of a
+succeeded descriptor transaction runs before the import stage's own
+installed-descriptor check. So `refuseNativeLivePayload` in
+`src/repository_backend.zig` keeps that stage's durable record: when the
+stage would import (`post_install`, or a resumed pipeline before `complete`),
+it persists the package checkpoint and records
+`installed_verification_failed` with the message `LivePayloadChanged`. The
+request reports `post_install` with that diagnostic and `imported: failed`.
+A failed transaction, or the completion step of a `complete` state, stays a
+raw `LivePayloadChanged` refusal, as the completion step's own
+installed-descriptor check was. In every case the receipt stays
+unacknowledged, no completion is published, and the root operation record
+stays owed with provenance pending. Another mutation refuses with
+`root_operation_recovery_required`, so no second operation can start. The
+operator path:
+
+1. `debz recover` adopts the owed attempt and refuses with
+   `root_operation_recovery_required`, because a repository bootstrap is
+   finished only by its own surface.
+2. Restore the managed payload, for example by reinstalling the retained
+   descriptor package's bytes.
+3. Rerun the same `debz repo add` request. It resumes import and refresh,
+   publishes the completion, acknowledges the receipt and clears the record.
+   While the payload still differs, each rerun records the same diagnostic.
+
+The `import` family of the `repository backend native execution external
+fixture` test covers this in its `success` case. Pass 0 removes the
+descriptor's installed source file after a succeeded transaction. It then
+asserts the recorded diagnostic, the `post_install` report, and that
+completion still refuses with the caller owed and its provenance pending.
+After the file is restored, pass 1 imports and refreshes from that
+checkpoint. The `resume` family covers the completion and record clearing
+that follow.
 
 **Gaps (follow-ups).** The hermetic and FS fixtures run no maintainer
 scripts, so retained `script_outcome` documents are tampered per component

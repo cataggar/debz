@@ -3546,7 +3546,7 @@ def native_workflow_acceptance_wiring_failures(
 
 
 def native_provenance_binding_wiring_failures(
-    build: str, e2e: str, binding: str, transaction: str,
+    build: str, e2e: str, binding: str, transaction: str, repository: str,
 ) -> list[str]:
     failures: list[str] = []
     if '            "native_provenance_binding.test.",\n        },\n    });\n    const run_sha512_e2e_tests = b.addRunArtifact(sha512_e2e_tests);' not in build:
@@ -3585,6 +3585,28 @@ def native_provenance_binding_wiring_failures(
     ):
         if token not in state:
             failures.append(f"native_transaction_result.zig: settled verification must bind the live managed payload lost {token}")
+    for start, tokens in (
+        ("\nfn nativeRepositoryCheckpointLoaded(", (
+            "        if (err == error.LivePayloadChanged)\n            return refuseNativeLivePayload(allocator, input, observer, stage, original, err);",
+        )),
+        ("\nfn refuseNativeLivePayload(", (
+            "    if (retained.receipt.document.outcome != .succeeded or !nativeStageImports(stage, prior.phase)) return cause;",
+            "    publication.persist(allocator, current.state, original.paths) catch |err| return err;",
+            "    return publication.fail(allocator, &current, original.paths, .installed_verification_failed, cause);",
+        )),
+        ("\nfn testProjectedNativeImport(", (
+            "try std.testing.expectError(error.LivePayloadChanged, importAndRefreshNative(allocator, input, reporting));",
+            "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, reported.diagnostics[0].id);",
+            'try std.testing.expectEqualStrings("LivePayloadChanged", reported.diagnostics[0].message);',
+            "try std.testing.expectError(error.LivePayloadChanged, completeNative(allocator, input));",
+            "try std.testing.expectEqual(root_operation.ProvenanceState.pending, attempt.record().provenance);",
+            "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, failed.state.diagnostic_id.?);",
+        )),
+    ):
+        body = repository.split(start, 1)[-1].split("\nfn ", 1)[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"repository_backend.zig: repository add must record a changed live payload as installed_verification_failed lost {token}")
     return failures
 
 
@@ -3793,6 +3815,7 @@ def audit_ci_pins() -> None:
         (ROOT / "src/sha512_transaction_e2e_test.zig").read_text(),
         (ROOT / "src/native_provenance_binding_test.zig").read_text(),
         (ROOT / "src/native_transaction_result.zig").read_text(),
+        (ROOT / "src/repository_backend.zig").read_text(),
     ):
         fail(failure)
     for failure in native_report_path_wiring_failures({
@@ -4853,6 +4876,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
                 "build.zig", "src/sha512_transaction_e2e_test.zig",
                 "src/native_provenance_binding_test.zig",
                 "src/native_transaction_result.zig",
+                "src/repository_backend.zig",
             ),
             "reference-root": REFERENCE_ROOT_PATHS,
             "protected-reference": PROTECTED_REFERENCE_PATHS,

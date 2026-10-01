@@ -1754,6 +1754,22 @@ test "security: native provenance component tamper coverage stays wired" {
         "    _ = try native_runtime.verifySettledPayload(",
         "        route_conffiles.items,\n",
     });
+    try nativeMutationsIn(&f, "native-provenance", "src/repository_backend.zig", "\nfn nativeRepositoryCheckpointLoaded(", "\nfn ", &.{
+        "        if (err == error.LivePayloadChanged)\n            return refuseNativeLivePayload(allocator, input, observer, stage, original, err);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/repository_backend.zig", "\nfn refuseNativeLivePayload(", "\nfn ", &.{
+        "    if (retained.receipt.document.outcome != .succeeded or !nativeStageImports(stage, prior.phase)) return cause;",
+        "    publication.persist(allocator, current.state, original.paths) catch |err| return err;",
+        "    return publication.fail(allocator, &current, original.paths, .installed_verification_failed, cause);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/repository_backend.zig", "\nfn testProjectedNativeImport(", "\nfn ", &.{
+        "try std.testing.expectError(error.LivePayloadChanged, importAndRefreshNative(allocator, input, reporting));",
+        "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, reported.diagnostics[0].id);",
+        "try std.testing.expectEqualStrings(\"LivePayloadChanged\", reported.diagnostics[0].message);",
+        "try std.testing.expectError(error.LivePayloadChanged, completeNative(allocator, input));",
+        "try std.testing.expectEqual(root_operation.ProvenanceState.pending, attempt.record().provenance);",
+        "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, failed.state.diagnostic_id.?);",
+    });
     try nativeMutationsIn(&f, "native-workflow", "test/native_recovery_family.zig", "\nfn ownedComponents(", "\nfn ", &.{
         "const retained_kinds = [_]provenance.EvidenceKind{ .authorization, .program, .execution_request, .intent, .progress, .managed_state, .trigger_events, .script_outcome };",
         "if (!observed_kinds.contains(kind) and (kind != .script_outcome or check.scripts))",
