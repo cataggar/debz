@@ -101,8 +101,9 @@ Rejected before mutation, with the classification in parentheses:
   group metadata (`file_metadata`);
 - unrecognized or unsupported compression and trailing compressed data
   (`compression`);
-- absolute, traversing, duplicate, conflicting, symlink-mediated, or forward
-  link paths (`path_or_link`);
+- absolute, traversing, duplicate, conflicting, symlink-mediated, cyclic,
+  over-40-hop, or forward link paths (`path_or_link`); acyclic in-archive
+  symlink chains up to that limit are accepted in any tar order;
 - any control member outside the table above, non-regular control entries,
   setuid or setgid control members, or non-root `config` ownership
   (`control_member`);
