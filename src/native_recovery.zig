@@ -143,6 +143,7 @@ pub const CrashPoint = enum {
     after_script_outcome,
     after_script_return_before_outcome,
     after_removal_postrm_return_before_outcome,
+    after_removal_postrm_outcome,
     after_upgrade_postrm_return_before_outcome,
     after_upgrade_postrm_route_publication,
     after_upgrade_postrm_cache_refresh,

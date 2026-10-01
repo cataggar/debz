@@ -19797,6 +19797,21 @@ fn stageIpRoutePostinstTemplates(
     );
 }
 
+fn removalRunsInstalledScript(
+    program: *const native_program.Program,
+    sequence: u32,
+    package: native_program.PackageIdentity,
+) bool {
+    for (program.steps[sequence + 1 ..]) |later| switch (later.operation) {
+        .run_maintainer_script => |call| if (call.source == .installed_package and
+            std.mem.eql(u8, call.package.name, package.name) and
+            std.mem.eql(u8, call.package.architecture, package.architecture))
+            return true,
+        else => {},
+    };
+    return false;
+}
+
 fn stageLifecycleScripts(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -24051,6 +24066,9 @@ fn runLifecycleScript(
             if (kind == .preinst and source == .installed_package and std.mem.eql(u8, arguments[0], "abort-upgrade"))
                 runtime.crash.hit(.after_upgrade_pre_rollback_compensation_outcome);
         }
+        if (kind == .postrm and source == .installed_package and
+            arguments.len != 0 and std.mem.eql(u8, arguments[0], "remove"))
+            runtime.crash.hit(.after_removal_postrm_outcome);
         runtime.crash.hit(.after_script_outcome);
         switch (report.outcome) {
             .exited => |code| if (code != 0)
@@ -30609,6 +30627,29 @@ fn executeLifecycleProgramWithRequest(
             if (lifecycleMaterializationFailure(result)) |failure| return failure;
         },
         .remove_package_files => |intent| {
+            // Removal deletes the installed scripts other than postrm, so a
+            // package without a prerm step stages them here, first (#328).
+            if (removalRunsInstalledScript(program, step.sequence, intent.package)) {
+                const staged = try stageLifecycleScripts(
+                    execution,
+                    allocator,
+                    scratch,
+                    root,
+                    external.root,
+                    program,
+                    authorization,
+                    models,
+                    initial_model,
+                    locks,
+                    attempt,
+                    operation,
+                    conffile_policy,
+                    intent.package,
+                    false,
+                    &staging,
+                );
+                if (lifecycleMaterializationFailure(staged)) |failure| return failure;
+            }
             const result = try lifecycleRemovePackage(
                 execution,
                 allocator,
