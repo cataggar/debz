@@ -855,12 +855,14 @@ pub const InstalledScript = struct {
 pub const InstalledConffile = struct {
     /// Absolute path recorded by the database.
     path: []const u8,
-    /// Digest the database records for the conffile.
-    recorded_md5: [16]u8,
+    /// Digest the database records for the conffile, or null for dpkg's
+    /// `newconffile` placeholder on a disappearing conffile.
+    recorded_md5: ?[16]u8,
     /// Digest observed in the root during preflight, or null when the file is
     /// absent.
     on_disk_md5: ?[16]u8 = null,
     obsolete: bool = false,
+    remove_on_upgrade: bool = false,
 };
 
 pub const InstalledPackage = struct {
@@ -1435,14 +1437,32 @@ fn scriptsDigest(scripts: []const InstalledScript) [32]u8 {
 fn conffilesDigest(conffiles: []const InstalledConffile) [32]u8 {
     var hasher = Sha256.init(.{});
     hasher.update("debz-native-transaction-program-conffiles-v1\x00");
+    var has_extension = false;
     for (conffiles) |conffile| {
         updateString(&hasher, conffile.path);
-        hasher.update(&conffile.recorded_md5);
+        if (conffile.recorded_md5) |digest| {
+            hasher.update(&digest);
+        } else {
+            const placeholder: [16]u8 = @splat(0);
+            hasher.update(&placeholder);
+            has_extension = true;
+        }
         if (conffile.on_disk_md5) |digest| {
             updateByte(&hasher, 1);
             hasher.update(&digest);
         } else updateByte(&hasher, 0);
         updateByte(&hasher, @intFromBool(conffile.obsolete));
+        if (conffile.remove_on_upgrade) has_extension = true;
+    }
+    if (has_extension) {
+        hasher.update("debz-native-transaction-program-conffiles-v1-newconffile\x00");
+        for (conffiles) |conffile| {
+            if (conffile.recorded_md5 != null and !conffile.remove_on_upgrade) continue;
+            updateString(&hasher, conffile.path);
+            updateByte(&hasher, @intFromBool(conffile.recorded_md5 == null));
+            updateByte(&hasher, @intFromBool(conffile.obsolete));
+            updateByte(&hasher, @intFromBool(conffile.remove_on_upgrade));
+        }
     }
     return hasher.finalResult();
 }
@@ -1787,6 +1807,14 @@ fn prepareInstalledConffiles(
             return self.reject(.{
                 .code = .invalid_conffile_metadata,
                 .detail = "path",
+                .package = package.name,
+                .path = conffile.path,
+            });
+        if (conffile.recorded_md5 == null and
+            !conffile.obsolete and !conffile.remove_on_upgrade)
+            return self.reject(.{
+                .code = .invalid_conffile_metadata,
+                .detail = "newconffile",
                 .package = package.name,
                 .path = conffile.path,
             });
@@ -2964,7 +2992,7 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
                     .policy = self.input.authorization.policy.conffile,
                     .action = .retain_on_remove,
                     .packaged_md5 = null,
-                    .recorded_md5 = hex(16, conffile.recorded_md5),
+                    .recorded_md5 = if (conffile.recorded_md5) |digest| hex(16, digest) else null,
                     .on_disk_md5 = if (conffile.on_disk_md5) |digest| hex(16, digest) else null,
                 } });
             }
@@ -3006,7 +3034,7 @@ fn emitRemoval(self: *Compiler, action_index: usize, purge: bool) CompileError!v
             .policy = self.input.authorization.policy.conffile,
             .action = .delete_on_purge,
             .packaged_md5 = null,
-            .recorded_md5 = hex(16, conffile.recorded_md5),
+            .recorded_md5 = if (conffile.recorded_md5) |digest| hex(16, digest) else null,
             .on_disk_md5 = if (conffile.on_disk_md5) |digest| hex(16, digest) else null,
         } });
     }
@@ -3290,23 +3318,35 @@ pub fn conffileDecision(
     if (packaged.remove_on_upgrade) {
         const record = recorded orelse return .skip_not_shipped;
         const on_disk = record.on_disk_md5 orelse return .skip_not_shipped;
-        return if (std.mem.eql(u8, &on_disk, &record.recorded_md5))
+        const recorded_md5 = record.recorded_md5 orelse return .remove_on_upgrade_stage_old;
+        return if (std.mem.eql(u8, &on_disk, &recorded_md5))
             .remove_on_upgrade
         else
             .remove_on_upgrade_stage_old;
     }
     const record = recorded orelse return .install_new;
     const shipped = packaged.md5.?;
-    const maintainer_edited = !std.mem.eql(u8, &shipped, &record.recorded_md5);
-    const on_disk = record.on_disk_md5 orelse {
+    const on_disk = record.on_disk_md5;
+    if (on_disk) |digest| {
+        if (std.mem.eql(u8, &digest, &shipped))
+            return .identical_no_op;
+    }
+    const recorded_md5 = record.recorded_md5 orelse {
+        if (on_disk == null) return .install_new;
+        return switch (policy) {
+            .keep_existing => .keep_existing_stage_dist,
+            .use_package_version => .install_stage_old,
+        };
+    };
+    const maintainer_edited = !std.mem.eql(u8, &shipped, &recorded_md5);
+    const root_md5 = on_disk orelse {
         if (!maintainer_edited) return .keep_user_deleted;
         return switch (policy) {
             .keep_existing => .keep_existing_stage_dist,
             .use_package_version => .restore_missing,
         };
     };
-    if (std.mem.eql(u8, &on_disk, &shipped)) return .identical_no_op;
-    if (std.mem.eql(u8, &on_disk, &record.recorded_md5)) return .replace_unmodified;
+    if (std.mem.eql(u8, &root_md5, &recorded_md5)) return .replace_unmodified;
     if (!maintainer_edited) return .keep_user_modified;
     return switch (policy) {
         .keep_existing => .keep_existing_stage_dist,
@@ -3339,7 +3379,10 @@ fn emitConffiles(
             .policy = policy,
             .action = conffileDecision(policy, conffile, recorded),
             .packaged_md5 = if (conffile.md5) |digest| hex(16, digest) else null,
-            .recorded_md5 = if (recorded) |value| hex(16, value.recorded_md5) else null,
+            .recorded_md5 = if (recorded) |value|
+                if (value.recorded_md5) |digest| hex(16, digest) else null
+            else
+                null,
             .on_disk_md5 = if (recorded) |value|
                 if (value.on_disk_md5) |digest| hex(16, digest) else null
             else
@@ -3355,7 +3398,7 @@ fn emitConffiles(
             .policy = policy,
             .action = .mark_obsolete,
             .packaged_md5 = null,
-            .recorded_md5 = hex(16, conffile.recorded_md5),
+            .recorded_md5 = if (conffile.recorded_md5) |digest| hex(16, digest) else null,
             .on_disk_md5 = if (conffile.on_disk_md5) |digest| hex(16, digest) else null,
         } });
     };
@@ -5261,8 +5304,10 @@ const ConffileCase = struct {
     name: []const u8,
     packaged: ?u8,
     recorded: ?u8,
+    recorded_new_conffile: bool = false,
     on_disk: ?u8,
     remove_on_upgrade: bool = false,
+    obsolete: bool = false,
     keep_existing: ConffileAction,
     use_package_version: ConffileAction,
 };
@@ -5311,6 +5356,56 @@ const conffile_cases = [_]ConffileCase{
         .remove_on_upgrade = true,
         .keep_existing = .skip_not_shipped,
         .use_package_version = .skip_not_shipped,
+    },
+    .{
+        .name = "remove-on-upgrade newconffile record preserves an absent path",
+        .packaged = null,
+        .recorded = null,
+        .recorded_new_conffile = true,
+        .on_disk = null,
+        .remove_on_upgrade = true,
+        .keep_existing = .skip_not_shipped,
+        .use_package_version = .skip_not_shipped,
+    },
+    .{
+        .name = "remove-on-upgrade newconffile record saves a present path",
+        .packaged = null,
+        .recorded = null,
+        .recorded_new_conffile = true,
+        .on_disk = 0x6f,
+        .remove_on_upgrade = true,
+        .keep_existing = .remove_on_upgrade_stage_old,
+        .use_package_version = .remove_on_upgrade_stage_old,
+    },
+    .{
+        .name = "obsolete newconffile record reinstalls when absent",
+        .packaged = 0x61,
+        .recorded = null,
+        .recorded_new_conffile = true,
+        .on_disk = null,
+        .obsolete = true,
+        .keep_existing = .install_new,
+        .use_package_version = .install_new,
+    },
+    .{
+        .name = "obsolete newconffile record treats a present file as local",
+        .packaged = 0x61,
+        .recorded = null,
+        .recorded_new_conffile = true,
+        .on_disk = 0x6f,
+        .obsolete = true,
+        .keep_existing = .keep_existing_stage_dist,
+        .use_package_version = .install_stage_old,
+    },
+    .{
+        .name = "obsolete newconffile record present and identical",
+        .packaged = 0x61,
+        .recorded = null,
+        .recorded_new_conffile = true,
+        .on_disk = 0x61,
+        .obsolete = true,
+        .keep_existing = .identical_no_op,
+        .use_package_version = .identical_no_op,
     },
     .{
         .name = "nothing changed anywhere",
@@ -5395,6 +5490,14 @@ test "native_program.test.conffile decisions follow the dpkg digest table" {
             .path = "/etc/app.conf",
             .recorded_md5 = @splat(value),
             .on_disk_md5 = if (case.on_disk) |observed| @splat(observed) else null,
+            .obsolete = case.obsolete,
+            .remove_on_upgrade = case.remove_on_upgrade,
+        } else if (case.recorded_new_conffile) .{
+            .path = "/etc/app.conf",
+            .recorded_md5 = null,
+            .on_disk_md5 = if (case.on_disk) |observed| @splat(observed) else null,
+            .obsolete = case.obsolete,
+            .remove_on_upgrade = case.remove_on_upgrade,
         } else null;
         for (conffilePolicies()) |policy| {
             const decision = conffileDecision(policy, packaged, recorded);
@@ -5436,15 +5539,22 @@ test "native_program.test.compiled conffile steps carry the deciding digests" {
             const archives = [_]Archive{archive};
             var recorded = [_]InstalledConffile{.{
                 .path = "/etc/app.conf",
-                .recorded_md5 = if (case.recorded) |value| @splat(value) else @splat(0),
+                .recorded_md5 = if (case.recorded) |value|
+                    @as([16]u8, @splat(value))
+                else if (case.recorded_new_conffile)
+                    null
+                else
+                    @as([16]u8, @splat(0)),
                 .on_disk_md5 = if (case.on_disk) |observed| @splat(observed) else null,
+                .obsolete = case.obsolete,
+                .remove_on_upgrade = case.remove_on_upgrade,
             }};
             var installed = [_]InstalledPackage{.{
                 .name = "app",
                 .version = "1.0",
                 .architecture = "amd64",
                 .state = .installed,
-                .conffiles = if (case.recorded == null) &.{} else &recorded,
+                .conffiles = if (case.recorded == null and !case.recorded_new_conffile) &.{} else &recorded,
             }};
             var owned = try expectProgram(compile(testing.allocator, .{
                 .authorization = &authorization.authorization,
@@ -5481,7 +5591,7 @@ test "native_program.test.compiled conffile steps carry the deciding digests" {
             try expectOptionalMd5(case.packaged, decision.packaged_md5);
             try expectOptionalMd5(case.recorded, decision.recorded_md5);
             try expectOptionalMd5(
-                if (case.recorded == null) null else case.on_disk,
+                if (case.recorded == null and !case.recorded_new_conffile) null else case.on_disk,
                 decision.on_disk_md5,
             );
         }
@@ -5564,6 +5674,43 @@ test "native_program.test.conffile digests change the compiled decision and dige
         }
         try digests.append(testing.allocator, owned.program.digest_sha256);
     }
+}
+
+test "native_program.test.newconffile conffile evidence is domain separated" {
+    const md5 = [_]InstalledConffile{.{
+        .path = "/etc/app.conf",
+        .recorded_md5 = @splat(0),
+    }};
+    const md5_remove_on_upgrade = [_]InstalledConffile{.{
+        .path = "/etc/app.conf",
+        .recorded_md5 = @splat(0),
+        .remove_on_upgrade = true,
+    }};
+    const remove_on_upgrade = [_]InstalledConffile{.{
+        .path = "/etc/app.conf",
+        .recorded_md5 = null,
+        .remove_on_upgrade = true,
+    }};
+    const obsolete = [_]InstalledConffile{.{
+        .path = "/etc/app.conf",
+        .recorded_md5 = null,
+        .obsolete = true,
+    }};
+    try testing.expect(!std.mem.eql(
+        u8,
+        &conffilesDigest(&md5),
+        &conffilesDigest(&md5_remove_on_upgrade),
+    ));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &conffilesDigest(&md5_remove_on_upgrade),
+        &conffilesDigest(&remove_on_upgrade),
+    ));
+    try testing.expect(!std.mem.eql(
+        u8,
+        &conffilesDigest(&remove_on_upgrade),
+        &conffilesDigest(&obsolete),
+    ));
 }
 
 test "native_program.test.packaged conffile digests must match the shipped contract" {
@@ -6744,6 +6891,21 @@ test "native_program.test.preflight evidence must be complete and quiescent" {
             .architecture = "amd64",
             .state = .installed,
             .conffiles = &.{.{ .path = "etc/relative.conf", .recorded_md5 = @splat(0) }},
+        }};
+        input.installed.packages = &invalid;
+        try expectDiagnostic(
+            compile(testing.allocator, input),
+            .invalid_conffile_metadata,
+        );
+    }
+    {
+        var input = base;
+        const invalid = [_]InstalledPackage{.{
+            .name = "menu",
+            .version = "3.0",
+            .architecture = "amd64",
+            .state = .installed,
+            .conffiles = &.{.{ .path = "/etc/new.conf", .recorded_md5 = null }},
         }};
         input.installed.packages = &invalid;
         try expectDiagnostic(

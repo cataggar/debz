@@ -3496,6 +3496,49 @@ test "package_database.test.canonical writers reproduce the imported generation"
     try testing.expectEqualStrings(test_fixtures.arch, arch_bytes);
 }
 
+test "package_database.test.newconffile disappearing conffiles round trip byte exactly" {
+    const status =
+        \\Package: procps
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 2:4.0.6-3ubuntu1
+        \\Conffiles:
+        \\ /etc/sysctl.conf newconffile remove-on-upgrade
+        \\ /etc/obsolete.conf newconffile obsolete
+        \\Description: procps
+        \\
+        \\
+    ;
+    var database = switch (try importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = .{
+            .status = regularFile(status),
+            .info = &.{
+                .{ .name = info_format_name, .bytes = supported_info_format ++ "\n" },
+                .{ .name = "procps.list", .bytes = "/.\n/etc\n/etc/obsolete.conf\n" },
+            },
+        },
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => |value| {
+            std.debug.print("newconffile database rejected: {any}\n", .{value});
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer database.deinit();
+    const record = database.model.find("procps", "amd64").?;
+    try testing.expectEqual(@as(usize, 2), record.conffiles.len);
+    try testing.expect(record.conffiles[0].digest == .new_conffile);
+    try testing.expect(record.conffiles[0].remove_on_upgrade);
+    try testing.expect(!record.conffiles[0].obsolete);
+    try testing.expect(record.conffiles[1].digest == .new_conffile);
+    try testing.expect(record.conffiles[1].obsolete);
+    try testing.expect(!record.conffiles[1].remove_on_upgrade);
+    const status_bytes = try writeStatusDocument(testing.allocator, database.model.packages);
+    defer testing.allocator.free(status_bytes);
+    try testing.expectEqualStrings(status, status_bytes);
+}
+
 test "package_database.test.literal package paths round trip every database surface" {
     const config = "/etc/literal\\config.conf";
     const directory = "/usr/share/literal\\directory";
