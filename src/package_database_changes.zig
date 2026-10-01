@@ -42,16 +42,29 @@ pub const MetadataUpdate = union(enum) {
     replace: []const StagedMetadata,
 };
 
+/// Exact bytes of a package's `triggers` control member. dpkg installs the
+/// member verbatim as `info/<stem>.triggers` and reads it only for meaning.
+pub const StagedTriggerFile = struct {
+    bytes: []const u8,
+    mode: u32 = 0o644,
+};
+
 /// A complete package record plus every modeled `info` file it owns. A `null`
 /// component means the file must not exist after publication; it is never
 /// interpreted as "leave whatever is there". Inert metadata has a separate,
 /// explicit preserve/replace policy so existing status-only callers retain it.
+///
+/// `trigger_file` carries the exact member bytes, which must declare exactly
+/// `trigger_declarations`. Without it, an installed file under the same stem
+/// that already declares the same set is kept byte-for-byte, as dpkg never
+/// rewrites it outside unpack; only a changed set is written canonically.
 pub const StagedPackage = struct {
     fields: []const database.StatusField,
     paths: ?[]const []const u8 = null,
     md5sums: ?[]const database.Md5sumEntry = null,
     declared_conffiles: ?[]const []const u8 = null,
     trigger_declarations: ?[]const database.TriggerDeclaration = null,
+    trigger_file: ?StagedTriggerFile = null,
     scripts: []const StagedScript = &.{},
     metadata: MetadataUpdate = .preserve,
 };
@@ -230,6 +243,23 @@ pub fn transitionAllowed(from: CurrentState, to: CurrentState) bool {
 }
 
 const PlanError = std.mem.Allocator.Error || error{Invalid};
+
+const TriggerPublication = union(enum) {
+    absent,
+    keep,
+    write: StagedTriggerFile,
+};
+
+fn sameDeclarations(
+    left: []const database.TriggerDeclaration,
+    right: []const database.TriggerDeclaration,
+) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |first, second| {
+        if (first.kind != second.kind or !std.mem.eql(u8, first.name, second.name)) return false;
+    }
+    return true;
+}
 
 const Builder = struct {
     arena: std.mem.Allocator,
@@ -601,6 +631,7 @@ const Builder = struct {
     fn stagePackageInfo(
         self: *Builder,
         record: database.PackageRecord,
+        triggers: TriggerPublication,
         scripts: []const StagedScript,
         metadata: []const StagedMetadata,
     ) PlanError!void {
@@ -625,12 +656,13 @@ const Builder = struct {
                 0o644,
             );
         }
-        if (record.trigger_declarations) |declarations| {
-            try self.stageReplace(
+        switch (triggers) {
+            .absent, .keep => {},
+            .write => |file| try self.stageReplace(
                 try self.infoPath(record.info_stem, "triggers"),
-                try database.writeTriggerDeclarations(self.arena, declarations),
-                0o644,
-            );
+                file.bytes,
+                file.mode,
+            ),
         }
         for (scripts) |script| {
             // Script bytes come from the caller; the plan owns its intent
@@ -708,6 +740,15 @@ const Builder = struct {
         if (staged.trigger_declarations) |declarations| {
             try self.validateDeclarations(declarations, record.name);
         }
+        if (staged.trigger_file) |file| {
+            const declarations = staged.trigger_declarations orelse
+                return self.fail(.invalid_trigger_declaration, record.name);
+            if (file.bytes.len > limits.max_info_file_bytes)
+                return self.fail(.file_too_large, record.name);
+            if (!database.safeFileMode(file.mode)) return self.fail(.unsafe_mode, record.name);
+            if (!database.triggerFileDeclares(file.bytes, declarations, limits))
+                return self.fail(.invalid_trigger_declaration, record.name);
+        }
         record.paths = staged.paths;
         record.md5sums = staged.md5sums;
         record.declared_conffiles = staged.declared_conffiles;
@@ -759,7 +800,7 @@ const Builder = struct {
             }
             try self.guardCoverage(old);
         }
-        try self.stagePackageInfo(record, staged.scripts, switch (staged.metadata) {
+        try self.stagePackageInfo(record, try self.triggerPublication(staged, record, existing), staged.scripts, switch (staged.metadata) {
             .preserve => &.{},
             .replace => |entries| entries,
         });
@@ -770,6 +811,26 @@ const Builder = struct {
             try self.records.append(self.scratch, record);
             try self.setPosition(record.identity(), self.records.items.len - 1);
         }
+    }
+
+    fn triggerPublication(
+        self: *Builder,
+        staged: StagedPackage,
+        record: database.PackageRecord,
+        existing: ?database.PackageRecord,
+    ) PlanError!TriggerPublication {
+        const declarations = record.trigger_declarations orelse return .absent;
+        if (staged.trigger_file) |file| return .{ .write = .{
+            .bytes = try self.arena.dupe(u8, file.bytes),
+            .mode = file.mode,
+        } };
+        if (existing) |old| if (old.trigger_declarations) |installed| {
+            if (std.mem.eql(u8, old.info_stem, record.info_stem) and
+                sameDeclarations(installed, declarations)) return .keep;
+        };
+        return .{ .write = .{
+            .bytes = try database.writeTriggerDeclarations(self.arena, declarations),
+        } };
     }
 
     fn applySetState(self: *Builder, change: StateChange) PlanError!void {
@@ -2131,6 +2192,118 @@ test "package_database_changes.test.inert metadata replacement preserves exact b
         } else if (index == 2) {
             try testing.expectEqual(@as(u32, 0o640), record.metadataMember(.shlibs).?.mode);
         }
+    }
+}
+
+test "package_database_changes.test.trigger files publish verbatim and survive re-puts" {
+    var root = try SimulatedRoot.init(testing.allocator, database.test_fixtures.snapshot());
+    defer root.deinit();
+    const both = [_]database.TriggerDeclaration{
+        .{ .kind = .activate_noawait, .name = "ldconfig" },
+        .{ .kind = .interest, .name = "/usr/share/newpkg" },
+    };
+    const verbatim = "# Triggers added by dh_makeshlibs\n\n  # indented\n" ++
+        "activate-noawait\tldconfig  \n \tinterest   /usr/share/newpkg\t\n";
+    const Expect = enum { verbatim, untouched, canonical, comments, removed };
+    const Step = struct {
+        declarations: ?[]const database.TriggerDeclaration,
+        file: ?StagedTriggerFile,
+        expect: Expect,
+    };
+    const steps = [_]Step{
+        .{ .declarations = &both, .file = .{ .bytes = verbatim, .mode = 0o640 }, .expect = .verbatim },
+        // Status-only re-puts never rewrite an equivalent installed file.
+        .{ .declarations = &both, .file = null, .expect = .untouched },
+        .{ .declarations = both[0..1], .file = null, .expect = .canonical },
+        // dpkg installs a member that declares nothing, too.
+        .{ .declarations = &.{}, .file = .{ .bytes = "# nothing yet\n" }, .expect = .comments },
+        .{ .declarations = &.{}, .file = null, .expect = .untouched },
+        .{ .declarations = null, .file = null, .expect = .removed },
+    };
+    var kept = std.heap.ArenaAllocator.init(testing.allocator);
+    defer kept.deinit();
+    var installed: []const u8 = "";
+    for (steps) |step| {
+        var source = switch (try database.importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = root.snapshot(),
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer source.deinit();
+        var package = newPackage();
+        package.trigger_declarations = step.declarations;
+        package.trigger_file = step.file;
+        var staged = switch (try plan(testing.allocator, source, &.{.{ .put_package = package }}, .{})) {
+            .plan => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer staged.deinit();
+        const write = staged.find("info/newpkg.triggers");
+        switch (step.expect) {
+            .verbatim => {
+                try testing.expectEqualStrings(verbatim, write.?.bytes);
+                try testing.expectEqual(@as(u32, 0o640), write.?.mode);
+            },
+            .untouched => try testing.expect(write == null),
+            .canonical => try testing.expectEqualStrings("activate-noawait ldconfig\n", write.?.bytes),
+            .comments => try testing.expectEqualStrings("# nothing yet\n", write.?.bytes),
+            .removed => try testing.expectEqual(WriteKind.remove, write.?.kind),
+        }
+        try root.apply(staged);
+        var imported = switch (try database.importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = root.snapshot(),
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer imported.deinit();
+        const record = imported.model.find("newpkg", "amd64").?;
+        if (step.declarations) |expected| {
+            const recorded = record.trigger_declarations.?;
+            try testing.expectEqual(expected.len, recorded.len);
+            for (expected, recorded) |want, got| {
+                try testing.expectEqual(want.kind, got.kind);
+                try testing.expectEqualStrings(want.name, got.name);
+            }
+            if (write) |value| installed = try kept.allocator().dupe(u8, value.bytes);
+            try testing.expectEqualStrings(installed, root.info.items[root.find("newpkg.triggers").?].bytes);
+        } else {
+            try testing.expect(record.trigger_declarations == null);
+            try testing.expect(root.find("newpkg.triggers") == null);
+        }
+    }
+}
+
+test "package_database_changes.test.trigger file bytes must declare the staged set" {
+    var source = try importFixture();
+    defer source.deinit();
+    const declarations = [_]database.TriggerDeclaration{.{ .kind = .activate, .name = "newpkg-trigger" }};
+    const Case = struct {
+        declarations: ?[]const database.TriggerDeclaration,
+        file: StagedTriggerFile,
+        code: database.Code,
+    };
+    const cases = [_]Case{
+        .{ .declarations = null, .file = .{ .bytes = "activate newpkg-trigger\n" }, .code = .invalid_trigger_declaration },
+        .{ .declarations = &declarations, .file = .{ .bytes = "activate other-trigger\n" }, .code = .invalid_trigger_declaration },
+        .{ .declarations = &declarations, .file = .{ .bytes = "activate-await newpkg-trigger\n" }, .code = .invalid_trigger_declaration },
+        .{ .declarations = &declarations, .file = .{ .bytes = "# only a comment\n" }, .code = .invalid_trigger_declaration },
+        .{ .declarations = &declarations, .file = .{ .bytes = "activate newpkg-trigger\nactivate newpkg-trigger\n" }, .code = .invalid_trigger_declaration },
+        .{ .declarations = &declarations, .file = .{ .bytes = "activate newpkg-trigger" }, .code = .invalid_trigger_declaration },
+        .{ .declarations = &declarations, .file = .{ .bytes = "# carriage\r\nactivate newpkg-trigger\n" }, .code = .invalid_trigger_declaration },
+        .{ .declarations = &declarations, .file = .{ .bytes = "activate newpkg-trigger\n", .mode = 0o4644 }, .code = .unsafe_mode },
+    };
+    for (cases) |case| {
+        var package = newPackage();
+        package.trigger_declarations = case.declarations;
+        package.trigger_file = case.file;
+        try expectPlanDiagnostic(
+            try plan(testing.allocator, source, &.{.{ .put_package = package }}, .{}),
+            case.code,
+        );
     }
 }
 

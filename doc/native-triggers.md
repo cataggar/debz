@@ -51,6 +51,27 @@ awaited state rather than claim that every package is installed. Dynamic
 script activations are constrained by bound trigger-handler identity and
 script evidence; they are not a free-form script-execution capability.
 
+## Installed `triggers` files
+
+dpkg 1.22.22 renames each control member into `info/` unchanged
+(`pkg_infodb_update` in `src/main/unpack.c`), so an installed
+`info/<package>.triggers` keeps the shipped comments, blank lines,
+indentation, and tab separators. Native publication installs the archive's
+`triggers` member verbatim, with its archive mode, and parses it only for
+declarations. The change plan proves the bytes re-import, under dpkg's
+`trig_parse_ci` rules, to exactly the staged declarations, so an
+unimportable database is never published. Re-staging a record without new
+bytes keeps a semantically equal installed file, and rollback restores the
+exact prior bytes. A member that holds only comments declares nothing and
+needs no trigger execution, but it is still installed, as dpkg does.
+Other control bytes refuse even inside comments, because the installed file
+must stay importable. The application digest binds the member's name, mode,
+size, and SHA-256 when it is present.
+`native_lifecycle_trigger_files.zig` (run by `--install-boundaries-only`)
+compares the exact bytes against pinned dpkg across install,
+comment-only upgrades and a downgrade, a comment-only member with and
+without trigger execution, removal, and purge.
+
 ## Automatic file interests owned by the source
 
 The signed `libglib2.0-0t64:amd64` `2.90.0-1` archive (SHA-512
