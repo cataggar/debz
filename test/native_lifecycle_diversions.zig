@@ -105,6 +105,38 @@ fn assertListed(case: *support.Scenario, source: []const u8, destination: []cons
     }
 }
 
+fn assertPackageListsLogical(case: *support.Scenario, package: []const u8, source: []const u8, destination: []const u8) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const relative = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/var/lib/dpkg/info/{s}.list", .{ case.name, side, package });
+        defer case.fixture.allocator.free(relative);
+        const text = try support.read(case.fixture, relative, 1024 * 1024);
+        defer case.fixture.allocator.free(text);
+        const match = try std.fmt.allocPrint(case.fixture.allocator, "/{s}\n", .{source});
+        defer case.fixture.allocator.free(match);
+        const shifted = try std.fmt.allocPrint(case.fixture.allocator, "/{s}\n", .{destination});
+        defer case.fixture.allocator.free(shifted);
+        if (std.mem.indexOf(u8, text, match) == null or std.mem.indexOf(u8, text, shifted) != null)
+            return error.WrongLogicalPackageList;
+    }
+}
+
+fn installDpkgDivert(case: *support.Scenario, dpkg: []const u8) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const root = try support.path(case.fixture.allocator, case.name, side);
+        defer case.fixture.allocator.free(root);
+        try support.copyReferenceTool(case.fixture, root, dpkg, "dpkg-divert", "/usr/bin/dpkg-divert");
+    }
+}
+
+fn divertSnippet(fixture: *foundation.Fixture, command: []const u8) ![]u8 {
+    return std.fmt.allocPrint(fixture.allocator,
+        \\if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ]; then
+        \\    {s}
+        \\fi
+        \\
+    , .{command});
+}
+
 fn staticRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8, first: []const u8, second: []const u8) !void {
     const selection = chosen(arch);
     for ([_]struct { label: []const u8, member: []const u8, owner: []const u8, override: []const u8 = "" }{
@@ -244,7 +276,7 @@ fn dynamicRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
         for ([_][]const u8{ "reference", "native" }) |side| {
             const root = try support.path(fixture.allocator, case.name, side);
             defer fixture.allocator.free(root);
-            try support.copyProgram(fixture, root, "/usr/bin/dpkg-divert", "/diversion-helper");
+            try support.copyReferenceTool(fixture, root, dpkg, "dpkg-divert", "/diversion-helper");
         }
         try both(&case, "diversion-helper-record", "/" ++ source ++ "\n/" ++ source ++ ".changed\n");
         try case.phase(.{ .operation = "install", .archives = &.{first}, .packages = &selection }, false);
@@ -341,6 +373,187 @@ fn dynamicRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
         try case.phase(.{ .operation = "reinstall", .archives = &.{first}, .packages = &selection }, false);
         try case.phase(.{ .operation = "remove", .packages = &selection }, false);
         try case.phase(.{ .operation = "purge", .packages = &selection }, false);
+    }
+}
+
+fn genuineToolRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    for ([_]struct {
+        label: []const u8,
+        package: []const u8,
+        command: []const u8,
+    }{
+        .{
+            .label = "env-owner",
+            .package = "genuine-divert-env-owner",
+            .command = "/usr/bin/dpkg-divert --no-rename --divert /usr/share/genuine-divert-env-owner/payload.distrib --add /usr/share/genuine-divert-env-owner/payload || exit 31",
+        },
+        .{
+            .label = "package-other",
+            .package = "genuine-divert-package-other",
+            .command = "/usr/bin/dpkg-divert --package genuine-divert-other --no-rename --divert /usr/share/genuine-divert-package-other/payload.distrib --add /usr/share/genuine-divert-package-other/payload || exit 31",
+        },
+        .{
+            .label = "default-add",
+            .package = "genuine-divert-default-add",
+            .command = "/usr/bin/dpkg-divert --no-rename --add /usr/share/genuine-divert-default-add/payload || exit 31",
+        },
+        .{
+            .label = "directory",
+            .package = "genuine-divert-directory",
+            .command = "/usr/bin/dpkg-divert --package genuine-divert-directory-owner --no-rename --divert /opt/genuine-divert-directory.distrib --add /opt/genuine-divert-directory || exit 31",
+        },
+    }) |entry| {
+        const script = try divertSnippet(fixture, entry.command);
+        defer fixture.allocator.free(script);
+        const archive_path = try std.fmt.allocPrint(fixture.allocator, "packages/genuine-divert-{s}", .{entry.label});
+        defer fixture.allocator.free(archive_path);
+        const archive_file = try support.makePackage(fixture, arch, "1", entry.package, archive_path, .{
+            .preinst_append = script,
+        });
+        defer fixture.allocator.free(archive_file);
+        const selected = [_]foundation.PackageIdentity{.{ .name = entry.package, .architecture = arch }};
+        const label = try std.fmt.allocPrint(fixture.allocator, "diversion-genuine-{s}", .{entry.label});
+        defer fixture.allocator.free(label);
+        var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+        defer case.deinit();
+        try installDpkgDivert(&case, dpkg);
+        try case.phase(.{ .operation = "install", .archives = &.{archive_file}, .packages = &selected }, false);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+    }
+
+    {
+        const package = "genuine-divert-identical";
+        const source = "usr/share/genuine-divert-identical/payload";
+        const script = try divertSnippet(
+            fixture,
+            "/usr/bin/dpkg-divert --no-rename --divert /usr/share/genuine-divert-identical/payload.distrib --add /usr/share/genuine-divert-identical/payload || exit 31\n" ++
+                "    /usr/bin/dpkg-divert --no-rename --divert /usr/share/genuine-divert-identical/payload.distrib --add /usr/share/genuine-divert-identical/payload || exit 32\n" ++
+                "    /usr/bin/dpkg-divert --no-rename --remove /usr/share/genuine-divert-identical/absent || exit 33",
+        );
+        defer fixture.allocator.free(script);
+        const archive_file = try support.makePackage(fixture, arch, "1", package, "packages/genuine-divert-identical", .{
+            .preinst_append = script,
+        });
+        defer fixture.allocator.free(archive_file);
+        const selected = [_]foundation.PackageIdentity{.{ .name = package, .architecture = arch }};
+        var case = try support.Scenario.init(fixture, "diversion-genuine-identical-noop", driver, dpkg, arch, false);
+        defer case.deinit();
+        const seeded = try record(fixture, source, source ++ ".distrib", package);
+        defer fixture.allocator.free(seeded);
+        try seed(&case, seeded);
+        try installDpkgDivert(&case, dpkg);
+        try case.phase(.{ .operation = "install", .archives = &.{archive_file}, .packages = &selected }, false);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+    }
+
+    {
+        const package = "genuine-divert-bounded-remove";
+        var body: std.Io.Writer.Allocating = .init(fixture.allocator);
+        defer body.deinit();
+        try body.writer.writeAll("if [ \"$DPKG_MAINTSCRIPT_NAME\" = preinst ]; then\n");
+        for (0..12) |index|
+            try body.writer.print("    /usr/bin/dpkg-divert --no-rename --remove /usr/share/coreutils-from-gnu/noop-{d} || exit 31\n", .{index});
+        try body.writer.writeAll("fi\n");
+        const archive_file = try support.makePackage(fixture, arch, "1", package, "packages/genuine-divert-bounded-remove", .{
+            .preinst_append = body.written(),
+        });
+        defer fixture.allocator.free(archive_file);
+        const selected = [_]foundation.PackageIdentity{.{ .name = package, .architecture = arch }};
+        var case = try support.Scenario.init(fixture, "diversion-genuine-bounded-remove", driver, dpkg, arch, false);
+        defer case.deinit();
+        try installDpkgDivert(&case, dpkg);
+        try case.phase(.{ .operation = "install", .archives = &.{archive_file}, .packages = &selected }, false);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+    }
+
+    {
+        const package = "genuine-divert-netplan";
+        const target = "/usr/lib/systemd/system-generators/netplan";
+        const preinst = try divertSnippet(
+            fixture,
+            "/usr/bin/dpkg-divert --no-rename --divert /usr/lib/systemd/system-generators/netplan.usr-is-merged --add /usr/lib/systemd/system-generators/netplan || exit 31",
+        );
+        defer fixture.allocator.free(preinst);
+        const postinst = try std.fmt.allocPrint(fixture.allocator,
+            \\if [ "$1" = configure ]; then
+            \\    /usr/bin/dpkg-divert --no-rename --remove {s} || exit 32
+            \\fi
+            \\
+        , .{target});
+        defer fixture.allocator.free(postinst);
+        const archive_file = try support.makePackage(fixture, arch, "1", package, "packages/genuine-divert-netplan", .{
+            .preinst_append = preinst,
+            .postinst_append = postinst,
+        });
+        defer fixture.allocator.free(archive_file);
+        const selected = [_]foundation.PackageIdentity{.{ .name = package, .architecture = arch }};
+        var case = try support.Scenario.init(fixture, "diversion-genuine-netplan-add-remove", driver, dpkg, arch, false);
+        defer case.deinit();
+        try installDpkgDivert(&case, dpkg);
+        try case.phase(.{ .operation = "install", .archives = &.{archive_file}, .packages = &selected }, false);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+    }
+
+    {
+        const provider = "genuine-divert-provider";
+        const consumer = "genuine-divert-consumer";
+        const source = "usr/share/genuine-divert-routed/payload";
+        const destination = source ++ ".distrib";
+        const script = try divertSnippet(
+            fixture,
+            "/usr/bin/dpkg-divert --no-rename --divert /usr/share/genuine-divert-routed/payload.distrib --add /usr/share/genuine-divert-routed/payload || exit 31",
+        );
+        defer fixture.allocator.free(script);
+        const provider_archive = try support.makePackage(fixture, arch, "1", provider, "packages/genuine-divert-routed-provider", .{
+            .preinst_append = script,
+        });
+        defer fixture.allocator.free(provider_archive);
+        const consumer_archive = try support.makePackage(fixture, arch, "1", consumer, "packages/genuine-divert-routed-consumer", .{
+            .control_fields = "Pre-Depends: " ++ provider ++ " (= 1)\n",
+            .no_scripts = true,
+            .extra_files = &.{.{ .path = source, .content = "routed payload\n" }},
+        });
+        defer fixture.allocator.free(consumer_archive);
+        const selected = [_]foundation.PackageIdentity{
+            .{ .name = provider, .architecture = arch },
+            .{ .name = consumer, .architecture = arch },
+        };
+        const actions = [_]support.Action{
+            .{ .sequence = 0, .kind = "unpack", .package = provider, .architecture = arch },
+            .{ .sequence = 1, .kind = "configure_pending", .package = consumer, .architecture = arch },
+            .{ .sequence = 2, .kind = "unpack", .package = consumer, .architecture = arch },
+            .{ .sequence = 3, .kind = "configure_pending", .package = consumer, .architecture = arch },
+        };
+        const groups = [_][]const []const u8{ &.{provider_archive}, &.{consumer_archive} };
+        var case = try support.Scenario.init(fixture, "diversion-genuine-same-transaction-route", driver, dpkg, arch, false);
+        defer case.deinit();
+        try installDpkgDivert(&case, dpkg);
+        try case.phase(.{
+            .operation = "install",
+            .archives = &.{ provider_archive, consumer_archive },
+            .reference_groups = &groups,
+            .packages = &selected,
+            .ordered_actions = &actions,
+        }, false);
+        try assertPackageListsLogical(&case, consumer, source, destination);
+        for ([_][]const u8{ case.reference_root, case.native_root }) |root| {
+            const original = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{ root, source });
+            defer fixture.allocator.free(original);
+            if (std.Io.Dir.cwd().statFile(fixture.io, original, .{ .follow_symlinks = false })) |_|
+                return error.WrongDiversionRoute
+            else |err| if (err != error.FileNotFound) return err;
+            const shifted = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{ root, destination });
+            defer fixture.allocator.free(shifted);
+            const payload = try std.Io.Dir.cwd().readFileAlloc(fixture.io, shifted, fixture.allocator, .limited(64 * 1024));
+            defer fixture.allocator.free(payload);
+            if (!std.mem.eql(u8, payload, "routed payload\n")) return error.WrongDiversionRoute;
+        }
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
     }
 }
 
@@ -644,6 +857,7 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     try unsafeRoutes(fixture, driver, dpkg, arch, first);
     try dynamicRoutes(fixture, driver, dpkg, arch, first, second);
     try failureRoutes(fixture, driver, dpkg, arch, first, second);
+    try genuineToolRoutes(fixture, driver, dpkg, arch);
     try conffileRoutes(fixture, driver, dpkg, arch, first, second);
     try aliasRoutes(fixture, driver, dpkg, arch);
     try backupRoutes(fixture, driver, dpkg, arch);

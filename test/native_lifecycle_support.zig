@@ -121,6 +121,24 @@ pub fn copyProgram(fixture: *foundation.Fixture, root: []const u8, source: []con
     }
 }
 
+pub fn referenceToolPath(allocator: std.mem.Allocator, dpkg: []const u8, basename: []const u8) ![]u8 {
+    if (std.mem.indexOfAny(u8, basename, "/\\") != null) return error.InvalidProgramPath;
+    const directory = std.fs.path.dirname(dpkg) orelse return error.InvalidProgramPath;
+    return std.fs.path.join(allocator, &.{ directory, basename });
+}
+
+pub fn copyReferenceTool(
+    fixture: *foundation.Fixture,
+    root: []const u8,
+    dpkg: []const u8,
+    basename: []const u8,
+    destination: []const u8,
+) !void {
+    const source = try referenceToolPath(fixture.allocator, dpkg, basename);
+    defer fixture.allocator.free(source);
+    try copyProgram(fixture, root, source, destination);
+}
+
 pub const ScriptOptions = struct {
     before_failure: []const u8 = "",
     after_failure: []const u8 = "",
@@ -801,6 +819,27 @@ pub const Scenario = struct {
         });
     }
 };
+
+pub fn readOptionalCaseFile(case: *Scenario, side: []const u8, relative: []const u8) !?[]u8 {
+    const path_name = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, relative });
+    defer case.fixture.allocator.free(path_name);
+    return read(case.fixture, path_name, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+pub fn assertDatabaseBytes(case: *Scenario, basename: []const u8) !void {
+    const relative = try std.fmt.allocPrint(case.fixture.allocator, "var/lib/dpkg/{s}", .{basename});
+    defer case.fixture.allocator.free(relative);
+    const expected = try readOptionalCaseFile(case, "reference", relative);
+    defer if (expected) |bytes| case.fixture.allocator.free(bytes);
+    const actual = try readOptionalCaseFile(case, "native", relative);
+    defer if (actual) |bytes| case.fixture.allocator.free(bytes);
+    if ((expected == null) != (actual == null)) return error.DatabaseFileChanged;
+    if (expected) |left| if (!std.mem.eql(u8, left, actual.?))
+        return error.DatabaseFileChanged;
+}
 
 pub fn prerequisites(init: std.process.Init, allocator: std.mem.Allocator, pinned: ?[]const u8) !struct { architecture: []u8, executable: []const u8, before: [32]u8 } {
     if (std.os.linux.geteuid() != 0) return error.RequiresRootForChroot;
