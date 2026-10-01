@@ -550,7 +550,7 @@ test "snapshot: stalled install stops at its progress limit before verification"
 test "snapshot: continuously progressing install stops at its fixed ceiling" {
     var f = try Driver.initOffline();
     defer f.deinit();
-    const refused = try f.offline(.{ .name = "endless-progress", .progress_limit_seconds = "2", .ceiling_seconds = "4" });
+    const refused = try f.offline(.{ .name = "endless-progress", .progress_limit_seconds = "3", .ceiling_seconds = "4" });
     defer refused.deinit();
     try testing.expectEqual(@as(u8, 124), refused.code);
     try support.contains(refused.stderr, "native create ceiling after");
@@ -558,7 +558,8 @@ test "snapshot: continuously progressing install stops at its fixed ceiling" {
     const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
     defer support.allocator.free(progress);
     try support.contains(progress, "\nverdict=ceiling\nexit_status=124\n");
-    try testing.expect(try progressField(progress, "longest_progress_gap_seconds") < 2);
+    // Whole-second polling can observe 250 ms progress up to 2 s apart.
+    try testing.expect(try progressField(progress, "longest_progress_gap_seconds") < 3);
     try testing.expect(try progressField(progress, "elapsed_seconds") < 20);
     const watchdog = try f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt");
     defer support.allocator.free(watchdog);
