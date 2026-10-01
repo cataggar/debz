@@ -2896,6 +2896,66 @@ test "package_cache_workflow.test.prepare rejects digest-valid invalid Debian pa
     try std.testing.expectEqual(@as(usize, 1), transport.calls);
 }
 
+test "package_cache_workflow.test.prepare refuses FIFO payload members and other special entries" {
+    const fixture = @import("fixtures/archive.zig");
+    const Case = struct { kind: u8, accepted: bool };
+    for ([_]Case{
+        .{ .kind = '6', .accepted = false },
+        .{ .kind = '3', .accepted = false },
+        .{ .kind = '4', .accepted = false },
+        .{ .kind = '7', .accepted = false },
+        .{ .kind = 's', .accepted = false },
+    }) |case| {
+        const payload = try fixture.deb(
+            std.testing.allocator,
+            "Package: packages-microsoft-prod\nVersion: 1.1\nArchitecture: all\n",
+            &.{},
+            &.{
+                .{ .path = "./run/", .kind = '5', .mode = 0o755 },
+                .{ .path = "./run/demo.pipe", .kind = case.kind, .mode = 0o640 },
+            },
+        );
+        defer std.testing.allocator.free(payload);
+        var repository = try testRepository(std.testing.allocator, payload);
+        defer repository.deinit(std.testing.allocator);
+        repository.view.input.packages = &repository.index;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+            .maximum_object_bytes = 64 * 1024,
+        });
+        defer cache.deinit();
+        var transport: TestTransport = .{ .payloads = &.{payload} };
+        const request: PrepareRequest = .{
+            .lock = &repository.lock.lock,
+            .cache = &cache,
+            .repositories = &.{repository.view},
+            .architecture = "amd64",
+            .debz_version = "0.3.0",
+            .cache_root = "/runner/cache",
+            .policy = .{ .limits = .{
+                .maximum_package_bytes = 64 * 1024,
+                .maximum_total_package_bytes = 64 * 1024,
+                .maximum_lock_packages = 10,
+                .maximum_staging_entries = 10,
+                .maximum_gc_directory_entries = 10,
+                .maximum_gc_objects_scanned = 10,
+                .maximum_gc_objects_deleted = 10,
+                .maximum_gc_bytes_deleted = 1024,
+            } },
+            .acquisition = transport.dependencies(),
+        };
+        if (case.accepted) {
+            var prepared = try prepare(std.testing.allocator, request);
+            defer prepared.deinit();
+            try std.testing.expectEqual(@as(usize, 1), prepared.downloaded_count);
+        } else {
+            try std.testing.expectError(error.InvalidPackagePayload, prepare(std.testing.allocator, request));
+        }
+        try std.testing.expectEqual(@as(usize, 1), transport.calls);
+    }
+}
+
 test "package_cache_workflow.test.preflight rejects directory symlink and FIFO objects" {
     const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
     var repository = try testRepository(std.testing.allocator, payload);

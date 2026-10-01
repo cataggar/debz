@@ -1491,7 +1491,7 @@ pub const Backend = struct {
                     .{ action.package, action.version, action.architecture, @errorName(err) },
                 ),
             );
-            var validation_result = deb_payload.validate(allocator, package.bytes, .{
+            const validation_expected: deb_payload.Expected = .{
                 .repository = origin.repository_id.slice(),
                 .package = action.package,
                 .version = action.version,
@@ -1503,7 +1503,11 @@ pub const Backend = struct {
                 .size = package.provenance.declared_size,
                 .sha256 = package.provenance.expected_sha256,
                 .archive_identity = package.provenance.expected_identity,
-            }, .{});
+            };
+            var validation_result = if (self.transaction_backend == .native)
+                deb_payload.validateForApplication(allocator, package.bytes, validation_expected, .{})
+            else
+                deb_payload.validate(allocator, package.bytes, validation_expected, .{});
             switch (validation_result) {
                 .diagnostic => |diagnostic| {
                     const message = try std.fmt.allocPrint(

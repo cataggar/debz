@@ -459,10 +459,30 @@ each run.
 FIFO publication is journaled like every other node
 ([root mutation](root-mutation.md#fifos-288)); its crash recovery is proven by
 the FIFO real-child cases of `test-native-recovery-zig-mutation-boundaries`
-([native recovery](native-recovery.md)). This is bounded fixture-level parity:
-FIFO-bearing repository archives are still refused at repository admission,
-and signed amd64/arm64 closure parity for FIFO-bearing packages remains
-tracked in [#288](https://github.com/cataggar/debz/issues/288).
+([native recovery](native-recovery.md)).
+
+The native application admission path accepts FIFO-bearing archives
+([archive model](archive-application-model.md#fifo-payloads-288)), while
+non-application validators keep refusing them before dpkg execution. The signed
+`fifo-closure` case of `test-native-recovery-zig-parity` runs in both
+the Debian-stable and Ubuntu-26.04 suites. It publishes a signed repository
+with two generations of a FIFO package. Version 1.0-1 ships four FIFOs, a
+regular file and a symbolic link that later become FIFOs, and a conffile.
+Version 2.0-1 re-modes one FIFO to set-group-ID `02660`, turns another into a
+regular file, drops one, adds one in a new directory, and keeps one under a
+seeded `statoverride` record (`#42420 #42421 0620`). For each generation, the
+public CLI resolves a signed exact lock with `plan --lock-output`, and the
+test checks every locked package's pool bytes (size, SHA-256, SHA-512) and the
+FIFO inventory. The CLI then runs `install --lock-input` natively. The
+production remove workflow resolves a remove lock, which the public CLI
+executes with `remove --lock-input`. The native lifecycle driver runs purge,
+because no public command purges. After every step, pinned dpkg 1.22.22 runs
+the same operation on an independent root, and the two roots must match in
+kind, mode, ownership, mtime, content, `status`, `statoverride`, `info/*.list`
+and `*.md5sums`. Each install, upgrade and remove receipt must bind its exact
+lock and pass retained-evidence verification. Install and upgrade must also
+pass `transaction-result verify`. The package-owned helper must be unchanged. Each architecture proves this for its
+own runner (linux-x64 and linux-arm64 in CI).
 
 ### Removal and trigger failure inventory (#264)
 

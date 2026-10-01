@@ -3005,6 +3005,56 @@ test "transaction_executor.test.exact lock scope is policy-bound without changin
     ));
 }
 
+test "transaction_executor.test.artifact validation refuses FIFO members and other special entries" {
+    const fixture = @import("fixtures/archive.zig");
+    const artifact: Artifact = .{
+        .package = "demo",
+        .version = "1.0",
+        .architecture = "amd64",
+        .path = "/cache/demo.deb",
+    };
+    for ([_]u8{ '6', '3', '4', '7', 's' }) |kind| {
+        const bytes = try fixture.deb(
+            std.testing.allocator,
+            "Package: demo\nVersion: 1.0\nArchitecture: amd64\n",
+            &.{},
+            &.{
+                .{ .path = "./run/", .kind = '5', .mode = 0o755 },
+                .{ .path = "./run/demo.pipe", .kind = kind, .mode = 0o640 },
+            },
+        );
+        defer std.testing.allocator.free(bytes);
+        var harness: TestHarness = .{ .bytes = bytes };
+        const repository_action = testInstallAction(bytes, "demo");
+        var local_action = repository_action;
+        local_action.repository = null;
+        const digest = try parseHexDigest(local_action.sha256.?);
+        local_action.origin = .{ .local_artifact = .{
+            .evidence = .{
+                .artifact_id = package_origin.artifactIdFromSha256(digest),
+                .sha256 = digest,
+                .size = bytes.len,
+                .package = "demo",
+                .version = "1.0",
+                .architecture = "amd64",
+                .acquisition_url = "file:///cache/demo.deb",
+                .trust_mode = .pinned_sha256,
+            },
+            .solver_priority = 1000,
+        } };
+        for ([_]solver.PlanAction{ repository_action, local_action }) |action| {
+            const result = validateArtifact(
+                std.testing.allocator,
+                harness.dependencies().filesystem,
+                artifact,
+                action,
+                .{},
+            );
+            try std.testing.expectError(error.InvalidDebPayload, result);
+        }
+    }
+}
+
 test "transaction_executor.test.local artifact preflight and reread require exact origin evidence" {
     const bytes = try testDeb(std.testing.allocator);
     defer std.testing.allocator.free(bytes);

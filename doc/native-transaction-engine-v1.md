@@ -31,7 +31,9 @@ V1 accepts the following package representation:
 - uncompressed, gzip, xz, and zstd control and data members;
 - POSIX USTAR and GNU base headers, including bounded GNU long-name and
   long-link records;
-- regular files, directories, symbolic links, and backward hard links;
+- regular files, directories, symbolic links, backward hard links, and
+  data-member FIFOs, which are published without ever being opened
+  ([FIFO payloads](archive-application-model.md#fifo-payloads-288));
 - numeric uid/gid, permission and special mode bits, modification time, and
   bounded USTAR owner/group names;
 - `control`, `conffiles`, `md5sums`, `triggers`, and the `preinst`, `postinst`,
@@ -41,8 +43,8 @@ V1 accepts the following package representation:
   authorized plan and filesystem replacement rules.
 
 Absolute or traversing paths, escaping or forward hard links, unsafe symlink
-descendants, duplicate destinations, devices, FIFOs, sockets, sparse files,
-and unknown file types are rejected before mutation. PAX headers, archive
+descendants, duplicate destinations, devices, sockets, control-member FIFOs,
+sparse files, and unknown file types are rejected before mutation. PAX headers, archive
 xattrs, ACLs, and labels are not in the v1 archive profile. The real-snapshot
 feature inventory is a cutover gate: encountering one of these features
 requires an explicit contract revision and implementation, not approximation.

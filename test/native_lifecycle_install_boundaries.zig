@@ -1,8 +1,8 @@
 const std = @import("std");
-const root_fs = @import("debz").root_fs;
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const statoverride = @import("native_lifecycle_statoverride.zig");
+const fifo = @import("native_fifo_fixture.zig");
 
 fn failureMarker(case: *support.Scenario, content: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
@@ -150,13 +150,9 @@ fn ownership(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8,
 const fifo_name = "fifo-payload";
 const fifo_base = "usr/share/" ++ fifo_name;
 
-const Pipe = struct { path: []const u8, mode: []const u8 };
-const Link = struct { path: []const u8, target: []const u8 };
+const Pipe = fifo.Pipe;
+const Link = fifo.Link;
 
-/// Builds one generation of the FIFO fixture. FIFOs and extra symbolic
-/// links are added to the unpacked source after `makePackage` and the archive
-/// is rebuilt, so the real `dpkg-deb` writes tar typeflag `6` exactly as a
-/// distribution package would.
 fn fifoArchive(
     fixture: *foundation.Fixture,
     arch: []const u8,
@@ -178,56 +174,22 @@ fn fifoPackage(
     links: []const Link,
     extra_files: []const foundation.Fixture.ExtraFile,
 ) ![]u8 {
-    const workspace = "packages/fifo";
-    const original = try support.makePackage(fixture, arch, version, name, workspace, .{
-        .no_scripts = true,
+    return fifo.build(fixture, arch, .{
+        .name = name,
+        .version = version,
         .control_fields = control_fields,
+        .pipes = pipes,
+        .links = links,
         .extra_files = extra_files,
     });
-    defer fixture.allocator.free(original);
-    const source = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}_{s}_data.source", .{ workspace, name, version });
-    defer fixture.allocator.free(source);
-    for (pipes) |pipe| {
-        const relative = try support.path(fixture.allocator, source, pipe.path);
-        defer fixture.allocator.free(relative);
-        const absolute = try fixture.absolute(relative);
-        defer fixture.allocator.free(absolute);
-        const log = try std.fmt.allocPrint(fixture.allocator, "{s}/mkfifo-{s}-{s}.log", .{ workspace, name, version });
-        defer fixture.allocator.free(log);
-        try fixture.run(&.{ "/usr/bin/mkfifo", absolute }, log, 10);
-        // `mkfifo -m` refuses special bits, so the final mode is set apart.
-        try fixture.run(&.{ "/usr/bin/chmod", pipe.mode, absolute }, log, 10);
-    }
-    for (links) |link| {
-        const relative = try support.path(fixture.allocator, source, link.path);
-        defer fixture.allocator.free(relative);
-        try fixture.dir.symLink(fixture.io, link.target, relative, .{});
-    }
-    const destination = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}_{s}_fifo.deb", .{ workspace, name, version });
-    defer fixture.allocator.free(destination);
-    return fixture.buildPackage(source, destination, .{});
 }
 
 fn expectFifo(case: *support.Scenario, relative: []const u8, mode: u32, uid: u32, gid: u32) !void {
-    for ([_][]const u8{ case.reference_root, case.native_root }) |root_path| {
-        var dir = try foundation.guardedRoot(case.fixture.io, root_path);
-        defer dir.close(case.fixture.io);
-        const entry = try (root_fs.Root.init(case.fixture.io, dir)).entry(try root_fs.Path.initPackage(relative));
-        if (entry.kind != .named_pipe) return error.FifoNotInstalled;
-        if (entry.mode != mode or entry.uid != uid or entry.gid != gid) {
-            std.debug.print("{s}: {s} mode {o} owner {d}:{d}\n", .{ root_path, relative, entry.mode, entry.uid, entry.gid });
-            return error.WrongFifoMetadata;
-        }
-    }
+    return fifo.expect(case.fixture, &.{ case.reference_root, case.native_root }, relative, mode, uid, gid);
 }
 
 fn expectAbsentBoth(case: *support.Scenario, relative: []const u8) !void {
-    for ([_][]const u8{ case.reference_root, case.native_root }) |root_path| {
-        var dir = try foundation.guardedRoot(case.fixture.io, root_path);
-        defer dir.close(case.fixture.io);
-        if (try (root_fs.Root.init(case.fixture.io, dir)).entryIfExists(try root_fs.Path.initPackage(relative)) != null)
-            return error.FifoLeftBehind;
-    }
+    return fifo.expectAbsent(case.fixture, &.{ case.reference_root, case.native_root }, relative);
 }
 
 /// FIFO payloads are compared exactly against pinned dpkg across install,

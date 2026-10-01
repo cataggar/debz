@@ -1403,6 +1403,10 @@ test "security: signed consumer receipts enforce retained proof and final databa
     try nativeMutations(&f, "native-consumer", "test/native_recovery_parity.zig", &.{
         "try retained.verify(fixture, root, arch, digest, case.exit_status != 0);",
         "try support.absent(fixture, try relative(fixture, root, completion_path));",
+        "try verifyFifoLock(fixture, signed.repository, lock.lock, version, fifos);",
+        "try support.compare(fixture, scenario.reference_root, scenario.native_root, remove_compare, true);",
+        "try scenario.phase(.{ .operation = \"purge\", .packages = &selected }, false);",
+        "if (fifo_closures != oracle.parity_suites.len) return error.MissingSignedFifoClosure;",
     });
     try nativeMutations(&f, "native-consumer", "test/native_recovery_parity_evidence.zig", &.{
         "try debz.native_provenance.verifyEvidence(allocator, root, proof);",
