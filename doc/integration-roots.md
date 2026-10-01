@@ -1971,6 +1971,20 @@ reviewed arm64 identity. Nothing was refused, so the wrapper exited with
 install's status 8 rather than 90. This is evidence for the audit only, not
 for wrapper completion.
 
+CI run 36836176163 then ran the full traced wrapper on a hosted amd64 runner,
+from main `85774a7aa6f8d2cae9ad75f85871451bd5b0bec0` on the
+`20261001T000000Z` pin. Native `install` succeeded after 5,972 seconds, with
+all 175 packages `install ok installed`. Durable progress never paused for
+more than 24 seconds. Final verification reported `exact_match`, and the
+exec audit allowed 98 script `dpkg` queries and forbade none. The zero-action
+`upgrade-all` then refused with exit **7** `UnsupportedDatabaseEntry` and left
+the root unchanged. dpkg's own postinst had written `var/lib/dpkg/arch-native`
+(`amd64` and a newline) from `$DPKG_MAINTSCRIPT_ARCH`, and the live-database
+preflight did not classify that member. The preflight now admits it only with
+the target architecture (see [Package database](package-database.md)). No
+fresh amd64 run has confirmed the update since, so this run is not
+wrapper-completion proof.
+
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
 root. The architecture-tagged [v1 JSON

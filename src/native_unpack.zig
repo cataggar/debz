@@ -9161,9 +9161,10 @@ fn captureDatabaseSnapshot(
 fn capturePreflightDatabaseSnapshot(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
+    target_architecture: []const u8,
     options: package_database.Options,
 ) !CapturedDatabase {
-    try validateImportedDatabaseLayout(root);
+    try validateImportedDatabaseLayout(root, target_architecture);
     return captureDatabaseSnapshot(allocator, root, options);
 }
 
@@ -9177,9 +9178,10 @@ fn captureInitialDatabaseSnapshot(
 fn capturePreflightInitialDatabaseSnapshot(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
+    target_architecture: []const u8,
 ) !CapturedDatabase {
     if (try root.entryIfExists(try root_fs.Path.init(package_database.database_directory)) != null)
-        try validateImportedDatabaseLayout(root);
+        try validateImportedDatabaseLayout(root, target_architecture);
     return captureInitialDatabaseSnapshot(allocator, root);
 }
 
@@ -9427,7 +9429,34 @@ fn captureDatabaseSnapshotInto(
     return snapshot;
 }
 
-fn validateImportedDatabaseLayout(root: root_fs.Root) !void {
+/// dpkg's own postinst writes `arch-native` (`create_db_native_arch`) and
+/// dpkg reads it only for a non-default admindir, where it overrides the
+/// native architecture. Admit it only when it names the operation's target
+/// architecture, so it can never change what dpkg would treat as native.
+pub const native_architecture_entry = "arch-native";
+
+fn validateDatabaseNativeArchitecture(
+    root: root_fs.Root,
+    path: []const u8,
+    target_architecture: []const u8,
+) !void {
+    const maximum = (package_database.Limits{}).max_architecture_bytes;
+    if (target_architecture.len == 0 or target_architecture.len > maximum or
+        !package_database.validArchitecture(target_architecture))
+        return error.DatabaseNativeArchitectureMismatch;
+    var file = try root.openRegularFile(try root_fs.Path.init(path));
+    defer file.close(root.io);
+    // One byte past `<arch>\n` exposes any trailing content without reading
+    // an unbounded attacker-controlled file.
+    var buffer: [maximum + 2]u8 = undefined;
+    const length = try file.readPositionalAll(root.io, buffer[0 .. target_architecture.len + 2], 0);
+    const bytes = buffer[0..length];
+    const name = if (std.mem.endsWith(u8, bytes, "\n")) bytes[0 .. bytes.len - 1] else bytes;
+    if (!std.mem.eql(u8, name, target_architecture))
+        return error.DatabaseNativeArchitectureMismatch;
+}
+
+fn validateImportedDatabaseLayout(root: root_fs.Root, target_architecture: []const u8) !void {
     var admin = try root.openDirectory(try root_fs.Path.init(package_database.database_directory));
     defer admin.close(root.io);
     var entries = admin.iterate();
@@ -9444,6 +9473,7 @@ fn validateImportedDatabaseLayout(root: root_fs.Root) !void {
         const file = std.mem.eql(u8, name, "status") or
             std.mem.eql(u8, name, "status-old") or
             std.mem.eql(u8, name, "arch") or
+            std.mem.eql(u8, name, native_architecture_entry) or
             std.mem.eql(u8, name, "diversions") or
             std.mem.eql(u8, name, "diversions-old") or
             std.mem.eql(u8, name, "statoverride") or
@@ -9463,6 +9493,8 @@ fn validateImportedDatabaseLayout(root: root_fs.Root) !void {
             (file and !observed.isRegularFile()) or
             (observed.mode & 0o022) != 0)
             return error.UnsafeDatabaseEntry;
+        if (std.mem.eql(u8, name, native_architecture_entry))
+            try validateDatabaseNativeArchitecture(root, path, target_architecture);
         if (std.mem.eql(u8, name, "parts")) {
             var child = try root.openDirectory(try root_fs.Path.init(path));
             defer child.close(root.io);
@@ -9513,8 +9545,220 @@ test "native_unpack.test.live database layout refuses unclassified and unsafe en
                 error.UnsafeDatabaseEntry
             else
                 error.UnsupportedDatabaseEntry,
-            capturePreflightInitialDatabaseSnapshot(testing.allocator, root),
+            capturePreflightInitialDatabaseSnapshot(testing.allocator, root, "amd64"),
         );
+    }
+}
+
+test "native_unpack.test.live database arch-native admits only the target architecture" {
+    const Expect = enum { accepted, mismatch, unsafe };
+    const Shape = enum { file, symlink, directory };
+    for ([_]struct {
+        target: []const u8,
+        bytes: []const u8 = "",
+        mode: u32 = 0o644,
+        shape: Shape = .file,
+        expect: Expect,
+    }{
+        // dpkg's postinst writes `$DPKG_MAINTSCRIPT_ARCH\n` under umask 022.
+        .{ .target = "amd64", .bytes = "amd64\n", .expect = .accepted },
+        .{ .target = "arm64", .bytes = "arm64\n", .expect = .accepted },
+        .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o600, .expect = .accepted },
+        .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o640, .expect = .accepted },
+        .{ .target = "amd64", .bytes = "amd64", .expect = .accepted },
+        .{ .target = "amd64", .bytes = "arm64\n", .expect = .mismatch },
+        .{ .target = "arm64", .bytes = "amd64\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "i386\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64\n\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64\narm64\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64 \n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = " amd64\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64\r\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "AMD64\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64x\n", .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64\n" ++ "x" ** 4096, .expect = .mismatch },
+        .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o666, .expect = .unsafe },
+        .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o620, .expect = .unsafe },
+        .{ .target = "amd64", .bytes = "amd64\n", .mode = 0o602, .expect = .unsafe },
+        .{ .target = "amd64", .shape = .symlink, .expect = .unsafe },
+        .{ .target = "amd64", .shape = .directory, .expect = .unsafe },
+    }) |case| {
+        var fixture: Fixture = undefined;
+        try fixture.init(empty_status, &.{});
+        defer fixture.deinit();
+        const root = fixture.root();
+        const path = try root_fs.Path.init("var/lib/dpkg/" ++ native_architecture_entry);
+        switch (case.shape) {
+            .file => {
+                try root.publishFile(path, case.bytes, .{});
+                try fixture.tmp.dir.setFilePermissions(
+                    testing.io,
+                    "var/lib/dpkg/" ++ native_architecture_entry,
+                    .fromMode(case.mode),
+                    .{},
+                );
+            },
+            .symlink => {
+                try root.publishFile(try root_fs.Path.init("var/lib/dpkg/arch"), "amd64\n", .{});
+                try fixture.tmp.dir.symLink(
+                    testing.io,
+                    "arch",
+                    "var/lib/dpkg/" ++ native_architecture_entry,
+                    .{},
+                );
+            },
+            .directory => try root.ensureDirectory(path, root_fs.default_directory_permissions),
+        }
+        switch (case.expect) {
+            .accepted => {
+                var captured = try capturePreflightInitialDatabaseSnapshot(testing.allocator, root, case.target);
+                captured.deinit();
+                var preflight = try capturePreflightDatabaseSnapshot(testing.allocator, root, case.target, .{});
+                preflight.deinit();
+            },
+            .mismatch, .unsafe => |expected| {
+                const err = if (expected == .mismatch)
+                    error.DatabaseNativeArchitectureMismatch
+                else
+                    error.UnsafeDatabaseEntry;
+                try testing.expectError(err, capturePreflightInitialDatabaseSnapshot(testing.allocator, root, case.target));
+                try testing.expectError(err, capturePreflightDatabaseSnapshot(testing.allocator, root, case.target, .{}));
+            },
+        }
+    }
+}
+
+test "native_unpack.test.live database zero-action upgrade-all admits dpkg-written arch-native" {
+    const status =
+        \\Package: arch-native-writer
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: postinst writes arch-native like dpkg
+        \\
+        \\
+    ;
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(0x22);
+    for ([_]struct { bytes: []const u8, mode: u32, refused: ?anyerror }{
+        .{ .bytes = "amd64\n", .mode = 0o644, .refused = null },
+        // The run-36836176163 bytes: a caller umask of 077 reached the script.
+        .{ .bytes = "amd64\n", .mode = 0o600, .refused = null },
+        .{ .bytes = "arm64\n", .mode = 0o644, .refused = error.DatabaseNativeArchitectureMismatch },
+        .{ .bytes = "amd64\n", .mode = 0o664, .refused = error.UnsafeDatabaseEntry },
+    }) |case| {
+        var fixture: Fixture = undefined;
+        try fixture.init(status, &.{.{ .name = "arch-native-writer.list", .bytes = "/.\n" }});
+        defer fixture.deinit();
+        try fixture.root().publishFile(
+            try root_fs.Path.init("var/lib/dpkg/" ++ native_architecture_entry),
+            case.bytes,
+            .{},
+        );
+        try fixture.tmp.dir.setFilePermissions(
+            testing.io,
+            "var/lib/dpkg/" ++ native_architecture_entry,
+            .fromMode(case.mode),
+            .{},
+        );
+        var lock = try exact_lock_v3.create(testing.allocator, .{
+            .target_architecture = "amd64",
+            .request_sha256 = @splat(7),
+            .policy_sha256 = @splat(8),
+            .repositories = &.{.{
+                .id = repository_id,
+                .snapshot_sha256 = snapshot,
+                .release_sha256 = @splat(3),
+                .index_identity = .{
+                    .digests = .{ .sha256 = @splat(4) },
+                    .primary = .sha256,
+                },
+                .signer_fingerprints = &.{@splat(5)},
+            }},
+            .local_artifacts = &.{},
+            .packages = &.{.{
+                .name = "arch-native-writer",
+                .version = "1",
+                .architecture = "amd64",
+                .origin = .{ .authenticated_repository = .{
+                    .repository_id = repository_id,
+                    .repository_snapshot_sha256 = snapshot,
+                } },
+                .archive_identity = .{
+                    .digests = .{ .sha256 = @splat(0x31) },
+                    .primary = .sha256,
+                },
+                .declared_size = 1,
+                .retention = .retained,
+                .dpkg_selection_hold = false,
+            }},
+            .verified_origins = true,
+        });
+        defer lock.deinit();
+        const solver_plan: solver.Plan = .{
+            .target_architecture = "amd64",
+            .mode = .plan_only,
+            .actions = &.{},
+            .ordered_actions = &.{},
+            .summary = .{},
+            .download_bytes = 0,
+            .installed_size_delta_bytes = 0,
+            .backing_allocator = testing.allocator,
+            .arena = undefined,
+        };
+        var root_buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+        var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try root_operation.Coordinator.open(
+            testing.io,
+            fixture.root(),
+            install_root,
+            locks.interface(),
+        );
+        var attempt = try coordinator.acquire(testing.allocator, .{
+            .backend = .native,
+            .operation = .{ .package_transaction = .upgrade_all },
+            .request_sha256 = @splat(0x11),
+            .policy_sha256 = @splat(0x22),
+            .target_architecture = "amd64",
+            .evidence = .{ .plan_sha256 = transaction_executor.planDigest(solver_plan) },
+        });
+        defer attempt.release();
+        var before = try captureInitialDatabaseSnapshot(testing.allocator, fixture.root());
+        defer before.deinit();
+        const arch_before = try fixture.root().entry(
+            try root_fs.Path.init("var/lib/dpkg/" ++ native_architecture_entry),
+        );
+        const request: Runtime.PrepareRequest = .{
+            .attempt = &attempt,
+            .plan = &solver_plan,
+            .exact_lock = &lock.lock,
+            .archives = &.{},
+            .policy = .{ .conffile = .keep_existing },
+        };
+        if (case.refused) |expected| {
+            try testing.expectError(expected, Runtime.verifyUnchanged(testing.allocator, request));
+        } else {
+            const unchanged = try Runtime.verifyUnchanged(testing.allocator, request);
+            try testing.expect(unchanged.eql(try Runtime.verifyUnchanged(testing.allocator, request)));
+        }
+        var after = try captureInitialDatabaseSnapshot(testing.allocator, fixture.root());
+        defer after.deinit();
+        try testing.expectEqualStrings(before.snapshot.status.bytes, after.snapshot.status.bytes);
+        const arch_after = try fixture.root().entry(
+            try root_fs.Path.init("var/lib/dpkg/" ++ native_architecture_entry),
+        );
+        try testing.expectEqual(arch_before.mode, arch_after.mode);
+        const bytes = try fixture.root().readFileAlloc(
+            testing.allocator,
+            try root_fs.Path.init("var/lib/dpkg/" ++ native_architecture_entry),
+            64,
+        );
+        defer testing.allocator.free(bytes);
+        try testing.expectEqualStrings(case.bytes, bytes);
     }
 }
 
@@ -9540,7 +9784,7 @@ test "native_unpack.test.imported live database detects external same-byte mode 
         .fromMode(0o600),
         .{},
     );
-    var changed = try capturePreflightInitialDatabaseSnapshot(testing.allocator, root);
+    var changed = try capturePreflightInitialDatabaseSnapshot(testing.allocator, root, "amd64");
     defer changed.deinit();
     const diagnostic = (try package_database.verifyGeneration(
         testing.allocator,
@@ -27709,7 +27953,7 @@ pub const Runtime = struct {
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        var captured = try capturePreflightInitialDatabaseSnapshot(allocator, root);
+        var captured = try capturePreflightInitialDatabaseSnapshot(allocator, root, request.plan.target_architecture);
         defer captured.deinit();
         if (captured.absent and request.plan.actions.len == 0)
             return error.DatabaseStatusMissing;
@@ -28212,7 +28456,7 @@ fn executePreparedNativeProgramWithHelper(
     const scratch = arena.allocator();
     const document = try native_execution_request.create(root, attempt, program, operation);
     const archives = try productionArchives(scratch, program.artifacts, archive_bytes);
-    var captured = try capturePreflightInitialDatabaseSnapshot(allocator, root);
+    var captured = try capturePreflightInitialDatabaseSnapshot(allocator, root, program.target_architecture);
     defer captured.deinit();
     if (captured.absent != requiresDatabaseInitialization(program))
         return error.DatabasePresenceChanged;
@@ -29708,7 +29952,7 @@ fn executeLifecycleProgramWithRequest(
         null
     else
         (if (recovery_intent == null)
-            capturePreflightInitialDatabaseSnapshot(allocator, root)
+            capturePreflightInitialDatabaseSnapshot(allocator, root, program.target_architecture)
         else
             captureInitialDatabaseSnapshot(allocator, root)) catch |err| {
             if (borrowed_attempt == null) try attempt.abandonIfPreMutation(allocator);
@@ -33965,6 +34209,124 @@ fn assertFixtureHelperBootstrap(
     }
 }
 
+// Zero-action `upgrade-all` over a fixture root: every installed package is
+// locked as retained, exactly as an unchanged exact closure would be, and only
+// `Runtime.verifyUnchanged` decides whether the root is unchanged.
+test "native_unpack.test.lifecycle external fixture unchanged upgrade-all" {
+    const raw_request = std.c.getenv("DEBZ_NATIVE_UNCHANGED_REQUEST") orelse
+        return error.SkipZigTest;
+    const request_path = std.mem.span(raw_request);
+    if (!absolute_path.nonRoot(request_path))
+        return error.InvalidExternalLifecycleRequest;
+    const request_bytes = try readAbsoluteFile(testing.allocator, testing.io, request_path, 64 * 1024);
+    defer testing.allocator.free(request_bytes);
+    const External = struct { root: []const u8, architecture: []const u8, report: []const u8 };
+    var parsed = try std.json.parseFromSlice(External, testing.allocator, request_bytes, .{});
+    defer parsed.deinit();
+    const external = parsed.value;
+    if (!absolute_path.nonRoot(external.root) or !absolute_path.nonRoot(external.report) or
+        (!std.mem.eql(u8, external.architecture, "amd64") and
+            !std.mem.eql(u8, external.architecture, "arm64")))
+        return error.InvalidExternalLifecycleRequest;
+    var root_dir = try std.Io.Dir.openDirAbsolute(testing.io, external.root, .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer root_dir.close(testing.io);
+    const root: root_fs.Root = .init(testing.io, root_dir);
+    const marker = try root.readFileAlloc(testing.allocator, try root_fs.Path.init(".debz-native-disposable"), 128);
+    defer testing.allocator.free(marker);
+    if (!std.mem.eql(u8, marker, "debz native materialization fixture v1\n"))
+        return error.InvalidExternalLifecycleRequest;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var captured = try captureDatabaseSnapshot(scratch, root, .{});
+    normalizeCapturedNativeArchitecture(&captured.snapshot, external.architecture);
+    const database = switch (try package_database.importSnapshot(scratch, .{
+        .native_architecture = external.architecture,
+        .snapshot = captured.snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.InvalidExternalLifecycleRequest,
+    };
+    const repository_id: [64]u8 = @splat('a');
+    const snapshot: [32]u8 = @splat(0x22);
+    var packages: std.ArrayList(exact_lock_v3.Package) = .empty;
+    for (database.model.packages) |package| try packages.append(scratch, .{
+        .name = package.name,
+        .version = package.version,
+        .architecture = package.architecture,
+        .origin = .{ .authenticated_repository = .{
+            .repository_id = repository_id,
+            .repository_snapshot_sha256 = snapshot,
+        } },
+        .archive_identity = .{ .digests = .{ .sha256 = @splat(0x31) }, .primary = .sha256 },
+        .declared_size = 1,
+        .retention = .retained,
+        .dpkg_selection_hold = false,
+    });
+    var lock = try exact_lock_v3.create(testing.allocator, .{
+        .target_architecture = external.architecture,
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = snapshot,
+            .release_sha256 = @splat(3),
+            .index_identity = .{ .digests = .{ .sha256 = @splat(4) }, .primary = .sha256 },
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = packages.items,
+        .verified_origins = true,
+    });
+    defer lock.deinit();
+    const empty_plan: solver.Plan = .{
+        .target_architecture = external.architecture,
+        .mode = .plan_only,
+        .actions = &.{},
+        .ordered_actions = &.{},
+        .summary = .{},
+        .download_bytes = 0,
+        .installed_size_delta_bytes = 0,
+        .backing_allocator = testing.allocator,
+        .arena = undefined,
+    };
+    var locks: root_operation.SystemLockBackend = .{ .allocator = testing.allocator, .io = testing.io };
+    var coordinator = try root_operation.Coordinator.open(testing.io, root, external.root, locks.interface());
+    var attempt = try coordinator.acquire(testing.allocator, .{
+        .intent = .mutation,
+        .existing = .reclaim_resolved,
+        .backend = .native,
+        .operation = .{ .package_transaction = .upgrade_all },
+        .request_sha256 = @splat(0x11),
+        .policy_sha256 = @splat(0x22),
+        .target_architecture = external.architecture,
+        .evidence = .{ .plan_sha256 = transaction_executor.planDigest(empty_plan) },
+    });
+    defer attempt.release();
+    const outcome: struct { refused: bool, detail: []const u8 } = if (Runtime.verifyUnchanged(testing.allocator, .{
+        .attempt = &attempt,
+        .plan = &empty_plan,
+        .exact_lock = &lock.lock,
+        .archives = &.{},
+        .policy = .{ .conffile = .keep_existing },
+    })) |_| .{ .refused = false, .detail = "unchanged" } else |err| .{ .refused = true, .detail = @errorName(err) };
+    try attempt.abandonIfPreMutation(testing.allocator);
+    // verifyUnchanged is read-only, so neither outcome may change the root.
+    const report = try std.json.Stringify.valueAlloc(testing.allocator, .{
+        .outcome = if (outcome.refused) "refused" else "unchanged",
+        .changed = false,
+        .detail = outcome.detail,
+    }, .{});
+    defer testing.allocator.free(report);
+    var file = try std.Io.Dir.createFileAbsolute(testing.io, external.report, .{ .exclusive = true });
+    defer file.close(testing.io);
+    try file.writeStreamingAll(testing.io, report);
+}
+
 test "native_unpack.test.lifecycle external fixture" {
     const raw_request = std.c.getenv("DEBZ_NATIVE_LIFECYCLE_REQUEST") orelse
         return error.SkipZigTest;
@@ -34174,7 +34536,7 @@ test "native_unpack.test.lifecycle external fixture" {
         }
     }
 
-    var captured = capturePreflightDatabaseSnapshot(testing.allocator, root, .{}) catch |err| {
+    var captured = capturePreflightDatabaseSnapshot(testing.allocator, root, external.architecture, .{}) catch |err| {
         try writeLifecycleReport(
             testing.allocator,
             testing.io,

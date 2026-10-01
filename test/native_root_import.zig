@@ -9,6 +9,23 @@ const options = @import("native_test_options");
 const keeper = "import-keeper";
 const incoming = "import-incoming";
 const admin = "var/lib/dpkg/";
+const arch_native_writer = "import-arch-native";
+const arch_native = admin ++ "arch-native";
+
+/// dpkg 1.23.7 `debian/dpkg.postinst` writes the admin directory's native
+/// architecture from configure with exactly this function.
+const dpkg_create_db_native_arch =
+    \\create_db_native_arch()
+    \\{
+    \\  local admindir="${DPKG_ADMINDIR:-/var/lib/dpkg}"
+    \\
+    \\  echo "$DPKG_MAINTSCRIPT_ARCH" >"$admindir/arch-native"
+    \\}
+    \\if [ "$1" = configure ]; then
+    \\  create_db_native_arch
+    \\fi
+    \\
+;
 
 fn rootFile(fixture: *foundation.Fixture, root: []const u8, path: []const u8) ![]u8 {
     const relative = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{
@@ -290,6 +307,181 @@ fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, archi
     try externalDrift(fixture, driver, script_drift, architecture, archive, "script-drift-import", .installed_script_mode);
 }
 
+const UnchangedReport = struct {
+    outcome: []const u8,
+    changed: bool,
+    detail: []const u8,
+};
+
+/// Runs the driver's zero-action `upgrade-all` (`Runtime.verifyUnchanged`).
+fn unchangedUpgradeAll(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    root: []const u8,
+    architecture: []const u8,
+    destination: []const u8,
+) !std.json.Parsed(UnchangedReport) {
+    try fixture.directory(destination);
+    const request_relative = try support.path(fixture.allocator, destination, "unchanged.request.json");
+    defer fixture.allocator.free(request_relative);
+    const report_relative = try support.path(fixture.allocator, destination, "unchanged.report.json");
+    defer fixture.allocator.free(report_relative);
+    const log = try support.path(fixture.allocator, destination, "unchanged.log");
+    defer fixture.allocator.free(log);
+    const request = try fixture.absolute(request_relative);
+    defer fixture.allocator.free(request);
+    const report = try fixture.absolute(report_relative);
+    defer fixture.allocator.free(report);
+    const document = try std.json.Stringify.valueAlloc(fixture.allocator, .{
+        .root = root,
+        .architecture = architecture,
+        .report = report,
+    }, .{});
+    defer fixture.allocator.free(document);
+    try fixture.write(request_relative, document, 0o644);
+    // The lifecycle test in the same driver would otherwise replay its last request.
+    _ = fixture.environment.swapRemove("DEBZ_NATIVE_LIFECYCLE_REQUEST");
+    try fixture.environment.put("DEBZ_NATIVE_UNCHANGED_REQUEST", request);
+    defer _ = fixture.environment.swapRemove("DEBZ_NATIVE_UNCHANGED_REQUEST");
+    try fixture.run(&.{driver}, log, 120);
+    const bytes = try support.read(fixture, report_relative, 64 * 1024);
+    defer fixture.allocator.free(bytes);
+    return std.json.parseFromSlice(UnchangedReport, fixture.allocator, bytes, .{
+        .allocate = .alloc_always,
+    });
+}
+
+/// `foundation.capture` refuses a linked database entry, so such a root is
+/// compared by a raw listing that records the link, modes, owners, and bytes.
+fn rootState(fixture: *foundation.Fixture, root: []const u8, label: []const u8) ![]u8 {
+    return foundation.capture(fixture.allocator, fixture.io, root) catch |err| switch (err) {
+        error.UnsafeDatabaseEntry => {
+            const log = try std.fmt.allocPrint(fixture.allocator, "{s}.state", .{label});
+            defer fixture.allocator.free(log);
+            const listing =
+                \\cd "$1" && LC_ALL=C && export LC_ALL &&
+                \\find . -path ./var/lib/debz -prune -o -printf '%p %y %m %U:%G %s %T@ %l\n' | sort &&
+                \\find . -path ./var/lib/debz -prune -o -type f -print0 | sort -z | xargs -0r sha256sum
+            ;
+            try fixture.run(&.{ "/bin/sh", "-c", listing, "sh", root }, log, 60);
+            return support.read(fixture, log, 64 * 1024 * 1024);
+        },
+        else => err,
+    };
+}
+
+fn expectUnchanged(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    root: []const u8,
+    architecture: []const u8,
+    destination: []const u8,
+    detail: []const u8,
+) !void {
+    const before_label = try std.fmt.allocPrint(fixture.allocator, "{s}-before", .{destination});
+    defer fixture.allocator.free(before_label);
+    const before = try rootState(fixture, root, before_label);
+    defer fixture.allocator.free(before);
+    var report = try unchangedUpgradeAll(fixture, driver, root, architecture, destination);
+    defer report.deinit();
+    const expected_outcome = if (std.mem.eql(u8, detail, "unchanged")) "unchanged" else "refused";
+    if (!std.mem.eql(u8, report.value.outcome, expected_outcome) or report.value.changed or
+        !std.mem.eql(u8, report.value.detail, detail))
+    {
+        std.debug.print("{s}: expected zero-action {s}, got {s} changed={} {s}\n", .{
+            destination, detail, report.value.outcome, report.value.changed, report.value.detail,
+        });
+        return error.ZeroActionUpgradeMismatch;
+    }
+    const after_label = try std.fmt.allocPrint(fixture.allocator, "{s}-after", .{destination});
+    defer fixture.allocator.free(after_label);
+    const after = try rootState(fixture, root, after_label);
+    defer fixture.allocator.free(after);
+    if (!std.mem.eql(u8, before, after)) return error.ZeroActionUpgradeChangedRoot;
+    try support.assertNoActiveEvidence(fixture, root);
+}
+
+/// A postinst that writes `arch-native` exactly like dpkg's own must leave a
+/// root that a zero-action `upgrade-all` proves unchanged (changed=false),
+/// while foreign, malformed, linked, or writable entries stay typed refusals.
+fn archNative(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, architecture: []const u8) !void {
+    const archive = try support.makePackage(fixture, architecture, "1", arch_native_writer, "packages/root-import-arch-native", .{
+        .postinst_append = dpkg_create_db_native_arch,
+    });
+    defer fixture.allocator.free(archive);
+    var scenario = try support.Scenario.init(fixture, "arch-native-import", driver, dpkg, architecture, false);
+    defer scenario.deinit();
+    const chosen = [_]foundation.PackageIdentity{.{ .name = arch_native_writer, .architecture = architecture }};
+    try scenario.phase(.{ .operation = "install", .archives = &.{archive}, .packages = &chosen }, false);
+    const expected = try std.fmt.allocPrint(fixture.allocator, "{s}\n", .{architecture});
+    defer fixture.allocator.free(expected);
+    for ([_][]const u8{ scenario.reference_root, scenario.native_root }) |root| {
+        try assertFile(fixture, root, arch_native, expected);
+        var guarded = try foundation.guardedRoot(fixture.io, root);
+        defer guarded.close(fixture.io);
+        const entry = try (root_fs.Root.init(fixture.io, guarded)).entry(try root_fs.Path.init(arch_native));
+        if (!entry.isRegularFile() or entry.mode & 0o7777 != 0o644) return error.ArchNativeModeMismatch;
+    }
+
+    const foreign = try cloneRoot(fixture, scenario.native_root, "arch-native-foreign", architecture);
+    defer fixture.allocator.free(foreign);
+    const trailing = try cloneRoot(fixture, scenario.native_root, "arch-native-trailing", architecture);
+    defer fixture.allocator.free(trailing);
+    const linked = try cloneRoot(fixture, scenario.native_root, "arch-native-linked", architecture);
+    defer fixture.allocator.free(linked);
+    const writable = try cloneRoot(fixture, scenario.native_root, "arch-native-writable", architecture);
+    defer fixture.allocator.free(writable);
+
+    try expectUnchanged(fixture, driver, scenario.native_root, architecture, "arch-native-import/unchanged-upgrade-all", "unchanged");
+    try expectUnchanged(fixture, driver, scenario.native_root, architecture, "arch-native-import/unchanged-upgrade-all-again", "unchanged");
+
+    const other = if (std.mem.eql(u8, architecture, "amd64")) "arm64\n" else "amd64\n";
+    try fixture.write("arch-native-foreign/" ++ arch_native, other, 0o644);
+    const doubled = try std.fmt.allocPrint(fixture.allocator, "{s}\n\n", .{architecture});
+    defer fixture.allocator.free(doubled);
+    try fixture.write("arch-native-trailing/" ++ arch_native, doubled, 0o644);
+    try fixture.dir.deleteFile(fixture.io, "arch-native-linked/" ++ arch_native);
+    try fixture.dir.symLink(fixture.io, "status", "arch-native-linked/" ++ arch_native, .{});
+    try fixture.write("arch-native-writable/" ++ arch_native, expected, 0o666);
+    for ([_]struct { root: []const u8, label: []const u8, detail: []const u8 }{
+        .{ .root = foreign, .label = "arch-native-foreign", .detail = "DatabaseNativeArchitectureMismatch" },
+        .{ .root = trailing, .label = "arch-native-trailing", .detail = "DatabaseNativeArchitectureMismatch" },
+        .{ .root = linked, .label = "arch-native-linked", .detail = "UnsafeDatabaseEntry" },
+        .{ .root = writable, .label = "arch-native-writable", .detail = "UnsafeDatabaseEntry" },
+    }) |case| {
+        const zero = try std.fmt.allocPrint(fixture.allocator, "{s}-unchanged", .{case.label});
+        defer fixture.allocator.free(zero);
+        try expectUnchanged(fixture, driver, case.root, architecture, zero, case.detail);
+        const destination = try std.fmt.allocPrint(fixture.allocator, "{s}-reinstall", .{case.label});
+        defer fixture.allocator.free(destination);
+        const before_label = try std.fmt.allocPrint(fixture.allocator, "{s}-before", .{destination});
+        defer fixture.allocator.free(before_label);
+        const before = try rootState(fixture, case.root, before_label);
+        defer fixture.allocator.free(before);
+        try fixture.directory(destination);
+        var report = try support.native(fixture, driver, case.root, architecture, .{
+            .operation = "reinstall",
+            .archives = &.{archive},
+            .packages = &chosen,
+        }, destination);
+        defer report.deinit();
+        if (!std.mem.eql(u8, report.value.outcome, "refused") or
+            !std.mem.eql(u8, report.value.detail, case.detail))
+        {
+            std.debug.print("{s}: expected refusal {s}, got {s}: {s}\n", .{
+                case.label, case.detail, report.value.outcome, report.value.detail,
+            });
+            return error.ArchNativeRefusalMismatch;
+        }
+        const after_label = try std.fmt.allocPrint(fixture.allocator, "{s}-after", .{destination});
+        defer fixture.allocator.free(after_label);
+        const after = try rootState(fixture, case.root, after_label);
+        defer fixture.allocator.free(after);
+        if (!std.mem.eql(u8, before, after)) return error.ArchNativeRefusalChangedRoot;
+        try support.assertNoActiveEvidence(fixture, case.root);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args = init.minimal.args.iterate();
@@ -305,5 +497,6 @@ pub fn main(init: std.process.Init) !void {
     defer fixture.deinit();
     errdefer fixture.retain = true;
     try run(&fixture, driver, prerequisite.executable, prerequisite.architecture);
+    try archNative(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try support.assertHostUnchanged(allocator, init.io, prerequisite.before);
 }
