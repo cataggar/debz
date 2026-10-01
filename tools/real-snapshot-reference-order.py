@@ -8,8 +8,11 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import re
+import os
 import subprocess
 import tempfile
+
+from real_snapshot_reference_paths import open_absolute, protected, read_root_file
 
 MAXIMUM_PACKAGES = 2000
 MAXIMUM_PROBES = 10000
@@ -18,6 +21,11 @@ MAXIMUM_LOG_BYTES = 16 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 512 * 1024 * 1024
 NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*\Z")
 DIGEST = re.compile(r"[a-f0-9]{128}\Z")
+PROFILE_VERSIONS = {
+    "systemd": "261.2-1ubuntu2",
+    "udev": "261.2-1ubuntu2",
+    "sudo": "1.9.17p2-7ubuntu3",
+}
 
 
 @dataclass(frozen=True)
@@ -70,23 +78,51 @@ def packages_from_manifest(path: Path, cache: Path) -> list[Package]:
 
 
 def verify_archive(package: Package) -> None:
-    if package.archive.is_symlink() or not package.archive.is_file():
-        raise ValueError(f"missing verified reference archive: {package.name}")
-    if package.archive.stat().st_size != package.size:
+    before = protected(package.archive)
+    if before.st_size != package.size:
         raise ValueError(f"reference archive size changed: {package.name}")
+    def identity(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+        )
     digest = hashlib.sha512()
-    with package.archive.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
+    fd = open_absolute(package.archive)
+    try:
+        if identity(os.fstat(fd)) != identity(before):
+            raise ValueError(f"reference archive identity changed: {package.name}")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        if identity(os.fstat(fd)) != identity(before):
+            raise ValueError(f"reference archive changed: {package.name}")
+    finally:
+        os.close(fd)
     if digest.hexdigest() != package.digest:
         raise ValueError(f"reference archive digest changed: {package.name}")
 
 
-def dpkg_command(dpkg: Path, root: Path, *operation: str) -> list[str]:
-    return [
-        str(dpkg), f"--root={root}", "--force-not-root", "--force-bad-path",
-        "--force-confold", *operation,
-    ]
+def dpkg_command(
+    launcher: Path, dpkg: Path, root: Path, architecture: str, profile: str,
+    verb: str, package: Package | None = None,
+) -> list[str]:
+    if verb not in ("probe_unpack", "unpack", "probe_configure", "configure"):
+        raise ValueError(f"reference dpkg operation has no single-script binding: {verb}")
+    if package is None:
+        raise ValueError("reference dpkg operation requires one signed package")
+    if profile != "none":
+        if (verb != "configure" or architecture != "amd64"
+            or profile not in PROFILE_VERSIONS
+            or package.name != profile or package.architecture != architecture
+            or package.version != PROFILE_VERSIONS[profile]):
+            raise ValueError(f"unauthorized reference script profile: {profile}")
+    elif verb == "configure" and package.name in PROFILE_VERSIONS:
+        raise ValueError(f"missing exact configure profile: {package.selector}")
+    command = [str(launcher), str(root), str(dpkg), architecture, profile, verb]
+    command.append(package.selector)
+    if verb in ("unpack", "probe_unpack"):
+        command.extend((str(package.archive), package.digest, str(package.size)))
+    return command
 
 
 def oracle_environment() -> dict[str, str]:
@@ -100,21 +136,25 @@ def oracle_environment() -> dict[str, str]:
     }
 
 
-def probe(command: list[str], environment: dict[str, str]) -> tuple[int, bytes]:
-    with tempfile.TemporaryFile() as output:
-        result = subprocess.run(
-            command,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=60,
-        )
-        if output.tell() > MAXIMUM_PROBE_OUTPUT:
-            raise ValueError("reference dpkg dry-run output exceeds limit")
-        output.seek(0)
-        return result.returncode, output.read()
+def probe(
+    command: list[str], environment: dict[str, str], evidence: Path,
+) -> tuple[int, bytes]:
+    with tempfile.TemporaryDirectory(prefix="reference-probe-", dir=evidence) as temporary:
+        output_path = Path(temporary) / "output"
+        with output_path.open("x+b") as output, output_path.open("ab") as writer:
+            result = subprocess.run(
+                command,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=writer,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=60,
+            )
+            writer.flush()
+            if output_path.stat().st_size > MAXIMUM_PROBE_OUTPUT:
+                raise ValueError("reference dpkg dry-run output exceeds limit")
+            return result.returncode, output.read(MAXIMUM_PROBE_OUTPUT + 1)
 
 
 def apply(
@@ -137,76 +177,43 @@ def apply(
         raise ValueError("reference dpkg output exceeds limit")
 
 
-def configured_packages(root: Path, environment: dict[str, str]) -> set[tuple[str, str]]:
-    result = subprocess.run(
-        [
-            "dpkg-query", f"--admindir={root / 'var/lib/dpkg'}", "-W",
-            "-f=${Package}\t${Architecture}\t${Status}\n",
-        ],
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=True,
-        timeout=60,
-    )
-    if len(result.stdout) > 1024 * 1024 or result.stderr:
-        raise ValueError("invalid reference database query")
-    configured: set[tuple[str, str]] = set()
-    for line in result.stdout.decode("utf-8").splitlines():
-        name, architecture, status = line.split("\t")
-        if status in ("install ok installed", "install ok triggers-pending"):
-            configured.add((name, architecture))
-        elif status != "install ok unpacked":
-            raise RuntimeError(f"unhealthy reference package state: {name}:{architecture} {status}")
-    return configured
+def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
+    records: dict[tuple[str, str], tuple[str, str]] = {}
+    data = read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024)
+    for stanza in data.decode("utf-8").strip().split("\n\n"):
+        if not stanza:
+            continue
+        fields: dict[str, str] = {}
+        previous: str | None = None
+        for line in stanza.splitlines():
+            if line.startswith((" ", "\t")):
+                if previous is None or previous in ("package", "architecture", "version", "status"):
+                    raise ValueError("invalid continuation in reference database identity")
+                continue
+            key, separator, value = line.partition(": ")
+            if not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", key):
+                raise ValueError("malformed reference database field")
+            previous = key.lower()
+            if previous in fields:
+                raise ValueError(f"duplicate reference database field: {key}")
+            fields[previous] = value
+        name = fields["package"]
+        architecture = fields["architecture"]
+        version = fields["version"]
+        status = fields["status"]
+        if not NAME.fullmatch(name) or not NAME.fullmatch(architecture) or not version:
+            raise ValueError("invalid reference database package")
+        key = name, architecture
+        if key in records:
+            raise ValueError(f"duplicate reference database package: {key}")
+        records[key] = (status, version)
+    return records
 
 
-def configure_batch(
-    dpkg: Path,
-    root: Path,
-    environment: dict[str, str],
-    stdout: Path,
-    stderr: Path,
+def install(
+    launcher: Path, dpkg: Path, root: Path, cache: Path, evidence: Path,
+    architecture: str,
 ) -> None:
-    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-        result = subprocess.run(
-            dpkg_command(dpkg, root, "--no-triggers", "--configure", "--pending"),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=errors,
-            check=False,
-            timeout=120,
-        )
-        if output.tell() > MAXIMUM_LOG_BYTES or errors.tell() > MAXIMUM_LOG_BYTES:
-            raise ValueError("reference dpkg batch output exceeds limit")
-        output.seek(0)
-        errors.seek(0)
-        observed_output, observed_errors = output.read(), errors.read()
-    with stdout.open("ab") as out, stderr.open("ab") as err:
-        out.write(observed_output)
-        err.write(observed_errors)
-    if stdout.stat().st_size > MAXIMUM_LOG_BYTES or stderr.stat().st_size > MAXIMUM_LOG_BYTES:
-        raise ValueError("reference dpkg output exceeds limit")
-    if result.returncode:
-        reasons = re.findall(
-            rb"dpkg: error processing package [^\n]+\n ([^\n]+)", observed_errors
-        )
-        other_errors = [
-            line for line in observed_errors.splitlines()
-            if line.startswith(b"dpkg: error")
-            and not line.startswith(b"dpkg: error processing package ")
-        ]
-        if (
-            not reasons
-            or any(reason != b"dependency problems - leaving unconfigured" for reason in reasons)
-            or observed_errors.count(b"dpkg: error processing package ") != len(reasons)
-            or other_errors
-        ):
-            raise RuntimeError(f"reference dpkg configuration failed: {observed_errors[:4096]!r}")
-
-
-def install(dpkg: Path, root: Path, cache: Path, evidence: Path) -> None:
     packages = packages_from_manifest(evidence / "reference-archives.tsv", cache)
     pending = packages[:]
     unpacked: list[Package] = []
@@ -219,11 +226,11 @@ def install(dpkg: Path, root: Path, cache: Path, evidence: Path) -> None:
         progressed = False
         deferred: list[str] = []
         for package in pending[:]:
-            command = dpkg_command(dpkg, root, "--no-triggers", "--no-act", "--unpack", str(package.archive))
+            command = dpkg_command(launcher, dpkg, root, architecture, "none", "probe_unpack", package)
             probes += 1
             if probes > MAXIMUM_PROBES:
                 raise ValueError("reference dpkg dependency probe limit exceeded")
-            status, output = probe(command, environment)
+            status, output = probe(command, environment, evidence)
             if status:
                 if b"pre-dependency problem" not in output:
                     raise RuntimeError(f"reference dpkg unpack refused {package.selector}: {output[:4096]!r}")
@@ -231,62 +238,97 @@ def install(dpkg: Path, root: Path, cache: Path, evidence: Path) -> None:
                 continue
             verify_archive(package)
             apply(
-                dpkg_command(dpkg, root, "--no-triggers", "--unpack", str(package.archive)),
+                dpkg_command(launcher, dpkg, root, architecture, "none", "unpack", package),
                 environment, stdout, stderr,
             )
             pending.remove(package)
             unpacked.append(package)
             progressed = True
         for package in unpacked[:]:
-            command = dpkg_command(dpkg, root, "--no-triggers", "--no-act", "--configure", package.selector)
+            command = dpkg_command(launcher, dpkg, root, architecture, "none", "probe_configure", package)
             probes += 1
             if probes > MAXIMUM_PROBES:
                 raise ValueError("reference dpkg dependency probe limit exceeded")
-            status, output = probe(command, environment)
+            status, output = probe(command, environment, evidence)
             if status:
                 if b"dependency problems" not in output:
                     raise RuntimeError(f"reference dpkg configure refused {package.selector}: {output[:4096]!r}")
                 deferred.append(package.selector)
                 continue
-            apply(
-                dpkg_command(dpkg, root, "--no-triggers", "--configure", package.selector),
-                environment, stdout, stderr,
-            )
+            current = database_packages(root).get((package.name, package.architecture))
+            if current != ("install ok unpacked", package.version):
+                raise ValueError(f"reference package state/version changed: {package.selector}")
+            profile = package.name if package.name in PROFILE_VERSIONS else "none"
+            if profile != "none" and package.version != PROFILE_VERSIONS[profile]:
+                raise ValueError(f"unauthorized reference script version: {package.selector}")
+            apply(dpkg_command(
+                launcher, dpkg, root, architecture, profile, "configure", package,
+            ), environment, stdout, stderr)
             unpacked.remove(package)
             configured.add((package.name, package.architecture))
             progressed = True
         if not progressed:
-            if unpacked:
-                before = set(configured)
-                configure_batch(dpkg, root, environment, stdout, stderr)
-                observed = configured_packages(root, environment)
-                for package in unpacked[:]:
-                    if (package.name, package.architecture) in observed:
-                        unpacked.remove(package)
-                        configured.add((package.name, package.architecture))
-                progressed = configured != before
-        if not progressed:
             raise RuntimeError(
-                "reference dependency ordering stalled: " + ", ".join(deferred[:20])
+                "reference dependency ordering stalled; ambiguous --configure --pending "
+                "is not authorized: " + ", ".join(deferred[:20])
             )
     if len(configured) != len(packages):
         raise ValueError("reference closure not fully configured")
-    apply(
-        dpkg_command(dpkg, root, "--triggers-only", "--pending"),
-        environment, stdout, stderr,
+    raise RuntimeError(
+        "reference trigger closure refused: the launcher has no exact triggered "
+        "postinst identity/profile or single-package trigger operation; --pending "
+        "and multi-package ordering are not authorized"
     )
+
+
+def report(root: Path, cache: Path, evidence: Path) -> None:
+    packages = packages_from_manifest(evidence / "reference-archives.tsv", cache)
+    records = database_packages(root)
+    if len(records) != len(packages):
+        raise ValueError("reference database differs from signed package closure")
+    lines: list[str] = []
+    for package in packages:
+        key = package.name, package.architecture
+        if records.get(key) != ("install ok installed", package.version):
+            raise ValueError(f"reference package not installed at signed version: {key}")
+        lines.append(f"ii  {package.selector} {package.version}\n")
+    (evidence / "reference-installed.txt").write_text("".join(lines))
+    info_fd = open_absolute(root / "var/lib/dpkg/info", directory=True)
+    try:
+        entries = os.listdir(info_fd)
+        if len(entries) > MAXIMUM_PACKAGES * 12:
+            raise ValueError("reference database info directory exceeds bound")
+        for entry in entries:
+            if entry.endswith(".list"):
+                data = read_root_file(root, f"var/lib/dpkg/info/{entry}", 8 * 1024 * 1024)
+                if b"/dev/null" in data.splitlines():
+                    raise ValueError("reference package claims excluded chroot device")
+    finally:
+        os.close(info_fd)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dpkg", type=Path, required=True)
+    parser.add_argument("--dpkg", type=Path)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--launcher", type=Path)
+    parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
+    parser.add_argument("--report-only", action="store_true")
     args = parser.parse_args()
-    if not args.dpkg.is_absolute() or not args.root.is_absolute() or not args.cache.is_absolute():
+    if not args.root.is_absolute() or not args.cache.is_absolute() or not args.evidence.is_absolute():
         raise ValueError("reference inputs must be absolute paths")
-    install(args.dpkg, args.root, args.cache, args.evidence)
+    if args.report_only:
+        report(args.root, args.cache, args.evidence)
+        return
+    if args.dpkg is None or args.launcher is None or not args.dpkg.is_absolute():
+        raise ValueError("reference launcher and pinned dpkg are required")
+    protected(args.launcher)
+    protected(args.dpkg)
+    protected(args.cache, directory=True)
+    protected(args.evidence, directory=True)
+    install(args.launcher, args.dpkg, args.root, args.cache, args.evidence, args.architecture)
 
 
 if __name__ == "__main__":

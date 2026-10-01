@@ -2321,6 +2321,89 @@ def workload_ci_failures(jobs: dict[str, str], text: str) -> list[str]:
     return failures
 
 
+REFERENCE_ROOT_PATHS = (
+    ".github/workflows/ci.yml",
+    "build.zig",
+    "tools/real-snapshot-reference-launcher.zig",
+    "tools/real-snapshot-reference-launcher-root-test.zig",
+)
+REFERENCE_ROOT_STEP = (
+    "      - name: Prove root reference capability transition\n"
+    "        run: zig build test-real-snapshot-reference-launcher-root --summary all\n"
+)
+
+
+def reference_launcher_root_wiring_failures(
+    ci: str, build: str, launcher: str, root_test: str,
+) -> list[str]:
+    """The root capability proof runs in CI, outside the sudo-free security audit."""
+    failures: list[str] = []
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
+    ))
+    job = jobs.get("security-audit", "")
+    step = re.search(
+        r"(?ms)^      - name: Prove root reference capability transition\n.*?(?=^      - |^\n|\Z)",
+        job,
+    )
+    if (
+        any(line not in job.splitlines() for line in (
+            "    name: Security and dependency policy",
+            "    runs-on: ubuntu-24.04",
+            "        run: zig build security-audit",
+        ))
+        or re.search(r"(?m)^    (?:if|continue-on-error|strategy):", job)
+        or "continue-on-error:" in job
+        or step is None or step.group(0) != REFERENCE_ROOT_STEP
+        or ci.count("test-real-snapshot-reference-launcher-root") != 1
+    ):
+        failures.append(
+            "ci.yml: the security job must unconditionally prove the root reference capability transition"
+        )
+    for token in (
+        'const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);',
+        'audit_step.dependOn(&run_reference_launcher_tests.step);',
+        'b.path("tools/real-snapshot-reference-launcher-root-test.zig")',
+        'const run_reference_launcher_root_tests = b.addSystemCommand(&.{ "sudo", "-n", "--" });',
+        'run_reference_launcher_root_tests.addArtifactArg(reference_launcher_root_tests);',
+        'b.step("test-real-snapshot-reference-launcher-root", ',
+        '.dependOn(&run_reference_launcher_root_tests.step);',
+    ):
+        if build.count(token) != 1:
+            failures.append(f"build.zig: root reference capability step lost {token}")
+    if re.search(r"audit_step\.dependOn\(&run_reference_launcher_root_tests\.step\)", build):
+        failures.append("build.zig: security-audit must not require passwordless sudo")
+    for token in (
+        "pub fn capabilityTransitionProbe() !void {",
+        "if (linux.geteuid() != 0 or linux.getuid() != 0) linux.exit(14);",
+        "if (linux.W.EXITSTATUS(status) == 14) return error.CapabilityProbeRequiresRoot;",
+        'test "reference capability transition fails closed without root authority" {\n'
+        "    try unprivilegedTransitionProbe();\n}",
+        "if (restrictReferencePrivileges() != .PERM) linux.exit(4);",
+    ):
+        if launcher.count(token) != 1:
+            failures.append(f"reference launcher: root capability refusal lost {token}")
+    if (
+        "SkipZigTest" in launcher
+        or launcher.count("capabilityTransitionProbe(") != 1
+        or re.search(r"\.unshare,\s*linux\.CLONE\.NEWUSER", launcher)
+    ):
+        failures.append(
+            "reference launcher: the capability transition must run only in the root step, never skip or use a user namespace"
+        )
+    expected_root_test = (
+        'const launcher = @import("real-snapshot-reference-launcher.zig");\n\n'
+        'test "reference capability transition clears ambient and high bounding privileges as root" {\n'
+        "    try launcher.capabilityTransitionProbe();\n}\n"
+    )
+    code = "\n".join(
+        line for line in root_test.splitlines() if not line.startswith("//!")
+    ).strip() + "\n"
+    if code != expected_root_test:
+        failures.append("reference launcher root test: must run the capability transition without conditions or skips")
+    return failures
+
+
 def native_recovery_ci_failures(text: str) -> list[str]:
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
@@ -3475,6 +3558,11 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
+            for failure in reference_launcher_root_wiring_failures(*(
+                (ROOT / path).read_text() if (ROOT / path).is_file() else ""
+                for path in REFERENCE_ROOT_PATHS
+            )):
+                fail(failure)
         expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
@@ -4447,6 +4535,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
+        "reference-root",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -4461,6 +4550,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
                 "build.zig", "src/sha512_transaction_e2e_test.zig",
                 "src/native_provenance_binding_test.zig",
             ),
+            "reference-root": REFERENCE_ROOT_PATHS,
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
@@ -4513,6 +4603,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_recovery_gate_wiring_failures(*(texts[path] for path in paths))
         elif kind == "native-provenance":
             failures = native_provenance_binding_wiring_failures(*(texts[path] for path in paths))
+        elif kind == "reference-root":
+            failures = reference_launcher_root_wiring_failures(*(texts.get(path, "") for path in paths))
         else:
             failures = native_lifecycle_fixture_failures(texts)
     elif kind == "release-install-metadata":

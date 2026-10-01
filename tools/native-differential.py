@@ -15,6 +15,10 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+if str(pathlib.Path(__file__).parent) not in sys.path:
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from real_snapshot_reference_paths import open_absolute
+
 SCHEMA = "https://debz.dev/test/native-transaction-snapshot-v1"
 CORPUS_SCHEMA = "https://debz.dev/test/native-transaction-corpus-v1"
 TRACE_PATH = "var/log/debz-native-differential.trace"
@@ -72,9 +76,8 @@ class SnapshotError(ValueError):
 def _sha256_file(path: pathlib.Path, expected_size: int) -> str:
     digest = hashlib.sha256()
     observed = 0
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = open_absolute(path)
     except OSError as error:
         raise SnapshotError(f"cannot open regular file {path}: {error}") from error
     with os.fdopen(descriptor, "rb", buffering=0) as stream:
@@ -93,6 +96,7 @@ def _sha256_file(path: pathlib.Path, expected_size: int) -> str:
 
 
 def _xattrs(path: pathlib.Path, limits: Limits) -> list[dict[str, str]]:
+    _no_symlink_directory(path.parent)
     try:
         names = sorted(os.listxattr(path, follow_symlinks=False))
     except OSError as error:
@@ -152,6 +156,7 @@ def capture_tree(
     pending = [("", root)]
     while pending:
         relative_parent, directory = pending.pop()
+        _no_symlink_directory(directory)
         try:
             children = sorted(os.scandir(directory), key=lambda item: os.fsencode(item.name))
         except OSError as error:
@@ -233,18 +238,24 @@ def _normalize_relative(value: str) -> str:
 def _validated_root(root: pathlib.Path) -> pathlib.Path:
     if not root.is_absolute():
         raise SnapshotError("root must be absolute")
-    current = pathlib.Path(root.anchor)
-    for component in root.parts[1:]:
-        if component in {"", ".", ".."}:
-            raise SnapshotError(f"root contains an ambiguous component: {root}")
-        current /= component
-        try:
-            metadata = current.lstat()
-        except OSError as error:
-            raise SnapshotError(f"cannot stat root component {current}: {error}") from error
-        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise SnapshotError(f"root component must be a real directory: {current}")
+    _no_symlink_directory(root)
     return root
+
+
+def _no_symlink_directory(path: pathlib.Path) -> None:
+    if not _optional_safe_directory(path):
+        raise SnapshotError(f"missing directory {path}")
+
+
+def _optional_safe_directory(path: pathlib.Path) -> bool:
+    try:
+        descriptor = open_absolute(path, directory=True)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as error:
+        raise SnapshotError(f"unsafe directory ancestor {path}: {error}") from error
+    os.close(descriptor)
+    return True
 
 
 def _read_bounded(path: pathlib.Path, maximum: int) -> bytes:
@@ -256,9 +267,8 @@ def _read_bounded(path: pathlib.Path, maximum: int) -> bytes:
         raise SnapshotError(f"database path is not a regular file: {path}")
     if metadata.st_size > maximum:
         raise SnapshotError(f"database file exceeds limit: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = open_absolute(path)
     except OSError as error:
         raise SnapshotError(f"cannot open database file {path}: {error}") from error
     with os.fdopen(descriptor, "rb", buffering=0) as stream:
@@ -414,6 +424,8 @@ def _capture_database_directory(
     limits: Limits,
     budget: dict[str, int],
 ) -> list[dict[str, Any]]:
+    if not _optional_safe_directory(directory):
+        return []
     try:
         metadata = directory.lstat()
     except FileNotFoundError:
@@ -463,6 +475,12 @@ def _capture_database_directory(
 
 def capture_dpkg(root: pathlib.Path, limits: Limits) -> dict[str, Any]:
     admin = root / "var/lib/dpkg"
+    if not _optional_safe_directory(admin):
+        return {
+            "present": False, "status": [], "status_old": [], "info": [],
+            "triggers": [], "updates": [], "alternatives": [], "parts": [],
+            "staging": [], "files": [],
+        }
     try:
         admin_metadata = admin.lstat()
     except FileNotFoundError:

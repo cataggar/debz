@@ -125,6 +125,23 @@ them into a separate oracle root only if dpkg's dependency checks permit it,
 and requires both captures to compare. Direct alphabetical lock order
 currently fails the reference's `Pre-Depends` checks; this gate is not yet
 passing real-package parity.
+The previous full-reference harness mounted unrestricted procfs and is
+retired; its healthy historical oracle root is not a private-PID parity
+proof. The bounded replacement refuses shared/unprotected checkouts,
+unknown or multi-package/pending script operations, and unsupported arm64
+script profiles. Hosted checkout staging, mode-0700 root-owned workspace
+and cleanup, small protected namespace tests, arm64 signed profiles and
+more than the current 90-minute job budget require separate review before
+re-enabling the full opt-in reference run. No retained failed root may be
+reused as a fresh proof.
+The opt-in `test-real-snapshot-reference-protected` Zig build target requires
+explicit root-owned protected fixture paths and a fresh proof workspace; it
+returns a failure, not a skip, without them;
+`tools/real-snapshot-reference-protected-stage.sh` stages them. Its
+pinned-dpkg operations, refusals and confined escape probe (including
+detached-descendant teardown) are not a substitute for the exact signed proc
+profiles, runtime binding (#263), hosted protected staging (#268) or the
+network decision (#278).
 Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
 dpkg/helper/package state, selects `native` explicitly, and exec-traces
 candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.
@@ -169,6 +186,12 @@ The required audit step runs Zig-owned policy mutations and offline snapshot
 workflow tests alongside the production Python audit utility. It does not
 download or execute the live snapshot; see the
 [test inventory](tooling-test-inventory.md) for the preserved negative cases.
+It needs no passwordless sudo. The same CI job then runs
+`zig build test-real-snapshot-reference-launcher-root`, which proves the
+reference launcher's capability transition as real root through `sudo -n`
+and fails with `CapabilityProbeRequiresRoot`, rather than skipping, without
+that authority; the audit refuses a missing, conditional or
+`continue-on-error` step and any audit dependency on it.
 Digest cutover drift is reviewed in `security/digest-inventory-v1.tsv`, a
 sorted TSV with one line per file that has findings, and in
 `security/digest-semantic-allowlist-v1.tsv`, a sorted TSV with one line per
