@@ -301,6 +301,72 @@ fn runTriggerLifecycle(fixture: *foundation.Fixture, driver: []const u8, helper:
     try removal.phase(.{ .operation = "remove", .packages = &selected_source, .triggers = true }, false);
 }
 
+/// Debian's libc6 postinst runs `dpkg-trigger --no-await libc-upgrade` even
+/// when no installed package is interested. dpkg-trigger queues it and
+/// incorporation drops it without leaving the caller triggers-awaited.
+fn runNoInterestActivations(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    // A handler for an unrelated trigger keeps the native trigger authority
+    // present, as libc-bin's `ldconfig` interest does in a Debian closure.
+    const handler = try support.makePackage(fixture, arch, "1", receiver, "no-interest-packages", .{
+        .declarations = "interest-noawait " ++ trigger ++ "\n",
+    });
+    defer fixture.allocator.free(handler);
+    for ([_]bool{ false, true }) |awaiting| {
+        const workspace = try std.fmt.allocPrint(fixture.allocator, "no-interest-{s}-packages", .{
+            if (awaiting) "await" else "noawait",
+        });
+        defer fixture.allocator.free(workspace);
+        const activating = try support.makePackage(fixture, arch, "1", source, workspace, .{
+            .activations = &.{ "debz-unwatched", "/usr/share/debz-unwatched/child" },
+            .activation_await = awaiting,
+        });
+        defer fixture.allocator.free(activating);
+        for ([_]bool{ false, true }) |defer_triggers| {
+            const name = try std.fmt.allocPrint(fixture.allocator, "no-interest-{s}-{s}", .{
+                if (awaiting) "await" else "noawait", if (defer_triggers) "deferred" else "immediate",
+            });
+            defer fixture.allocator.free(name);
+            var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+            defer case.deinit();
+            try case.seed(handler);
+            try copyNativeHelper(fixture, &case, helper);
+            try case.phase(.{
+                .operation = "install",
+                .archives = &.{activating},
+                .triggers = true,
+                .defer_triggers = defer_triggers,
+            }, false);
+            if (defer_triggers) try case.phase(.{ .operation = "process_triggers", .triggers = true }, false);
+            for ([_][]const u8{ "reference", "native" }) |side| {
+                const status_path = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/var/lib/dpkg/status", .{ name, side });
+                defer fixture.allocator.free(status_path);
+                const status = try support.read(fixture, status_path, 1024 * 1024);
+                defer fixture.allocator.free(status);
+                const start = std.mem.indexOf(u8, status, "Package: " ++ source ++ "\n") orelse
+                    return error.MissingNoInterestSource;
+                const end = std.mem.indexOfPos(u8, status, start, "\n\n") orelse status.len;
+                const record = status[start..end];
+                if (std.mem.indexOf(u8, record, "Status: install ok installed\n") == null or
+                    std.mem.indexOf(u8, record, "Triggers-Awaited:") != null or
+                    std.mem.indexOf(u8, status, "Triggers-Pending:") != null)
+                    return error.NoInterestActivationLeftTriggerState;
+                const queue_path = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/var/lib/dpkg/triggers/Unincorp", .{ name, side });
+                defer fixture.allocator.free(queue_path);
+                if (support.read(fixture, queue_path, 1024 * 1024)) |queue| {
+                    defer fixture.allocator.free(queue);
+                    if (queue.len != 0) return error.NoInterestActivationLeftQueue;
+                } else |err| if (err != error.FileNotFound) return err;
+                const trace_path = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/{s}", .{ name, side, support.trace });
+                defer fixture.allocator.free(trace_path);
+                const recorded = try support.read(fixture, trace_path, 64 * 1024);
+                defer fixture.allocator.free(recorded);
+                if (std.mem.indexOf(u8, recorded, "\t9:triggered\t") != null)
+                    return error.NoInterestActivationRanHandler;
+            }
+        }
+    }
+}
+
 fn runTriggerChains(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const first_name = "debz-trigger-a";
     const second_name = "debz-trigger-b";
@@ -1044,6 +1110,10 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         runTriggerLifecycle(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
+            try support.assertHostUnchanged(allocator, init.io, reference.before);
+            return err;
+        };
+        runNoInterestActivations(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };

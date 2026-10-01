@@ -1408,6 +1408,104 @@ fn triggerOutcome(
     std.debug.print("{s}: exit 86, pinned dpkg and exact automatic/dynamic receipt order with immutable recovery\n", .{name});
 }
 
+/// Crash after activations no package is interested in were queued but
+/// before native incorporation; recovery must drop them like pinned dpkg and
+/// leave the awaiting caller installed rather than triggers-awaited. The
+/// isolated case runs debz's bound helper; the caller-less case runs the
+/// root's own dpkg-trigger, so recovery is checked for both queue producers.
+fn noInterestOutcome(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    isolated: bool,
+) !void {
+    const name = if (isolated) "isolated-no-interest-trigger" else "known-no-interest-trigger";
+    var scenario = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer scenario.deinit();
+    const handler = try support.makePackage(fixture, arch, "1", "debz-recovery-a", try support.path(fixture.allocator, name, "handler"), .{
+        .declarations = "interest-noawait debz-a\n",
+    });
+    try scenario.seed(handler);
+    const helper_before = try helperIdentity(fixture, scenario.native_root);
+    const source = try support.makePackage(fixture, arch, "1", "debz-trigger-source", try support.path(fixture.allocator, name, "source"), .{
+        .activations = &.{ "debz-unwatched", "/usr/share/debz-unwatched/child" },
+        .activation_await = true,
+        .scripts = .{ .only_postinst = true },
+    });
+    const reference_run = try support.path(fixture.allocator, name, "reference-install");
+    try fixture.directory(reference_run);
+    if (try support.reference(fixture, dpkg, scenario.reference_root, .{
+        .operation = "install",
+        .archives = &.{source},
+        .triggers = true,
+    }, reference_run) != 0) return error.UnexpectedReferenceTriggerExit;
+    if (try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "crash"), .{
+        .operation = "install",
+        .archive = source,
+        .crash_at = "after_script_outcome",
+        .caller_owned = isolated,
+        .isolated_helper = isolated,
+        .trigger_execution = true,
+    }) != null) return error.CrashProducedCompletionReport;
+    const queued = try bytes(fixture, scenario.native_root, "var/lib/dpkg/triggers/Unincorp", 64 * 1024);
+    var lines = std.mem.splitScalar(u8, queued, '\n');
+    for ([_][]const u8{ "debz-unwatched ", "/usr/share/debz-unwatched/child " }) |prefix| {
+        const line = lines.next() orelse return error.MissingQueuedNoInterestActivation;
+        if (!std.mem.startsWith(u8, line, prefix) or
+            std.mem.indexOf(u8, line, "debz-trigger-source") == null)
+            return error.MissingQueuedNoInterestActivation;
+    }
+    if ((lines.next() orelse return error.MissingQueuedNoInterestActivation).len != 0 or lines.next() != null)
+        return error.UnexpectedQueuedActivation;
+    var intent = try debz.native_recovery.decodeIntent(fixture.allocator, try bytes(fixture, scenario.native_root, intent_path, 16 * 1024 * 1024));
+    defer intent.deinit();
+    const request = try originalRequestFor(fixture, scenario.native_root, intent.intent, isolated, isolated, source);
+    var recovered = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "recovery"), .{
+        .operation = "recover",
+        .caller_owned = isolated,
+        .isolated_helper = isolated,
+        .trigger_execution = true,
+    }), "applied", null);
+    defer recovered.deinit();
+    const comparison = try support.path(fixture.allocator, name, "comparison");
+    try fixture.directory(comparison);
+    try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);
+    try verifyProofFor(fixture, scenario.native_root, recovered.value, intent.intent, request, .succeeded, true, isolated, isolated);
+    try sameHelper(fixture, scenario.native_root, helper_before);
+    const status = try bytes(fixture, scenario.native_root, "var/lib/dpkg/status", 1024 * 1024);
+    if (std.mem.indexOf(u8, status, "Triggers-Awaited:") != null or
+        std.mem.indexOf(u8, status, "Triggers-Pending:") != null)
+        return error.NoInterestActivationLeftTriggerState;
+    const proof_bytes = try bytes(fixture, scenario.native_root, provenance_path, 16 * 1024 * 1024);
+    const package_before = try snapshot(fixture, scenario.native_root);
+    var repeated = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "repeat"), .{
+        .operation = "recover",
+        .caller_owned = isolated,
+        .isolated_helper = isolated,
+        .trigger_execution = true,
+    }), "applied", null);
+    defer repeated.deinit();
+    try unchanged(fixture, scenario.native_root, package_before);
+    try same(try bytes(fixture, scenario.native_root, provenance_path, 16 * 1024 * 1024), proof_bytes);
+    if (isolated) {
+        var acknowledged = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "ack"), .{
+            .operation = "recover",
+            .caller_owned = true,
+            .isolated_helper = true,
+            .trigger_execution = true,
+            .acknowledge = true,
+        }), "applied", null);
+        defer acknowledged.deinit();
+        try unchanged(fixture, scenario.native_root, package_before);
+    }
+    try missing(fixture, scenario.native_root, operation_path);
+    try missing(fixture, scenario.native_root, intent_path);
+    try sameHelper(fixture, scenario.native_root, helper_before);
+    try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);
+    std.debug.print("{s}: exit 86 after queued no-interest activations, pinned dpkg state with immutable recovery\n", .{name});
+}
+
 const Corruption = enum { intent, progress, artifact, managed_root, completed_phase };
 
 fn corruptedOrdinary(
@@ -1991,6 +2089,8 @@ pub fn main(init: std.process.Init) !void {
     try blockedUnknown(&fixture, driver, reference.executable, reference.architecture, true);
     try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, false);
     try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, true);
+    try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, false);
+    try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, true);
     for ([_]Corruption{ .intent, .progress, .artifact, .managed_root, .completed_phase }) |which|
         try corruptedOrdinary(&fixture, driver, reference.architecture, which);
     for ([_]struct { name: []const u8, crash: []const u8, unknown: bool = false }{

@@ -3162,6 +3162,8 @@ def native_exercise_final_wiring_failures(
         "try blockedUnknown(&fixture, driver, reference.executable, reference.architecture, true);",
         "try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, false);",
         "try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, true);",
+        "try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, false);",
+        "try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, true);",
         "for ([_]Corruption{ .intent, .progress, .artifact, .managed_root, .completed_phase }) |which|",
         "try corruptedOrdinary(&fixture, driver, reference.architecture, which);",
     ):
@@ -3181,13 +3183,23 @@ def native_exercise_final_wiring_failures(
             "try unchanged(fixture, scenario.native_root, package_before);",
             "try sameHelper(fixture, scenario.native_root, original_helper);",
         )),
-        ("fn triggerOutcome(", "\nconst Corruption =", (
+        ("fn triggerOutcome(", "\nfn noInterestOutcome(", (
             '"after_trigger_outcome"',
             "try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);",
             "if (events.value.events.len != 2) return error.IncorrectTriggerEventCount;",
             "observed[0].origin != .automatic or observed[1].origin != .dynamic",
             'try same(observed[0].trigger, "debz-a");',
             'try same(observed[1].trigger, "debz-b");',
+            ".acknowledge = true,",
+        )),
+        ("fn noInterestOutcome(", "\nconst Corruption =", (
+            '"after_script_outcome"',
+            '.activations = &.{ "debz-unwatched", "/usr/share/debz-unwatched/child" },',
+            ".activation_await = true,",
+            '"debz-unwatched "',
+            'std.mem.indexOf(u8, line, "debz-trigger-source") == null',
+            'std.mem.indexOf(u8, status, "Triggers-Awaited:") != null or',
+            'std.mem.indexOf(u8, status, "Triggers-Pending:") != null',
             ".acknowledge = true,",
         )),
         ("fn corruptedOrdinary(", "\nfn caseRun(", (
