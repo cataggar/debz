@@ -137,6 +137,7 @@ pub const Request = struct {
     exact_lock_package: ?exact_lock.Package = null,
     exact_lock_v2_package: ?exact_lock_v2.Package = null,
     exact_lock_v3_package: ?exact_lock_v3.Package = null,
+    cache_identity: ?Digest = null,
 };
 
 pub const Provenance = struct {
@@ -660,15 +661,23 @@ pub fn acquirePackage(
         declared_size > request.policy.maximum_package_bytes or
         declared_size > cache.limits.maximum_object_bytes)
         return error.PackageTooLarge;
-    const digest: Digest = record.transport.identity;
+    const transport_digest: Digest = record.transport.identity;
+    const digest: Digest = request.cache_identity orelse transport_digest;
     var cache_key_buffer: [135]u8 = undefined;
     const cache_key = digest.cacheKey(&cache_key_buffer);
     const resolved = try resolvePackageUri(allocator, request.selected.repository_base_uri, record.transport.filename.value);
     defer allocator.free(resolved.text);
 
     if (cache.lookup(allocator, digest, declared_size, request.policy.cache_integrity)) |bytes| {
-        // The CAS object already matched every signed digest; a derived
-        // SHA512 is checked only after that and never repairs the cache.
+        // The CAS object matched its workflow cache key. When that key is a
+        // legacy exact-lock SHA256 alias, also re-check the authenticated
+        // repository transport identity before treating the object as reused.
+        transport_digest.verify(bytes) catch {
+            allocator.free(bytes);
+            return error.CorruptObject;
+        };
+        // A derived SHA512 is checked only after signed-digest verification and
+        // never repairs the cache.
         verifyDerivedSha512(request, bytes) catch |err| {
             allocator.free(bytes);
             return err;
@@ -698,6 +707,7 @@ pub fn acquirePackage(
     }, dependencies);
     defer downloaded.deinit(allocator);
     if (downloaded.bytes.len != declared_size) return error.SizeMismatch;
+    transport_digest.verify(downloaded.bytes) catch return error.DigestMismatch;
     digest.verify(downloaded.bytes) catch return error.DigestMismatch;
     try verifyDerivedSha512(request, downloaded.bytes);
     try cache.publish(

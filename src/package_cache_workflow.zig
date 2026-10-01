@@ -109,6 +109,13 @@ fn originMode(version: Version) []const u8 {
     };
 }
 
+fn objectIdentityMode(version: Version) []const u8 {
+    return switch (version) {
+        .v1, .v2 => "exact-lock-sha256-cache-key-v1",
+        .v3 => unreachable,
+    };
+}
+
 pub const RepositoryPolicy = enum {
     strict_priority,
     best_version,
@@ -883,6 +890,7 @@ fn prepareAfterCleanupVersion(
                 .exact_lock_package = if (version == .v1) locked else null,
                 .exact_lock_v2_package = if (version == .v2) locked else null,
                 .exact_lock_v3_package = if (version == .v3) locked else null,
+                .cache_identity = if (version == .v3) null else packageIdentity(version, locked),
             },
             request.acquisition,
         );
@@ -1124,6 +1132,51 @@ const PackageMatch = struct {
     record_index: usize,
 };
 
+fn putIdentityIndexes(
+    by_sha256: *std.AutoHashMap([32]u8, usize),
+    by_sha512: *std.AutoHashMap([64]u8, usize),
+    identity: content_digest.Identity,
+    index: usize,
+) !void {
+    if (identity.digests.sha256) |digest| try by_sha256.put(digest, index);
+    if (identity.digests.sha512) |digest| try by_sha512.put(digest, index);
+}
+
+fn findIdentityIndex(
+    by_sha256: *std.AutoHashMap([32]u8, usize),
+    by_sha512: *std.AutoHashMap([64]u8, usize),
+    identity: content_digest.Identity,
+) !?usize {
+    var result: ?usize = null;
+    if (identity.digests.sha256) |digest| {
+        if (by_sha256.get(digest)) |index| result = index;
+    }
+    if (identity.digests.sha512) |digest| {
+        if (by_sha512.get(digest)) |index| {
+            if (result) |existing| {
+                if (existing != index) return error.AmbiguousPackage;
+            }
+            result = index;
+        }
+    }
+    return result;
+}
+
+fn packageEvidenceMatches(
+    comptime version: Version,
+    record: packages_index.PackageRecord,
+    locked: anytype,
+) bool {
+    return switch (version) {
+        .v1, .v2 => record.transport.sha256 != null and
+            std.mem.eql(u8, &record.transport.sha256.?.bytes, &locked.sha256),
+        .v3 => content_digest.Identity.eql(
+            record.transport.identity,
+            locked.archive_identity,
+        ),
+    };
+}
+
 fn matchPackages(
     comptime version: Version,
     allocator: std.mem.Allocator,
@@ -1139,11 +1192,7 @@ fn matchPackages(
         if (version != .v1) {
             if (package.origin == .local_artifact) continue;
         }
-        const identity = packageIdentity(version, package);
-        switch (identity.primaryValue()) {
-            .sha256 => |digest| try by_sha256.put(digest, index),
-            .sha512 => |digest| try by_sha512.put(digest, index),
-        }
+        try putIdentityIndexes(&by_sha256, &by_sha512, packageIdentity(version, package), index);
     }
 
     const matches = try allocator.alloc(?PackageMatch, lock.packages.len);
@@ -1158,10 +1207,11 @@ fn matchPackages(
         for (repository.input.packages.records, 0..) |record, record_index| {
             if (scanned == maximum_records) return error.TooManyRepositoryRecords;
             scanned += 1;
-            const lock_index = switch (record.transport.identity.primaryValue()) {
-                .sha256 => |digest| by_sha256.get(digest),
-                .sha512 => |digest| by_sha512.get(digest),
-            } orelse continue;
+            const lock_index = (try findIdentityIndex(
+                &by_sha256,
+                &by_sha512,
+                record.transport.identity,
+            )) orelse continue;
             const locked = lock.packages[lock_index];
             const repository_id = if (version == .v1) locked.repository_id else switch (locked.origin) {
                 .authenticated_repository => |origin| origin.repository_id,
@@ -1171,10 +1221,7 @@ fn matchPackages(
                 !std.mem.eql(u8, record.control.package.text, locked.name) or
                 !std.mem.eql(u8, record.control.version.value.original, locked.version) or
                 !std.mem.eql(u8, record.control.architecture.text, locked.architecture) or
-                !content_digest.Identity.eql(
-                    record.transport.identity,
-                    packageIdentity(version, locked),
-                ) or
+                !packageEvidenceMatches(version, record, locked) or
                 record.transport.size.value != locked.declared_size)
             {
                 mismatched[lock_index] = true;
@@ -1229,6 +1276,7 @@ fn acceptancePolicyDigest(
     for (foreign) |value| hashField(&hash, value);
     hashField(&hash, debz_version);
     hashField(&hash, package_acquisition.namespace);
+    if (version != .v3) hashField(&hash, objectIdentityMode(version));
     hashField(&hash, archiveFormat(version));
     hashField(&hash, abi_identity);
     hashField(&hash, payload_policy);
@@ -1671,22 +1719,63 @@ const TestRepository = struct {
 };
 
 fn testRepository(allocator: std.mem.Allocator, payload: []const u8) !TestRepository {
+    return testRepositoryWithOptionalSha512(allocator, payload, null);
+}
+
+fn testRepositoryWithSha512(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    include_sha512: bool,
+) !TestRepository {
+    return testRepositoryWithOptionalSha512(
+        allocator,
+        payload,
+        if (include_sha512) payload else null,
+    );
+}
+
+fn testRepositoryWithOptionalSha512(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    sha512_payload: ?[]const u8,
+) !TestRepository {
     const digest = package_acquisition.Digest.of(payload);
     var digest_buffer: [128]u8 = undefined;
     const digest_hex = digest.primaryValue().hex(&digest_buffer);
-    const index_bytes = try std.fmt.allocPrint(
-        allocator,
-        \\Package: packages-microsoft-prod
-        \\Version: 1.1
-        \\Architecture: all
-        \\Description: package cache workflow fixture
-        \\Filename: pool/main/p/packages-microsoft-prod_1.1_all.deb
-        \\Size: {d}
-        \\SHA256: {s}
-        \\
-    ,
-        .{ payload.len, digest_hex },
-    );
+    var sha512_buffer: [128]u8 = undefined;
+    const index_bytes = if (sha512_payload) |sha512_source|
+        try std.fmt.allocPrint(
+            allocator,
+            \\Package: packages-microsoft-prod
+            \\Version: 1.1
+            \\Architecture: all
+            \\Description: package cache workflow fixture
+            \\Filename: pool/main/p/packages-microsoft-prod_1.1_all.deb
+            \\Size: {d}
+            \\SHA256: {s}
+            \\SHA512: {s}
+            \\
+        ,
+            .{
+                payload.len,
+                digest_hex,
+                content_digest.Value.of(.sha512, sha512_source).hex(&sha512_buffer),
+            },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            \\Package: packages-microsoft-prod
+            \\Version: 1.1
+            \\Architecture: all
+            \\Description: package cache workflow fixture
+            \\Filename: pool/main/p/packages-microsoft-prod_1.1_all.deb
+            \\Size: {d}
+            \\SHA256: {s}
+            \\
+        ,
+            .{ payload.len, digest_hex },
+        );
     errdefer allocator.free(index_bytes);
     const repository_id: source.RepositoryId = .{ .bytes = @splat('a') };
     var index = switch (try packages_index.parseBorrowed(allocator, index_bytes, .{
@@ -2449,6 +2538,328 @@ test "package_cache_workflow.test.prepare covers cold exact corrupt repair and b
         } },
         .acquisition = no_network.dependencies(),
     }));
+}
+
+test "package_cache_workflow.test.legacy exact lock matches SHA512-primary repository records by SHA256" {
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepositoryWithSha512(std.testing.allocator, payload, true);
+    defer repository.deinit(std.testing.allocator);
+    repository.view.input.packages = &repository.index;
+    try std.testing.expectEqual(content_digest.Algorithm.sha512, repository.index.records[0].transport.identity.primary);
+    try std.testing.expect(repository.index.records[0].transport.sha256 != null);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy: Policy = .{ .limits = .{
+        .maximum_package_bytes = 1024 * 1024,
+        .maximum_total_package_bytes = 1024 * 1024,
+        .maximum_lock_packages = 10,
+        .maximum_staging_entries = 10,
+        .maximum_gc_directory_entries = 10,
+        .maximum_gc_objects_scanned = 10,
+        .maximum_gc_objects_deleted = 10,
+        .maximum_gc_bytes_deleted = 1024,
+    } };
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .maximum_object_bytes = policy.limits.maximum_package_bytes,
+    });
+    defer cache.deinit();
+
+    var online: TestTransport = .{ .payloads = &.{payload} };
+    var cold = try prepare(std.testing.allocator, .{
+        .lock = &repository.lock.lock,
+        .cache = &cache,
+        .repositories = &.{repository.view},
+        .architecture = "amd64",
+        .debz_version = "0.3.0",
+        .cache_root = "/runner/cache",
+        .policy = policy,
+        .acquisition = online.dependencies(),
+    });
+    defer cold.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cold.downloaded_count);
+    try std.testing.expectEqual(@as(usize, 0), cold.reused_count);
+    try std.testing.expectEqual(@as(usize, 0), cold.gc_deleted);
+    try std.testing.expectEqual(@as(usize, 1), online.calls);
+
+    const lock_identity = packageIdentity(.v1, repository.lock.lock.packages[0]);
+    const cached = try cache.lookup(
+        std.testing.allocator,
+        lock_identity,
+        payload.len,
+        .verify_all_supported,
+    );
+    defer std.testing.allocator.free(cached);
+    try std.testing.expectEqualSlices(u8, payload, cached);
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        try cache.objectSize(repository.index.records[0].transport.identity),
+    );
+
+    var offline_policy = policy;
+    offline_policy.offline = true;
+    var no_network: TestTransport = .{};
+    var warm = try prepare(std.testing.allocator, .{
+        .lock = &repository.lock.lock,
+        .cache = &cache,
+        .repositories = &.{repository.view},
+        .architecture = "amd64",
+        .debz_version = "0.3.0",
+        .cache_root = "/runner/cache",
+        .policy = offline_policy,
+        .acquisition = no_network.dependencies(),
+    });
+    defer warm.deinit();
+    try std.testing.expectEqual(@as(usize, 0), warm.downloaded_count);
+    try std.testing.expectEqual(@as(usize, 1), warm.reused_count);
+    try std.testing.expectEqual(@as(usize, 0), no_network.calls);
+}
+
+fn boundedPackageCacheTestPolicy() Policy {
+    return .{ .limits = .{
+        .maximum_package_bytes = 1024 * 1024,
+        .maximum_total_package_bytes = 1024 * 1024,
+        .maximum_lock_packages = 10,
+        .maximum_staging_entries = 10,
+        .maximum_gc_directory_entries = 10,
+        .maximum_gc_objects_scanned = 10,
+        .maximum_gc_objects_deleted = 10,
+        .maximum_gc_bytes_deleted = 1024 * 1024,
+    } };
+}
+
+fn expectSha512MismatchRejectedOnDownload(comptime version: Version) !void {
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepositoryWithOptionalSha512(
+        std.testing.allocator,
+        payload,
+        "not the package payload",
+    );
+    defer repository.deinit(std.testing.allocator);
+    repository.view.input.packages = &repository.index;
+    try std.testing.expectEqual(content_digest.Algorithm.sha512, repository.index.records[0].transport.identity.primary);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const policy = boundedPackageCacheTestPolicy();
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .maximum_object_bytes = policy.limits.maximum_package_bytes,
+    });
+    defer cache.deinit();
+    var transport: TestTransport = .{ .payloads = &.{payload} };
+
+    switch (version) {
+        .v1 => {
+            const lock_identity = packageIdentity(.v1, repository.lock.lock.packages[0]);
+            try std.testing.expectError(error.DigestMismatch, prepare(std.testing.allocator, .{
+                .lock = &repository.lock.lock,
+                .cache = &cache,
+                .repositories = &.{repository.view},
+                .architecture = "amd64",
+                .debz_version = "0.3.0",
+                .cache_root = "/runner/cache",
+                .policy = policy,
+                .acquisition = transport.dependencies(),
+            }));
+            try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(lock_identity));
+        },
+        .v2 => {
+            var lock = try testNativeLock(std.testing.allocator, &repository, payload, .repository);
+            defer lock.deinit();
+            const lock_identity = packageIdentity(.v2, lock.lock.packages[0]);
+            try std.testing.expectError(error.DigestMismatch, prepareNative(std.testing.allocator, .{
+                .lock = &lock.lock,
+                .cache = &cache,
+                .repositories = &.{repository.view},
+                .architecture = "amd64",
+                .debz_version = "0.3.0",
+                .cache_root = "/runner/cache",
+                .policy = policy,
+                .acquisition = transport.dependencies(),
+            }));
+            try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(lock_identity));
+        },
+        .v3 => unreachable,
+    }
+    try std.testing.expectEqual(@as(usize, 1), transport.calls);
+}
+
+test "package_cache_workflow.test.v1 and v2 reject repository SHA512 mismatch on download" {
+    try expectSha512MismatchRejectedOnDownload(.v1);
+    try expectSha512MismatchRejectedOnDownload(.v2);
+}
+
+fn expectSha512MismatchRejectedOnCacheHit(comptime version: Version) !void {
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepositoryWithOptionalSha512(
+        std.testing.allocator,
+        payload,
+        "not the package payload",
+    );
+    defer repository.deinit(std.testing.allocator);
+    repository.view.input.packages = &repository.index;
+    try std.testing.expectEqual(content_digest.Algorithm.sha512, repository.index.records[0].transport.identity.primary);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var policy = boundedPackageCacheTestPolicy();
+    policy.corrupt_cache = .repair_online;
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .maximum_object_bytes = policy.limits.maximum_package_bytes,
+    });
+    defer cache.deinit();
+    var transport: TestTransport = .{ .payloads = &.{payload} };
+
+    switch (version) {
+        .v1 => {
+            const lock_identity = packageIdentity(.v1, repository.lock.lock.packages[0]);
+            try cache.publish(
+                std.testing.allocator,
+                lock_identity,
+                payload.len,
+                payload,
+                .fail_fast,
+                .{},
+            );
+            try std.testing.expectError(error.CorruptObject, prepare(std.testing.allocator, .{
+                .lock = &repository.lock.lock,
+                .cache = &cache,
+                .repositories = &.{repository.view},
+                .architecture = "amd64",
+                .debz_version = "0.3.0",
+                .cache_root = "/runner/cache",
+                .policy = policy,
+                .acquisition = transport.dependencies(),
+            }));
+            try std.testing.expectEqual(@as(?u64, payload.len), try cache.objectSize(lock_identity));
+        },
+        .v2 => {
+            var lock = try testNativeLock(std.testing.allocator, &repository, payload, .repository);
+            defer lock.deinit();
+            const lock_identity = packageIdentity(.v2, lock.lock.packages[0]);
+            try cache.publish(
+                std.testing.allocator,
+                lock_identity,
+                payload.len,
+                payload,
+                .fail_fast,
+                .{},
+            );
+            try std.testing.expectError(error.CorruptObject, prepareNative(std.testing.allocator, .{
+                .lock = &lock.lock,
+                .cache = &cache,
+                .repositories = &.{repository.view},
+                .architecture = "amd64",
+                .debz_version = "0.3.0",
+                .cache_root = "/runner/cache",
+                .policy = policy,
+                .acquisition = transport.dependencies(),
+            }));
+            try std.testing.expectEqual(@as(?u64, payload.len), try cache.objectSize(lock_identity));
+        },
+        .v3 => unreachable,
+    }
+    try std.testing.expectEqual(@as(usize, 0), transport.calls);
+}
+
+test "package_cache_workflow.test.v1 and v2 reject repository SHA512 mismatch on cache hit" {
+    try expectSha512MismatchRejectedOnCacheHit(.v1);
+    try expectSha512MismatchRejectedOnCacheHit(.v2);
+}
+
+fn expectSha512PrimaryCacheKeyMigratesToLockIdentity(comptime version: Version) !void {
+    const payload = @embedFile("fixtures/packages-microsoft-prod-depends_1.1_all.deb");
+    var repository = try testRepositoryWithSha512(std.testing.allocator, payload, true);
+    defer repository.deinit(std.testing.allocator);
+    repository.view.input.packages = &repository.index;
+    const old_identity = repository.index.records[0].transport.identity;
+    try std.testing.expectEqual(content_digest.Algorithm.sha512, old_identity.primary);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var policy = boundedPackageCacheTestPolicy();
+    policy.restored_cache = .partial;
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .maximum_object_bytes = policy.limits.maximum_package_bytes,
+    });
+    defer cache.deinit();
+    try cache.publish(
+        std.testing.allocator,
+        old_identity,
+        payload.len,
+        payload,
+        .fail_fast,
+        .{},
+    );
+    var transport: TestTransport = .{ .payloads = &.{payload} };
+
+    switch (version) {
+        .v1 => {
+            const lock_identity = packageIdentity(.v1, repository.lock.lock.packages[0]);
+            try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(lock_identity));
+            var result = try prepare(std.testing.allocator, .{
+                .lock = &repository.lock.lock,
+                .cache = &cache,
+                .repositories = &.{repository.view},
+                .architecture = "amd64",
+                .debz_version = "0.3.0",
+                .cache_root = "/runner/cache",
+                .policy = policy,
+                .acquisition = transport.dependencies(),
+            });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.downloaded_count);
+            try std.testing.expectEqual(@as(usize, 0), result.reused_count);
+            try std.testing.expectEqual(@as(?u64, payload.len), try cache.objectSize(lock_identity));
+        },
+        .v2 => {
+            var lock = try testNativeLock(std.testing.allocator, &repository, payload, .repository);
+            defer lock.deinit();
+            const lock_identity = packageIdentity(.v2, lock.lock.packages[0]);
+            try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(lock_identity));
+            var result = try prepareNative(std.testing.allocator, .{
+                .lock = &lock.lock,
+                .cache = &cache,
+                .repositories = &.{repository.view},
+                .architecture = "amd64",
+                .debz_version = "0.3.0",
+                .cache_root = "/runner/cache",
+                .policy = policy,
+                .acquisition = transport.dependencies(),
+            });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.downloaded_count);
+            try std.testing.expectEqual(@as(usize, 0), result.reused_count);
+            try std.testing.expectEqual(@as(?u64, payload.len), try cache.objectSize(lock_identity));
+        },
+        .v3 => unreachable,
+    }
+    try std.testing.expectEqual(@as(usize, 1), transport.calls);
+    try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(old_identity));
+}
+
+test "package_cache_workflow.test.v1 and v2 migrate SHA512-primary CAS keys by redownloading" {
+    try expectSha512PrimaryCacheKeyMigratesToLockIdentity(.v1);
+    try expectSha512PrimaryCacheKeyMigratesToLockIdentity(.v2);
+}
+
+test "package_cache_workflow.test.findIdentityIndex rejects digest-spanning ambiguity" {
+    const sha256 = content_digest.Value.of(.sha256, "first package").sha256;
+    const sha512 = content_digest.Value.of(.sha512, "second package").sha512;
+    var by_sha256 = std.AutoHashMap([32]u8, usize).init(std.testing.allocator);
+    defer by_sha256.deinit();
+    var by_sha512 = std.AutoHashMap([64]u8, usize).init(std.testing.allocator);
+    defer by_sha512.deinit();
+    try by_sha256.put(sha256, 0);
+    try by_sha512.put(sha512, 1);
+    const record_identity = try content_digest.Identity.init(
+        .{ .sha256 = sha256, .sha512 = sha512 },
+        .sha512,
+    );
+    try std.testing.expectError(
+        error.AmbiguousPackage,
+        findIdentityIndex(&by_sha256, &by_sha512, record_identity),
+    );
 }
 
 test "package_cache_workflow.test.prepare rejects digest-valid invalid Debian payloads" {
