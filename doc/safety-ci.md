@@ -138,10 +138,19 @@ The opt-in `test-real-snapshot-reference-protected` Zig build target requires
 explicit root-owned protected fixture paths and a fresh proof workspace; it
 returns a failure, not a skip, without them;
 `tools/real-snapshot-reference-protected-stage.sh` stages them. Its
-pinned-dpkg operations, refusals and confined escape probe (including
-detached-descendant teardown) are not a substitute for the exact signed proc
-profiles, runtime binding (#263), hosted protected staging (#268) or the
-network decision (#278).
+pinned-dpkg operations, refusals, confined escape probe (including
+detached-descendant teardown) and amd64 signed proc profiles are not a
+substitute for runtime binding (#263) or the network decision (#278).
+The `protected-reference` job runs that target on hosted amd64 and arm64
+runners only on the weekly schedule or a `workflow_dispatch` with
+`run_protected_reference: true`. Under `sudo -n` it clones the exact commit
+from a root-owned bare repository into a new mode-0700 tree under
+`/srv/debz-protected`. It verifies the pinned Zig with minisign, tightens and
+records the `zig-pkg` modes, and runs seven fail-closed negatives before the
+proof. Bounded evidence is always uploaded, and the tree is always removed.
+`tools/security-audit.py` and `test/security-policy.zig` keep the job opt-in,
+`sudo -n`-only and unskippable; see "Hosted protected reference job" in
+[integration roots](integration-roots.md).
 Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
 dpkg/helper/package state, selects `native` explicitly, and exec-traces
 candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.

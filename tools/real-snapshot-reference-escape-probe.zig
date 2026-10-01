@@ -7,6 +7,12 @@
 //! descendant, to show that each check detects authority when it is present.
 //! Every attempted operation targets a missing path, an invalid argument or the
 //! probe's own process, so an unconfined control run changes no host state.
+//!
+//! Installed as a profile root's `/bin/sh`, the probe is also the interpreter
+//! the kernel starts for a digest-bound signed `systemd`, `udev` or `sudo`
+//! postinst (`/bin/sh SCRIPT configure [VERSION]`). It never interprets the
+//! script; it reports the exact proc view the launcher gave that profile
+//! instead of `no-proc-view`, then runs the same escape checks.
 const std = @import("std");
 const linux = std.os.linux;
 
@@ -36,8 +42,12 @@ const Statfs = extern struct {
 };
 const st_rdonly_nosuid_nodev_noexec: i64 = 1 | 2 | 4 | 8;
 const statx_attr_mount_root: u64 = 0x2000;
+const proc_super_magic: i64 = 0x9fa0;
+const tmpfs_magic: i64 = 0x01021994;
+const Profile = enum { systemd, udev, sudo };
 
 var failures: u32 = 0;
+var mountinfo_buffer: [1 << 18]u8 = undefined;
 
 fn report(name: []const u8, ok: bool, comptime detail: []const u8, args: anytype) void {
     var bytes: [512]u8 = undefined;
@@ -123,11 +133,18 @@ fn checkProc() void {
     });
 }
 
-fn identity(path: [*:0]const u8) ?[2]u64 {
+const Identity = struct { status: linux.E, value: [2]u64 = .{ 0, 0 } };
+
+fn statIdentity(path: [*:0]const u8, flags: u32) Identity {
     var value: linux.Statx = undefined;
-    if (errno(linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, .BASIC_STATS, &value)) != .SUCCESS)
-        return null;
-    return .{ (@as(u64, value.dev_major) << 32) | value.dev_minor, value.ino };
+    const status = errno(linux.statx(linux.AT.FDCWD, path, flags, .BASIC_STATS, &value));
+    if (status != .SUCCESS) return .{ .status = status };
+    return .{ .status = status, .value = .{ (@as(u64, value.dev_major) << 32) | value.dev_minor, value.ino } };
+}
+
+fn identity(path: [*:0]const u8) ?[2]u64 {
+    const result = statIdentity(path, linux.AT.SYMLINK_NOFOLLOW);
+    return if (result.status == .SUCCESS) result.value else null;
 }
 
 fn checkRootPath() void {
@@ -257,6 +274,191 @@ fn checkArchiveMount() void {
     });
 }
 
+fn statfsFlags(path: [*:0]const u8, magic: i64) ?i64 {
+    var filesystem: Statfs = undefined;
+    if (errno(linux.syscall2(.statfs, @intFromPtr(path), @intFromPtr(&filesystem))) != .SUCCESS) return null;
+    if (filesystem.type != magic) return null;
+    return filesystem.flags;
+}
+
+fn absent(path: [*:0]const u8) linux.E {
+    const result = linux.open(path, .{ .PATH = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (errno(result) == .SUCCESS) {
+        _ = linux.close(@intCast(result));
+        return .SUCCESS;
+    }
+    return errno(result);
+}
+
+const Listing = struct { count: usize = 0, numeric: usize = 0, other: usize = 0, has_one: bool = false, matched: usize = 0 };
+
+/// Counts the entries of a directory; `matched` counts the names in `expected`.
+fn list(path: [*:0]const u8, expected: []const []const u8) ?Listing {
+    const directory = linux.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (errno(directory) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(directory));
+    var listing: Listing = .{};
+    var bytes: [4096]u8 = undefined;
+    while (true) {
+        const count = linux.getdents64(@intCast(directory), &bytes, bytes.len);
+        if (errno(count) != .SUCCESS) return null;
+        if (count == 0) break;
+        var offset: usize = 0;
+        while (offset + 19 < count) {
+            const size = std.mem.readInt(u16, bytes[offset + 16 ..][0..2], .little);
+            if (size < 20 or size > count - offset) return null;
+            const name = std.mem.sliceTo(bytes[offset + 19 .. offset + size], 0);
+            offset += size;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            listing.count += 1;
+            var numeric = name.len > 0;
+            for (name) |byte| numeric = numeric and std.ascii.isDigit(byte);
+            if (numeric) listing.numeric += 1 else listing.other += 1;
+            if (std.mem.eql(u8, name, "1")) listing.has_one = true;
+            for (expected) |item| {
+                if (std.mem.eql(u8, name, item)) listing.matched += 1;
+            }
+        }
+    }
+    return listing;
+}
+
+/// The super options of the only mount at `/proc` in this process's mountinfo.
+fn procSuperOptions(buffer: []u8) ?[]const u8 {
+    const file = linux.open("/proc/self/mountinfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (errno(file) != .SUCCESS) return null;
+    defer _ = linux.close(@intCast(file));
+    var length: usize = 0;
+    while (length < buffer.len) {
+        const got = linux.read(@intCast(file), buffer[length..].ptr, buffer.len - length);
+        if (errno(got) != .SUCCESS) return null;
+        if (got == 0) break;
+        length += got;
+    }
+    if (length == buffer.len) return null;
+    var found: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, buffer[0..length], '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.splitScalar(u8, line, ' ');
+        var index: usize = 0;
+        var mountpoint: []const u8 = "";
+        while (fields.next()) |field| : (index += 1) {
+            if (index == 4) mountpoint = field;
+            if (std.mem.eql(u8, field, "-")) break;
+        }
+        if (!std.mem.eql(u8, mountpoint, "/proc")) continue;
+        const kind = fields.next() orelse return null;
+        _ = fields.next() orelse return null;
+        const options = fields.next() orelse return null;
+        if (found != null or !std.mem.eql(u8, kind, "proc")) return null;
+        found = options;
+    }
+    return found;
+}
+
+fn hasOption(options: []const u8, option: []const u8) bool {
+    var items = std.mem.splitScalar(u8, options, ',');
+    while (items.next()) |item| {
+        if (std.mem.eql(u8, item, option)) return true;
+    }
+    return false;
+}
+
+fn checkProcView(profile: Profile) void {
+    // Every profile mounts a fresh read-only, nosuid, nodev, noexec procfs of
+    // the private PID namespace whose PID 1 (dpkg) shares the chroot.
+    const flags = statfsFlags("/proc", proc_super_magic);
+    const status = linux.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (errno(status) == .SUCCESS) _ = linux.close(@intCast(status));
+    report("proc-mount", flags != null and flags.? & st_rdonly_nosuid_nodev_noexec == st_rdonly_nosuid_nodev_noexec and
+        errno(status) == .SUCCESS, "flags=0x{x} self_status={s}", .{ flags orelse -1, @tagName(errno(status)) });
+    // Follow PID 1's root magic link: its target, not the link inode, must be this root.
+    const root = identity("/");
+    const pid_one_root = statIdentity("/proc/1/root", 0);
+    const same_root = root != null and pid_one_root.status == .SUCCESS and std.mem.eql(u64, &root.?, &pid_one_root.value);
+    report("proc-root", same_root, "pid1_root_is_root={} pid1_root_stat={s}", .{ same_root, @tagName(pid_one_root.status) });
+    const options = procSuperOptions(&mountinfo_buffer);
+    const pid_only = profile != .systemd;
+    report("proc-hidepid", options != null and hasOption(options.?, "hidepid=invisible") and
+        hasOption(options.?, "subset=pid") == pid_only, "options={s}", .{options orelse "missing"});
+    const entries = list("/proc", &.{ "self", "thread-self" });
+    if (entries) |value| info("proc-entries", "total={d} numeric={d} other={d}", .{ value.count, value.numeric, value.other });
+    const read_only = linux.open("/proc/sysrq-trigger", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+    if (errno(read_only) == .SUCCESS) _ = linux.close(@intCast(read_only));
+    if (pid_only) {
+        // subset=pid: only PID directories and the self links remain.
+        const sys = absent("/proc/sys");
+        const meminfo = absent("/proc/meminfo");
+        report("proc-pid-only", entries != null and entries.?.has_one and entries.?.other == entries.?.matched and
+            entries.?.matched == 2 and sys == .NOENT and meminfo == .NOENT and errno(read_only) == .NOENT, "other={d} sys={s} meminfo={s} sysrq={s}", .{
+            if (entries) |value| value.other else 0, @tagName(sys), @tagName(meminfo), @tagName(errno(read_only)),
+        });
+        return;
+    }
+    // systemd: the full PID view, with /proc/sys replaced by a read-only tmpfs
+    // that holds only the host boot ID.
+    report("proc-read-only", errno(read_only) == .ROFS and entries != null and entries.?.has_one, "sysrq_write={s}", .{@tagName(errno(read_only))});
+    const sys_flags = statfsFlags("/proc/sys", tmpfs_magic);
+    const sys_entries = list("/proc/sys", &.{"kernel"});
+    const kernel_entries = list("/proc/sys/kernel", &.{"random"});
+    const random_entries = list("/proc/sys/kernel/random", &.{"boot_id"});
+    const uuid = absent("/proc/sys/kernel/random/uuid");
+    const extra = linux.open("/proc/sys/extra", .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
+    if (errno(extra) == .SUCCESS) _ = linux.close(@intCast(extra));
+    const writer = linux.open("/proc/sys/kernel/random/boot_id", .{ .ACCMODE = .WRONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (errno(writer) == .SUCCESS) _ = linux.close(@intCast(writer));
+    const only = struct {
+        fn one(listing: ?Listing) bool {
+            return listing != null and listing.?.count == 1 and listing.?.matched == 1;
+        }
+    }.one;
+    report("proc-sys-masked", sys_flags != null and sys_flags.? & st_rdonly_nosuid_nodev_noexec == st_rdonly_nosuid_nodev_noexec and
+        only(sys_entries) and only(kernel_entries) and only(random_entries) and uuid == .NOENT and
+        errno(extra) == .ROFS and errno(writer) == .ROFS, "flags=0x{x} uuid={s} create={s} write={s}", .{
+        sys_flags orelse -1, @tagName(uuid), @tagName(errno(extra)), @tagName(errno(writer)),
+    });
+    var boot_id: [38]u8 = undefined;
+    var boot_id_length: usize = 0;
+    const reader = linux.open("/proc/sys/kernel/random/boot_id", .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+    if (errno(reader) == .SUCCESS) {
+        const got = linux.read(@intCast(reader), &boot_id, boot_id.len);
+        if (errno(got) == .SUCCESS) boot_id_length = got;
+        _ = linux.close(@intCast(reader));
+    }
+    var valid = boot_id_length == 37 and boot_id[36] == '\n';
+    if (valid) {
+        for (boot_id[0..36], 0..) |digit, index| {
+            valid = valid and if (index == 8 or index == 13 or index == 18 or index == 23)
+                digit == '-'
+            else
+                std.ascii.isHex(digit) and !std.ascii.isUpper(digit);
+        }
+    }
+    report("proc-boot-id", valid, "boot_id={s}", .{if (valid) boot_id[0..36] else "invalid"});
+}
+
+fn checkArchiveUnbound() void {
+    // Configure operations bind no archive; the mountpoint stays the empty file.
+    var value: linux.Statx = undefined;
+    const stat_status = errno(linux.statx(linux.AT.FDCWD, archive_mountpoint, linux.AT.SYMLINK_NOFOLLOW, .BASIC_STATS, &value));
+    const mount_root = stat_status == .SUCCESS and
+        @as(u64, @bitCast(value.attributes_mask)) & statx_attr_mount_root != 0 and
+        @as(u64, @bitCast(value.attributes)) & statx_attr_mount_root != 0;
+    report("archive-unbound", stat_status == .SUCCESS and value.mode & 0o170000 == 0o100000 and value.size == 0 and !mount_root, "size={d} mount_root={}", .{
+        if (stat_status == .SUCCESS) value.size else 0, mount_root,
+    });
+}
+
+/// The kernel starts `/bin/sh SCRIPT configure [VERSION]` for a signed postinst.
+fn scriptProfile(args: []const [*:0]const u8) ?Profile {
+    if (args.len < 3 or args.len > 4 or !std.mem.eql(u8, std.mem.span(args[2]), "configure")) return null;
+    inline for (@typeInfo(Profile).@"enum".fields) |field| {
+        if (std.mem.eql(u8, std.mem.span(args[1]), "/var/lib/dpkg/info/" ++ field.name ++ ".postinst"))
+            return @enumFromInt(field.value);
+    }
+    return null;
+}
+
 fn startDescendant() void {
     var ready: [2]i32 = undefined;
     if (errno(linux.pipe2(&ready, .{ .CLOEXEC = true })) != .SUCCESS) {
@@ -301,18 +503,22 @@ fn startDescendant() void {
 pub fn main(init: std.process.Init.Minimal) u8 {
     const args = init.args.vector;
     if (args.len < 2) return 2;
-    const mode = std.mem.span(args[1]);
-    const confined = std.mem.eql(u8, mode, "install");
+    const profile = scriptProfile(args);
+    const mode = if (profile) |value| @tagName(value) else std.mem.span(args[1]);
+    const confined = profile != null or std.mem.eql(u8, mode, "install");
     if (!confined and !std.mem.eql(u8, mode, "control")) return 2;
     checkNamespaces();
-    checkProc();
+    if (profile) |value| checkProcView(value) else checkProc();
     checkDescriptors();
     checkPrivileges();
     checkRootPath();
     checkKernelAuthority();
     checkNamespaceChanges();
     networkInformation();
-    if (confined) {
+    if (profile != null) {
+        checkArchiveUnbound();
+        startDescendant();
+    } else if (confined) {
         checkArchiveMount();
         startDescendant();
     }

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-from real_snapshot_reference_paths import protected, read_root_file
+from real_snapshot_reference_paths import open_absolute, open_beneath, protected, read_root_file
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -117,6 +117,19 @@ CONTROL_DETECTS = tuple(
 DESCENDANT_MARKER = ".debz-escape-probe-descendant"
 # Confined-only checks: the bound archive and the detached descendant.
 CONFINED_CHECKS = ("archive-mount", "descendant-started")
+# Signed amd64 configure profiles: the probe is the root's /bin/sh, so the
+# kernel starts it for the digest-bound postinst. It reports the profile's proc
+# view in place of no-proc-view, then the same escape checks.
+PROFILE_ESCAPE_CHECKS = tuple(check for check in ESCAPE_CHECKS if check != "no-proc-view")
+PROFILE_COMMON_CHECKS = (
+    "proc-mount", "proc-root", "proc-hidepid", "archive-unbound", "descendant-started",
+)
+PROFILE_VIEW_CHECKS = {
+    "systemd": ("proc-read-only", "proc-sys-masked", "proc-boot-id"),
+    "udev": ("proc-pid-only",),
+    "sudo": ("proc-pid-only",),
+}
+PROFILE_SCRIPT_LIMIT = 64 * 1024
 
 
 def probe_detail(output: str, check: str) -> dict[str, str]:
@@ -141,17 +154,20 @@ def probe_results(output: str) -> dict[str, str]:
 
 def operation(
     workspace: Path, name: str, launcher: Path, dpkg: Path, root: Path,
-    architecture: str, archive: Path, digest: str, size: int, verb: str,
+    architecture: str, archive: Path | None, digest: str | None, size: int | None, verb: str,
     *, readable_output: bool = False, inherited_fd: int | None = None,
-    package: str = "debz-reference-proof",
+    package: str = "debz-reference-proof", profile: str = "none",
+    selector: str | None = None,
 ) -> tuple[int, str]:
     stdout_path = workspace / f"{name}.stdout"
     stderr_path = workspace / f"{name}.stderr"
     stdout_mode = "a+b" if readable_output else "ab"
     command = [
-        str(launcher), str(root), str(dpkg), architecture, "none", verb,
-        f"{package}:{architecture}", str(archive), digest, str(size),
+        str(launcher), str(root), str(dpkg), architecture, profile, verb,
+        selector or f"{package}:{architecture}",
     ]
+    if archive is not None:
+        command.extend((str(archive), str(digest), str(size)))
     # subprocess.DEVNULL is read-write; the launcher requires a read-only stdin.
     stdin = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
     try:
@@ -189,6 +205,142 @@ def require(status: int, error: str, expected: str, name: str) -> None:
         )
 
 
+def write_beneath(root: Path, relative: str, data: bytes, mode: int, *, replace: bool = False) -> None:
+    parent, _, name = relative.rpartition("/")
+    root_fd = open_absolute(root, directory=True)
+    try:
+        directory = open_beneath(root_fd, parent, directory=True)
+    finally:
+        os.close(root_fd)
+    try:
+        flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        flags |= os.O_TRUNC if replace else os.O_CREAT | os.O_EXCL
+        fd = os.open(name, flags, mode, dir_fd=directory)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError(f"profile root member is not a regular file: {relative}")
+            os.fchmod(fd, mode)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory)
+
+
+def profile_scripts(directory: Path, architecture: str) -> dict[str, bytes]:
+    """Load the signed postinsts staged from the authenticated snapshot."""
+    protected(directory, directory=True)
+    names = sorted(entry.name for entry in directory.iterdir())
+    if architecture != "amd64":
+        # The launcher binds signed proc profiles to amd64 only.
+        if names:
+            raise ValueError(f"{architecture} must not stage amd64 profile scripts: {names}")
+        return {}
+    expected = sorted(f"{profile}.postinst" for profile in PROFILE_VIEW_CHECKS)
+    if names != expected:
+        raise ValueError(f"amd64 profile scripts must be exactly {expected}: {names}")
+    scripts = {}
+    for profile in PROFILE_VIEW_CHECKS:
+        path = directory / f"{profile}.postinst"
+        if protected(path).st_size > PROFILE_SCRIPT_LIMIT:
+            raise ValueError(f"profile script exceeds limit: {path}")
+        scripts[profile] = path.read_bytes()
+    return scripts
+
+
+def profile_root(
+    template: Path, workspace: Path, name: str, profile: str, script: bytes,
+    probe: bytes, *, version: str | None = None,
+) -> Path:
+    """An unpacked signed package whose root /bin/sh is the static probe."""
+    root = fresh_root(template, workspace, name)
+    write_beneath(root, "var/lib/dpkg/status", (
+        f"Package: {profile}\nStatus: install ok unpacked\nPriority: optional\n"
+        "Section: admin\nMaintainer: debz reference proof <reference-proof@debz.invalid>\n"
+        f"Architecture: amd64\nVersion: {version or ORDER.PROFILE_VERSIONS[profile]}\n"
+        "Description: debz protected proc-view proof\n"
+    ).encode(), 0o644, replace=True)
+    write_beneath(root, f"var/lib/dpkg/info/{profile}.list", b"", 0o644)
+    write_beneath(root, f"var/lib/dpkg/info/{profile}.postinst", script, 0o755)
+    write_beneath(root, "usr/bin/sh", probe, 0o755)
+    return root
+
+
+def require_unchanged_profile(root: Path, profile: str, name: str) -> None:
+    packages = ORDER.database_packages(root)
+    if packages.get((profile, "amd64"), ("",))[0] != "install ok unpacked":
+        raise AssertionError(f"{name}: refused profile changed the package state: {packages}")
+    marker = (root / DESCENDANT_MARKER)
+    if marker.exists() or marker.is_symlink():
+        raise AssertionError(f"{name}: the probe ran despite the refusal")
+
+
+def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
+    probe = args.escape_probe.read_bytes()
+    if args.architecture != "amd64":
+        for profile in PROFILE_VIEW_CHECKS:
+            name = f"profile-{profile}-{args.architecture}"
+            root = fresh_root(args.root_template, args.workspace, name)
+            status, error = operation(
+                args.workspace, name, args.launcher, args.dpkg, root,
+                args.architecture, None, None, None, "configure",
+                profile=profile, selector=f"{profile}:{args.architecture}",
+            )
+            require(status, error, "InvalidProfile", name)
+        return f"{args.architecture} refusal of the amd64-only signed proc profiles"
+    host_boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    for profile, view in PROFILE_VIEW_CHECKS.items():
+        name = f"profile-{profile}"
+        root = profile_root(args.root_template, args.workspace, name, profile, scripts[profile], probe)
+        parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            status, error = operation(
+                args.workspace, name, args.launcher, args.dpkg, root,
+                args.architecture, None, None, None, "configure",
+                inherited_fd=parent_fd, profile=profile, selector=f"{profile}:amd64",
+            )
+        finally:
+            os.close(parent_fd)
+        output = (args.workspace / f"{name}.stdout").read_text(errors="replace")
+        results = probe_results(output)
+        failed = [check for check in (*PROFILE_ESCAPE_CHECKS, *PROFILE_COMMON_CHECKS, *view, "result")
+                  if results.get(check) != "ok"]
+        if status != 0 or failed or "no-proc-view" in results:
+            raise AssertionError(f"{name}: proc view checks failed {failed}; exit={status}: {error}")
+        if probe_detail(output, "result").get("mode") != profile:
+            raise AssertionError(f"{name}: the probe did not run as the {profile} postinst")
+        if profile == "systemd" and probe_detail(output, "proc-boot-id").get("boot_id") != host_boot_id:
+            raise AssertionError(f"{name}: the masked boot ID is not the host boot ID")
+        if not read_root_file(root, DESCENDANT_MARKER, 64).strip().isdigit():
+            raise AssertionError(f"{name}: detached descendant never started")
+        if ORDER.database_packages(root).get((profile, "amd64")) != (
+            "install ok installed", ORDER.PROFILE_VERSIONS[profile],
+        ):
+            raise AssertionError(f"{name}: pinned dpkg did not configure the bound package")
+    tampered = bytearray(scripts["systemd"])
+    tampered[-2] ^= 0x01
+    for name, profile, selector, script, version, expected in (
+        ("profile-tampered-script", "systemd", "systemd:amd64", bytes(tampered), None, "SourceChanged"),
+        ("profile-wrong-version", "systemd", "systemd:amd64", scripts["systemd"], "261.2-1ubuntu1",
+         "ReferenceSetupFailed"),
+        ("profile-wrong-selector", "systemd", "udev:amd64", scripts["systemd"], None, "InvalidProfile"),
+        ("profile-unbound-configure", "none", "systemd:amd64", scripts["systemd"], None, "InvalidProfile"),
+    ):
+        bound = "systemd"
+        root = profile_root(args.root_template, args.workspace, name, bound, script, probe, version=version)
+        status, error = operation(
+            args.workspace, name, args.launcher, args.dpkg, root, args.architecture,
+            None, None, None, "configure", profile=profile, selector=selector,
+        )
+        require(status, error, expected, name)
+        if name == "profile-wrong-version" and "failed at stage 10" not in error:
+            raise AssertionError(f"{name}: the in-root binding did not refuse: {error!r}")
+        require_unchanged_profile(root, bound, name)
+    return "amd64 systemd boot-ID and udev/sudo PID-only proc views with four binding refusals"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launcher", type=Path, required=True)
@@ -202,6 +354,7 @@ def main() -> None:
     parser.add_argument("--escape-archive", type=Path, required=True)
     parser.add_argument("--escape-archive-sha512", required=True)
     parser.add_argument("--escape-archive-size", type=int, required=True)
+    parser.add_argument("--profile-scripts", type=Path, required=True)
     parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
     args = parser.parse_args()
     if os.geteuid() != 0 or os.getegid() != 0:
@@ -210,7 +363,7 @@ def main() -> None:
     os.umask(0o077)
     if not all(path.is_absolute() for path in (
         args.launcher, args.dpkg, args.root_template, args.workspace, args.archive,
-        args.escape_probe, args.escape_archive,
+        args.escape_probe, args.escape_archive, args.profile_scripts,
     )):
         raise ValueError("protected proof inputs must be absolute paths")
     protected(Path(__file__).resolve())
@@ -218,6 +371,15 @@ def main() -> None:
         protected(path)
     protected_directory(args.root_template)
     protected_directory(args.workspace, empty=True)
+    # Bind the claimed architecture to its pinned dpkg before any per-architecture input.
+    identity = hashlib.sha256(args.dpkg.read_bytes()).hexdigest()
+    pinned = {
+        "amd64": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
+        "arm64": "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79",
+    }
+    if identity != pinned[args.architecture]:
+        raise ValueError("reference dpkg executable is not the pinned architecture artifact")
+    scripts = profile_scripts(args.profile_scripts, args.architecture)
     proc = protected(args.root_template / "proc", directory=True)
     mountpoint = protected(args.root_template / ".debz-reference-archive")
     if stat.S_IMODE(proc.st_mode) != 0o755 or (
@@ -241,13 +403,6 @@ def main() -> None:
                 archive_hash.update(block)
         if archive_hash.hexdigest() != digest:
             raise ValueError("authenticated archive SHA512 differs")
-    identity = hashlib.sha256(args.dpkg.read_bytes()).hexdigest()
-    pinned = {
-        "amd64": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
-        "arm64": "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79",
-    }
-    if identity != pinned[args.architecture]:
-        raise ValueError("reference dpkg executable is not the pinned architecture artifact")
     for name, verb in (("probe", "probe_unpack"), ("unpack", "unpack")):
         root = fresh_root(args.root_template, args.workspace, name)
         parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -361,10 +516,11 @@ def main() -> None:
         raise AssertionError("escape: detached descendant never started")
     if ("debz-reference-escape-probe", args.architecture) not in ORDER.database_packages(root):
         raise AssertionError("escape: pinned dpkg did not record the probe package")
+    profiles = prove_profiles(args, scripts)
     print(
         "protected pinned-dpkg probe/unpack, six refusals, unconfined escape control and "
         f"{len(ESCAPE_CHECKS)} confined escape checks, read-only archive mount and "
-        "descendant teardown: executed without skips"
+        f"descendant teardown, {profiles}: executed without skips"
     )
 
 

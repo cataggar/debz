@@ -27,6 +27,11 @@ on:
         required: true
         type: boolean
         default: false
+      run_protected_reference:
+        description: "Stage root-owned inputs and run the protected pinned-dpkg reference proof on amd64 and arm64"
+        required: true
+        type: boolean
+        default: false
   schedule:
     - cron: "23 3 * * 1"
 
@@ -2137,3 +2142,107 @@ jobs:
           path: .real-snapshot/${{ matrix.architecture }}/evidence/
           if-no-files-found: error
           retention-days: 14
+
+  protected-reference:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_protected_reference)
+    name: Protected pinned-dpkg reference (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    # Root-run staging: Zig download and package fetch 5, debz build 15,
+    # snapshot staging 15, preflight refusals 5 and the proof 45 (its own
+    # timeout), leaving 5 for evidence, upload and cleanup.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCHITECTURE: ${{ matrix.architecture }}
+      PROTECTED_TREE: /srv/debz-protected/ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Stage the reviewed commit in a root-owned tree and run the protected proof
+        timeout-minutes: 80
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          bundle="$RUNNER_TEMP/debz-protected-$ARCHITECTURE.bundle"
+          git bundle create "$bundle" HEAD
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            bash -euo pipefail -c '
+            tree=$1 architecture=$2 expected=$3 bundle=$4
+            [[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]
+            [[ ${BASH_REMATCH[1]} == "$architecture" && $expected =~ ^[0-9a-f]{40}$ ]]
+            umask 022
+            install -d -o root -g root -m 0755 /srv/debz-protected
+            for ancestor in / /srv /srv/debz-protected; do
+              [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]
+              (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))
+            done
+            mkdir -m 0700 -- "$tree"
+            install -o root -g root -m 0600 -- "$bundle" "$tree/debz.bundle"
+            git init --quiet --bare "$tree/bare.git"
+            printf "%s\n" "$expected" >"$tree/bare.git/shallow"
+            git --git-dir="$tree/bare.git" bundle verify "$tree/debz.bundle"
+            git --git-dir="$tree/bare.git" fetch --quiet "$tree/debz.bundle" HEAD:refs/heads/protected
+            test "$(git --git-dir="$tree/bare.git" rev-parse refs/heads/protected)" = "$expected"
+            git --git-dir="$tree/bare.git" symbolic-ref HEAD refs/heads/protected
+            git --git-dir="$tree/bare.git" fsck --full --no-dangling
+            git clone --quiet --no-hardlinks "file://$tree/bare.git" "$tree/checkout"
+            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"
+            exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" "$tree" "$architecture" "$expected"
+            ' protected-bootstrap "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$bundle"
+      - name: Copy bounded protected evidence
+        if: always()
+        run: |
+          output="$RUNNER_TEMP/protected-reference-$ARCHITECTURE"
+          mkdir -p "$output"
+          sudo -n test -d "$PROTECTED_TREE/upload"
+          sudo -n tar -C "$PROTECTED_TREE/upload" -cf - . >"$RUNNER_TEMP/protected-evidence.tar"
+          tar --no-same-owner --no-same-permissions -C "$output" -xf "$RUNNER_TEMP/protected-evidence.tar"
+          test -s "$output/result.txt"
+          cat "$output/result.txt"
+      - name: Upload protected reference evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: protected-reference-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/protected-reference-${{ matrix.architecture }}/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Kill protected descendants and remove the named tree
+        if: always()
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C bash -euo pipefail -c '
+            tree=$1
+            [[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]
+            [[ -e $tree || -L $tree ]] || exit 0
+            [[ -d $tree && ! -L $tree ]]
+            for attempt in 1 2 3 4 5; do
+              victims=()
+              for process in /proc/[0-9]*; do
+                root=$(readlink "$process/root" 2>/dev/null) || continue
+                cwd=$(readlink "$process/cwd" 2>/dev/null) || cwd=
+                case "$root/ $cwd/" in
+                  *"$tree/"*) victims+=("${process#/proc/}") ;;
+                esac
+              done
+              (( ${#victims[@]} )) || break
+              echo "killing protected descendants: ${victims[*]}"
+              kill -KILL "${victims[@]}" 2>/dev/null || true
+              sleep 1
+            done
+            (( ${#victims[@]} == 0 ))
+            if grep -F " $tree" /proc/self/mountinfo; then
+              echo "mounts remain beneath $tree" >&2
+              exit 1
+            fi
+            rm -rf --one-file-system -- "$tree"
+            test ! -e "$tree"
+            ' protected-cleanup "$PROTECTED_TREE"

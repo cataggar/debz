@@ -86,6 +86,7 @@ class ReferenceLauncherTests(unittest.TestCase):
              "--escape-archive", str(self.root / "escape-archive"),
              "--escape-archive-sha512", "0" * 128,
              "--escape-archive-size", "1",
+             "--profile-scripts", str(self.root / "profiles"),
              "--architecture", "amd64"],
             cwd=ROOT, text=True, capture_output=True, timeout=10,
         )

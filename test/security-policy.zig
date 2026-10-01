@@ -2024,6 +2024,80 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
     }
 }
 
+test "security: protected reference CI stays opt-in, root-staged, bounded and unskippable" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{
+        "      run_protected_reference:\n",
+        "  schedule:\n    - cron: \"23 3 * * 1\"\n",
+        "          test \"$(git rev-parse HEAD)\" = \"$GITHUB_SHA\"\n          test -z \"$(git status --porcelain)\"\n",
+        "            mkdir -m 0700 -- \"$tree\"\n",
+        "            git --git-dir=\"$tree/bare.git\" fsck --full --no-dangling\n",
+        "            test \"$(git -C \"$tree/checkout\" rev-parse HEAD)\" = \"$expected\"\n",
+        "          sudo -n tar -C \"$PROTECTED_TREE/upload\" -cf - . >\"$RUNNER_TEMP/protected-evidence.tar\"\n",
+        "          path: ${{ runner.temp }}/protected-reference-${{ matrix.architecture }}/\n          if-no-files-found: error\n",
+        "              kill -KILL \"${victims[@]}\" 2>/dev/null || true\n",
+        "            rm -rf --one-file-system -- \"$tree\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
+        "trap collect EXIT\n",
+        "test \"$(git -C \"$checkout\" rev-parse HEAD)\" = \"$commit\"\n",
+        "step zig-verify 0 \"\" python3 -I tools/verify-minisign.py --public-key \"$zig_public_key\" \\\n",
+        "chmod -R go-w zig-pkg \"$tree/zig-global\"\n",
+        "step zig-pkg-verify 0 \"\" python3 -I tools/real-snapshot-reference-tree-check.py packages \\\n",
+        "step tree-staged 0 \"\" python3 -I tools/real-snapshot-reference-tree-check.py tree \"$tree\"\n",
+        "negative mutable-ancestor \"writable or non-root ancestor\" \\\n",
+        "negative swapped-dpkg \"reference dpkg executable is not the pinned architecture artifact\" \\\n",
+        "negative wrong-architecture \"reference dpkg executable is not the pinned architecture artifact\" \\\n",
+        "step negative-swapped-keyring refused '\"summary\":\"WrongSigningKey\"' swapped_keyring_stage\n",
+        "    echo \"negative-$name launched before refusing\" >&2\n",
+        "step proof 0 \"executed without skips\" timeout --signal=TERM --kill-after=60s 45m \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
+        "  printf -- '-Dreference-protected-profile-scripts=%s\\n' \"$profiles\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/test_real_snapshot_reference_protected.py", &.{
+        "    profiles = prove_profiles(args, scripts)\n",
+        "    \"systemd\": (\"proc-read-only\", \"proc-sys-masked\", \"proc-boot-id\"),\n",
+        "    \"udev\": (\"proc-pid-only\",),\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-escape-probe.zig", &.{
+        "    const pid_one_root = statIdentity(\"/proc/1/root\", 0);\n",
+        "    report(\"proc-pid-only\", ",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/verify-minisign.py", &.{
+        "    ed25519_verify(key, blob[10:] + trusted, global_signature)\n",
+    });
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const ci_script = try f.source("tools/real-snapshot-reference-protected-ci.sh");
+    const harness = try f.source("tools/test_real_snapshot_reference_protected.py");
+    const gate = "    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_protected_reference)\n";
+    const stage = "      - name: Stage the reviewed commit in a root-owned tree and run the protected proof\n";
+    for ([_]struct { path: []const u8, text: []const u8 }{
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, gate, "    if: false\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, gate, "    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_protected_reference)\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, stage, stage ++ "        continue-on-error: true\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, stage, stage ++ "        if: false\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n", "          env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n", "          sudo env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "          if-no-files-found: error\n          retention-days: 14\n      - name: Kill protected", "          if-no-files-found: warn\n          retention-days: 14\n      - name: Kill protected") },
+        .{ .path = ".github/workflows/ci.yml", .text = try f.replace(workflow, "    timeout-minutes: 90\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: amd64\n            runner: ubuntu-24.04\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE", "    timeout-minutes: 90\n    strategy:\n      fail-fast: false\n      matrix:\n        include:\n          - architecture: arm64\n            runner: ubuntu-24.04-arm\n    env:\n      ARCHITECTURE") },
+        .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "trap collect EXIT\n", "trap collect EXIT\nexit 0\n") },
+        .{ .path = "tools/real-snapshot-reference-protected-ci.sh", .text = try f.replace(ci_script, "  -Doptimize=ReleaseSafe -j4 --summary all\n", "  -Doptimize=ReleaseSafe -j4 --summary all || true\n") },
+        .{ .path = "tools/test_real_snapshot_reference_protected.py", .text = try f.replace(harness, "    profiles = prove_profiles(args, scripts)\n", "    profiles = \"skipped\"\n    unittest.SkipTest\n") },
+    }) |mutation| {
+        const refused = try nativeCheck(&f, "protected-reference", mutation.path, mutation.text);
+        defer refused.deinit();
+        if (refused.code == 0) std.debug.print("unchecked protected-reference mutation in {s}\n", .{mutation.path});
+        try testing.expectEqual(@as(u8, 1), refused.code);
+        try refused.failsWith("security-audit:");
+    }
+    const missing = try nativeCheck(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", null);
+    defer missing.deinit();
+    try testing.expectEqual(@as(u8, 1), missing.code);
+}
+
 test "security: root reference capability proof stays required outside the sudo-free audit" {
     var f = try Fixture.init();
     defer f.deinit();

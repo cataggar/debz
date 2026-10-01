@@ -433,9 +433,89 @@ options to the target, for example
 `zig build test-real-snapshot-reference-protected $(cat WORKSPACE/reference-protected.args) -Doptimize=ReleaseSafe`.
 It does not run the proof.
 
-This gate does **not** exercise the exact signed proc profiles, prove runtime
-library binding (#263), or resolve the shared host-network decision (#278).
-An arm64 run is not amd64 evidence; hosted protected execution is #268.
+On amd64 the stage script also locks and downloads the exact signed
+`systemd`, `udev` and `sudo` archives through debz (one authenticated
+single-package plan each) and extracts only their `postinst` into
+`WORKSPACE/profiles` (0644, listed in the staging manifest); the directory is
+empty on arm64 and passed as the required
+`-Dreference-protected-profile-scripts`. The target then runs the launcher's
+exact proc-configure profiles with the escape probe installed as the root's
+`/bin/sh`, so dpkg's real `postinst configure ""` exec reaches it. On amd64
+the systemd case must see a read-only `hidepid=2` procfs with `/proc/sys`
+masked and a `/proc/sys/kernel/random/boot_id` equal to the host's, and the
+udev/sudo cases a read-only PID-only procfs without `/proc/sys`. In each
+case the followed `/proc/1/root` must be the script's own root (PID 1 is
+dpkg in the same chroot), and the script must start a detached descendant
+that is gone afterwards and leave its package `install ok installed`.
+Altered postinst bytes refuse with `SourceChanged`;
+an installed version other than the pinned one refuses inside the root
+(`ReferenceSetupFailed`, stage 10) before proc is mounted or dpkg runs; a
+selector naming another package, or a configure without its profile, refuses
+with `InvalidProfile`. Each refusal must leave the bound package unpacked and
+the probe unrun. On arm64 all three profiles must refuse with `InvalidProfile`
+(arm64 signed profiles remain unproved).
+
+This gate does **not** prove runtime library binding (#263), or resolve the
+shared host-network decision (#278). An arm64 run is not amd64 evidence.
+
+### Hosted protected reference job
+
+The `protected-reference` job in `.github/workflows/ci.yml` runs this proof
+on hosted `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) runners
+(#268). It runs only on the weekly schedule or a `workflow_dispatch` with
+`run_protected_reference: true`, never on pushes or pull requests. The runner
+checkout is used only to confirm `GITHUB_SHA` and a clean tree and to write a
+`git bundle`. Everything protected happens under `sudo -n env -i`:
+
+1. a **new** mode-0700 tree `/srv/debz-protected/ci-RUN-ATTEMPT-ARCH`
+   (every ancestor root-owned and not group/world-writable);
+2. a root-owned bare repository fetched from the bundle, checked to resolve
+   to `GITHUB_SHA` and pass `git fsck --full`, then a `--no-hardlinks` clone
+   into `TREE/checkout`;
+3. `tools/real-snapshot-reference-protected-ci.sh`, run from that checkout.
+
+The script downloads the pinned Zig 0.16.0 tarball and refuses it unless
+`tools/verify-minisign.py` accepts its pinned name, size, SHA-256 and the
+prehashed minisign signature (file and trusted-comment signatures) under the
+pinned Zig release key. It extracts it with Python's `data` filter. Zig
+0.16's `zig build --fetch` unpacks dependencies into `checkout/zig-pkg`
+with 24 world-writable (0777) shell scripts; the script records them,
+removes group/other write from `zig-pkg` and the global cache (it never
+runs them), and then requires `real-snapshot-reference-tree-check.py
+packages` to find no non-root, group/world-writable, setuid/setgid/sticky
+or escaping-symlink entry. It records a per-file mode and SHA-256 manifest.
+The tree checker then requires root ownership, a single filesystem and no
+group/world-writable entry (except symlinks, sticky directories and
+`/dev/null`) across the whole tree before the build, after the build,
+after staging and after the proof.
+
+Before the proof, each of these must fail closed on its own new workspace,
+which must stay empty:
+- a launcher copy under a mutable ancestor;
+- the host dpkg in place of the pinned one;
+- a swapped archive SHA512;
+- the wrong architecture;
+- missing profile scripts;
+- a reused workspace;
+- a swapped repository keyring (debz's `WrongSigningKey`, with no lock or
+  plan written).
+
+The proof itself runs the target in ReleaseSafe under a 45-minute timeout
+and requires "executed without skips". No proof mount may remain afterwards.
+
+Evidence is always collected, even on failure: exit codes, stderr, manifests
+and the proof workspace's JSON, each bounded at 16 MiB and 256 MiB in total,
+with `SHA256SUMS` and `result.txt`. It is copied out by `sudo -n tar` and
+uploaded with `if-no-files-found: error`. Cleanup always runs: it kills
+processes whose root or cwd lies under the tree, refuses to delete while a
+mount remains, and removes the tree with `rm -rf --one-file-system`.
+`tools/security-audit.py` and `test/security-policy.zig` pin the gate,
+steps, `sudo -n` use and script tokens, so the job cannot silently skip,
+continue on error or lose its protection.
+
+Not covered: a missing-namespace negative (hosted runners cannot withdraw
+namespace support cleanly). The bundle passes through the runner-owned
+checkout, but the protected side binds it to `GITHUB_SHA` and `git fsck`.
 
 PID 1 now refuses supervisor-pipe EOF (including the death-before-`prctl`
 window), not just unexpected bytes, and requires `getppid()` to be 0 because

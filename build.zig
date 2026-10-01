@@ -421,6 +421,7 @@ pub fn build(b: *std.Build) void {
             "-m",
             "unittest",
             "tools/test_real_snapshot_reference_launcher.py",
+            "tools/test_real_snapshot_reference_protected_ci.py",
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
@@ -492,6 +493,8 @@ pub fn build(b: *std.Build) void {
         b.option([]const u8, "reference-protected-escape-archive-sha512", "Escape probe archive SHA512") orelse "",
         "--escape-archive-size",
         b.fmt("{d}", .{b.option(usize, "reference-protected-escape-archive-size", "Escape probe archive byte size") orelse 0}),
+        "--profile-scripts",
+        b.option([]const u8, "reference-protected-profile-scripts", "Root-owned signed amd64 systemd/udev/sudo postinsts (empty on arm64)") orelse "",
         "--architecture",
         b.option([]const u8, "reference-protected-architecture", "Native amd64 or arm64") orelse "",
     });
