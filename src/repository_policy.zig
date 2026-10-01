@@ -58,6 +58,10 @@ pub const Policy = struct {
     /// `debz-archive-binding` option supplies it too; a declaration that
     /// contradicts a non-default document policy is an invalid policy.
     archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
+    /// Witness suites for `frozen_release_with_witnesses`. Each must resolve
+    /// to an enabled repository with the same URI, component, architecture
+    /// and Signed-By whose own freshness is not frozen.
+    freshness_witnesses: []const []const u8 = &.{},
     proxy: Proxy = .direct,
     credentials: ?OpaqueReference = null,
     deadlines: acquisition.Deadlines = .{
@@ -90,6 +94,7 @@ pub const DiagnosticCode = enum {
     missing_runtime,
     duplicate_runtime,
     aggregate_publication_failed,
+    invalid_freshness_witness,
 };
 
 pub const Diagnostic = struct {
@@ -115,6 +120,7 @@ pub const Diagnostic = struct {
             .missing_runtime => "enabled repository has no authenticated refresh runtime",
             .duplicate_runtime => "repository refresh runtime is repeated",
             .aggregate_publication_failed => "aggregate manifest publication failed",
+            .invalid_freshness_witness => "frozen release freshness witness must name another enabled, non-frozen suite with the same URI, component, architecture, and Signed-By",
         };
     }
 };
@@ -133,6 +139,8 @@ pub const NormalizedRepository = struct {
     immutability: Immutability,
     freshness: refresh_module.ExpiryPolicy,
     archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
+    /// Sorted witness suites; empty unless `freshness` is frozen.
+    freshness_witnesses: []const []const u8,
     proxy: Proxy,
     /// Opaque reference only. It is deliberately excluded from IDs,
     /// canonical sources, manifests, diagnostics, and cache keys.
@@ -365,6 +373,13 @@ fn normalizeInternal(
             }
         }
     }
+    for (repositories.items) |repository| {
+        if (!validFreshnessWitnesses(repositories.items, repository))
+            return finishDiagnostic(allocator, arena, .{
+                .code = .invalid_freshness_witness,
+                .repository_id = repository.id,
+            });
+    }
 
     var canonical: std.ArrayList(u8) = .empty;
     for (repositories.items) |repository| {
@@ -408,6 +423,10 @@ fn appendNormalized(
             .priority = pin.priority,
         };
         std.mem.sort(PinRule, pins, {}, lessPin);
+        const witnesses = try allocator.alloc([]const u8, policy.freshness_witnesses.len);
+        for (policy.freshness_witnesses, 0..) |value, index|
+            witnesses[index] = try allocator.dupe(u8, value);
+        std.mem.sort([]const u8, witnesses, {}, lessString);
         var normalized: NormalizedRepository = .{
             .id = undefined,
             .enabled = parsed.enabled,
@@ -431,6 +450,7 @@ fn appendNormalized(
             },
             .freshness = policy.freshness,
             .archive_binding = policy.archive_binding,
+            .freshness_witnesses = witnesses,
             .proxy = switch (policy.proxy) {
                 .direct => .direct,
                 .declared => |value| .{ .declared = .{
@@ -465,6 +485,17 @@ fn effectiveArchiveBinding(
 
 fn validPolicy(policy: Policy) bool {
     if (!refresh_module.validExpiryPolicy(policy.freshness)) return false;
+    if (policy.freshness == .frozen_release_with_witnesses) {
+        if (policy.freshness_witnesses.len == 0 or
+            policy.freshness_witnesses.len > refresh_module.maximum_freshness_witnesses)
+            return false;
+    } else if (policy.freshness_witnesses.len != 0) return false;
+    for (policy.freshness_witnesses, 0..) |suite, index| {
+        if (!validToken(suite) or std.mem.endsWith(u8, suite, "/")) return false;
+        for (policy.freshness_witnesses[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, suite)) return false;
+        }
+    }
     if (policy.deadlines.connect_ms == 0 or policy.deadlines.read_ms == 0 or
         policy.deadlines.overall_ms == 0)
         return false;
@@ -489,6 +520,37 @@ fn validPolicy(policy: Policy) bool {
         if (pin.component) |value| if (!validToken(value)) return false;
     }
     return true;
+}
+
+fn validFreshnessWitnesses(
+    repositories: []const NormalizedRepository,
+    repository: NormalizedRepository,
+) bool {
+    if (!repository.enabled or repository.freshness != .frozen_release_with_witnesses)
+        return true;
+    for (repository.freshness_witnesses) |suite| {
+        if (std.mem.eql(u8, suite, repository.suite)) return false;
+        const witness = findWitness(repositories, repository, suite) orelse return false;
+        if (!witness.enabled or witness.freshness == .frozen_release_with_witnesses or
+            !equalStrings(witness.signed_by, repository.signed_by))
+            return false;
+    }
+    return true;
+}
+
+fn findWitness(
+    repositories: []const NormalizedRepository,
+    frozen: NormalizedRepository,
+    suite: []const u8,
+) ?NormalizedRepository {
+    for (repositories) |candidate| {
+        if (std.mem.eql(u8, candidate.uri, frozen.uri) and
+            std.mem.eql(u8, candidate.suite, suite) and
+            std.mem.eql(u8, candidate.component, frozen.component) and
+            std.mem.eql(u8, candidate.architecture, frozen.architecture))
+            return candidate;
+    }
+    return null;
 }
 
 fn validRepositoryUri(value: []const u8) bool {
@@ -547,6 +609,15 @@ fn repositoryId(repository: NormalizedRepository) source.RepositoryId {
         hashPart(&hash, @tagName(repository.freshness));
         hashInt(&hash, @intCast(maximum_age));
     }
+    switch (repository.freshness) {
+        .frozen_release_with_witnesses => |frozen| {
+            hashPart(&hash, @tagName(repository.freshness));
+            hashPart(&hash, &frozen.release_sha256);
+            hashInt(&hash, @intCast(repository.freshness_witnesses.len));
+            for (repository.freshness_witnesses) |suite| hashPart(&hash, suite);
+        },
+        else => {},
+    }
     switch (repository.proxy) {
         .direct => hashPart(&hash, "direct"),
         .declared => |value| hashPart(&hash, value.id),
@@ -568,15 +639,20 @@ fn repositoryId(repository: NormalizedRepository) source.RepositoryId {
 fn configurationId(repositories: []const NormalizedRepository) source.RepositoryId {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var bounded_missing_expiry = false;
+    var frozen_release = false;
     for (repositories) |repository| {
-        if (refresh_module.expiryPolicyMaxAge(repository.freshness) != null) {
+        if (refresh_module.expiryPolicyMaxAge(repository.freshness) != null)
             bounded_missing_expiry = true;
-            break;
-        }
+        if (repository.freshness == .frozen_release_with_witnesses)
+            frozen_release = true;
     }
+    // Each domain is used only when its policy appears, so identities of
+    // existing configurations stay unchanged.
     hashPart(
         &hash,
-        if (bounded_missing_expiry)
+        if (frozen_release)
+            "debz-multi-repository-configuration-v3"
+        else if (bounded_missing_expiry)
             "debz-multi-repository-configuration-v2"
         else
             "debz-multi-repository-configuration-v1",
@@ -634,6 +710,21 @@ fn appendCanonical(
         try output.appendSlice(allocator, "\n# X-Debz-Archive-Binding: ");
         try output.appendSlice(allocator, @tagName(repository.archive_binding));
     }
+    switch (repository.freshness) {
+        .frozen_release_with_witnesses => |frozen| {
+            try output.appendSlice(allocator, "\n# X-Debz-Expiry-Policy: ");
+            try output.appendSlice(allocator, @tagName(repository.freshness));
+            try output.appendSlice(allocator, "\n# X-Debz-Frozen-Release-SHA256: ");
+            const digest = std.fmt.bytesToHex(frozen.release_sha256, .lower);
+            try output.appendSlice(allocator, &digest);
+            try output.appendSlice(allocator, "\n# X-Debz-Freshness-Witnesses:");
+            for (repository.freshness_witnesses) |suite| {
+                try output.append(allocator, ' ');
+                try output.appendSlice(allocator, suite);
+            }
+        },
+        else => {},
+    }
     try output.appendSlice(
         allocator,
         if (repository.enabled) "\nEnabled: yes\n\n" else "\nEnabled: no\n\n",
@@ -674,6 +765,7 @@ fn equalRepository(left: NormalizedRepository, right: NormalizedRepository) bool
         ) and
         refresh_module.expiryPoliciesEqual(left.freshness, right.freshness) and
         left.archive_binding == right.archive_binding and
+        equalStrings(left.freshness_witnesses, right.freshness_witnesses) and
         equalProxy(left.proxy, right.proxy) and
         equalOptionalReference(left.credentials, right.credentials) and
         left.deadlines.connect_ms == right.deadlines.connect_ms and
@@ -766,6 +858,18 @@ pub const PublishedRepositoryState = struct {
     immutable: bool,
     immutable_identity: ?[]const u8,
     stale: bool,
+    /// Present only for `frozen_release_with_witnesses`.
+    frozen: ?FrozenState = null,
+};
+
+pub const FrozenState = struct {
+    admission_deadline_unix: i64,
+    witness_count: u8,
+    witness_ids: [refresh_module.maximum_freshness_witnesses]source.RepositoryId,
+
+    pub fn witnesses(self: *const FrozenState) []const source.RepositoryId {
+        return self.witness_ids[0..self.witness_count];
+    }
 };
 
 pub const RefreshRequest = struct {
@@ -853,7 +957,10 @@ pub fn refreshAll(
         return .{ .failed = failed };
     }
 
-    for (request.configuration.repositories) |repository| {
+    const order = try refreshOrder(allocator, request.configuration.repositories);
+    defer allocator.free(order);
+    for (order) |repository_index| {
+        const repository = request.configuration.repositories[repository_index];
         if (!repository.enabled) continue;
         const runtime = findRuntime(request.runtimes, repository.id) orelse {
             try diagnostics.append(allocator, .{
@@ -881,6 +988,24 @@ pub fn refreshAll(
             .component = repository.component,
             .architecture = repository.architecture,
         };
+        var witness_buffer: [refresh_module.maximum_freshness_witnesses]refresh_module.WitnessEvidence =
+            undefined;
+        if (repository.freshness == .frozen_release_with_witnesses) {
+            refresh_policy.frozen_witnesses = frozenWitnessEvidence(
+                request.configuration,
+                repository,
+                snapshots.items,
+                states.items,
+                &witness_buffer,
+            ) catch |err| {
+                try diagnostics.append(allocator, .{
+                    .repository_id = repository.id,
+                    .stale_attempted = false,
+                    .error_name = @errorName(err),
+                });
+                continue;
+            };
+        }
         var snapshot = refreshRepository(
             allocator,
             repository,
@@ -1031,6 +1156,55 @@ pub fn refreshAll(
     } };
 }
 
+/// Witnesses are refreshed before any frozen repository so that each frozen
+/// admission uses evidence from this same refresh. Configurations without a
+/// frozen repository keep their configuration order.
+fn refreshOrder(
+    allocator: std.mem.Allocator,
+    repositories: []const NormalizedRepository,
+) ![]usize {
+    const order = try allocator.alloc(usize, repositories.len);
+    var next: usize = 0;
+    for ([_]bool{ false, true }) |frozen| {
+        for (repositories, 0..) |repository, index| {
+            if ((repository.freshness == .frozen_release_with_witnesses) != frozen) continue;
+            order[next] = index;
+            next += 1;
+        }
+    }
+    return order;
+}
+
+fn frozenWitnessEvidence(
+    configuration: *const Configuration,
+    repository: NormalizedRepository,
+    snapshots: []const refresh_module.AuthenticatedResult,
+    states: []const PublishedRepositoryState,
+    buffer: *[refresh_module.maximum_freshness_witnesses]refresh_module.WitnessEvidence,
+) ![]const refresh_module.WitnessEvidence {
+    if (repository.freshness_witnesses.len == 0 or
+        repository.freshness_witnesses.len > buffer.len)
+        return error.InvalidConfiguration;
+    for (repository.freshness_witnesses, 0..) |suite, index| {
+        // Normalization already proved that every witness resolves.
+        const witness = findWitness(configuration.repositories, repository, suite) orelse
+            return error.InvalidConfiguration;
+        const position = for (states, 0..) |state, state_index| {
+            if (std.mem.eql(u8, state.repository_id.slice(), witness.id.slice()))
+                break state_index;
+        } else return error.ReleaseFrozenWitnessUnavailable;
+        if (states[position].stale) return error.ReleaseFrozenWitnessUnavailable;
+        buffer[index] = try refresh_module.witnessEvidence(&snapshots[position], .{
+            .id = witness.id,
+            .base_uri = try acquisition.Uri.parse(witness.uri),
+            .suite = witness.suite,
+            .component = witness.component,
+            .architecture = witness.architecture,
+        });
+    }
+    return buffer[0..repository.freshness_witnesses.len];
+}
+
 fn findRuntime(runtimes: []const Runtime, id: source.RepositoryId) ?Runtime {
     for (runtimes) |runtime| {
         if (std.mem.eql(u8, runtime.repository_id.slice(), id.slice())) return runtime;
@@ -1065,7 +1239,9 @@ fn refreshRepository(
             cached_policy,
             dependencies,
         ) catch |err| switch (err) {
-            error.CacheMiss => refresh_module.refreshAuthenticated(
+            // A changed witness invalidates only the cached admission; the
+            // pinned frozen bytes are fetched and admitted again.
+            error.CacheMiss, error.ReleaseFrozenWitnessChanged => refresh_module.refreshAuthenticated(
                 allocator,
                 refresh_repository,
                 runtime.authentication,
@@ -1091,6 +1267,8 @@ fn runtimeMatches(repository: NormalizedRepository, runtime: Runtime) bool {
         repository.freshness,
         runtime.refresh.expiry_policy,
     )) return false;
+    // Witness evidence comes only from this refresh's own witness results.
+    if (runtime.refresh.frozen_witnesses.len != 0) return false;
     if (runtime.acquisition.deadlines.connect_ms == 0 or
         runtime.acquisition.deadlines.read_ms == 0 or
         runtime.acquisition.deadlines.overall_ms == 0 or
@@ -1150,6 +1328,16 @@ fn stateFromSnapshot(
         else
             null,
         .stale = stale,
+        .frozen = if (snapshot.snapshot.provenance.policy.frozen) |*frozen| blk: {
+            var state: FrozenState = .{
+                .admission_deadline_unix = frozen.admission_deadline_unix,
+                .witness_count = frozen.witness_count,
+                .witness_ids = undefined,
+            };
+            for (frozen.slice(), 0..) |witness, index|
+                state.witness_ids[index] = witness.repository_id;
+            break :blk state;
+        } else null,
     };
 }
 
@@ -1170,7 +1358,16 @@ fn encodeAggregateManifest(
 ) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
-    try output.appendSlice(allocator, "debz-multi-repository-manifest-v1\nconfiguration ");
+    var frozen_present = false;
+    for (states) |state| frozen_present = frozen_present or state.frozen != null;
+    // v2 adds frozen admission records; manifests without them stay v1.
+    try output.appendSlice(
+        allocator,
+        if (frozen_present)
+            "debz-multi-repository-manifest-v2\nconfiguration "
+        else
+            "debz-multi-repository-manifest-v1\nconfiguration ",
+    );
     try output.appendSlice(allocator, configuration_id.slice());
     try output.append(allocator, '\n');
     for (states) |state| {
@@ -1209,6 +1406,21 @@ fn encodeAggregateManifest(
             try output.appendSlice(allocator, "immutable-identity ");
             try output.appendSlice(allocator, value);
             try output.append(allocator, '\n');
+        }
+        if (state.frozen) |*frozen| {
+            const deadline = try std.fmt.bufPrint(
+                &number,
+                "{d}",
+                .{frozen.admission_deadline_unix},
+            );
+            try output.appendSlice(allocator, "frozen-admission-deadline ");
+            try output.appendSlice(allocator, deadline);
+            try output.append(allocator, '\n');
+            for (frozen.witnesses()) |witness| {
+                try output.appendSlice(allocator, "frozen-witness ");
+                try output.appendSlice(allocator, witness.slice());
+                try output.append(allocator, '\n');
+            }
         }
     }
     return output.toOwnedSlice(allocator);
@@ -2334,4 +2546,566 @@ test "repository failure does not publish a mixed aggregate and stale is explici
     var stale_count: usize = 0;
     for (published.states) |state| stale_count += @intFromBool(state.stale);
     try std.testing.expectEqual(@as(usize, 1), stale_count);
+}
+
+fn expectPinnedHex(expected: []const u8, actual: []const u8) !void {
+    try std.testing.expectEqualStrings(expected, actual);
+}
+
+fn expectPinnedDigest(expected: []const u8, bytes: []const u8) !void {
+    const digest = cache_module.Digest.of(bytes);
+    const encoded = std.fmt.bytesToHex(digest.bytes, .lower);
+    try expectPinnedHex(expected, &encoded);
+}
+
+test "non-frozen repository configuration identities stay byte-identical" {
+    const fixture = @import("fixtures/openpgp.zig");
+    const bytes =
+        "deb [arch=amd64 signed-by=/keys/archive.gpg] file:///pinned stable main\n";
+    const strict_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = bytes,
+        .format = .legacy,
+    }}, null, .{});
+    var strict = switch (strict_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer strict.deinit();
+    try expectPinnedHex(
+        "c8bb59a0c60b21d66aec23342c4d79fb0078bfd649672c63a14ee2e7e3e7f438",
+        strict.repositories[0].id.slice(),
+    );
+    try expectPinnedHex(
+        "b549c5eb9360849e19f6034200b14da94a857710a37b96b893687b5012149984",
+        strict.identity.slice(),
+    );
+    try expectPinnedDigest(
+        "9a912e673b507e2a86afddd4f13ff6534534f32a23b52cceaba4a92951a66beb",
+        strict.canonical_deb822,
+    );
+
+    const bounded_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = bytes,
+        .format = .legacy,
+        .policy = .{ .freshness = .{
+            .allow_missing_valid_until_with_max_age_seconds = refresh_module.maximum_missing_valid_until_age_seconds,
+        } },
+    }}, null, .{});
+    var bounded = switch (bounded_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer bounded.deinit();
+    try expectPinnedHex(
+        "7073688e3d50be12458b3ca7e91e62e1a422e4ae913d1e3c3fc15bf177e47e27",
+        bounded.repositories[0].id.slice(),
+    );
+    try expectPinnedHex(
+        "c66b43e89a8b7ed73d886e2f0a4b289a2460b67feec2c0c15028f28a3958201a",
+        bounded.identity.slice(),
+    );
+    try expectPinnedDigest(
+        "7498c9d0c7bd57f15afe67137e19896ff095f55b494d0606f00da1fe15cee238",
+        bounded.canonical_deb822,
+    );
+
+    var files = [_][]const u8{ &fixture.repository_in_release, &fixture.repository_packages };
+    var refresh_fixture: PolicyTestFixture = .{ .files = &files };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, temporary.dir, .{
+        .max_object_bytes = 512 * 1024,
+    });
+    defer cache.deinit();
+    var outcome = try refreshAll(std.testing.allocator, .{
+        .configuration = &strict,
+        .runtimes = &.{policyTestRuntime(strict.repositories[0])},
+        .mode = .online,
+        .dependencies = .{
+            .acquisition = refresh_fixture.dependencies(),
+            .cache = &cache,
+            .clock = .{ .context = null, .nowUnixFn = policyTestNow },
+            .io = std.testing.io,
+        },
+    });
+    defer outcome.deinit(std.testing.allocator);
+    const published = switch (outcome) {
+        .published => |*value| value,
+        .failed => return error.UnexpectedRefreshFailure,
+    };
+    try expectPinnedDigest(
+        "8c2cc03581c540bab33acd73b50124f5472257c3e145b79ef71504776ab85c29",
+        published.aggregate_manifest,
+    );
+    const snapshot_digest = std.fmt.bytesToHex(
+        refresh_module.snapshotDigest(&published.snapshots[0]),
+        .lower,
+    );
+    try expectPinnedHex(
+        "b3cb7c05c8b1189a4ff68cf6be52c919c492835d1f3b6b81f1976886fce9f9ed",
+        &snapshot_digest,
+    );
+}
+
+fn frozenPolicyPin() refresh_module.ExpiryPolicy {
+    const fixture = @import("fixtures/openpgp.zig");
+    return .{ .frozen_release_with_witnesses = .{
+        .release_sha256 = cache_module.Digest.of(&fixture.frozen_release).bytes,
+    } };
+}
+
+const frozen_policy_bounded: refresh_module.ExpiryPolicy = .{
+    .allow_missing_valid_until_with_max_age_seconds = 2_678_400,
+};
+
+fn frozenPolicyDocuments(
+    frozen_policy: Policy,
+    updates_line: []const u8,
+    updates_policy: Policy,
+) [3]SourceDocument {
+    return .{
+        .{
+            .bytes = "deb [arch=amd64 signed-by=/keys/archive.gpg] file:///snapshot stable main\n",
+            .format = .legacy,
+            .policy = frozen_policy,
+        },
+        .{ .bytes = updates_line, .format = .legacy, .policy = updates_policy },
+        .{
+            .bytes = "deb [arch=amd64 signed-by=/keys/archive.gpg] file:///snapshot stable-security main\n",
+            .format = .legacy,
+        },
+    };
+}
+
+const frozen_updates_line =
+    "deb [arch=amd64 signed-by=/keys/archive.gpg] file:///snapshot stable-updates main\n";
+
+fn normalizeFrozen(documents: []const SourceDocument) !Configuration {
+    return switch (try normalize(std.testing.allocator, documents, null, .{})) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+}
+
+fn expectFrozenDiagnostic(documents: []const SourceDocument, expected: DiagnosticCode) !void {
+    switch (try normalize(std.testing.allocator, documents, null, .{})) {
+        .configuration => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDiagnostic;
+        },
+        .diagnostic => |diagnostic| try std.testing.expectEqual(expected, diagnostic.code),
+    }
+}
+
+test "frozen release freshness is identity canonical output and witness validated" {
+    const pin = frozenPolicyPin();
+    const witnesses: []const []const u8 = &.{ "stable-updates", "stable-security" };
+    const frozen_policy: Policy = .{ .freshness = pin, .freshness_witnesses = witnesses };
+    const updates_policy: Policy = .{ .freshness = frozen_policy_bounded };
+    var configuration = try normalizeFrozen(&frozenPolicyDocuments(
+        frozen_policy,
+        frozen_updates_line,
+        updates_policy,
+    ));
+    defer configuration.deinit();
+    var frozen_count: usize = 0;
+    for (configuration.repositories) |repository| {
+        if (repository.freshness != .frozen_release_with_witnesses) {
+            try std.testing.expectEqual(@as(usize, 0), repository.freshness_witnesses.len);
+            continue;
+        }
+        frozen_count += 1;
+        try std.testing.expectEqualStrings("stable", repository.suite);
+        try std.testing.expectEqual(@as(usize, 2), repository.freshness_witnesses.len);
+        try std.testing.expectEqualStrings("stable-security", repository.freshness_witnesses[0]);
+        try std.testing.expectEqualStrings("stable-updates", repository.freshness_witnesses[1]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), frozen_count);
+    const pin_hex = std.fmt.bytesToHex(pin.frozen_release_with_witnesses.release_sha256, .lower);
+    const expected_lines = [_][]const u8{
+        "# X-Debz-Expiry-Policy: frozen_release_with_witnesses\n",
+        "# X-Debz-Frozen-Release-SHA256: " ++ pin_hex ++ "\n",
+        "# X-Debz-Freshness-Witnesses: stable-security stable-updates\n",
+    };
+    for (expected_lines) |line|
+        try std.testing.expect(std.mem.indexOf(u8, configuration.canonical_deb822, line) != null);
+
+    // Witness order is not identity input.
+    var reordered = try normalizeFrozen(&frozenPolicyDocuments(
+        .{ .freshness = pin, .freshness_witnesses = &.{ "stable-security", "stable-updates" } },
+        frozen_updates_line,
+        updates_policy,
+    ));
+    defer reordered.deinit();
+    try std.testing.expectEqualStrings(configuration.identity.slice(), reordered.identity.slice());
+    try std.testing.expectEqualStrings(configuration.canonical_deb822, reordered.canonical_deb822);
+
+    // The pin and the witness set are identity input.
+    var other_pin = pin;
+    other_pin.frozen_release_with_witnesses.release_sha256[0] ^= 1;
+    const variants = [_]Policy{
+        .{ .freshness = other_pin, .freshness_witnesses = witnesses },
+        .{ .freshness = pin, .freshness_witnesses = &.{"stable-updates"} },
+    };
+    for (variants) |variant| {
+        var changed = try normalizeFrozen(&frozenPolicyDocuments(variant, frozen_updates_line, updates_policy));
+        defer changed.deinit();
+        try std.testing.expect(!std.mem.eql(u8, configuration.identity.slice(), changed.identity.slice()));
+        for (changed.repositories) |left| {
+            for (configuration.repositories) |right| {
+                if (!std.mem.eql(u8, left.suite, right.suite)) continue;
+                const same = std.mem.eql(u8, left.id.slice(), right.id.slice());
+                try std.testing.expectEqual(left.freshness != .frozen_release_with_witnesses, same);
+            }
+        }
+    }
+
+    // Conflicting pins or witness sets for one target are refused.
+    const base = frozenPolicyDocuments(frozen_policy, frozen_updates_line, updates_policy);
+    for (variants) |variant| {
+        var conflict = base[0];
+        conflict.policy = variant;
+        try expectFrozenDiagnostic(&.{ base[0], base[1], base[2], conflict }, .conflicting_repository);
+    }
+    try expectFrozenDiagnostic(&.{ base[0], base[1], base[2], base[0] }, .duplicate_repository);
+
+    // Witnesses must resolve to another enabled, non-frozen suite with the
+    // same URI, component, architecture, and Signed-By.
+    const invalid_witness = [_]struct { frozen: Policy, updates_line: []const u8, updates: Policy }{
+        .{ .frozen = .{ .freshness = pin, .freshness_witnesses = &.{"stable-backports"} }, .updates_line = frozen_updates_line, .updates = updates_policy },
+        .{ .frozen = .{ .freshness = pin, .freshness_witnesses = &.{"stable"} }, .updates_line = frozen_updates_line, .updates = updates_policy },
+        .{ .frozen = frozen_policy, .updates_line = "deb [arch=amd64 signed-by=/keys/archive.gpg] file:///elsewhere stable-updates main\n", .updates = updates_policy },
+        .{ .frozen = frozen_policy, .updates_line = "deb [arch=amd64 signed-by=/keys/archive.gpg] file:///snapshot stable-updates contrib\n", .updates = updates_policy },
+        .{ .frozen = frozen_policy, .updates_line = "deb [arch=arm64 signed-by=/keys/archive.gpg] file:///snapshot stable-updates main\n", .updates = updates_policy },
+        .{ .frozen = frozen_policy, .updates_line = "deb [arch=amd64 signed-by=/keys/other.gpg] file:///snapshot stable-updates main\n", .updates = updates_policy },
+        .{ .frozen = frozen_policy, .updates_line = "# deb [arch=amd64 signed-by=/keys/archive.gpg] file:///snapshot stable-updates main\n", .updates = updates_policy },
+        .{ .frozen = frozen_policy, .updates_line = frozen_updates_line, .updates = .{ .freshness = other_pin, .freshness_witnesses = &.{"stable-security"} } },
+    };
+    for (invalid_witness) |case|
+        try expectFrozenDiagnostic(&frozenPolicyDocuments(case.frozen, case.updates_line, case.updates), .invalid_freshness_witness);
+
+    // Witness lists are explicit, bounded, unique, and only for frozen pins.
+    const invalid_policy = [_]Policy{
+        .{ .freshness = pin },
+        .{ .freshness = pin, .freshness_witnesses = &.{ "a", "b", "c", "d", "e" } },
+        .{ .freshness = pin, .freshness_witnesses = &.{ "stable-updates", "stable-updates" } },
+        .{ .freshness = pin, .freshness_witnesses = &.{"stable-updates/"} },
+        .{ .freshness = pin, .freshness_witnesses = &.{""} },
+        .{ .freshness = .{ .frozen_release_with_witnesses = .{ .release_sha256 = @splat(0) } }, .freshness_witnesses = witnesses },
+        .{ .freshness = frozen_policy_bounded, .freshness_witnesses = witnesses },
+        .{ .freshness = .require_valid_until, .freshness_witnesses = witnesses },
+    };
+    for (invalid_policy) |policy|
+        try expectFrozenDiagnostic(&frozenPolicyDocuments(policy, frozen_updates_line, updates_policy), .invalid_policy);
+}
+
+fn frozenPolicyRuntimes(configuration: *const Configuration, storage: []Runtime) []Runtime {
+    var count: usize = 0;
+    for (configuration.repositories) |repository| {
+        if (!repository.enabled) continue;
+        storage[count] = policyTestRuntime(repository);
+        storage[count].refresh.expiry_policy = repository.freshness;
+        count += 1;
+    }
+    return storage[0..count];
+}
+
+/// Serves each repository's InRelease and Packages in refresh order.
+fn frozenPolicyFiles(
+    configuration: *const Configuration,
+    storage: *[6][]const u8,
+    updates_in_release: []const u8,
+) ![][]const u8 {
+    const fixture = @import("fixtures/openpgp.zig");
+    const order = try refreshOrder(std.testing.allocator, configuration.repositories);
+    defer std.testing.allocator.free(order);
+    for (order, 0..) |repository_index, position| {
+        const suite = configuration.repositories[repository_index].suite;
+        storage[position * 2] = if (std.mem.eql(u8, suite, "stable"))
+            &fixture.frozen_in_release
+        else if (std.mem.eql(u8, suite, "stable-updates"))
+            updates_in_release
+        else
+            &fixture.witness_security_in_release;
+        storage[position * 2 + 1] = &fixture.repository_packages;
+    }
+    return storage[0 .. order.len * 2];
+}
+
+fn expectFrozenFailure(
+    outcome: *RefreshOutcome,
+    frozen_id: source.RepositoryId,
+    expected: []const u8,
+) !void {
+    switch (outcome.*) {
+        .published => return error.ExpectedRefreshFailure,
+        .failed => |diagnostics| {
+            for (diagnostics) |diagnostic| {
+                if (std.mem.eql(u8, diagnostic.repository_id.slice(), frozen_id.slice())) {
+                    try std.testing.expectEqualStrings(expected, diagnostic.error_name);
+                    return;
+                }
+            }
+            return error.MissingFrozenDiagnostic;
+        },
+    }
+}
+
+test "frozen release refresh admits through this refresh's witnesses" {
+    const fixture = @import("fixtures/openpgp.zig");
+    var configuration = try normalizeFrozen(&frozenPolicyDocuments(
+        .{
+            .freshness = frozenPolicyPin(),
+            .freshness_witnesses = &.{ "stable-updates", "stable-security" },
+            .immutability = .{ .kind = .snapshot, .declared_identity = "20231114T220000Z" },
+        },
+        frozen_updates_line,
+        .{ .freshness = frozen_policy_bounded },
+    ));
+    defer configuration.deinit();
+    var frozen_id: source.RepositoryId = undefined;
+    var witness_ids: [2]source.RepositoryId = undefined;
+    for (configuration.repositories) |repository| {
+        if (std.mem.eql(u8, repository.suite, "stable")) frozen_id = repository.id;
+        if (std.mem.eql(u8, repository.suite, "stable-security")) witness_ids[0] = repository.id;
+        if (std.mem.eql(u8, repository.suite, "stable-updates")) witness_ids[1] = repository.id;
+    }
+    var runtime_storage: [3]Runtime = undefined;
+    const runtimes = frozenPolicyRuntimes(&configuration, &runtime_storage);
+    var file_storage: [6][]const u8 = undefined;
+    var refresh_fixture: PolicyTestFixture = .{
+        .files = try frozenPolicyFiles(&configuration, &file_storage, &fixture.witness_updates_in_release),
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, temporary.dir, .{
+        .max_object_bytes = 512 * 1024,
+    });
+    defer cache.deinit();
+    var dependencies: refresh_module.Dependencies = .{
+        .acquisition = refresh_fixture.dependencies(),
+        .cache = &cache,
+        .clock = .{ .context = null, .nowUnixFn = policyTestNow },
+        .io = std.testing.io,
+    };
+    var outcome = try refreshAll(std.testing.allocator, .{
+        .configuration = &configuration,
+        .runtimes = runtimes,
+        .mode = .online,
+        .dependencies = dependencies,
+    });
+    defer outcome.deinit(std.testing.allocator);
+    const online = switch (outcome) {
+        .published => |*value| value,
+        .failed => return error.UnexpectedRefreshFailure,
+    };
+    try std.testing.expectEqual(@as(usize, 6), refresh_fixture.next);
+    try std.testing.expectEqual(@as(usize, 3), online.states.len);
+    var frozen_states: usize = 0;
+    for (online.states) |state| {
+        const frozen = state.frozen orelse continue;
+        frozen_states += 1;
+        try std.testing.expectEqualStrings(frozen_id.slice(), state.repository_id.slice());
+        try std.testing.expectEqual(@as(i64, 1_700_600_400), frozen.admission_deadline_unix);
+        try std.testing.expectEqual(@as(usize, 2), frozen.witnesses().len);
+        try std.testing.expectEqualStrings(witness_ids[0].slice(), frozen.witnesses()[0].slice());
+        try std.testing.expectEqualStrings(witness_ids[1].slice(), frozen.witnesses()[1].slice());
+    }
+    try std.testing.expectEqual(@as(usize, 1), frozen_states);
+    const manifest = online.aggregate_manifest;
+    try std.testing.expect(std.mem.startsWith(u8, manifest, "debz-multi-repository-manifest-v2\n"));
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "frozen-admission-deadline 1700600400\n") != null);
+    for (witness_ids) |id| {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "frozen-witness {s}\n", .{id.slice()});
+        defer std.testing.allocator.free(line);
+        try std.testing.expect(std.mem.indexOf(u8, manifest, line) != null);
+    }
+
+    // Cache-only reload reproduces the admission without acquisition.
+    var offline_fixture: PolicyTestFixture = .{ .files = &.{} };
+    var offline_dependencies = dependencies;
+    offline_dependencies.acquisition = offline_fixture.dependencies();
+    var offline_outcome = try refreshAll(std.testing.allocator, .{
+        .configuration = &configuration,
+        .runtimes = runtimes,
+        .mode = .cache_only,
+        .dependencies = offline_dependencies,
+    });
+    defer offline_outcome.deinit(std.testing.allocator);
+    switch (offline_outcome) {
+        .published => |*value| try std.testing.expectEqualStrings(manifest, value.aggregate_manifest),
+        .failed => return error.UnexpectedRefreshFailure,
+    }
+    try std.testing.expectEqual(@as(usize, 0), offline_fixture.next);
+
+    // An immutable frozen pocket reuses its cached admission while the
+    // witnesses are unchanged.
+    var reuse_storage: [6][]const u8 = undefined;
+    var reuse_fixture: PolicyTestFixture = .{
+        .files = (try frozenPolicyFiles(&configuration, &reuse_storage, &fixture.witness_updates_in_release))[0..4],
+    };
+    dependencies.acquisition = reuse_fixture.dependencies();
+    var reused = try refreshAll(std.testing.allocator, .{
+        .configuration = &configuration,
+        .runtimes = runtimes,
+        .mode = .online,
+        .dependencies = dependencies,
+    });
+    defer reused.deinit(std.testing.allocator);
+    switch (reused) {
+        .published => |*value| try std.testing.expectEqualStrings(manifest, value.aggregate_manifest),
+        .failed => return error.UnexpectedRefreshFailure,
+    }
+    try std.testing.expectEqual(@as(usize, 4), reuse_fixture.next);
+
+    // A changed witness invalidates the cached admission, so the pinned
+    // frozen bytes are acquired and admitted again.
+    var changed_configuration = try normalizeFrozen(&frozenPolicyDocuments(
+        .{
+            .freshness = frozenPolicyPin(),
+            .freshness_witnesses = &.{ "stable-updates", "stable-security" },
+            .immutability = .{ .kind = .snapshot, .declared_identity = "20231114T220000Z" },
+        },
+        frozen_updates_line,
+        .{ .freshness = .{ .allow_missing_valid_until_with_max_age_seconds = 2_678_399 } },
+    ));
+    defer changed_configuration.deinit();
+    for (changed_configuration.repositories) |repository| {
+        const same = for (configuration.repositories) |previous| {
+            if (std.mem.eql(u8, previous.id.slice(), repository.id.slice())) break true;
+        } else false;
+        try std.testing.expectEqual(!std.mem.eql(u8, repository.suite, "stable-updates"), same);
+    }
+    var changed_runtime_storage: [3]Runtime = undefined;
+    var changed_storage: [6][]const u8 = undefined;
+    var changed_fixture: PolicyTestFixture = .{
+        .files = try frozenPolicyFiles(&changed_configuration, &changed_storage, &fixture.witness_updates_in_release),
+    };
+    dependencies.acquisition = changed_fixture.dependencies();
+    var changed = try refreshAll(std.testing.allocator, .{
+        .configuration = &changed_configuration,
+        .runtimes = frozenPolicyRuntimes(&changed_configuration, &changed_runtime_storage),
+        .mode = .online,
+        .dependencies = dependencies,
+    });
+    defer changed.deinit(std.testing.allocator);
+    if (changed != .published) return error.UnexpectedRefreshFailure;
+    try std.testing.expectEqual(@as(usize, 6), changed_fixture.next);
+
+    // Runtime-supplied witness evidence is never trusted.
+    var forged_storage: [3]Runtime = undefined;
+    const forged = frozenPolicyRuntimes(&configuration, &forged_storage);
+    var forged_evidence: [1]refresh_module.WitnessEvidence = undefined;
+    for (forged) |*runtime| {
+        if (std.mem.eql(u8, runtime.repository_id.slice(), frozen_id.slice()))
+            runtime.refresh.frozen_witnesses = &forged_evidence;
+    }
+    var forged_fixture: PolicyTestFixture = .{ .files = &.{} };
+    dependencies.acquisition = forged_fixture.dependencies();
+    var forged_outcome = try refreshAll(std.testing.allocator, .{
+        .configuration = &configuration,
+        .runtimes = forged,
+        .mode = .cache_only,
+        .dependencies = dependencies,
+    });
+    defer forged_outcome.deinit(std.testing.allocator);
+    try expectFrozenFailure(&forged_outcome, frozen_id, "DeclaredPolicyMismatch");
+}
+
+test "frozen release refresh fails closed when a witness fails or is stale" {
+    const fixture = @import("fixtures/openpgp.zig");
+    var configuration = try normalizeFrozen(&frozenPolicyDocuments(
+        .{ .freshness = frozenPolicyPin(), .freshness_witnesses = &.{ "stable-updates", "stable-security" } },
+        frozen_updates_line,
+        .{ .freshness = frozen_policy_bounded },
+    ));
+    defer configuration.deinit();
+    var frozen_id: source.RepositoryId = undefined;
+    for (configuration.repositories) |repository| {
+        if (std.mem.eql(u8, repository.suite, "stable")) frozen_id = repository.id;
+    }
+    var runtime_storage: [3]Runtime = undefined;
+    const runtimes = frozenPolicyRuntimes(&configuration, &runtime_storage);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, temporary.dir, .{
+        .max_object_bytes = 512 * 1024,
+    });
+    defer cache.deinit();
+    var dependencies: refresh_module.Dependencies = .{
+        .acquisition = undefined,
+        .cache = &cache,
+        .clock = .{ .context = null, .nowUnixFn = policyTestNow },
+        .io = std.testing.io,
+    };
+
+    // A witness from another origin is refused by the frozen admission.
+    {
+        var storage: [6][]const u8 = undefined;
+        var other: PolicyTestFixture = .{
+            .files = try frozenPolicyFiles(&configuration, &storage, &fixture.witness_other_origin_in_release),
+        };
+        dependencies.acquisition = other.dependencies();
+        var outcome = try refreshAll(std.testing.allocator, .{
+            .configuration = &configuration,
+            .runtimes = runtimes,
+            .mode = .online,
+            .dependencies = dependencies,
+        });
+        defer outcome.deinit(std.testing.allocator);
+        try expectFrozenFailure(&outcome, frozen_id, "ReleaseFrozenWitnessOriginMismatch");
+    }
+
+    // A failed witness fails the frozen pocket without acquiring it.
+    {
+        var storage: [6][]const u8 = undefined;
+        var missing: PolicyTestFixture = .{
+            .files = (try frozenPolicyFiles(&configuration, &storage, &fixture.witness_updates_in_release))[0..2],
+        };
+        dependencies.acquisition = missing.dependencies();
+        var outcome = try refreshAll(std.testing.allocator, .{
+            .configuration = &configuration,
+            .runtimes = runtimes,
+            .mode = .online,
+            .dependencies = dependencies,
+        });
+        defer outcome.deinit(std.testing.allocator);
+        try expectFrozenFailure(&outcome, frozen_id, "ReleaseFrozenWitnessUnavailable");
+        try std.testing.expectEqual(@as(usize, 2), missing.next);
+    }
+
+    // Publish one good generation, then let a witness fall back to stale
+    // cache: a stale witness never admits the frozen pocket.
+    {
+        var storage: [6][]const u8 = undefined;
+        var good: PolicyTestFixture = .{
+            .files = try frozenPolicyFiles(&configuration, &storage, &fixture.witness_updates_in_release),
+        };
+        dependencies.acquisition = good.dependencies();
+        var outcome = try refreshAll(std.testing.allocator, .{
+            .configuration = &configuration,
+            .runtimes = runtimes,
+            .mode = .online,
+            .dependencies = dependencies,
+        });
+        defer outcome.deinit(std.testing.allocator);
+        if (outcome != .published) return error.UnexpectedRefreshFailure;
+    }
+    {
+        var storage: [6][]const u8 = undefined;
+        var stale: PolicyTestFixture = .{
+            .files = (try frozenPolicyFiles(&configuration, &storage, &fixture.witness_updates_in_release))[0..2],
+        };
+        dependencies.acquisition = stale.dependencies();
+        var outcome = try refreshAll(std.testing.allocator, .{
+            .configuration = &configuration,
+            .runtimes = runtimes,
+            .mode = .online,
+            .failure_policy = .allow_stale_authenticated,
+            .dependencies = dependencies,
+        });
+        defer outcome.deinit(std.testing.allocator);
+        try expectFrozenFailure(&outcome, frozen_id, "ReleaseFrozenWitnessUnavailable");
+    }
 }

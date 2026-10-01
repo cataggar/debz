@@ -1230,7 +1230,13 @@ pub const Backend = struct {
                 .package = try allocator.dupe(u8, state.repository_id.slice()),
                 .version = try allocator.dupe(u8, state.release_suite),
                 .architecture = null,
-                .detail = if (state.stale) "authenticated stale cache" else "authenticated",
+                .detail = if (state.frozen) |frozen|
+                    try std.fmt.allocPrint(
+                        allocator,
+                        "authenticated frozen release; admission deadline {d}",
+                        .{frozen.admission_deadline_unix},
+                    )
+                else if (state.stale) "authenticated stale cache" else "authenticated",
             };
             return success(.refresh, true, "authenticated repository metadata refreshed", items);
         }
@@ -3304,6 +3310,7 @@ pub const Backend = struct {
     ) !LoadedDocuments {
         var documents: std.ArrayList(repository_policy.SourceDocument) = .empty;
         var bytes: std.ArrayList([]u8) = .empty;
+        var witness_lists: std.ArrayList([]const []const u8) = .empty;
         for (options.source_paths) |path| {
             const contents = try readFile(allocator, self.io, path, 8 * 1024 * 1024);
             try bytes.append(allocator, contents);
@@ -3335,8 +3342,17 @@ pub const Backend = struct {
             else
                 options.default_release;
             policy.immutability.kind = if (parsed.value.immutable) .immutable_url else .moving;
-            if (parsed.value.freshness) |freshness|
+            if (parsed.value.freshness) |freshness| {
                 policy.freshness = try configuredFreshness(freshness);
+                if (freshness.witness_suites) |suites| {
+                    const witnesses = try allocator.alloc([]const u8, suites.len);
+                    for (witnesses) |*witness| witness.* = "";
+                    try witness_lists.append(allocator, witnesses);
+                    for (suites, 0..) |suite, index|
+                        witnesses[index] = try allocator.dupe(u8, suite);
+                    policy.freshness_witnesses = witnesses;
+                }
+            }
             policy.archive_binding = parsed.value.archive_binding;
             try documents.append(allocator, .{
                 .bytes = contents,
@@ -3348,6 +3364,7 @@ pub const Backend = struct {
             .allocator = allocator,
             .documents = try documents.toOwnedSlice(allocator),
             .bytes = try bytes.toOwnedSlice(allocator),
+            .witness_lists = try witness_lists.toOwnedSlice(allocator),
         };
     }
 };
@@ -3356,11 +3373,17 @@ const LoadedDocuments = struct {
     allocator: std.mem.Allocator,
     documents: []repository_policy.SourceDocument,
     bytes: [][]u8,
+    witness_lists: []const []const []const u8 = &.{},
 
     fn deinit(self: *LoadedDocuments) void {
         for (self.bytes) |value| self.allocator.free(value);
         self.allocator.free(self.bytes);
         self.allocator.free(self.documents);
+        for (self.witness_lists) |witnesses| {
+            for (witnesses) |witness| self.allocator.free(witness);
+            self.allocator.free(witnesses);
+        }
+        self.allocator.free(self.witness_lists);
         self.* = undefined;
     }
 };
@@ -4527,11 +4550,14 @@ fn basePolicy(options: RepositoryOptions) repository_policy.Policy {
 const ConfigFreshnessMode = enum {
     require_valid_until,
     allow_missing_valid_until_with_max_age_seconds,
+    frozen_release_with_witnesses,
 };
 
 const ConfigFreshness = struct {
     mode: ConfigFreshnessMode,
-    maximum_release_age_seconds: ?u64,
+    maximum_release_age_seconds: ?u64 = null,
+    frozen_release_sha256: ?[]const u8 = null,
+    witness_suites: ?[]const []const u8 = null,
 };
 
 const WireRepositoryConfig = struct {
@@ -4548,6 +4574,10 @@ const WireRepositoryConfig = struct {
 fn configuredFreshness(
     freshness: ConfigFreshness,
 ) !repository_refresh.ExpiryPolicy {
+    const frozen = freshness.mode == .frozen_release_with_witnesses;
+    if (frozen != (freshness.frozen_release_sha256 != null) or
+        frozen != (freshness.witness_suites != null))
+        return error.InvalidRepositoryConfig;
     const policy: repository_refresh.ExpiryPolicy = switch (freshness.mode) {
         .require_valid_until => blk: {
             if (freshness.maximum_release_age_seconds != null)
@@ -4559,10 +4589,37 @@ fn configuredFreshness(
                 freshness.maximum_release_age_seconds orelse
                 return error.InvalidRepositoryConfig,
         },
+        .frozen_release_with_witnesses => blk: {
+            if (freshness.maximum_release_age_seconds != null)
+                return error.InvalidRepositoryConfig;
+            const suites = freshness.witness_suites.?;
+            if (suites.len == 0 or suites.len > repository_refresh.maximum_freshness_witnesses)
+                return error.InvalidRepositoryConfig;
+            for (suites, 0..) |suite, index| {
+                if (suite.len == 0) return error.InvalidRepositoryConfig;
+                for (suites[0..index]) |previous| {
+                    if (std.mem.eql(u8, previous, suite)) return error.InvalidRepositoryConfig;
+                }
+            }
+            break :blk .{ .frozen_release_with_witnesses = .{
+                .release_sha256 = try lowercaseSha256(freshness.frozen_release_sha256.?),
+            } };
+        },
     };
     if (!repository_refresh.validExpiryPolicy(policy))
         return error.InvalidRepositoryConfig;
     return policy;
+}
+
+fn lowercaseSha256(text: []const u8) ![32]u8 {
+    if (text.len != 64) return error.InvalidRepositoryConfig;
+    for (text) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return error.InvalidRepositoryConfig,
+    };
+    var digest: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, text) catch return error.InvalidRepositoryConfig;
+    return digest;
 }
 
 test "production repository config freshness is finite and explicit" {
@@ -4593,6 +4650,55 @@ test "production repository config freshness is finite and explicit" {
         .mode = .allow_missing_valid_until_with_max_age_seconds,
         .maximum_release_age_seconds = maximum + 1,
     }));
+}
+
+test "production repository config frozen release freshness is pinned and witnessed" {
+    const digest_hex = "596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834";
+    var digest: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&digest, digest_hex);
+    const witnesses: []const []const u8 = &.{ "resolute-updates", "resolute-security" };
+    try std.testing.expect(repository_refresh.expiryPoliciesEqual(
+        .{ .frozen_release_with_witnesses = .{ .release_sha256 = digest } },
+        try configuredFreshness(.{
+            .mode = .frozen_release_with_witnesses,
+            .frozen_release_sha256 = digest_hex,
+            .witness_suites = witnesses,
+        }),
+    ));
+    const invalid = [_]ConfigFreshness{
+        // Missing digest or witnesses.
+        .{ .mode = .frozen_release_with_witnesses, .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex },
+        // Empty, oversized, blank and duplicate witness lists.
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{} },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{ "a", "b", "c", "d", "e" } },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{""} },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{ "resolute-updates", "resolute-updates" } },
+        // Digests must be exactly 64 lowercase hex characters and non-zero.
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = "596EE4CEA058F74D59E2180532C89904E306D90725D42162EDA82C01D4370834", .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex[0..63], .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = "0" ** 64, .witness_suites = witnesses },
+        // A frozen pocket has no maximum age of its own.
+        .{ .mode = .frozen_release_with_witnesses, .maximum_release_age_seconds = 2678400, .frozen_release_sha256 = digest_hex, .witness_suites = witnesses },
+        // Frozen fields are refused for every other mode.
+        .{ .mode = .require_valid_until, .frozen_release_sha256 = digest_hex },
+        .{ .mode = .allow_missing_valid_until_with_max_age_seconds, .maximum_release_age_seconds = 2678400, .witness_suites = witnesses },
+    };
+    for (invalid) |freshness|
+        try std.testing.expectError(error.InvalidRepositoryConfig, configuredFreshness(freshness));
+
+    var parsed = try std.json.parseFromSlice(WireRepositoryConfig, std.testing.allocator,
+        \\{"source_path":"/r.sources","immutable":true,"freshness":{"mode":"frozen_release_with_witnesses","frozen_release_sha256":"596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834","witness_suites":["resolute-updates","resolute-security"]}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+    defer parsed.deinit();
+    _ = try configuredFreshness(parsed.value.freshness.?);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(
+        WireRepositoryConfig,
+        std.testing.allocator,
+        \\{"source_path":"/r.sources","freshness":{"mode":"frozen_release_with_witnesses","frozen_release_sha256":"596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834","witness_suites":["resolute-updates"],"clock":0}}
+    ,
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
+    ));
 }
 
 fn makeRuntimes(

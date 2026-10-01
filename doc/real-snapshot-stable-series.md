@@ -1,6 +1,8 @@
 # Real-snapshot reference on a stable series (design for #330)
 
-Status: **design for review on #330**. Nothing here is implemented yet. The
+Status: **reviewed on #330** (see [review decisions](#review-decisions)).
+PR A implements the `frozen_release_with_witnesses` freshness policy; the repin
+tool (PR B) and the migration (PR C) are not implemented yet. The
 current pin stays the Ubuntu development series `stonking` at
 `https://snapshot.ubuntu.com/ubuntu/20261001T000000Z` until the migration
 described in [question 5](#5-migration-order) lands.
@@ -158,6 +160,9 @@ The same URL now serves different bytes:
 - InRelease SHA-256 `ee4ca502…`;
 - `Date` 23:37:07;
 - `Valid-Until` 23:37:07.
+
+PR A corrected the five docs to these values after re-fetching the same bytes
+on 2026-10-01, after `T` had passed.
 
 `review_lock` does not pin `release_sha256`, so the dispatch lane still
 passes. However, the docs are inaccurate, and any evidence that binds the old
@@ -332,8 +337,12 @@ already accepts many. The release document becomes:
 `resolute-updates` and `resolute-security` keep
 `{"mode": "allow_missing_valid_until_with_max_age_seconds",
 "maximum_release_age_seconds": 2678400}`. Any unknown field, empty witness
-list, duplicate witness, self-reference or digest that is not 64 lowercase hex
-characters is `InvalidRepositoryConfig`.
+list, duplicate witness or digest that is not 64 lowercase hex characters is
+`InvalidRepositoryConfig`. A self-reference or unresolved witness is the
+normalization diagnostic `invalid_freshness_witness`.
+`maximum_release_age_seconds` may be
+omitted; it must be absent or `null` for `require_valid_until` and the frozen
+mode, and the frozen fields are refused for every other mode.
 
 ### Identity binding
 
@@ -343,9 +352,9 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
 | Layer | What changes |
 |---|---|
 | Normalized repository identity | `repository_policy.repositoryId` hashes the tag, `frozen_release_sha256` and the sorted witness suites. `configurationId` uses a new domain, `debz-multi-repository-configuration-v3`, only when a frozen repository is present, so v1/v2 identities of existing configurations are unchanged. `appendCanonical` emits `# X-Debz-Expiry-Policy: frozen_release_with_witnesses`, `# X-Debz-Frozen-Release-SHA256: …` and `# X-Debz-Freshness-Witnesses: …`. Conflict equality (`expiryPoliciesEqual`, `runtimeMatches`) compares all three. |
-| Snapshot provenance | `PolicyDecisions` gains `frozen_release_sha256`, the witness decisions (each witness's repository id, snapshot digest, signed `Date`, deadline and the matched fingerprint) and `admission_deadline_unix`. `snapshotDigest` hashes them under a new domain, `debz-authenticated-repository-snapshot-v4`, only for frozen repositories, so every existing digest and lock stays byte-identical. `SnapshotManifest`/`encodeSnapshot` move to `debz-repository-snapshot-v5` in a new cache namespace, `repository-refresh-v5`, with the v4 namespace treated like today's legacy v2. |
+| Snapshot provenance | `PolicyDecisions` gains `frozen_release_sha256`, the witness decisions (each witness's repository id, snapshot digest, signed `Date`, deadline and the matched fingerprint) and `admission_deadline_unix`. `snapshotDigest` hashes them under a new domain, `debz-authenticated-repository-snapshot-v4`, only for frozen repositories, so every existing digest and lock stays byte-identical. Frozen repositories store `SnapshotManifest`/`encodeSnapshot` as `debz-repository-snapshot-v5` in a new cache namespace, `repository-refresh-v5`; every other repository keeps v4 bytes and the v4 namespace. |
 | Exact lock | `schema/exact-closure-lock-v3.json` does not change. A lock binds the policy through `Repository.id` (repository identity) and `Repository.snapshot_sha256` (snapshot digest v4, which includes the witnesses' snapshot digests). This holds even when a witness contributes no package and so cannot appear in the lock (`error.UnusedRepository`). `doc/exact-locks-and-provenance.md` documents snapshot digest v4. An explicit `freshness` member in a future lock v4 is deferred until other v4 changes justify a new lock schema. |
-| Aggregate manifest | The `debz-multi-repository-manifest-v1` writer in `refreshAll` moves to v2 and records each frozen repository's witnesses and deadline. |
+| Aggregate manifest | The `refreshAll` writer emits `debz-multi-repository-manifest-v2` only when a frozen repository is present, recording each frozen repository's admission deadline and witness repository IDs. Other manifests keep their v1 bytes. |
 
 ### Files and structs that change
 
@@ -358,8 +367,9 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
     empty for a frozen policy, refresh fails with
     `ReleaseFrozenWitnessUnavailable`, so `refreshAuthenticated` can never
     admit a frozen pocket alone.
-  - Add a frozen branch in `validateRelease`, plus the six new `Release*`
-    errors.
+  - Add a frozen branch in `validateRelease`, plus eight new `Release*`
+    errors: the six above, `ReleaseFrozenWitnessTargetMismatch` and
+    `ReleaseFrozenWitnessChanged`.
   - Update `PolicyDecisions`, `snapshotDigest`, `SnapshotManifest`,
     `encodeSnapshot`, `snapshot_magic` and `snapshot_id`.
   - Make the cache-only reload re-evaluate the witnesses.
@@ -371,8 +381,9 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
   - In `refreshAll`, refresh witnesses first, build `WitnessEvidence` from
     their `AuthenticatedResult`s, and fail the frozen repository if any
     witness failed or is stale.
-  - Add `PublishedRepositoryState.admission_deadline_unix`.
-  - Bump the aggregate manifest to v2.
+  - Add `PublishedRepositoryState.frozen` (admission deadline and witness
+    repository IDs).
+  - Emit aggregate manifest v2 only when a frozen repository is present.
 - **`src/production_backend.zig`**
   - Add the new mode to `ConfigFreshnessMode`.
   - Add `ConfigFreshness.frozen_release_sha256` and `.witness_suites`.
@@ -380,9 +391,9 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
   - Extend the test "production repository config freshness is finite and
     explicit".
 - **`src/target_apt_config.zig` and `schema/apt-config-snapshot-v2.json`**
-  - Unchanged in phase 1. Target-root APT configuration cannot express the
-    frozen mode, and `sourceFreshness`/`parseFreshness` keep refusing unknown
-    modes.
+  - The schema is unchanged in phase 1. Target-root APT configuration cannot
+    express the frozen mode: `parseFreshness` keeps refusing unknown modes, and
+    source policies and manifests refuse it explicitly.
   - Supporting the mode in target-root configuration later requires
     `apt-config-snapshot-v3`.
 - **`tools/real-snapshot-acceptance.sh`, `test/real-snapshot-policy.zig` and
@@ -693,7 +704,7 @@ depends on it: `test/real-snapshot-policy.zig` uses fixed offline inputs.
      offline cross-check proves it covers every in-tree pin.
    - The tool is exercised once against stonking: the provenance-only and
      `changed` paths, and the timestamp hazard above.
-4. **#322 (#259)** is open and can land on stonking. Its bounds and
+4. **#322 (#259)** landed on stonking as 85774a7. Its bounds and
    audit are not tied to a series. PR C replaces its `1.23.7ubuntu2` pin with
    `1.23.7ubuntu1`, and the stonking value is deleted rather than kept.
 5. **PR C: migration to resolute, after A and B.** Using the tool's `diff`:
@@ -742,3 +753,12 @@ depends on it: `test/real-snapshot-policy.zig` uses fixed offline inputs.
    before PR C, or part of it?
 4. Is an explicit lock-v4 `freshness` member wanted now, or is the deferral
    acceptable? The deferral follows the snapshot-digest precedent.
+
+### Review decisions
+
+The coordinator answered the open questions on #330:
+
+1. Every listed witness must pass.
+2. Witnesses without `Valid-Until` keep the 31-day bound.
+3. Exact-byte admission binding is its own PR, before PR C.
+4. Lock v4 is deferred.

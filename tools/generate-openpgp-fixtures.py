@@ -124,6 +124,40 @@ NOBLE_RELEASE = (
     )
 )
 UID = b"debz hermetic archive fixture <fixture.invalid>"
+FROZEN_ORIGIN = b"Origin: debz fixture\nLabel: debz fixture\n"
+
+
+def frozen_family_release(suite, codename, date, valid_until=None, origin=FROZEN_ORIGIN):
+    """Release cleartext for frozen-release freshness witness fixtures."""
+    return (
+        origin
+        + b"Suite: " + suite + b"\n"
+        + b"Codename: " + codename + b"\n"
+        + b"Date: " + date + b"\n"
+        + (b"Valid-Until: " + valid_until + b"\n" if valid_until else b"")
+        + b"Architectures: amd64\n"
+        b"Components: main\n"
+        b"Acquire-By-Hash: no\n"
+        b"SHA256:\n "
+        + sha256(PACKAGES).hexdigest().encode()
+        + b" "
+        + str(len(PACKAGES)).encode()
+        + b" main/binary-amd64/Packages\n"
+    )
+
+
+FROZEN_RELEASE = frozen_family_release(
+    b"stable", b"bookworm", b"Sat, 01 Apr 2023 00:00:00 +0000")
+FROZEN_NEWER_RELEASE = frozen_family_release(
+    b"stable", b"bookworm", b"Tue, 14 Nov 2023 21:30:00 +0000")
+WITNESS_UPDATES_RELEASE = frozen_family_release(
+    b"stable-updates", b"bookworm-updates", b"Tue, 14 Nov 2023 20:00:00 +0000")
+WITNESS_SECURITY_RELEASE = frozen_family_release(
+    b"stable-security", b"bookworm-security", b"Tue, 14 Nov 2023 21:00:00 +0000",
+    valid_until=b"Tue, 21 Nov 2023 21:00:00 +0000")
+WITNESS_OTHER_ORIGIN_RELEASE = frozen_family_release(
+    b"stable-updates", b"bookworm-updates", b"Tue, 14 Nov 2023 20:00:00 +0000",
+    origin=b"Origin: other fixture\nLabel: other fixture\n")
 
 
 def mpi(value):
@@ -321,6 +355,15 @@ def main():
         + armor_signature(noble_text_signature)
     )
 
+    def signed_in_release(release, key=subkey, key_fp=subkey_fp):
+        canonical = release.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n").removesuffix(b"\r\n")
+        return (
+            b"-----BEGIN PGP SIGNED MESSAGE-----\n"
+            b"Hash: SHA256\n\n"
+            + release
+            + armor_signature(signature(key, 0x01, [canonical], key_fp))
+        )
+
     values = {
         "message": MESSAGE,
         "keyring": primary_packet + uid_packet + certification + subkey_packet + binding,
@@ -345,6 +388,15 @@ def main():
         "repository_in_release": in_release,
         "noble_repository_packages": NOBLE_PACKAGES,
         "noble_repository_in_release": noble_in_release,
+        "frozen_release": FROZEN_RELEASE,
+        "frozen_in_release": signed_in_release(FROZEN_RELEASE),
+        "frozen_newer_release": FROZEN_NEWER_RELEASE,
+        "frozen_newer_in_release": signed_in_release(FROZEN_NEWER_RELEASE),
+        "witness_updates_in_release": signed_in_release(WITNESS_UPDATES_RELEASE),
+        "witness_security_in_release": signed_in_release(WITNESS_SECURITY_RELEASE),
+        "witness_other_origin_in_release": signed_in_release(WITNESS_OTHER_ORIGIN_RELEASE),
+        "witness_updates_ed25519_in_release": signed_in_release(
+            WITNESS_UPDATES_RELEASE, ed_key, ed_fp),
         "primary_fingerprint": primary_fp,
         "subkey_fingerprint": subkey_fp,
         "ed25519_fingerprint": ed_fp,

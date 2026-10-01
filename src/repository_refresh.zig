@@ -10,10 +10,13 @@ const openpgp = @import("openpgp_verifier.zig");
 const source = @import("source.zig");
 
 const snapshot_magic = "debz-repository-snapshot-v4";
+const frozen_snapshot_magic = "debz-repository-snapshot-v5";
 const snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v4" };
+const frozen_snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v5" };
 const legacy_snapshot_id = cache_module.SnapshotId{ .value = "repository-refresh-v2" };
 pub const maximum_future_release_seconds: u64 = 24 * 60 * 60;
 pub const maximum_missing_valid_until_age_seconds: u64 = 31 * 24 * 60 * 60;
+pub const maximum_freshness_witnesses: usize = 4;
 
 pub const Repository = struct {
     id: source.RepositoryId,
@@ -51,21 +54,32 @@ pub const Compression = enum(u8) {
 pub const ByHashFallback = enum { disabled, not_found_only };
 pub const Mode = enum { online, cache_only };
 
+/// A release pocket that no longer changes. It is admitted only while its
+/// signed Release bytes equal the reviewed digest and fresh, same-key witness
+/// pockets from the same snapshot pass their own freshness policy.
+pub const FrozenRelease = struct {
+    /// SHA-256 of the signed Release cleartext, the value recorded as
+    /// `Provenance.release_digest` and exact-lock `release_sha256`.
+    release_sha256: [32]u8,
+};
+
 pub const ExpiryPolicy = union(enum) {
     require_valid_until,
     allow_missing_valid_until_with_max_age_seconds: u64,
+    frozen_release_with_witnesses: FrozenRelease,
 };
 
 pub fn validExpiryPolicy(policy: ExpiryPolicy) bool {
     return switch (policy) {
         .require_valid_until => true,
         .allow_missing_valid_until_with_max_age_seconds => |seconds| seconds != 0 and seconds <= maximum_missing_valid_until_age_seconds,
+        .frozen_release_with_witnesses => |frozen| !allZero(&frozen.release_sha256),
     };
 }
 
 pub fn expiryPolicyMaxAge(policy: ExpiryPolicy) ?u64 {
     return switch (policy) {
-        .require_valid_until => null,
+        .require_valid_until, .frozen_release_with_witnesses => null,
         .allow_missing_valid_until_with_max_age_seconds => |seconds| seconds,
     };
 }
@@ -74,10 +88,101 @@ pub fn expiryPoliciesEqual(left: ExpiryPolicy, right: ExpiryPolicy) bool {
     return switch (left) {
         .require_valid_until => right == .require_valid_until,
         .allow_missing_valid_until_with_max_age_seconds => |seconds| switch (right) {
-            .require_valid_until => false,
             .allow_missing_valid_until_with_max_age_seconds => |other| seconds == other,
+            else => false,
+        },
+        .frozen_release_with_witnesses => |frozen| switch (right) {
+            .frozen_release_with_witnesses => |other| std.mem.eql(
+                u8,
+                &frozen.release_sha256,
+                &other.release_sha256,
+            ),
+            else => false,
         },
     };
+}
+
+/// Authenticated freshness evidence of a witness pocket. It borrows from the
+/// witness's `AuthenticatedResult`, which must outlive it.
+pub const WitnessEvidence = struct {
+    repository: Repository,
+    snapshot_sha256: [32]u8,
+    expiry_policy: ExpiryPolicy,
+    origin: ?[]const u8,
+    label: ?[]const u8,
+    release_date_unix: i64,
+    /// `Valid-Until` plus grace, or `Date` plus the bounded maximum age.
+    deadline_unix: i64,
+    signatures: []const openpgp.SignatureResult,
+};
+
+/// Builds witness evidence from a witness pocket's own authenticated refresh.
+/// A frozen pocket can never witness another one.
+pub fn witnessEvidence(
+    result: *const AuthenticatedResult,
+    repository: Repository,
+) Error!WitnessEvidence {
+    const provenance = &result.snapshot.provenance;
+    if (!std.mem.eql(u8, provenance.repository_id.slice(), repository.id.slice()) or
+        provenance.authentication != .openpgp_verified or
+        provenance.policy.expiry_policy == .frozen_release_with_witnesses)
+        return error.ReleaseFrozenWitnessUnavailable;
+    const deadline = if (provenance.policy.valid_until_unix) |valid_until|
+        saturatingAdd(valid_until, provenance.policy.expiry_grace_seconds)
+    else if (provenance.policy.maximum_release_age_seconds) |maximum_age|
+        missingValidUntilDeadline(provenance.policy.release_date_unix, maximum_age) catch
+            return error.ReleaseFrozenWitnessUnavailable
+    else
+        return error.ReleaseFrozenWitnessUnavailable;
+    return .{
+        .repository = repository,
+        .snapshot_sha256 = snapshotDigest(result),
+        .expiry_policy = provenance.policy.expiry_policy,
+        .origin = if (result.snapshot.release.origin) |value| value.value else null,
+        .label = if (result.snapshot.release.label) |value| value.value else null,
+        .release_date_unix = provenance.policy.release_date_unix,
+        .deadline_unix = deadline,
+        .signatures = provenance.authentication_evidence.signatures,
+    };
+}
+
+pub const WitnessDecision = struct {
+    repository_id: source.RepositoryId,
+    snapshot_sha256: [32]u8,
+    release_date_unix: i64,
+    deadline_unix: i64,
+    primary_fingerprint: [20]u8,
+};
+
+pub const FrozenDecisions = struct {
+    release_sha256: [32]u8,
+    /// The earliest witness deadline. Every later load recomputes it.
+    admission_deadline_unix: i64,
+    witness_count: u8,
+    witnesses: [maximum_freshness_witnesses]WitnessDecision,
+
+    pub fn slice(self: *const FrozenDecisions) []const WitnessDecision {
+        return self.witnesses[0..self.witness_count];
+    }
+};
+
+fn frozenDecisionsEqual(left: ?FrozenDecisions, right: ?FrozenDecisions) bool {
+    if (left == null or right == null) return left == null and right == null;
+    const a = left.?;
+    const b = right.?;
+    if (!std.mem.eql(u8, &a.release_sha256, &b.release_sha256) or
+        a.admission_deadline_unix != b.admission_deadline_unix or
+        a.witness_count != b.witness_count)
+        return false;
+    for (a.slice(), b.slice()) |x, y| {
+        if (!std.mem.eql(u8, &x.repository_id.bytes, &y.repository_id.bytes) or
+            !std.mem.eql(u8, &x.snapshot_sha256, &y.snapshot_sha256) or
+            x.release_date_unix != y.release_date_unix or
+            x.deadline_unix != y.deadline_unix or
+            !std.mem.eql(u8, &x.primary_fingerprint, &y.primary_fingerprint))
+            return false;
+    }
+    return true;
 }
 
 pub const RefreshPolicy = struct {
@@ -94,6 +199,8 @@ pub const RefreshPolicy = struct {
     maximum_decoder_memory: u64,
     cache_publish_options: cache_module.PublishOptions = .{},
     retained_reservation: ?cache_module.Reservation = null,
+    /// Required, and only allowed, for `frozen_release_with_witnesses`.
+    frozen_witnesses: []const WitnessEvidence = &.{},
 };
 
 pub const AcquisitionPolicy = struct {
@@ -154,6 +261,7 @@ pub const PolicyDecisions = struct {
     acquire_by_hash_advertised: bool,
     acquire_by_hash_used: bool,
     fallback_used: bool,
+    frozen: ?FrozenDecisions = null,
 };
 
 pub const Provenance = struct {
@@ -214,7 +322,11 @@ pub const AuthenticatedResult = struct {
 /// every refresh still revalidates those bounds at the current time.
 pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("debz-authenticated-repository-snapshot-v3\x00");
+    // Frozen repositories use v4 so that every existing digest is unchanged.
+    hash.update(if (result.snapshot.provenance.policy.frozen != null)
+        "debz-authenticated-repository-snapshot-v4\x00"
+    else
+        "debz-authenticated-repository-snapshot-v3\x00");
     hash.update(result.snapshot.provenance.repository_id.slice());
     hash.update(&result.snapshot.provenance.release_digest.bytes);
     hash.update(&result.snapshot.provenance.index_digest.bytes);
@@ -246,6 +358,18 @@ pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
         @intFromBool(policy.missing_valid_until_exception_exercised),
         @intFromBool(policy.future_date_accepted),
     });
+    if (policy.frozen) |*frozen| {
+        hash.update(&frozen.release_sha256);
+        updateDigestInt(&hash, i64, frozen.admission_deadline_unix);
+        hash.update(&.{frozen.witness_count});
+        for (frozen.slice()) |witness| {
+            hash.update(&witness.repository_id.bytes);
+            hash.update(&witness.snapshot_sha256);
+            updateDigestInt(&hash, i64, witness.release_date_unix);
+            updateDigestInt(&hash, i64, witness.deadline_unix);
+            hash.update(&witness.primary_fingerprint);
+        }
+    }
     return hash.finalResult();
 }
 
@@ -292,6 +416,14 @@ pub const Error = error{
     RevokedSigningKey,
     InvalidSignature,
     AuthenticationModeMismatch,
+    ReleaseFrozenDigestMismatch,
+    ReleaseFrozenValidUntilPresent,
+    ReleaseFrozenWitnessUnavailable,
+    ReleaseFrozenWitnessTargetMismatch,
+    ReleaseFrozenWitnessSignerMismatch,
+    ReleaseFrozenWitnessOriginMismatch,
+    ReleaseFrozenWitnessOlder,
+    ReleaseFrozenWitnessChanged,
 };
 
 pub fn refresh(
@@ -338,11 +470,17 @@ fn refreshInternal(
     dependencies: Dependencies,
 ) !Result {
     try validateConfiguration(repository, acquisition_policy, refresh_policy);
+    if (refresh_policy.expiry_policy == .frozen_release_with_witnesses) {
+        if (authentication_input == null) return error.InvalidConfiguration;
+        if (refresh_policy.frozen_witnesses.len == 0)
+            return error.ReleaseFrozenWitnessUnavailable;
+    }
+    const namespace = snapshotNamespace(refresh_policy.expiry_policy);
     if (refresh_policy.mode == .cache_only) {
         var record = try dependencies.cache.lookup(
             allocator,
             .{ .value = repository.id.slice() },
-            snapshot_id,
+            namespace,
         );
         errdefer record.deinit();
         const cached_authentication: AuthenticationStatus = switch (record.provenance.verification) {
@@ -546,6 +684,7 @@ fn refreshInternal(
         repository,
         refresh_policy,
         refreshed_at,
+        signature_results,
     );
     const selected = try selectIndex(
         &parsed_release,
@@ -642,6 +781,7 @@ fn refreshInternal(
         .verification_time_unix = release_policy.verification_time,
         .observed_release_age_seconds = release_policy.observed_age_seconds,
         .missing_valid_until_exception_exercised = release_policy.missing_valid_until_exception_exercised,
+        .frozen = release_policy.frozen,
         .by_hash_advertised = advertised,
         .by_hash_used = advertised and !fallback_used,
         .fallback_used = fallback_used,
@@ -670,7 +810,7 @@ fn refreshInternal(
         refresh_policy.retained_reservation.?.finish(token, retained_committed);
     try dependencies.cache.publish(
         .{ .value = repository.id.slice() },
-        snapshot_id,
+        namespace,
         .{
             .verification = cache_verification,
             .verified_at_unix = refreshed_at,
@@ -712,7 +852,12 @@ const ReleasePolicyResult = struct {
     maximum_release_age_seconds: ?u64,
     missing_valid_until_exception_exercised: bool,
     future_date_accepted: bool,
+    frozen: ?FrozenDecisions,
 };
+
+fn snapshotNamespace(policy: ExpiryPolicy) cache_module.SnapshotId {
+    return if (policy == .frozen_release_with_witnesses) frozen_snapshot_id else snapshot_id;
+}
 
 fn validateConfiguration(
     repository: Repository,
@@ -727,7 +872,10 @@ fn validateConfiguration(
         refresh_policy.maximum_decompressed_bytes == 0 or
         refresh_policy.maximum_decoder_memory == 0 or
         refresh_policy.maximum_future_seconds > maximum_future_release_seconds or
-        !validExpiryPolicy(refresh_policy.expiry_policy))
+        !validExpiryPolicy(refresh_policy.expiry_policy) or
+        refresh_policy.frozen_witnesses.len > maximum_freshness_witnesses or
+        (refresh_policy.frozen_witnesses.len != 0 and
+            refresh_policy.expiry_policy != .frozen_release_with_witnesses))
         return error.InvalidConfiguration;
     if (!validPathToken(repository.suite, false) or
         !validPathToken(repository.component, true) or
@@ -847,6 +995,7 @@ fn validateRelease(
     repository: Repository,
     policy: RefreshPolicy,
     now: i64,
+    signatures: []const openpgp.SignatureResult,
 ) !ReleasePolicyResult {
     const suite = metadata.suite orelse return error.ReleaseIdentityMismatch;
     const codename = metadata.codename orelse return error.ReleaseIdentityMismatch;
@@ -866,14 +1015,31 @@ fn validateRelease(
     const valid_until = if (metadata.valid_until) |value| timestampUnix(value.value) else null;
     const maximum_release_age = expiryPolicyMaxAge(policy.expiry_policy);
     var exception_exercised = false;
-    if (valid_until == null) switch (policy.expiry_policy) {
-        .require_valid_until => return error.ReleaseMissingValidUntil,
-        .allow_missing_valid_until_with_max_age_seconds => |maximum_age| {
+    var frozen_decisions: ?FrozenDecisions = null;
+    switch (policy.expiry_policy) {
+        .require_valid_until => if (valid_until == null)
+            return error.ReleaseMissingValidUntil,
+        .allow_missing_valid_until_with_max_age_seconds => |maximum_age| if (valid_until == null) {
             if (now > try missingValidUntilDeadline(date, maximum_age))
                 return error.ReleaseExpired;
             exception_exercised = true;
         },
-    };
+        // The frozen pocket's own age is never compared with `now`.
+        .frozen_release_with_witnesses => |frozen| {
+            if (!cache_module.Digest.of(metadata.source).eql(.{ .bytes = frozen.release_sha256 }))
+                return error.ReleaseFrozenDigestMismatch;
+            if (valid_until != null) return error.ReleaseFrozenValidUntilPresent;
+            frozen_decisions = try admitFrozenRelease(
+                metadata,
+                repository,
+                frozen,
+                policy.frozen_witnesses,
+                date,
+                signatures,
+                now,
+            );
+        },
+    }
     if (valid_until) |valid| {
         if (valid < date) return error.ReleaseValidityInverted;
         if (now > saturatingAdd(valid, policy.expiry_grace_seconds))
@@ -889,7 +1055,105 @@ fn validateRelease(
         .maximum_release_age_seconds = maximum_release_age,
         .missing_valid_until_exception_exercised = exception_exercised,
         .future_date_accepted = future_date_accepted,
+        .frozen = frozen_decisions,
     };
+}
+
+fn admitFrozenRelease(
+    metadata: *const release_metadata.ReleaseMetadata,
+    repository: Repository,
+    frozen: FrozenRelease,
+    witnesses: []const WitnessEvidence,
+    date: i64,
+    signatures: []const openpgp.SignatureResult,
+    now: i64,
+) Error!FrozenDecisions {
+    if (witnesses.len == 0) return error.ReleaseFrozenWitnessUnavailable;
+    if (witnesses.len > maximum_freshness_witnesses) return error.InvalidConfiguration;
+    var decisions: FrozenDecisions = .{
+        .release_sha256 = frozen.release_sha256,
+        .admission_deadline_unix = std.math.maxInt(i64),
+        .witness_count = @intCast(witnesses.len),
+        .witnesses = std.mem.zeroes([maximum_freshness_witnesses]WitnessDecision),
+    };
+    for (witnesses, 0..) |witness, index| {
+        for (witnesses[0..index]) |previous| {
+            if (std.mem.eql(u8, &previous.repository.id.bytes, &witness.repository.id.bytes))
+                return error.InvalidConfiguration;
+        }
+        if (!sameWitnessTarget(repository, witness.repository))
+            return error.ReleaseFrozenWitnessTargetMismatch;
+        if (witness.expiry_policy == .frozen_release_with_witnesses)
+            return error.ReleaseFrozenWitnessUnavailable;
+        const fingerprint = sharedValidFingerprint(signatures, witness.signatures) orelse
+            return error.ReleaseFrozenWitnessSignerMismatch;
+        if (!optionalFieldEqual(metadata.origin, witness.origin) or
+            !optionalFieldEqual(metadata.label, witness.label))
+            return error.ReleaseFrozenWitnessOriginMismatch;
+        if (witness.release_date_unix < date) return error.ReleaseFrozenWitnessOlder;
+        if (now > witness.deadline_unix) return error.ReleaseFrozenWitnessUnavailable;
+        decisions.witnesses[index] = .{
+            .repository_id = witness.repository.id,
+            .snapshot_sha256 = witness.snapshot_sha256,
+            .release_date_unix = witness.release_date_unix,
+            .deadline_unix = witness.deadline_unix,
+            .primary_fingerprint = fingerprint,
+        };
+        decisions.admission_deadline_unix = @min(
+            decisions.admission_deadline_unix,
+            witness.deadline_unix,
+        );
+    }
+    return decisions;
+}
+
+fn sameWitnessTarget(frozen: Repository, witness: Repository) bool {
+    return uriEqual(frozen.base_uri, witness.base_uri) and
+        !std.mem.eql(u8, frozen.suite, witness.suite) and
+        std.mem.eql(u8, frozen.component, witness.component) and
+        std.mem.eql(u8, frozen.architecture, witness.architecture);
+}
+
+fn uriComponentText(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw, .percent_encoded => |value| value,
+    };
+}
+
+fn uriEqual(left: std.Uri, right: std.Uri) bool {
+    if (!std.ascii.eqlIgnoreCase(left.scheme, right.scheme) or left.port != right.port or
+        (left.host == null) != (right.host == null))
+        return false;
+    if (left.host) |host| {
+        if (!std.ascii.eqlIgnoreCase(uriComponentText(host), uriComponentText(right.host.?)))
+            return false;
+    }
+    return std.mem.eql(
+        u8,
+        std.mem.trimEnd(u8, uriComponentText(left.path), "/"),
+        std.mem.trimEnd(u8, uriComponentText(right.path), "/"),
+    );
+}
+
+fn sharedValidFingerprint(
+    frozen: []const openpgp.SignatureResult,
+    witness: []const openpgp.SignatureResult,
+) ?[20]u8 {
+    for (frozen) |left| {
+        if (left.status != .valid) continue;
+        const fingerprint = left.primary_fingerprint orelse continue;
+        for (witness) |right| {
+            if (right.status != .valid) continue;
+            const other = right.primary_fingerprint orelse continue;
+            if (std.mem.eql(u8, &fingerprint, &other)) return fingerprint;
+        }
+    }
+    return null;
+}
+
+fn optionalFieldEqual(field: ?release_metadata.LocatedString, value: ?[]const u8) bool {
+    if (field == null or value == null) return field == null and value == null;
+    return std.mem.eql(u8, field.?.value, value.?);
 }
 
 pub fn validateFutureDate(
@@ -1173,6 +1437,8 @@ const SnapshotManifest = struct {
     verification_time_unix: i64,
     observed_release_age_seconds: u64,
     missing_valid_until_exception_exercised: bool,
+    /// Present only in v5 snapshots, which only frozen repositories use.
+    frozen: ?FrozenDecisions = null,
     by_hash_advertised: bool,
     by_hash_used: bool,
     fallback_used: bool,
@@ -1188,7 +1454,10 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
         return error.InvalidConfiguration;
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(allocator);
-    try bytes.appendSlice(allocator, snapshot_magic ++ "\n");
+    try bytes.appendSlice(
+        allocator,
+        if (manifest.frozen != null) frozen_snapshot_magic ++ "\n" else snapshot_magic ++ "\n",
+    );
     try appendInt(&bytes, allocator, i64, manifest.refreshed_at_unix);
     try appendInt(&bytes, allocator, i64, manifest.release_date_unix);
     try appendInt(&bytes, allocator, i64, manifest.valid_until_unix orelse 0);
@@ -1267,6 +1536,20 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
         manifest.release_bytes,
         manifest.index_bytes,
     }) |value| try bytes.appendSlice(allocator, value);
+    if (manifest.frozen) |*frozen| {
+        if (frozen.witness_count == 0 or frozen.witness_count > maximum_freshness_witnesses)
+            return error.InvalidConfiguration;
+        try bytes.appendSlice(allocator, &frozen.release_sha256);
+        try appendInt(&bytes, allocator, i64, frozen.admission_deadline_unix);
+        try bytes.append(allocator, frozen.witness_count);
+        for (frozen.slice()) |witness| {
+            try bytes.appendSlice(allocator, &witness.repository_id.bytes);
+            try bytes.appendSlice(allocator, &witness.snapshot_sha256);
+            try appendInt(&bytes, allocator, i64, witness.release_date_unix);
+            try appendInt(&bytes, allocator, i64, witness.deadline_unix);
+            try bytes.appendSlice(allocator, &witness.primary_fingerprint);
+        }
+    }
     return bytes.toOwnedSlice(allocator);
 }
 
@@ -1283,7 +1566,10 @@ fn appendInt(
 
 fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotManifest {
     var reader: FixedReader = .{ .bytes = bytes };
-    if (!std.mem.eql(u8, reader.take(snapshot_magic.len), snapshot_magic) or
+    comptime std.debug.assert(snapshot_magic.len == frozen_snapshot_magic.len);
+    const magic = reader.take(snapshot_magic.len);
+    const frozen_snapshot = std.mem.eql(u8, magic, frozen_snapshot_magic);
+    if ((!frozen_snapshot and !std.mem.eql(u8, magic, snapshot_magic)) or
         !std.mem.eql(u8, reader.take(1), "\n"))
         return error.CorruptSnapshot;
     const refreshed = reader.int(i64);
@@ -1381,6 +1667,25 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
     const authentication_payload = reader.take(authentication_payload_len);
     const release_bytes = reader.take(release_len);
     const index_bytes = reader.take(index_len);
+    var frozen: ?FrozenDecisions = null;
+    if (frozen_snapshot) {
+        var decisions: FrozenDecisions = .{
+            .release_sha256 = reader.array(32),
+            .admission_deadline_unix = reader.int(i64),
+            .witness_count = reader.byte(),
+            .witnesses = std.mem.zeroes([maximum_freshness_witnesses]WitnessDecision),
+        };
+        if (decisions.witness_count == 0 or decisions.witness_count > maximum_freshness_witnesses)
+            return error.CorruptSnapshot;
+        for (decisions.witnesses[0..decisions.witness_count]) |*witness| witness.* = .{
+            .repository_id = .{ .bytes = reader.array(64) },
+            .snapshot_sha256 = reader.array(32),
+            .release_date_unix = reader.int(i64),
+            .deadline_unix = reader.int(i64),
+            .primary_fingerprint = reader.array(20),
+        };
+        frozen = decisions;
+    }
     if (reader.failed or reader.offset != bytes.len or selected_path.len == 0 or
         release_uri.len == 0 or index_uri.len == 0)
         return error.CorruptSnapshot;
@@ -1410,6 +1715,7 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
         .verification_time_unix = policy_verification_time,
         .observed_release_age_seconds = observed_release_age,
         .missing_valid_until_exception_exercised = policy_flags & 1 != 0,
+        .frozen = frozen,
         .by_hash_advertised = flags & 8 != 0,
         .by_hash_used = flags & 16 != 0,
         .fallback_used = flags & 32 != 0,
@@ -1456,13 +1762,26 @@ fn loadSnapshot(
     const configured_maximum_age = expiryPolicyMaxAge(policy.expiry_policy);
     if (manifest.maximum_future_seconds != policy.maximum_future_seconds or
         manifest.expiry_grace_seconds != policy.expiry_grace_seconds or
-        manifest.maximum_release_age_seconds != configured_maximum_age)
+        manifest.maximum_release_age_seconds != configured_maximum_age or
+        (manifest.frozen != null) != (policy.expiry_policy == .frozen_release_with_witnesses))
         return error.CorruptSnapshot;
+    if (manifest.frozen) |*frozen| {
+        // A cached admission is reusable only with the exact witness
+        // snapshots that admitted it.
+        if (frozen.witness_count != policy.frozen_witnesses.len)
+            return error.ReleaseFrozenWitnessChanged;
+        for (frozen.slice(), policy.frozen_witnesses) |stored, current| {
+            if (!std.mem.eql(u8, &stored.repository_id.bytes, &current.repository.id.bytes) or
+                !std.mem.eql(u8, &stored.snapshot_sha256, &current.snapshot_sha256))
+                return error.ReleaseFrozenWitnessChanged;
+        }
+    }
     const stored_release_policy = validateRelease(
         &release,
         repository,
         policy,
         manifest.verification_time_unix,
+        current_signatures,
     ) catch return error.CorruptSnapshot;
     if (manifest.refreshed_at_unix != manifest.verification_time_unix or
         manifest.release_date_unix != stored_release_policy.date or
@@ -1473,9 +1792,16 @@ fn loadSnapshot(
         manifest.maximum_release_age_seconds != stored_release_policy.maximum_release_age_seconds or
         manifest.missing_valid_until_exception_exercised !=
             stored_release_policy.missing_valid_until_exception_exercised or
-        manifest.future_date_accepted != stored_release_policy.future_date_accepted)
+        manifest.future_date_accepted != stored_release_policy.future_date_accepted or
+        !frozenDecisionsEqual(manifest.frozen, stored_release_policy.frozen))
         return error.CorruptSnapshot;
-    const release_policy = try validateRelease(&release, repository, policy, now);
+    const release_policy = try validateRelease(
+        &release,
+        repository,
+        policy,
+        now,
+        current_signatures,
+    );
     const selected = try selectIndex(&release, repository, policy.compression_order);
     if (!std.mem.eql(u8, selected.path.value, manifest.selected_path) or
         selected.compression != manifest.compression or
@@ -1493,7 +1819,8 @@ fn loadSnapshot(
     );
     errdefer packages.deinit();
     if (manifest.release_date_unix != release_policy.date or
-        manifest.valid_until_unix != release_policy.valid_until)
+        manifest.valid_until_unix != release_policy.valid_until or
+        !frozenDecisionsEqual(manifest.frozen, release_policy.frozen))
         return error.CorruptSnapshot;
     return .{
         .bytes = owned_bytes,
@@ -1536,6 +1863,7 @@ fn loadSnapshot(
                 .acquire_by_hash_advertised = manifest.by_hash_advertised,
                 .acquire_by_hash_used = manifest.by_hash_used,
                 .fallback_used = manifest.fallback_used,
+                .frozen = release_policy.frozen,
             },
         },
         .allocator = allocator,
@@ -2339,7 +2667,7 @@ test "bounded missing Valid-Until policy is explicit finite and fail closed" {
     var policy = testRefreshPolicy(&.{.uncompressed});
     try std.testing.expectError(
         error.ReleaseMissingValidUntil,
-        validateRelease(&boundary_metadata, repository, policy, fixedNow(null)),
+        validateRelease(&boundary_metadata, repository, policy, fixedNow(null), &.{}),
     );
     policy.expiry_policy = .{
         .allow_missing_valid_until_with_max_age_seconds = 100,
@@ -2349,6 +2677,7 @@ test "bounded missing Valid-Until policy is explicit finite and fail closed" {
         repository,
         policy,
         fixedNow(null),
+        &.{},
     );
     try std.testing.expect(accepted.missing_valid_until_exception_exercised);
     try std.testing.expectEqual(@as(u64, 100), accepted.observed_age_seconds);
@@ -2365,7 +2694,7 @@ test "bounded missing Valid-Until policy is explicit finite and fail closed" {
     defer stale_metadata.deinit();
     try std.testing.expectError(
         error.ReleaseExpired,
-        validateRelease(&stale_metadata, repository, policy, fixedNow(null)),
+        validateRelease(&stale_metadata, repository, policy, fixedNow(null), &.{}),
     );
 
     const future_release = try makeReleaseWithoutValidUntil(
@@ -2382,6 +2711,7 @@ test "bounded missing Valid-Until policy is explicit finite and fail closed" {
         repository,
         policy,
         fixedNow(null),
+        &.{},
     );
     try std.testing.expect(future.future_date_accepted);
     try std.testing.expectEqual(@as(u64, 0), future.observed_age_seconds);
@@ -2445,7 +2775,7 @@ test "Valid-Until remains authoritative under bounded missing-expiry policy" {
     };
     try std.testing.expectError(
         error.ReleaseExpired,
-        validateRelease(&metadata, repository, policy, fixedNow(null)),
+        validateRelease(&metadata, repository, policy, fixedNow(null), &.{}),
     );
 }
 
@@ -2962,5 +3292,568 @@ test "interrupted publication leaves no snapshot and offline miss fails closed" 
         testAcquisitionPolicy(),
         policy,
         testDependencies(&offline_fixture, &cache),
+    ));
+}
+
+fn expectHexDigest(expected: []const u8, actual: [32]u8) !void {
+    const encoded = std.fmt.bytesToHex(actual, .lower);
+    try std.testing.expectEqualStrings(expected, &encoded);
+}
+
+test "non-frozen snapshot digests and cache encodings stay byte-identical" {
+    const allocator = std.testing.allocator;
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .max_object_bytes = 128 * 1024,
+    });
+    defer cache.deinit();
+
+    var signed_fixture: TestFixture = .{
+        .responses = &.{},
+        .file_bodies = &.{ &fixture_data.repository_in_release, test_packages },
+    };
+    var repository = try testRepository();
+    repository.base_uri = try acquisition.Uri.parse("file:///repository");
+    var signed = try refreshAuthenticated(
+        allocator,
+        repository,
+        .{ .in_release = authenticationPolicy(&fixture_data.keyring, fixture_data.created + 30) },
+        testAcquisitionPolicy(),
+        testRefreshPolicy(&.{.uncompressed}),
+        authenticatedDependencies(&signed_fixture, &cache),
+    );
+    defer signed.deinit();
+    try expectHexDigest(
+        "4d800159ef36333642057bab5504c9fa40fd8848992fac127dd6d9d06b9b5134",
+        snapshotDigest(&signed),
+    );
+    try expectHexDigest(
+        "8cf6a894ab595573db6c245d510a3d314d3b40c8a46c4033db913b0f090ce932",
+        cache_module.Digest.of(signed.snapshot.bytes).bytes,
+    );
+
+    const bounded_release = try makeReleaseWithoutValidUntil(
+        allocator,
+        test_packages,
+        "main/binary-amd64/Packages",
+        "Fri, 14 Aug 2026 19:58:20 UTC",
+    );
+    defer allocator.free(bounded_release);
+    var bounded_fixture: TestFixture = .{ .responses = &.{
+        .{ .status = 200, .body = bounded_release },
+        .{ .status = 200, .body = test_packages },
+    } };
+    var bounded_repository = try testRepository();
+    bounded_repository.id = .{ .bytes = @splat('b') };
+    var bounded_policy = testRefreshPolicy(&.{.uncompressed});
+    bounded_policy.expiry_policy = .{
+        .allow_missing_valid_until_with_max_age_seconds = maximum_missing_valid_until_age_seconds,
+    };
+    const bounded_result = try refresh(
+        allocator,
+        bounded_repository,
+        testAcquisitionPolicy(),
+        bounded_policy,
+        testDependencies(&bounded_fixture, &cache),
+    );
+    var bounded: AuthenticatedResult = .{ .snapshot = bounded_result };
+    defer bounded.deinit();
+    try expectHexDigest(
+        "6ae885944bbf987652519efdb030423a0dae0e910c38fa543e24416d0418686a",
+        snapshotDigest(&bounded),
+    );
+    try expectHexDigest(
+        "64670462d57b54e8ecac32a3aac84a8a75d5ea1127fa54464dd0b3c5dd094530",
+        cache_module.Digest.of(bounded.snapshot.bytes).bytes,
+    );
+}
+
+const frozen_test_bounded: ExpiryPolicy = .{
+    .allow_missing_valid_until_with_max_age_seconds = 2_678_400,
+};
+// Dates in tools/generate-openpgp-fixtures.py.
+const frozen_test_date: i64 = 1_680_307_200; // Sat, 01 Apr 2023 00:00:00
+const witness_updates_date: i64 = 1_699_992_000; // Tue, 14 Nov 2023 20:00:00
+const witness_security_date: i64 = 1_699_995_600; // Tue, 14 Nov 2023 21:00:00
+const witness_security_valid_until: i64 = 1_700_600_400; // Tue, 21 Nov 2023 21:00:00
+
+fn frozenTestRepository(id: u8, uri: []const u8, suite: []const u8) !Repository {
+    return .{
+        .id = .{ .bytes = @splat(id) },
+        .base_uri = try acquisition.Uri.parse(uri),
+        .suite = suite,
+        .component = "main",
+        .architecture = "amd64",
+    };
+}
+
+fn frozenTestPin(release: []const u8) ExpiryPolicy {
+    return .{ .frozen_release_with_witnesses = .{
+        .release_sha256 = cache_module.Digest.of(release).bytes,
+    } };
+}
+
+fn refreshFrozenFixture(
+    cache: *cache_module.Cache,
+    repository: Repository,
+    in_release: []const u8,
+    expiry_policy: ExpiryPolicy,
+    witnesses: []const WitnessEvidence,
+    now: *i64,
+    signer: enum { archive, ed25519 },
+    mode: Mode,
+) !AuthenticatedResult {
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var fixture: TestFixture = .{
+        .responses = &.{},
+        .file_bodies = if (mode == .online) &.{ in_release, test_packages } else &.{},
+    };
+    var policy = testRefreshPolicy(&.{.uncompressed});
+    policy.mode = mode;
+    policy.expiry_policy = expiry_policy;
+    policy.frozen_witnesses = witnesses;
+    const auth: AuthenticationInput = .{ .in_release = switch (signer) {
+        .archive => authenticationPolicy(&fixture_data.keyring, fixture_data.created + 30),
+        .ed25519 => .{
+            .keyrings = .{ .one = .{ .bytes = &fixture_data.ed25519_keyring } },
+            .accepted_primary_fingerprints = &.{fixture_data.ed25519_fingerprint},
+            .verification_time = fixture_data.created + 30,
+        },
+    } };
+    var dependencies = testDependencies(&fixture, cache);
+    dependencies.clock = .{ .context = now, .nowUnixFn = mutableNow };
+    const result = try refreshAuthenticated(
+        std.testing.allocator,
+        repository,
+        auth,
+        testAcquisitionPolicy(),
+        policy,
+        dependencies,
+    );
+    if (mode == .cache_only) try std.testing.expectEqual(@as(usize, 0), fixture.next_file);
+    return result;
+}
+
+const FrozenWitnessSet = struct {
+    updates: AuthenticatedResult,
+    security: AuthenticatedResult,
+    evidence: [2]WitnessEvidence,
+
+    fn deinit(self: *FrozenWitnessSet) void {
+        self.updates.deinit();
+        self.security.deinit();
+    }
+};
+
+fn refreshFrozenWitnesses(
+    cache: *cache_module.Cache,
+    uri: []const u8,
+    now: *i64,
+) !FrozenWitnessSet {
+    const fixture_data = @import("fixtures/openpgp.zig");
+    const updates_repository = try frozenTestRepository('u', uri, "stable-updates");
+    const security_repository = try frozenTestRepository('s', uri, "stable-security");
+    var updates = try refreshFrozenFixture(
+        cache,
+        updates_repository,
+        &fixture_data.witness_updates_in_release,
+        frozen_test_bounded,
+        &.{},
+        now,
+        .archive,
+        .online,
+    );
+    errdefer updates.deinit();
+    var security = try refreshFrozenFixture(
+        cache,
+        security_repository,
+        &fixture_data.witness_security_in_release,
+        .require_valid_until,
+        &.{},
+        now,
+        .archive,
+        .online,
+    );
+    errdefer security.deinit();
+    return .{
+        .updates = updates,
+        .security = security,
+        .evidence = .{
+            try witnessEvidence(&updates, updates_repository),
+            try witnessEvidence(&security, security_repository),
+        },
+    };
+}
+
+test "frozen release is admitted only through same-snapshot witnesses" {
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .max_object_bytes = 128 * 1024,
+    });
+    defer cache.deinit();
+    const uri = "file:///snapshot/20231114T220000Z";
+    var now: i64 = fixture_data.created + 30;
+    var witnesses = try refreshFrozenWitnesses(&cache, uri, &now);
+    defer witnesses.deinit();
+    const updates_deadline = witness_updates_date + 2_678_400;
+    try std.testing.expectEqual(updates_deadline, witnesses.evidence[0].deadline_unix);
+    try std.testing.expectEqual(witness_security_valid_until, witnesses.evidence[1].deadline_unix);
+    try std.testing.expectEqual(witness_updates_date, witnesses.evidence[0].release_date_unix);
+    try std.testing.expectEqual(witness_security_date, witnesses.evidence[1].release_date_unix);
+
+    const repository = try frozenTestRepository('f', uri, "stable");
+    const pin = frozenTestPin(&fixture_data.frozen_release);
+    // The frozen pocket is two-thirds of a year old; only the witnesses keep
+    // it fresh.
+    try std.testing.expect(now - frozen_test_date > 2_678_400);
+    var result = try refreshFrozenFixture(
+        &cache,
+        repository,
+        &fixture_data.frozen_in_release,
+        pin,
+        &witnesses.evidence,
+        &now,
+        .archive,
+        .online,
+    );
+    defer result.deinit();
+    const policy = result.snapshot.provenance.policy;
+    const frozen = policy.frozen orelse return error.TestExpectedFrozenDecision;
+    try std.testing.expect(expiryPoliciesEqual(pin, policy.expiry_policy));
+    try std.testing.expectEqual(@as(?i64, null), policy.valid_until_unix);
+    try std.testing.expectEqual(@as(?u64, null), policy.maximum_release_age_seconds);
+    try std.testing.expect(!policy.missing_valid_until_exception_exercised);
+    try std.testing.expectEqual(frozen_test_date, policy.release_date_unix);
+    try std.testing.expectEqualSlices(u8, &pin.frozen_release_with_witnesses.release_sha256, &frozen.release_sha256);
+    try std.testing.expectEqualSlices(u8, &frozen.release_sha256, &result.snapshot.provenance.release_digest.bytes);
+    // The admission deadline is the earliest witness deadline.
+    try std.testing.expectEqual(witness_security_valid_until, frozen.admission_deadline_unix);
+    try std.testing.expectEqual(@min(updates_deadline, witness_security_valid_until), frozen.admission_deadline_unix);
+    try std.testing.expectEqual(@as(usize, 2), frozen.slice().len);
+    for (frozen.slice(), witnesses.evidence) |decision, evidence| {
+        try std.testing.expectEqualSlices(u8, &evidence.repository.id.bytes, &decision.repository_id.bytes);
+        try std.testing.expectEqualSlices(u8, &evidence.snapshot_sha256, &decision.snapshot_sha256);
+        try std.testing.expectEqual(evidence.release_date_unix, decision.release_date_unix);
+        try std.testing.expectEqual(evidence.deadline_unix, decision.deadline_unix);
+        try std.testing.expectEqualSlices(u8, &fixture_data.primary_fingerprint, &decision.primary_fingerprint);
+    }
+
+    // Snapshot digest v4 binds every frozen decision.
+    const original_digest = snapshotDigest(&result);
+    const original_frozen = frozen;
+    const FrozenBinding = enum { release, deadline, count, witness_id, witness_snapshot, witness_date, witness_deadline, witness_signer };
+    inline for (std.meta.tags(FrozenBinding)) |binding| {
+        var changed = original_frozen;
+        switch (binding) {
+            .release => changed.release_sha256[0] ^= 1,
+            .deadline => changed.admission_deadline_unix -= 1,
+            .count => changed.witness_count = 1,
+            .witness_id => changed.witnesses[0].repository_id.bytes[0] ^= 1,
+            .witness_snapshot => changed.witnesses[1].snapshot_sha256[0] ^= 1,
+            .witness_date => changed.witnesses[0].release_date_unix += 1,
+            .witness_deadline => changed.witnesses[1].deadline_unix += 1,
+            .witness_signer => changed.witnesses[0].primary_fingerprint[0] ^= 1,
+        }
+        result.snapshot.provenance.policy.frozen = changed;
+        try std.testing.expect(!std.mem.eql(u8, &original_digest, &snapshotDigest(&result)));
+    }
+    result.snapshot.provenance.policy.frozen = original_frozen;
+    try std.testing.expectEqualSlices(u8, &original_digest, &snapshotDigest(&result));
+
+    // Cache-only reload re-admits through the same witnesses and is
+    // byte-identical.
+    var cached = try refreshFrozenFixture(
+        &cache,
+        repository,
+        &fixture_data.frozen_in_release,
+        pin,
+        &witnesses.evidence,
+        &now,
+        .archive,
+        .cache_only,
+    );
+    defer cached.deinit();
+    try std.testing.expectEqual(MetadataSource.cache, cached.snapshot.provenance.source);
+    try std.testing.expectEqualSlices(u8, &original_digest, &snapshotDigest(&cached));
+
+    // A changed witness snapshot invalidates the cached admission.
+    var changed_evidence = witnesses.evidence;
+    changed_evidence[1].snapshot_sha256[0] ^= 1;
+    try std.testing.expectError(error.ReleaseFrozenWitnessChanged, refreshFrozenFixture(
+        &cache,
+        repository,
+        &fixture_data.frozen_in_release,
+        pin,
+        &changed_evidence,
+        &now,
+        .archive,
+        .cache_only,
+    ));
+    try std.testing.expectError(error.ReleaseFrozenWitnessChanged, refreshFrozenFixture(
+        &cache,
+        repository,
+        &fixture_data.frozen_in_release,
+        pin,
+        witnesses.evidence[0..1],
+        &now,
+        .archive,
+        .cache_only,
+    ));
+
+    // Cache-only reload re-evaluates witness freshness at its own `now`.
+    now = witness_security_valid_until;
+    var at_deadline = try refreshFrozenFixture(
+        &cache,
+        repository,
+        &fixture_data.frozen_in_release,
+        pin,
+        &witnesses.evidence,
+        &now,
+        .archive,
+        .cache_only,
+    );
+    at_deadline.deinit();
+    now = witness_security_valid_until + 1;
+    try std.testing.expectError(error.ReleaseFrozenWitnessUnavailable, refreshFrozenFixture(
+        &cache,
+        repository,
+        &fixture_data.frozen_in_release,
+        pin,
+        &witnesses.evidence,
+        &now,
+        .archive,
+        .cache_only,
+    ));
+
+    // The frozen pocket uses its own v5 cache namespace; the v4 namespace
+    // never holds it.
+    try std.testing.expectError(error.CacheMiss, cache.lookup(
+        std.testing.allocator,
+        .{ .value = repository.id.slice() },
+        snapshot_id,
+    ));
+    var stored = try cache.lookup(
+        std.testing.allocator,
+        .{ .value = repository.id.slice() },
+        frozen_snapshot_id,
+    );
+    defer stored.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, stored.bytes, frozen_snapshot_magic ++ "\n"));
+}
+
+test "frozen release refusals are typed and publish nothing" {
+    const fixture_data = @import("fixtures/openpgp.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cache = try cache_module.Cache.initFromDir(std.testing.io, tmp.dir, .{
+        .max_object_bytes = 128 * 1024,
+    });
+    defer cache.deinit();
+    const uri = "file:///snapshot/20231114T220000Z";
+    var now: i64 = fixture_data.created + 30;
+    var witnesses = try refreshFrozenWitnesses(&cache, uri, &now);
+    defer witnesses.deinit();
+    const repository = try frozenTestRepository('f', uri, "stable");
+    const pin = frozenTestPin(&fixture_data.frozen_release);
+    const Expect = struct {
+        fn refusal(
+            expected: anyerror,
+            cache_value: *cache_module.Cache,
+            repository_value: Repository,
+            in_release: []const u8,
+            policy: ExpiryPolicy,
+            evidence: []const WitnessEvidence,
+            now_value: *i64,
+        ) !void {
+            try std.testing.expectError(expected, refreshFrozenFixture(
+                cache_value,
+                repository_value,
+                in_release,
+                policy,
+                evidence,
+                now_value,
+                .archive,
+                .online,
+            ));
+            try std.testing.expectError(error.CacheMiss, cache_value.lookup(
+                std.testing.allocator,
+                .{ .value = repository_value.id.slice() },
+                frozen_snapshot_id,
+            ));
+        }
+    };
+
+    // Frozen Release bytes that do not match the pin.
+    var wrong_pin = pin;
+    wrong_pin.frozen_release_with_witnesses.release_sha256[31] ^= 1;
+    try Expect.refusal(error.ReleaseFrozenDigestMismatch, &cache, repository, &fixture_data.frozen_in_release, wrong_pin, &witnesses.evidence, &now);
+    try Expect.refusal(error.ReleaseFrozenDigestMismatch, &cache, repository, &fixture_data.frozen_newer_in_release, pin, &witnesses.evidence, &now);
+
+    // A "frozen" pocket that still has Valid-Until, even with matching bytes.
+    try Expect.refusal(
+        error.ReleaseFrozenValidUntilPresent,
+        &cache,
+        try frozenTestRepository('v', uri, "stable"),
+        &fixture_data.repository_in_release,
+        frozenTestPin(&fixture_data.repository_release),
+        &witnesses.evidence,
+        &now,
+    );
+
+    // Missing witnesses.
+    try Expect.refusal(error.ReleaseFrozenWitnessUnavailable, &cache, repository, &fixture_data.frozen_in_release, pin, &.{}, &now);
+
+    // An expired witness.
+    var expired_now: i64 = witness_security_valid_until + 1;
+    try Expect.refusal(error.ReleaseFrozenWitnessUnavailable, &cache, repository, &fixture_data.frozen_in_release, pin, &witnesses.evidence, &expired_now);
+    try Expect.refusal(error.ReleaseFrozenWitnessUnavailable, &cache, repository, &fixture_data.frozen_in_release, pin, witnesses.evidence[1..2], &expired_now);
+
+    // A witness from another snapshot URI.
+    {
+        var other_now: i64 = now;
+        var other = try refreshFrozenWitnesses(&cache, "file:///snapshot/20231115T000000Z", &other_now);
+        defer other.deinit();
+        try Expect.refusal(error.ReleaseFrozenWitnessTargetMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, other.evidence[0..1], &now);
+        try Expect.refusal(error.ReleaseFrozenWitnessTargetMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, &.{ witnesses.evidence[0], other.evidence[1] }, &now);
+    }
+
+    // A witness with another component, architecture, or the frozen suite.
+    const TargetMutation = enum { component, architecture, suite };
+    inline for (std.meta.tags(TargetMutation)) |mutation| {
+        var evidence = witnesses.evidence;
+        switch (mutation) {
+            .component => evidence[0].repository.component = "contrib",
+            .architecture => evidence[1].repository.architecture = "arm64",
+            .suite => evidence[0].repository.suite = repository.suite,
+        }
+        try Expect.refusal(error.ReleaseFrozenWitnessTargetMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, &evidence, &now);
+    }
+
+    // A witness with no shared signer fingerprint.
+    {
+        const ed25519_repository = try frozenTestRepository('e', uri, "stable-updates");
+        var ed25519 = try refreshFrozenFixture(
+            &cache,
+            ed25519_repository,
+            &fixture_data.witness_updates_ed25519_in_release,
+            frozen_test_bounded,
+            &.{},
+            &now,
+            .ed25519,
+            .online,
+        );
+        defer ed25519.deinit();
+        const evidence = [_]WitnessEvidence{
+            try witnessEvidence(&ed25519, ed25519_repository),
+            witnesses.evidence[1],
+        };
+        try Expect.refusal(error.ReleaseFrozenWitnessSignerMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, &evidence, &now);
+        var invalid_signature = witnesses.evidence;
+        var statuses: [8]openpgp.SignatureResult = undefined;
+        @memcpy(statuses[0..invalid_signature[0].signatures.len], invalid_signature[0].signatures);
+        for (statuses[0..invalid_signature[0].signatures.len]) |*status| status.status = .bad_signature;
+        invalid_signature[0].signatures = statuses[0..invalid_signature[0].signatures.len];
+        try Expect.refusal(error.ReleaseFrozenWitnessSignerMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, &invalid_signature, &now);
+    }
+
+    // A witness with a different Origin or Label.
+    {
+        const other_repository = try frozenTestRepository('o', uri, "stable-updates");
+        var other_origin = try refreshFrozenFixture(
+            &cache,
+            other_repository,
+            &fixture_data.witness_other_origin_in_release,
+            frozen_test_bounded,
+            &.{},
+            &now,
+            .archive,
+            .online,
+        );
+        defer other_origin.deinit();
+        const evidence = [_]WitnessEvidence{
+            try witnessEvidence(&other_origin, other_repository),
+            witnesses.evidence[1],
+        };
+        try Expect.refusal(error.ReleaseFrozenWitnessOriginMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, &evidence, &now);
+        var label = witnesses.evidence;
+        label[1].label = "other fixture";
+        try Expect.refusal(error.ReleaseFrozenWitnessOriginMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, &label, &now);
+        var missing_origin = witnesses.evidence;
+        missing_origin[0].origin = null;
+        try Expect.refusal(error.ReleaseFrozenWitnessOriginMismatch, &cache, repository, &fixture_data.frozen_in_release, pin, &missing_origin, &now);
+    }
+
+    // A witness Date older than the frozen pocket's Date.
+    try Expect.refusal(
+        error.ReleaseFrozenWitnessOlder,
+        &cache,
+        try frozenTestRepository('n', uri, "stable"),
+        &fixture_data.frozen_newer_in_release,
+        frozenTestPin(&fixture_data.frozen_newer_release),
+        &witnesses.evidence,
+        &now,
+    );
+
+    // A witness that is itself frozen cannot be used, and witnesses cannot be
+    // duplicated, exceed the bound, or appear on a non-frozen policy.
+    {
+        const admitted_repository = try frozenTestRepository('z', uri, "stable");
+        var frozen = try refreshFrozenFixture(
+            &cache,
+            admitted_repository,
+            &fixture_data.frozen_in_release,
+            pin,
+            &witnesses.evidence,
+            &now,
+            .archive,
+            .online,
+        );
+        defer frozen.deinit();
+        try std.testing.expectError(
+            error.ReleaseFrozenWitnessUnavailable,
+            witnessEvidence(&frozen, admitted_repository),
+        );
+        var chained = witnesses.evidence;
+        chained[0].expiry_policy = pin;
+        try std.testing.expectError(error.ReleaseFrozenWitnessUnavailable, refreshFrozenFixture(
+            &cache,
+            try frozenTestRepository('c', uri, "stable"),
+            &fixture_data.frozen_in_release,
+            pin,
+            &chained,
+            &now,
+            .archive,
+            .online,
+        ));
+        try std.testing.expectError(
+            error.ReleaseFrozenWitnessUnavailable,
+            witnessEvidence(&witnesses.updates, try frozenTestRepository('x', uri, "stable-updates")),
+        );
+    }
+    try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, pin, &.{ witnesses.evidence[0], witnesses.evidence[0] }, &now);
+    try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, pin, &(.{witnesses.evidence[0]} ** (maximum_freshness_witnesses + 1)), &now);
+    try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, frozen_test_bounded, &witnesses.evidence, &now);
+    try std.testing.expect(!validExpiryPolicy(.{
+        .frozen_release_with_witnesses = .{ .release_sha256 = @splat(0) },
+    }));
+
+    // A frozen pocket is never admitted without authentication.
+    var fixture: TestFixture = .{
+        .responses = &.{},
+        .file_bodies = &.{ &fixture_data.frozen_release, test_packages },
+    };
+    var policy = testRefreshPolicy(&.{.uncompressed});
+    policy.expiry_policy = pin;
+    policy.frozen_witnesses = &witnesses.evidence;
+    try std.testing.expectError(error.InvalidConfiguration, refresh(
+        std.testing.allocator,
+        repository,
+        testAcquisitionPolicy(),
+        policy,
+        testDependencies(&fixture, &cache),
     ));
 }

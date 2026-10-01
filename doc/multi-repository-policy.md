@@ -35,16 +35,38 @@ previous authenticated cache snapshot, marks it stale in provenance, and
 never substitutes another mirror. `cache_only` performs no acquisition and
 fails on a missing or policy-incompatible snapshot.
 
+A `frozen_release_with_witnesses` repository names witness suites
+(`Policy.freshness_witnesses`). Each must resolve, in the same normalized
+configuration, to an enabled repository with the same URI, component,
+architecture and `Signed-By` whose own freshness is not frozen; otherwise
+normalization fails with `invalid_freshness_witness`. Witness lists must be
+non-empty, unique and at most four entries (`invalid_policy`). The pinned
+Release SHA-256 and sorted witness suites are repository identity input and
+appear in canonical output as `X-Debz-Expiry-Policy`,
+`X-Debz-Frozen-Release-SHA256` and `X-Debz-Freshness-Witnesses` comments. A
+configuration with a frozen repository uses configuration identity domain
+v3; all other configurations keep their v1/v2 identities. `refreshAll`
+refreshes every non-frozen repository first, then admits each frozen
+repository only through evidence from this run's own authenticated witness
+results. Runtime-supplied witness evidence is `DeclaredPolicyMismatch`, and a
+failed or stale witness fails the frozen repository with
+`ReleaseFrozenWitnessUnavailable`.
+
 Immutable URL and named snapshot repositories are cache-first in online mode:
 after their first authenticated publication, the same configuration identity
 can only reuse that authenticated generation. Changing immutable content or
 authentication policy requires changing the declared immutable identity.
+A frozen immutable repository whose cached admission names different witness
+snapshots refetches and re-admits its pinned bytes.
 
 After every enabled repository has a complete trusted generation, `refreshAll`
 atomically publishes a deterministic aggregate manifest through the explicit
 `metadata_cache.Cache`. It records configuration/repository IDs, Release and
 index digests, selected index paths, signer fingerprints, explicit clock time,
-immutability identity, and stale decisions. Cache publish locking is controlled
+immutability identity, and stale decisions. When a frozen repository is
+present, the manifest is `debz-multi-repository-manifest-v2` and adds each
+frozen repository's admission deadline and witness repository IDs; other
+manifests keep their v1 bytes. Cache publish locking is controlled
 by `aggregate_publish`; per-repository locking remains controlled by each
 runtime refresh policy. Optional reservation hooks reject retained snapshot
 memory, aggregate-manifest memory, object growth, or derived-manifest growth
