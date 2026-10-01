@@ -34,7 +34,7 @@ require_protected_path() {
     }
     metadata=$(stat -c '%u:%g:%a' -- "$current")
     [[ "$metadata" =~ ^0:0:[0-7]{3,4}$ ]] && (( (8#${metadata##*:} & 022) == 0 )) || {
-      echo "staging path is not root-owned and protected: $current" >&2
+      echo "staging path is not root-owned and protected: $current (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)" >&2
       return 2
     }
     [[ -n "$remainder" ]] || break
@@ -55,7 +55,7 @@ require_protected_file() {
   [[ -f "$1" && ! -L "$1" ]] || return 2
   metadata=$(stat -c '%u:%g:%a' -- "$1")
   [[ "$metadata" =~ ^0:0:[0-7]{3,4}$ ]] && (( (8#${metadata##*:} & 022) == 0 )) || {
-    echo "staging file is not root-owned and protected: $1" >&2
+    echo "staging file is not root-owned and protected: $1 (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)" >&2
     return 2
   }
 }

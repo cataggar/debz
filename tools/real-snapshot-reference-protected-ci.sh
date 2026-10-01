@@ -6,10 +6,12 @@
 # mode-0700 directory under /srv/debz-protected, and executes this script from
 # that clone. It installs a minisign- and SHA256-pinned Zig, fetches Zig's
 # package sources and tightens and records their modes without executing them,
-# builds debz, stages the pinned dpkg, runtime closure, archives and (amd64)
-# signed profile postinsts, refuses fail-closed preflight negatives on new
-# workspaces, and runs the protected proof on a new empty workspace. Bounded
-# evidence is copied into TREE/upload; nothing outside TREE is written.
+# copies the Ubuntu archive keyring only after pinning it to a reviewed
+# package-derived digest, builds debz, stages the pinned dpkg, runtime closure,
+# archives and (amd64) signed profile postinsts, refuses fail-closed preflight
+# negatives on new workspaces, and runs the protected proof on a new empty
+# workspace. Bounded evidence is copied into TREE/upload; nothing outside TREE
+# is written.
 set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root
@@ -18,6 +20,15 @@ unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
 readonly zig_version=0.16.0
 readonly zig_release=https://github.com/cataggar/zig/releases/download/v0.16.0
 readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+# Pin source: ubuntu-keyring 2026.08.18 (Architecture: all) from
+# https://snapshot.ubuntu.com/ubuntu/20261001T000000Z, suite stonking:
+# pool/main/u/ubuntu-keyring/ubuntu-keyring_2026.08.18_all.deb
+# (Size 12718, SHA512 22078b3cf6a876d87cb7e3bffa97999fc87023b890788006fc78c952e2861b655d941be7563c307caa3fcce3b78f75b5f62b8cdd993f0dd646c7775955860fd4).
+# The pinned artifact is usr/share/keyrings/ubuntu-archive-keyring.gpg extracted
+# from that deb, deliberately committed as a reviewed trust root.
+readonly archive_keyring_source=/usr/share/keyrings/ubuntu-archive-keyring.gpg
+readonly archive_keyring_sha256=655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835
+readonly archive_keyring_size=2334
 
 [[ $# == 3 && $(id -u) == 0 && $(id -g) == 0 ]] || {
   echo "usage (as root, from the protected clone): $0 TREE ARCHITECTURE COMMIT" >&2
@@ -122,9 +133,140 @@ step() {
   fi
 }
 
+stage_verified_archive_keyring() {
+  local trust_dir target
+  trust_dir=$tree/trust
+  target=$trust_dir/ubuntu-archive-keyring.gpg
+  printf 'path\trole\tuid:gid:mode:size\tsha256\n' >"$evidence/archive-keyring-path.tsv"
+  [[ ! -e "$trust_dir" && ! -L "$trust_dir" ]] || {
+    echo "trusted keyring staging directory must be new: $trust_dir" >&2
+    exit 2
+  }
+  install -d -o root -g root -m 0700 "$trust_dir"
+  [[ -d "$trust_dir" && ! -L "$trust_dir" ]]
+  [[ ! -e "$target" && ! -L "$target" ]] || {
+    echo "trusted keyring copy must be new: $target" >&2
+    exit 2
+  }
+  python3 -I - "$archive_keyring_source" "$target" "$archive_keyring_sha256" \
+    "$archive_keyring_size" "$evidence/archive-keyring-path.tsv" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+source, target, expected_sha256, expected_size_text, evidence_path = sys.argv[1:]
+expected_size = int(expected_size_text)
+
+
+def metadata(entry: os.stat_result) -> str:
+    return f"{entry.st_uid}:{entry.st_gid}:{stat.S_IMODE(entry.st_mode):03o}:{entry.st_size}"
+
+
+def append_evidence(role: str, path: str, entry: os.stat_result, sha256: str) -> None:
+    with open(evidence_path, "a", encoding="utf-8") as evidence:
+        evidence.write(f"{path}\t{role}\t{metadata(entry)}\t{sha256}\n")
+
+
+def require_root_owned(role: str, path: str, entry: os.stat_result) -> None:
+    if (entry.st_uid, entry.st_gid) != (0, 0):
+        append_evidence(role, path, entry, "-")
+        raise SystemExit(
+            f"Ubuntu archive keyring path is not root-owned: {path} "
+            f"(uid:gid:mode:size={metadata(entry)})"
+        )
+
+
+flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+directory_flags = flags | os.O_DIRECTORY
+if source != "/usr/share/keyrings/ubuntu-archive-keyring.gpg":
+    raise SystemExit(f"unexpected Ubuntu archive keyring source path: {source}")
+opened_directories: list[int] = []
+directory_fd = os.open("/", directory_flags)
+opened_directories.append(directory_fd)
+root_stat = os.fstat(directory_fd)
+require_root_owned("ancestor-fd", "/", root_stat)
+append_evidence("ancestor-fd", "/", root_stat, "-")
+current_path = ""
+for component in ("usr", "share", "keyrings"):
+    current_path = f"{current_path}/{component}"
+    try:
+        next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise SystemExit(
+            f"failed to open Ubuntu archive keyring ancestor without following symlinks: {current_path}: {error}"
+        ) from error
+    opened_directories.append(next_fd)
+    directory_fd = next_fd
+    directory_stat = os.fstat(directory_fd)
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise SystemExit(f"Ubuntu archive keyring ancestor is not a directory: {current_path}")
+    require_root_owned("ancestor-fd", current_path, directory_stat)
+    append_evidence("ancestor-fd", current_path, directory_stat, "-")
+try:
+    source_fd = os.open("ubuntu-archive-keyring.gpg", flags, dir_fd=directory_fd)
+except OSError as error:
+    raise SystemExit(f"failed to open Ubuntu archive keyring without following symlinks: {source}: {error}") from error
+try:
+    source_stat = os.fstat(source_fd)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise SystemExit(f"Ubuntu archive keyring source is not a regular file: {source}")
+    require_root_owned("source-fd", source, source_stat)
+    out_fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        os.fchown(out_fd, 0, 0)
+        while True:
+            block = os.read(source_fd, 1 << 20)
+            if not block:
+                break
+            size += len(block)
+            digest.update(block)
+            view = memoryview(block)
+            while view:
+                written = os.write(out_fd, view)
+                if written <= 0:
+                    raise OSError("short write while copying Ubuntu archive keyring")
+                view = view[written:]
+        os.fchmod(out_fd, 0o644)
+    finally:
+        os.close(out_fd)
+finally:
+    os.close(source_fd)
+    for directory in reversed(opened_directories):
+        os.close(directory)
+
+actual_sha256 = digest.hexdigest()
+target_stat = os.stat(target, follow_symlinks=False)
+append_evidence("source-fd", source, source_stat, actual_sha256)
+append_evidence("staged-copy", target, target_stat, actual_sha256)
+if (
+    size != expected_size
+    or target_stat.st_size != expected_size
+    or actual_sha256 != expected_sha256
+    or (target_stat.st_uid, target_stat.st_gid) != (0, 0)
+    or stat.S_IMODE(target_stat.st_mode) != 0o644
+):
+    try:
+        os.unlink(target)
+    finally:
+        raise SystemExit(
+            "Ubuntu archive keyring pin mismatch: "
+            f"expected size={expected_size} sha256={expected_sha256}; "
+            f"copied size={size} target_size={target_stat.st_size} sha256={actual_sha256}"
+        )
+print(f"verified Ubuntu archive keyring copy: {target} size={size} sha256={actual_sha256}")
+PY
+  staged_archive_keyring=$target
+}
+
 echo "protected reference CI: commit=$commit architecture=$architecture kernel=$(uname -r) started=$(date -u +%FT%TZ)"
 test "$(git -C "$checkout" rev-parse HEAD)" = "$commit"
 test -z "$(git -C "$checkout" status --porcelain --ignored)"
+staged_archive_keyring=
+stage_verified_archive_keyring
+readonly staged_archive_keyring
 step tree-initial 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
 
 # Zig from the pinned release, accepted only after its pinned size, SHA256 and
@@ -170,7 +312,8 @@ step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree
 
 workspace=$checkout/.real-snapshot/$architecture
 install -d -o root -g root -m 0700 .real-snapshot
-step stage 0 "" "${zenv[@]}" tools/real-snapshot-reference-protected-stage.sh \
+step stage 0 "" "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
+  tools/real-snapshot-reference-protected-stage.sh \
   "$zig" "$checkout/zig-out/bin/debz" ".real-snapshot/$architecture"
 arguments=$workspace/reference-protected.args
 mapfile -t proof_arguments <"$arguments"
@@ -194,12 +337,15 @@ negative() { # NAME PATTERN sed-expression...
     exit 1
   }
 }
-mutable=$(mktemp -d /tmp/debz-protected-negative.XXXXXXXX)
+negatives=$tree/negative-inputs
+install -d -o root -g root -m 0755 "$negatives"
+mutable=$negatives/mutable-ancestor
+[[ ! -e "$mutable" && ! -L "$mutable" ]]
+install -d -o root -g root -m 0777 "$mutable"
 install -o root -g root -m 0500 "$workspace/launcher" "$mutable/launcher"
 negative mutable-ancestor "writable or non-root ancestor" \
   "s|^-Dreference-protected-launcher=.*|-Dreference-protected-launcher=$mutable/launcher|"
 rm -rf --one-file-system -- "$mutable"
-negatives=$tree/negative-inputs
 install -d -o root -g root -m 0755 "$negatives" "$negatives/profiles"
 install -o root -g root -m 0755 /usr/bin/dpkg "$negatives/dpkg"
 negative swapped-dpkg "reference dpkg executable is not the pinned architecture artifact" \
