@@ -2840,6 +2840,28 @@ GHR_ZIG_INSTALL = """\
         run: test "$(zig version)" = 0.16.0
 """
 
+CI_CONCURRENCY = """\
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+"""
+
+
+def ci_concurrency_failures(text: str, label: str) -> list[str]:
+    failures: list[str] = []
+    if text.count(CI_CONCURRENCY) != 1:
+        failures.append(
+            f"{label}: CI concurrency must exactly isolate push, pull_request, schedule, and workflow_dispatch runs"
+        )
+    if not re.search(
+        r"(?ms)^on:\n.*?\n\n"
+        + re.escape(CI_CONCURRENCY)
+        + r"\npermissions:\n",
+        text,
+    ):
+        failures.append(f"{label}: CI concurrency must be a top-level workflow policy before permissions")
+    return failures
+
 
 def ghr_zig_workflow_failures(
     text: str, label: str, expected_count: int
@@ -3061,6 +3083,8 @@ def audit_ci_pins() -> None:
         for failure in workflow_failure_handling_failures(text, str(relative)):
             fail(failure)
         if workflow.name == "ci.yml":
+            for failure in ci_concurrency_failures(text, str(relative)):
+                fail(failure)
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
         expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
@@ -4025,6 +4049,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         failures = ghr_zig_workflow_failures(text, "release.yml", 1)
     elif kind == "workflow-failure":
         failures = workflow_failure_handling_failures(text, "ci.yml")
+    elif kind == "ci-concurrency":
+        failures = ci_concurrency_failures(text, "ci.yml")
     elif kind == "ci-recovery":
         failures = native_recovery_ci_failures(text)
     elif kind == "workload-build":

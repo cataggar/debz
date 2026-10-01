@@ -31,6 +31,11 @@ class ZigInstallPolicyTests(unittest.TestCase):
         policy.audit_zig_installation(ci, self.release if release is None else release)
         return list(policy.FAILURES)
 
+    def concurrency_failures(self, ci: str) -> list[str]:
+        policy.FAILURES.clear()
+        policy.audit_ci_concurrency(ci)
+        return list(policy.FAILURES)
+
     def job(self, name: str) -> str:
         match = re.search(
             rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [a-z][a-z0-9-]*:\n|\Z)",
@@ -85,6 +90,17 @@ class ZigInstallPolicyTests(unittest.TestCase):
     def test_release_install_remains_exact(self) -> None:
         changed = self.release.replace(policy.GHR_ZIG_INSTALL, "", 1)
         self.assertIn("release.yml: expected 1 exact verified ghr Zig install blocks", " ".join(self.failures(self.ci, changed)))
+
+    def test_ci_concurrency_remains_exact(self) -> None:
+        self.assertEqual(self.concurrency_failures(self.ci), [])
+        without = self.ci.replace(policy.CI_CONCURRENCY + "\n", "", 1)
+        self.assertIn("workflow concurrency", " ".join(self.concurrency_failures(without)))
+        weakened = self.ci.replace(
+            "cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}",
+            "cancel-in-progress: false",
+            1,
+        )
+        self.assertIn("workflow concurrency", " ".join(self.concurrency_failures(weakened)))
 
 
 if __name__ == "__main__":

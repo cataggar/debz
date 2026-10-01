@@ -28,6 +28,11 @@ GHR_ZIG_INSTALL = """\
       - name: Validate Zig version
         run: test "$(zig version)" = 0.16.0
 """
+CI_CONCURRENCY = """\
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+"""
 CI_GHR_ZIG_JOBS = (
     "install-action-native",
     "download-action-cache",
@@ -92,6 +97,20 @@ def audit_zig_installation(ci: str, release: str) -> None:
     ]
     if len(jobs) != len({name for name, _ in jobs}) or sorted(installed) != sorted(CI_GHR_ZIG_JOBS):
         FAILURES.append("ci.yml: exact verified ghr Zig installs must match the reviewed CI job inventory")
+
+
+def audit_ci_concurrency(ci: str) -> None:
+    if ci.count(CI_CONCURRENCY) != 1:
+        FAILURES.append(
+            "ci.yml: workflow concurrency must exactly isolate push, pull_request, schedule, and workflow_dispatch runs"
+        )
+    if not re.search(
+        r"(?ms)^on:\n.*?\n\n"
+        + re.escape(CI_CONCURRENCY)
+        + r"\npermissions:\n",
+        ci,
+    ):
+        FAILURES.append("ci.yml: workflow concurrency must be a top-level policy before permissions")
 
 
 def audit_setup_action(ci: str, release: str) -> None:
@@ -391,6 +410,7 @@ def main() -> None:
     )
     audit_actions(release, RELEASE)
     audit_actions(ci, CI)
+    audit_ci_concurrency(ci)
     audit_zig_installation(ci, release)
     audit_setup_action(ci, release)
     audit_download_action(ci, release)
