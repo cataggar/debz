@@ -365,11 +365,21 @@ URI user information before provenance or output is constructed.
 `--source` accepts an explicit `.list` or `.sources` file. Every enabled entry
 must declare `Signed-By`, and each referenced keyring must also be declared by
 `--keyring`. A `--config` file is strict JSON containing `source_path` and
-optional `priority`, `default_release`, `immutable`, and `freshness` fields.
+optional `priority`, `default_release`, `immutable`, `freshness`, and
+`archive_binding` fields.
 `freshness` is either `{"mode":"require_valid_until","maximum_release_age_seconds":null}`
 or `{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":N}`
 with `0 < N <= 2678400`. For example, Microsoft's Ubuntu 24.04 feed uses the
-reviewed `1209600` (14 days). Installed state
+reviewed `1209600` (14 days). `archive_binding` is a per-repository opt-in for
+repositories that sign only SHA256 archive digests. Its only non-default value,
+`signed_sha256_derived_sha512`, makes native exact locks record a derived,
+never signed, SHA512 bound to the verified SHA256. The same opt-in can be
+declared on the source itself (`X-Debz-Archive-Binding:` in DEB822 or the
+`debz-archive-binding=` one-line option); a declaration that contradicts the
+`--config` value refuses the configuration. Native consumers otherwise
+require a SHA-512 archive identity
+([exact locks](exact-locks-and-provenance.md)). Unknown fields or tokens refuse
+the configuration. Installed state
 comes from `--status-path`, or from
 `INSTALL_ROOT/var/lib/dpkg/status` when the explicit status path is omitted.
 `--credential-reference` is an absolute path to a bounded file containing the

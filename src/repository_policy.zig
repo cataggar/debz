@@ -2,6 +2,7 @@ const std = @import("std");
 const acquisition = @import("repository_acquisition.zig");
 const cache_module = @import("metadata_cache.zig");
 const debian_version = @import("debian_version.zig");
+const exact_lock_v3 = @import("exact_lock_v3.zig");
 const refresh_module = @import("repository_refresh.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
@@ -49,6 +50,14 @@ pub const Policy = struct {
     default_release: ?[]const u8 = null,
     immutability: Immutability = .{},
     freshness: refresh_module.ExpiryPolicy = .require_valid_until,
+    /// Per-repository archive identity binding. The non-default
+    /// `signed_sha256_derived_sha512` opts a repository that publishes only
+    /// signed SHA256 package digests into exact-lock v3 binding with an
+    /// explicitly derived SHA-512 (#261). It is repository identity input.
+    /// A declaration's own `X-Debz-Archive-Binding` field or
+    /// `debz-archive-binding` option supplies it too; a declaration that
+    /// contradicts a non-default document policy is an invalid policy.
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
     proxy: Proxy = .direct,
     credentials: ?OpaqueReference = null,
     deadlines: acquisition.Deadlines = .{
@@ -123,6 +132,7 @@ pub const NormalizedRepository = struct {
     default_release: ?[]const u8,
     immutability: Immutability,
     freshness: refresh_module.ExpiryPolicy,
+    archive_binding: exact_lock_v3.ArchiveBinding = .published_digests,
     proxy: Proxy,
     /// Opaque reference only. It is deliberately excluded from IDs,
     /// canonical sources, manifests, diagnostics, and cache keys.
@@ -274,6 +284,14 @@ fn normalizeInternal(
                     },
                 );
             }
+            var policy = document.policy;
+            policy.archive_binding = effectiveArchiveBinding(
+                document.policy.archive_binding,
+                repository.archive_binding,
+            ) orelse return finishDiagnostic(allocator, arena, .{
+                .code = .invalid_policy,
+                .document_index = document_index,
+            });
             const component_count = @max(repository.components.len, 1);
             const uri_suite_count = std.math.mul(
                 usize,
@@ -315,7 +333,7 @@ fn normalizeInternal(
                         suite.value,
                         "",
                         architectures,
-                        document.policy,
+                        policy,
                     );
                 } else for (repository.components) |component| {
                     try appendNormalized(
@@ -326,7 +344,7 @@ fn normalizeInternal(
                         suite.value,
                         component.value,
                         architectures,
-                        document.policy,
+                        policy,
                     );
                 }
             };
@@ -412,6 +430,7 @@ fn appendNormalized(
                     null,
             },
             .freshness = policy.freshness,
+            .archive_binding = policy.archive_binding,
             .proxy = switch (policy.proxy) {
                 .direct => .direct,
                 .declared => |value| .{ .declared = .{
@@ -426,6 +445,22 @@ fn appendNormalized(
         normalized.id = repositoryId(normalized);
         try repositories.append(allocator, normalized);
     }
+}
+
+/// Combines a document policy with a declaration's own binding. Only the
+/// non-default binding is distinguishable in a document policy, so the
+/// declaration wins unless the two explicitly disagree.
+fn effectiveArchiveBinding(
+    configured: exact_lock_v3.ArchiveBinding,
+    declared: ?source.ArchiveBinding,
+) ?exact_lock_v3.ArchiveBinding {
+    const value = declared orelse return configured;
+    const binding: exact_lock_v3.ArchiveBinding = switch (value) {
+        .published_digests => .published_digests,
+        .signed_sha256_derived_sha512 => .signed_sha256_derived_sha512,
+    };
+    if (configured != .published_digests and configured != binding) return null;
+    return binding;
 }
 
 fn validPolicy(policy: Policy) bool {
@@ -519,6 +554,12 @@ fn repositoryId(repository: NormalizedRepository) source.RepositoryId {
     hashInt(&hash, @intCast(repository.deadlines.connect_ms));
     hashInt(&hash, @intCast(repository.deadlines.read_ms));
     hashInt(&hash, @intCast(repository.deadlines.overall_ms));
+    // Only an explicit opt-in extends the identity so existing repository,
+    // configuration, and lock identities remain byte-identical.
+    if (repository.archive_binding != .published_digests) {
+        hashPart(&hash, "archive-binding");
+        hashPart(&hash, @tagName(repository.archive_binding));
+    }
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return .{ .bytes = std.fmt.bytesToHex(digest, .lower) };
@@ -589,6 +630,10 @@ fn appendCanonical(
         const text = std.fmt.bufPrint(&seconds_buffer, "{d}", .{seconds}) catch unreachable;
         try output.appendSlice(allocator, text);
     }
+    if (repository.archive_binding != .published_digests) {
+        try output.appendSlice(allocator, "\n# X-Debz-Archive-Binding: ");
+        try output.appendSlice(allocator, @tagName(repository.archive_binding));
+    }
     try output.appendSlice(
         allocator,
         if (repository.enabled) "\nEnabled: yes\n\n" else "\nEnabled: no\n\n",
@@ -628,6 +673,7 @@ fn equalRepository(left: NormalizedRepository, right: NormalizedRepository) bool
             right.immutability.declared_identity,
         ) and
         refresh_module.expiryPoliciesEqual(left.freshness, right.freshness) and
+        left.archive_binding == right.archive_binding and
         equalProxy(left.proxy, right.proxy) and
         equalOptionalReference(left.credentials, right.credentials) and
         left.deadlines.connect_ms == right.deadlines.connect_ms and
@@ -1674,6 +1720,178 @@ test "freshness policy is canonical identity and conflict input" {
             DiagnosticCode.conflicting_repository,
             diagnostic.code,
         ),
+    }
+}
+
+test "archive binding opt-in is canonical identity and conflict input" {
+    const bytes =
+        "deb [arch=amd64 signed-by=/keys/archive.gpg] https://packages.example stable main\n";
+    const default_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = bytes,
+        .format = .legacy,
+    }}, null, .{});
+    var default = switch (default_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer default.deinit();
+    const explicit_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = bytes,
+        .format = .legacy,
+        .policy = .{ .archive_binding = .published_digests },
+    }}, null, .{});
+    var explicit = switch (explicit_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer explicit.deinit();
+    const bound_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = bytes,
+        .format = .legacy,
+        .policy = .{ .archive_binding = .signed_sha256_derived_sha512 },
+    }}, null, .{});
+    var bound = switch (bound_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer bound.deinit();
+
+    // The default adds nothing to identity or canonical sources.
+    try std.testing.expectEqualStrings(default.identity.slice(), explicit.identity.slice());
+    try std.testing.expectEqualStrings(default.repositories[0].id.slice(), explicit.repositories[0].id.slice());
+    try std.testing.expectEqualStrings(default.canonical_deb822, explicit.canonical_deb822);
+    try std.testing.expect(std.mem.indexOf(u8, default.canonical_deb822, "Archive-Binding") == null);
+    try std.testing.expectEqual(
+        exact_lock_v3.ArchiveBinding.published_digests,
+        default.repositories[0].archive_binding,
+    );
+
+    try std.testing.expectEqual(
+        exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512,
+        bound.repositories[0].archive_binding,
+    );
+    try std.testing.expect(!std.mem.eql(u8, default.identity.slice(), bound.identity.slice()));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        default.repositories[0].id.slice(),
+        bound.repositories[0].id.slice(),
+    ));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        bound.canonical_deb822,
+        "# X-Debz-Archive-Binding: signed_sha256_derived_sha512\n",
+    ) != null);
+
+    const conflict = try normalize(std.testing.allocator, &.{
+        .{ .bytes = bytes, .format = .legacy },
+        .{
+            .bytes = bytes,
+            .format = .legacy,
+            .policy = .{ .archive_binding = .signed_sha256_derived_sha512 },
+        },
+    }, null, .{});
+    switch (conflict) {
+        .configuration => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedConflict;
+        },
+        .diagnostic => |diagnostic| try std.testing.expectEqual(
+            DiagnosticCode.conflicting_repository,
+            diagnostic.code,
+        ),
+    }
+}
+
+fn expectNormalizedBinding(
+    document: SourceDocument,
+    expected: exact_lock_v3.ArchiveBinding,
+    expected_id: ?[]const u8,
+) !void {
+    const result = try normalize(std.testing.allocator, &.{document}, null, .{});
+    var configuration = switch (result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer configuration.deinit();
+    try std.testing.expectEqual(expected, configuration.repositories[0].archive_binding);
+    if (expected_id) |id|
+        try std.testing.expectEqualStrings(id, configuration.repositories[0].id.slice());
+}
+
+test "declared archive binding in sources is the same per-repository opt-in" {
+    const plain = "deb [arch=amd64 signed-by=/keys/archive.gpg] https://packages.example stable main\n";
+    const declared_legacy =
+        "deb [arch=amd64 signed-by=/keys/archive.gpg debz-archive-binding=signed_sha256_derived_sha512] https://packages.example stable main\n";
+    const declared_default =
+        "deb [arch=amd64 signed-by=/keys/archive.gpg debz-archive-binding=published_digests] https://packages.example stable main\n";
+    const declared_deb822 =
+        "Types: deb\nURIs: https://packages.example\nSuites: stable\nComponents: main\n" ++
+        "Architectures: amd64\nSigned-By: /keys/archive.gpg\n" ++
+        "X-Debz-Archive-Binding: signed_sha256_derived_sha512\n";
+
+    const configured_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = plain,
+        .format = .legacy,
+        .policy = .{ .archive_binding = .signed_sha256_derived_sha512 },
+    }}, null, .{});
+    var configured = switch (configured_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer configured.deinit();
+    const default_result = try normalize(std.testing.allocator, &.{.{
+        .bytes = plain,
+        .format = .legacy,
+    }}, null, .{});
+    var default = switch (default_result) {
+        .configuration => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer default.deinit();
+    const bound_id = configured.repositories[0].id.slice();
+    const default_id = default.repositories[0].id.slice();
+
+    // A source declaration, in either format, yields exactly the normalized
+    // identity of the equivalent per-repository configuration.
+    try expectNormalizedBinding(.{ .bytes = declared_legacy, .format = .legacy }, .signed_sha256_derived_sha512, bound_id);
+    try expectNormalizedBinding(.{ .bytes = declared_deb822, .format = .deb822 }, .signed_sha256_derived_sha512, bound_id);
+    try expectNormalizedBinding(.{
+        .bytes = declared_legacy,
+        .format = .legacy,
+        .policy = .{ .archive_binding = .signed_sha256_derived_sha512 },
+    }, .signed_sha256_derived_sha512, bound_id);
+    // Declaring the default adds nothing to normalized identity.
+    try expectNormalizedBinding(.{ .bytes = declared_default, .format = .legacy }, .published_digests, default_id);
+
+    // A declaration cannot silently undo a configured opt-in.
+    const contradiction = try normalize(std.testing.allocator, &.{.{
+        .bytes = declared_default,
+        .format = .legacy,
+        .policy = .{ .archive_binding = .signed_sha256_derived_sha512 },
+    }}, null, .{});
+    switch (contradiction) {
+        .configuration => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDiagnostic;
+        },
+        .diagnostic => |diagnostic| try std.testing.expectEqual(DiagnosticCode.invalid_policy, diagnostic.code),
+    }
+    const unknown = try normalize(std.testing.allocator, &.{.{
+        .bytes = "deb [arch=amd64 debz-archive-binding=signed_sha512] https://packages.example stable main\n",
+        .format = .legacy,
+    }}, null, .{});
+    switch (unknown) {
+        .configuration => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.ExpectedDiagnostic;
+        },
+        .diagnostic => |diagnostic| {
+            try std.testing.expectEqual(DiagnosticCode.source_invalid, diagnostic.code);
+            try std.testing.expectEqual(source.DiagnosticCode.invalid_archive_binding, diagnostic.source_diagnostic.?.code);
+        },
     }
 }
 

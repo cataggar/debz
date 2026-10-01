@@ -184,7 +184,16 @@ def package_specs(suite: str, architecture: str, *, signed_parity: bool = False)
     return specs
 
 
-def write_repository(output: pathlib.Path, suite: str, architecture: str, *, signed_parity: bool = False) -> None:
+def write_repository(
+    output: pathlib.Path,
+    suite: str,
+    architecture: str,
+    *,
+    signed_parity: bool = False,
+    sha256_only: bool = False,
+) -> None:
+    if signed_parity and sha256_only:
+        raise ValueError("--signed-parity requires published SHA512 records")
     if output.exists():
         shutil.rmtree(output)
     packages_dir = output / "dists" / suite / "main" / f"binary-{architecture}"
@@ -210,7 +219,9 @@ def write_repository(output: pathlib.Path, suite: str, architecture: str, *, sig
             "Filename": filename,
             "Size": str(len(deb)),
             "SHA256": digest,
-            **({"SHA512": hashlib.sha512(deb).hexdigest()} if signed_parity else {}),
+            # Native engine consumers require a SHA-512 archive identity
+            # (#261). --sha256-only models Debian's SHA256-only publication.
+            **({} if sha256_only else {"SHA512": hashlib.sha512(deb).hexdigest()}),
             "Description": f"debz hermetic fixture {package}",
         }
         paragraphs.append("".join(f"{key}: {value}\n" for key, value in paragraph.items()).encode() + b"\n")
@@ -353,6 +364,7 @@ def main() -> None:
     parser.add_argument("--suite", required=True, choices=("debian-stable", "ubuntu-26.04"))
     parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
     parser.add_argument("--signed-parity", action="store_true")
+    parser.add_argument("--sha256-only", action="store_true")
     parser.add_argument("--descriptor-output", type=pathlib.Path)
     parser.add_argument("--descriptor-repository-url")
     parser.add_argument(
@@ -369,7 +381,15 @@ def main() -> None:
         raise SystemExit("--descriptor-output must be absolute")
     if args.descriptor_script_case != "default" and args.descriptor_output is None:
         raise SystemExit("--descriptor-script-case requires --descriptor-output")
-    write_repository(args.output, args.suite, args.architecture, signed_parity=args.signed_parity)
+    if args.signed_parity and args.sha256_only:
+        raise SystemExit("--signed-parity and --sha256-only are mutually exclusive")
+    write_repository(
+        args.output,
+        args.suite,
+        args.architecture,
+        signed_parity=args.signed_parity,
+        sha256_only=args.sha256_only,
+    )
     if args.descriptor_output is not None:
         scripts = None
         if args.descriptor_script_case != "default":

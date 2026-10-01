@@ -1959,8 +1959,8 @@ WORKLOAD_PARTITIONS = {
     "workload_core": ("test-workload-core", (
         "run_tests", "run_repository_cli_tests", "cli_tests", "no_args_help",
         "positional_help", "removed_version_flag", "consumer_tests",
-        "run_real_snapshot_comparator_tests", "run_apt_acceptance_unit_tests",
-        "repository_add_tests",
+        "run_real_snapshot_comparator_tests", "run_debian_closure_inventory_tests",
+        "run_apt_acceptance_unit_tests", "repository_add_tests",
     )),
     "workload_production": ("test-workload-production", (
         "run_package_family_tests", "run_production_backend_tests",

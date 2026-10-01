@@ -1,0 +1,3249 @@
+{
+  "architectures": {
+    "amd64": {
+      "cas": [
+        {
+          "architecture": "amd64",
+          "derived_sha512": "0bba33fb09eb7e099cc966235fcbd02419a60d04ff5daf4275d46fdf486b0fd28266c05e2150fcf9a962d9b34d774f8e643a6ff0690fa60275a16b8dba257adf",
+          "filename": "pool/main/a/apt/apt_3.0.3_amd64.deb",
+          "mode": "0600",
+          "package": "apt",
+          "sha256": "55e341fbe92d7502c98faf1b3c235393ea0744db119cf2173603e965b658aef4",
+          "size": 1452192,
+          "version": "3.0.3"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "37ff942d0f2da3d5ee4ba439e31c781c4765e543e0511335526be29b203518032c3060c71ec5c641793311fd695d5b3ec3083484966d05586396189edfc38b32",
+          "filename": "pool/main/b/base-files/base-files_13.8+deb13u7_amd64.deb",
+          "mode": "0600",
+          "package": "base-files",
+          "sha256": "fcd42bb5cb63f7bfc4326a92541247872206d60a192fdff65ca14eb83ed408b9",
+          "size": 88296,
+          "version": "13.8+deb13u7"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "f891f281e0bb9b1cdb175127763507833422070c9563ebd0361fbacd55c6987078cd77824cab2772f70fa23add8d427f87f1c6864932a9f725f7a2ec7b4b6734",
+          "filename": "pool/main/b/base-passwd/base-passwd_3.6.7_amd64.deb",
+          "mode": "0600",
+          "package": "base-passwd",
+          "sha256": "cf31c6956ab5f65815d9d9ea1615c4f78ecd2893c31119658248a4756cee83e7",
+          "size": 53712,
+          "version": "3.6.7"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "e87f6a682970634c911bbddfa788e7eda52b385e7568f8aa3384e92af1dc7ffe44602d07bd64a027325e1b21fcc7a7b4930858894cacee0d09271e41f3defcd4",
+          "filename": "pool/main/b/bash/bash_5.2.37-2+b10_amd64.deb",
+          "mode": "0600",
+          "package": "bash",
+          "sha256": "2fd7b04f1b7caa29c4e683f5216e6af354a41e3cdcf6e75394d7cda680f9ab82",
+          "size": 1500792,
+          "version": "5.2.37-2+b10"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "e1443c8a990e930b5615fb69c70a5e11280fe8d821065904ff784cd37094f3329c92878e254ef2d1b00c0d9d15fd2447903e83ac53c6fda15ff157aeb9164315",
+          "filename": "pool/main/u/util-linux/bsdutils_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "bsdutils",
+          "sha256": "d935a5102752a1108bdf1e815c89a84ac88d1949bf049a784178f946a09b14da",
+          "size": 110208,
+          "version": "1:2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "cfb50cf3c2040fbb204a4c53434ace3d3dac15396074d867c172f9813ef8999b71c4e3bf31235558e41c4802be0dc8e4e486adc4368d46b38d791aa9884d9c8f",
+          "filename": "pool/main/c/coreutils/coreutils_9.7-3_amd64.deb",
+          "mode": "0600",
+          "package": "coreutils",
+          "sha256": "1299ab6f9389a288eb2f5f3dd222c26cc777b9a2d5ecb6ee4cbd340cebcdada2",
+          "size": 3023556,
+          "version": "9.7-3"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "bb860aae227bc37300174ca2c00281a34ae1a663ee7f0cc93de8fead56b190bcc724a217f0430e0948106c6214a2ac73de93b7944eb9a47e707e8773240991ef",
+          "filename": "pool/main/d/dash/dash_0.5.12-12_amd64.deb",
+          "mode": "0600",
+          "package": "dash",
+          "sha256": "a8902cb6d8650134764a25fb80aec8589d858ef71ece1680a62e84816c37bb04",
+          "size": 98504,
+          "version": "0.5.12-12"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "9d24db8201c080e48fa45e4008305a8f7a97e1d65be5dcfd9680ee9306237ad0b62dfe663918235771116c239655b774b434cf2f0b677d0af7d36fd521454d3d",
+          "filename": "pool/main/d/debconf/debconf_1.5.91_all.deb",
+          "mode": "0600",
+          "package": "debconf",
+          "sha256": "1ddc7e6c5925f748eefb7ca811d98e049f18c158bb21fbc7e122262ce6011e49",
+          "size": 121088,
+          "version": "1.5.91"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "d99dafbe92c40468012d0a95fa4e4dedbdb96e6e96bcc8b8f0fb082eadcbad42f625303ba128257dc7f660d6ba536f5bb27f7d72ded33121bf4679ae60070397",
+          "filename": "pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb",
+          "mode": "0600",
+          "package": "debian-archive-keyring",
+          "sha256": "9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac",
+          "size": 179244,
+          "version": "2025.1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "3ddad7312a36aa9114bd25638a0b52f73f6d5d3c2bda796c90028f68db92033bd7b8b903beb06755b6d41a35ec421bf93b6ed57e4d57cda790c2a8daeec0949d",
+          "filename": "pool/main/d/debianutils/debianutils_5.23.2_amd64.deb",
+          "mode": "0600",
+          "package": "debianutils",
+          "sha256": "720e43fda316676076498b4224ad3318049deafe60cc7c601011048de03ee97d",
+          "size": 92360,
+          "version": "5.23.2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "8a3caeff4f23c5332326b9d9085a21334a81460dbfb89bde50a094201d5deca76162da007c6545a1b87cb8606d48924b2c66e4fe5786c8b88b3f63d976970897",
+          "filename": "pool/main/d/diffutils/diffutils_3.10-4_amd64.deb",
+          "mode": "0600",
+          "package": "diffutils",
+          "sha256": "d3412669f7ae53ba895c3a509620ea7494ec1a36faa204c5215442ced381a479",
+          "size": 386504,
+          "version": "1:3.10-4"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "4d8dedbf31b5b598f74f82803269593735e980c5d35ffe8fe650fb1946fdd75d484003f153e7ba769e8ae2bb3f8fac478ac47ec96f7f965f889ea17124a7da54",
+          "filename": "pool/main/d/dpkg/dpkg_1.22.22_amd64.deb",
+          "mode": "0600",
+          "package": "dpkg",
+          "sha256": "3e800c6d75e8e709007ed1c356e5fa8509a75c1694fb0a1183709abc9cfdc1f3",
+          "size": 1537216,
+          "version": "1.22.22"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "5252bc6d501ec410026135201eaac9101b9767b777628fe31772e546939d5ad0331f9e61ddfe54716dbfaf385ff54b556299cf474b6b68438c69882d5fda9aa9",
+          "filename": "pool/main/f/findutils/findutils_4.10.0-3_amd64.deb",
+          "mode": "0600",
+          "package": "findutils",
+          "sha256": "3edf02b016456b6a98cefdbab99c5ce6f829b786f63affe970badea221aecfc7",
+          "size": 700008,
+          "version": "4.10.0-3"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "1b46de8afa1dbb047a85bf077eaeef7beb9dda16bae5b6d88b811a69166d5cb826d0cb7d181c48be5fea0653c5ff8b1b0439af320f6c8aa1f03d2c269174194b",
+          "filename": "pool/main/g/gawk/gawk_5.2.1-2+b1_amd64.deb",
+          "mode": "0600",
+          "package": "gawk",
+          "sha256": "0e3b376e74cadfa5049bc8248c563efe89fd45e31466f8891c094c65c0879f5c",
+          "size": 673696,
+          "version": "1:5.2.1-2+b1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "372defee254080b998da134bfe02ca1b8122ac28247776f7d2f3c36f1c18b2739232b6363c74d17217558e5c4326887ac2270fd642240a14eb391fd67ec532fe",
+          "filename": "pool/main/g/gcc-14/gcc-14-base_14.2.0-19_amd64.deb",
+          "mode": "0600",
+          "package": "gcc-14-base",
+          "sha256": "5b6825de4263824b78c4c51f6476414f3b4e89c2ab63e81dc8b9b5501e867cf6",
+          "size": 49432,
+          "version": "14.2.0-19"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "7340e5d47335a72bc10633fba86f0fc124ae92a24535d929da95cab03b6cd359a033dbaac38a896a25ca68d2ca22a3ed48a68f4445751920e3c301eddb8e4cf2",
+          "filename": "pool/main/g/grep/grep_3.11-4_amd64.deb",
+          "mode": "0600",
+          "package": "grep",
+          "sha256": "2d78ed07d86a530ebf538f05cb2415f37c8daf908596bc32fc2563cc7e88c55a",
+          "size": 431488,
+          "version": "3.11-4"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "8d7f99593f446621445a5e2ab2d997a0a2ac57a09b070bb360d107a127ecb9e6c538c8d1d87013e9d1ec0a0b344e538d159faf50b10110b835ffd45a18848d6a",
+          "filename": "pool/main/g/gzip/gzip_1.13-1+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "gzip",
+          "sha256": "74cf12212beee4ab8d473bdc0107abf9e8cef737492198e2f4944a19f142b0ac",
+          "size": 138608,
+          "version": "1.13-1+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "dadc6569db169e4b44eed2de6222684060002ff5eb743d37bba1f00866deabc9ee7f5a103c907de363438d5d7e52e31587d28c93bdb7065481e6c23db3e4efc9",
+          "filename": "pool/main/h/hostname/hostname_3.25_amd64.deb",
+          "mode": "0600",
+          "package": "hostname",
+          "sha256": "9c2a27e5d4d87137211fe46631b05b2ee8892ec76aae926304e4485ba02e1015",
+          "size": 11024,
+          "version": "3.25"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "c1f35ca8662b742ccdae6f0b483d539ddb635e7296f4e59c5e0679a4040cda04fc628205f27ec2fb8f875ce18b27deccac711e9fc83912e24f9d66b715bc75a2",
+          "filename": "pool/main/i/init-system-helpers/init-system-helpers_1.69~deb13u1_all.deb",
+          "mode": "0600",
+          "package": "init-system-helpers",
+          "sha256": "addf78073e1cbc5a5508937e11d2571055e29835e00ee8fab52a66775649378f",
+          "size": 39360,
+          "version": "1.69~deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "4a747908e80442e32af00e34662666b829e171cb6c2c7c0ad98d449a03a4d647e41ab3883711a54859e4e6297e85985fb18e2f28038c7b3cb6d095acc4618deb",
+          "filename": "pool/main/a/acl/libacl1_2.3.2-2+b1_amd64.deb",
+          "mode": "0600",
+          "package": "libacl1",
+          "sha256": "08074f01e384bc07c0c2d79a58cf4a6523f71cf75d1808101c79617656c9a39d",
+          "size": 32860,
+          "version": "2.3.2-2+b1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "ab97751e3691a8f03337cc12007bc8273eb3211e8033650a8596f3be211dece0fdf05cce7b29e156db616816c5e85483c2b6980cc64f5fa10255e5fe30138442",
+          "filename": "pool/main/a/apparmor/libapparmor1_4.1.0-1_amd64.deb",
+          "mode": "0600",
+          "package": "libapparmor1",
+          "sha256": "4158976c77038b93021967f425b4cc505df18c4f5e3f444732399e7ed4af4419",
+          "size": 43688,
+          "version": "4.1.0-1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "b6da5a438c483ded6685d1d23f24ccd3ab5abc6a9971a4c8963a1a8f4f79ae4535420b25548fed25bb3a5100ed9b930e966e3ceed5b22a2d325a60a23b04363a",
+          "filename": "pool/main/a/apt/libapt-pkg7.0_3.0.3_amd64.deb",
+          "mode": "0600",
+          "package": "libapt-pkg7.0",
+          "sha256": "fdcc9f780c7de466c7f0038e6e242c73cb63c8f9fe2781a3185a2c810984ab0a",
+          "size": 1112916,
+          "version": "3.0.3"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "93e29587b995ca6918623aec7282b619d207ae5302befecc22f9ec6d04e361d2c083f4ebd5fca32c78530d315488254551c1bba32c37a2ae354856bc610dc20c",
+          "filename": "pool/main/a/attr/libattr1_2.5.2-3_amd64.deb",
+          "mode": "0600",
+          "package": "libattr1",
+          "sha256": "606b5ee12ea2786be607a17f40c1fb5e65c76ceaff66665bdf8f8c6c1b71d1fb",
+          "size": 22876,
+          "version": "1:2.5.2-3"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "36bfe3788961362709cf25a2282987a0ae39d4f1056a7d8335dec76d2824536be4b5c18e6a21eee778a74ea958316e8648a0ae7720386db0222c60cbd8e423b1",
+          "filename": "pool/main/a/audit/libaudit-common_4.0.2-2+deb13u1_all.deb",
+          "mode": "0600",
+          "package": "libaudit-common",
+          "sha256": "b9d32e5ff04fd747aacb7d6b3ebbbbf734ddefb2f1695f0b1b2a4b5e51b1052e",
+          "size": 12812,
+          "version": "1:4.0.2-2+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "8d9855915dda98da7b2c8c726cb2607e71c75d9ec14bf0331507ee9e43e2dc00e84772f425fc1ed51bb78b93bb24edbaac1dfe40cd2595c9813702c90f2d0695",
+          "filename": "pool/main/a/audit/libaudit1_4.0.2-2+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libaudit1",
+          "sha256": "3d1dd3f031a56f01b747e2acc0e14575212580e6fa63d800c44cb0a31f1edfd7",
+          "size": 57680,
+          "version": "1:4.0.2-2+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "6a35fcfdf5e9ae6f757c63fcdbe65f558d62defb4020519b9e89a887638447fc6aa305fbd8a4cfc1a1355606949e6a40ef5c5223692611f743368714cd6ee2fa",
+          "filename": "pool/main/u/util-linux/libblkid1_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libblkid1",
+          "sha256": "81535f3c2c0efc732965907c8749103a0a26377c761622c9ce39b4c92dcde52f",
+          "size": 171612,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "5765ec82be20460494f991ab3f3ea676199905b4165f9f00b62b7d8d5a37cf4a800a43582601f32f31e59d8e1c10842d8d906ca1825a3492b09da6f927982e52",
+          "filename": "pool/main/b/bzip2/libbz2-1.0_1.0.8-6_amd64.deb",
+          "mode": "0600",
+          "package": "libbz2-1.0",
+          "sha256": "cba4cda04244b5e481bb15524bc3c983a7d1b6f330013b9b381706a2fcb65310",
+          "size": 37912,
+          "version": "1.0.8-6"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "dd9704fa1935280a1a5418658c75cc45c8c646f9020229e72addde5bc9744ce75f46daeecc7a46c256cf2c4f08bc50bebbbd87e04848b55787f4ec304cfd41bc",
+          "filename": "pool/main/g/glibc/libc-bin_2.41-12+deb13u4_amd64.deb",
+          "mode": "0600",
+          "package": "libc-bin",
+          "sha256": "dc8c79647fe3a5f37f72a400414f70263d0212f010ff2c09f990e30d91e38d1c",
+          "size": 638452,
+          "version": "2.41-12+deb13u4"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "0ab52592ed75cd5731f9b065ff4ea9109d58ce4f80cfc044d3209219e88a79c904baacc8f48d49cb440376b172ef82e5875ae15d7de7336e9d93e7c3bc2f61e5",
+          "filename": "pool/main/g/glibc/libc6_2.41-12+deb13u4_amd64.deb",
+          "mode": "0600",
+          "package": "libc6",
+          "sha256": "967aa62605721081c3eb2a17650611a792aa802d76a6511d1840242623d204c9",
+          "size": 2846580,
+          "version": "2.41-12+deb13u4"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "5c90477f653e926033b758a5b385a2e20da338d9a0b5e83a5b06394614f8a95cfa60d9ff017f5af9ff68bfb9ecfd4b21036c8c99e4023ddc73049257bb6988c9",
+          "filename": "pool/main/libc/libcap-ng/libcap-ng0_0.8.5-4+b1_amd64.deb",
+          "mode": "0600",
+          "package": "libcap-ng0",
+          "sha256": "20a9e4b0619a3eb2566338223bed135dde5a601eaa2f8fdd5f20b94506addcac",
+          "size": 17584,
+          "version": "0.8.5-4+b1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "fe39d44b8ebb551a50a5f9e3d471c25deb40785ec00437cc85afb437e35c7d8df87c66f5135f27b29a5a603d89a8f5ad0e490db274cb4ea8b16d181c0e44102f",
+          "filename": "pool/main/libc/libcap2/libcap2_2.75-10+deb13u1+b3_amd64.deb",
+          "mode": "0600",
+          "package": "libcap2",
+          "sha256": "89fc4d34fc7a28ad6f0fcd0c561ab253b9dedf6f77f5a000b47c276c8295bf67",
+          "size": 28988,
+          "version": "1:2.75-10+deb13u1+b3"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "a677a97a7e5079f0ffc6c82af1905999f6806bcef00301d803a5418f75f717fd823c6f86738ccce8355972ade3bf300d8c85c6bd10b8c46081f2f08ecf544fa1",
+          "filename": "pool/main/libx/libxcrypt/libcrypt1_4.4.38-1_amd64.deb",
+          "mode": "0600",
+          "package": "libcrypt1",
+          "sha256": "0ebc144d662e3197982d1bf3a7b8b35ca845e54c68811de0328b1f0d7c67585c",
+          "size": 90072,
+          "version": "1:4.4.38-1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "86b9e0da75a7f3cd20f74b12a12a566146ad87d10c1a1a4df85f939777cb36cf557f649efb45aaaa662c76b821ff33651e32bca3bbed4c633b76d8f70408c28f",
+          "filename": "pool/main/d/db5.3/libdb5.3t64_5.3.28+dfsg2-9_amd64.deb",
+          "mode": "0600",
+          "package": "libdb5.3t64",
+          "sha256": "18d02510ee78b67e4504ba050176797a200ff24214a7cd318082ab60ad7bf3fc",
+          "size": 703676,
+          "version": "5.3.28+dfsg2-9"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "edd7c34017817a081817a9ef08399ff1da21602b565ed9bc957d6def20eafe8b0406082cc18d78cb94909e96385d11a478c8b97fd5cacce27b9bfc412963df17",
+          "filename": "pool/main/c/cdebconf/libdebconfclient0_0.280_amd64.deb",
+          "mode": "0600",
+          "package": "libdebconfclient0",
+          "sha256": "25acadc8b394bc86d05df16e70975e523f8f839a7d8d6d5e22c1cafdcef741aa",
+          "size": 10632,
+          "version": "0.280"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "a772ead03f938d76c09b3efba8c77652262be015cf44a8cb881183769c5ab19138afb95125d4b9563ec682d15163df1d3d9317563cd7ac3633178f5ae81185e9",
+          "filename": "pool/main/g/gcc-14/libgcc-s1_14.2.0-19_amd64.deb",
+          "mode": "0600",
+          "package": "libgcc-s1",
+          "sha256": "3c71917b490d1a17aed43196a2787a256ecf060526cdb20216a74bedc061b150",
+          "size": 72772,
+          "version": "14.2.0-19"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "dbe5c8a464a794d869b852500a109085a35488f93ce7c141a3d8143c86ef898db7f1488c7f773043e05f995e7413be18050e24a715758019b47331c4c1aa68aa",
+          "filename": "pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_amd64.deb",
+          "mode": "0600",
+          "package": "libgmp10",
+          "sha256": "d0d0265eb01770f17afd0f7c8c0622f80479dcfbbe13653a0debeec61464e622",
+          "size": 560220,
+          "version": "2:6.3.0+dfsg-3"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "d9d127aefef45df44f33145b75449ae30a7e20b674e9d4425af4cffd2bada7b32c5bd0c25429471f61949c4a96311e68d2e91f593334211f5d945c765c347c14",
+          "filename": "pool/main/n/nettle/libhogweed6t64_3.10.1-1_amd64.deb",
+          "mode": "0600",
+          "package": "libhogweed6t64",
+          "sha256": "b059ed155115ac09da295322de48ee1ed58ef5fa45edcc9e12ff0e94636ef25f",
+          "size": 335240,
+          "version": "3.10.1-1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "2f7337988af17470f7f4f7448d0cfe9accfdf8fa0637c6616a0985ce96387df17579c668843abc54fdb5d9ff7bd960453caa5ee6658fe08c0885595a2995ebc9",
+          "filename": "pool/main/u/util-linux/liblastlog2-2_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "liblastlog2-2",
+          "sha256": "abb76aecbf51479e6e193873dfddaa1b88667dc0b1db82a11286a67550ba1557",
+          "size": 28772,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "e86c27b17c601ef22a5809a649e783d533d15537c6d9391444564b1176f6474f3616e88635eb39534a25c50b3f818ddb9dac773c618ee33b6bac25e9cd8a4579",
+          "filename": "pool/main/l/lz4/liblz4-1_1.10.0-4_amd64.deb",
+          "mode": "0600",
+          "package": "liblz4-1",
+          "sha256": "c31ec4c7c82755a38b2f3fe066fc0c5518cc91a601a268fbcd19bdacb1f22e1e",
+          "size": 63900,
+          "version": "1.10.0-4"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "19b38351b05afc01ba80a4e6471f97129846e85adf2b3eee8463f362336eb1ffd33aeb7acb0cce91194d67ff3583c309451eccc41e1ea5dad971097e88b4f7c9",
+          "filename": "pool/main/x/xz-utils/liblzma5_5.8.1-1+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "liblzma5",
+          "sha256": "1cfcc6e0dc36f438a79b6e2189facdb9d150b08f57d190a60e01c98075c7f896",
+          "size": 309492,
+          "version": "5.8.1-1+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "1bca99d6e63a750da1a61d98de3b90273541c3509744985cc45a7ceb6040df87795bca01ac07bf5266bba2ccca9bb9f1d86ef355a0c11ea4a6898565d69919f1",
+          "filename": "pool/main/libm/libmd/libmd0_1.1.0-2+b1_amd64.deb",
+          "mode": "0600",
+          "package": "libmd0",
+          "sha256": "7244ec3839b61fac0c1884fe08aaa040f26e8f1f35f1f5d3482eacefd30d1b44",
+          "size": 36272,
+          "version": "1.1.0-2+b1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "aa8e5709d64ce6d46ebd22c06802a85ae927a55d7d7032fe7f7ae98724615d4aa8efd418acc1d58359b15e5b2bc212545c78836d92c0f588acf828267e6252fb",
+          "filename": "pool/main/u/util-linux/libmount1_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libmount1",
+          "sha256": "6d00f45f2e80e078e906e3eedecd3ba6913e39fef49bff361ee583f17f00ec05",
+          "size": 210408,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "43aecb66dc87459b0afaad9fcd39efec4e4937dec62fe32928e34ecfb040a630e6fa56a7437a69497d5041132a9ca7cdcd4276403695ebcd56e43eba87b9959f",
+          "filename": "pool/main/m/mpfr4/libmpfr6_4.2.2-1_amd64.deb",
+          "mode": "0600",
+          "package": "libmpfr6",
+          "sha256": "75dddce11dabc7fc543712c33dc27b7f2ee66a111763eb5eac654d010b42cd92",
+          "size": 729320,
+          "version": "4.2.2-1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "947bcdd2e52f46cd5bab0f0ca883ce945d712dcf56d08647fe335dadd98123c9ec2be3f91ca07b2fac4ac877555b445bacc29b7b724917cbcd1fa35fb9c5f8f0",
+          "filename": "pool/main/n/nettle/libnettle8t64_3.10.1-1_amd64.deb",
+          "mode": "0600",
+          "package": "libnettle8t64",
+          "sha256": "1b03d4a9cd9c8143ba50fe6396f36937e901a317d492d179f4596862c1731cfe",
+          "size": 305436,
+          "version": "3.10.1-1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "e82c1585632dfd0e355eba7d0d5deb8c46e33b2a8ad08f749da27e27719fecd03cedc5a129e8e9d45214d07417629a6e486831a374f67ea4d74601061925dd59",
+          "filename": "pool/main/p/pam/libpam-modules_1.7.0-5_amd64.deb",
+          "mode": "0600",
+          "package": "libpam-modules",
+          "sha256": "9679ade117f8775ac0471f48a92652ab8e8dcda4e2ff06de75158cded9cfd83c",
+          "size": 178696,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "796bf14b6eec13e94b05e94e975b63230295d3eff7a50ab0b3caa1344c8d52a1b4da2dd3c48775ddbe028e9e9808e509877debdcec71ca7f96370b493968cc49",
+          "filename": "pool/main/p/pam/libpam-modules-bin_1.7.0-5_amd64.deb",
+          "mode": "0600",
+          "package": "libpam-modules-bin",
+          "sha256": "cc72066d008444317738e8e931d6131b301466b4e2dd5ef5baa75fb1a45d61a7",
+          "size": 49116,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "d6d932b9e430b46255f326a9a7b31ecc2815e00ce1020d704bb09947d71ef9ee0846ce3c9b111983d5449cbc0ce58c5a7fbce950229fc62ebe41029304300fcf",
+          "filename": "pool/main/p/pam/libpam-runtime_1.7.0-5_all.deb",
+          "mode": "0600",
+          "package": "libpam-runtime",
+          "sha256": "b02792c9ed6174db695a653b95ef3629fdac3a73ba1eff1754ab161b5711bfbf",
+          "size": 248720,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "3abe0ea31a0dacea7cc1783a80e96fe251af493debbc568f992be0d2a881d381da7f9ca0fdc9f6d5bffbd99e796677666d3e9d742725ea6f4b9da24abd4b2f6d",
+          "filename": "pool/main/p/pam/libpam0g_1.7.0-5_amd64.deb",
+          "mode": "0600",
+          "package": "libpam0g",
+          "sha256": "4f5bde27d8df2de6ea8990319b42d9974f56a3ba9907ce7296fd0f8964fc9fb1",
+          "size": 69880,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "65012d637ce93587c29f8f54b854bb6edb5b3866e4442ad7a2f87d1460a3afc694b4ba4e2e750ce066dbdcc9022d5ba13ca2790d2f700d4a751e68b554604f67",
+          "filename": "pool/main/p/pcre2/libpcre2-8-0_10.46-1~deb13u2_amd64.deb",
+          "mode": "0600",
+          "package": "libpcre2-8-0",
+          "sha256": "1252b96a5bc44bb5db982bef8eb18e54f5047cede2aff641bce4f8e1edb91c3e",
+          "size": 298872,
+          "version": "10.46-1~deb13u2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "fc8746069ac084d215c1e8fafafbbf090ccbf19906b42d4ce45559c5b98de4594db513730c228f6748c11989f275666a5e822c43c1eaa871359f0813accfb17c",
+          "filename": "pool/main/r/readline/libreadline8t64_8.2-6_amd64.deb",
+          "mode": "0600",
+          "package": "libreadline8t64",
+          "sha256": "eeadf2b5e755c9f183883feea2d9b5b28560284275d5f54d3e55d0923b1d0967",
+          "size": 168832,
+          "version": "8.2-6"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "dd09d9c921ca2c06c6689616d5ef2462f75d1b524cdb33ca417d2e86c70780b8b3ae6a9f7c102355b7db64449540247c2148c1cbb9513ccf6b91567054c336a0",
+          "filename": "pool/main/libs/libseccomp/libseccomp2_2.6.0-2_amd64.deb",
+          "mode": "0600",
+          "package": "libseccomp2",
+          "sha256": "89d5138e05fb6a86b9afd8b54dc0fb4b14f4c27c05e6c5f767c2132bdf808531",
+          "size": 51712,
+          "version": "2.6.0-2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "73e2967dbd16a8fd65b553345bed2c618854baaeada2042363595ab1028936d363c8243f4e3497283d813ba83c6432801aa95e2f4600c049b6ed28a9776f2855",
+          "filename": "pool/main/libs/libselinux/libselinux1_3.8.1-1_amd64.deb",
+          "mode": "0600",
+          "package": "libselinux1",
+          "sha256": "68bb8d32bd8d6d7d2f5952a169db03d1484b46ae1e52abccdec42a19dccea5d5",
+          "size": 84680,
+          "version": "3.8.1-1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "d1440f8f47e34598090b6bef1e7e32bac5ba3e18c9c49156d121a0679ccc8b2056d3ab8213b51f08f5565e9142720f6a668b3fde836b2784164f70da3518dafd",
+          "filename": "pool/main/libs/libsigsegv/libsigsegv2_2.14-1+b2_amd64.deb",
+          "mode": "0600",
+          "package": "libsigsegv2",
+          "sha256": "bac603b965f303ea88dc39cd723b3d88cd86e3be9c948783f0d5e0d00e971302",
+          "size": 34368,
+          "version": "2.14-1+b2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "bd889cc72159f642728ce73f51752e27d3296e8c858b42779b5a5d4b92842cb52e30b41ee803ca07a3e8cf9d3e15b1793850beb1c13e34100fdc8262bbca66a1",
+          "filename": "pool/main/u/util-linux/libsmartcols1_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libsmartcols1",
+          "sha256": "d96bac9c8805685f2734885098a214b82950da6ebb182c27a6b7a124a0323392",
+          "size": 143216,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "a84af2ded53ec9bc67f0dcbea8f98c8e21a2585bdb84de293342e790f20b7ee50404ab1dd3a437588a4433cef317905ee0b53ffa0b0c3698a1c0107a83940ef9",
+          "filename": "pool/main/s/sqlite3/libsqlite3-0_3.46.1-7+deb13u2_amd64.deb",
+          "mode": "0600",
+          "package": "libsqlite3-0",
+          "sha256": "0a459adaffd901109f7811ab65f58e7a957b4907d05539cf3d1184efdcde0468",
+          "size": 914584,
+          "version": "3.46.1-7+deb13u2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "b9451913054c60ebc1273439b944c95d441930a71aefb385033764541f70bb8238d637e595019793c759c923693675741267863b8f7a5d934a8e1b8a77780b26",
+          "filename": "pool/main/o/openssl/libssl3t64_3.5.7-1~deb13u2_amd64.deb",
+          "mode": "0600",
+          "package": "libssl3t64",
+          "sha256": "916f7f40b34a06e6ebfaefcdab331bff458328411da672598f126a760472467d",
+          "size": 2453872,
+          "version": "3.5.7-1~deb13u2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "604bf6e4c810b083402b609a464fd86dcd55c5d0c7dedf00ae4543470eeb423f03589b6dc1c3f0dad28b9b7f4fa1aa9f24be265d56a9df2517d230183c50ec17",
+          "filename": "pool/main/g/gcc-14/libstdc++6_14.2.0-19_amd64.deb",
+          "mode": "0600",
+          "package": "libstdc++6",
+          "sha256": "ab1fa05837aa7a92aae748fd07a18a35f7d18bb4a71c4724fe2bbf0e32089de0",
+          "size": 713628,
+          "version": "14.2.0-19"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "ca5764a3a811126457362b5aca24e670601d1c56c0f8edf460c2b0f9e6a0212d202196f9dab6b53682f30b108fdbe54fcaa5ee17933def28cbc000a4c4ce6d48",
+          "filename": "pool/main/s/systemd/libsystemd-shared_257.13-1~deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libsystemd-shared",
+          "sha256": "2d349824e57f88507e2a33360610d8afc143a4ad5e80ee4bf8f37b826d6f37f9",
+          "size": 2154616,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "125a810fb58e17ae09716042e0b8dabfb1943350927061b2623d3f274e959e3580fcf72301268c108668470e5c80f81b847b37eaeeb3255c9fdb6d4d263ae655",
+          "filename": "pool/main/s/systemd/libsystemd0_257.13-1~deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libsystemd0",
+          "sha256": "ab0d4127b5e46e6f8c015a1db15a62ba9ae274cdefa150083adf90ada0600ea1",
+          "size": 454648,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "53597edeb8053e169f0aec20a36310156f5fa903105abb23016ee91980bf1889f5d159d976b1d57a354a33186726c2014d2307928c38f4246310de9b604d53bb",
+          "filename": "pool/main/n/ncurses/libtinfo6_6.5+20250216-2_amd64.deb",
+          "mode": "0600",
+          "package": "libtinfo6",
+          "sha256": "8b9f6a7983e9418564e48a627518de4c03917b56efe68d7f3e93bd8fffa1cc10",
+          "size": 348380,
+          "version": "6.5+20250216-2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "af7791ced811aeca7be1a8af415a60f325a54e7c51938e6c7c6be80fb342d1c1d613abd6a841688211e3deffa5ab45223b35bb85efb8f4cc35a34e69a048d5b4",
+          "filename": "pool/main/s/systemd/libudev1_257.13-1~deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libudev1",
+          "sha256": "5d41c284f5a93b05bc7d648b61a02dd2bb9ff05b2261ad1a8b7d96044a0cfa88",
+          "size": 152300,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "898e3d4c1b4cf7e7964347156e2fe7cbe6ad7be61cab3ba8958eb1f76cb96de8f97133f229e71d26ea6c6f496f7f86ec3a80b0f49740da53c02d6e2ff1413502",
+          "filename": "pool/main/u/util-linux/libuuid1_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "libuuid1",
+          "sha256": "c1bf4c4c3ff48c57fabf93307dfb56996b60cfa33927afc4158b5db36fb2721e",
+          "size": 37848,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "5bcd90d5747fbb818ec87080a5d967a64a74cb8c54eb393b8916453ca42ac2460295313f7c8e7edb06b3aee79479000cf6ca55b553f777cf1628620ce519cd30",
+          "filename": "pool/main/x/xxhash/libxxhash0_0.8.3-2_amd64.deb",
+          "mode": "0600",
+          "package": "libxxhash0",
+          "sha256": "81da7064d56fc044f5db4bb3c1e80ff50a4986dcbbf80d958eeca565b44c157f",
+          "size": 27096,
+          "version": "0.8.3-2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "1f211445c1aa3a8e9dad19369bfcc3959a50720e386f53b49104a8fe9ff3aaa3a7ee44cce84f426178819f009e368ff0dff44fd79ef7f645a88449c8400a0d88",
+          "filename": "pool/main/libz/libzstd/libzstd1_1.5.7+dfsg-1_amd64.deb",
+          "mode": "0600",
+          "package": "libzstd1",
+          "sha256": "2f6a2aeacfc925eba8b00ac9139bc4bfccf8cacb09eb93de067074b26948eef9",
+          "size": 303836,
+          "version": "1.5.7+dfsg-1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "d6789513fd6f772ce41c03cfd7249a1042cd2c0441dd23ae6ca2d5be6a7fafdb7edb3fa884cf650032c07174028d76257b0d59cfdb21075412497918dd701648",
+          "filename": "pool/main/u/util-linux/mount_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "mount",
+          "sha256": "eb70a615114ac40123768beb20e302554d5cb7edb33290be7e418ebe1075c878",
+          "size": 163208,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "4852cf736b47b5063a1ca1237a4de0a4538bd52e4e99e1d45f78ccb3d224ca31c27c4e0c1c4b23437757f1da250f4af574a22fbae9173e26a859d47bdca23fa4",
+          "filename": "pool/main/n/ncurses/ncurses-base_6.5+20250216-2_all.deb",
+          "mode": "0600",
+          "package": "ncurses-base",
+          "sha256": "190e775260a38973c415a36ae99f33ad1b37ea6ca99929d7c5d53843fc23e914",
+          "size": 273216,
+          "version": "6.5+20250216-2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "7247a97f613225def0812674ca9e3ed9f6cd6ca5022d094a83bc4bbd149ad950752e1c78f99d109aafed03336ed1ddf5c8a9d1a357bf4f989fc0b711f9671f13",
+          "filename": "pool/main/n/ncurses/ncurses-bin_6.5+20250216-2_amd64.deb",
+          "mode": "0600",
+          "package": "ncurses-bin",
+          "sha256": "40a525f4761e9ed4b8adcd1783cb9a6467ff8008215ae99b3597825bdefc61e4",
+          "size": 438372,
+          "version": "6.5+20250216-2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "808addd039e469876a893944288c3e7dfd39005943f2a1b955e40f558a97a268e901c724dd39774d9acc030880996c0d11932867a19f4d73defd0b0d1126ab68",
+          "filename": "pool/main/o/openssl/openssl-provider-legacy_3.5.7-1~deb13u2_amd64.deb",
+          "mode": "0600",
+          "package": "openssl-provider-legacy",
+          "sha256": "f155c8191ae6d41da73d792f4182680aeafeb85c3dd223934ee9fdd115c4f1fa",
+          "size": 316132,
+          "version": "3.5.7-1~deb13u2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "008e3da0ef6f547d0310db5450e0b6c54c36d95d29f7e74ee1f6f0200965d4fca4a553d4a9535d6432137c943c146df8bd8094ddaf7fac19df7a4d48ebabb955",
+          "filename": "pool/main/p/perl/perl-base_5.40.1-6+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "perl-base",
+          "sha256": "b795464137a0f4d443fc9284f4b93e883fb83883cb533adf300ac660807a352a",
+          "size": 1666320,
+          "version": "5.40.1-6+deb13u1"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "108b7c792a22a95734804b1f2ba4893463fb8353da03ced2480d0a255ef0a9af1ff2378921eb7e0f677a1c9ac7b3842d7bd4f9ef95153ba1478c8d4f296ba6e6",
+          "filename": "pool/main/r/readline/readline-common_8.2-6_all.deb",
+          "mode": "0600",
+          "package": "readline-common",
+          "sha256": "f77e8aa0bf0de618f11cb0b21658a4ed60f177d63b3cf26d7fc3706b6d0eaaa9",
+          "size": 69360,
+          "version": "8.2-6"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "93008361eabebf6f4e0bba9e2ac36fefb6e25662891d6faa1ceb7759168aecd1822beccdd946ffc99a1d995829435f0fa3d66073b7727612015897f350cd6d2f",
+          "filename": "pool/main/s/sed/sed_4.9-2+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "sed",
+          "sha256": "7071270ed4f6adda55bc4f926347fb847bacaffbdee3dff917bc6006ed7e3775",
+          "size": 330696,
+          "version": "4.9-2+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "64012bce51cce6945c19254a528dbbeef40562da53a3104bb956b471945f8d5e999a0fbafa5db36160540c90494669bcea5ea197bfdb5f6ba0ad36f4dae31780",
+          "filename": "pool/main/r/rust-sequoia-sqv/sqv_1.3.0-3+b2_amd64.deb",
+          "mode": "0600",
+          "package": "sqv",
+          "sha256": "97760aa17acceee0cace13d9edbed781d891b43e0dec0d6ddc4bd5e4c3ac65aa",
+          "size": 661428,
+          "version": "1.3.0-3+b2"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "1afbf8d88bce1c16aa98f6d53a086a74cfa74f5e072668f9c17427874334cd42aecc7c7da46fec3fbdf653a4d143d72c6caf8c250eaf0fde74bb96b1896f0f19",
+          "filename": "pool/main/s/systemd/systemd_257.13-1~deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "systemd",
+          "sha256": "ee81302a1d5b7434762b6e784a572854d4b6cf6235e33e2d104ad4e1cae71ab4",
+          "size": 3093632,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "4d94f1f35447cb84b4a15512329776e1c3a2e69b5879269e5c265268743c92855e043de067a95c284f7e4d550f845b1c1c7450fa16a11a0f7c27b45d59a75e81",
+          "filename": "pool/main/s/systemd/systemd-sysv_257.13-1~deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "systemd-sysv",
+          "sha256": "3bed48042b6e40f8a3c439e79b4a4ed6a12102eb3ab66123dc43aa18f0416729",
+          "size": 64876,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "fdafe5934eef1c9becbd06d590f2dfd187eb9f068021eab635884e94f3041beaa3ef5f5b30a6935bae0530d45ffb24e8c6761e3db314cef9c4b04e0d8a313ecb",
+          "filename": "pool/main/s/sysvinit/sysvinit-utils_3.14-4_amd64.deb",
+          "mode": "0600",
+          "package": "sysvinit-utils",
+          "sha256": "c7e957360dff89675b491e501b00047cf750695178cabab167c92fc260d358ec",
+          "size": 34060,
+          "version": "3.14-4"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "a11027aacc71b99b909c96ba334c4ea7386f99b3fdc3738bb11abb278826ac02237f4bb3eb147d8c21e12645415d4d34e16858662240cd15d7442e4d23e44e03",
+          "filename": "pool/main/t/tar/tar_1.35+dfsg-3.1_amd64.deb",
+          "mode": "0600",
+          "package": "tar",
+          "sha256": "214c02e1aa291076a3147b8a4c4cae02fadf4c67df629186e3e313726faef1de",
+          "size": 814968,
+          "version": "1.35+dfsg-3.1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "bec0944051e4cc1b05b24006a49185b7ad499d60a9ba86cc3bbd592df8911f1deebee04e54de0c458afb51a7818ddbf25cfd97a33137a262d3ef0255f6660e57",
+          "filename": "pool/main/u/util-linux/util-linux_2.41.5-0+deb13u1_amd64.deb",
+          "mode": "0600",
+          "package": "util-linux",
+          "sha256": "7d5b1176cc3d8cc6b290b3ec17af458f362d9200845f30da22057a8198744430",
+          "size": 1242392,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "amd64",
+          "derived_sha512": "99707ae371d970a774a7e0fffcceb48ad7ae611ff8513488f8fab809a4eb69a3d9df734d1a211f7b6e9104ada25a75f9a86fcf137000001006ce64bf0d38057d",
+          "filename": "pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_amd64.deb",
+          "mode": "0600",
+          "package": "zlib1g",
+          "sha256": "015be740d6236ad114582dea500c1d907f29e16d6db00566ca32fb68d71ac90d",
+          "size": 88892,
+          "version": "1:1.3.dfsg+really1.3.1-1+b1"
+        }
+      ],
+      "cas_bytes": 37313912,
+      "cas_objects": 78,
+      "cas_sha256": "279028c4f10a0b5024df65b0cc135b2d4fa5eded8f678196ca9bef42d11600a0",
+      "inventory": {
+        "path": "amd64-inventory.json",
+        "sha256": "0e6a5d82ca5f939efde1ec4d8ddb49e3ff255e79143c623221cc0788b6c7e2cf",
+        "summary": {
+          "admitted": 78,
+          "conffiles": 64,
+          "essential": 22,
+          "gaps": [
+            {
+              "category": "alternatives_script_authority",
+              "packages": [
+                "bash",
+                "debianutils",
+                "gawk",
+                "tar",
+                "util-linux"
+              ],
+              "priority": "P1"
+            },
+            {
+              "category": "debconf_frontend",
+              "packages": [
+                "base-passwd",
+                "dash",
+                "debconf",
+                "libc6",
+                "libpam-modules",
+                "libpam-runtime",
+                "libpam0g"
+              ],
+              "priority": "P1"
+            },
+            {
+              "category": "kernel_filesystem",
+              "packages": [
+                "libc6"
+              ],
+              "priority": "P1"
+            },
+            {
+              "category": "accounts",
+              "packages": [
+                "apt",
+                "base-passwd",
+                "libpam-modules",
+                "libpam-runtime",
+                "systemd"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "service_manager",
+              "packages": [
+                "apt",
+                "dpkg",
+                "libc6",
+                "libpam-modules-bin",
+                "libpam0g",
+                "libselinux1",
+                "systemd",
+                "util-linux"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "system_registry",
+              "packages": [
+                "dash",
+                "debianutils"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "environment_probe",
+              "packages": [
+                "apt",
+                "base-files",
+                "base-passwd",
+                "dpkg",
+                "libc6",
+                "libpam-modules-bin",
+                "libpam0g",
+                "systemd",
+                "util-linux"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "dpkg_database_helper",
+              "packages": [
+                "apt",
+                "base-files",
+                "dash",
+                "debian-archive-keyring",
+                "dpkg",
+                "gzip",
+                "init-system-helpers",
+                "libc6",
+                "libpam-modules",
+                "libpam-runtime",
+                "libpam0g",
+                "libreadline8t64",
+                "libselinux1",
+                "libstdc++6",
+                "systemd",
+                "systemd-sysv"
+              ],
+              "priority": "P3"
+            },
+            {
+              "category": "ldconfig",
+              "packages": [
+                "libc-bin"
+              ],
+              "priority": "P3"
+            },
+            {
+              "category": "trigger_declaration",
+              "packages": [
+                "apt",
+                "base-files",
+                "debianutils",
+                "libacl1",
+                "libapparmor1",
+                "libapt-pkg7.0",
+                "libattr1",
+                "libaudit1",
+                "libblkid1",
+                "libbz2-1.0",
+                "libc-bin",
+                "libc6",
+                "libcap-ng0",
+                "libcap2",
+                "libcrypt1",
+                "libdb5.3t64",
+                "libdebconfclient0",
+                "libgcc-s1",
+                "libgmp10",
+                "libhogweed6t64",
+                "liblastlog2-2",
+                "liblz4-1",
+                "liblzma5",
+                "libmd0",
+                "libmount1",
+                "libmpfr6",
+                "libnettle8t64",
+                "libpam0g",
+                "libpcre2-8-0",
+                "libreadline8t64",
+                "libseccomp2",
+                "libselinux1",
+                "libsigsegv2",
+                "libsmartcols1",
+                "libsqlite3-0",
+                "libssl3t64",
+                "libstdc++6",
+                "libsystemd0",
+                "libtinfo6",
+                "libudev1",
+                "libuuid1",
+                "libxxhash0",
+                "libzstd1",
+                "systemd",
+                "zlib1g"
+              ],
+              "priority": "P3"
+            },
+            {
+              "category": "ownership_and_mode",
+              "packages": [
+                "base-files",
+                "base-passwd",
+                "libpam-modules-bin",
+                "mount",
+                "util-linux"
+              ],
+              "priority": "P4"
+            }
+          ],
+          "metadata_members": [
+            {
+              "count": 41,
+              "name": "shlibs"
+            },
+            {
+              "count": 35,
+              "name": "symbols"
+            },
+            {
+              "count": 7,
+              "name": "templates"
+            }
+          ],
+          "packages": 78,
+          "rejected": 0,
+          "remove_on_upgrade_conffiles": 0,
+          "scripts": [
+            {
+              "count": 1,
+              "name": "config"
+            },
+            {
+              "count": 24,
+              "name": "postinst"
+            },
+            {
+              "count": 17,
+              "name": "postrm"
+            },
+            {
+              "count": 10,
+              "name": "preinst"
+            },
+            {
+              "count": 12,
+              "name": "prerm"
+            }
+          ],
+          "tools": [
+            {
+              "count": 2,
+              "name": "/proc"
+            },
+            {
+              "count": 25,
+              "name": "/run"
+            },
+            {
+              "count": 2,
+              "name": "add-shell"
+            },
+            {
+              "count": 1,
+              "name": "adduser"
+            },
+            {
+              "count": 6,
+              "name": "chmod"
+            },
+            {
+              "count": 5,
+              "name": "chown"
+            },
+            {
+              "count": 30,
+              "name": "confmodule"
+            },
+            {
+              "count": 1,
+              "name": "db_beginblock"
+            },
+            {
+              "count": 1,
+              "name": "db_capb"
+            },
+            {
+              "count": 1,
+              "name": "db_endblock"
+            },
+            {
+              "count": 5,
+              "name": "db_fset"
+            },
+            {
+              "count": 5,
+              "name": "db_get"
+            },
+            {
+              "count": 17,
+              "name": "db_go"
+            },
+            {
+              "count": 18,
+              "name": "db_input"
+            },
+            {
+              "count": 7,
+              "name": "db_purge"
+            },
+            {
+              "count": 9,
+              "name": "db_reset"
+            },
+            {
+              "count": 2,
+              "name": "db_set"
+            },
+            {
+              "count": 6,
+              "name": "db_stop"
+            },
+            {
+              "count": 8,
+              "name": "db_subst"
+            },
+            {
+              "count": 12,
+              "name": "db_version"
+            },
+            {
+              "count": 22,
+              "name": "deb-systemd-helper"
+            },
+            {
+              "count": 9,
+              "name": "deb-systemd-invoke"
+            },
+            {
+              "count": 27,
+              "name": "dpkg"
+            },
+            {
+              "count": 30,
+              "name": "dpkg-divert"
+            },
+            {
+              "count": 64,
+              "name": "dpkg-maintscript-helper"
+            },
+            {
+              "count": 3,
+              "name": "dpkg-query"
+            },
+            {
+              "count": 2,
+              "name": "dpkg-trigger"
+            },
+            {
+              "count": 1,
+              "name": "getent"
+            },
+            {
+              "count": 7,
+              "name": "invoke-rc.d"
+            },
+            {
+              "count": 3,
+              "name": "ischroot"
+            },
+            {
+              "count": 1,
+              "name": "ldconfig"
+            },
+            {
+              "count": 4,
+              "name": "pam-auth-update"
+            },
+            {
+              "count": 2,
+              "name": "start-stop-daemon"
+            },
+            {
+              "count": 20,
+              "name": "systemctl"
+            },
+            {
+              "count": 1,
+              "name": "systemd-machine-id-setup"
+            },
+            {
+              "count": 1,
+              "name": "systemd-sysusers"
+            },
+            {
+              "count": 4,
+              "name": "systemd-tmpfiles"
+            },
+            {
+              "count": 10,
+              "name": "update-alternatives"
+            },
+            {
+              "count": 7,
+              "name": "update-passwd"
+            },
+            {
+              "count": 4,
+              "name": "update-shells"
+            }
+          ],
+          "total_bytes": 37313912,
+          "triggers": [
+            {
+              "count": 41,
+              "name": "activate_noawait"
+            },
+            {
+              "count": 1,
+              "name": "interest_await"
+            },
+            {
+              "count": 8,
+              "name": "interest_noawait"
+            }
+          ]
+        }
+      },
+      "locks": {
+        "apt": {
+          "digest_sha256": "1de068531d57382c89ef40e6b33be062e9dd73ff41cb118def8fa153755797f9",
+          "file_sha256": "72e36e01e0148691382c0f8877f982bb3d075a4bf112020c0685ea4a794339b5",
+          "packages": 73,
+          "path": "amd64-apt.lock.json",
+          "policy_sha256": "2f5d0d954dfe682bcc36acd6d636f4bc3d52a819156b6623b6a1d2339ed38d57",
+          "request_sha256": "b999effaa1e7a9423a9c192c063823f8470ae67d4ecd6dfb604f6aa8f3ffce6b",
+          "total_bytes": 31793892
+        },
+        "systemd-sysv": {
+          "digest_sha256": "c45486fc240ffcf6dba1ff54a1073269795bb1e2ddf6f813973a256c11bd193c",
+          "file_sha256": "115ad16d61ad4545da210e2675680de75cb01a058606f33dc1f94836939394f7",
+          "packages": 69,
+          "path": "amd64-systemd-sysv.lock.json",
+          "policy_sha256": "2f5d0d954dfe682bcc36acd6d636f4bc3d52a819156b6623b6a1d2339ed38d57",
+          "request_sha256": "5f49cb0a386e27c7f4e9c77de5916e43f832f2848e428382f0947548a14aed97",
+          "total_bytes": 32462832
+        }
+      },
+      "repository": {
+        "archive_binding": "signed_sha256_derived_sha512",
+        "id": "c8cec41705612dba684f249dc277c1f39d9a2137134155dedd528837a4e497c2",
+        "index_sha256": "7778d3e3f303b7ddb8ce0fe7c8d57473a076c6bf2e8f241f75421d2396352498",
+        "inrelease_sha256": "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+        "release_sha256": "ed56aac47e7911e65ee63aae8d67e29f20e023f840e49f8ed037043a33de138a",
+        "snapshot_sha256": "671d2df2c3b28d900dedfbcad8e20f4c66cebc33995e2a1831dfa8bfd2b2ccd0"
+      },
+      "runs": [
+        "debian-261-closure-amd64-1",
+        "debian-261-closure-amd64-2"
+      ],
+      "source_sha256": "0ff1ed7aeaa451948bf5f576cf51473027f563da01d1d274c6cff8c813fc3b04"
+    },
+    "arm64": {
+      "cas": [
+        {
+          "architecture": "arm64",
+          "derived_sha512": "f9c92e40428cc29b4a9fce2599b6af9f145e76069aa872b5ee982197520781d9f53f139cca7a86f7593e42a3ecbfe62d3d7778434ba2c7435cd0b8ed6862e6a9",
+          "filename": "pool/main/a/apt/apt_3.0.3_arm64.deb",
+          "mode": "0600",
+          "package": "apt",
+          "sha256": "9d88b95c6a6c9880b1bb40aebe7df3b34a0a160a9430d76fac496512a4cf69a6",
+          "size": 1361960,
+          "version": "3.0.3"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "7e98dc35cb95c0a95bfe58c723dc89da85435e559eb880cea7d1ea9b282a87236bde6267830d8b9aabce549314d03dec7f06bde4a5be8724bc81f3c8742c2b7a",
+          "filename": "pool/main/b/base-files/base-files_13.8+deb13u7_arm64.deb",
+          "mode": "0600",
+          "package": "base-files",
+          "sha256": "5330362213dc8b9327a56383104235c269797d5db2fd8688f535298d4c44e4d2",
+          "size": 88244,
+          "version": "13.8+deb13u7"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "86ff5040b506431e6940f2737534cd812ff3c7db1aee7bb76b99979d0e23bd0b32eb252ee56fe048e48022dcf34980ade16c52fc46e74f011e7dbdc9fb4730fb",
+          "filename": "pool/main/b/base-passwd/base-passwd_3.6.7_arm64.deb",
+          "mode": "0600",
+          "package": "base-passwd",
+          "sha256": "c5755fd2cbf76961a1230e708b6bfc12c5400b57f3cd8a255675e9aa11d85848",
+          "size": 53392,
+          "version": "3.6.7"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "2da3f0646a230d3497f43951563f658ac213e517181fc4cf6f4a3e9b1273a0f323e344a02c595ce0e83cd3a615a0afe831aeb81ee8f8f0d9404c5e74051a5558",
+          "filename": "pool/main/b/bash/bash_5.2.37-2+b10_arm64.deb",
+          "mode": "0600",
+          "package": "bash",
+          "sha256": "9e2d2b3646b250f53be79b6128d9cff5e99cc5ff4a8c84e58efab59ad9bb0ddc",
+          "size": 1456340,
+          "version": "5.2.37-2+b10"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "b217d4813e317c537892ed7eaf9ba13170a9c199c38fa7102db971e41beed7e4de8b120ea1c410480752ea48e332b36f1624a7bd39acb4c9450dce1801b8e544",
+          "filename": "pool/main/u/util-linux/bsdutils_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "bsdutils",
+          "sha256": "9afcc3e049a66d7f703d092f845c800b767fb9afe9e681e1483eec163aadcb18",
+          "size": 109000,
+          "version": "1:2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "17626c7ac1b9ca3cfa0fea4e1ee96c6704da7dcc5af1e9b3e26953da29b517dad433b8fe56fa6b2885226d5f14b9b715e0f7aff9cc0165df229965649e8ffcf8",
+          "filename": "pool/main/c/coreutils/coreutils_9.7-3_arm64.deb",
+          "mode": "0600",
+          "package": "coreutils",
+          "sha256": "99b2531e8d16e4f2d3f239ae3cb57913ec1f43764d2d6cd5c69154cbb1e57f3e",
+          "size": 2948764,
+          "version": "9.7-3"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "9583afe382ec61e2fdc4a06b599c063ab6a9a490c2537d41ed3cba3bb69815c5d2e99fa2a4bf96487b230f96017f06d47653c2f70b2b1dcc2d9a9d31d2293b3d",
+          "filename": "pool/main/d/dash/dash_0.5.12-12_arm64.deb",
+          "mode": "0600",
+          "package": "dash",
+          "sha256": "ce4c8688a1a3ea510186ba95aba74d4c49863094e47e1effc0b602839e840c04",
+          "size": 95648,
+          "version": "0.5.12-12"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "9d24db8201c080e48fa45e4008305a8f7a97e1d65be5dcfd9680ee9306237ad0b62dfe663918235771116c239655b774b434cf2f0b677d0af7d36fd521454d3d",
+          "filename": "pool/main/d/debconf/debconf_1.5.91_all.deb",
+          "mode": "0600",
+          "package": "debconf",
+          "sha256": "1ddc7e6c5925f748eefb7ca811d98e049f18c158bb21fbc7e122262ce6011e49",
+          "size": 121088,
+          "version": "1.5.91"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "d99dafbe92c40468012d0a95fa4e4dedbdb96e6e96bcc8b8f0fb082eadcbad42f625303ba128257dc7f660d6ba536f5bb27f7d72ded33121bf4679ae60070397",
+          "filename": "pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb",
+          "mode": "0600",
+          "package": "debian-archive-keyring",
+          "sha256": "9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac",
+          "size": 179244,
+          "version": "2025.1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "dc3d4eafd191c81b47437f1341bdd4452ff4b8e65920be43e2aacad9ee05e91460aaa1f69c6b33c744e799b2b414434ba36dc2dfdb0a40e98b9a11c134962db7",
+          "filename": "pool/main/d/debianutils/debianutils_5.23.2_arm64.deb",
+          "mode": "0600",
+          "package": "debianutils",
+          "sha256": "662d59d9cd0d46f0250ddcd997353be915fbc6be692d7c676c73dc33c90715e8",
+          "size": 92412,
+          "version": "5.23.2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "c6f379ede8112260de40aeea706bd2f5b29e43330c9614193a7f416ccd69d82986613e517bd2f63741c10270b150d6b3542c70b92dea0167fc81f4fd8a006032",
+          "filename": "pool/main/d/diffutils/diffutils_3.10-4_arm64.deb",
+          "mode": "0600",
+          "package": "diffutils",
+          "sha256": "85cfb5576fa43ba2bd2047c53140fb465b929753048e53eb0fe6482ed343a5b9",
+          "size": 377920,
+          "version": "1:3.10-4"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "5736568f761e4b93a20bc373478757b32261e4a9b71c8562512e647a0055612bc47ce3d8e36b64b9a43a3878ee623a9b877ba9db1bae8c07a81dae3ce400d659",
+          "filename": "pool/main/d/dpkg/dpkg_1.22.22_arm64.deb",
+          "mode": "0600",
+          "package": "dpkg",
+          "sha256": "1142468e57f69e13d174f517dff739508c61ee97d81c182c120cd6b281d8cdfa",
+          "size": 1521436,
+          "version": "1.22.22"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "cabb8f0caa2cee1c53bd1f4876db11aee6c4de802ca797d5199272766aa4c3511fd83665a0f2c45248fe9a83aafd0da68565b27d40d74f1c540c78ae027acbfa",
+          "filename": "pool/main/f/findutils/findutils_4.10.0-3_arm64.deb",
+          "mode": "0600",
+          "package": "findutils",
+          "sha256": "c8b505ce907c293031095b3a237cb231967963b1d5aa8b1699aff45ccec3158a",
+          "size": 695700,
+          "version": "4.10.0-3"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "a5bc28b0f4232147a07cfec94423cd3cf415b3e8a5dd92102079ae8a30cd4d40136df17c5810dd6568094571190b909b2f2065d40c1ecdcc892f26f774f86739",
+          "filename": "pool/main/g/gawk/gawk_5.2.1-2+b2_arm64.deb",
+          "mode": "0600",
+          "package": "gawk",
+          "sha256": "0c040f686b0dd34387c0aa69848dd9f29741043821a843b480c38a1cf5956142",
+          "size": 643936,
+          "version": "1:5.2.1-2+b2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "39bb505b163ec38b840530b6de11d7021ce553451e749fa6caaed2010b3c7d4c9f438fe5e89544bcbcb383d4dd3b817c60ed073d024950834d134751eec57471",
+          "filename": "pool/main/g/gcc-14/gcc-14-base_14.2.0-19_arm64.deb",
+          "mode": "0600",
+          "package": "gcc-14-base",
+          "sha256": "34ee90679b018c0e64234747a4c4c0ae6b7f63541115037465a8627c2dfbc594",
+          "size": 49444,
+          "version": "14.2.0-19"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "c54e9933de5de7a0c74062efc22e0c91df33a3e0c50a129d39cda88f67f8175d7c1934037b1fdb32a9068a8fc455050fe0ad60f68910dd5d873bdd522ed9594b",
+          "filename": "pool/main/g/grep/grep_3.11-4+b1_arm64.deb",
+          "mode": "0600",
+          "package": "grep",
+          "sha256": "6f7257fbec0197bd54b2347861ff01e2c4e8411790b0df20242483615324fe66",
+          "size": 426128,
+          "version": "3.11-4+b1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "3351f43f7c016930f30cd40f30c7ab6b1bf7fe964abdc0ada5e799caeee9e0c97c2266c0e01d0d98378aee027dc3701d1a194d6879ef620de02a97e024793033",
+          "filename": "pool/main/g/gzip/gzip_1.13-1+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "gzip",
+          "sha256": "02f83e5b4351ab4caa54f0405a334943dcd4986fdce740072bbda7b3c844e1f6",
+          "size": 135152,
+          "version": "1.13-1+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "812f25aedaf15112cbd28d1e0b5b18c755b257c011e6f142d9450cf4d91edc64a534279c3525a3eaeed0925e0ed7dc9b75f7ba9e60f3041cab94a739e5b3dd17",
+          "filename": "pool/main/h/hostname/hostname_3.25_arm64.deb",
+          "mode": "0600",
+          "package": "hostname",
+          "sha256": "04d1ff24cb605788b59ed30d0052c1039c8bce2fb44c01c3c4b0c6edd4ea7ccc",
+          "size": 10808,
+          "version": "3.25"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "c1f35ca8662b742ccdae6f0b483d539ddb635e7296f4e59c5e0679a4040cda04fc628205f27ec2fb8f875ce18b27deccac711e9fc83912e24f9d66b715bc75a2",
+          "filename": "pool/main/i/init-system-helpers/init-system-helpers_1.69~deb13u1_all.deb",
+          "mode": "0600",
+          "package": "init-system-helpers",
+          "sha256": "addf78073e1cbc5a5508937e11d2571055e29835e00ee8fab52a66775649378f",
+          "size": 39360,
+          "version": "1.69~deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "288b4ca5d8a4f3c4dc6c7af464d12567c669b5357c2bec0eea95bbe324bb46dd2525d3cc894877b322130a5d44bd87c0508abf362ce3eff5c16b8cee626bef2e",
+          "filename": "pool/main/a/acl/libacl1_2.3.2-2+b1_arm64.deb",
+          "mode": "0600",
+          "package": "libacl1",
+          "sha256": "10b2399169e42e6d8db55944116cb2ed61caab997cf700acb83de0b0668e5721",
+          "size": 32216,
+          "version": "2.3.2-2+b1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "674e6e07a09b7fb881f27cafa8199b6cd0b060f7f4915a4a7b6aae8c16ef91de8f7f5148c19795ce262863820fcd222c486c09b65482b0624f4fb7864f334316",
+          "filename": "pool/main/a/apparmor/libapparmor1_4.1.0-1_arm64.deb",
+          "mode": "0600",
+          "package": "libapparmor1",
+          "sha256": "6e5ec85de21bd5f489327e6d2c85c2825e82ff6f4581dc936704d022a1f164af",
+          "size": 42936,
+          "version": "4.1.0-1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "655cf1f9c416029dd6c1ebf36812cce88a42cb9c3f3b45e7e079c261151ebcc8b58aa6f975f9fa2ec286dc27c4dcf8e4b8f9c7aa909adbe6f6d926ce1f81bc8f",
+          "filename": "pool/main/a/apt/libapt-pkg7.0_3.0.3_arm64.deb",
+          "mode": "0600",
+          "package": "libapt-pkg7.0",
+          "sha256": "c5aea30677a9c7a56edc92fcba3361f5e8cb31d5cdfedf72fc9d8e4fba150bda",
+          "size": 978112,
+          "version": "3.0.3"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "26dd364d4b84845d54912cf2683a9c6a8885954b427805fca62d9aaf7820f516c6e21e1da39c1fc6bfff2cfc419845027e12445cd426a01e1a659e6fd81390a7",
+          "filename": "pool/main/a/attr/libattr1_2.5.2-3_arm64.deb",
+          "mode": "0600",
+          "package": "libattr1",
+          "sha256": "25057d7bfba969a76cdf18ae88ce7ff6e664520726ddf02cdde97c03d5e9a43c",
+          "size": 22664,
+          "version": "1:2.5.2-3"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "36bfe3788961362709cf25a2282987a0ae39d4f1056a7d8335dec76d2824536be4b5c18e6a21eee778a74ea958316e8648a0ae7720386db0222c60cbd8e423b1",
+          "filename": "pool/main/a/audit/libaudit-common_4.0.2-2+deb13u1_all.deb",
+          "mode": "0600",
+          "package": "libaudit-common",
+          "sha256": "b9d32e5ff04fd747aacb7d6b3ebbbbf734ddefb2f1695f0b1b2a4b5e51b1052e",
+          "size": 12812,
+          "version": "1:4.0.2-2+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "b70f30d4afe60f4ec40e874e6b615e54c943b9c6c28f969b59534c6c7ce340d129aca6fa43da76517e6b4363a7f70ac7d0caa454d81395c238026e0b9fdcd838",
+          "filename": "pool/main/a/audit/libaudit1_4.0.2-2+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libaudit1",
+          "sha256": "3472a1d77e36832ea0bb6509153c721ffc46a96aa0bc25073e7b95571df16196",
+          "size": 56900,
+          "version": "1:4.0.2-2+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "2e036584cf9c9001a973c34204a9ff510e42a2d76d24cb2cd90601429167fd2d811fda628b0134589eb83bc448d7e59853b5082cdd464c467ea50c28269b40c3",
+          "filename": "pool/main/u/util-linux/libblkid1_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libblkid1",
+          "sha256": "d7d122b4c7a0a8ae6135a1687c9c4ce80a88f9e498c01998f634dd32caab9016",
+          "size": 166472,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "88909bde379d2e814382107690af38e3a20282c7ada3f429d5f0d524a6f72a072fb6dcdec718a4d50679214841f10ee76426e14f052590c923f360fbf06b8591",
+          "filename": "pool/main/b/bzip2/libbz2-1.0_1.0.8-6_arm64.deb",
+          "mode": "0600",
+          "package": "libbz2-1.0",
+          "sha256": "3537fe4fc577a60c8a9568873cd577db7ebc135eb8bb1825f18caf8972d9d2f2",
+          "size": 37772,
+          "version": "1.0.8-6"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "ea983f61c25f7b7e555cea4a8ea020db47dfe1b9f68156ec37c02b6418ca8fb2d224769eb3ae48969d5bb7092762bc102bd6a691c11306bf3593de5165779cb4",
+          "filename": "pool/main/g/glibc/libc-bin_2.41-12+deb13u4_arm64.deb",
+          "mode": "0600",
+          "package": "libc-bin",
+          "sha256": "3aba9182d6989d7c512178defdcb9d02b6906816bc8b2778a82a6c39582c880c",
+          "size": 551956,
+          "version": "2.41-12+deb13u4"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "6bf6e36ace1a974c53c643d06a28546e75d857411b96df385d7f0860ab330624e5812a6603ce73cd758b7b46197a9326ee408cf375815bea8b576346ad98db20",
+          "filename": "pool/main/g/glibc/libc6_2.41-12+deb13u4_arm64.deb",
+          "mode": "0600",
+          "package": "libc6",
+          "sha256": "8784eda966b189c777a384dac5ce009e8fc9b52d006926c5a013e7fa8aa688cc",
+          "size": 2483572,
+          "version": "2.41-12+deb13u4"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "4c93f2ad15d6e009c2df9b137d11a8dc2c7cc7e38533ff0fd7908e6ab42c9f00e56f1356f8083e129ae299412275217aae5eaa3f5d69e6d651d69cc5e2c0d04c",
+          "filename": "pool/main/libc/libcap-ng/libcap-ng0_0.8.5-4+b1_arm64.deb",
+          "mode": "0600",
+          "package": "libcap-ng0",
+          "sha256": "eb6da83296e4710a8600c1426692ed9b9eadcab7ebd36dbabc2a562b5c1ab691",
+          "size": 17032,
+          "version": "0.8.5-4+b1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "51712999447a38b20d1c23e682287ee597f92e4c939414294da22d85a6843fa9cdc60e514bd9c2380a22dee7974b4b8dc823b4d4e092e96e6a6b39593330332d",
+          "filename": "pool/main/libc/libcap2/libcap2_2.75-10+deb13u1+b3_arm64.deb",
+          "mode": "0600",
+          "package": "libcap2",
+          "sha256": "863aa5b9cdf6f80010b48982d4639126b09a89eeef2c0c5c7be226297c811581",
+          "size": 28568,
+          "version": "1:2.75-10+deb13u1+b3"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "c18471c2e62ad69c2bd0b9ffe4a3ce698da5154cd9f42765df537c30cbae1fc1e77595e8e3f8b69dbe06c6220189b38af4c7886a5fdecbd1e35c56c51986b14d",
+          "filename": "pool/main/libx/libxcrypt/libcrypt1_4.4.38-1_arm64.deb",
+          "mode": "0600",
+          "package": "libcrypt1",
+          "sha256": "b9aaa808aa3812b3de3e54eb5dfb16762c1779db032604abef2354c02fdc29b8",
+          "size": 91760,
+          "version": "1:4.4.38-1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "bcff3713437f4a2e0975cd1db43a4de6f6d776061f416feec63c6b0b86f106351007cd8b8bc82389c2bfb352d2a5bf71862690386986648cfe286d27d2966602",
+          "filename": "pool/main/d/db5.3/libdb5.3t64_5.3.28+dfsg2-9_arm64.deb",
+          "mode": "0600",
+          "package": "libdb5.3t64",
+          "sha256": "bfef56508d69fd3f940668f6abd0a466a362cabf63c4cc1c787cc58d28f6e92f",
+          "size": 629132,
+          "version": "5.3.28+dfsg2-9"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "06cbfbf26a987b64ce0fd1f139faf2beae3e6f25d5097d80f091d7360e8bec4a01746eb5e55494f7f23e670826cf5af912b367dffdd71fd465b519cb640b5d31",
+          "filename": "pool/main/c/cdebconf/libdebconfclient0_0.280_arm64.deb",
+          "mode": "0600",
+          "package": "libdebconfclient0",
+          "sha256": "8c2976dc62d0f5133018ea62636105335f9b17da77adce7fed1ffb24e2533dba",
+          "size": 10784,
+          "version": "0.280"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "134d5404a297ccf303642328538fb4e46ec6d71d8e0cdf5ed16bce8c7b98d9a08237973170157f0cbfe37786b91ce9e03a83f0d4eea412829b1524ebcb641633",
+          "filename": "pool/main/g/gcc-14/libgcc-s1_14.2.0-19_arm64.deb",
+          "mode": "0600",
+          "package": "libgcc-s1",
+          "sha256": "1108bc87879833d6d9a145f22a4a15cddb34e065b4b5f4b97bee586adbac2851",
+          "size": 54104,
+          "version": "14.2.0-19"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "3f052fef3e533db2f99615ec1efe3ffedf27c92d94fd5478d65738b35ac54e9dbd550813947c246190fa1d849aa4a3d501de09b85ce165d18438c810520fe6ea",
+          "filename": "pool/main/g/gmp/libgmp10_6.3.0+dfsg-3_arm64.deb",
+          "mode": "0600",
+          "package": "libgmp10",
+          "sha256": "a27bbc27f119161ea9702c8dd66f54131cdf0d2ca73000f50ea91ef2fdfef0fb",
+          "size": 535088,
+          "version": "2:6.3.0+dfsg-3"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "2f543d692e29d62c5cede53fbb2c7f15bac1f3a07f80438defd75fc4939daef5a275435df019a94ebb3773a0ac3245cdce3f007b17df85021fbe7a4d9f9c66a3",
+          "filename": "pool/main/n/nettle/libhogweed6t64_3.10.1-1_arm64.deb",
+          "mode": "0600",
+          "package": "libhogweed6t64",
+          "sha256": "cb92d5a51c4fd6c7b7cbb62aaa60c7af830d0bea5b410fb1f47ee685e26944d1",
+          "size": 331628,
+          "version": "3.10.1-1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "15330de6440832feae270f570ca2ab8e272d23ea7170af8a57e8d71cfdf871b84b4cd0f914f80ca7efc671c20db3da1e49cb0be324487f588d60ed6922ef98ca",
+          "filename": "pool/main/u/util-linux/liblastlog2-2_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "liblastlog2-2",
+          "sha256": "934e7f90814e014aa0ab8ffbadef4f31ce44228b7135db9b733f4b68cabfccfc",
+          "size": 28616,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "e8fa61e69bdb5c4b3648ce0774aca88365ae84d5b304e868e3b83ed10f9fb91954d1e5b2d1f5adfacf1c8bea38a112a25be87563a6dcfdeba1482414b912f01f",
+          "filename": "pool/main/l/lz4/liblz4-1_1.10.0-4_arm64.deb",
+          "mode": "0600",
+          "package": "liblz4-1",
+          "sha256": "f86fa7f8112d56b74f99c4a8baade57a9962d187d7c8e319428e171b2a34d223",
+          "size": 59988,
+          "version": "1.10.0-4"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "4bb29bd19a77768187e8907509da8e22761879b977cb41388e06912e2d2739e280432031e633b5e91e7723ada580fbdd13fd83a15c874fa5b21cbb899b194d53",
+          "filename": "pool/main/x/xz-utils/liblzma5_5.8.1-1+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "liblzma5",
+          "sha256": "6a7b98005f84fc26d66a45e432f70d0793646a734f8c44cd1626b3ffa8edd7c6",
+          "size": 302720,
+          "version": "5.8.1-1+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "e2d69fa6752d4511ff409438f73c72cd3a79620273a69bf8155d92673f82c626d949a33348f0799b9a9d7046ced6371ccbc271dc15435fb8c7f904102f0b0573",
+          "filename": "pool/main/libm/libmd/libmd0_1.1.0-2+b1_arm64.deb",
+          "mode": "0600",
+          "package": "libmd0",
+          "sha256": "772e86842fd3fa1816a0cfee4833a73996aaa550461491543b886b9c8f999052",
+          "size": 33664,
+          "version": "1.1.0-2+b1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "4f12e55e922f45c6a0e75b125eebe0fda4f0955055ee3f664b5d14321761f5271da7a7002a05947b27304d9257e4f07837abcc230d691a6330b28ce28a0b73f0",
+          "filename": "pool/main/u/util-linux/libmount1_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libmount1",
+          "sha256": "14e2d555459f3c0b1442bb49dd2d266ea202a003198c86f65508a1dbfaa18732",
+          "size": 200668,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "73eaee53cc2aadae8fa4950bde5b85d6a83456313c9d791f3a2184f9f5db6ab5bf9f0be43ac6512982393e54ac33efb0901903373e4b3319e10ee27b5a9beca4",
+          "filename": "pool/main/m/mpfr4/libmpfr6_4.2.2-1_arm64.deb",
+          "mode": "0600",
+          "package": "libmpfr6",
+          "sha256": "628a4ef58cc6815880f72e9d3953984a379a017e4042bc575f1fcbf3954d79ac",
+          "size": 685000,
+          "version": "4.2.2-1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "85306b2eac98dd79623d4015688570c85b7d58a3abd1ed8c2958d1271fb19b90996449733898450113a14588b8f5d54073673c68b2db31a26f5749a9540c2f98",
+          "filename": "pool/main/n/nettle/libnettle8t64_3.10.1-1_arm64.deb",
+          "mode": "0600",
+          "package": "libnettle8t64",
+          "sha256": "16107ce5a7b522da021fa8aba42d42af9c5e90ddabfcda3710aff6ea95808ee0",
+          "size": 310548,
+          "version": "3.10.1-1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "d1789b0ad89849ac3bb7e93d6d198da0c8389332b22005f3d2448ac7828223d88601e9f8a8ca4693ec7154373d169eadfe0f898c9b5bf58398616dc88cb845bd",
+          "filename": "pool/main/p/pam/libpam-modules_1.7.0-5_arm64.deb",
+          "mode": "0600",
+          "package": "libpam-modules",
+          "sha256": "3c6c4b0be396f2a90d150effd480e06674d7d22739fe4c54ffbf95587fe2bcf4",
+          "size": 172452,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "5ecc291083e005849b905cb374f817a9bbc71f5c448ca30d0261c8467801ef831317b7139d47c667bdcf826952121ebf68663fb2d40ac954af72ed7e218e9a9c",
+          "filename": "pool/main/p/pam/libpam-modules-bin_1.7.0-5_arm64.deb",
+          "mode": "0600",
+          "package": "libpam-modules-bin",
+          "sha256": "8c50ad191934474b5177cba48aed2c4023ec8392ef7096808311315c50b3bfec",
+          "size": 48272,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "d6d932b9e430b46255f326a9a7b31ecc2815e00ce1020d704bb09947d71ef9ee0846ce3c9b111983d5449cbc0ce58c5a7fbce950229fc62ebe41029304300fcf",
+          "filename": "pool/main/p/pam/libpam-runtime_1.7.0-5_all.deb",
+          "mode": "0600",
+          "package": "libpam-runtime",
+          "sha256": "b02792c9ed6174db695a653b95ef3629fdac3a73ba1eff1754ab161b5711bfbf",
+          "size": 248720,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "3669ab46e0063afdcf06206fa38098442dd5b6ce3e4220462c84327c55394d9621446cbb1f56617f9ee9db6e8e55c019b0a6a37bba1934a80ecb9a581e0da60b",
+          "filename": "pool/main/p/pam/libpam0g_1.7.0-5_arm64.deb",
+          "mode": "0600",
+          "package": "libpam0g",
+          "sha256": "2dd0fdc9af8a8a48f0a54581f74005d4d8623baa8aea9ac3d201624c3217b6d3",
+          "size": 68776,
+          "version": "1.7.0-5"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "6bdd760e6a48e4b5b74bf5302ff6116ca36a96149a8011ab72563f80113b411a6b61f1e9ae2a0127cc28fb2553f2fc788d42f4dd843e062401f04fc0b0a0dcc4",
+          "filename": "pool/main/p/pcre2/libpcre2-8-0_10.46-1~deb13u2_arm64.deb",
+          "mode": "0600",
+          "package": "libpcre2-8-0",
+          "sha256": "e7d2c997dac145c16457be0fed3d084c98cd030bec7633eec7e5bde6dbb97712",
+          "size": 262840,
+          "version": "10.46-1~deb13u2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "267eeee631cb232216780eaa579d908ae6af75403ecca94d430d08c777f477faaeab8d535ed5c093b8cff5296d2e0436f5b309e2249b2cf1a3d012a8d076a902",
+          "filename": "pool/main/r/readline/libreadline8t64_8.2-6_arm64.deb",
+          "mode": "0600",
+          "package": "libreadline8t64",
+          "sha256": "f78ff432b2a627bc04f7eef0e6e2696501c9e06feca748a5b741d5e594429033",
+          "size": 159264,
+          "version": "8.2-6"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "d0e085a8f6f5d8bea1372bb2b17d7ed147640ef04553d3b7457361abd37082f42d213a19c00308d359d3377546b9813bace5b1f609f8532cc6186cbdcd328207",
+          "filename": "pool/main/libs/libseccomp/libseccomp2_2.6.0-2_arm64.deb",
+          "mode": "0600",
+          "package": "libseccomp2",
+          "sha256": "013d0af0444177960d5899f4673e35d492f31edfc40cb8d5a82bb56147ab2e35",
+          "size": 51012,
+          "version": "2.6.0-2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "6d293368cee662c456663895e8b2f5648749c804f5ae53c3329934f783adfd4acb8006c6ca814e1aef465439fb36aca14a052f82fb808a048dac6323418d005b",
+          "filename": "pool/main/libs/libselinux/libselinux1_3.8.1-1_arm64.deb",
+          "mode": "0600",
+          "package": "libselinux1",
+          "sha256": "fc13da4c7783b8f4361d92ef1045931f298d1b0ac78ed1a85c2232615f49fc6f",
+          "size": 79352,
+          "version": "3.8.1-1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "1bfb911abca5d714c3569854e75f4ecef6860c6e463196b3cfa9c6326e8c8216131118ee589e1bc76df9e9fe336148c0dd1291eebf0db1234be770d9f1e27e30",
+          "filename": "pool/main/libs/libsigsegv/libsigsegv2_2.14-1+b2_arm64.deb",
+          "mode": "0600",
+          "package": "libsigsegv2",
+          "sha256": "4fd72af654e2a72c84093cc2a38c856fba9492ecd828721117867e99c2c9cd92",
+          "size": 34332,
+          "version": "2.14-1+b2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "a1f4423a3503078cba9a2cce5283a8378d507bd03d9b15a56c6479b460a9a0455dc5c9690d3e883e47032dfc7a3097e20bd1f41e8c3801a9c5f9c50f770d6f70",
+          "filename": "pool/main/u/util-linux/libsmartcols1_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libsmartcols1",
+          "sha256": "1881ac0bc2a58a52ecbf6e7690b17552233b71e94129db79e2302656b0d22f24",
+          "size": 139452,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "700be071337f7592f0944a35fb8bb9367591e549fce8b5473aea82d9cf4795b181a1474973df5c1f11c62c8ce75949c9fb7f0fe0050ec57159424aaa6ead9cb0",
+          "filename": "pool/main/s/sqlite3/libsqlite3-0_3.46.1-7+deb13u2_arm64.deb",
+          "mode": "0600",
+          "package": "libsqlite3-0",
+          "sha256": "5b09efca71cb7a16d67f5453af3989ae1a84fe6b68c6dd3913de527cb0ca23aa",
+          "size": 854152,
+          "version": "3.46.1-7+deb13u2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "93b4877e8f43532ce54162057e041b28a8379018fe115555af41f0efb3b0466a7b447ae0e4ddcc71ade1d981d66db3642af90fef1a99a39b7c66715a10581bba",
+          "filename": "pool/main/o/openssl/libssl3t64_3.5.7-1~deb13u2_arm64.deb",
+          "mode": "0600",
+          "package": "libssl3t64",
+          "sha256": "ec131326aa9fa9ec934eca386bc7991f328fe383eaefd3e43bd8901a9199c5ae",
+          "size": 2766020,
+          "version": "3.5.7-1~deb13u2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "8a16eb948227fb65b9dae018e54b1b812d87e2184104111fa292094047edcbddd5cfa390ee2d6b83c95259cff26c6fef38582910d4d737ff5fc8b08e521051af",
+          "filename": "pool/main/g/gcc-14/libstdc++6_14.2.0-19_arm64.deb",
+          "mode": "0600",
+          "package": "libstdc++6",
+          "sha256": "6669b0c52a2e7c6af9adfdabce3ff6e286065cdfbc7b85280862b5f799daebee",
+          "size": 637536,
+          "version": "14.2.0-19"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "f87978fdcb54e1da30d9342a508899546d7a7c47103eb9202c73808213822075fe55b43523e1fd531d65031f35de2ae4a4aef26d51dc56e346373ddbcb8027cc",
+          "filename": "pool/main/s/systemd/libsystemd-shared_257.13-1~deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libsystemd-shared",
+          "sha256": "b48df445566ff6c39395c9fc571524c9e03803bc2e434d7869fc21e723c64b4d",
+          "size": 1921984,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "e6b9d3d63fd0f36dc0a0ad67f606fd1c2d0c2e717f4f4fb2471cd41ad6a3d95f44a4c810773b64c204b5b96ae705a4f13605c4eec27a831d915388bd6bf726f2",
+          "filename": "pool/main/s/systemd/libsystemd0_257.13-1~deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libsystemd0",
+          "sha256": "d2f63c408549c29eaefb6f4c948393edce99f45ee8e43c991391bef63fb7d54b",
+          "size": 422500,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "36c3771c354a4d735626089e6e7ee5b205a9fda9ddb5587241b0625af6ef9fb7baa2110a62df19b462816b981d8244ae74793303de371822952391c3711a78f7",
+          "filename": "pool/main/n/ncurses/libtinfo6_6.5+20250216-2_arm64.deb",
+          "mode": "0600",
+          "package": "libtinfo6",
+          "sha256": "2a747f7fff3c2347c357387a7133df997410f07ba1b1df1a1461a97bd7fbc2fc",
+          "size": 341360,
+          "version": "6.5+20250216-2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "abc3b4607ab51b19b4556645ad3ce1626593e823c57cf1b85f4c802fa406ef291fa9d6a7de34586a630eb1da68ff3e3d440cca578ec6d01f475c04533defdc3e",
+          "filename": "pool/main/s/systemd/libudev1_257.13-1~deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libudev1",
+          "sha256": "459b1c9c17cc3c586e90d13d2a991715d498c6eed6c046cabf321021167bc380",
+          "size": 144536,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "9a6f71c580b723429e22068491b0aba1044216b3a7e79586baab29245393f11e0acf63f320525ce4a035772a606a2676bec7f688a9c69160565adeafed96e62b",
+          "filename": "pool/main/u/util-linux/libuuid1_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "libuuid1",
+          "sha256": "448ad6b190184dbff24508ef2eda88bd737a5ffc0f9750eb779fcf9885292bea",
+          "size": 37648,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "b544ada76e69445625c00f751df39e05b7ec6be51022a550f0a6d03d09b158bdc5b9362666dc7b5bb4c0bb21d7e003be340054b61a0e597475152e8eecf43136",
+          "filename": "pool/main/x/xxhash/libxxhash0_0.8.3-2_arm64.deb",
+          "mode": "0600",
+          "package": "libxxhash0",
+          "sha256": "66665776740ced6c5ddcb48a89a92b056d0dcb13851e1ff573d2b99b766e5c6c",
+          "size": 22276,
+          "version": "0.8.3-2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "7d6f82d9c2294238f8f78083f67ae315e4bb2cb9a6e4e966f20064c4945b28ef6cd56379290b2c99e9595e27ab76bd124ff126680b270e684b78d15adea1a496",
+          "filename": "pool/main/libz/libzstd/libzstd1_1.5.7+dfsg-1_arm64.deb",
+          "mode": "0600",
+          "package": "libzstd1",
+          "sha256": "924540bd59fdbfa77a0604360efdaca54411a43daf11c7e002a3c64791b67448",
+          "size": 266052,
+          "version": "1.5.7+dfsg-1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "805a91e7b9b01f2d9f44c4ef43b1b53a7944e04425e8b88c8e87bac204473e01800475bf0efee1e3257ee112c663e7fc376c9eac17e3bb13c7e9ce42c6a63bd1",
+          "filename": "pool/main/u/util-linux/mount_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "mount",
+          "sha256": "8b40a9eb9f72647c8732e9264c7328233f8ef8e9d962e516edeb210caa6789b6",
+          "size": 161232,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "4852cf736b47b5063a1ca1237a4de0a4538bd52e4e99e1d45f78ccb3d224ca31c27c4e0c1c4b23437757f1da250f4af574a22fbae9173e26a859d47bdca23fa4",
+          "filename": "pool/main/n/ncurses/ncurses-base_6.5+20250216-2_all.deb",
+          "mode": "0600",
+          "package": "ncurses-base",
+          "sha256": "190e775260a38973c415a36ae99f33ad1b37ea6ca99929d7c5d53843fc23e914",
+          "size": 273216,
+          "version": "6.5+20250216-2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "eace724e798a760903c25461543afa55409a0be5a7dc176bebf08bd87383c0fa6dfb1d5bbed17768bc9eed8b50d81b42b8a29e1b9443254f84882f771b48762e",
+          "filename": "pool/main/n/ncurses/ncurses-bin_6.5+20250216-2_arm64.deb",
+          "mode": "0600",
+          "package": "ncurses-bin",
+          "sha256": "7ac6919efb0effc9004caae758811bfe85bb486a057262822468e90d73d38458",
+          "size": 432224,
+          "version": "6.5+20250216-2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "2b77e3a5ba04d918f5c8b3772894c7af91f3098eecbd46cd828f5fbaa3daf3a07333d8baf1d8bdbb0dd5697b4a1354b082c4435e150110b275f2b7de60d77541",
+          "filename": "pool/main/o/openssl/openssl-provider-legacy_3.5.7-1~deb13u2_arm64.deb",
+          "mode": "0600",
+          "package": "openssl-provider-legacy",
+          "sha256": "7628954796eb651fc499ad98d4e51435691c2ccce0b5fbae6b198cbece742db4",
+          "size": 313492,
+          "version": "3.5.7-1~deb13u2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "a6dbf1612d1005e267c90922149b1e9711ab164c510f81802f84f26696a7a7fe34f8c58ed1e2e8a081fc2fb313507a1a4ca5b81b0d59dfb19487d7a48e8f716c",
+          "filename": "pool/main/p/perl/perl-base_5.40.1-6+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "perl-base",
+          "sha256": "4cee6f6b5b4b501d82118c56aa31bbefc2491415bc03a00e21bdacff2406b288",
+          "size": 1529152,
+          "version": "5.40.1-6+deb13u1"
+        },
+        {
+          "architecture": "all",
+          "derived_sha512": "108b7c792a22a95734804b1f2ba4893463fb8353da03ced2480d0a255ef0a9af1ff2378921eb7e0f677a1c9ac7b3842d7bd4f9ef95153ba1478c8d4f296ba6e6",
+          "filename": "pool/main/r/readline/readline-common_8.2-6_all.deb",
+          "mode": "0600",
+          "package": "readline-common",
+          "sha256": "f77e8aa0bf0de618f11cb0b21658a4ed60f177d63b3cf26d7fc3706b6d0eaaa9",
+          "size": 69360,
+          "version": "8.2-6"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "77d9adb72b87f4902293dabe7d35de0fa96eef000dfe51004cb92e4418f34a11c5934f89cdb1196205813957d81e5d0fe175a4cb666a300aed95f59586881317",
+          "filename": "pool/main/s/sed/sed_4.9-2+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "sed",
+          "sha256": "c654fa045de8cc722855b8db59990b703cb7299c897c6e187bf949d42df82b62",
+          "size": 325712,
+          "version": "4.9-2+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "4c6cfbc67d98fc014bdd4a89e8b6fe953344fecda0cadf46791249fc23b6dca5803d2bc580c355c4de412bec2f48c6dfa59a41df5ea47f2a727b594e5c56a3ce",
+          "filename": "pool/main/r/rust-sequoia-sqv/sqv_1.3.0-3+b2_arm64.deb",
+          "mode": "0600",
+          "package": "sqv",
+          "sha256": "feb611506f420594bf767b1a8748429802ff4f324536ab1154bcc61478b9a8b6",
+          "size": 611508,
+          "version": "1.3.0-3+b2"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "9dfdb1e5072d7a808d33ee757ba16df27513763bc84e537ea4de0cd00275e223b8c2f9a7cee8af3d4e6d1642c99a8206be8d0c2e498cf4fdfb946d126e6730ee",
+          "filename": "pool/main/s/systemd/systemd_257.13-1~deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "systemd",
+          "sha256": "dcc3ba37f0488ecd513820035b4efc300e198849f5b6437a9bac9c2f307149ab",
+          "size": 2921364,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "cb35e28a9ea89155010b3765382b99fb99f1ab49e5fd0d1034954c87441bd741c7c0b8e9a26fa94c842707a6df518095d55fdae2fee43f9957b85b97ce5ac5bf",
+          "filename": "pool/main/s/systemd/systemd-sysv_257.13-1~deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "systemd-sysv",
+          "sha256": "af3c883fabc97850c7afe9489a9e1808b4db2d9cfdc4dc1639da9e1b0356c97b",
+          "size": 64880,
+          "version": "257.13-1~deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "fed38ef6f0b151b4f9e0f27d7c5dc208b39728104f2fd2de1206c7e744d1994b981e5082dcf9026c684b66f1bebaf560d4dcafc48ff1cc5ed871bdcea08a0a98",
+          "filename": "pool/main/s/sysvinit/sysvinit-utils_3.14-4_arm64.deb",
+          "mode": "0600",
+          "package": "sysvinit-utils",
+          "sha256": "1366e87a382a6b95a0a7c507b8f1be9b193f772f3428f9f7e0271a217915cfae",
+          "size": 33960,
+          "version": "3.14-4"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "c7ef913c6e6704ca99ad4b5a87f6fb0011974f67f0320a3768c62eec98f24c744769f37bdf1eac8b0c241c3073b659e47412b39cd7253c2f34bbc451b3b67d5a",
+          "filename": "pool/main/t/tar/tar_1.35+dfsg-3.1_arm64.deb",
+          "mode": "0600",
+          "package": "tar",
+          "sha256": "c460a8294202ca3802b7c703b0bd70dd8bda1f2fc8785839595cf9d5e060d71b",
+          "size": 802008,
+          "version": "1.35+dfsg-3.1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "acbed88b0719e169c2f046c5f37fa77c27375ce55d8fbc07667abb4e0d39be907d5be7bb65c2ed8ec7dce96b2ea5d356808acfc8be72a91721008f49d2fc046e",
+          "filename": "pool/main/u/util-linux/util-linux_2.41.5-0+deb13u1_arm64.deb",
+          "mode": "0600",
+          "package": "util-linux",
+          "sha256": "d427f83a08d46107e8f7d39f1522a8a316e785e45f04ad657d2ecb7570210d84",
+          "size": 1199468,
+          "version": "2.41.5-0+deb13u1"
+        },
+        {
+          "architecture": "arm64",
+          "derived_sha512": "17fae1070ab2d235dcb756e46fb62e3846176f271a660a5c13f5e6c70d590741658cf86a7c6a6303430d0bb51b2019dddba88fabc5d4e7afa3f82db96bb03961",
+          "filename": "pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+b1_arm64.deb",
+          "mode": "0600",
+          "package": "zlib1g",
+          "sha256": "209aa5cf671e97b9eb0410844fa6df4cae2e75b0c72e7802ab6c8ece13e6ddef",
+          "size": 85116,
+          "version": "1:1.3.dfsg+really1.3.1-1+b1"
+        }
+      ],
+      "cas_bytes": 35611916,
+      "cas_objects": 78,
+      "cas_sha256": "73dc70968393094f29eaa9ca0cca597cd21bd529b6feaefdaedc3f6b9f539cf3",
+      "inventory": {
+        "path": "arm64-inventory.json",
+        "sha256": "2f83186a7afd23799ae7f4b71fda49dd34dace74e15fee34226c6573752be38f",
+        "summary": {
+          "admitted": 78,
+          "conffiles": 64,
+          "essential": 22,
+          "gaps": [
+            {
+              "category": "alternatives_script_authority",
+              "packages": [
+                "bash",
+                "debianutils",
+                "gawk",
+                "tar",
+                "util-linux"
+              ],
+              "priority": "P1"
+            },
+            {
+              "category": "debconf_frontend",
+              "packages": [
+                "base-passwd",
+                "dash",
+                "debconf",
+                "libc6",
+                "libpam-modules",
+                "libpam-runtime",
+                "libpam0g"
+              ],
+              "priority": "P1"
+            },
+            {
+              "category": "kernel_filesystem",
+              "packages": [
+                "libc6"
+              ],
+              "priority": "P1"
+            },
+            {
+              "category": "accounts",
+              "packages": [
+                "apt",
+                "base-passwd",
+                "libpam-modules",
+                "libpam-runtime",
+                "systemd"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "service_manager",
+              "packages": [
+                "apt",
+                "dpkg",
+                "libc6",
+                "libpam-modules-bin",
+                "libpam0g",
+                "libselinux1",
+                "systemd",
+                "util-linux"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "system_registry",
+              "packages": [
+                "dash",
+                "debianutils"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "environment_probe",
+              "packages": [
+                "apt",
+                "base-files",
+                "base-passwd",
+                "dpkg",
+                "libc6",
+                "libpam-modules-bin",
+                "libpam0g",
+                "systemd",
+                "util-linux"
+              ],
+              "priority": "P2"
+            },
+            {
+              "category": "dpkg_database_helper",
+              "packages": [
+                "apt",
+                "base-files",
+                "dash",
+                "debian-archive-keyring",
+                "dpkg",
+                "gzip",
+                "init-system-helpers",
+                "libc6",
+                "libpam-modules",
+                "libpam-runtime",
+                "libpam0g",
+                "libreadline8t64",
+                "libselinux1",
+                "libstdc++6",
+                "systemd",
+                "systemd-sysv"
+              ],
+              "priority": "P3"
+            },
+            {
+              "category": "ldconfig",
+              "packages": [
+                "libc-bin"
+              ],
+              "priority": "P3"
+            },
+            {
+              "category": "trigger_declaration",
+              "packages": [
+                "apt",
+                "base-files",
+                "debianutils",
+                "libacl1",
+                "libapparmor1",
+                "libapt-pkg7.0",
+                "libattr1",
+                "libaudit1",
+                "libblkid1",
+                "libbz2-1.0",
+                "libc-bin",
+                "libc6",
+                "libcap-ng0",
+                "libcap2",
+                "libcrypt1",
+                "libdb5.3t64",
+                "libdebconfclient0",
+                "libgcc-s1",
+                "libgmp10",
+                "libhogweed6t64",
+                "liblastlog2-2",
+                "liblz4-1",
+                "liblzma5",
+                "libmd0",
+                "libmount1",
+                "libmpfr6",
+                "libnettle8t64",
+                "libpam0g",
+                "libpcre2-8-0",
+                "libreadline8t64",
+                "libseccomp2",
+                "libselinux1",
+                "libsigsegv2",
+                "libsmartcols1",
+                "libsqlite3-0",
+                "libssl3t64",
+                "libstdc++6",
+                "libsystemd0",
+                "libtinfo6",
+                "libudev1",
+                "libuuid1",
+                "libxxhash0",
+                "libzstd1",
+                "systemd",
+                "zlib1g"
+              ],
+              "priority": "P3"
+            },
+            {
+              "category": "ownership_and_mode",
+              "packages": [
+                "base-files",
+                "base-passwd",
+                "libpam-modules-bin",
+                "mount",
+                "util-linux"
+              ],
+              "priority": "P4"
+            }
+          ],
+          "metadata_members": [
+            {
+              "count": 41,
+              "name": "shlibs"
+            },
+            {
+              "count": 35,
+              "name": "symbols"
+            },
+            {
+              "count": 7,
+              "name": "templates"
+            }
+          ],
+          "packages": 78,
+          "rejected": 0,
+          "remove_on_upgrade_conffiles": 0,
+          "scripts": [
+            {
+              "count": 1,
+              "name": "config"
+            },
+            {
+              "count": 24,
+              "name": "postinst"
+            },
+            {
+              "count": 17,
+              "name": "postrm"
+            },
+            {
+              "count": 10,
+              "name": "preinst"
+            },
+            {
+              "count": 12,
+              "name": "prerm"
+            }
+          ],
+          "tools": [
+            {
+              "count": 2,
+              "name": "/proc"
+            },
+            {
+              "count": 25,
+              "name": "/run"
+            },
+            {
+              "count": 2,
+              "name": "add-shell"
+            },
+            {
+              "count": 1,
+              "name": "adduser"
+            },
+            {
+              "count": 6,
+              "name": "chmod"
+            },
+            {
+              "count": 5,
+              "name": "chown"
+            },
+            {
+              "count": 30,
+              "name": "confmodule"
+            },
+            {
+              "count": 1,
+              "name": "db_beginblock"
+            },
+            {
+              "count": 1,
+              "name": "db_capb"
+            },
+            {
+              "count": 1,
+              "name": "db_endblock"
+            },
+            {
+              "count": 5,
+              "name": "db_fset"
+            },
+            {
+              "count": 5,
+              "name": "db_get"
+            },
+            {
+              "count": 17,
+              "name": "db_go"
+            },
+            {
+              "count": 18,
+              "name": "db_input"
+            },
+            {
+              "count": 7,
+              "name": "db_purge"
+            },
+            {
+              "count": 9,
+              "name": "db_reset"
+            },
+            {
+              "count": 2,
+              "name": "db_set"
+            },
+            {
+              "count": 6,
+              "name": "db_stop"
+            },
+            {
+              "count": 8,
+              "name": "db_subst"
+            },
+            {
+              "count": 12,
+              "name": "db_version"
+            },
+            {
+              "count": 22,
+              "name": "deb-systemd-helper"
+            },
+            {
+              "count": 9,
+              "name": "deb-systemd-invoke"
+            },
+            {
+              "count": 27,
+              "name": "dpkg"
+            },
+            {
+              "count": 30,
+              "name": "dpkg-divert"
+            },
+            {
+              "count": 64,
+              "name": "dpkg-maintscript-helper"
+            },
+            {
+              "count": 3,
+              "name": "dpkg-query"
+            },
+            {
+              "count": 2,
+              "name": "dpkg-trigger"
+            },
+            {
+              "count": 1,
+              "name": "getent"
+            },
+            {
+              "count": 7,
+              "name": "invoke-rc.d"
+            },
+            {
+              "count": 3,
+              "name": "ischroot"
+            },
+            {
+              "count": 1,
+              "name": "ldconfig"
+            },
+            {
+              "count": 4,
+              "name": "pam-auth-update"
+            },
+            {
+              "count": 2,
+              "name": "start-stop-daemon"
+            },
+            {
+              "count": 20,
+              "name": "systemctl"
+            },
+            {
+              "count": 1,
+              "name": "systemd-machine-id-setup"
+            },
+            {
+              "count": 1,
+              "name": "systemd-sysusers"
+            },
+            {
+              "count": 4,
+              "name": "systemd-tmpfiles"
+            },
+            {
+              "count": 10,
+              "name": "update-alternatives"
+            },
+            {
+              "count": 7,
+              "name": "update-passwd"
+            },
+            {
+              "count": 4,
+              "name": "update-shells"
+            }
+          ],
+          "total_bytes": 35611916,
+          "triggers": [
+            {
+              "count": 41,
+              "name": "activate_noawait"
+            },
+            {
+              "count": 1,
+              "name": "interest_await"
+            },
+            {
+              "count": 9,
+              "name": "interest_noawait"
+            }
+          ]
+        }
+      },
+      "locks": {
+        "apt": {
+          "digest_sha256": "fb2321a81cc14faf15f34cb23528ad0b3e98f7e3d89e6e93d66b0739c633894c",
+          "file_sha256": "f32bd3faded815e44cb25f6f4f66170279c234f2c341978bc911d4231cb38f7e",
+          "packages": 73,
+          "path": "arm64-apt.lock.json",
+          "policy_sha256": "2f5d0d954dfe682bcc36acd6d636f4bc3d52a819156b6623b6a1d2339ed38d57",
+          "request_sha256": "b999effaa1e7a9423a9c192c063823f8470ae67d4ecd6dfb604f6aa8f3ffce6b",
+          "total_bytes": 30499520
+        },
+        "systemd-sysv": {
+          "digest_sha256": "5392c08048e2290d95c0f1bdd2c41fc56c1add0eacc5ac2ab8decd3bd8b73b16",
+          "file_sha256": "b1df06f6b80967f18f8f8575674f3d8ead22a65d5ae47834edbb321290b2321c",
+          "packages": 69,
+          "path": "arm64-systemd-sysv.lock.json",
+          "policy_sha256": "2f5d0d954dfe682bcc36acd6d636f4bc3d52a819156b6623b6a1d2339ed38d57",
+          "request_sha256": "5f49cb0a386e27c7f4e9c77de5916e43f832f2848e428382f0947548a14aed97",
+          "total_bytes": 31119116
+        }
+      },
+      "repository": {
+        "archive_binding": "signed_sha256_derived_sha512",
+        "id": "663e2a215ff393b6840f6e66c12fb62f80e2b0aa057143ba0bed0ca6a0714f9b",
+        "index_sha256": "be16b37b2f740f066ea93d35d56f04f94d63693e5a3eb421b052bf86fae75bcd",
+        "inrelease_sha256": "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+        "release_sha256": "ed56aac47e7911e65ee63aae8d67e29f20e023f840e49f8ed037043a33de138a",
+        "snapshot_sha256": "c4c076343da42d5def7410dc4efe24bfaaf7f48458e8b92d3df2bf75a6d274be"
+      },
+      "runs": [
+        "debian-261-closure-arm64-1",
+        "debian-261-closure-arm64-2"
+      ],
+      "source_sha256": "95f54700f44255a5d86505f3597cc1f15448bf475ede6056c68ed0cb6bd7e510"
+    }
+  },
+  "bounds": {
+    "max_bytes_per_lock": 67108864,
+    "max_packages_per_lock": 128
+  },
+  "commands": [
+    [
+      "$DEBZ",
+      "refresh",
+      "--install-root",
+      "$WORKSPACE/root",
+      "--cache-path",
+      "$WORKSPACE/cache",
+      "--state-path",
+      "$WORKSPACE/state",
+      "--architecture",
+      "$ARCHITECTURE",
+      "--config",
+      "$WORKSPACE/debian.json",
+      "--keyring",
+      "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+      "--deadline-ms",
+      "300000",
+      "--lock-wait-ms",
+      "30000",
+      "--json",
+      "--assume-yes"
+    ],
+    [
+      "$DEBZ",
+      "plan",
+      "--install-root",
+      "$WORKSPACE/root",
+      "--cache-path",
+      "$WORKSPACE/cache",
+      "--state-path",
+      "$WORKSPACE/state",
+      "--architecture",
+      "$ARCHITECTURE",
+      "--config",
+      "$WORKSPACE/debian.json",
+      "--keyring",
+      "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+      "--deadline-ms",
+      "300000",
+      "--lock-wait-ms",
+      "30000",
+      "--json",
+      "--transaction-backend",
+      "native",
+      "--lock-output",
+      "$WORKSPACE/evidence/apt.lock.json",
+      "apt"
+    ],
+    [
+      "$DEBZ",
+      "plan",
+      "--install-root",
+      "$WORKSPACE/root",
+      "--cache-path",
+      "$WORKSPACE/cache",
+      "--state-path",
+      "$WORKSPACE/state",
+      "--architecture",
+      "$ARCHITECTURE",
+      "--config",
+      "$WORKSPACE/debian.json",
+      "--keyring",
+      "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+      "--deadline-ms",
+      "300000",
+      "--lock-wait-ms",
+      "30000",
+      "--json",
+      "--transaction-backend",
+      "native",
+      "--lock-input",
+      "$WORKSPACE/evidence/apt.lock.json",
+      "--lock-output",
+      "$WORKSPACE/evidence/apt.reproduced.lock.json",
+      "apt"
+    ],
+    [
+      "$DEBZ",
+      "download",
+      "--install-root",
+      "$WORKSPACE/root",
+      "--cache-path",
+      "$WORKSPACE/cache",
+      "--state-path",
+      "$WORKSPACE/state",
+      "--architecture",
+      "$ARCHITECTURE",
+      "--config",
+      "$WORKSPACE/debian.json",
+      "--keyring",
+      "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+      "--deadline-ms",
+      "300000",
+      "--lock-wait-ms",
+      "30000",
+      "--json",
+      "--transaction-backend",
+      "native",
+      "--lock-input",
+      "$WORKSPACE/evidence/apt.lock.json",
+      "apt"
+    ],
+    [
+      "$DEBZ",
+      "plan",
+      "--install-root",
+      "$WORKSPACE/root",
+      "--cache-path",
+      "$WORKSPACE/cache",
+      "--state-path",
+      "$WORKSPACE/state",
+      "--architecture",
+      "$ARCHITECTURE",
+      "--config",
+      "$WORKSPACE/debian.json",
+      "--keyring",
+      "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+      "--deadline-ms",
+      "300000",
+      "--lock-wait-ms",
+      "30000",
+      "--json",
+      "--transaction-backend",
+      "native",
+      "--lock-output",
+      "$WORKSPACE/evidence/systemd-sysv.lock.json",
+      "systemd-sysv"
+    ],
+    [
+      "$DEBZ",
+      "plan",
+      "--install-root",
+      "$WORKSPACE/root",
+      "--cache-path",
+      "$WORKSPACE/cache",
+      "--state-path",
+      "$WORKSPACE/state",
+      "--architecture",
+      "$ARCHITECTURE",
+      "--config",
+      "$WORKSPACE/debian.json",
+      "--keyring",
+      "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+      "--deadline-ms",
+      "300000",
+      "--lock-wait-ms",
+      "30000",
+      "--json",
+      "--transaction-backend",
+      "native",
+      "--lock-input",
+      "$WORKSPACE/evidence/systemd-sysv.lock.json",
+      "--lock-output",
+      "$WORKSPACE/evidence/systemd-sysv.reproduced.lock.json",
+      "systemd-sysv"
+    ],
+    [
+      "$DEBZ",
+      "download",
+      "--install-root",
+      "$WORKSPACE/root",
+      "--cache-path",
+      "$WORKSPACE/cache",
+      "--state-path",
+      "$WORKSPACE/state",
+      "--architecture",
+      "$ARCHITECTURE",
+      "--config",
+      "$WORKSPACE/debian.json",
+      "--keyring",
+      "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+      "--deadline-ms",
+      "300000",
+      "--lock-wait-ms",
+      "30000",
+      "--json",
+      "--transaction-backend",
+      "native",
+      "--lock-input",
+      "$WORKSPACE/evidence/systemd-sysv.lock.json",
+      "systemd-sysv"
+    ]
+  ],
+  "freshness": {
+    "expires_at": "2026-10-13T07:55:41Z",
+    "maximum_release_age_seconds": 2678400,
+    "mode": "allow_missing_valid_until_with_max_age_seconds",
+    "recorded_on": "2026-09-30",
+    "release_date": "Sat, 12 Sep 2026 07:55:41 UTC",
+    "valid_until": null
+  },
+  "gaps": [
+    {
+      "category": "alternatives_script_authority",
+      "evidence": [
+        "bash postinst:update-alternatives",
+        "bash prerm:update-alternatives",
+        "debianutils postinst:update-alternatives",
+        "debianutils prerm:update-alternatives",
+        "gawk postinst:update-alternatives",
+        "gawk prerm:update-alternatives",
+        "tar postinst:update-alternatives",
+        "tar prerm:update-alternatives",
+        "util-linux postinst:update-alternatives",
+        "util-linux prerm:update-alternatives"
+      ],
+      "native_status": "native lifecycle refuses the script before launch; only exact Ubuntu script and dpkg tool digests carry update-alternatives authority",
+      "packages": {
+        "amd64": [
+          "bash",
+          "debianutils",
+          "gawk",
+          "tar",
+          "util-linux"
+        ],
+        "arm64": [
+          "bash",
+          "debianutils",
+          "gawk",
+          "tar",
+          "util-linux"
+        ]
+      },
+      "priority": "P1"
+    },
+    {
+      "category": "debconf_frontend",
+      "evidence": [
+        "base-passwd postinst:confmodule",
+        "base-passwd postinst:db_version",
+        "base-passwd postrm:confmodule",
+        "base-passwd postrm:db_purge",
+        "dash postrm:confmodule",
+        "dash postrm:db_purge",
+        "dash preinst:confmodule",
+        "dash preinst:db_go",
+        "dash preinst:db_input",
+        "dash preinst:db_purge",
+        "debconf config:confmodule",
+        "debconf config:db_beginblock",
+        "debconf config:db_capb",
+        "debconf config:db_endblock",
+        "debconf config:db_go",
+        "debconf config:db_input",
+        "debconf config:db_version",
+        "debconf config:debconf configuration script",
+        "debconf postinst:confmodule",
+        "libc6 postinst:confmodule",
+        "libc6 postinst:db_fset",
+        "libc6 postinst:db_get",
+        "libc6 postinst:db_go",
+        "libc6 postinst:db_input",
+        "libc6 postinst:db_reset",
+        "libc6 postinst:db_set",
+        "libc6 postinst:db_stop",
+        "libc6 postinst:db_subst",
+        "libc6 postinst:db_version",
+        "libc6 postrm:confmodule",
+        "libc6 postrm:db_purge",
+        "libc6 preinst:confmodule",
+        "libc6 preinst:db_fset",
+        "libc6 preinst:db_get",
+        "libc6 preinst:db_go",
+        "libc6 preinst:db_input",
+        "libc6 preinst:db_reset",
+        "libc6 preinst:db_stop",
+        "libc6 preinst:db_subst",
+        "libc6 preinst:db_version",
+        "libpam-modules postrm:confmodule",
+        "libpam-modules postrm:db_purge",
+        "libpam-modules preinst:confmodule",
+        "libpam-modules preinst:db_go",
+        "libpam-modules preinst:db_input",
+        "libpam-modules preinst:db_reset",
+        "libpam-modules preinst:db_subst",
+        "libpam-modules preinst:db_version",
+        "libpam-runtime postinst:confmodule",
+        "libpam-runtime postrm:confmodule",
+        "libpam-runtime postrm:db_purge",
+        "libpam0g postinst:confmodule",
+        "libpam0g postinst:db_get",
+        "libpam0g postinst:db_go",
+        "libpam0g postinst:db_input",
+        "libpam0g postinst:db_reset",
+        "libpam0g postinst:db_set",
+        "libpam0g postinst:db_stop",
+        "libpam0g postinst:db_subst",
+        "libpam0g postinst:db_version",
+        "libpam0g postrm:confmodule",
+        "libpam0g postrm:db_purge"
+      ],
+      "native_status": "no Debian debconf database/frontend authority; only exact Ubuntu staged-script allowances exist",
+      "packages": {
+        "amd64": [
+          "base-passwd",
+          "dash",
+          "debconf",
+          "libc6",
+          "libpam-modules",
+          "libpam-runtime",
+          "libpam0g"
+        ],
+        "arm64": [
+          "base-passwd",
+          "dash",
+          "debconf",
+          "libc6",
+          "libpam-modules",
+          "libpam-runtime",
+          "libpam0g"
+        ]
+      },
+      "priority": "P1"
+    },
+    {
+      "category": "kernel_filesystem",
+      "evidence": [
+        "libc6 preinst:/proc"
+      ],
+      "native_status": "runner provides no /proc or /sys; only exact Ubuntu proc views exist",
+      "packages": {
+        "amd64": [
+          "libc6"
+        ],
+        "arm64": [
+          "libc6"
+        ]
+      },
+      "priority": "P1"
+    },
+    {
+      "category": "accounts",
+      "evidence": [
+        "apt postinst:adduser",
+        "apt postinst:getent",
+        "base-passwd postinst:update-passwd",
+        "libpam-modules preinst:pam-auth-update",
+        "libpam-runtime postinst:pam-auth-update",
+        "systemd postinst:systemd-sysusers"
+      ],
+      "native_status": "script mutates account databases outside the dpkg database; no Debian execution evidence",
+      "packages": {
+        "amd64": [
+          "apt",
+          "base-passwd",
+          "libpam-modules",
+          "libpam-runtime",
+          "systemd"
+        ],
+        "arm64": [
+          "apt",
+          "base-passwd",
+          "libpam-modules",
+          "libpam-runtime",
+          "systemd"
+        ]
+      },
+      "priority": "P2"
+    },
+    {
+      "category": "environment_probe",
+      "evidence": [
+        "apt postinst:/run",
+        "apt postrm:/run",
+        "apt prerm:/run",
+        "base-files postinst:/run",
+        "base-passwd preinst:/run",
+        "dpkg postinst:/run",
+        "dpkg postrm:/run",
+        "libc6 postinst:/run",
+        "libc6 postinst:ischroot",
+        "libc6 preinst:/run",
+        "libc6 preinst:ischroot",
+        "libpam-modules-bin postinst:/run",
+        "libpam-modules-bin postrm:/run",
+        "libpam-modules-bin prerm:/run",
+        "libpam0g postinst:/run",
+        "systemd postinst:/run",
+        "systemd preinst:/run",
+        "systemd prerm:/run",
+        "util-linux postinst:/run",
+        "util-linux postrm:/run",
+        "util-linux prerm:/run"
+      ],
+      "native_status": "script probes the runtime environment; the native runner result is unobserved for Debian",
+      "packages": {
+        "amd64": [
+          "apt",
+          "base-files",
+          "base-passwd",
+          "dpkg",
+          "libc6",
+          "libpam-modules-bin",
+          "libpam0g",
+          "systemd",
+          "util-linux"
+        ],
+        "arm64": [
+          "apt",
+          "base-files",
+          "base-passwd",
+          "dpkg",
+          "libc6",
+          "libpam-modules-bin",
+          "libpam0g",
+          "systemd",
+          "util-linux"
+        ]
+      },
+      "priority": "P2"
+    },
+    {
+      "category": "service_manager",
+      "evidence": [
+        "apt postinst:deb-systemd-helper",
+        "apt postinst:deb-systemd-invoke",
+        "apt postinst:systemctl",
+        "apt postrm:deb-systemd-helper",
+        "apt postrm:systemctl",
+        "apt prerm:deb-systemd-invoke",
+        "dpkg postinst:deb-systemd-helper",
+        "dpkg postinst:start-stop-daemon",
+        "dpkg postinst:systemctl",
+        "dpkg postrm:deb-systemd-helper",
+        "dpkg postrm:deb-systemd-invoke",
+        "dpkg postrm:start-stop-daemon",
+        "dpkg postrm:systemctl",
+        "libc6 postinst:invoke-rc.d",
+        "libc6 postinst:systemctl",
+        "libc6 preinst:invoke-rc.d",
+        "libc6 preinst:systemctl",
+        "libpam-modules-bin postinst:deb-systemd-invoke",
+        "libpam-modules-bin postinst:systemctl",
+        "libpam-modules-bin postrm:systemctl",
+        "libpam-modules-bin prerm:deb-systemd-invoke",
+        "libpam0g postinst:invoke-rc.d",
+        "libpam0g postinst:systemctl",
+        "libselinux1 postinst:systemd-tmpfiles",
+        "systemd postinst:systemctl",
+        "systemd postinst:systemd-machine-id-setup",
+        "systemd postinst:systemd-tmpfiles",
+        "util-linux postinst:deb-systemd-helper",
+        "util-linux postinst:deb-systemd-invoke",
+        "util-linux postinst:systemctl",
+        "util-linux postrm:deb-systemd-helper",
+        "util-linux postrm:systemctl",
+        "util-linux prerm:deb-systemd-invoke"
+      ],
+      "native_status": "service enablement/invocation in a chroot without a running manager; no Debian execution evidence",
+      "packages": {
+        "amd64": [
+          "apt",
+          "dpkg",
+          "libc6",
+          "libpam-modules-bin",
+          "libpam0g",
+          "libselinux1",
+          "systemd",
+          "util-linux"
+        ],
+        "arm64": [
+          "apt",
+          "dpkg",
+          "libc6",
+          "libpam-modules-bin",
+          "libpam0g",
+          "libselinux1",
+          "systemd",
+          "util-linux"
+        ]
+      },
+      "priority": "P2"
+    },
+    {
+      "category": "system_registry",
+      "evidence": [
+        "dash postrm:add-shell",
+        "dash postrm:update-shells",
+        "debianutils postinst:update-shells"
+      ],
+      "native_status": "script updates a system registry outside the dpkg database; no Debian execution evidence",
+      "packages": {
+        "amd64": [
+          "dash",
+          "debianutils"
+        ],
+        "arm64": [
+          "dash",
+          "debianutils"
+        ]
+      },
+      "priority": "P2"
+    },
+    {
+      "category": "dpkg_database_helper",
+      "evidence": [
+        "apt postinst:dpkg",
+        "apt postinst:dpkg-maintscript-helper",
+        "apt postrm:dpkg-maintscript-helper",
+        "apt preinst:dpkg-maintscript-helper",
+        "apt prerm:dpkg-maintscript-helper",
+        "base-files postinst:dpkg",
+        "base-files postinst:dpkg-divert",
+        "base-files postrm:dpkg-divert",
+        "base-files preinst:dpkg-divert",
+        "dash postinst:dpkg",
+        "dash postinst:dpkg-divert",
+        "dash postrm:dpkg",
+        "dash preinst:dpkg",
+        "dash preinst:dpkg-divert",
+        "dash prerm:dpkg-divert",
+        "debian-archive-keyring postinst:dpkg",
+        "debian-archive-keyring postinst:dpkg-maintscript-helper",
+        "debian-archive-keyring postrm:dpkg-maintscript-helper",
+        "debian-archive-keyring preinst:dpkg-maintscript-helper",
+        "debian-archive-keyring prerm:dpkg-maintscript-helper",
+        "dpkg postinst:dpkg",
+        "dpkg postrm:dpkg",
+        "gzip postinst:dpkg-divert",
+        "gzip preinst:dpkg-divert",
+        "init-system-helpers postinst:dpkg-divert",
+        "libc6 postinst:dpkg",
+        "libc6 postinst:dpkg-query",
+        "libc6 postinst:dpkg-trigger",
+        "libc6 postrm:dpkg-divert",
+        "libc6 preinst:dpkg",
+        "libc6 preinst:dpkg-divert",
+        "libc6 preinst:dpkg-query",
+        "libpam-modules postinst:dpkg",
+        "libpam-modules preinst:dpkg",
+        "libpam-runtime postinst:dpkg",
+        "libpam0g postinst:dpkg",
+        "libreadline8t64 postrm:dpkg-divert",
+        "libreadline8t64 preinst:dpkg-divert",
+        "libselinux1 postinst:dpkg",
+        "libstdc++6 prerm:dpkg",
+        "systemd postinst:dpkg",
+        "systemd postinst:dpkg-maintscript-helper",
+        "systemd postrm:dpkg-maintscript-helper",
+        "systemd preinst:dpkg",
+        "systemd preinst:dpkg-maintscript-helper",
+        "systemd prerm:dpkg-maintscript-helper",
+        "systemd-sysv postinst:dpkg-divert"
+      ],
+      "native_status": "modeled natively (diversions, statoverrides, triggers, maintscript helpers) but without Debian parity evidence",
+      "packages": {
+        "amd64": [
+          "apt",
+          "base-files",
+          "dash",
+          "debian-archive-keyring",
+          "dpkg",
+          "gzip",
+          "init-system-helpers",
+          "libc6",
+          "libpam-modules",
+          "libpam-runtime",
+          "libpam0g",
+          "libreadline8t64",
+          "libselinux1",
+          "libstdc++6",
+          "systemd",
+          "systemd-sysv"
+        ],
+        "arm64": [
+          "apt",
+          "base-files",
+          "dash",
+          "debian-archive-keyring",
+          "dpkg",
+          "gzip",
+          "init-system-helpers",
+          "libc6",
+          "libpam-modules",
+          "libpam-runtime",
+          "libpam0g",
+          "libreadline8t64",
+          "libselinux1",
+          "libstdc++6",
+          "systemd",
+          "systemd-sysv"
+        ]
+      },
+      "priority": "P3"
+    },
+    {
+      "category": "ldconfig",
+      "evidence": [
+        "libc-bin postinst:ldconfig"
+      ],
+      "native_status": "modeled as an ordinary in-root command; no Debian parity evidence",
+      "packages": {
+        "amd64": [
+          "libc-bin"
+        ],
+        "arm64": [
+          "libc-bin"
+        ]
+      },
+      "priority": "P3"
+    },
+    {
+      "category": "trigger_declaration",
+      "evidence": [
+        "apt triggers:activate_noawait ldconfig",
+        "base-files triggers:interest_noawait /usr/lib32",
+        "base-files triggers:interest_noawait /usr/lib64",
+        "base-files triggers:interest_noawait /usr/libo32",
+        "base-files triggers:interest_noawait /usr/libx32",
+        "debianutils triggers:interest_noawait /usr/share/debianutils/shells.d",
+        "libacl1 triggers:activate_noawait ldconfig",
+        "libapparmor1 triggers:activate_noawait ldconfig",
+        "libapt-pkg7.0 triggers:activate_noawait ldconfig",
+        "libattr1 triggers:activate_noawait ldconfig",
+        "libaudit1 triggers:activate_noawait ldconfig",
+        "libblkid1 triggers:activate_noawait ldconfig",
+        "libbz2-1.0 triggers:activate_noawait ldconfig",
+        "libc-bin triggers:interest_await ldconfig",
+        "libc6 triggers:activate_noawait ldconfig",
+        "libcap-ng0 triggers:activate_noawait ldconfig",
+        "libcap2 triggers:activate_noawait ldconfig",
+        "libcrypt1 triggers:activate_noawait ldconfig",
+        "libdb5.3t64 triggers:activate_noawait ldconfig",
+        "libdebconfclient0 triggers:activate_noawait ldconfig",
+        "libgcc-s1 triggers:activate_noawait ldconfig",
+        "libgmp10 triggers:activate_noawait ldconfig",
+        "libhogweed6t64 triggers:activate_noawait ldconfig",
+        "liblastlog2-2 triggers:activate_noawait ldconfig",
+        "liblz4-1 triggers:activate_noawait ldconfig",
+        "liblzma5 triggers:activate_noawait ldconfig",
+        "libmd0 triggers:activate_noawait ldconfig",
+        "libmount1 triggers:activate_noawait ldconfig",
+        "libmpfr6 triggers:activate_noawait ldconfig",
+        "libnettle8t64 triggers:activate_noawait ldconfig",
+        "libpam0g triggers:activate_noawait ldconfig",
+        "libpcre2-8-0 triggers:activate_noawait ldconfig",
+        "libreadline8t64 triggers:activate_noawait ldconfig",
+        "libseccomp2 triggers:activate_noawait ldconfig",
+        "libselinux1 triggers:activate_noawait ldconfig",
+        "libsigsegv2 triggers:activate_noawait ldconfig",
+        "libsmartcols1 triggers:activate_noawait ldconfig",
+        "libsqlite3-0 triggers:activate_noawait ldconfig",
+        "libssl3t64 triggers:activate_noawait ldconfig",
+        "libstdc++6 triggers:activate_noawait ldconfig",
+        "libsystemd0 triggers:activate_noawait ldconfig",
+        "libtinfo6 triggers:activate_noawait ldconfig",
+        "libudev1 triggers:activate_noawait ldconfig",
+        "libuuid1 triggers:activate_noawait ldconfig",
+        "libxxhash0 triggers:activate_noawait ldconfig",
+        "libzstd1 triggers:activate_noawait ldconfig",
+        "systemd triggers:interest_noawait /usr/lib/binfmt.d",
+        "systemd triggers:interest_noawait /usr/lib/sysctl.d",
+        "systemd triggers:interest_noawait /usr/lib/systemd/catalog",
+        "systemd triggers:interest_noawait libc-upgrade",
+        "zlib1g triggers:activate_noawait ldconfig"
+      ],
+      "native_status": "declared trigger interests/activations are modeled; Debian processing parity is unobserved",
+      "packages": {
+        "amd64": [
+          "apt",
+          "base-files",
+          "debianutils",
+          "libacl1",
+          "libapparmor1",
+          "libapt-pkg7.0",
+          "libattr1",
+          "libaudit1",
+          "libblkid1",
+          "libbz2-1.0",
+          "libc-bin",
+          "libc6",
+          "libcap-ng0",
+          "libcap2",
+          "libcrypt1",
+          "libdb5.3t64",
+          "libdebconfclient0",
+          "libgcc-s1",
+          "libgmp10",
+          "libhogweed6t64",
+          "liblastlog2-2",
+          "liblz4-1",
+          "liblzma5",
+          "libmd0",
+          "libmount1",
+          "libmpfr6",
+          "libnettle8t64",
+          "libpam0g",
+          "libpcre2-8-0",
+          "libreadline8t64",
+          "libseccomp2",
+          "libselinux1",
+          "libsigsegv2",
+          "libsmartcols1",
+          "libsqlite3-0",
+          "libssl3t64",
+          "libstdc++6",
+          "libsystemd0",
+          "libtinfo6",
+          "libudev1",
+          "libuuid1",
+          "libxxhash0",
+          "libzstd1",
+          "systemd",
+          "zlib1g"
+        ],
+        "arm64": [
+          "apt",
+          "base-files",
+          "debianutils",
+          "libacl1",
+          "libapparmor1",
+          "libapt-pkg7.0",
+          "libattr1",
+          "libaudit1",
+          "libblkid1",
+          "libbz2-1.0",
+          "libc-bin",
+          "libc6",
+          "libcap-ng0",
+          "libcap2",
+          "libcrypt1",
+          "libdb5.3t64",
+          "libdebconfclient0",
+          "libgcc-s1",
+          "libgmp10",
+          "libhogweed6t64",
+          "liblastlog2-2",
+          "liblz4-1",
+          "liblzma5",
+          "libmd0",
+          "libmount1",
+          "libmpfr6",
+          "libnettle8t64",
+          "libpam0g",
+          "libpcre2-8-0",
+          "libreadline8t64",
+          "libseccomp2",
+          "libselinux1",
+          "libsigsegv2",
+          "libsmartcols1",
+          "libsqlite3-0",
+          "libssl3t64",
+          "libstdc++6",
+          "libsystemd0",
+          "libtinfo6",
+          "libudev1",
+          "libuuid1",
+          "libxxhash0",
+          "libzstd1",
+          "systemd",
+          "zlib1g"
+        ]
+      },
+      "priority": "P3"
+    },
+    {
+      "category": "ownership_and_mode",
+      "evidence": [
+        "base-files postinst:chmod",
+        "base-files postinst:chown",
+        "base-passwd postinst:chmod",
+        "base-passwd postinst:chown",
+        "libpam-modules-bin payload:non_root_owner",
+        "libpam-modules-bin payload:setuid_or_setgid",
+        "mount payload:setuid_or_setgid",
+        "util-linux payload:setuid_or_setgid"
+      ],
+      "native_status": "supported metadata recorded for review against statoverrides",
+      "packages": {
+        "amd64": [
+          "base-files",
+          "base-passwd",
+          "libpam-modules-bin",
+          "mount",
+          "util-linux"
+        ],
+        "arm64": [
+          "base-files",
+          "base-passwd",
+          "libpam-modules-bin",
+          "mount",
+          "util-linux"
+        ]
+      },
+      "priority": "P4"
+    }
+  ],
+  "host_machine": "aarch64",
+  "issue": 261,
+  "keyring": {
+    "fingerprint": "41587f7db8c774bccf131416762f67a0b2c39de4",
+    "path": "/usr/share/keyrings/debian-archive-trixie-stable.pgp",
+    "sha256": "abced156a22aa8683b228299ac35c1ea51515eef900cec0e562f56716dfe3915"
+  },
+  "pin_sha256": "5491f7732c6d470e91e42f182698bf92ee7bedc47a6ba41077adf681e330d619",
+  "program": {
+    "optimize": "ReleaseSafe",
+    "sha256": "6aca15f0ef7747954ee186ca7a38bf77af83f22490583b5278ddb48d9d3bb540",
+    "source_commit": "7fc3960fd2e77cf08f5448cd594cba0f6a299c34",
+    "version": "0.3.0"
+  },
+  "requests": [
+    "apt",
+    "systemd-sysv"
+  ],
+  "schema": "https://debz.dev/test/debian-stable-closure-evidence-v1"
+}

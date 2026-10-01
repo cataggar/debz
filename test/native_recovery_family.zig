@@ -60,6 +60,8 @@ pub const Invocation = struct {
     reconciliation_claim: ?std.json.Value = null,
     reconciliation_owner_output: ?[]const u8 = null,
     completion_crash: ?[]const u8 = null,
+    /// Explicit native relaxation for static SHA256-only fixtures (#261).
+    archive_digest_policy: ?[]const u8 = null,
 };
 
 pub const OwnedVerification = struct {
@@ -234,6 +236,7 @@ fn runWorkflow(
         } else null,
         .family_execution = invocation.family_execution,
         .family_update_planning = invocation.family_update_planning,
+        .archive_digest_policy = invocation.archive_digest_policy,
         .native_evidence_output = evidence_path,
     }, .{});
     defer fixture.allocator.free(payload);
@@ -448,6 +451,37 @@ fn planning(fixture: *foundation.Fixture, driver: []const u8) !void {
     const source = try fixture.absolute("planning/sources.list");
     const source_text = try std.fmt.allocPrint(fixture.allocator, "deb [arch=amd64 signed-by={s}] file://{s} stable main\n", .{ keyring, repo });
     try fixture.write("planning/sources.list", source_text, 0o644);
+    // #261: this static repository publishes signed SHA256 only, so native
+    // consumers refuse it by default and write no lock.
+    {
+        var request = try familyRequest(fixture, root, "amd64", "resolve_lock");
+        request.sources = &.{source};
+        request.keyrings = &.{keyring};
+        request.lock_output = try fixture.absolute("planning/sha256-only.lock.json");
+        var refused = try workflow(fixture, driver, root, "amd64", "planning/sha256-only", .{
+            .family_execution = request,
+            .family_update_planning = true,
+        });
+        defer refused.deinit();
+        try expectFamily(refused.report.value, "resolve_lock", false);
+        try same(try string(refused.report.value, "exit_status"), "planning");
+        if (std.mem.indexOf(u8, try string(try field(refused.report.value, "diagnostic"), "message"), "SHA-512 archive identity") == null)
+            return error.MissingSha512IdentityDiagnostic;
+        try support.absent(fixture, "planning/sha256-only.lock.json");
+        var core_refused = try workflow(fixture, driver, root, "amd64", "planning/sha256-only-core", .{
+            .ordinary_plan = true,
+            .sources = &.{source},
+            .keyrings = &.{keyring},
+            .lock_output = try fixture.absolute("planning/sha256-only-core.lock.json"),
+        });
+        defer core_refused.deinit();
+        try std.testing.expectEqual(@as(i64, 5), (try field(core_refused.report.value, "exit_status")).integer);
+        const diagnostic = (try field(core_refused.report.value, "diagnostics")).array.items[0];
+        try same(try string(diagnostic, "id"), "planning_failed");
+        if (std.mem.indexOf(u8, try string(diagnostic, "message"), "SHA-512 archive identity") == null)
+            return error.MissingSha512IdentityDiagnostic;
+        try support.absent(fixture, "planning/sha256-only-core.lock.json");
+    }
     for ([_]?[]const u8{ "alpha:amd64=1", null }, [_][]const u8{ "selected", "all" }) |package, label| {
         const lock_relative = try std.fmt.allocPrint(fixture.allocator, "planning/{s}.lock.json", .{label});
         const lock = try fixture.absolute(lock_relative);
@@ -461,6 +495,7 @@ fn planning(fixture: *foundation.Fixture, driver: []const u8) !void {
             .family_execution = request,
             .family_update_planning = true,
             .capture_evidence = true,
+            .archive_digest_policy = "published_digests",
         });
         defer planned.deinit();
         try expectFamily(planned.report.value, "resolve_lock", true);
@@ -485,7 +520,10 @@ fn planning(fixture: *foundation.Fixture, driver: []const u8) !void {
     ordinary.sources = &.{source};
     ordinary.keyrings = &.{keyring};
     ordinary.lock_output = try fixture.absolute("planning/ordinary.lock.json");
-    var refused = try workflow(fixture, driver, root, "amd64", "planning/ordinary", .{ .family_execution = ordinary });
+    var refused = try workflow(fixture, driver, root, "amd64", "planning/ordinary", .{
+        .family_execution = ordinary,
+        .archive_digest_policy = "published_digests",
+    });
     defer refused.deinit();
     try expectFamily(refused.report.value, "resolve_lock", false);
     try same(try string(try field(refused.report.value, "diagnostic"), "id"), "invalid_request");
@@ -497,6 +535,7 @@ fn planning(fixture: *foundation.Fixture, driver: []const u8) !void {
         .keyrings = &.{keyring},
         .lock_output = core_lock,
         .capture_evidence = true,
+        .archive_digest_policy = "published_digests",
     });
     defer core_plan.deinit();
     try std.testing.expectEqual(@as(i64, 0), (try field(core_plan.report.value, "exit_status")).integer);
@@ -511,7 +550,7 @@ fn planning(fixture: *foundation.Fixture, driver: []const u8) !void {
     const after = try foundation.capture(fixture.allocator, fixture.io, root);
     defer fixture.allocator.free(after);
     try std.testing.expectEqualSlices(u8, before, after);
-    std.debug.print("family: selected and upgrade-all update planning used real signed repository and bound locks\n", .{});
+    std.debug.print("family: SHA256-only native default refusal, then selected and upgrade-all update planning used real signed repository and bound locks\n", .{});
 }
 
 fn archive(fixture: *foundation.Fixture, arch: []const u8, name: []const u8, version: []const u8) ![]u8 {

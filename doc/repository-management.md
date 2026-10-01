@@ -635,6 +635,12 @@ must be a regular payload file. Keyring bytes are parsed and used to
 authenticate a dry refresh of the new repositories. Dynamic repository
 material and authentication-bypassing `Trusted: yes`/`trusted=yes`
 declarations fail before target mutation. Explicit false values remain valid.
+A payload may declare the per-repository signed-SHA256 archive binding
+(`X-Debz-Archive-Binding: signed_sha256_derived_sha512` or the one-line
+option `debz-archive-binding=signed_sha256_derived_sha512`); an unknown token
+is a malformed repository source. The declaration is part of the repository
+identity and is kept in the managed sources
+([exact locks](exact-locks-and-provenance.md)).
 
 Architecture comes only from an explicit request or target-root dpkg
 configuration. Host `uname`, host APT configuration, environment proxies,
@@ -740,6 +746,13 @@ descriptor and every repository-selected package in the mutation closure;
 already-installed dependency satisfiers are retained from target state rather
 than assigned invented artifact origins, and binds the complete request,
 authenticated repository snapshots, local artifacts, and executable plan.
+On the native engine, dependencies from a target repository that opted in
+to the signed-SHA256 archive binding are acquired, checked against size and
+signed SHA256, and bound with their derived SHA512 before the lock is
+persisted; any mismatch fails the `archive-binding` stage and persists no
+lock. Native preparation then requires a SHA512 archive identity (signed or
+bound) for every repository dependency. A lock that relabels a repository
+dependency as a local artifact does not match the plan origin and is refused.
 Its policy digest explicitly binds repository-add's `locked_packages`
 verification scope. Under that scope every locked mutation package must have
 the exact installed identity, plan origin, digest, size, and completed journal

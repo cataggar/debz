@@ -1,0 +1,6 @@
+Types: deb
+URIs: https://deb.example/debian
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/debian.gpg
+X-Debz-Archive-Binding: signed_sha256_derived_sha512

@@ -1,0 +1,36 @@
+{
+  "schema": "https://debz.dev/test/debian-stable-readiness-arm64-evidence-v1",
+  "observed_at_utc_date": "2026-09-28",
+  "source_base_commit": "367a3a0722a8b326ce4e80bf60fc1c49a83ff550",
+  "host_architecture": "aarch64",
+  "debz_build": "zig build -Doptimize=ReleaseSafe -j2",
+  "program_sha256": "0e237ec1910c7dd66a0180254c1e3d127d25ff17047462e19ad4721804c36de2",
+  "signed_by_path": "/d/debz/.tmp/worktrees/issue-261-fleet/.tmp/debian-261-trixie-release-13.gpg",
+  "signed_by_sha256": "abced156a22aa8683b228299ac35c1ea51515eef900cec0e562f56716dfe3915",
+  "source_sha256": "12c31b94f6a18de583b5c67af9be4d61c7b21529a700738f5e39a6a0808dc51b",
+  "inrelease_sha256": "0584fba32e13e0ab8285fb16c27adea1ec03a73669c18702821094fd6ca86675",
+  "index_sha256": "be16b37b2f740f066ea93d35d56f04f94d63693e5a3eb421b052bf86fae75bcd",
+  "package_records": 68196,
+  "sha256_package_records": 68196,
+  "sha512_package_records": 0,
+  "index_published_sha512": false,
+  "exact_lock_published": false,
+  "cas_archive_count": 0,
+  "install_root_empty": true,
+  "runs": [
+    {
+      "workspace": ".tmp/debian-261-readiness-arm64-3",
+      "config_sha256": "d4424383ba07091e32e7f3653d92402ee96178e8a1f5c28cea589eeb60dafd2b",
+      "refresh_exit_status": 0,
+      "refresh_repository_identity": "7fe912e27736222973cc4b742b428aec21be4b684fdf1feddf35cd13b68fe9c9",
+      "preflight_exit_status": 3
+    },
+    {
+      "workspace": ".tmp/debian-261-readiness-arm64-4",
+      "config_sha256": "5280938099d12252b71d1c8d0eb0760f795d5ffb4d29c4068abd02d1aabb4eec",
+      "refresh_exit_status": 0,
+      "refresh_repository_identity": "7fe912e27736222973cc4b742b428aec21be4b684fdf1feddf35cd13b68fe9c9",
+      "preflight_exit_status": 3
+    }
+  ]
+}

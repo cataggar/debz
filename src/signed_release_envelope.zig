@@ -341,7 +341,7 @@ pub fn parseInRelease(
     errdefer signature.deinit(allocator);
     if (signature.source_range.end != source.len)
         return .{ .diagnostic = diag(.trailing_garbage, .in_release, signature.source_range.end, source.len) };
-    if (signature.packet_ranges.len != 1)
+    if (signature.packet_ranges.len > limits.max_signature_count)
         return .{ .diagnostic = diag(.too_many_signatures, .in_release, signature.source_range.start, signature.source_range.end) };
 
     const display_owned = try display.toOwnedSlice(allocator);
@@ -793,6 +793,33 @@ test "RFC-style CRLF fixture preserves display text without newline ambiguity" {
     defer envelope.deinit();
     try std.testing.expectEqualStrings("Origin: Debian\r\n", envelope.display_cleartext);
     try std.testing.expectEqualStrings("Origin: Debian", envelope.canonical_cleartext);
+}
+
+test "cleartext InRelease retains each bounded signature packet for independent verification" {
+    const fixture =
+        "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n" ++
+        "Origin: Debian\n" ++
+        "-----BEGIN PGP SIGNATURE-----\n\n" ++
+        "wgDCAA==\n" ++
+        "-----END PGP SIGNATURE-----\n";
+    const result = try parseInRelease(std.testing.allocator, fixture, .{});
+    var envelope = switch (result) {
+        .envelope => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer envelope.deinit();
+    try std.testing.expectEqual(@as(usize, 2), envelope.signature.packet_ranges.len);
+    for (envelope.signature.packet_ranges) |packet|
+        try std.testing.expectEqualSlices(u8, &.{ 0xc2, 0 }, packet.slice(envelope.signature.bytes));
+    const limited = try parseInRelease(std.testing.allocator, fixture, .{ .max_signature_count = 1 });
+    switch (limited) {
+        .diagnostic => |value| try std.testing.expectEqual(DiagnosticCode.too_many_signatures, value.code),
+        .envelope => |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.TestExpectedError;
+        },
+    }
 }
 
 test "detached Release bytes remain exact including missing final newline" {

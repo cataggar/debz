@@ -26,12 +26,11 @@ const solver = @import("solver.zig");
 const source = @import("source.zig");
 const transaction_executor = @import("transaction_executor.zig");
 const transaction_recovery = @import("transaction_recovery.zig");
+const test_openpgp_signer = @import("test_openpgp_signer.zig");
 
 const testing = std.testing;
-const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha512 = std.crypto.hash.sha2.Sha512;
-const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const repository_id: source.RepositoryId = .{ .bytes = @splat('a') };
 pub const base_uri_text = "https://sha512.invalid/debian";
@@ -121,7 +120,10 @@ pub const SignedRepository = struct {
         );
         errdefer allocator.free(release);
 
-        const signer = try TestSigner.init(allocator);
+        const signer = try test_openpgp_signer.Signer.init(allocator, .{
+            .uid = "debz SHA512 e2e fixture <fixture.invalid>",
+            .created = created,
+        });
         errdefer allocator.free(signer.keyring);
         const signature = try signer.signDocument(allocator, release);
         errdefer allocator.free(signature);
@@ -147,195 +149,6 @@ pub const SignedRepository = struct {
         self.* = undefined;
     }
 };
-
-const TestSigner = struct {
-    key_pair: Ed25519.KeyPair,
-    fingerprint: [20]u8,
-    keyring: []u8,
-
-    fn init(allocator: std.mem.Allocator) !TestSigner {
-        const seed: [Ed25519.KeyPair.seed_length]u8 = @splat(0x42);
-        const key_pair = try Ed25519.KeyPair.generateDeterministic(seed);
-        const public_key = key_pair.public_key.toBytes();
-
-        var key_body: std.ArrayList(u8) = .empty;
-        defer key_body.deinit(allocator);
-        try key_body.append(allocator, 4);
-        try appendInt(&key_body, allocator, u32, created);
-        try key_body.append(allocator, 22);
-        const oid = [_]u8{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01 };
-        try key_body.append(allocator, oid.len);
-        try key_body.appendSlice(allocator, &oid);
-        var point: [33]u8 = undefined;
-        point[0] = 0x40;
-        point[1..].* = public_key;
-        try appendMpi(&key_body, allocator, &point);
-
-        var fingerprint_input: std.ArrayList(u8) = .empty;
-        defer fingerprint_input.deinit(allocator);
-        try fingerprint_input.append(allocator, 0x99);
-        try appendInt(&fingerprint_input, allocator, u16, @intCast(key_body.items.len));
-        try fingerprint_input.appendSlice(allocator, key_body.items);
-        var fingerprint: [20]u8 = undefined;
-        Sha1.hash(fingerprint_input.items, &fingerprint, .{});
-
-        const uid = "debz SHA512 e2e fixture <fixture.invalid>";
-        var keyring: std.ArrayList(u8) = .empty;
-        errdefer keyring.deinit(allocator);
-        try appendPacket(&keyring, allocator, 6, key_body.items);
-        try appendPacket(&keyring, allocator, 13, uid);
-
-        var certification_input: std.ArrayList(u8) = .empty;
-        defer certification_input.deinit(allocator);
-        try certification_input.appendSlice(allocator, fingerprint_input.items);
-        try certification_input.append(allocator, 0xb4);
-        try appendInt(&certification_input, allocator, u32, uid.len);
-        try certification_input.appendSlice(allocator, uid);
-        const certification = try signPacket(
-            allocator,
-            key_pair,
-            fingerprint,
-            0x13,
-            certification_input.items,
-            0x03,
-        );
-        defer allocator.free(certification);
-        try keyring.appendSlice(allocator, certification);
-
-        return .{
-            .key_pair = key_pair,
-            .fingerprint = fingerprint,
-            .keyring = try keyring.toOwnedSlice(allocator),
-        };
-    }
-
-    fn signDocument(self: TestSigner, allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-        return signPacket(
-            allocator,
-            self.key_pair,
-            self.fingerprint,
-            0x00,
-            bytes,
-            null,
-        );
-    }
-};
-
-fn signPacket(
-    allocator: std.mem.Allocator,
-    key_pair: Ed25519.KeyPair,
-    fingerprint: [20]u8,
-    signature_type: u8,
-    signed_bytes: []const u8,
-    key_flags: ?u8,
-) ![]u8 {
-    var hashed: std.ArrayList(u8) = .empty;
-    defer hashed.deinit(allocator);
-    var created_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &created_bytes, created, .big);
-    try appendSubpacket(&hashed, allocator, 2, &created_bytes);
-    var issuer: [21]u8 = undefined;
-    issuer[0] = 4;
-    issuer[1..].* = fingerprint;
-    try appendSubpacket(&hashed, allocator, 33, &issuer);
-    if (key_flags) |flags| try appendSubpacket(&hashed, allocator, 27, &.{flags});
-
-    var prefix: std.ArrayList(u8) = .empty;
-    defer prefix.deinit(allocator);
-    try prefix.appendSlice(allocator, &.{ 4, signature_type, 22, 10 });
-    try appendInt(&prefix, allocator, u16, @intCast(hashed.items.len));
-    try prefix.appendSlice(allocator, hashed.items);
-
-    var hash = Sha512.init(.{});
-    hash.update(signed_bytes);
-    hash.update(prefix.items);
-    var trailer: [6]u8 = .{ 4, 0xff, 0, 0, 0, 0 };
-    std.mem.writeInt(u32, trailer[2..6], @intCast(prefix.items.len), .big);
-    hash.update(&trailer);
-    const digest = hash.finalResult();
-    const signature = try key_pair.sign(&digest, null);
-    const encoded = signature.toBytes();
-
-    var unhashed: std.ArrayList(u8) = .empty;
-    defer unhashed.deinit(allocator);
-    try appendSubpacket(&unhashed, allocator, 16, fingerprint[12..20]);
-
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(allocator);
-    try body.appendSlice(allocator, prefix.items);
-    try appendInt(&body, allocator, u16, @intCast(unhashed.items.len));
-    try body.appendSlice(allocator, unhashed.items);
-    try body.appendSlice(allocator, digest[0..2]);
-    try appendMpi(&body, allocator, encoded[0..32]);
-    try appendMpi(&body, allocator, encoded[32..64]);
-
-    var packet: std.ArrayList(u8) = .empty;
-    errdefer packet.deinit(allocator);
-    try appendPacket(&packet, allocator, 2, body.items);
-    return packet.toOwnedSlice(allocator);
-}
-
-fn appendPacket(
-    output: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    tag: u8,
-    body: []const u8,
-) !void {
-    try output.append(allocator, 0xc0 | tag);
-    if (body.len < 192) {
-        try output.append(allocator, @intCast(body.len));
-    } else if (body.len < 8384) {
-        const adjusted = body.len - 192;
-        try output.append(allocator, @intCast((adjusted >> 8) + 192));
-        try output.append(allocator, @intCast(adjusted & 0xff));
-    } else {
-        try output.append(allocator, 0xff);
-        try appendInt(output, allocator, u32, @intCast(body.len));
-    }
-    try output.appendSlice(allocator, body);
-}
-
-fn appendSubpacket(
-    output: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    kind: u8,
-    body: []const u8,
-) !void {
-    const len = body.len + 1;
-    if (len >= 192) return error.TestFixtureTooLarge;
-    try output.append(allocator, @intCast(len));
-    try output.append(allocator, kind);
-    try output.appendSlice(allocator, body);
-}
-
-fn appendMpi(
-    output: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-) !void {
-    var first: usize = 0;
-    while (first < raw.len and raw[first] == 0) : (first += 1) {}
-    if (first == raw.len) {
-        try appendInt(output, allocator, u16, 0);
-        return;
-    }
-    const significant = raw[first..];
-    const leading_bits: u16 = @intCast(8 - @clz(significant[0]));
-    const bit_len: u16 = @intCast((significant.len - 1) * 8 + leading_bits);
-    try appendInt(output, allocator, u16, bit_len);
-    try output.appendSlice(allocator, significant);
-}
-
-fn appendInt(
-    output: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    comptime T: type,
-    value: T,
-) !void {
-    var bytes: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &bytes, value, .big);
-    try output.appendSlice(allocator, &bytes);
-}
 
 pub const RepositoryTransport = struct {
     fixture: *const SignedRepository,

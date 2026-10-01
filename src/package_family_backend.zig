@@ -301,6 +301,9 @@ pub const VerifiedNativeCompletion = struct {
 pub const NativeBackend = struct {
     io: std.Io,
     now_unix: ?i64 = null,
+    /// Native engine archive identity policy (#261); embedders only relax it
+    /// explicitly. Per-repository opt-in comes from the request `configs`.
+    archive_digest_policy: exact_lock_v3.ArchiveDigestPolicy = .sha512_identity_required,
 
     /// Read-only proof of a settled successful transaction, not execution,
     /// recovery, an unchanged result, or authority to publish an image.
@@ -355,6 +358,7 @@ pub const NativeBackend = struct {
                 .policy_sha256 = production.planningPolicyDigest(.native, mapped.request.options),
                 .foreign_architectures = mapped.request.options.foreign_architectures,
                 .completion = returned,
+                .archive_digest_policy = self.archive_digest_policy,
             },
             locks.interface(),
         ) catch |err| switch (err) {
@@ -420,6 +424,7 @@ pub const NativeBackend = struct {
                 .io = self.io,
                 .transaction_backend = .native,
                 .now_unix = self.now_unix,
+                .native_archive_digest_policy = self.archive_digest_policy,
             };
             const response = if (update_planning) planning: {
                 if (product.validate(mapped.request)) |invalid| break :planning invalid;

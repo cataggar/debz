@@ -451,12 +451,15 @@ fn refreshInternal(
                     .diagnostic => return error.MalformedSignedEnvelope,
                 };
                 release_bytes = in_release_envelope.?.display_cleartext;
-                const signatures = [_][]const u8{in_release_envelope.?.signature.bytes};
+                var signatures: std.ArrayList([]const u8) = .empty;
+                defer signatures.deinit(allocator);
+                for (in_release_envelope.?.signature.packet_ranges) |packet_range|
+                    try signatures.append(allocator, packet_range.slice(in_release_envelope.?.signature.bytes));
                 verification_outcome = try verifyAuthentication(
                     allocator,
                     dependencies.io,
                     in_release_envelope.?.canonical_cleartext,
-                    &signatures,
+                    signatures.items,
                     auth_policy,
                 );
                 authentication_mode = .in_release;
@@ -1593,12 +1596,15 @@ fn revalidateAuthentication(
             defer envelope.deinit();
             if (!std.mem.eql(u8, envelope.display_cleartext, manifest.release_bytes))
                 return error.CorruptSnapshot;
-            const signatures = [_][]const u8{envelope.signature.bytes};
+            var signatures: std.ArrayList([]const u8) = .empty;
+            defer signatures.deinit(allocator);
+            for (envelope.signature.packet_ranges) |packet_range|
+                try signatures.append(allocator, packet_range.slice(envelope.signature.bytes));
             outcome = try verifyAuthentication(
                 allocator,
                 io,
                 envelope.canonical_cleartext,
-                &signatures,
+                signatures.items,
                 policy,
             );
         },

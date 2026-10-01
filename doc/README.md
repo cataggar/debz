@@ -36,6 +36,7 @@
 - [Root-anchored filesystem primitives](root-filesystem.md) documents the traversal-safe path grammar, no-follow resolution, exclusive creation, atomic publication, and durability rules used by the native engine.
 - [Audited maintainer-script runner](maintainer-script-runner.md) documents the native maintainer-script contract: pre-spawn rejection, root isolation, environment allowlist, bounded output and runtime, process-tree termination, outcome taxonomy, and provenance evidence.
 - [Hermetic integration roots](integration-roots.md) documents deterministic signed fixtures, disposable native/foreign roots, CI lanes, and local prerequisites.
+- [Debian 13 stable signed-input readiness](debian-stable-readiness.md) pins the reviewed Release, signer, freshness and both architecture indexes, records how Debian's signed SHA256 archive binding (with an explicitly derived SHA512) is used, and holds reproducible amd64/arm64 bound locks, CAS evidence and a pre-mutation native gap list for the Debian closure.
 - [Pinned dpkg/update-alternatives reference](dpkg-alternatives-reference.md) documents and binds the admitted bounded amd64/arm64 record, link, package lifecycle, failure, attack, settlement, and recovery contract for the 14 reviewed vendor groups.
 - [zvmi Debian-family backend](zvmi-package-family.md) defines the versioned Ubuntu/Debian image-builder boundary, explicit inputs, locks, provenance, cache policy, and failure contract.
 - [Threat model and safety limits](threat-model.md) defines untrusted surfaces, security properties, and residual risks.

@@ -39,6 +39,23 @@ and package evidence with the legacy closure, verifies its independent digest
 and backend-bound policy, and exercises cold download and cache-only replay.
 It rejects v1 input and changed policy. A missing helper target refuses native
 execution without changing package state or leaving an active root record.
+
+The generated repository publishes signed SHA256 and SHA512 for every archive
+by default, so native lanes satisfy the native default
+`sha512_identity_required` policy. `tools/generate-integration-repository.py
+--sha256-only` (incompatible with `--signed-parity`) instead generates a
+Debian-shaped repository that signs only SHA256. The legacy archive and
+package-cache lanes, including the GitHub Action fixtures, use it: the legacy
+package cache keys SHA256-pinned v1/v2 locks and cannot yet match records that
+also publish SHA512. The same repository exercises the #261 binding
+end to end:
+
+- a native lock without the opt-in is refused and none is written;
+- the legacy lock is unchanged;
+- an opted-in `--config` (`archive_binding`) plans a bound lock, and its
+  derived SHA512 must equal the CAS object;
+- a forged lock and a tampered CAS object are refused;
+- native mode installs from the bound lock.
 The focused `native` mode and full lane use a real package-owned helper target
 to exercise native install, exact-lock reinstall, no-op upgrade, retained-package
 closure, receipt/evidence hashes, receipt-bound outer completion, and recovery
@@ -86,6 +103,17 @@ differ, so Debian and Ubuntu rows cannot collapse to aliases. PR CI requires
 all four suite/architecture combinations in full mode on native amd64 and arm64
 runners, including mandatory dpkg-root transactions. Scheduled/manual CI adds
 foreign arm64 roots on amd64.
+
+The separate [Debian stable signed-input readiness
+inventory](debian-stable-readiness.md) records a real, authenticated Debian 13
+stable snapshot and its current SHA256-only index/archive metadata. Per
+issue #261 those signed SHA256 entries are its archive binding. An exact v3
+lock records them with an explicit derived-SHA512 provenance, never a signed
+SHA512. Its committed amd64 and arm64 bound locks, CAS evidence and
+pre-mutation inventory are input evidence only; they do not satisfy Debian
+vendor-closure install or parity acceptance (#271, #273). The hermetic
+`debian-stable` fixture remains synthetic and is not a substitute for those
+real locks.
 
 The repository exercises dependencies and Pre-Depends, alternatives,
 versioned virtual Provides, Conflicts/Breaks/Replaces, Recommends policy,

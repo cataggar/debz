@@ -137,6 +137,7 @@ pub const Request = struct {
     exact_lock_package: ?exact_lock.Package = null,
     exact_lock_v2_package: ?exact_lock_v2.Package = null,
     exact_lock_v3_package: ?exact_lock_v3.Package = null,
+    cache_identity: ?Digest = null,
 };
 
 pub const Provenance = struct {
@@ -183,6 +184,7 @@ pub const Error = SelectionError || error{
     PackageTooLarge,
     SizeMismatch,
     DigestMismatch,
+    DerivedDigestMismatch,
     CacheMiss,
     CorruptObject,
     LockBusy,
@@ -659,13 +661,27 @@ pub fn acquirePackage(
         declared_size > request.policy.maximum_package_bytes or
         declared_size > cache.limits.maximum_object_bytes)
         return error.PackageTooLarge;
-    const digest: Digest = record.transport.identity;
+    const transport_digest: Digest = record.transport.identity;
+    const digest: Digest = request.cache_identity orelse transport_digest;
     var cache_key_buffer: [135]u8 = undefined;
     const cache_key = digest.cacheKey(&cache_key_buffer);
     const resolved = try resolvePackageUri(allocator, request.selected.repository_base_uri, record.transport.filename.value);
     defer allocator.free(resolved.text);
 
     if (cache.lookup(allocator, digest, declared_size, request.policy.cache_integrity)) |bytes| {
+        // The CAS object matched its workflow cache key. When that key is a
+        // legacy exact-lock SHA256 alias, also re-check the authenticated
+        // repository transport identity before treating the object as reused.
+        transport_digest.verify(bytes) catch {
+            allocator.free(bytes);
+            return error.CorruptObject;
+        };
+        // A derived SHA512 is checked only after signed-digest verification and
+        // never repairs the cache.
+        verifyDerivedSha512(request, bytes) catch |err| {
+            allocator.free(bytes);
+            return err;
+        };
         return makeResult(allocator, request, bytes, resolved.uri, digest, cache_key, .cache_hit, 0);
     } else |cache_err| switch (cache_err) {
         error.CacheMiss => {},
@@ -691,7 +707,9 @@ pub fn acquirePackage(
     }, dependencies);
     defer downloaded.deinit(allocator);
     if (downloaded.bytes.len != declared_size) return error.SizeMismatch;
+    transport_digest.verify(downloaded.bytes) catch return error.DigestMismatch;
     digest.verify(downloaded.bytes) catch return error.DigestMismatch;
+    try verifyDerivedSha512(request, downloaded.bytes);
     try cache.publish(
         allocator,
         digest,
@@ -712,6 +730,11 @@ pub fn acquirePackage(
         .downloaded,
         downloaded.provenance.timing.attempts,
     );
+}
+
+/// Runs only after size and signed-digest verification of `bytes`.
+fn verifyDerivedSha512(request: Request, bytes: []const u8) error{DerivedDigestMismatch}!void {
+    if (request.exact_lock_v3_package) |locked| try locked.verifyDerivedSha512(bytes);
 }
 
 fn makeResult(
@@ -1284,6 +1307,112 @@ test "package_acquisition.test.v2 lock binds downloads and cache hits before acq
         transport.dependencies(),
     ));
     try std.testing.expectEqual(@as(usize, 1), transport.count);
+}
+
+test "package_acquisition.test.signed SHA256 binding checks the derived SHA512 only after the signed digest" {
+    const allocator = std.testing.allocator;
+    const payload = "package payload";
+    var selection = try testSelection(allocator, payload);
+    defer selection.deinit(allocator);
+    selection.selected.authenticated_snapshot_sha256 = @splat(1);
+    const record = selection.index.records[0];
+    const repository_id = selection.repository.repository_id.bytes;
+    var unbound = try exact_lock_v3.create(allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = @splat(2),
+        .policy_sha256 = @splat(3),
+        .repositories = &.{.{
+            .id = repository_id,
+            .snapshot_sha256 = @splat(1),
+            .release_sha256 = @splat(4),
+            .index_identity = content_digest.Identity.ofSha256(selection.index_bytes),
+            .signer_fingerprints = &.{@splat(5)},
+        }},
+        .local_artifacts = &.{},
+        .packages = &.{.{
+            .name = "demo",
+            .version = "1.2.3-1",
+            .architecture = "amd64",
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = @splat(1),
+            } },
+            .archive_identity = record.transport.identity,
+            .declared_size = payload.len,
+            .retention = .requested,
+            .dpkg_selection_hold = false,
+        }},
+        .verified_origins = true,
+    });
+    defer unbound.deinit();
+    try std.testing.expectError(
+        error.Sha512IdentityRequired,
+        unbound.lock.requireArchiveDigestPolicy(.sha512_identity_required),
+    );
+    var bound = try exact_lock_v3.bindSignedSha256Repositories(allocator, unbound.lock, &.{repository_id}, &.{payload});
+    defer bound.deinit();
+    try bound.lock.requireArchiveDigestPolicy(.sha512_identity_required);
+    const locked = bound.lock.packages[0];
+    try std.testing.expectEqual(
+        exact_lock_v3.ArchiveAuthentication.signed_sha256_derived_sha512,
+        bound.lock.archiveAuthentication(locked),
+    );
+    try std.testing.expect(content_digest.Identity.eql(locked.archive_identity, record.transport.identity));
+
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var cache = try testCache(&directory);
+    defer cache.deinit();
+    var request: Request = .{
+        .selected = selection.selected,
+        .policy = testPolicy(.online),
+        .exact_lock_v3_package = locked,
+    };
+    var offline: TestTransport = .{};
+
+    // Same-length tampering fails the signed SHA256; nothing is published.
+    var tampered: TestTransport = .{ .responses = &.{.{ .body = "package paylaod" }} };
+    try std.testing.expectError(error.DigestMismatch, acquirePackage(allocator, &cache, request, tampered.dependencies()));
+    request.policy = testPolicy(.cache_only);
+    try std.testing.expectError(error.CacheMiss, acquirePackage(allocator, &cache, request, offline.dependencies()));
+
+    // Bytes matching the signed SHA256 are still refused when the recorded
+    // derived SHA512 disagrees, and are not published.
+    var wrong_derived = locked;
+    wrong_derived.derived_sha512.?[0] ^= 1;
+    request.exact_lock_v3_package = wrong_derived;
+    request.policy = testPolicy(.online);
+    var genuine_for_wrong: TestTransport = .{ .responses = &.{.{ .body = payload }} };
+    try std.testing.expectError(error.DerivedDigestMismatch, acquirePackage(allocator, &cache, request, genuine_for_wrong.dependencies()));
+    request.exact_lock_v3_package = locked;
+    request.policy = testPolicy(.cache_only);
+    try std.testing.expectError(error.CacheMiss, acquirePackage(allocator, &cache, request, offline.dependencies()));
+
+    request.policy = testPolicy(.online);
+    var transport: TestTransport = .{ .responses = &.{.{ .body = payload }} };
+    var downloaded = try acquirePackage(allocator, &cache, request, transport.dependencies());
+    defer downloaded.deinit();
+    try std.testing.expectEqual(Outcome.downloaded, downloaded.provenance.outcome);
+    // The CAS stays keyed by the signed SHA256, never by the derived SHA512.
+    try std.testing.expect(std.mem.startsWith(u8, downloaded.provenance.cache_key, "sha256-"));
+    request.policy = testPolicy(.cache_only);
+    var cached = try acquirePackage(allocator, &cache, request, offline.dependencies());
+    defer cached.deinit();
+    try std.testing.expectEqual(Outcome.cache_hit, cached.provenance.outcome);
+
+    request.exact_lock_v3_package = wrong_derived;
+    try std.testing.expectError(error.DerivedDigestMismatch, acquirePackage(allocator, &cache, request, offline.dependencies()));
+
+    // A lock that promotes the derived value into a signed SHA512 identity
+    // no longer matches the signed index record.
+    var promoted = locked;
+    var promoted_digests = locked.archive_identity.digests;
+    promoted_digests.sha512 = locked.derived_sha512.?;
+    promoted.archive_identity = try content_digest.Identity.init(promoted_digests, .sha512);
+    promoted.derived_sha512 = null;
+    request.exact_lock_v3_package = promoted;
+    try std.testing.expectError(error.LockPackageMismatch, acquirePackage(allocator, &cache, request, offline.dependencies()));
+    try std.testing.expectEqual(@as(usize, 0), offline.count);
 }
 
 test "verified download publishes CAS and cache-only hit performs no network" {

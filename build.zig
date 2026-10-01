@@ -253,6 +253,55 @@ pub fn build(b: *std.Build) void {
     );
     workload_core.dependOn(&run_real_snapshot_comparator_tests.step);
 
+    const debian_closure_inventory_module = b.createModule(.{
+        .root_source_file = b.path("test/debian-closure-inventory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    debian_closure_inventory_module.addImport("debz", debz);
+    for ([_][2][]const u8{
+        .{ "debian_closure_amd64_apt_lock", "amd64-apt" },
+        .{ "debian_closure_amd64_systemd_sysv_lock", "amd64-systemd-sysv" },
+        .{ "debian_closure_arm64_apt_lock", "arm64-apt" },
+        .{ "debian_closure_arm64_systemd_sysv_lock", "arm64-systemd-sysv" },
+    }) |lock| debian_closure_inventory_module.addAnonymousImport(lock[0], .{
+        .root_source_file = b.path(b.fmt(
+            "tools/fixtures/debian-stable-closure-v1/{s}.lock.json",
+            .{lock[1]},
+        )),
+    });
+    debian_closure_inventory_module.addAnonymousImport("debian_closure_evidence", .{
+        .root_source_file = b.path("tools/fixtures/debian-stable-closure-v1/evidence.json"),
+    });
+    debian_closure_inventory_module.addAnonymousImport("debian_stable_pin", .{
+        .root_source_file = b.path("tools/fixtures/debian-stable-readiness-v1.json"),
+    });
+    const debian_closure_inventory = b.addExecutable(.{
+        .name = "debian-closure-inventory",
+        .root_module = debian_closure_inventory_module,
+    });
+    const install_debian_closure_inventory = b.addInstallArtifact(
+        debian_closure_inventory,
+        .{},
+    );
+    const debian_closure_inventory_tests = b.addTest(.{
+        .root_module = debian_closure_inventory_module,
+    });
+    const run_debian_closure_inventory_tests = b.addRunArtifact(
+        debian_closure_inventory_tests,
+    );
+    const debian_closure_inventory_step = b.step(
+        "test-debian-closure-inventory",
+        "Run Debian closure pre-mutation inventory and native gap classification tests",
+    );
+    debian_closure_inventory_step.dependOn(
+        &run_debian_closure_inventory_tests.step,
+    );
+    debian_closure_inventory_step.dependOn(
+        &install_debian_closure_inventory.step,
+    );
+    workload_core.dependOn(&run_debian_closure_inventory_tests.step);
+
     const apt_system_acceptance_module = b.createModule(.{
         .root_source_file = b.path("test/apt-system-acceptance.zig"),
         .target = target,
@@ -375,6 +424,8 @@ pub fn build(b: *std.Build) void {
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
             "tools/test_release_workflow_policy.py",
+            "tools/test_debian_stable_readiness.py",
+            "tools/test_debian_stable_closure.py",
         },
     );
     audit_step.dependOn(&audit_tests.step);
@@ -1915,6 +1966,7 @@ fn installReleaseFiles(
         "authenticated-refresh.md",
         "deb-payload-validation.md",
         "dpkg-alternatives-reference.md",
+        "debian-stable-readiness.md",
         "exact-locks-and-provenance.md",
         "github-actions.md",
         "integration-roots.md",

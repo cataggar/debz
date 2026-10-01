@@ -55,6 +55,132 @@ identity. Local origins bind a typed artifact ID plus the complete archive and
 pinned content identities; v2/v3 plan serialization remains byte-for-byte
 unchanged.
 
+**Signed SHA256 with a derived SHA512.** Some signed archives, including
+Debian stable, publish only SHA256 in both
+Release and Packages. For those repositories debz accepts the signed SHA256
+entries (plus declared size) as the authenticated archive binding. It records
+a SHA512 only as a *derived* identity, bound to the verified SHA256, never as
+an independently authenticated one (issue #261). A repository opts in
+explicitly and additively:
+
+```json
+{"id":"…","index_identity":{…},"archive_binding":"signed_sha256_derived_sha512","signer_fingerprints":[…]}
+{"name":"…","archive_identity":{"primary":"sha256","digests":[{"algorithm":"sha256","digest":"…"}]},
+ "derived_archive_identity":{"provenance":"derived_from_signed_sha256","algorithm":"sha512","digest":"…"},…}
+```
+
+- `archive_identity` still holds exactly the signed digests. The derived value
+  lives only in `derived_archive_identity`, with the fixed provenance
+  `derived_from_signed_sha256`. Package CAS stays keyed by the signed SHA256
+  and never by the derived value.
+- Every package of a bound repository must be SHA256-only and must carry the
+  derived identity. The following are rejected: a derived identity without the
+  repository binding, a missing derived identity, a signed SHA512 in a bound
+  repository, local-artifact derived identities, other provenance or binding
+  strings, `null` values, and a derived value that duplicates another archive's
+  SHA512. So is promoting the derived value into `archive_identity` as a signed
+  SHA512 while the repository is bound.
+- `bindSignedSha256Repositories` produces bound locks. It checks every
+  archive's size and signed SHA256 *before* computing any SHA512; a mismatch
+  refuses and derives nothing. Acquisition, cache hits, tagged CAS import, and
+  native unpack verify size, then every signed digest, then the derived
+  SHA512. A derived mismatch refuses (`DerivedDigestMismatch`) and is never
+  published to or repaired in CAS.
+- `Lock.archiveAuthentication` reports each package's authority
+  (`signed_sha512`, `signed_sha256_derived_sha512`, `signed_sha256_only`, or a
+  local variant). `Lock.requireArchiveDigestPolicy(.sha512_identity_required)`
+  governs repository archives. It accepts a signed SHA512 or the explicit
+  binding, and refuses an unbound signed-SHA256-only repository archive.
+  Local artifacts keep the caller-pinned digest set they were admitted with,
+  such as a repository-add descriptor pinned by SHA256. Their exact class
+  stays visible as `local_artifact_sha256_only` or `local_artifact_sha512`.
+
+Locks that do not opt in, including every Ubuntu signed-SHA512 lock, keep
+identical bytes, digests, and meaning. Older decoders reject bound locks as
+unknown fields, so a derived SHA512 can never be read as signed.
+
+**Opting in and native enforcement.** The opt-in is a per-repository setting;
+there is no CLI flag. It can be given in the `--config` JSON source entry:
+
+```json
+{"source_path":"/etc/apt/sources.list.d/debian.sources","archive_binding":"signed_sha256_derived_sha512"}
+```
+
+or declared on the source itself, as a DEB822 field or a one-line option:
+
+```text
+X-Debz-Archive-Binding: signed_sha256_derived_sha512
+deb [signed-by=/usr/share/keyrings/debian-archive-keyring.gpg debz-archive-binding=signed_sha256_derived_sha512] https://deb.debian.org/debian trixie main
+```
+
+- `archive_binding` defaults to `published_digests`. Any other token refuses
+  the configuration (`configuration_required`). A source declaration accepts
+  exactly `published_digests` or `signed_sha256_derived_sha512`; anything else
+  is a malformed source (`invalid_archive_binding`), and a repeated one-line
+  option is a duplicate option. A declaration that contradicts a non-default
+  `--config` setting for the same source refuses the configuration. APT
+  ignores both spellings, so the same files stay valid APT sources.
+- The binding is repository identity input. Only an opted-in repository adds
+  it to the repository ID and to canonical sources
+  (`# X-Debz-Archive-Binding: …`), so existing IDs, configuration identities,
+  and locks stay byte-identical. The same source declared with and without the
+  opt-in is a conflicting repository.
+- Because the declaration travels with the source bytes, target-APT
+  configuration import (`target-apt-config import`) and repository-add
+  descriptors (`.list` or `.sources` payloads) carry it unchanged into the
+  managed sources and repository IDs. The target-APT manifest format does not
+  change.
+- Native lock production (`plan`/`download --lock-output`, package-family
+  `resolve_lock`, and native repository-add operation locks) acquires each
+  opted-in repository's locked archives through the package cache. With `--offline`/`--cache-only` it reads only the cache.
+  Every archive must match its declared size and signed SHA256 before any
+  SHA512 is derived. The lock is written only after the bound lock passes
+  admission. A tampered or substituted archive refuses with `download_failed`
+  and writes no lock.
+- Native engine consumers enforce `sha512_identity_required` by default. This
+  covers product native lock input and output, native preparation
+  (`Runtime.prepare`), the package-family `NativeBackend`, and native locks in
+  package-cache workflows. The following are refused:
+  - an unbound SHA256-only native lock: `lock_verification_failed` on input,
+    `planning_failed` on output, with no lock written;
+  - a lock whose repository `archive_binding` differs from the configured one,
+    which covers a derived SHA512 relabelled as signed (`lock_verification_failed`);
+  - a derived SHA512 that does not match the verified bytes
+    (`download_failed`, `DerivedDigestMismatch`).
+
+  The policy governs repository archives. Caller-pinned local artifacts, such
+  as a repository-add descriptor pinned by SHA256, stay admissible. Local
+  artifacts carry distinct `local_artifact` provenance (artifact ID,
+  acquisition URL, trust mode) that only resolves against caller-supplied,
+  verified local artifact input. A repository archive relabelled as a local
+  artifact therefore refuses: product planning reports `planning_failed`
+  ("locked local artifact is unavailable"), and native repository-add
+  preparation refuses the plan/lock origin mismatch
+  (`AuthorizationArtifactMismatch`). Embedders can relax the default only
+  explicitly, through `Backend.native_archive_digest_policy`,
+  `NativeBackend.archive_digest_policy`,
+  `Runtime.PrepareRequest.archive_digest_policy`,
+  `native_transaction_result` `ExpectedCaller`/`OwnedRequest`
+  `archive_digest_policy`, or the repository-add
+  `NativePreparationRequest`/`NativeCachePreparationRequest` field.
+- The policy is re-checked wherever a native exact-lock v3 is consumed after
+  planning, so a lock whose binding is stripped or altered after planning
+  refuses before any evidence is read:
+  - `native_transaction_result` verification of v3 results (`verify`,
+    `verifyForCaller`, pending/owned routes, and repository history);
+  - the APT/system orchestrator's lock re-reads before download, execution,
+    recovery, and acknowledgement (`OperationalVerificationFailure`);
+  - native preparation.
+
+  Persisted-only native recovery consumes no lock. It is bound to the admitted
+  lock digest through the authorization's exact-lock binding, so a changed
+  lock cannot be substituted there either.
+- Legacy consumers are unchanged. The legacy backend ignores the binding and
+  writes ordinary v1 locks with no binding or derived fields. The only effect
+  of opting in is the repository ID change.
+- Native repository-add refuses a dependency from a signed-SHA256-only
+  repository unless that target repository opts in.
+
 Native execution carries that identity without truncation through explicit
 successor documents: authorization v2, program v2, execution request v4,
 recovery intent v2, progress v3/v4, transaction result v3, native provenance

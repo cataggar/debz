@@ -5,6 +5,8 @@ const fuzz_options = @import("fuzz_options");
 const max_input = 32 * 1024;
 const text_corpus = &.{
     @embedFile("corpus/deb822/basic"),
+    @embedFile("corpus/deb822/archive-binding-sources"),
+    @embedFile("corpus/deb822/archive-binding-list"),
     @embedFile("corpus/control/basic"),
     @embedFile("corpus/release/basic"),
     @embedFile("corpus/packages/basic"),
@@ -50,10 +52,14 @@ const transaction_plan_v4_file = @embedFile("corpus/state/transaction-plan-v4.js
 const transaction_plan_v4_seed =
     transaction_plan_v4_file[0 .. transaction_plan_v4_file.len - 1];
 const transaction_journal_v4_seed = @embedFile("corpus/state/journal-v4");
+const signed_sha256_lock_v3_file = @embedFile("corpus/state/lock-v3-signed-sha256.json");
+const signed_sha256_lock_v3_seed =
+    signed_sha256_lock_v3_file[0 .. signed_sha256_lock_v3_file.len - 1];
 const state_corpus = &.{
     @embedFile("corpus/state/lock.json"),
     @embedFile("corpus/state/lock-v2.json"),
     @embedFile("corpus/state/lock-v3.json"),
+    signed_sha256_lock_v3_seed,
     @embedFile("corpus/state/authorization.json"),
     authorization_v2_seed,
     @embedFile("corpus/state/program.json"),
@@ -756,6 +762,29 @@ fn sealProgressForCorpus(document: *debz.native_recovery.ProgressDocument) void 
     document.digest_sha256 = debz.native_recovery.hexDigest(
         sink.hasher.finalResult(),
     );
+}
+
+test "fuzz.corpus signed SHA256 lock seed stays canonical with explicit derived SHA512" {
+    var owned = try debz.exact_lock_v3.decode(
+        std.testing.allocator,
+        signed_sha256_lock_v3_seed,
+        max_input,
+    );
+    defer owned.deinit();
+    const package = owned.lock.packages[0];
+    try std.testing.expectEqual(
+        debz.exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512,
+        owned.lock.repositories[0].archive_binding,
+    );
+    try std.testing.expectEqual(
+        debz.exact_lock_v3.ArchiveAuthentication.signed_sha256_derived_sha512,
+        owned.lock.archiveAuthentication(package),
+    );
+    try std.testing.expect(package.archive_identity.digests.sha512 == null);
+    try package.verifyArchive("debian signed sha256 archive");
+    const encoded = try owned.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings(signed_sha256_lock_v3_seed, encoded);
 }
 
 test "fuzz.new native state corpus is the exact canonical encoding" {

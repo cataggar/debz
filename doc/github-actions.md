@@ -18,6 +18,12 @@ v5 fingerprints/preparation results, and tagged archive-v3 keys,
 with no version autodetection or fallback. Native empty and local-only
 closures may omit repository inputs; local bytes must already be acquired or
 imported, never fetched from redacted provenance URLs.
+Native v3 locks must carry a SHA-512 archive identity: a signed SHA512 or, for a
+repository whose `--config` opts in with
+`"archive_binding":"signed_sha256_derived_sha512"`, a derived SHA512 bound to
+its signed SHA256 ([exact locks](exact-locks-and-provenance.md)). The legacy
+package cache currently requires repositories that publish only SHA256
+archive digests, so the hermetic legacy action fixtures use `--sha256-only`.
 Legacy remains the default for this increment but is explicitly deprecated.
 Successful download and install invocations publish `backend-capability` as
 `legacy-dpkg-execution-deprecated-v1` or

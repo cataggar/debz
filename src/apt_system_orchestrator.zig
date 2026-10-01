@@ -4672,6 +4672,10 @@ pub const SystemResultVerifier = struct {
         )) |decoded_value| {
             var decoded = decoded_value;
             defer decoded.deinit();
+            // Every native lock re-read (before download, execution, recovery
+            // and acknowledgment) re-checks the native archive policy (#261),
+            // so a binding stripped after planning is refused.
+            try decoded.lock.requireArchiveDigestPolicy(.sha512_identity_required);
             return verifiedLockBinding(
                 path,
                 architecture,
@@ -14851,7 +14855,7 @@ test "apt_system_orchestrator.test.backend-bound locks preserve schema identity 
     }
 }
 
-test "apt_system_orchestrator.test.native lock verification retains mixed origin authority" {
+fn mixedOriginNativeLock(bound: bool) !exact_lock_v2.OwnedLock {
     const origin = @import("package_origin.zig");
     const artifact: origin.LocalArtifactEvidenceV2 = .{
         .artifact_id = .{ .sha256 = @splat(0xab) },
@@ -14866,7 +14870,7 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
         .acquisition_url = "https://example.test/local.deb?REDACTED",
         .trust_mode = .pinned_content_digest,
     };
-    var lock = try exact_lock_v2.create(std.testing.allocator, .{
+    return exact_lock_v2.create(std.testing.allocator, .{
         .target_architecture = "amd64",
         .request_sha256 = @splat(7),
         .policy_sha256 = @splat(8),
@@ -14879,6 +14883,7 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
                 .primary = .sha256,
             },
             .signer_fingerprints = &.{@splat(4)},
+            .archive_binding = if (bound) .signed_sha256_derived_sha512 else .published_digests,
         }},
         .local_artifacts = &.{artifact},
         .packages = &.{
@@ -14904,6 +14909,7 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
                     .digests = .{ .sha256 = @splat(9) },
                     .primary = .sha256,
                 },
+                .derived_sha512 = if (bound) @splat('5') else null,
                 .declared_size = 34,
                 .retention = .dependency,
                 .dpkg_selection_hold = false,
@@ -14911,6 +14917,10 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
         },
         .verified_origins = true,
     });
+}
+
+test "apt_system_orchestrator.test.native lock verification retains mixed origin authority" {
+    var lock = try mixedOriginNativeLock(true);
     defer lock.deinit();
     const source = try lock.lock.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(source);
@@ -14938,6 +14948,28 @@ test "apt_system_orchestrator.test.native lock verification retains mixed origin
     try std.testing.checkAllAllocationFailures(std.testing.allocator, verifyLockAllocationCase, .{
         system_profile.TransactionBackend.native, source,
     });
+}
+
+test "apt_system_orchestrator.test.native lock re-verification refuses a stripped archive binding" {
+    // The same closure with its derived-SHA512 binding removed after planning
+    // is a well-formed, canonically digested v3 lock. Every native re-read
+    // (download, execution, recovery, acknowledgment) must still refuse it.
+    var stripped = try mixedOriginNativeLock(false);
+    defer stripped.deinit();
+    const source = try stripped.lock.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "archive_binding") == null);
+    try std.testing.expectError(
+        error.Sha512IdentityRequired,
+        SystemResultVerifier.verifyLockSource(
+            std.testing.allocator,
+            .native,
+            "/state/lock.json",
+            source,
+            "amd64",
+            @splat(7),
+        ),
+    );
 }
 
 fn ownedNativeTransportFixture(
