@@ -73,6 +73,19 @@ A spawned script runs with:
   always a real `dup2` that clears CLOEXEC. A runner invoked with fd 0, 1, or 2
   already closed therefore still hands the script the intended streams instead
   of losing them at `execve`.
+- **Descriptor seal.** Immediately before `execve`, every descriptor above the
+  standard streams is marked close-on-exec for every maintainer script, not only
+  signed proc-view scripts. Inherited host sockets, directory handles, helper
+  preparation descriptors, and test leak descriptors therefore cannot become
+  script authority. If the kernel rejects the seal, the script does not launch.
+- **Private network namespace.** Every script is cloned into a fresh network
+  namespace before any script byte runs. The child brings up only loopback; it
+  receives no non-loopback interface, route, host TCP listener, or host
+  abstract UNIX socket authority. Ordinary socket creation and loopback bind or
+  self-connect inside the private namespace remain available. Failure to create
+  the namespace is a typed, non-spawned `network_namespace` setup failure; the
+  runner never falls back to host networking. Failure to bring up loopback after
+  the child exists is a typed `network_setup` failure.
 - **Bounded output.** Combined or separate stdout/stderr capture is bounded by
   `limits.maximum_output_bytes`; exceeding it is the distinct
   `output_limit_exceeded` outcome, not a truncated success.
@@ -95,6 +108,28 @@ A spawned script runs with:
   therefore its process-group id — cannot be recycled while the runner is still
   signalling. Every `SIGTERM`/`SIGKILL`, including the final descendant sweep,
   is issued before the reap, and the reap is always the last operation.
+
+## Network authority inventory and contract
+
+Before the #278 contract, the ordinary native launcher used `fork()` and the
+signed proc-view launcher used new mount/PID namespaces without `CLONE_NEWNET`.
+Dropping `CAP_NET_ADMIN` did not remove ordinary host-network authority: a
+host-root script could observe the host network namespace through `/proc/net`,
+connect to a host loopback listener owned by a bounded test, bind host-network
+loopback sockets, connect to a host abstract UNIX socket, and inherit any
+non-CLOEXEC socket fd. The signed systemd broad-proc view also exposed
+`/proc/net` for that shared namespace; the signed udev and sudo `subset=pid`
+proc views did not expose `/proc/net`, but their sockets still used the host
+network namespace.
+
+The reviewed contract is now loopback-only private networking for every native
+maintainer script. `/proc/net`, when present in the selected root or the signed
+systemd proc view, describes the child's private namespace and contains only
+loopback state; the signed udev and sudo proc views keep their existing
+PID-only shape and still do not expose `/proc/net`. No signed maintainer script
+in the real 20261001 closure is authorized to use host connectivity; the exact
+systemd, udev, and sudo admissions need their current proc and file grants, but
+no network peer, interface, route, or inherited socket fd.
 
 ## Private helper exposure
 
@@ -159,9 +194,9 @@ and executes only the installed dpkg-info path, matching pinned dpkg. An
 unexpected alias or changed copy refuses before launch; there is no generic
 script-path redirection.
 
-Only this child is cloned into new mount and PID namespaces. Namespace PID 1
-enters the same pinned chroot before mounting anything: its own root is the
-selected root, not a supervisor's host root. With private propagation, it
+Only this child is cloned into new mount, PID, and network namespaces. Namespace
+PID 1 enters the same pinned chroot before mounting anything: its own root is
+the selected root, not a supervisor's host root. With private propagation, it
 mounts a fresh read-only, nosuid, nodev, noexec procfs with `hidepid=2`,
 *immediately* covers its entire `/proc/sys` with a private tmpfs, publishes a
 single read-only copy of the actual kernel boot ID at
@@ -169,22 +204,21 @@ single read-only copy of the actual kernel boot ID at
 maintainer script runs between the first mount and the completed mask; the
 other sysctl entries remain absent. Before `execve`, the child drops
 `CAP_SYS_ADMIN` from bounding, effective, permitted, inheritable and ambient
-sets and sets `no_new_privs`; it cannot unmount the mask. Every descriptor
-above the standard streams is marked close-on-exec (including any inherited
-host-root descriptor); if the kernel rejects this seal, the script does not
-launch. A parent-death signal is established before setup with a control-pipe
-check for the clone/race window. The script receives only its normal standard
-streams, not root or
-host-proc descriptors. Namespace PID 1 exit kills all descendants, even those
+sets and sets `no_new_privs`; it cannot unmount the mask. The shared descriptor
+seal prevents inherited host-root or socket fds from reaching the script. A
+parent-death signal is established before setup with a control-pipe check for
+the clone/race window. The script receives only its normal standard streams,
+not root, socket, or host-proc descriptors. Namespace PID 1 exit kills all descendants, even those
 that leave its process group, so the private mounts disappear before another
 script or the deferred procps trigger can run. A setup failure is a typed
 non-spawned `snapshot_proc` outcome, never a successful script exit. Helper overlay
 setup retains its own existing `root_isolation` stage and failure claim.
 
 The opt-in uses a distinct v2 policy domain and exact invocation digest
-extension containing the SHA-256 of the kernel boot ID; default requests keep
-their v1 policy digest. Native program and script-outcome recovery retain
-their existing program-policy and unknown-outcome claims. Synthetic positive
+extension containing the SHA-256 of the kernel boot ID. Every policy domain,
+including default v1 requests, also binds the `private-network-loopback-v1`
+contract token. Native program and script-outcome recovery retain their
+existing program-policy and unknown-outcome claims. Synthetic positive
 and negative namespace tests run in the privileged
 `test-native-helper-namespace` target; the signed postinst test additionally
 requires an explicitly supplied disposable
@@ -227,7 +261,7 @@ Replaced, differently owned or multiply linked inputs refuse before
 launch. This does not admit udev triggers, other
 scripts, other architectures, or other package versions.
 
-The child reuses the isolated PID-1/chroot boundary, descriptor seal,
+The child reuses the isolated PID-1/chroot/network boundary, descriptor seal,
 private mount propagation, privilege drop, no-new-privileges setting,
 supervision and teardown described above, but mounts a fresh
 `ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs. It never mounts
@@ -264,14 +298,14 @@ The namespace helper uses the same fresh, private
 `ro,nosuid,nodev,noexec,hidepid=2,subset=pid` procfs as the udev mode,
 without granting either script the other's identity. PID 1 and its
 descendants stay in the same pinned chroot; `/proc/sys` and boot ID are
-absent, inherited host-root descriptors are sealed, and `CAP_SYS_ADMIN`
-and remount authority are dropped before the script runs. Setup failure
-records a typed non-spawned result; exit, deadline, crash and recovery
-preserve ordinary durable outcomes and private mount teardown. The
-invocation uses a separate v4 policy digest; the earlier systemd v2 and
-udev v3 invocation digests remain unchanged. This is no grant to sudo
-triggers, other scripts or package versions, and does not establish
-CI arm64 or WSL namespace capability.
+absent, inherited host-root and socket descriptors are sealed, and
+`CAP_SYS_ADMIN` and remount authority are dropped before the script runs. Setup
+failure records a typed non-spawned result; exit, deadline, crash and recovery
+preserve ordinary durable outcomes and private mount teardown. The invocation
+uses a separate v4 policy domain, with the same private-network token now bound
+into every runner policy digest. This is no grant to sudo triggers, other
+scripts or package versions, and does not establish CI arm64 or WSL namespace
+capability.
 From the root-owned protected checkout on final #252 squash plus sudo-only
 source `898d81e`, the Debug and ReleaseSafe privileged suites each ran
 46/46 tests, including the signed sudo script and four distinct sourced

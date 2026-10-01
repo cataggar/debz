@@ -1552,7 +1552,11 @@ def audit_production_sources() -> None:
         fail(f"native capability boundary changed: {capability_calls!r}")
     runner = (ROOT / "src/maintainer_script.zig").read_text(errors="strict")
     for required in (
-        "linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID",
+        "const clone_flags = linux.CLONE.NEWNET |",
+        "linux.CLONE.NEWNS | linux.CLONE.NEWPID",
+        "fn setupPrivateLoopback() linux.E",
+        '"private-network-loopback-v1\\x00"',
+        "fn sealInheritedDescriptors() linux.E",
         "linux.PR.SET_PDEATHSIG",
         "linux.PR.CAPBSET_DROP",
         "linux.PR.SET_NO_NEW_PRIVS",
