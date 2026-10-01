@@ -97,6 +97,7 @@ pub fn main(init: std.process.Init) !void {
         var root = try std.Io.Dir.openDirAbsolute(io, install_root, .{});
         defer root.close(io);
         try root.createDirPath(io, "var/lib/dpkg/info");
+        if (equals(operation, "install")) try installProgress(io, allocator, root, scenario);
         if (equals(operation, "install")) {
             const arch = option(args, "--architecture") orelse return error.MissingArchitecture;
             const status = try std.fmt.allocPrint(allocator,
@@ -131,17 +132,30 @@ pub fn main(init: std.process.Init) !void {
     }
     if (equals(operation, "transaction-result")) {
         if (args.len < 2 or !equals(args[1], "verify") or digest == null) return error.InvalidVerification;
-        const state_path = option(args, "--state-path") orelse return error.MissingState;
-        const receipt_path = try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{state_path});
+        const native = equals(option(args, "--transaction-backend") orelse "legacy_dpkg", "native");
+        const receipt_path = if (native) path: {
+            if (option(args, "--state-path") != null) return error.NativeVerificationDoesNotUseStatePath;
+            const install_root = option(args, "--install-root") orelse return error.MissingRoot;
+            if (option(args, "--architecture") == null) return error.MissingArchitecture;
+            break :path try std.fmt.allocPrint(allocator, "{s}/var/lib/debz/native-transaction-provenance-v2.json", .{install_root});
+        } else path: {
+            if (option(args, "--install-root") != null) return error.LegacyVerificationDoesNotUseInstallRoot;
+            const state_path = option(args, "--state-path") orelse return error.MissingState;
+            break :path try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{state_path});
+        };
         const receipt = try read(io, allocator, receipt_path);
         var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{});
         defer parsed.deinit();
         if (!equals(parsed.value.object.get("fixture_lock_digest").?.string, digest.?))
             return error.MismatchedReceipt;
-        try std.Io.File.stdout().writeStreamingAll(io, if (equals(scenario, "failed-verification"))
-            "{\"outcome\":\"failed\"}\n"
+        if (equals(scenario, "failed-verification")) {
+            try std.Io.File.stdout().writeStreamingAll(io, "{\"backend\":\"native\",\"outcome\":\"failed\"}\n");
+            std.process.exit(7);
+        }
+        try std.Io.File.stdout().writeStreamingAll(io, if (equals(scenario, "failed-outcome"))
+            "{\"backend\":\"native\",\"outcome\":\"failed\"}\n"
         else
-            "{\"outcome\":\"succeeded\"}\n");
+            "{\"backend\":\"native\",\"outcome\":\"succeeded\",\"final_verification_status\":\"exact_match\",\"lock_evidence\":\"exact_match\",\"receipt_evidence\":\"exact_match\",\"root_operation_status\":\"cleared\"}\n");
     } else {
         const changed = !equals(operation, "refresh") and !equals(operation, "plan") and
             !equals(operation, "download") and !equals(operation, "upgrade-all");
@@ -154,6 +168,28 @@ pub fn main(init: std.process.Init) !void {
 
 fn equals(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+/// Publishes intermediate package states like a long native install: steadily
+/// (`slow-progress`), once and then never again (`stalled-install`), or
+/// steadily without ever finishing (`endless-progress`).
+fn installProgress(io: std.Io, allocator: std.mem.Allocator, root: std.Io.Dir, scenario: []const u8) !void {
+    const interval_ms: i64, const updates: usize = if (equals(scenario, "slow-progress"))
+        .{ 500, 10 }
+    else if (equals(scenario, "stalled-install"))
+        .{ 60_000, 1 }
+    else if (equals(scenario, "endless-progress"))
+        .{ 250, 240 }
+    else
+        return;
+    var status: std.ArrayList(u8) = .empty;
+    for (0..updates) |index| {
+        const entry = try std.fmt.allocPrint(allocator, "Package: fixture-{d}\nStatus: install ok unpacked\n\n", .{index});
+        try status.appendSlice(allocator, entry);
+        try root.writeFile(io, .{ .sub_path = "var/lib/dpkg/status", .data = status.items });
+        try io.sleep(.fromMilliseconds(interval_ms), .awake);
+    }
+    if (!equals(scenario, "slow-progress")) return error.FixtureInstallDidNotFinish;
 }
 
 fn option(args: []const []const u8, name: []const u8) ?[]const u8 {

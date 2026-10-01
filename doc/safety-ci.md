@@ -128,6 +128,16 @@ passing real-package parity.
 Missing or unequal captures fail the job. The gate proves the candidate root has no pre-existing
 dpkg/helper/package state, selects `native` explicitly, and exec-traces
 candidate commands to reject `dpkg` or `dpkg-deb`, including failed commands.
+The only exception is a read-only query by a maintainer script that `debz`
+started. The call must be a plain `execve` of the filename `/usr/bin/dpkg`,
+with `argv[0]` `dpkg` or `/usr/bin/dpkg` and an action of `--compare-versions`,
+`--validate-version`, `--print-architecture`, `-s`, `-L` or `-l`, and no
+`--root`, `--admindir`, `--instdir` or `--force*` option. That `dpkg` must
+also match the reviewed per-architecture `1.23.7ubuntu2` digest, with no
+`PATH` shadow. Each allowed call is logged with its script and PID lineage.
+These calls hand no transaction step to dpkg; dpkg would run the same scripts
+the same way. `execveat`, `dpkg-deb` and every other dpkg exec still fail with
+exit 90; see "Native exec audit" in [integration roots](integration-roots.md).
 Evidence members are capped at 128 MiB and the artifact at 512 MiB before
 upload. Bounded, recognized acquisition retry diagnostics remain in the
 evidence; unexpected candidate stderr still fails the gate. Repository

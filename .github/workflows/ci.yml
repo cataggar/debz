@@ -1888,7 +1888,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot
     name: Native Ubuntu snapshot (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    # Step budgets: native wrapper 220 (install ceiling 180), pinned
+    # reference 50 and diagnostics 15, leaving 15 for setup, build and upload.
+    timeout-minutes: 300
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -1938,6 +1940,7 @@ jobs:
             --architecture "$ARCHITECTURE")"
           printf 'dpkg=%s\n' "$reference_dpkg" >>"$GITHUB_OUTPUT"
       - name: Create and replay exact native Ubuntu root
+        timeout-minutes: 220
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
           REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
@@ -1950,6 +1953,7 @@ jobs:
             "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "$ARCHITECTURE" \
             "$PWD/.real-snapshot/$ARCHITECTURE"
       - name: Install exact closure with pinned dpkg reference
+        timeout-minutes: 50
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
           REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
@@ -1961,6 +1965,7 @@ jobs:
             "$PWD/.real-snapshot/$ARCHITECTURE"
       - name: Collect diagnostics and clean staged payloads
         if: always()
+        timeout-minutes: 15
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
           REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
@@ -2026,13 +2031,38 @@ jobs:
               sudo tee "$evidence/acceptance-outcome-v1.json" >/dev/null
           fi
           sudo chown -R "$USER:$USER" "$evidence"
+          # Re-audit every retained trace against the still-present root, even
+          # if the wrapper stopped before its own audit.
           forbidden_exec_status=0
-          if grep -Eh 'execve\("([^"]*/)?dpkg(-deb)?"|execveat\([^,]+, "([^"]*/)?dpkg(-deb)?"|execveat\([^,]*</[^>]+/dpkg(-deb)?>, ""' \
-            "$evidence"/*.execve >"$evidence/forbidden-exec.txt" 2>/dev/null; then
-            forbidden_exec_status=1
-          else
-            rm -f "$evidence/forbidden-exec.txt"
+          allowed_script_dpkg_exec=0
+          candidate="$(realpath zig-out/bin/debz)"
+          : >"$evidence/exec-reaudit.txt"
+          for trace in "$evidence"/*.execve; do
+            [ -f "$trace" ] || continue
+            audit_status=0
+            sudo tools/real-snapshot-acceptance.sh --audit-exec-trace \
+              "$PWD/$trace" "$PWD/$work/root" "$ARCHITECTURE" "$candidate" \
+              >"$evidence/exec-reaudit.part" || audit_status=$?
+            {
+              printf 'trace=%s\naudit_status=%s\n' "${trace##*/}" "$audit_status"
+              cat "$evidence/exec-reaudit.part"
+            } >>"$evidence/exec-reaudit.txt"
+            allowed=$(sed -n 's/^allowed_script_dpkg_exec=\([0-9][0-9]*\)$/\1/p' \
+              "$evidence/exec-reaudit.part")
+            allowed_script_dpkg_exec=$((allowed_script_dpkg_exec + ${allowed:-0}))
+            if [ "$audit_status" -ne 0 ]; then
+              forbidden_exec_status=1
+            fi
+          done
+          rm -f "$evidence/exec-reaudit.part"
+          if [ "$forbidden_exec_status" -ne 0 ]; then
+            grep -h '^forbidden_exec' "$evidence/exec-reaudit.txt" \
+              >"$evidence/forbidden-exec.txt" || true
           fi
+          printf '%s exec re-audit: %s allowed read-only script dpkg execs; forbidden=%s\n' \
+            "$ARCHITECTURE" "$allowed_script_dpkg_exec" \
+            "$([ "$forbidden_exec_status" -eq 0 ] && echo false || echo true)" |
+            tee -a "$GITHUB_STEP_SUMMARY"
           sudo cp -a "$work/state/." "$work/evidence/state/" 2>/dev/null || true
           sudo cp "$work/root/var/lib/dpkg/status" "$work/evidence/status-final" 2>/dev/null || true
           sudo cp "$work/ubuntu.sources" "$work/evidence/" 2>/dev/null || true

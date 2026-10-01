@@ -11,6 +11,9 @@ const Scenario = struct {
     injected_execve: []const u8 = "",
     no_trace: bool = false,
     execveat: bool = false,
+    script_dpkg: bool = false,
+    progress_limit_seconds: []const u8 = "",
+    ceiling_seconds: []const u8 = "",
 };
 
 var fixture_compiled = false;
@@ -107,19 +110,30 @@ const Driver = struct {
         try driver.work.write("strace",
             \\#!/usr/bin/env bash
             \\set -euo pipefail
-            \\[[ $# -ge 8 && "$1" == -f && "$2" == -qq && "$3" == -yy &&
-            \\   "$4" == -e && "$5" == trace=execve,execveat && "$6" == -o ]]
-            \\output=$7
-            \\shift 7
+            \\reviewed=(-f --seccomp-bpf -qq -yy -s 4096 --pidns-translation -e signal=none
+            \\  -e trace=execve,execveat,fork,vfork,clone,clone3 -o)
+            \\(( $# > ${#reviewed[@]} + 1 )) && [[ "${*:1:${#reviewed[@]}}" == "${reviewed[*]}" ]]
+            \\shift ${#reviewed[@]}
+            \\output=$1
+            \\shift
             \\traced=${SNAPSHOT_TEST_EXECVE:-$1}
             \\if [[ " $* " == *injected-invalid.lock.json* ]]; then
             \\  traced=${SNAPSHOT_TEST_INJECTED_EXECVE:-$traced}
             \\fi
             \\if [[ ${SNAPSHOT_TEST_NO_TRACE:-0} != 1 ]]; then
             \\  if [[ ${SNAPSHOT_TEST_EXECVEAT:-0} == 1 ]]; then
-            \\    printf 'execveat(3<%s>, "", [], [], AT_EMPTY_PATH) = 0\n' "$traced" >"$output"
+            \\    printf '%s execveat(3<%s>, "", ["dpkg-deb"], 0x1 /* 1 var */, AT_EMPTY_PATH) = 0\n' \
+            \\      "$$" "$traced" >"$output"
             \\  else
-            \\    printf 'execve("%s", [...], [...]) = 0\n' "$traced" >"$output"
+            \\    printf '%s execve("%s", ["%s", "--print-architecture"], 0x1 /* 1 var */) = 0\n' \
+            \\      "$$" "$traced" "${traced##*/}" >"$output"
+            \\  fi
+            \\  if [[ ${SNAPSHOT_TEST_SCRIPT_DPKG:-0} == 1 ]]; then
+            \\    script=/var/lib/debz-lifecycle-scripts/tzdata.postinst
+            \\    printf '%s\n' "$$ clone(child_stack=NULL, flags=SIGCHLD) = 9001" \
+            \\      "9001 execve(\"$script\", [\"$script\", \"configure\"], 0x1 /* 1 var */) = 0" \
+            \\      '9001 vfork() = 9002' \
+            \\      '9002 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0' >>"$output"
             \\  fi
             \\fi
             \\exec "$@"
@@ -145,6 +159,10 @@ const Driver = struct {
         defer support.allocator.free(execve);
         const injected = try std.fmt.allocPrint(support.allocator, "SNAPSHOT_TEST_INJECTED_EXECVE={s}", .{config.injected_execve});
         defer support.allocator.free(injected);
+        const progress_limit = try std.fmt.allocPrint(support.allocator, "DEBZ_REAL_SNAPSHOT_INSTALL_PROGRESS_LIMIT_SECONDS={s}", .{config.progress_limit_seconds});
+        defer support.allocator.free(progress_limit);
+        const ceiling = try std.fmt.allocPrint(support.allocator, "DEBZ_REAL_SNAPSHOT_INSTALL_CEILING_SECONDS={s}", .{config.ceiling_seconds});
+        defer support.allocator.free(ceiling);
         const inherited = try support.run(&.{ "printenv", "PATH" });
         defer inherited.deinit();
         try inherited.ok();
@@ -153,10 +171,11 @@ const Driver = struct {
         const path = try std.fmt.allocPrint(support.allocator, "PATH={s}:{s}", .{ self.work.root, inherited_path });
         defer support.allocator.free(path);
         return support.runIn(&.{
-            "env", key, calls, name, path, execve, injected,
+            "env", key, calls, name, path, execve, injected, progress_limit, ceiling,
             if (config.trace) "DEBZ_REAL_SNAPSHOT_TRACE=1" else "DEBZ_REAL_SNAPSHOT_TRACE=0",
             if (config.no_trace) "SNAPSHOT_TEST_NO_TRACE=1" else "SNAPSHOT_TEST_NO_TRACE=0",
             if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0",
+            if (config.script_dpkg) "SNAPSHOT_TEST_SCRIPT_DPKG=1" else "SNAPSHOT_TEST_SCRIPT_DPKG=0",
             "bash", self.script, self.executable, uri, "stonking", self.arch, self.workspace,
         }, .{ .path = self.work.root });
     }
@@ -279,9 +298,13 @@ test "snapshot: offline native creation and zero-action update preserve evidence
         const args = parsed.value;
         if (std.mem.eql(u8, args[0], "transaction-result")) {
             verifications += 1;
-            try testing.expect(args.len > 1 and std.mem.eql(u8, args[1], "verify"));
-            try testing.expect(hasArgument(args, install_lock));
-            try testing.expect(hasArgument(args, "--transaction-backend") and hasArgument(args, "native"));
+            const root = try f.work.path(".real-snapshot/fresh/root");
+            defer support.allocator.free(root);
+            try expectArguments(args, &.{
+                "transaction-result", "verify", "--transaction-backend", "native",
+                "--install-root", root, "--lock-input", install_lock,
+                "--architecture", f.arch, "--json",
+            });
         }
         if (std.mem.eql(u8, args[0], "plan") and hasArgument(args, update_lock)) {
             update_plans += 1;
@@ -296,6 +319,11 @@ test "snapshot: offline native creation and zero-action update preserve evidence
     try testing.expectEqual(@as(usize, 1), verifications);
     try testing.expectEqual(@as(usize, 1), update_plans);
     try testing.expectEqual(@as(usize, 2), mutating);
+}
+
+fn expectArguments(actual: []const []const u8, expected: []const []const u8) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| try testing.expectEqualStrings(want, got);
 }
 
 fn hasArgument(args: []const []const u8, value: []const u8) bool {
@@ -334,15 +362,212 @@ test "snapshot: unreviewed initial signer refuses before any download" {
     try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/download.json"));
 }
 
-test "snapshot: failed receipt and unreviewed update signer refuse before update" {
+test "snapshot: native verification refusal preserves installed evidence and stops before update" {
+    for ([_]struct { scenario: []const u8, exit_code: u8 }{
+        .{ .scenario = "failed-verification", .exit_code = 7 },
+        .{ .scenario = "failed-outcome", .exit_code = 1 },
+    }) |scenario| {
+        var f = try Driver.initOffline();
+        defer f.deinit();
+        const refused = try f.offline(.{ .name = scenario.scenario });
+        defer refused.deinit();
+        try testing.expectEqual(scenario.exit_code, refused.code);
+        try support.contains(refused.stderr, "native create transaction-result verification");
+        try expectOperations(&f, &.{ "refresh", "plan", "download", "install", "transaction-result" });
+        const provenance = try f.work.read(".real-snapshot/fresh/root/var/lib/debz/native-transaction-provenance-v2.json");
+        defer support.allocator.free(provenance);
+        try support.contains(provenance, "\"outcome\":\"succeeded\"");
+        const status = try f.work.read(".real-snapshot/fresh/root/var/lib/dpkg/status");
+        defer support.allocator.free(status);
+        try support.contains(status, "Status: install ok installed");
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/update.json"));
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/update-zero-actions.txt"));
+    }
+}
+
+test "snapshot: legacy verification requires state path, native rejects it" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const accepted = try f.offline(.{});
+    defer accepted.deinit();
+    try accepted.ok();
+    const calls = try f.work.path("calls.jsonl");
+    defer support.allocator.free(calls);
+    const env_calls = try std.fmt.allocPrint(support.allocator, "SNAPSHOT_TEST_CALLS={s}", .{calls});
+    defer support.allocator.free(env_calls);
+    const lock = try f.work.path(".real-snapshot/fresh/evidence/ubuntu-minimal.lock.json");
+    defer support.allocator.free(lock);
+    const update_lock = try f.work.path(".real-snapshot/fresh/evidence/ubuntu-minimal.update.lock.json");
+    defer support.allocator.free(update_lock);
+    const root = try f.work.path(".real-snapshot/fresh/root");
+    defer support.allocator.free(root);
+    const state = try f.work.path(".real-snapshot/fresh/state");
+    defer support.allocator.free(state);
+    const legacy = try support.run(&.{
+        "env", env_calls, f.executable, "transaction-result", "verify",
+        "--state-path", state, "--lock-input", update_lock, "--architecture", f.arch, "--json",
+    });
+    defer legacy.deinit();
+    try legacy.ok();
+    const legacy_without_state = try support.run(&.{
+        "env", env_calls, f.executable, "transaction-result", "verify",
+        "--lock-input", update_lock, "--architecture", f.arch, "--json",
+    });
+    defer legacy_without_state.deinit();
+    try testing.expect(legacy_without_state.code != 0);
+    try support.contains(legacy_without_state.stderr, "MissingState");
+    const native_with_state = try support.run(&.{
+        "env", env_calls, f.executable, "transaction-result", "verify",
+        "--transaction-backend", "native", "--install-root", root, "--state-path", state,
+        "--lock-input", lock, "--architecture", f.arch, "--json",
+    });
+    defer native_with_state.deinit();
+    try testing.expect(native_with_state.code != 0);
+    try support.contains(native_with_state.stderr, "NativeVerificationDoesNotUseStatePath");
+}
+
+test "snapshot: install verdict bounds time without durable progress by a fixed ceiling" {
+    var f = try Driver.init();
+    defer f.deinit();
+    for ([_]struct { elapsed: []const u8, progressed: []const u8, limit: []const u8, ceiling: []const u8, verdict: []const u8 }{
+        .{ .elapsed = "0", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "1199", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "1200", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "stalled\n" },
+        .{ .elapsed = "6199", .progressed = "5000", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "6200", .progressed = "5000", .limit = "1200", .ceiling = "10800", .verdict = "stalled\n" },
+        .{ .elapsed = "10799", .progressed = "10799", .limit = "1200", .ceiling = "10800", .verdict = "running\n" },
+        .{ .elapsed = "10800", .progressed = "10800", .limit = "1200", .ceiling = "10800", .verdict = "ceiling\n" },
+        .{ .elapsed = "10800", .progressed = "0", .limit = "1200", .ceiling = "10800", .verdict = "ceiling\n" },
+        .{ .elapsed = "3", .progressed = "0", .limit = "3", .ceiling = "3", .verdict = "ceiling\n" },
+    }) |case| {
+        const result = try f.run(f.keyring, &.{ "--progress-verdict", case.elapsed, case.progressed, case.limit, case.ceiling });
+        defer result.deinit();
+        try result.ok();
+        try testing.expectEqualStrings(case.verdict, result.stdout);
+    }
+    for ([_][4][]const u8{
+        .{ "5", "6", "1", "10" },
+        .{ "5", "0", "0", "10" },
+        .{ "5", "0", "11", "10" },
+        .{ "05", "0", "1", "10" },
+        .{ "-1", "0", "1", "10" },
+        .{ "5", "0", "one", "10" },
+        .{ "5", "0", "1", "1000000" },
+    }) |invalid| {
+        const result = try f.run(f.keyring, &.{ "--progress-verdict", invalid[0], invalid[1], invalid[2], invalid[3] });
+        defer result.deinit();
+        try testing.expectEqual(@as(u8, 2), result.code);
+        try support.contains(result.stderr, "invalid progress verdict input");
+    }
+}
+
+test "snapshot: reviewed install bounds are recorded and overrides may only tighten them" {
     {
         var f = try Driver.initOffline();
         defer f.deinit();
-        const refused = try f.offline(.{ .name = "failed-verification" });
-        defer refused.deinit();
-        try testing.expect(refused.code != 0);
-        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-transaction-result.json"));
+        const accepted = try f.offline(.{});
+        defer accepted.deinit();
+        try accepted.ok();
+        const identity = try f.work.read(".real-snapshot/fresh/evidence/invocation-identity.txt");
+        defer support.allocator.free(identity);
+        try support.contains(identity, "operation_limit=30m\nverification_limit=10m\n" ++
+            "install_progress_limit_seconds=1200\ninstall_ceiling_seconds=10800\n");
+        const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+        defer support.allocator.free(progress);
+        try support.contains(progress, "progress_limit_seconds=1200\nceiling_seconds=10800\nsample_seconds=60\n");
+        try support.contains(progress, "\nsha_instructions=");
+        try support.contains(progress, "\nverdict=completed\nexit_status=0\n");
+        try support.contains(progress, "status_entries=1 installed=1 unpacked=0 other=0 ledger_bytes=0\n");
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt"));
     }
+    for ([_]struct { limit: []const u8 = "", ceiling: []const u8 = "", message: []const u8 }{
+        .{ .limit = "1201", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .ceiling = "10801", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .limit = "0", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .ceiling = "90m", .message = "install progress bounds may only tighten the reviewed limits" },
+        .{ .limit = "30", .ceiling = "20", .message = "install progress limit exceeds its ceiling" },
+    }) |invalid| {
+        var f = try Driver.initOffline();
+        defer f.deinit();
+        const refused = try f.offline(.{ .progress_limit_seconds = invalid.limit, .ceiling_seconds = invalid.ceiling });
+        defer refused.deinit();
+        try testing.expectEqual(@as(u8, 2), refused.code);
+        try support.contains(refused.stderr, invalid.message);
+        try testing.expectError(error.FileNotFound, f.work.read("calls.jsonl"));
+        try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh"));
+    }
+}
+
+fn progressField(progress: []const u8, comptime field: []const u8) !u64 {
+    const marker = "\n" ++ field ++ "=";
+    const start = (std.mem.lastIndexOf(u8, progress, marker) orelse return error.MissingProgressField) + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, progress, start, '\n') orelse return error.MissingProgressField;
+    return std.fmt.parseInt(u64, progress[start..end], 10);
+}
+
+test "snapshot: slowly progressing install continues beyond its progress limit" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const accepted = try f.offline(.{ .name = "slow-progress", .progress_limit_seconds = "3", .ceiling_seconds = "20" });
+    defer accepted.deinit();
+    try accepted.ok();
+    const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+    defer support.allocator.free(progress);
+    try support.contains(progress, "\nverdict=completed\nexit_status=0\n");
+    try testing.expect(try progressField(progress, "elapsed_seconds") > 3);
+    try testing.expect(try progressField(progress, "longest_progress_gap_seconds") < 3);
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt"));
+    try expectOperations(&f, &.{
+        "refresh", "plan", "download",    "install", "transaction-result",
+        "plan",    "plan", "upgrade-all", "plan",
+    });
+}
+
+test "snapshot: stalled install stops at its progress limit before verification" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const refused = try f.offline(.{ .name = "stalled-install", .trace = true, .progress_limit_seconds = "2", .ceiling_seconds = "20" });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 124), refused.code);
+    try support.contains(refused.stderr, "native create stalled after");
+    try expectOperations(&f, &.{ "refresh", "plan", "download", "install" });
+    const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+    defer support.allocator.free(progress);
+    try support.contains(progress, "\nverdict=stalled\nexit_status=124\n");
+    try support.contains(progress, "status_entries=1 installed=0 unpacked=1 other=0");
+    try testing.expect(try progressField(progress, "elapsed_seconds") < 20);
+    const watchdog = try f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt");
+    defer support.allocator.free(watchdog);
+    try support.contains(watchdog, "verdict=stalled\n");
+    try support.contains(watchdog, "\nloadavg=");
+    try support.contains(watchdog, " install --install-root ");
+    const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
+    defer support.allocator.free(audit);
+    try support.contains(audit, "operation=create\nexit_status=124\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n");
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-summary.json"));
+}
+
+test "snapshot: continuously progressing install stops at its fixed ceiling" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const refused = try f.offline(.{ .name = "endless-progress", .progress_limit_seconds = "3", .ceiling_seconds = "4" });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 124), refused.code);
+    try support.contains(refused.stderr, "native create ceiling after");
+    try expectOperations(&f, &.{ "refresh", "plan", "download", "install" });
+    const progress = try f.work.read(".real-snapshot/fresh/evidence/create-progress.txt");
+    defer support.allocator.free(progress);
+    try support.contains(progress, "\nverdict=ceiling\nexit_status=124\n");
+    // Whole-second polling can observe 250 ms progress up to 2 s apart.
+    try testing.expect(try progressField(progress, "longest_progress_gap_seconds") < 3);
+    try testing.expect(try progressField(progress, "elapsed_seconds") < 20);
+    const watchdog = try f.work.read(".real-snapshot/fresh/evidence/create-watchdog.txt");
+    defer support.allocator.free(watchdog);
+    try support.contains(watchdog, "verdict=ceiling\n");
+    try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/create-summary.json"));
+}
+
+test "snapshot: unreviewed update signer refuses before update" {
     {
         var f = try Driver.initOffline();
         defer f.deinit();
@@ -412,7 +637,10 @@ test "snapshot: failed traced refresh reports freshness while no forbidden nativ
     try expectOperations(&f, &.{"refresh"});
     const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
     defer support.allocator.free(audit);
-    try testing.expectEqualStrings("operation=refresh\nexit_status=4\nforbidden_dpkg_exec=false\n", audit);
+    try testing.expectEqualStrings("operation=refresh\nexit_status=4\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n", audit);
+    const summary = try f.work.read(".real-snapshot/fresh/evidence/exec-audit-summary.txt");
+    defer support.allocator.free(summary);
+    try testing.expectEqualStrings("audited_operations=1\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n", summary);
     const refresh = try f.work.read(".real-snapshot/fresh/evidence/refresh.json");
     defer support.allocator.free(refresh);
     try support.contains(refresh, "\"summary\":\"ReleaseExpired\"");
@@ -423,20 +651,63 @@ test "snapshot: failed traced refresh reports freshness while no forbidden nativ
 }
 
 test "snapshot: trace rejects forbidden dpkg execve and descriptor execveat even on failed refresh" {
-    for ([_]Scenario{
-        .{ .name = "freshness-failure", .trace = true, .execve = "/usr/bin/dpkg" },
-        .{ .name = "freshness-failure", .trace = true, .execve = "/usr/local/bin/dpkg-deb", .execveat = true },
-    }) |scenario| {
+    for ([_]struct { scenario: Scenario, record: []const u8 }{
+        .{
+            .scenario = .{ .name = "freshness-failure", .trace = true, .execve = "/usr/bin/dpkg" },
+            .record = "forbidden_exec reason=not-script-descended line=1 ",
+        },
+        .{
+            .scenario = .{ .name = "freshness-failure", .trace = true, .execve = "/usr/local/bin/dpkg-deb", .execveat = true },
+            .record = "forbidden_exec reason=execveat line=1 ",
+        },
+    }) |case| {
         var f = try Driver.initOffline();
         defer f.deinit();
-        const refused = try f.offline(scenario);
+        const refused = try f.offline(case.scenario);
         defer refused.deinit();
         try testing.expectEqual(@as(u8, 90), refused.code);
+        try support.contains(refused.stderr, "outside the reviewed script exception during refresh");
         try expectOperations(&f, &.{"refresh"});
         const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
         defer support.allocator.free(audit);
-        try testing.expectEqualStrings("operation=refresh\nexit_status=4\nforbidden_dpkg_exec=true\n", audit);
+        try testing.expect(std.mem.startsWith(u8, audit, "operation=refresh\nexit_status=4\n"));
+        try support.contains(audit, case.record);
+        try testing.expect(std.mem.endsWith(u8, audit, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
+        const summary = try f.work.read(".real-snapshot/fresh/evidence/exec-audit-summary.txt");
+        defer support.allocator.free(summary);
+        try testing.expectEqualStrings("audited_operations=1\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n", summary);
     }
+}
+
+test "snapshot: wrapper binds script dpkg calls to the reviewed root identity" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const refused = try f.offline(.{ .name = "freshness-failure", .trace = true, .script_dpkg = true });
+    defer refused.deinit();
+    try testing.expectEqual(@as(u8, 90), refused.code);
+    try expectOperations(&f, &.{"refresh"});
+    const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
+    defer support.allocator.free(audit);
+    // The fixture root has no reviewed /usr/bin/dpkg, so the otherwise
+    // reviewed script-descended query is refused rather than counted.
+    try support.contains(audit, "forbidden_exec reason=dpkg-identity:");
+    try support.contains(audit, " pid=9002 path=\"/usr/bin/dpkg\" script=/var/lib/debz-lifecycle-scripts/tzdata.postinst script_pid=9001 lineage=");
+    try support.contains(audit, ">9001>9002 argv=[\"dpkg\",\"-s\",\"tzdata\"]\n");
+    try testing.expect(std.mem.indexOf(u8, audit, "script_dpkg_exec ") == null);
+    try testing.expect(std.mem.endsWith(u8, audit, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
+}
+
+test "snapshot: traced acceptance without dpkg execs records a passing exec audit summary" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const accepted = try f.offline(.{ .trace = true });
+    defer accepted.deinit();
+    try accepted.ok();
+    const summary = try f.work.read(".real-snapshot/fresh/evidence/exec-audit-summary.txt");
+    defer support.allocator.free(summary);
+    try support.contains(summary, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n");
+    try testing.expect(std.mem.startsWith(u8, summary, "audited_operations="));
+    try testing.expect(try numberBetween(summary, "audited_operations=", "\n") >= 8);
 }
 
 test "snapshot: missing trace refuses failed command and invalid-lock probe audits dpkg-deb" {
@@ -457,9 +728,512 @@ test "snapshot: missing trace refuses failed command and invalid-lock probe audi
         try testing.expectEqual(@as(u8, 90), refused.code);
         const audit = try f.work.read(".real-snapshot/fresh/evidence/native-exec-audit.txt");
         defer support.allocator.free(audit);
-        try support.contains(audit, "operation=injected-failure\nexit_status=5\nforbidden_dpkg_exec=true\n");
+        try support.contains(audit, "operation=injected-failure\nexit_status=5\nforbidden_exec reason=path line=1 ");
+        try support.contains(audit, " path=\"/opt/pinned/bin/dpkg-deb\" ");
+        try testing.expect(std.mem.endsWith(u8, audit, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
         try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/injected-failure.txt"));
     }
+}
+
+const audit_debz = "/opt/debz/bin/debz";
+const audit_dpkg = "reviewed fixture dpkg\n";
+const audit_dpkg_size = std.fmt.comptimePrint("{d}", .{audit_dpkg.len});
+const audit_version = "1.23.7ubuntu2";
+const audit_script = "/var/lib/debz-lifecycle-scripts/tzdata.postinst";
+const audit_lineage = " script=" ++ audit_script ++ " script_pid=702 lineage=700>701>702>703 argv=";
+
+fn auditHex(bytes: []const u8) [2 * std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hashed: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hashed, .{});
+    return std.fmt.bytesToHex(hashed, .lower);
+}
+
+fn writeAuditRoot(f: *Driver, version: []const u8, status_architecture: []const u8) !void {
+    try f.work.write("audit-root/usr/bin/dpkg", audit_dpkg);
+    try f.work.directory.dir.createDirPath(support.io, "audit-root/usr/sbin");
+    try f.work.directory.dir.createDirPath(support.io, "audit-root/usr/local/bin");
+    const status = try std.fmt.allocPrint(support.allocator, "Package: dpkg-dev\nStatus: install ok installed\nVersion: {s}\nArchitecture: all\n\n" ++
+        "Package: dpkg\nStatus: install ok installed\nVersion: {s}\nArchitecture: {s}\n" ++
+        "Description: fixture\n Version: 0\n\n", .{ audit_version, version, status_architecture });
+    defer support.allocator.free(status);
+    try f.work.write("audit-root/var/lib/dpkg/status", status);
+}
+
+fn auditLink(f: *Driver, target: []const u8, relative: []const u8) !void {
+    const link = try f.work.path(relative);
+    defer support.allocator.free(link);
+    const linked = try support.run(&.{ "ln", "-s", target, link });
+    defer linked.deinit();
+    try linked.ok();
+}
+
+fn auditWith(f: *Driver, mode: []const u8, trace: []const u8, digest: []const u8, size: []const u8) !support.Result {
+    try f.work.write("audit.trace", trace);
+    const trace_path = try f.work.path("audit.trace");
+    defer support.allocator.free(trace_path);
+    const root = try f.work.path("audit-root");
+    defer support.allocator.free(root);
+    if (std.mem.eql(u8, mode, "--audit-exec-trace"))
+        return f.run(f.keyring, &.{ mode, trace_path, root, f.arch, audit_debz });
+    return f.run(f.keyring, &.{ mode, trace_path, root, f.arch, audit_debz, digest, size, audit_version });
+}
+
+fn auditFixture(f: *Driver, trace: []const u8) !support.Result {
+    const digest = auditHex(audit_dpkg);
+    return auditWith(f, "--audit-exec-trace-fixture", trace, &digest, audit_dpkg_size);
+}
+
+/// A debz thread forks a lifecycle script, which vforks CALL(ARGS); strace
+/// prints the child's exec before the vfork returns.
+fn scriptTrace(script: []const u8, call: []const u8, args: []const u8, result: []const u8) ![]u8 {
+    return std.fmt.allocPrint(support.allocator,
+        \\700 execve("/opt/debz/bin/debz", ["debz", "install"], 0x7ffd0 /* 4 vars */) = 0
+        \\700 clone3({{flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x1, parent_tid=0x2, exit_signal=0, stack=0x3, stack_size=0x4, tls=0x5}} => {{parent_tid=[701]}}, 88) = 701
+        \\701 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x6) = 702
+        \\702 execve("{s}", ["{s}", "configure", ""], 0x7ffd1 /* 1 var */) = 0
+        \\702 vfork( <unfinished ...>
+        \\703 {s}({s} <unfinished ...>
+        \\702 <... vfork resumed>)              = 703
+        \\703 <... {s} resumed>) = {s}
+        \\
+    , .{ script, script, call, args, call, result });
+}
+
+fn dpkgArgs(path: []const u8, argv: []const u8) ![]u8 {
+    return std.fmt.allocPrint(support.allocator, "\"{s}\", [{s}], 0x7ffd2 /* 2 vars */", .{ path, argv });
+}
+
+fn scriptDpkg(argv: []const u8) ![]u8 {
+    const args = try dpkgArgs("/usr/bin/dpkg", argv);
+    defer support.allocator.free(args);
+    return scriptTrace(audit_script, "execve", args, "0");
+}
+
+fn expectRefused(result: support.Result, reason: []const u8) !void {
+    const record = try std.fmt.allocPrint(support.allocator, "forbidden_exec reason={s} ", .{reason});
+    defer support.allocator.free(record);
+    errdefer std.debug.print("expected refusal {s}, got {d}:\n{s}{s}\n", .{ reason, result.code, result.stdout, result.stderr });
+    try testing.expectEqual(@as(u8, 90), result.code);
+    try testing.expect(std.mem.startsWith(u8, result.stdout, record));
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "script_dpkg_exec ") == null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "script_dpkg_identity ") == null);
+    try testing.expect(std.mem.endsWith(u8, result.stdout, "\nallowed_script_dpkg_exec=0\nforbidden_dpkg_exec=true\n"));
+}
+
+fn expectAllowed(result: support.Result, record: []const u8) !void {
+    errdefer std.debug.print("expected allowed {s}, got {d}:\n{s}{s}\n", .{ record, result.code, result.stdout, result.stderr });
+    try result.ok();
+    try testing.expect(std.mem.startsWith(u8, result.stdout, record));
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "forbidden_exec") == null);
+    try support.contains(result.stdout, "\nscript_dpkg_identity version=" ++ audit_version ++ " architecture=");
+    try testing.expect(std.mem.endsWith(u8, result.stdout, "\nallowed_script_dpkg_exec=1\nforbidden_dpkg_exec=false\n"));
+}
+
+test "snapshot: exec audit allows each reviewed read-only dpkg action and argv[0] label from a debz-started script" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    for ([_][]const u8{
+        "\"dpkg\", \"--compare-versions\", \"--\", \"1.0\", \"lt\", \"2.0\"",
+        "\"dpkg\", \"--compare-versions\", \"1.0\", \"lt-nl\", \"\"",
+        "\"dpkg\", \"--validate-version\", \"--\", \"1:2.0-1\"",
+        "\"dpkg\", \"--print-architecture\"",
+        "\"dpkg\", \"-s\", \"tzdata\"",
+        "\"dpkg\", \"-L\", \"python3-yaml\"",
+        "\"dpkg\", \"-l\", \"libc6\"",
+        "\"/usr/bin/dpkg\", \"-L\", \"python3-minimal:amd64\"",
+        "\"/usr/bin/dpkg\", \"--compare-versions\", \"3.14\", \"ge\", \"3.13\"",
+    }) |argv| {
+        const trace = try scriptDpkg(argv);
+        defer support.allocator.free(trace);
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        const compact = try std.mem.replaceOwned(u8, support.allocator, argv, "\", \"", "\",\"");
+        defer support.allocator.free(compact);
+        const record = try std.fmt.allocPrint(support.allocator, "script_dpkg_exec line=6 pid=703" ++ audit_lineage ++ "[{s}]\n", .{compact});
+        defer support.allocator.free(record);
+        try expectAllowed(result, record);
+        const digest = auditHex(audit_dpkg);
+        const identity = try std.fmt.allocPrint(support.allocator, "\nscript_dpkg_identity version={s} architecture={s} size={s} digest={s}\n", .{
+            audit_version, f.arch, audit_dpkg_size, &digest,
+        });
+        defer support.allocator.free(identity);
+        try support.contains(result.stdout, identity);
+    }
+}
+
+test "snapshot: exec audit follows pid namespace, fork and debconf re-exec lineage" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    for ([_]struct { trace: []const u8, record: []const u8 }{
+        .{
+            .trace =
+            \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+            \\700 clone(child_stack=NULL, flags=CLONE_NEWNS|CLONE_NEWPID|SIGCHLD) = 801
+            \\801 execve("/var/lib/debz-lifecycle-scripts/dash.postinst", ["/var/lib/debz-lifecycle-scripts/dash.postinst", "configure"], 0x1 /* 1 var */) = 0
+            \\801 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x1) = 2 /* 802 in strace's PID NS */
+            \\802 execve("/usr/bin/dpkg", ["dpkg", "--print-architecture"], 0x1 /* 1 var */) = 0
+            \\
+            ,
+            .record = "script_dpkg_exec line=5 pid=802 script=/var/lib/debz-lifecycle-scripts/dash.postinst script_pid=801 lineage=700>801>802 argv=[\"dpkg\",\"--print-architecture\"]\n",
+        },
+        .{
+            .trace =
+            \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+            \\700 fork() = 702
+            \\702 execve("/var/lib/dpkg/info/libc6:amd64.postinst", ["/var/lib/dpkg/info/libc6:amd64.postinst", "configure"], 0x1 /* 1 var */) = 0
+            \\702 execve("/usr/share/debconf/frontend", ["/usr/share/debconf/frontend", "/var/lib/dpkg/info/libc6:amd64.postinst", "configure"], 0x1 /* 2 vars */) = 0
+            \\702 clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0x1) = 703
+            \\703 execve("/var/lib/dpkg/info/libc6:amd64.postinst", ["/var/lib/dpkg/info/libc6:amd64.postinst", "configure"], 0x1 /* 3 vars */) = 0
+            \\703 vfork() = 704
+            \\704 execve("/usr/bin/dpkg", ["dpkg", "--compare-versions", "--", "2.41", "lt", "2.42"], 0x1 /* 3 vars */) = 0
+            \\
+            ,
+            .record = "script_dpkg_exec line=8 pid=704 script=/var/lib/dpkg/info/libc6:amd64.postinst script_pid=702 lineage=700>702>703>704 argv=[\"dpkg\",\"--compare-versions\",\"--\",\"2.41\",\"lt\",\"2.42\"]\n",
+        },
+    }) |case| {
+        const result = try auditFixture(&f, case.trace);
+        defer result.deinit();
+        try expectAllowed(result, case.record);
+    }
+}
+
+test "snapshot: exec audit refuses dpkg outside a debz-started script or with unreviewed arguments" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    for ([_]struct { argv: []const u8, reason: []const u8 }{
+        .{ .argv = "\"dpkg\", \"--configure\", \"tzdata\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"-i\", \"/tmp/x.deb\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"--unpack\", \"/tmp/x.deb\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"--set-selections\"", .reason = "action" },
+        .{ .argv = "\"dpkg\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"--root=/target\", \"-s\", \"tzdata\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"--admindir\", \"/x\", \"-s\", \"tzdata\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"--force-all\", \"-L\", \"tzdata\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"--instdir=/x\", \"-l\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"--no-pager\", \"-l\", \"tzdata\"", .reason = "action" },
+        .{ .argv = "\"dpkg\", \"-s\", \"--admindir=/x\", \"tzdata\"", .reason = "option" },
+        .{ .argv = "\"dpkg\", \"--print-architecture\", \"--force-all\"", .reason = "option" },
+        .{ .argv = "\"dpkg\", \"-L\", \"--instdir\", \"/x\", \"tzdata\"", .reason = "option" },
+        .{ .argv = "\"dpkg\", \"-s\", \"-l\", \"tzdata\"", .reason = "option" },
+        .{ .argv = "\"dpkg\", \"--compare-versions\", \"--\", \"1\", \"lt\", \"--root=/\"", .reason = "option" },
+        .{ .argv = "\"./dpkg\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "\"/bin/dpkg\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "\"/usr/local/bin/dpkg\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "\"/usr/bin//dpkg\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "\"/usr/bin/../bin/dpkg\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "\"usr/bin/dpkg\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "\"dpkg-query\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "\"\", \"-L\", \"python3\"", .reason = "argv0" },
+        .{ .argv = "", .reason = "argv0" },
+        .{ .argv = "\"dpkg\", \"-s\", \"tzdata\"...", .reason = "truncated" },
+    }) |case| {
+        const trace = try scriptDpkg(case.argv);
+        defer support.allocator.free(trace);
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        try expectRefused(result, case.reason);
+    }
+    for ([_][]const u8{ "/tmp/dpkg", "/usr/local/bin/dpkg", "/usr/sbin/dpkg", "/bin/dpkg", "dpkg", "./dpkg", "/usr/bin//dpkg", "/usr/bin/../bin/dpkg" }) |path| {
+        for ([_][]const u8{ "\"dpkg\", \"-s\", \"tzdata\"", "\"/usr/bin/dpkg\", \"-s\", \"tzdata\"" }) |argv| {
+            const args = try dpkgArgs(path, argv);
+            defer support.allocator.free(args);
+            const trace = try scriptTrace(audit_script, "execve", args, "0");
+            defer support.allocator.free(trace);
+            const result = try auditFixture(&f, trace);
+            defer result.deinit();
+            try expectRefused(result, "path");
+        }
+    }
+    {
+        const args = try dpkgArgs("/usr/bin/dpkg-deb", "\"dpkg-deb\", \"--info\", \"/tmp/x.deb\"");
+        defer support.allocator.free(args);
+        const trace = try scriptTrace(audit_script, "execve", args, "0");
+        defer support.allocator.free(trace);
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        try expectRefused(result, "path");
+    }
+    for ([_]struct { call: []const u8, args: []const u8, result: []const u8, reason: []const u8 }{
+        .{ .call = "execveat", .args = "AT_FDCWD, \"/usr/bin/dpkg\", [\"dpkg\", \"-s\", \"tzdata\"], 0x1 /* 1 var */, 0", .result = "0", .reason = "execveat" },
+        .{ .call = "execveat", .args = "3</usr/bin/dpkg>, \"\", [\"dpkg\", \"-s\", \"tzdata\"], 0x1 /* 1 var */, AT_EMPTY_PATH", .result = "0", .reason = "execveat" },
+        .{ .call = "execve", .args = "\"/usr/bin/dpkg\", [\"dpkg\", \"-s\", \"tzdata\"], 0x1 /* 1 var */", .result = "-1 ENOENT (No such file or directory)", .reason = "exec-result" },
+    }) |case| {
+        const trace = try scriptTrace(audit_script, case.call, case.args, case.result);
+        defer support.allocator.free(trace);
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        try expectRefused(result, case.reason);
+    }
+    for ([_]struct { trace: []const u8, reason: []const u8 }{
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/usr/bin/perl", ["perl", "-e", "exec @ARGV"], 0x1 /* 1 var */) = 0
+        \\702 clone(child_stack=NULL, flags=SIGCHLD) = 703
+        \\703 execve("/var/lib/debz-lifecycle-scripts/tzdata.postinst", ["/var/lib/debz-lifecycle-scripts/tzdata.postinst"], 0x1 /* 1 var */) = 0
+        \\703 vfork() = 704
+        \\704 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/usr/bin/env", ["env", "/opt/debz/bin/debz"], 0x1 /* 1 var */) = 0
+        \\700 execve("/opt/debz/bin/debz", ["/opt/debz/bin/debz"], 0x1 /* 1 var */) = -1 EACCES (Permission denied)
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/tzdata.postinst", ["/var/lib/debz-lifecycle-scripts/tzdata.postinst"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\900 execve("/var/lib/dpkg/info/tzdata.postinst", ["/var/lib/dpkg/info/tzdata.postinst", "configure"], 0x1 /* 1 var */) = 0
+        \\900 vfork() = 901
+        \\901 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\900 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\900 execve("/var/lib/dpkg/info/tzdata.postinst", ["/var/lib/dpkg/info/tzdata.postinst", "configure"], 0x1 /* 1 var */) = 0
+        \\900 vfork() = 901
+        \\901 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\900 execve("/var/lib/dpkg/info/tzdata.postinst", ["/var/lib/dpkg/info/tzdata.postinst", "configure"], 0x1 /* 1 var */) = 0
+        \\900 vfork() = 901
+        \\901 execve("/usr/bin/dpkg", ["/usr/bin/dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/bin/sh", ["sh", "-c", "/var/lib/dpkg/info/tzdata.postinst configure"], 0x1 /* 1 var */) = 0
+        \\702 execve("/var/lib/dpkg/info/tzdata.postinst", ["/var/lib/dpkg/info/tzdata.postinst", "configure"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "not-script-descended", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/tzdata.config", ["/var/lib/debz-lifecycle-scripts/tzdata.config"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "exec-result", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/tzdata.postinst", ["/var/lib/debz-lifecycle-scripts/tzdata.postinst"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */ <unfinished ...>
+        \\
+        },
+        .{ .reason = "ambiguous-lineage", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 703
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/tzdata.postinst", ["/var/lib/debz-lifecycle-scripts/tzdata.postinst"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], 0x1 /* 1 var */) = 0
+        \\
+        },
+        .{ .reason = "unparsed", .trace =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/tzdata.postinst", ["/var/lib/debz-lifecycle-scripts/tzdata.postinst"], 0x1 /* 1 var */) = 0
+        \\702 vfork() = 703
+        \\703 execve("/usr/bin/dpkg", ["dpkg", "-s", "tzdata"], ["PATH=/usr/bin"]) = 0
+        \\
+        },
+    }) |case| {
+        const result = try auditFixture(&f, case.trace);
+        defer result.deinit();
+        try expectRefused(result, case.reason);
+    }
+}
+
+test "snapshot: exec audit refuses script dpkg calls unless the root dpkg has the reviewed identity" {
+    for ([_][]const u8{ "dpkg", "/usr/bin/dpkg" }) |argv0| try expectIdentityBound(argv0);
+}
+
+fn expectIdentityBound(argv0: []const u8) !void {
+    const argv = try std.fmt.allocPrint(support.allocator, "\"{s}\", \"-s\", \"tzdata\"", .{argv0});
+    defer support.allocator.free(argv);
+    const allowed = try scriptDpkg(argv);
+    defer support.allocator.free(allowed);
+    const recorded = try std.fmt.allocPrint(support.allocator, audit_lineage ++ "[\"{s}\",\"-s\",\"tzdata\"]\n", .{argv0});
+    defer support.allocator.free(recorded);
+    const allowed_record = try std.fmt.allocPrint(support.allocator, "script_dpkg_exec line=6 pid=703{s}", .{recorded});
+    defer support.allocator.free(allowed_record);
+    const Change = enum { none, merged_sbin, digest, size, reviewed_pins, usr_sbin, dangling_local, absolute_sbin, symlinked_dpkg, symlinked_bin_dir, version, status_architecture, no_root };
+    for ([_]struct { change: Change, reason: ?[]const u8 }{
+        .{ .change = .none, .reason = null },
+        .{ .change = .merged_sbin, .reason = null },
+        .{ .change = .digest, .reason = "dpkg-identity:digest" },
+        .{ .change = .size, .reason = "dpkg-identity:digest" },
+        .{ .change = .reviewed_pins, .reason = "dpkg-identity:digest" },
+        .{ .change = .usr_sbin, .reason = "dpkg-identity:shadow:/usr/sbin/dpkg" },
+        .{ .change = .dangling_local, .reason = "dpkg-identity:shadow:/usr/local/bin/dpkg" },
+        .{ .change = .absolute_sbin, .reason = "dpkg-identity:shadow:/sbin/dpkg" },
+        .{ .change = .symlinked_dpkg, .reason = "dpkg-identity:not-regular" },
+        .{ .change = .symlinked_bin_dir, .reason = "dpkg-identity:not-regular" },
+        .{ .change = .version, .reason = "dpkg-identity:version" },
+        .{ .change = .status_architecture, .reason = "dpkg-identity:version" },
+        .{ .change = .no_root, .reason = "dpkg-identity:unreadable" },
+    }) |case| {
+        var f = try Driver.init();
+        defer f.deinit();
+        const wrong_arch = if (std.mem.eql(u8, f.arch, "amd64")) "arm64" else "amd64";
+        if (case.change != .no_root)
+            try writeAuditRoot(&f, if (case.change == .version) "1.23.7ubuntu1" else audit_version, if (case.change == .status_architecture) wrong_arch else f.arch);
+        switch (case.change) {
+            .merged_sbin => try auditLink(&f, "usr/sbin", "audit-root/sbin"),
+            .usr_sbin => try f.work.write("audit-root/usr/sbin/dpkg", audit_dpkg),
+            .dangling_local => try auditLink(&f, "/nonexistent/dpkg", "audit-root/usr/local/bin/dpkg"),
+            .absolute_sbin => {
+                try f.work.write("audit-root/opt/alternate/dpkg", audit_dpkg);
+                try auditLink(&f, "/opt/alternate", "audit-root/sbin");
+            },
+            .symlinked_dpkg => {
+                try f.work.write("audit-root/usr/lib/dpkg/dpkg", audit_dpkg);
+                try f.work.directory.dir.deleteFile(support.io, "audit-root/usr/bin/dpkg");
+                try auditLink(&f, "../lib/dpkg/dpkg", "audit-root/usr/bin/dpkg");
+            },
+            .symlinked_bin_dir => {
+                const bin = try f.work.path("audit-root/usr/bin");
+                defer support.allocator.free(bin);
+                const moved_to = try f.work.path("audit-root/usr/alt-bin");
+                defer support.allocator.free(moved_to);
+                const moved = try support.run(&.{ "mv", bin, moved_to });
+                defer moved.deinit();
+                try moved.ok();
+                try auditLink(&f, "alt-bin", "audit-root/usr/bin");
+            },
+            else => {},
+        }
+        const reviewed = auditHex(audit_dpkg);
+        const other = auditHex("unreviewed dpkg\n");
+        const result = switch (case.change) {
+            .digest => try auditWith(&f, "--audit-exec-trace-fixture", allowed, &other, audit_dpkg_size),
+            .size => try auditWith(&f, "--audit-exec-trace-fixture", allowed, &reviewed, "23"),
+            .reviewed_pins => try auditWith(&f, "--audit-exec-trace", allowed, "", ""),
+            else => try auditFixture(&f, allowed),
+        };
+        defer result.deinit();
+        if (case.reason) |reason| {
+            try expectRefused(result, reason);
+            try support.contains(result.stdout, recorded);
+        } else {
+            try expectAllowed(result, allowed_record);
+        }
+    }
+}
+
+test "snapshot: exec audit accepts only the /usr/bin/dpkg filename even when /bin is the usrmerge link" {
+    var f = try Driver.init();
+    defer f.deinit();
+    try writeAuditRoot(&f, audit_version, f.arch);
+    try auditLink(&f, "usr/bin", "audit-root/bin");
+    for ([_]struct { path: []const u8, argv0: []const u8, reason: ?[]const u8 }{
+        .{ .path = "/usr/bin/dpkg", .argv0 = "dpkg", .reason = null },
+        .{ .path = "/usr/bin/dpkg", .argv0 = "/usr/bin/dpkg", .reason = null },
+        .{ .path = "/bin/dpkg", .argv0 = "dpkg", .reason = "path" },
+        .{ .path = "/bin/dpkg", .argv0 = "/bin/dpkg", .reason = "path" },
+        .{ .path = "/bin/dpkg", .argv0 = "/usr/bin/dpkg", .reason = "path" },
+        .{ .path = "/usr/bin/dpkg", .argv0 = "/bin/dpkg", .reason = "argv0" },
+    }) |case| {
+        const argv = try std.fmt.allocPrint(support.allocator, "\"{s}\", \"-L\", \"python3\"", .{case.argv0});
+        defer support.allocator.free(argv);
+        const args = try dpkgArgs(case.path, argv);
+        defer support.allocator.free(args);
+        const trace = try scriptTrace(audit_script, "execve", args, "0");
+        defer support.allocator.free(trace);
+        const result = try auditFixture(&f, trace);
+        defer result.deinit();
+        if (case.reason) |reason| {
+            try expectRefused(result, reason);
+            const path = try std.fmt.allocPrint(support.allocator, " path=\"{s}\" ", .{case.path});
+            defer support.allocator.free(path);
+            try support.contains(result.stdout, path);
+        } else {
+            const record = try std.fmt.allocPrint(support.allocator, "script_dpkg_exec line=6 pid=703" ++ audit_lineage ++ "[\"{s}\",\"-L\",\"python3\"]\n", .{case.argv0});
+            defer support.allocator.free(record);
+            try expectAllowed(result, record);
+        }
+    }
+}
+
+test "snapshot: exec audit without dpkg needs no root and unauditable input fails closed" {
+    var f = try Driver.init();
+    defer f.deinit();
+    const quiet =
+        \\700 execve("/opt/debz/bin/debz", ["debz"], 0x1 /* 1 var */) = 0
+        \\700 clone(child_stack=NULL, flags=SIGCHLD) = 702
+        \\702 execve("/var/lib/debz-lifecycle-scripts/tzdata.postinst", ["/var/lib/debz-lifecycle-scripts/tzdata.postinst"], 0x1 /* 1 var */) = 0
+        \\702 execve("/usr/bin/dpkg-split-helper", ["dpkg-split-helper"], 0x1 /* 1 var */) = 0
+        \\
+    ;
+    for ([_][]const u8{ "--audit-exec-trace", "--audit-exec-trace-fixture" }) |mode| {
+        const digest = auditHex(audit_dpkg);
+        const passed = try auditWith(&f, mode, quiet, &digest, audit_dpkg_size);
+        defer passed.deinit();
+        try passed.ok();
+        try testing.expectEqualStrings("allowed_script_dpkg_exec=0\nforbidden_dpkg_exec=false\n", passed.stdout);
+    }
+    const missing_trace = try f.run(f.keyring, &.{ "--audit-exec-trace", "/nonexistent/trace", "/nonexistent/root", f.arch, audit_debz });
+    defer missing_trace.deinit();
+    try testing.expectEqual(@as(u8, 91), missing_trace.code);
+    try support.contains(missing_trace.stderr, "exec trace unreadable");
+    const unreviewed = try f.run(f.keyring, &.{ "--audit-exec-trace", "/nonexistent/trace", "/nonexistent/root", "i386", audit_debz });
+    defer unreviewed.deinit();
+    try testing.expectEqual(@as(u8, 91), unreviewed.code);
+    try support.contains(unreviewed.stderr, "no reviewed script dpkg identity for i386");
+    const usage = try f.run(f.keyring, &.{ "--audit-exec-trace", "/nonexistent/trace" });
+    defer usage.deinit();
+    try testing.expectEqual(@as(u8, 2), usage.code);
+}
+
+test "snapshot: script dpkg pins are per architecture and bound to the pinned snapshot" {
+    const runner = try source("tools/real-snapshot-acceptance.sh");
+    defer support.allocator.free(runner);
+    for ([_][]const u8{
+        "readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z\n",
+        "readonly script_dpkg_snapshot=20261001T000000Z\n",
+        "readonly script_dpkg_version=1.23.7ubuntu2\n",
+        "readonly script_dpkg_amd64='6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f 322728'\n",
+        "readonly script_dpkg_arm64='d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4 330816'\n",
+        "[[ \"$pinned_uri\" == */\"$script_dpkg_snapshot\" ]]",
+        "    amd64) echo \"$script_dpkg_amd64\" ;;\n",
+        "    arm64) echo \"$script_dpkg_arm64\" ;;\n",
+        "ACTIONS = (\"--compare-versions\", \"--validate-version\", \"--print-architecture\", \"-s\", \"-L\", \"-l\")\n",
+        "REFUSED_OPTIONS = (\"--root\", \"--admindir\", \"--instdir\", \"--force\")\n",
+        "ARGV0 = (\"dpkg\", \"/usr/bin/dpkg\")\n",
+        "elif not argv or argv[0] not in ARGV0:",
+        "elif path != \"/usr/bin/dpkg\":",
+        "native-exec-audit.txt",
+        "exec-audit-summary.txt",
+    }) |required| try support.contains(runner, required);
+    const workflow = try source(".github/workflows/ci.yml");
+    defer support.allocator.free(workflow);
+    const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n") orelse return error.MissingSnapshotJob;
+    const job = workflow[start..];
+    try support.contains(job, "sudo tools/real-snapshot-acceptance.sh --audit-exec-trace \\\n");
+    try support.contains(job, "candidate=\"$(realpath zig-out/bin/debz)\"");
+    try support.contains(job, ">\"$evidence/forbidden-exec.txt\"");
+    try support.contains(job, "tee -a \"$GITHUB_STEP_SUMMARY\"");
+    try testing.expect(std.mem.indexOf(u8, workflow, "--audit-exec-trace-fixture") == null);
+    try testing.expect(std.mem.indexOf(u8, workflow, "execveat\\(") == null);
 }
 
 test "snapshot: reference rejects corrupt cached archive before creating root or snapshot" {
@@ -518,7 +1292,6 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
     const job = workflow[start..];
     for ([_][]const u8{
         "if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot",
-        "timeout-minutes: 90",
         "- architecture: amd64",
         "- architecture: arm64",
         "real-snapshot-acceptance.sh --validate",
@@ -538,6 +1311,43 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
     try testing.expect(std.mem.indexOf(u8, workflow[0..start], "schedule:\n") != null);
 }
 
+fn minutesAfter(text: []const u8, marker: []const u8) !u64 {
+    return numberBetween(text, marker, "\n");
+}
+
+fn numberBetween(text: []const u8, marker: []const u8, terminator: []const u8) !u64 {
+    const start = (std.mem.indexOf(u8, text, marker) orelse return error.MissingTimeBudget) + marker.len;
+    const end = std.mem.indexOfPos(u8, text, start, terminator) orelse return error.MissingTimeBudget;
+    return std.fmt.parseInt(u64, text[start..end], 10);
+}
+
+test "snapshot: manual job budgets cover the reviewed install ceiling and the pinned reference" {
+    const workflow = try source(".github/workflows/ci.yml");
+    defer support.allocator.free(workflow);
+    const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n") orelse return error.MissingSnapshotJob;
+    const job = workflow[start..];
+    const job_minutes = try minutesAfter(job, "\n    timeout-minutes: ");
+    const native_minutes = try minutesAfter(job, "- name: Create and replay exact native Ubuntu root\n        timeout-minutes: ");
+    const reference_minutes = try minutesAfter(job, "- name: Install exact closure with pinned dpkg reference\n        timeout-minutes: ");
+    const diagnostics_minutes = try minutesAfter(job, "- name: Collect diagnostics and clean staged payloads\n        if: always()\n        timeout-minutes: ");
+    const runner = try source("tools/real-snapshot-acceptance.sh");
+    defer support.allocator.free(runner);
+    const ceiling_minutes = try numberBetween(runner, "readonly maximum_install_ceiling_seconds=$((", " * 60))\n");
+    try testing.expectEqual(@as(u64, 300), job_minutes);
+    try testing.expectEqual(@as(u64, 220), native_minutes);
+    try testing.expectEqual(@as(u64, 50), reference_minutes);
+    try testing.expectEqual(@as(u64, 15), diagnostics_minutes);
+    // Refresh, planning, download, verification and the zero-action update
+    // need their own budget beyond the install ceiling; the reference keeps
+    // its 40-minute pinned-dpkg limit; setup, build and upload need 15.
+    try testing.expect(native_minutes >= ceiling_minutes + 30);
+    try testing.expect(reference_minutes >= 45);
+    try testing.expect(job_minutes >= native_minutes + reference_minutes + diagnostics_minutes + 15);
+    const reference = try source("tools/real-snapshot-reference.sh");
+    defer support.allocator.free(reference);
+    try support.contains(reference, "timeout --signal=TERM --kill-after=30s 40m");
+}
+
 test "snapshot: runner bounds and native backend safety checks remain explicit" {
     const runner = try source("tools/real-snapshot-acceptance.sh");
     defer support.allocator.free(runner);
@@ -547,9 +1357,16 @@ test "snapshot: runner bounds and native backend safety checks remain explicit" 
         "max_cache_bytes=$((2 * 1024 * 1024 * 1024))",
         "maximum_release_age_seconds=$((31 * 24 * 60 * 60))",
         "DEBZ_REAL_SNAPSHOT_KEYRING",
-        "trace=execve,execveat",
+        "strace -f --seccomp-bpf -qq -yy -s 4096 --pidns-translation -e signal=none\n      -e trace=execve,execveat,fork,vfork,clone,clone3 -o \"$evidence/$name.execve\"",
+        "readonly operation_limit=30m",
+        "readonly verification_limit=10m",
+        "readonly maximum_install_progress_limit_seconds=$((20 * 60))",
+        "readonly maximum_install_ceiling_seconds=$((180 * 60))",
+        "install progress bounds may only tighten the reviewed limits",
+        "kill -ALRM \"$pid\"",
+        "--kill-after=30s \"$((install_ceiling_seconds + 30))s\"",
         "candidate execution trace missing",
-        "forbidden_dpkg_exec=true",
+        "outside the reviewed script exception during",
         "unexpected candidate stderr during",
         "candidate package claims excluded chroot device",
         "update-zero-actions.txt",
