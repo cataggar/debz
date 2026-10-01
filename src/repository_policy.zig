@@ -1,6 +1,7 @@
 const std = @import("std");
 const acquisition = @import("repository_acquisition.zig");
 const cache_module = @import("metadata_cache.zig");
+const content_digest = @import("content_digest.zig");
 const debian_version = @import("debian_version.zig");
 const exact_lock_v3 = @import("exact_lock_v3.zig");
 const refresh_module = @import("repository_refresh.zig");
@@ -612,7 +613,8 @@ fn repositoryId(repository: NormalizedRepository) source.RepositoryId {
     switch (repository.freshness) {
         .frozen_release_with_witnesses => |frozen| {
             hashPart(&hash, @tagName(repository.freshness));
-            hashPart(&hash, &frozen.release_sha256);
+            var tagged: [135]u8 = undefined;
+            hashPart(&hash, refresh_module.taggedDigestText(frozen.release_digest, &tagged));
             hashInt(&hash, @intCast(repository.freshness_witnesses.len));
             for (repository.freshness_witnesses) |suite| hashPart(&hash, suite);
         },
@@ -714,9 +716,9 @@ fn appendCanonical(
         .frozen_release_with_witnesses => |frozen| {
             try output.appendSlice(allocator, "\n# X-Debz-Expiry-Policy: ");
             try output.appendSlice(allocator, @tagName(repository.freshness));
-            try output.appendSlice(allocator, "\n# X-Debz-Frozen-Release-SHA256: ");
-            const digest = std.fmt.bytesToHex(frozen.release_sha256, .lower);
-            try output.appendSlice(allocator, &digest);
+            try output.appendSlice(allocator, "\n# X-Debz-Frozen-Release-Digest: ");
+            var tagged: [135]u8 = undefined;
+            try output.appendSlice(allocator, refresh_module.taggedDigestText(frozen.release_digest, &tagged));
             try output.appendSlice(allocator, "\n# X-Debz-Freshness-Witnesses:");
             for (repository.freshness_witnesses) |suite| {
                 try output.append(allocator, ' ');
@@ -2650,7 +2652,7 @@ test "non-frozen repository configuration identities stay byte-identical" {
 fn frozenPolicyPin() refresh_module.ExpiryPolicy {
     const fixture = @import("fixtures/openpgp.zig");
     return .{ .frozen_release_with_witnesses = .{
-        .release_sha256 = cache_module.Digest.of(&fixture.frozen_release).bytes,
+        .release_digest = content_digest.Value.of(.sha256, &fixture.frozen_release),
     } };
 }
 
@@ -2722,10 +2724,10 @@ test "frozen release freshness is identity canonical output and witness validate
         try std.testing.expectEqualStrings("stable-updates", repository.freshness_witnesses[1]);
     }
     try std.testing.expectEqual(@as(usize, 1), frozen_count);
-    const pin_hex = std.fmt.bytesToHex(pin.frozen_release_with_witnesses.release_sha256, .lower);
+    const pin_hex = std.fmt.bytesToHex(pin.frozen_release_with_witnesses.release_digest.sha256, .lower);
     const expected_lines = [_][]const u8{
         "# X-Debz-Expiry-Policy: frozen_release_with_witnesses\n",
-        "# X-Debz-Frozen-Release-SHA256: " ++ pin_hex ++ "\n",
+        "# X-Debz-Frozen-Release-Digest: sha256:" ++ pin_hex ++ "\n",
         "# X-Debz-Freshness-Witnesses: stable-security stable-updates\n",
     };
     for (expected_lines) |line|
@@ -2743,7 +2745,7 @@ test "frozen release freshness is identity canonical output and witness validate
 
     // The pin and the witness set are identity input.
     var other_pin = pin;
-    other_pin.frozen_release_with_witnesses.release_sha256[0] ^= 1;
+    other_pin.frozen_release_with_witnesses.release_digest.sha256[0] ^= 1;
     const variants = [_]Policy{
         .{ .freshness = other_pin, .freshness_witnesses = witnesses },
         .{ .freshness = pin, .freshness_witnesses = &.{"stable-updates"} },
@@ -2792,7 +2794,8 @@ test "frozen release freshness is identity canonical output and witness validate
         .{ .freshness = pin, .freshness_witnesses = &.{ "stable-updates", "stable-updates" } },
         .{ .freshness = pin, .freshness_witnesses = &.{"stable-updates/"} },
         .{ .freshness = pin, .freshness_witnesses = &.{""} },
-        .{ .freshness = .{ .frozen_release_with_witnesses = .{ .release_sha256 = @splat(0) } }, .freshness_witnesses = witnesses },
+        .{ .freshness = .{ .frozen_release_with_witnesses = .{ .release_digest = .{ .sha256 = @splat(0) } } }, .freshness_witnesses = witnesses },
+        .{ .freshness = .{ .frozen_release_with_witnesses = .{ .release_digest = content_digest.Value.of(.sha512, "stable") } }, .freshness_witnesses = witnesses },
         .{ .freshness = frozen_policy_bounded, .freshness_witnesses = witnesses },
         .{ .freshness = .require_valid_until, .freshness_witnesses = witnesses },
     };

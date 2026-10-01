@@ -45,9 +45,13 @@ clock override and without replaying historical time. It never compares the
 frozen pocket's own `Date` with the clock beyond the future-skew bound.
 Instead:
 
-1. The Release cleartext SHA-256 must equal the configured
-   `release_sha256` (`ReleaseFrozenDigestMismatch`), and the Release must have
-   no `Valid-Until` (`ReleaseFrozenValidUntilPresent`).
+1. The Release cleartext must match the configured algorithm-tagged
+   `release_digest`, a `content_digest.Value`
+   (`ReleaseFrozenDigestMismatch`), and the Release must have no
+   `Valid-Until` (`ReleaseFrozenValidUntilPresent`). SHA-256 is the only
+   accepted algorithm for now, because Release files publish only SHA-256 and
+   provenance records the cleartext as SHA-256; any other algorithm or an
+   all-zero digest is `InvalidConfiguration`.
 2. `RefreshPolicy.frozen_witnesses` must name one to four witnesses, built by
    `witnessEvidence` from authenticated results of the same refresh. An empty
    list, a witness that is itself frozen, or an expired witness is

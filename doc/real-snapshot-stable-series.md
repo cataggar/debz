@@ -252,10 +252,13 @@ A repository R configured with this policy is admitted at verification time
 refresh already uses: `RefreshPolicy` plus the injectable `Clock`, with no
 override.
 
-1. **Pinned bytes.** R's signed Release cleartext SHA-256 (the value recorded
+1. **Pinned bytes.** R's signed Release cleartext digest (the value recorded
    as `Provenance.release_digest` and lock `release_sha256`) equals the
-   configured `frozen_release_sha256`. Otherwise refusal is
-   `ReleaseFrozenDigestMismatch`. A Debian point release or an Ubuntu
+   configured, algorithm-tagged `frozen_release_digest`. Otherwise refusal is
+   `ReleaseFrozenDigestMismatch`. The pin is new content authority over index
+   metadata, so it is a `content_digest.Value`, never a raw 32-byte field, and
+   every wire form names its algorithm (`sha256:<hex>`). SHA-256 is the only
+   accepted algorithm for now, because Release files publish only SHA-256. A Debian point release or an Ubuntu
    re-publication therefore always needs a reviewed repin.
 2. **Really frozen.** R's Release has no `Valid-Until`
    (`ReleaseFrozenValidUntilPresent`). Its `Date` still obeys the existing
@@ -328,7 +331,7 @@ already accepts many. The release document becomes:
   "immutable": true,
   "freshness": {
     "mode": "frozen_release_with_witnesses",
-    "frozen_release_sha256": "596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834",
+    "frozen_release_digest": "sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834",
     "witness_suites": ["resolute-updates", "resolute-security"]
   }
 }
@@ -337,7 +340,8 @@ already accepts many. The release document becomes:
 `resolute-updates` and `resolute-security` keep
 `{"mode": "allow_missing_valid_until_with_max_age_seconds",
 "maximum_release_age_seconds": 2678400}`. Any unknown field, empty witness
-list, duplicate witness or digest that is not 64 lowercase hex characters is
+list, duplicate witness, untagged digest, digest with an algorithm other than
+`sha256`, or digest that is not 64 lowercase hex characters is
 `InvalidRepositoryConfig`. A self-reference or unresolved witness is the
 normalization diagnostic `invalid_freshness_witness`.
 `maximum_release_age_seconds` may be
@@ -351,8 +355,8 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
 
 | Layer | What changes |
 |---|---|
-| Normalized repository identity | `repository_policy.repositoryId` hashes the tag, `frozen_release_sha256` and the sorted witness suites. `configurationId` uses a new domain, `debz-multi-repository-configuration-v3`, only when a frozen repository is present, so v1/v2 identities of existing configurations are unchanged. `appendCanonical` emits `# X-Debz-Expiry-Policy: frozen_release_with_witnesses`, `# X-Debz-Frozen-Release-SHA256: …` and `# X-Debz-Freshness-Witnesses: …`. Conflict equality (`expiryPoliciesEqual`, `runtimeMatches`) compares all three. |
-| Snapshot provenance | `PolicyDecisions` gains `frozen_release_sha256`, the witness decisions (each witness's repository id, snapshot digest, signed `Date`, deadline and the matched fingerprint) and `admission_deadline_unix`. `snapshotDigest` hashes them under a new domain, `debz-authenticated-repository-snapshot-v4`, only for frozen repositories, so every existing digest and lock stays byte-identical. Frozen repositories store `SnapshotManifest`/`encodeSnapshot` as `debz-repository-snapshot-v5` in a new cache namespace, `repository-refresh-v5`; every other repository keeps v4 bytes and the v4 namespace. |
+| Normalized repository identity | `repository_policy.repositoryId` hashes the tag, the tagged `frozen_release_digest` text and the sorted witness suites. `configurationId` uses a new domain, `debz-multi-repository-configuration-v3`, only when a frozen repository is present, so v1/v2 identities of existing configurations are unchanged. `appendCanonical` emits `# X-Debz-Expiry-Policy: frozen_release_with_witnesses`, `# X-Debz-Frozen-Release-Digest: sha256:…` and `# X-Debz-Freshness-Witnesses: …`. Conflict equality (`expiryPoliciesEqual`, `runtimeMatches`) compares all three. |
+| Snapshot provenance | `PolicyDecisions` gains the tagged `release_digest`, the witness decisions (each witness's repository id, snapshot digest, signed `Date`, deadline and the matched fingerprint) and `admission_deadline_unix`. `snapshotDigest` hashes them under a new domain, `debz-authenticated-repository-snapshot-v4`, only for frozen repositories, so every existing digest and lock stays byte-identical. Frozen repositories store `SnapshotManifest`/`encodeSnapshot` as `debz-repository-snapshot-v5` in a new cache namespace, `repository-refresh-v5`; every other repository keeps v4 bytes and the v4 namespace. |
 | Exact lock | `schema/exact-closure-lock-v3.json` does not change. A lock binds the policy through `Repository.id` (repository identity) and `Repository.snapshot_sha256` (snapshot digest v4, which includes the witnesses' snapshot digests). This holds even when a witness contributes no package and so cannot appear in the lock (`error.UnusedRepository`). `doc/exact-locks-and-provenance.md` documents snapshot digest v4. An explicit `freshness` member in a future lock v4 is deferred until other v4 changes justify a new lock schema. |
 | Aggregate manifest | The `refreshAll` writer emits `debz-multi-repository-manifest-v2` only when a frozen repository is present, recording each frozen repository's admission deadline and witness repository IDs. Other manifests keep their v1 bytes. |
 
@@ -360,7 +364,12 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
 
 - **`src/repository_refresh.zig`**
   - Add `ExpiryPolicy.frozen_release_with_witnesses: FrozenRelease`, holding
-    `release_sha256: [32]u8`.
+    `release_digest: content_digest.Value`, plus `validFrozenReleaseDigest`
+    (SHA-256 only, non-zero), `parseFrozenReleaseDigest` and
+    `taggedDigestText`. Snapshot manifest v5 stores the algorithm byte before
+    the digest bytes. Only the witness snapshot digests are raw 32-byte
+    domain-separated controls; `src/repository_refresh.zig` joins the
+    `raw-control-and-compatibility-fields` semantic allowlist for them.
   - Update `validExpiryPolicy`, `expiryPolicyMaxAge` (returns `null`) and
     `expiryPoliciesEqual`.
   - Add `RefreshPolicy.frozen_witnesses: []const WitnessEvidence`. If it is
@@ -386,7 +395,8 @@ precedent set when the bounded missing-`Valid-Until` exception was added:
   - Emit aggregate manifest v2 only when a frozen repository is present.
 - **`src/production_backend.zig`**
   - Add the new mode to `ConfigFreshnessMode`.
-  - Add `ConfigFreshness.frozen_release_sha256` and `.witness_suites`.
+  - Add `ConfigFreshness.frozen_release_digest` (`sha256:<hex>`) and
+    `.witness_suites`.
   - Update `configuredFreshness` and `loadRepositoryDocuments`.
   - Extend the test "production repository config freshness is finite and
     explicit".

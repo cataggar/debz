@@ -4556,7 +4556,8 @@ const ConfigFreshnessMode = enum {
 const ConfigFreshness = struct {
     mode: ConfigFreshnessMode,
     maximum_release_age_seconds: ?u64 = null,
-    frozen_release_sha256: ?[]const u8 = null,
+    /// Algorithm-tagged text, `sha256:<lowercase hex>`.
+    frozen_release_digest: ?[]const u8 = null,
     witness_suites: ?[]const []const u8 = null,
 };
 
@@ -4575,7 +4576,7 @@ fn configuredFreshness(
     freshness: ConfigFreshness,
 ) !repository_refresh.ExpiryPolicy {
     const frozen = freshness.mode == .frozen_release_with_witnesses;
-    if (frozen != (freshness.frozen_release_sha256 != null) or
+    if (frozen != (freshness.frozen_release_digest != null) or
         frozen != (freshness.witness_suites != null))
         return error.InvalidRepositoryConfig;
     const policy: repository_refresh.ExpiryPolicy = switch (freshness.mode) {
@@ -4602,24 +4603,15 @@ fn configuredFreshness(
                 }
             }
             break :blk .{ .frozen_release_with_witnesses = .{
-                .release_sha256 = try lowercaseSha256(freshness.frozen_release_sha256.?),
+                .release_digest = repository_refresh.parseFrozenReleaseDigest(
+                    freshness.frozen_release_digest.?,
+                ) catch return error.InvalidRepositoryConfig,
             } };
         },
     };
     if (!repository_refresh.validExpiryPolicy(policy))
         return error.InvalidRepositoryConfig;
     return policy;
-}
-
-fn lowercaseSha256(text: []const u8) ![32]u8 {
-    if (text.len != 64) return error.InvalidRepositoryConfig;
-    for (text) |byte| switch (byte) {
-        '0'...'9', 'a'...'f' => {},
-        else => return error.InvalidRepositoryConfig,
-    };
-    var digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&digest, text) catch return error.InvalidRepositoryConfig;
-    return digest;
 }
 
 test "production repository config freshness is finite and explicit" {
@@ -4653,49 +4645,53 @@ test "production repository config freshness is finite and explicit" {
 }
 
 test "production repository config frozen release freshness is pinned and witnessed" {
-    const digest_hex = "596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834";
+    const hex = "596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834";
+    const digest_hex = "sha256:" ++ hex;
     var digest: [32]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&digest, digest_hex);
+    _ = try std.fmt.hexToBytes(&digest, hex);
     const witnesses: []const []const u8 = &.{ "resolute-updates", "resolute-security" };
     try std.testing.expect(repository_refresh.expiryPoliciesEqual(
-        .{ .frozen_release_with_witnesses = .{ .release_sha256 = digest } },
+        .{ .frozen_release_with_witnesses = .{ .release_digest = .{ .sha256 = digest } } },
         try configuredFreshness(.{
             .mode = .frozen_release_with_witnesses,
-            .frozen_release_sha256 = digest_hex,
+            .frozen_release_digest = digest_hex,
             .witness_suites = witnesses,
         }),
     ));
     const invalid = [_]ConfigFreshness{
         // Missing digest or witnesses.
         .{ .mode = .frozen_release_with_witnesses, .witness_suites = witnesses },
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = digest_hex },
         // Empty, oversized, blank and duplicate witness lists.
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{} },
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{ "a", "b", "c", "d", "e" } },
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{""} },
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex, .witness_suites = &.{ "resolute-updates", "resolute-updates" } },
-        // Digests must be exactly 64 lowercase hex characters and non-zero.
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = "596EE4CEA058F74D59E2180532C89904E306D90725D42162EDA82C01D4370834", .witness_suites = witnesses },
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = digest_hex[0..63], .witness_suites = witnesses },
-        .{ .mode = .frozen_release_with_witnesses, .frozen_release_sha256 = "0" ** 64, .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = digest_hex, .witness_suites = &.{} },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = digest_hex, .witness_suites = &.{ "a", "b", "c", "d", "e" } },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = digest_hex, .witness_suites = &.{""} },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = digest_hex, .witness_suites = &.{ "resolute-updates", "resolute-updates" } },
+        // Digests are tagged, SHA-256 only, exactly 64 lowercase hex
+        // characters, and non-zero.
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = hex, .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = "sha256:596EE4CEA058F74D59E2180532C89904E306D90725D42162EDA82C01D4370834", .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = digest_hex[0 .. digest_hex.len - 1], .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = "sha256:" ++ "0" ** 64, .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .frozen_release_digest = "sha512:" ++ hex ++ hex, .witness_suites = witnesses },
         // A frozen pocket has no maximum age of its own.
-        .{ .mode = .frozen_release_with_witnesses, .maximum_release_age_seconds = 2678400, .frozen_release_sha256 = digest_hex, .witness_suites = witnesses },
+        .{ .mode = .frozen_release_with_witnesses, .maximum_release_age_seconds = 2678400, .frozen_release_digest = digest_hex, .witness_suites = witnesses },
         // Frozen fields are refused for every other mode.
-        .{ .mode = .require_valid_until, .frozen_release_sha256 = digest_hex },
+        .{ .mode = .require_valid_until, .frozen_release_digest = digest_hex },
         .{ .mode = .allow_missing_valid_until_with_max_age_seconds, .maximum_release_age_seconds = 2678400, .witness_suites = witnesses },
     };
     for (invalid) |freshness|
         try std.testing.expectError(error.InvalidRepositoryConfig, configuredFreshness(freshness));
 
     var parsed = try std.json.parseFromSlice(WireRepositoryConfig, std.testing.allocator,
-        \\{"source_path":"/r.sources","immutable":true,"freshness":{"mode":"frozen_release_with_witnesses","frozen_release_sha256":"596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834","witness_suites":["resolute-updates","resolute-security"]}}
+        \\{"source_path":"/r.sources","immutable":true,"freshness":{"mode":"frozen_release_with_witnesses","frozen_release_digest":"sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834","witness_suites":["resolute-updates","resolute-security"]}}
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
     defer parsed.deinit();
     _ = try configuredFreshness(parsed.value.freshness.?);
     try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(
         WireRepositoryConfig,
         std.testing.allocator,
-        \\{"source_path":"/r.sources","freshness":{"mode":"frozen_release_with_witnesses","frozen_release_sha256":"596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834","witness_suites":["resolute-updates"],"clock":0}}
+        \\{"source_path":"/r.sources","freshness":{"mode":"frozen_release_with_witnesses","frozen_release_digest":"sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834","witness_suites":["resolute-updates"],"clock":0}}
     ,
         .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
     ));

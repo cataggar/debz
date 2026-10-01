@@ -40,10 +40,11 @@ A `frozen_release_with_witnesses` repository names witness suites
 configuration, to an enabled repository with the same URI, component,
 architecture and `Signed-By` whose own freshness is not frozen; otherwise
 normalization fails with `invalid_freshness_witness`. Witness lists must be
-non-empty, unique and at most four entries (`invalid_policy`). The pinned
-Release SHA-256 and sorted witness suites are repository identity input and
-appear in canonical output as `X-Debz-Expiry-Policy`,
-`X-Debz-Frozen-Release-SHA256` and `X-Debz-Freshness-Witnesses` comments. A
+non-empty, unique and at most four entries (`invalid_policy`). The pinned,
+algorithm-tagged Release digest and sorted witness suites are repository
+identity input and appear in canonical output as `X-Debz-Expiry-Policy`,
+`X-Debz-Frozen-Release-Digest` (`sha256:<hex>`) and
+`X-Debz-Freshness-Witnesses` comments. A
 configuration with a frozen repository uses configuration identity domain
 v3; all other configurations keep their v1/v2 identities. `refreshAll`
 refreshes every non-frozen repository first, then admits each frozen

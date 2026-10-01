@@ -234,7 +234,8 @@ regeneration; it never silently acquires the exception. Transaction
 provenance retains the same fail-closed snapshot comparison.
 Authenticated snapshot digest version 4 is used only for
 `frozen_release_with_witnesses` repositories. It hashes the version 3 inputs
-plus the pinned Release SHA-256, the admission deadline, and each witness's
+plus the pinned Release digest (algorithm name and bytes), the admission
+deadline, and each witness's
 repository ID, snapshot digest, signed `Date`, deadline and shared signer
 fingerprint. A lock therefore binds a frozen pocket's witnesses through
 `Repository.snapshot_sha256`, even when a witness contributes no locked

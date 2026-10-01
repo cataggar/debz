@@ -2461,10 +2461,12 @@ test "target_apt_config carries per-repository archive binding declarations" {
         .root_path = root_path,
         .architecture_override = "amd64",
         .dependencies = .{ .filesystem = files.interface() },
+    }));
+}
 
 test "target_apt_config refuses frozen release freshness" {
     const frozen: repository_refresh.ExpiryPolicy = .{
-        .frozen_release_with_witnesses = .{ .release_sha256 = @splat(7) },
+        .frozen_release_with_witnesses = .{ .release_digest = .{ .sha256 = @splat(7) } },
     };
     try std.testing.expect(repository_refresh.validExpiryPolicy(frozen));
     try std.testing.expectError(error.InvalidSourcePolicy, validateSourcePolicies(

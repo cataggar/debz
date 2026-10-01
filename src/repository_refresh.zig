@@ -58,10 +58,47 @@ pub const Mode = enum { online, cache_only };
 /// signed Release bytes equal the reviewed digest and fresh, same-key witness
 /// pockets from the same snapshot pass their own freshness policy.
 pub const FrozenRelease = struct {
-    /// SHA-256 of the signed Release cleartext, the value recorded as
+    /// Algorithm-tagged digest of the signed Release cleartext. It is
+    /// SHA-256 for now (`validFrozenReleaseDigest`), the value recorded as
     /// `Provenance.release_digest` and exact-lock `release_sha256`.
-    release_sha256: [32]u8,
+    release_digest: content_digest.Value,
 };
+
+/// Release files publish only SHA-256, and provenance and exact locks record
+/// the Release cleartext as SHA-256, so a frozen-release pin accepts no other
+/// algorithm yet. The tagged type keeps every wire form algorithm-explicit.
+pub fn validFrozenReleaseDigest(value: content_digest.Value) bool {
+    return switch (value) {
+        .sha256 => |bytes| !allZero(&bytes),
+        .sha512 => false,
+    };
+}
+
+/// Parses the tagged text form, `sha256:<lowercase hex>`.
+pub fn parseFrozenReleaseDigest(text: []const u8) error{InvalidDigest}!content_digest.Value {
+    const separator = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidDigest;
+    const algorithm = content_digest.Algorithm.parse(text[0..separator]) catch
+        return error.InvalidDigest;
+    const value = try content_digest.Value.parse(algorithm, text[separator + 1 ..]);
+    if (!validFrozenReleaseDigest(value)) return error.InvalidDigest;
+    return value;
+}
+
+/// Writes the tagged text form, `<algorithm>:<lowercase hex>`.
+pub fn taggedDigestText(value: content_digest.Value, output: *[135]u8) []const u8 {
+    var encoded: [128]u8 = undefined;
+    return std.fmt.bufPrint(output, "{s}:{s}", .{
+        value.algorithm().name(),
+        value.hex(&encoded),
+    }) catch unreachable;
+}
+
+fn digestBytes(value: *const content_digest.Value) []const u8 {
+    return switch (value.*) {
+        .sha256 => |*bytes| bytes,
+        .sha512 => |*bytes| bytes,
+    };
+}
 
 pub const ExpiryPolicy = union(enum) {
     require_valid_until,
@@ -73,7 +110,7 @@ pub fn validExpiryPolicy(policy: ExpiryPolicy) bool {
     return switch (policy) {
         .require_valid_until => true,
         .allow_missing_valid_until_with_max_age_seconds => |seconds| seconds != 0 and seconds <= maximum_missing_valid_until_age_seconds,
-        .frozen_release_with_witnesses => |frozen| !allZero(&frozen.release_sha256),
+        .frozen_release_with_witnesses => |frozen| validFrozenReleaseDigest(frozen.release_digest),
     };
 }
 
@@ -92,11 +129,7 @@ pub fn expiryPoliciesEqual(left: ExpiryPolicy, right: ExpiryPolicy) bool {
             else => false,
         },
         .frozen_release_with_witnesses => |frozen| switch (right) {
-            .frozen_release_with_witnesses => |other| std.mem.eql(
-                u8,
-                &frozen.release_sha256,
-                &other.release_sha256,
-            ),
+            .frozen_release_with_witnesses => |other| frozen.release_digest.eql(other.release_digest),
             else => false,
         },
     };
@@ -155,7 +188,7 @@ pub const WitnessDecision = struct {
 };
 
 pub const FrozenDecisions = struct {
-    release_sha256: [32]u8,
+    release_digest: content_digest.Value,
     /// The earliest witness deadline. Every later load recomputes it.
     admission_deadline_unix: i64,
     witness_count: u8,
@@ -170,7 +203,7 @@ fn frozenDecisionsEqual(left: ?FrozenDecisions, right: ?FrozenDecisions) bool {
     if (left == null or right == null) return left == null and right == null;
     const a = left.?;
     const b = right.?;
-    if (!std.mem.eql(u8, &a.release_sha256, &b.release_sha256) or
+    if (!a.release_digest.eql(b.release_digest) or
         a.admission_deadline_unix != b.admission_deadline_unix or
         a.witness_count != b.witness_count)
         return false;
@@ -359,7 +392,9 @@ pub fn snapshotDigest(result: *const AuthenticatedResult) [32]u8 {
         @intFromBool(policy.future_date_accepted),
     });
     if (policy.frozen) |*frozen| {
-        hash.update(&frozen.release_sha256);
+        hash.update(frozen.release_digest.algorithm().name());
+        hash.update("\x00");
+        hash.update(digestBytes(&frozen.release_digest));
         updateDigestInt(&hash, i64, frozen.admission_deadline_unix);
         hash.update(&.{frozen.witness_count});
         for (frozen.slice()) |witness| {
@@ -1026,7 +1061,7 @@ fn validateRelease(
         },
         // The frozen pocket's own age is never compared with `now`.
         .frozen_release_with_witnesses => |frozen| {
-            if (!cache_module.Digest.of(metadata.source).eql(.{ .bytes = frozen.release_sha256 }))
+            if (!frozen.release_digest.verify(metadata.source))
                 return error.ReleaseFrozenDigestMismatch;
             if (valid_until != null) return error.ReleaseFrozenValidUntilPresent;
             frozen_decisions = try admitFrozenRelease(
@@ -1071,7 +1106,7 @@ fn admitFrozenRelease(
     if (witnesses.len == 0) return error.ReleaseFrozenWitnessUnavailable;
     if (witnesses.len > maximum_freshness_witnesses) return error.InvalidConfiguration;
     var decisions: FrozenDecisions = .{
-        .release_sha256 = frozen.release_sha256,
+        .release_digest = frozen.release_digest,
         .admission_deadline_unix = std.math.maxInt(i64),
         .witness_count = @intCast(witnesses.len),
         .witnesses = std.mem.zeroes([maximum_freshness_witnesses]WitnessDecision),
@@ -1539,7 +1574,9 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
     if (manifest.frozen) |*frozen| {
         if (frozen.witness_count == 0 or frozen.witness_count > maximum_freshness_witnesses)
             return error.InvalidConfiguration;
-        try bytes.appendSlice(allocator, &frozen.release_sha256);
+        if (!validFrozenReleaseDigest(frozen.release_digest)) return error.InvalidConfiguration;
+        try bytes.append(allocator, @intFromEnum(frozen.release_digest.algorithm()));
+        try bytes.appendSlice(allocator, digestBytes(&frozen.release_digest));
         try appendInt(&bytes, allocator, i64, frozen.admission_deadline_unix);
         try bytes.append(allocator, frozen.witness_count);
         for (frozen.slice()) |witness| {
@@ -1669,8 +1706,13 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
     const index_bytes = reader.take(index_len);
     var frozen: ?FrozenDecisions = null;
     if (frozen_snapshot) {
+        const frozen_digest: content_digest.Value = switch (reader.byte()) {
+            @intFromEnum(content_digest.Algorithm.sha256) => .{ .sha256 = reader.array(32) },
+            else => return error.CorruptSnapshot,
+        };
+        if (!validFrozenReleaseDigest(frozen_digest)) return error.CorruptSnapshot;
         var decisions: FrozenDecisions = .{
-            .release_sha256 = reader.array(32),
+            .release_digest = frozen_digest,
             .admission_deadline_unix = reader.int(i64),
             .witness_count = reader.byte(),
             .witnesses = std.mem.zeroes([maximum_freshness_witnesses]WitnessDecision),
@@ -3391,7 +3433,7 @@ fn frozenTestRepository(id: u8, uri: []const u8, suite: []const u8) !Repository 
 
 fn frozenTestPin(release: []const u8) ExpiryPolicy {
     return .{ .frozen_release_with_witnesses = .{
-        .release_sha256 = cache_module.Digest.of(release).bytes,
+        .release_digest = content_digest.Value.of(.sha256, release),
     } };
 }
 
@@ -3528,8 +3570,8 @@ test "frozen release is admitted only through same-snapshot witnesses" {
     try std.testing.expectEqual(@as(?u64, null), policy.maximum_release_age_seconds);
     try std.testing.expect(!policy.missing_valid_until_exception_exercised);
     try std.testing.expectEqual(frozen_test_date, policy.release_date_unix);
-    try std.testing.expectEqualSlices(u8, &pin.frozen_release_with_witnesses.release_sha256, &frozen.release_sha256);
-    try std.testing.expectEqualSlices(u8, &frozen.release_sha256, &result.snapshot.provenance.release_digest.bytes);
+    try std.testing.expect(pin.frozen_release_with_witnesses.release_digest.eql(frozen.release_digest));
+    try std.testing.expectEqualSlices(u8, &frozen.release_digest.sha256, &result.snapshot.provenance.release_digest.bytes);
     // The admission deadline is the earliest witness deadline.
     try std.testing.expectEqual(witness_security_valid_until, frozen.admission_deadline_unix);
     try std.testing.expectEqual(@min(updates_deadline, witness_security_valid_until), frozen.admission_deadline_unix);
@@ -3549,7 +3591,7 @@ test "frozen release is admitted only through same-snapshot witnesses" {
     inline for (std.meta.tags(FrozenBinding)) |binding| {
         var changed = original_frozen;
         switch (binding) {
-            .release => changed.release_sha256[0] ^= 1,
+            .release => changed.release_digest.sha256[0] ^= 1,
             .deadline => changed.admission_deadline_unix -= 1,
             .count => changed.witness_count = 1,
             .witness_id => changed.witnesses[0].repository_id.bytes[0] ^= 1,
@@ -3643,6 +3685,18 @@ test "frozen release is admitted only through same-snapshot witnesses" {
     );
     defer stored.deinit();
     try std.testing.expect(std.mem.startsWith(u8, stored.bytes, frozen_snapshot_magic ++ "\n"));
+
+    // Manifest v5 stores the pin tagged: the algorithm byte, then its bytes.
+    var manifest = try decodeSnapshot(std.testing.allocator, stored.bytes);
+    defer if (manifest.signature_results.len != 0)
+        std.testing.allocator.free(manifest.signature_results);
+    try std.testing.expect(manifest.frozen.?.release_digest.eql(pin.frozen_release_with_witnesses.release_digest));
+    const tag_offset = stored.bytes.len - (1 + 32 + 8 + 1 + 2 * (64 + 32 + 8 + 8 + 20));
+    try std.testing.expectEqual(@intFromEnum(content_digest.Algorithm.sha256), stored.bytes[tag_offset]);
+    const tampered = try std.testing.allocator.dupe(u8, stored.bytes);
+    defer std.testing.allocator.free(tampered);
+    tampered[tag_offset] = @intFromEnum(content_digest.Algorithm.sha512);
+    try std.testing.expectError(error.CorruptSnapshot, decodeSnapshot(std.testing.allocator, tampered));
 }
 
 test "frozen release refusals are typed and publish nothing" {
@@ -3689,7 +3743,7 @@ test "frozen release refusals are typed and publish nothing" {
 
     // Frozen Release bytes that do not match the pin.
     var wrong_pin = pin;
-    wrong_pin.frozen_release_with_witnesses.release_sha256[31] ^= 1;
+    wrong_pin.frozen_release_with_witnesses.release_digest.sha256[31] ^= 1;
     try Expect.refusal(error.ReleaseFrozenDigestMismatch, &cache, repository, &fixture_data.frozen_in_release, wrong_pin, &witnesses.evidence, &now);
     try Expect.refusal(error.ReleaseFrozenDigestMismatch, &cache, repository, &fixture_data.frozen_newer_in_release, pin, &witnesses.evidence, &now);
 
@@ -3838,8 +3892,28 @@ test "frozen release refusals are typed and publish nothing" {
     try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, pin, &(.{witnesses.evidence[0]} ** (maximum_freshness_witnesses + 1)), &now);
     try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, frozen_test_bounded, &witnesses.evidence, &now);
     try std.testing.expect(!validExpiryPolicy(.{
-        .frozen_release_with_witnesses = .{ .release_sha256 = @splat(0) },
+        .frozen_release_with_witnesses = .{ .release_digest = .{ .sha256 = @splat(0) } },
     }));
+    // The pin is algorithm-tagged, and SHA-256 is the only accepted algorithm.
+    const sha512_pin: ExpiryPolicy = .{ .frozen_release_with_witnesses = .{
+        .release_digest = content_digest.Value.of(.sha512, &fixture_data.frozen_release),
+    } };
+    try std.testing.expect(!validExpiryPolicy(sha512_pin));
+    try Expect.refusal(error.InvalidConfiguration, &cache, repository, &fixture_data.frozen_in_release, sha512_pin, &witnesses.evidence, &now);
+    var tagged_buffer: [135]u8 = undefined;
+    const tagged = taggedDigestText(pin.frozen_release_with_witnesses.release_digest, &tagged_buffer);
+    try std.testing.expect(std.mem.startsWith(u8, tagged, "sha256:"));
+    try std.testing.expect(pin.frozen_release_with_witnesses.release_digest.eql(try parseFrozenReleaseDigest(tagged)));
+    var sha512_buffer: [135]u8 = undefined;
+    for ([_][]const u8{
+        tagged[7..],
+        tagged[0 .. tagged.len - 1],
+        "SHA256:" ++ "a" ** 64,
+        "sha256:" ++ "A" ** 64,
+        "sha256:" ++ "0" ** 64,
+        "sha1:" ++ "a" ** 40,
+        taggedDigestText(sha512_pin.frozen_release_with_witnesses.release_digest, &sha512_buffer),
+    }) |text| try std.testing.expectError(error.InvalidDigest, parseFrozenReleaseDigest(text));
 
     // A frozen pocket is never admitted without authentication.
     var fixture: TestFixture = .{
