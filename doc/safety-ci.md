@@ -27,7 +27,7 @@ workload command runs in exactly one job:
 | `build-and-test-workload-production` | `test-workload-production` (package family, production backend, required security and customize tests); pinned `test-native-triggers-zig` and `test-native-diversion-settlement-zig` |
 | `build-and-test-workload-apt-system` | `test-workload-apt-system` (system profile, apt system API/CLI/command/state/orchestrator and required orchestrator security tests); installed-CLI `test-apt-system-acceptance` in both modes; Debug privileged `test-apt-system` |
 | `build-and-test-workload-native` | `test-workload-native` (native alternatives, snapshot, differential, fixture, conffile, dpkg reference/evidence, SHA-512, trigger queue, lifecycle/trigger/settlement unit and recovery unit tests); pinned `test-native-materialization`, `test-native-conffiles`, `test-native-differential` and `test-native-lifecycle-zig`; `test-native-helper-namespace` |
-| `build-and-test-workload-release` | `test-workload-release` (apt schema and native-only rehearsal); `fuzz`; Debug `test-release`; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
+| `build-and-test-workload-release` | `test-workload-release` (apt schema, native-only rehearsal and the real-snapshot repin harness); `fuzz`; Debug `test-release`; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
 
 The security audit enforces this inventory in three ways:
 

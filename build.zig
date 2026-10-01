@@ -427,6 +427,19 @@ pub fn build(b: *std.Build) void {
     const run_snapshot_policy_tests = b.addRunArtifact(snapshot_policy_tests);
     run_snapshot_policy_tests.setCwd(b.path("."));
     audit_step.dependOn(&run_snapshot_policy_tests.step);
+    const snapshot_repin_options = b.addOptions();
+    snapshot_repin_options.addOptionPath("debz", cli.getEmittedBin());
+    const snapshot_repin_module = b.createModule(.{
+        .root_source_file = b.path("test/real-snapshot-repin.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    snapshot_repin_module.addOptions("real_snapshot_repin_options", snapshot_repin_options);
+    const run_snapshot_repin_tests = b.addRunArtifact(b.addTest(.{ .root_module = snapshot_repin_module }));
+    run_snapshot_repin_tests.setCwd(b.path("."));
+    b.step("test-real-snapshot-repin", "Drive the real-snapshot repin tool against synthetic signed snapshots")
+        .dependOn(&run_snapshot_repin_tests.step);
+    workload_release.dependOn(&run_snapshot_repin_tests.step);
     const audit_tests = b.addSystemCommand(
         &.{
             "env",
@@ -442,6 +455,7 @@ pub fn build(b: *std.Build) void {
             "tools/test_release_workflow_policy.py",
             "tools/test_debian_stable_readiness.py",
             "tools/test_debian_stable_closure.py",
+            "tools/test_real_snapshot_repin.py",
         },
     );
     audit_step.dependOn(&audit_tests.step);
@@ -2072,6 +2086,7 @@ fn installReleaseFiles(
         "product-api.md",
         "project-status.md",
         "real-snapshot-stable-series.md",
+        "real-snapshot-repin.md",
         "repository-management.md",
         "release-installation.md",
         "release-tooling.md",
