@@ -346,3 +346,23 @@ as much unaccelerated hashing (#307).
 `-Dnative-helper-debug-info=true` retains the
 metadata for helper debugging; use that option consistently when building the
 caller and helper because their exact byte/digest binding still applies.
+
+Each helper authentication hashes the exact bytes it decides on, and hashes
+them once (#324). Only the bundled helper's SHA-256 is cached. It is computed
+once per process for the embedded read-only image and reused only for that
+exact slice (address and length). Any other buffer, including an equal copy,
+is hashed again. No digest of a published, retained or pinned helper file is
+cached by path, inode or timestamp. Staging, binding, the namespace probe,
+launch, evidence retention, completion and receipt verification each read the
+file again and hash what they read. Checks that previously re-hashed a buffer
+they had just hashed now compare that digest instead:
+`Binding.matchesBytes` and `Binding.matchesObserved` serve completion and
+receipt verification, a present fresh-root source is verified once per
+staging, and bootstrap binding checks the pinned source's attributes
+without re-reading the bytes that `bind` has just hashed through the pinned
+descriptor. In the repository execution fixture this cut helper-sized
+hashes from 1558 to 687 per success run. Test builds count these
+computations by subject (`native_helper.digestCount`,
+`maintainer_script.helperDigestCount`), and unit tests use the counts to
+show that one digest is cached and that changing a byte afterwards is still
+refused at stage, bind, probe and launch.

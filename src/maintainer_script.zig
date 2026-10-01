@@ -181,6 +181,14 @@ pub const HelperEvidence = struct {
     sha256: [32]u8,
 };
 
+var helper_digest_count: std.atomic.Value(u64) = .init(0);
+
+/// Test seam: pinned helper source hashes so far, at bind and at launch.
+pub fn helperDigestCount() u64 {
+    if (!builtin.is_test) @compileError("helperDigestCount is a test seam");
+    return helper_digest_count.load(.monotonic);
+}
+
 /// One verified helper and existing target, pinned for a single invocation.
 /// The caller keeps the root and this binding alive until execution returns.
 pub const HelperMount = struct {
@@ -228,6 +236,7 @@ pub const HelperMount = struct {
         const observed = try self.source.observeAlloc(allocator, 32 * 1024 * 1024);
         defer allocator.free(observed.bytes);
         if (observed.entry.mode & 0o111 == 0) return error.HelperNotExecutable;
+        if (builtin.is_test) _ = helper_digest_count.fetchAdd(1, .monotonic);
         var sha256: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(observed.bytes, &sha256, .{});
         if (!std.mem.eql(u8, &sha256, &self.evidence.sha256))
@@ -3917,6 +3926,32 @@ test "maintainer_script.test.helper binding rejects changed source and target" {
     try mount.verify(testing.allocator);
     try writeExecutableScript(&directory, "target", "externally-changed-target");
     try testing.expectError(error.PathChanged, mount.verify(testing.allocator));
+}
+
+test "maintainer_script.test.helper binding rehashes the pinned source at every verify" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    try writeExecutableScript(&directory, "source", "native-helper");
+    try writeExecutableScript(&directory, "target", "original-helper");
+    const root = root_fs.Root.init(testing.io, directory.dir);
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("native-helper", &sha256, .{});
+    const before = helperDigestCount();
+    var mount = try HelperMount.init(testing.allocator, root, "source", "target", sha256);
+    defer mount.deinit();
+    try mount.verify(testing.allocator);
+    try mount.verify(testing.allocator);
+    try testing.expectEqual(before + 3, helperDigestCount());
+    // Same-size bytes written through the pinned inode are refused by the
+    // identity check or, within one timestamp tick, by the digest.
+    try writeExecutableScript(&directory, "source", "native-HELPER");
+    if (mount.verify(testing.allocator)) |_|
+        return error.TestUnexpectedResult
+    else |err| switch (err) {
+        error.PathChanged, error.HelperDigestMismatch => {},
+        else => return err,
+    }
 }
 
 test "maintainer_script.test.helper identity is bound without changing the environment" {

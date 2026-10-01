@@ -28683,9 +28683,7 @@ fn verifyNativeHelperBytes(
     try helper.validateAny();
     const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init(helper.source_path), native_helper.maximum_bytes);
     defer allocator.free(bytes);
-    var sha256: [32]u8 = undefined;
-    Sha256.hash(bytes, &sha256, .{});
-    try helper.matches(.{ .bytes = bytes, .sha256 = sha256 });
+    try helper.matchesBytes(bytes);
 }
 
 fn executePreparedNativeProgramWithHelper(
@@ -29705,9 +29703,7 @@ fn readProductionCompletion(
     if (request.helper()) |helper| {
         const helper_bytes = try retainedNativeBytes(allocator, root, receipt.document, .helper_binary);
         defer allocator.free(helper_bytes);
-        var sha256: [32]u8 = undefined;
-        Sha256.hash(helper_bytes, &sha256, .{});
-        try helper.matches(.{ .bytes = helper_bytes, .sha256 = sha256 });
+        try helper.matchesBytes(helper_bytes);
     }
     const progress_bytes = try retainedNativeBytes(
         allocator,

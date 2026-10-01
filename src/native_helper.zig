@@ -1,6 +1,7 @@
 //! Trusted helper deployment never creates or replaces its package-owned target.
 //! Sources are immutable, content-addressed files in debz's private namespace.
 const std = @import("std");
+const builtin = @import("builtin");
 const content_digest = @import("content_digest.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const root_fs = @import("root_fs.zig");
@@ -18,6 +19,69 @@ pub const maximum_bytes = 32 * 1024 * 1024;
 const cleanup_prepared = "prepared\n";
 const cleanup_completed = "completed\n";
 
+/// What a helper-sized SHA-256 computation authenticates. Only `.bundled` is
+/// ever reused; every other subject is hashed again at each check.
+pub const DigestSubject = enum {
+    /// The helper embedded in this process image, hashed once per process.
+    bundled,
+    /// Caller-supplied `Source` bytes outside the embedded image.
+    supplied,
+    /// Bytes read from a published or retained helper file.
+    retained,
+    /// The attempt-scoped bootstrap source, read by its private path.
+    published,
+    /// The package-owned `dpkg-trigger` target.
+    target,
+    /// The pinned helper descriptor, at bind and again at launch.
+    pinned,
+};
+
+var digest_counts: [std.enums.values(DigestSubject).len]std.atomic.Value(u64) =
+    @splat(.init(0));
+
+fn helperDigest(subject: DigestSubject, bytes: []const u8) [32]u8 {
+    if (builtin.is_test) _ = digest_counts[@intFromEnum(subject)].fetchAdd(1, .monotonic);
+    var sha256: [32]u8 = undefined;
+    Sha256.hash(bytes, &sha256, .{});
+    return sha256;
+}
+
+/// Test seam: helper-content SHA-256 computations so far, by subject.
+pub fn digestCount(subject: DigestSubject) u64 {
+    if (!builtin.is_test) @compileError("digestCount is a test seam");
+    if (subject == .pinned) return maintainer_script.helperDigestCount();
+    return digest_counts[@intFromEnum(subject)].load(.monotonic);
+}
+
+/// The embedded helper is mapped read-only from the executable, so its digest
+/// is computed once and reused only for that exact slice. Racing first callers
+/// each hash; one publishes, and none waits.
+const EmbeddedSource = struct {
+    bytes: []const u8,
+    state: std.atomic.Value(u8) = .init(empty),
+    source: Source = undefined,
+
+    const empty = 0;
+    const publishing = 1;
+    const ready = 2;
+
+    fn covers(self: *const EmbeddedSource, bytes: []const u8) bool {
+        return bytes.ptr == self.bytes.ptr and bytes.len == self.bytes.len;
+    }
+
+    fn get(self: *EmbeddedSource) Source {
+        if (self.state.load(.acquire) == ready) return self.source;
+        const computed: Source = .{ .bytes = self.bytes, .sha256 = helperDigest(.bundled, self.bytes) };
+        if (self.state.cmpxchgStrong(empty, publishing, .acquire, .monotonic) == null) {
+            self.source = computed;
+            self.state.store(ready, .release);
+        }
+        return computed;
+    }
+};
+
+var embedded: EmbeddedSource = .{ .bytes = @embedFile("debz_native_trigger_helper") };
+
 pub const Source = struct {
     bytes: []const u8,
     sha256: [32]u8,
@@ -25,18 +89,17 @@ pub const Source = struct {
     pub fn validate(self: Source) !void {
         if (self.bytes.len == 0 or self.bytes.len > maximum_bytes)
             return error.InvalidNativeHelper;
-        var observed: [32]u8 = undefined;
-        Sha256.hash(self.bytes, &observed, .{});
+        const observed = if (embedded.covers(self.bytes))
+            embedded.get().sha256
+        else
+            helperDigest(.supplied, self.bytes);
         if (!std.mem.eql(u8, &observed, &self.sha256))
             return error.NativeHelperDigestMismatch;
     }
 };
 
 pub fn bundled() Source {
-    const bytes = @embedFile("debz_native_trigger_helper");
-    var sha256: [32]u8 = undefined;
-    Sha256.hash(bytes, &sha256, .{});
-    return .{ .bytes = bytes, .sha256 = sha256 };
+    return embedded.get();
 }
 
 pub const Binding = struct {
@@ -96,8 +159,29 @@ pub const Binding = struct {
     pub fn matches(self: Binding, source: Source) !void {
         try self.validateAny();
         try source.validate();
-        if (self.size != source.bytes.len or
-            !std.mem.eql(u8, &self.sha256, &std.fmt.bytesToHex(source.sha256, .lower)))
+        try self.matchesObserved(source.bytes.len, std.fmt.bytesToHex(source.sha256, .lower));
+    }
+
+    /// Authenticates bytes read from published or retained helper evidence
+    /// with exactly one hash of those bytes.
+    pub fn matchesBytes(self: Binding, bytes: []const u8) !void {
+        try self.validateAny();
+        if (bytes.len == 0 or bytes.len > maximum_bytes)
+            return error.InvalidNativeHelper;
+        try self.matchesObserved(
+            bytes.len,
+            std.fmt.bytesToHex(helperDigest(.retained, bytes), .lower),
+        );
+    }
+
+    /// Compares only. `sha256` must either be the digest the caller has just
+    /// computed over the `size` bytes it holds, or a recorded digest already
+    /// fail-closed verified against exactly those bytes. Never pass an
+    /// unverified recorded claim.
+    pub fn matchesObserved(self: Binding, size: u64, sha256: [64]u8) !void {
+        try self.validateAny();
+        if (size == 0 or size > maximum_bytes) return error.InvalidNativeHelper;
+        if (self.size != size or !std.mem.eql(u8, &self.sha256, &sha256))
             return error.NativeHelperDigestMismatch;
     }
 };
@@ -343,8 +427,7 @@ pub fn verifyBootstrapTarget(
         std.math.cast(usize, target.size) orelse return error.InvalidNativeHelperBootstrap,
     );
     defer allocator.free(bytes);
-    var observed: [32]u8 = undefined;
-    Sha256.hash(bytes, &observed, .{});
+    const observed = helperDigest(.target, bytes);
     if (!std.mem.eql(u8, &std.fmt.bytesToHex(observed, .lower), &target.sha256))
         return error.NativeHelperTargetDrift;
 }
@@ -355,6 +438,17 @@ pub fn verifyBootstrapPrivateState(
     bootstrap: Bootstrap,
     source_required: bool,
 ) !void {
+    _ = try observeBootstrapPrivateState(allocator, root, bootstrap, source_required);
+}
+
+/// Returns whether the private source exists; when it does, its bytes were
+/// hashed and matched by this call.
+fn observeBootstrapPrivateState(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    bootstrap: Bootstrap,
+    source_required: bool,
+) !bool {
     try bootstrap.validate();
     const root_entry = try root.rootEntry();
     if (!root_entry.modeled or root_entry.inode != bootstrap.root_inode)
@@ -371,7 +465,7 @@ pub fn verifyBootstrapPrivateState(
     );
     if (source_entry == null) {
         if (source_required) return error.NativeHelperEvidenceMissing;
-        return;
+        return false;
     }
     const entry = source_entry.?;
     if (!entry.modeled or entry.kind != .file or entry.link_count != 1 or
@@ -385,10 +479,10 @@ pub fn verifyBootstrapPrivateState(
         maximum_bytes,
     );
     defer allocator.free(bytes);
-    var observed: [32]u8 = undefined;
-    Sha256.hash(bytes, &observed, .{});
+    const observed = helperDigest(.published, bytes);
     if (!std.mem.eql(u8, &std.fmt.bytesToHex(observed, .lower), &bootstrap.helper.sha256))
         return error.NativeHelperEvidenceChanged;
+    return true;
 }
 
 pub fn stageBootstrap(
@@ -400,12 +494,11 @@ pub fn stageBootstrap(
     try bootstrap.validate();
     try bootstrap.helper.matches(source);
     try verifyBootstrapTarget(allocator, root, bootstrap.target);
-    try verifyBootstrapPrivateState(allocator, root, bootstrap, false);
-    const path = try root_fs.Path.init(bootstrap.helper.source_path);
-    if (try root.entryIfExists(path) != null) {
-        try verifyBootstrapPrivateState(allocator, root, bootstrap, true);
+    // A source that is already present was just hashed and matched; hashing
+    // it again here would authenticate nothing new.
+    if (try observeBootstrapPrivateState(allocator, root, bootstrap, false))
         return;
-    }
+    const path = try root_fs.Path.init(bootstrap.helper.source_path);
     try root.publishFile(path, source.bytes, .{
         .permissions = .fromMode(0o500),
         .overwrite = .fail_if_exists,
@@ -660,8 +753,8 @@ pub fn bindBootstrap(
     const root_entry = try root.rootEntry();
     if (!root_entry.modeled or root_entry.inode != bootstrap.root_inode)
         return error.NativeHelperRootDrift;
-    const source = try mount.source.observeAlloc(allocator, maximum_bytes);
-    defer allocator.free(source.bytes);
+    // `bind` already hashed the pinned source; attributes need no second read.
+    const source = try mount.source.metadata();
     if (source.entry.size != bootstrap.helper.size or
         source.entry.mode & 0o7777 != 0o500 or
         source.entry.uid != bootstrap.root_uid or
@@ -676,8 +769,7 @@ pub fn bindBootstrap(
         target.entry.uid != bootstrap.target.uid or
         target.entry.gid != bootstrap.target.gid or target.entry.link_count != 1)
         return error.NativeHelperTargetDrift;
-    var observed: [32]u8 = undefined;
-    Sha256.hash(target.bytes, &observed, .{});
+    const observed = helperDigest(.target, target.bytes);
     if (!std.mem.eql(
         u8,
         &std.fmt.bytesToHex(observed, .lower),
@@ -1052,4 +1144,188 @@ test "native_helper.test.fresh-root bootstrap rejects target source and identity
     );
     try stageBootstrap(testing.allocator, root, bootstrap, bundled());
     try cleanupBootstrap(testing.allocator, root, bootstrap);
+}
+
+test "native_helper.test.bundled digest is hashed once and bound to the embedded bytes" {
+    const testing = std.testing;
+    const first = bundled();
+    // Every earlier test in this process shares the one cached computation.
+    try testing.expectEqual(@as(u64, 1), digestCount(.bundled));
+    var expected: [32]u8 = undefined;
+    Sha256.hash(first.bytes, &expected, .{});
+    try testing.expectEqualSlices(u8, &expected, &first.sha256);
+    const supplied = digestCount(.supplied);
+    for (0..8) |_| {
+        const again = bundled();
+        try testing.expectEqual(first.bytes.ptr, again.bytes.ptr);
+        try testing.expectEqualSlices(u8, &first.sha256, &again.sha256);
+        try again.validate();
+    }
+    try testing.expectEqual(@as(u64, 1), digestCount(.bundled));
+    try testing.expectEqual(supplied, digestCount(.supplied));
+
+    // The cache is keyed by the immutable embedded slice, never by a digest
+    // or by equal content elsewhere in memory.
+    var forged = first;
+    forged.sha256[0] ^= 1;
+    try testing.expectError(error.NativeHelperDigestMismatch, forged.validate());
+    const copy = try testing.allocator.dupe(u8, first.bytes);
+    defer testing.allocator.free(copy);
+    try (Source{ .bytes = copy, .sha256 = first.sha256 }).validate();
+    copy[copy.len / 2] ^= 1;
+    try testing.expectError(
+        error.NativeHelperDigestMismatch,
+        (Source{ .bytes = copy, .sha256 = first.sha256 }).validate(),
+    );
+    try testing.expectError(
+        error.NativeHelperDigestMismatch,
+        (Source{ .bytes = first.bytes[0 .. first.bytes.len - 1], .sha256 = first.sha256 }).validate(),
+    );
+    try testing.expectEqual(supplied + 3, digestCount(.supplied));
+    try testing.expectEqual(@as(u64, 1), digestCount(.bundled));
+}
+
+test "native_helper.test.retained helper bytes are hashed once per check and changes are refused" {
+    const testing = std.testing;
+    const source = bundled();
+    const sha256 = std.fmt.bytesToHex(source.sha256, .lower);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}.bin", .{ directory, sha256 });
+    defer testing.allocator.free(path);
+    const binding: Binding = .{
+        .source_path = path,
+        .target_path = target_path,
+        .sha256 = sha256,
+        .size = source.bytes.len,
+    };
+    const supplied = digestCount(.supplied);
+    try binding.matches(source);
+    try testing.expectEqual(supplied, digestCount(.supplied));
+    try testing.expectEqual(@as(u64, 1), digestCount(.bundled));
+
+    const retained = try testing.allocator.dupe(u8, source.bytes);
+    defer testing.allocator.free(retained);
+    const before = digestCount(.retained);
+    try binding.matchesBytes(retained);
+    try testing.expectEqual(before + 1, digestCount(.retained));
+    retained[retained.len - 1] ^= 1;
+    try testing.expectError(error.NativeHelperDigestMismatch, binding.matchesBytes(retained));
+    retained[retained.len - 1] ^= 1;
+    try testing.expectError(error.NativeHelperDigestMismatch, binding.matchesBytes(retained[1..]));
+    try testing.expectError(error.InvalidNativeHelper, binding.matchesBytes(""));
+    try testing.expectEqual(before + 3, digestCount(.retained));
+
+    try binding.matchesObserved(source.bytes.len, sha256);
+    var changed = sha256;
+    changed[0] = if (changed[0] == '0') '1' else '0';
+    try testing.expectError(
+        error.NativeHelperDigestMismatch,
+        binding.matchesObserved(source.bytes.len, changed),
+    );
+    try testing.expectError(
+        error.NativeHelperDigestMismatch,
+        binding.matchesObserved(source.bytes.len - 1, sha256),
+    );
+    try testing.expectError(error.InvalidNativeHelper, binding.matchesObserved(0, sha256));
+    try testing.expectEqual(before + 3, digestCount(.retained));
+}
+
+test "native_helper.test.published helper is rehashed at every bind after the bundled digest is cached" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    try root.createDirectoryPath(try root_fs.Path.init("usr/bin"), .fromMode(0o755));
+    try root.publishFile(try root_fs.Path.init(target_path), "package-owned helper\n", .{});
+    const source = bundled();
+    const pinned = digestCount(.pinned);
+    var deployment = try stage(testing.allocator, root, source);
+    defer deployment.deinit();
+    try testing.expectEqual(pinned + 1, digestCount(.pinned));
+    var mount = try bind(testing.allocator, root, deployment.binding);
+    try testing.expectEqual(pinned + 2, digestCount(.pinned));
+    // Launch repeats this check on the pinned descriptor before exec.
+    try mount.verify(testing.allocator);
+    try mount.verify(testing.allocator);
+    try testing.expectEqual(pinned + 4, digestCount(.pinned));
+    mount.deinit();
+
+    // Same-size published bytes changed after caching are refused by every
+    // check that would otherwise expose them.
+    const changed = try testing.allocator.dupe(u8, source.bytes);
+    defer testing.allocator.free(changed);
+    changed[changed.len / 2] ^= 1;
+    try root.publishFile(try root_fs.Path.init(deployment.binding.source_path), changed, .{
+        .permissions = .fromMode(0o500),
+        .overwrite = .replace,
+    });
+    try testing.expectError(error.HelperDigestMismatch, stage(testing.allocator, root, bundled()));
+    try testing.expectError(error.HelperDigestMismatch, bind(testing.allocator, root, deployment.binding));
+    try testing.expectError(error.HelperDigestMismatch, probe(testing.allocator, root, deployment.binding));
+    try testing.expectEqual(pinned + 7, digestCount(.pinned));
+    try testing.expectEqual(@as(u64, 1), digestCount(.bundled));
+}
+
+test "native_helper.test.fresh-root source is hashed once per check and changed bytes are refused" {
+    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0)
+        return error.SkipZigTest;
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = root_fs.Root.init(testing.io, temporary.dir);
+    const target_bytes = "package-owned dpkg-trigger\n";
+    const target = try root_fs.Path.init(target_path);
+    try root.createDirectoryPath(try root_fs.Path.init("usr/bin"), .fromMode(0o755));
+    try root.publishFile(target, target_bytes, .{ .permissions = .fromMode(0o755) });
+    try root.applyMetadata(target, .{ .mode = 0o755, .uid = 0, .gid = 0 });
+    try root.createDirectoryPath(try root_fs.Path.init(bootstrap_directory), .fromMode(0o700));
+    try root.applyMetadata(
+        try root_fs.Path.init(bootstrap_directory),
+        .{ .mode = 0o700, .uid = 0, .gid = 0 },
+    );
+    const bootstrap = try testBootstrap(testing.allocator, root, target_bytes);
+    defer testing.allocator.free(bootstrap.helper.source_path);
+
+    var published = digestCount(.published);
+    try stageBootstrap(testing.allocator, root, bootstrap, bundled());
+    try testing.expectEqual(published + 1, digestCount(.published));
+    published = digestCount(.published);
+    try stageBootstrap(testing.allocator, root, bootstrap, bundled());
+    try testing.expectEqual(published + 1, digestCount(.published));
+
+    published = digestCount(.published);
+    const pinned = digestCount(.pinned);
+    var mount = try bindBootstrap(testing.allocator, root, bootstrap);
+    try testing.expectEqual(published + 1, digestCount(.published));
+    try testing.expectEqual(pinned + 1, digestCount(.pinned));
+    try mount.verify(testing.allocator);
+    try testing.expectEqual(pinned + 2, digestCount(.pinned));
+    mount.deinit();
+
+    const changed = try testing.allocator.dupe(u8, bundled().bytes);
+    defer testing.allocator.free(changed);
+    changed[changed.len / 2] ^= 1;
+    const source_path = try root_fs.Path.init(bootstrap.helper.source_path);
+    try root.publishFile(source_path, changed, .{
+        .permissions = .fromMode(0o500),
+        .overwrite = .replace,
+    });
+    try root.applyMetadata(source_path, .{ .mode = 0o500, .uid = 0, .gid = 0 });
+    try testing.expectError(
+        error.NativeHelperEvidenceChanged,
+        verifyBootstrapPrivateState(testing.allocator, root, bootstrap, true),
+    );
+    try testing.expectError(
+        error.NativeHelperEvidenceChanged,
+        stageBootstrap(testing.allocator, root, bootstrap, bundled()),
+    );
+    try testing.expectError(
+        error.NativeHelperEvidenceChanged,
+        bindBootstrap(testing.allocator, root, bootstrap),
+    );
+    try testing.expectError(
+        error.HelperDigestMismatch,
+        bind(testing.allocator, root, bootstrap.helper),
+    );
+    try testing.expectEqual(@as(u64, 1), digestCount(.bundled));
 }
