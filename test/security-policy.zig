@@ -97,6 +97,43 @@ test "security: commit-pinned composite actions reject floating refs" {
     try bad.failsWith("action.yml: actions/cache/restore is not commit-pinned");
 }
 
+const ci_concurrency_block =
+    \\concurrency:
+    \\  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}
+    \\  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+;
+
+test "security: CI concurrency cancels only superseded push and PR runs" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const source = try f.source(".github/workflows/ci.yml");
+    const valid = try f.check("ci-concurrency", source);
+    defer valid.deinit();
+    try valid.ok();
+
+    for ([_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = ci_concurrency_block ++ "\n", .to = "" },
+        .{
+            .from = "cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}",
+            .to = "cancel-in-progress: false",
+        },
+        .{
+            .from = "group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}",
+            .to = "group: ${{ github.workflow }}-${{ github.ref }}",
+        },
+        .{
+            .from = "group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name == 'push' && github.ref || github.run_id }}",
+            .to = "group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.base_ref }}",
+        },
+    }) |mutation| {
+        const changed = try f.replace(source, mutation.from, mutation.to);
+        const refused = try f.check("ci-concurrency", changed);
+        defer refused.deinit();
+        try testing.expectEqual(@as(u8, 1), refused.code);
+        try refused.failsWith("CI concurrency");
+    }
+}
+
 const ActionCandidateMutation = enum {
     none,
     metadata,

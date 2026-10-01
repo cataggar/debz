@@ -81,6 +81,14 @@ action cache contains only the exact installed tool and `ghr` transaction state;
 it does not restore Zig's local or global build caches, preserving the previous
 no-build-cache policy.
 
+The CI workflow has a top-level concurrency group keyed by the workflow name,
+event name, and either the pull request number, the pushed ref, or the unique
+manual/scheduled run id. Newer pushes to the same pull request or to `main`
+cancel their superseded run, while `workflow_dispatch` and `schedule` runs use
+non-cancelling groups that cannot collide with push or pull-request traffic.
+Release, provenance, and attestation workflows remain separate so a tag
+publication or attestation is never cancelled by development CI churn.
+
 The same tests are native `std.testing.fuzz` targets with seed corpora, so
 coverage-guided runs can use `zig build fuzz --fuzz=<cases>` on Zig toolchains
 where the built-in fuzzer is available. CI uses the deterministic runner
