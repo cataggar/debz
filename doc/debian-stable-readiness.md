@@ -404,7 +404,10 @@ Findings are identical for both architectures unless noted:
 
 - **Admission:** 78 packages (22 Essential). The native model admits all
   78. There are no FIFOs, character or block devices, PAX or unknown
-  members, and no unsupported control members.
+  members, and no unsupported control members. Since #325 the native model
+  admits FIFO payloads; the inventory counts them as `payload.fifo`, emitted
+  only when present, so these FIFO-free inventories keep their bytes.
+  Devices remain P0 refusals.
 - **Payload:** amd64 has 4,033 regular files, 2,343 directories, 351 symlinks
   and 1 hard link; arm64 has 4,033, 2,341, 346 and 1.
 - **Scripts:** 24 `postinst`, 17 `postrm`, 10 `preinst`, 12 `prerm` and 1

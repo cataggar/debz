@@ -215,9 +215,24 @@ pub const PayloadReport = struct {
     directory: usize = 0,
     symlink: usize = 0,
     hardlink: usize = 0,
+    /// Named pipes, admitted natively since #325. Emitted only when present,
+    /// so inventories of FIFO-free closures keep their committed bytes.
+    fifo: usize = 0,
     setuid_or_setgid: []const []const u8 = &.{},
     non_root_owned: []const []const u8 = &.{},
     system_paths: SystemPaths = .{},
+
+    pub fn jsonStringify(self: PayloadReport, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (std.meta.fields(PayloadReport)) |field| {
+            const is_fifo = comptime std.mem.eql(u8, field.name, "fifo");
+            if (!is_fifo or self.fifo != 0) {
+                try writer.objectField(field.name);
+                try writer.write(@field(self, field.name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const NativeModel = struct {
@@ -509,6 +524,7 @@ fn describeModel(
             .directory => report.payload.directory += 1,
             .symlink => report.payload.symlink += 1,
             .hardlink => report.payload.hardlink += 1,
+            .fifo => report.payload.fifo += 1,
         }
         if (file.setuid() or file.setgid()) {
             try setuid.append(arena, try arena.dupe(u8, file.path));
@@ -941,13 +957,12 @@ test "debian closure inventory: scripts, conffiles, triggers, diversions, statov
     try testing.expectEqual(Category.alternatives_script_authority, summary.gaps[0].category);
 }
 
-test "debian closure inventory: FIFOs, devices and unsupported control members are native P0 gaps" {
+test "debian closure inventory: devices and unsupported control members are native P0 gaps; FIFOs are admitted and counted" {
     var state = std.heap.ArenaAllocator.init(testing.allocator);
     defer state.deinit();
     const arena = state.allocator();
     const Case = struct { entry: fixtures.Entry, feature: []const u8 };
     const cases = [_]Case{
-        .{ .entry = .{ .path = "run-fifo", .kind = '6', .mode = 0o600 }, .feature = "file_type" },
         .{ .entry = .{ .path = "console", .kind = '3', .mode = 0o600 }, .feature = "file_type" },
         .{ .entry = .{ .path = "loop0", .kind = '4', .mode = 0o600 }, .feature = "file_type" },
     };
@@ -962,6 +977,23 @@ test "debian closure inventory: FIFOs, devices and unsupported control members a
         try testing.expectEqualStrings("P0", gap.priority);
         try testing.expectEqual(@as(usize, 0), report.scripts.len);
     }
+
+    // Native FIFO payloads (#325) are admitted, counted, and not a gap.
+    const fifo = try fixtures.build(testing.allocator, .{
+        .package = "pipe",
+        .data = &.{.{ .path = "run-fifo", .kind = '6', .mode = 0o600 }},
+    });
+    defer testing.allocator.free(fifo);
+    const piped = try inspectArchive(arena, testing.allocator, fifo, try fixtureExpectation(arena, fifo, "pipe"));
+    try testing.expect(piped.native_model.admitted);
+    try testing.expectEqual(@as(usize, 1), piped.payload.fifo);
+    try testing.expect(findGap(piped, .native_archive_rejected) == null);
+    const with_fifo = try std.json.Stringify.valueAlloc(arena, piped.payload, .{});
+    try testing.expect(std.mem.indexOf(u8, with_fifo, "\"hardlink\":0,\"fifo\":1,\"setuid_or_setgid\"") != null);
+    // FIFO-free payloads serialize exactly as before #325.
+    const without_fifo = try std.json.Stringify.valueAlloc(arena, PayloadReport{ .regular = 2 }, .{});
+    try testing.expect(std.mem.indexOf(u8, without_fifo, "fifo") == null);
+    try testing.expect(std.mem.indexOf(u8, without_fifo, "\"hardlink\":0,\"setuid_or_setgid\":[]") != null);
 
     const unknown = try fixtures.build(testing.allocator, .{
         .package = "member",
