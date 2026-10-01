@@ -2406,6 +2406,31 @@ Test abbreviations:
   `receipt-<field>`, `receipt-missing`, `completion-missing`,
   `stale-owner`).
 - **FV**: `verificationRefusals` in the same file.
+- **FSS**: the third `ownedComponents` call, from `ownedScriptedSuccess`
+  in the same file. It runs `native-trigger-pkg`, whose postinst runs and
+  activates a trigger, so the receipt retains `script_outcome` documents.
+  The owner is released and the outcome is succeeded. Labels add
+  `receipt-script_outcome-omitted` and `receipt-script_outcome-duplicated`.
+- **HCC** and **HCR**: `callerScriptComponents` in
+  `test/native_recovery_helper.zig` (`test-native-recovery-helper-zig`),
+  real processes against pinned dpkg with a held caller-owned attempt:
+  - HCC runs from `completedScriptComponents` (`caller-script-components-completed`),
+    an applied install with preinst and postinst outcomes;
+  - HCR runs from `recoveredOrdinary` (`caller-script-components-recovered`),
+    which loses the process at `after_script_outcome` and settles with
+    `recovered_phase_count >= 1`.
+
+  Each case checks the caller lifecycle verification (`caller_verification`)
+  and then `recover` with acknowledgment. Both must refuse with the same
+  typed error, and the record, intent, receipt, package state and root
+  inventory must be unchanged. Labels are `changed-script_outcome-<n>`
+  (`EvidenceChanged`), `deleted-script_outcome-<n>` (`FileNotFound`), and
+  resealed receipts that bind the forged digest: `receipt-omitted`
+  (`EvidenceMissing`), `receipt-duplicated` (`InvalidRecoveryProgress`),
+  `receipt-rebound` (`EvidenceMismatch`), `receipt-reindexed`
+  (`EvidenceMissing`), `receipt-script_outcomes` (`EvidenceMismatch`),
+  `receipt-recovered_phase_count` and `receipt-progress_head`
+  (`InvalidRecoveryProgress`).
 - **U1**: `native_transaction_result.test.retained script outcomes bind every exact progress invocation`.
 - **U2**: `native_transaction_result.test.known failure cannot become success or accept unknown outcomes`.
 - **U3**: `native_recovery.test.settled managed state binds live payload kind, mode and bytes`
@@ -2422,7 +2447,7 @@ Test abbreviations:
 | DB generation / status | receipt `initial_database_generation_sha256`, `final_database_generation_sha256`, `final_state_sha256` (`package_database_closure_v1`); completion `database_generation_sha256` | HC/HR `receipt.final_database_generation_sha256`, `receipt.final_state_sha256` (`FinalStateMismatch`), `receipt.initial_database_generation_sha256`, `completion.database_generation_sha256`, `live dpkg status`, `live dpkg info list`; FS `receipt-final_database_generation`, `receipt-final_state`; FV `refuse-damaged-database` | FF `changed-database` (`FinalStateMismatch`), `receipt-final_*` | HQ receipt records its interrupted generation; never settles |
 | Filesystem decisions | retained `managed_state` (per-path decisions/digests), progress; diversion/route evidence when present | HC/HR `retained managed_state bytes`, `receipt.evidence_files[managed_state]` omitted/`.sha256`; FS `retained-managed_state-*` | FF `retained-managed_state-*` | HQ: changed payload during recovery → `managed_state_changed` receipt |
 | Live managed payload (#317) | final stable `managed_state` snapshot compared with the live root: kind, mode/owner, content SHA-256, symlink target; absent stays absent (`LivePayloadChanged`) | HC/HR `live payload bytes`, `live payload resized`, `live payload removed`, `live payload replaced by symlink`, `live payload replaced by directory`, `live payload mode`, `caller verify of live payload`, in-attempt `expectCallerPayloadBound` (also the typed change: path, `content_changed`, recorded SHA-256, owner `demo` `1.0` `amd64`); unrelated directory member still verifies; FS `live-payload-bytes`, `live-payload-removed`, and `administrator-conffile-edit` still verifies; U3; repository `import` `success` pass 0 records `installed_verification_failed` with the typed diagnostic (`expectLivePayloadDiagnostic`); P1 names the owning repository surface and resume path | FF `live-payload-bytes`, `live-payload-removed` (published `fail-script` payload) | HQ: the same change during recovery → `managed_state_changed` receipt |
-| Maintainer-script launch / outcome | progress `in_flight`/`outcome` records, retained `script_outcome` documents, receipt `script_outcomes_sha256`, `progress_head_sha256`, `progress_record_count` | U1; HC/HR `receipt.script_outcomes_sha256`, `receipt.progress_head_sha256`, `receipt.progress_record_count`, `retained progress bytes`; FS `receipt-script_outcomes`, `retained-progress-*` | FF `retained-script_outcome-*`, `retained-progress-*`, `receipt-script_outcomes` | HQ (no script evidence consumed) |
+| Maintainer-script launch / outcome | progress `in_flight`/`outcome` records, retained `script_outcome` documents, receipt `script_outcomes_sha256`, `progress_head_sha256`, `progress_record_count`, `recovered_phase_count` | U1; HC/HR `receipt.script_outcomes_sha256`, `receipt.progress_head_sha256`, `receipt.progress_record_count`, `retained progress bytes`; FS `receipt-script_outcomes`, `retained-progress-*`; FSS `retained-script_outcome-*`, `receipt-script_outcomes`, `receipt-script_outcome-omitted`, `receipt-script_outcome-duplicated`; HCC (completed) and HCR (recovered) `changed-script_outcome-*`, `deleted-script_outcome-*`, `receipt-omitted`, `receipt-duplicated`, `receipt-rebound`, `receipt-reindexed`, `receipt-script_outcomes`, `receipt-recovered_phase_count`, `receipt-progress_head` | FF `retained-script_outcome-*`, `retained-progress-*`, `receipt-script_outcomes` | HQ (no script evidence consumed) |
 | Conffile choice | policy digest (conffile mode) → receipt/completion `policy_sha256`, exact-lock v3 policy (`AuthorizationMismatch`), `managed_state` conffile decisions; after settlement the live conffile is administrator state (see below) | HC/HR `caller conffile choice` (`CallerRequestMismatch`), `receipt.policy_sha256`, `completion.policy_sha256`; FS `receipt-policy`, `retained-managed_state-*` (`conffile-pkg`), `administrator-conffile-edit`; FV `refuse-request-conffile` | FF `receipt-policy`, `wrong-request` | HQ |
 | Trigger claims | retained `trigger_events`, receipt `trigger_evidence_sha256`; live `triggers/*` in the final closure | HC/HR `receipt.trigger_evidence_sha256`, `retained trigger_events bytes`, `live pending trigger claim`; FS `retained-trigger_events-*`, `receipt-trigger_evidence` | FF same | HQ |
 | Attempt owner / recovery step | receipt `attempt_id`, `root_inode`, `recovered_phase_count`, `execution_intent_sha256`; retained `intent`; completion `attempt_id`; record and deferred owner; progress terminal `provenance` record | HC/HR `receipt.attempt_id`, `receipt.root_inode`, `receipt.recovered_phase_count`, `receipt.execution_intent_sha256`, `completion.attempt_id`, `root-operation record reinstated`, `native intent reinstated`, `deferred owner reinstated`; HR second operation refused while owed; FS `stale-owner` | FF `stale-owner` (`OwnershipMismatch`), `changed-intent`, `retained-intent-*`, `receipt-execution_intent`, `pending-publication-crash` | HQ second operation refused; restart reports the requirement again |
@@ -2445,10 +2470,35 @@ outcome. Before this change, a `recovery_required` receipt resealed as
 reported success, and `acknowledge` cleared the active native evidence
 before any final-state verification. HQ covers both resealed outcomes.
 
-**Wiring.** FS and FF run in the required `native-recovery-zig-family` job.
+**Binding added by #318.** `readProductionCompletion` now also requires
+the retained progress head and record count to match the receipt. It then
+applies `native_provenance.verifyScriptOutcomes`, the check that settled
+verification already used:
+
+- the receipt `script_outcomes_sha256` and `recovered_phase_count` must match
+  the retained progress;
+- every exact progress `outcome` record must have exactly one retained
+  `script_outcome` document, at its ordinal, with the same document digest.
+
+Before this change, a receipt resealed to omit or duplicate a
+`script_outcome` entry passed `readProductionCompletion`, because the
+remaining retained files still matched. Settled caller verification
+already refused it, but `recover` with acknowledgment reported `applied`,
+acknowledged the forged receipt and published a completion. HCC fails in
+exactly that way when the binding is removed. `recover`, `acknowledge`,
+`readCompletion` and caller verification
+all read through this function, so HCC and HCR cover each tamper on both the
+caller-verification and recovery paths. The repository's
+`readRetainedNativeReceipt` also reads through it, so a receipt resealed with
+an inconsistent `progress_record_count` is now refused when it is read, with
+the same `InvalidRecoveryProgress` that `verifyNativePackageState` reports.
+
+**Wiring.** FS, FSS and FF run in the required `native-recovery-zig-family` job.
+HCC and HCR run in the required `native-recovery-zig-helper` job.
 `tools/security-audit.py` refuses loss of the hermetic filter and import
 (`native_provenance_binding_wiring_failures`), the `ownedComponents`
-matrix and both of its call sites, and the terminal-record binding in
+matrix and its three call sites, the `callerScriptComponents` matrix and its
+two call sites, and the terminal-record and script-outcome bindings in
 `readProductionCompletion`. It also refuses loss of the live payload
 cases in both matrices and of the `verifySettledPayload` call in
 `verifyStateEvidence` (#317), of the change description and owner lookup,
@@ -2583,6 +2633,6 @@ After the file is restored, pass 1 imports and refreshes from that
 checkpoint. The `resume` family covers the completion and record clearing
 that follow.
 
-**Gaps (follow-ups).** The hermetic and FS fixtures run no maintainer
-scripts, so retained `script_outcome` documents are tampered per component
-only in FF and U1 (#318).
+**Gaps (follow-ups).** The hermetic HC/HR/HQ and FS fixtures run no
+maintainer scripts; FSS, HCC and HCR cover retained `script_outcome`
+documents for scripted succeeded and recovered attempts (#318).

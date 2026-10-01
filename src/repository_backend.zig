@@ -8544,10 +8544,9 @@ fn testRepositoryNativePackageState(
         try root.publishFile(retained_path, inconsistent_bytes, .{ .permissions = .fromMode(0o600), .overwrite = .fail_if_exists });
         var inconsistent_input = input;
         inconsistent_input.expected_receipt_sha256 = inconsistent.digest_sha256;
-        {
-            var readable = try readRetainedNativeReceipt(allocator, inconsistent_input);
-            defer readable.deinit();
-        }
+        // Issue #318: the retained progress binding is enforced when the
+        // receipt is read, before settled verification.
+        try std.testing.expectError(error.InvalidRecoveryProgress, readRetainedNativeReceipt(allocator, inconsistent_input));
         try std.testing.expectError(error.InvalidRecoveryProgress, verifyNativePackageState(allocator, inconsistent_input));
         try root.removeFile(shared_path);
         try root.removeFile(retained_path);

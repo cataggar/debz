@@ -3114,7 +3114,7 @@ def native_core_completion_wiring_failures(
     )[0]
     if caller_case.count(".isolated_helper = false,") != 2:
         failures.append("native_recovery_helper.zig: rehashed caller refusal must run without isolated helper")
-    ordinary = helper.split("fn recoveredOrdinary(", 1)[-1].split("\nfn blockedUnknown(", 1)[0]
+    ordinary = helper.split("fn recoveredOrdinary(", 1)[-1].split("\n}\n", 1)[0]
     for token in (
         "if (try invoke(fixture, driver, root, arch, crash_output, .{",
         "try fixture.dir.deleteFile(fixture.io, archive_relative);",
@@ -3135,7 +3135,7 @@ def native_core_completion_wiring_failures(
         if ordinary.count(token) != 2:
             failures.append(f"native_recovery_helper.zig: ordinary first/last checks lost {token}")
     main = helper.split("pub fn main(", 1)[-1]
-    if main.count("try recoveredOrdinary(") != 4:
+    if main.count("try recoveredOrdinary(") != 5:
         failures.append("native_recovery_helper.zig: ordinary caller, failure and crash matrices not all executed")
     for token in (
         '"after_execution_intent", "during_filesystem_publication",\n        "after_script_outcome",   "after_provenance",',
@@ -3242,6 +3242,59 @@ def native_exercise_final_wiring_failures(
     ):
         if token not in completion_read:
             failures.append(f"native_unpack.zig: terminal receipt must bind retained terminal provenance progress lost {token}")
+    for token in (
+        "if (!std.mem.eql(u8, &retained_progress.document.head_sha256, &receipt.document.progress_head_sha256) or\n"
+        "        retained_progress.document.records.len != receipt.document.progress_record_count)\n"
+        "        return error.InvalidRecoveryProgress;",
+        "try native_provenance.verifyScriptOutcomes(receipt.document, retained_progress.document);",
+    ):
+        if token not in completion_read:
+            failures.append(f"native_unpack.zig: terminal receipt must bind retained script outcomes lost {token}")
+    if ") catch |err| return .{ .outcome = .refused, .detail = @errorName(err) };" not in unpack.split("fn callerOwnedLifecycleFixture(", 1)[-1].split("\nfn ", 1)[0]:
+        failures.append("native_unpack.zig: caller lifecycle verification must report typed refusals")
+    for token in (
+        "try completedScriptComponents(&fixture, driver, reference.executable, reference.architecture);",
+        '.name = "caller-script-components-recovered",\n'
+        '        .crash = "after_script_outcome",\n'
+        "        .caller_owned = true,\n"
+        "        .isolated_helper = true,\n"
+        "        .script_components = true,",
+    ):
+        if token not in main:
+            failures.append(f"native_recovery_helper.zig: completed and recovered script component matrices lost {token}")
+    if "try callerScriptComponents(fixture, driver, root, arch, case.name, true);" not in helper.split("\nfn recoveredOrdinary(", 1)[-1].split("\n}\n", 1)[0]:
+        failures.append("native_recovery_helper.zig: recovered attempts lost the script component matrix")
+    if "try callerScriptComponents(fixture, driver, root, arch, name, false);" not in helper.split("\nfn completedScriptComponents(", 1)[-1].split("\nfn ", 1)[0]:
+        failures.append("native_recovery_helper.zig: completed attempts lost the script component matrix")
+    scripts = helper.split("\nfn callerScriptComponents(", 1)[-1].split("\nfn ", 1)[0]
+    for token in (
+        "if (recovered != (receipt.document.recovered_phase_count != 0)) return error.UnexpectedRecoveredPhaseCount;",
+        '"changed-script_outcome-{d}"',
+        '"EvidenceChanged"',
+        '"deleted-script_outcome-{d}"',
+        '"FileNotFound"',
+        "if (scripts < 2) return error.MissingRetainedScriptOutcome;",
+        "for (std.enums.values(ScriptReceiptTamper)) |tamper| {",
+        'break :omitted "EvidenceMissing";',
+        'break :duplicated "InvalidRecoveryProgress";',
+        'break :rebound "EvidenceMismatch";',
+        'break :reindexed "EvidenceMissing";',
+        'break :summary "EvidenceMismatch";',
+        'break :phases "InvalidRecoveryProgress";',
+        'break :head "InvalidRecoveryProgress";',
+        "forged.evidence_files_sha256 = provenance.evidenceDigest(forged.evidence_files);",
+    ):
+        if token not in scripts:
+            failures.append(f"native_recovery_helper.zig: script component tamper matrix lost {token}")
+    refused = helper.split("\nfn scriptComponentRefused(", 1)[-1].split("\nfn ", 1)[0]
+    for token in (
+        '        .caller_verification = expected_receipt,\n    }), "refused", expected_error);',
+        '        .acknowledge = true,\n    }), "recovery_required", expected_error);',
+    ):
+        if token not in refused:
+            failures.append(f"native_recovery_helper.zig: script component refusal lost {token}")
+    if refused.count("try held.owed(fixture, root, receipt);") != 2:
+        failures.append("native_recovery_helper.zig: script component refusals must leave the attempt owed after verification and recovery")
     return failures
 
 
@@ -3531,17 +3584,21 @@ def native_workflow_acceptance_wiring_failures(
         '"live-payload-bytes", selected, lock, check, "LivePayloadChanged"',
         '"live-payload-removed", selected, lock, check, "LivePayloadChanged"',
         '"administrator-conffile-edit", selected, lock, check',
+        '"receipt-script_outcome-duplicated" else "receipt-script_outcome-omitted"',
     ):
         if token not in components:
             failures.append(f"native_recovery_family.zig: owned component tamper matrix lost {token}")
     for token in (
         '        .state = "released",\n        .outcome = .succeeded,\n        .scripts = false,',
+        '        .state = "released",\n        .outcome = .succeeded,\n        .scripts = true,',
         '        .state = "pending",\n        .outcome = .failed,\n        .scripts = true,',
     ):
         if "    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{\n        .owner_evidence = " not in family or token not in family:
             failures.append(f"native_recovery_family.zig: owned success and failed attempts require component tamper coverage lost {token}")
-    if family.count("    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{") != 2:
-        failures.append("native_recovery_family.zig: owned success and failed attempts both require the component tamper matrix")
+    if family.count("    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{") != 3:
+        failures.append("native_recovery_family.zig: owned success, scripted success and failed attempts all require the component tamper matrix")
+    if "    try ownedScriptedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);" not in family:
+        failures.append("native_recovery_family.zig: owned scripted success no longer runs")
     return failures
 
 

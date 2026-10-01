@@ -15334,6 +15334,7 @@ const ExternalLifecycleRequest = struct {
     root_mutation_crash: ?root_mutation.Boundary = null,
     caller_owned: bool = false,
     acknowledge_native: bool = false,
+    caller_verification: ?native_provenance.Digest = null,
     core_product: bool = false,
     core_completion_crash: ?@import("production_backend.zig").CompletionPoint = null,
     isolated_helper: bool = false,
@@ -29735,6 +29736,13 @@ fn readProductionCompletion(
         .failed => terminal.result != .failed,
         .recovery_required => true,
     }) return error.InvalidRecoveryProvenance;
+    // Until a completion binds the receipt digest, only these bindings stop a
+    // resealed receipt from dropping, duplicating or rebinding a retained
+    // script outcome before recovery reports or acknowledges it.
+    if (!std.mem.eql(u8, &retained_progress.document.head_sha256, &receipt.document.progress_head_sha256) or
+        retained_progress.document.records.len != receipt.document.progress_record_count)
+        return error.InvalidRecoveryProgress;
+    try native_provenance.verifyScriptOutcomes(receipt.document, retained_progress.document);
     if (request.bootstrap()) |bootstrap|
         try native_helper.verifyBootstrapTarget(allocator, root, bootstrap.target);
     const program_bytes = try retainedNativeBytes(allocator, root, receipt.document, .program);
@@ -34017,6 +34025,17 @@ fn callerOwnedLifecycleFixture(
             .evidence = record.evidence(),
         });
         defer attempt.release();
+        if (external.caller_verification) |expected| {
+            // Settled caller verification only: no recovery, acknowledgment
+            // or record change. A refusal is reported, never retried.
+            var verified = @import("native_transaction_result.zig").verifyCallerSuccess(
+                allocator,
+                &attempt,
+                expected,
+            ) catch |err| return .{ .outcome = .refused, .detail = @errorName(err) };
+            verified.deinit();
+            return .{ .outcome = .applied, .detail = "caller_verified" };
+        }
         const result = if (external.isolated_helper) block: {
             var report = try Runtime.recoverBounded(
                 allocator,
@@ -34638,6 +34657,10 @@ test "native_unpack.test.lifecycle external fixture" {
     const external = parsed.value;
     if ((external.caller_owned and (!external.recovery or external.fault != null)) or
         (external.acknowledge_native and (!external.caller_owned or external.operation != .recover)) or
+        (external.caller_verification != null and
+            (!external.caller_owned or !external.isolated_helper or external.operation != .recover or
+                external.acknowledge_native or external.core_product or external.crash_at != null or
+                external.root_mutation_crash != null)) or
         (external.core_product and (!external.caller_owned or !external.isolated_helper)) or
         (external.core_completion_crash != null and (!external.core_product or external.operation != .recover)) or
         (external.root_mutation_crash != null and
