@@ -24,18 +24,38 @@ pub fn main(init: std.process.Init) !void {
     try log.writePositionalAll(io, line, offset);
     try log.writePositionalAll(io, "\n", offset + line.len);
 
-    if ((equals(scenario, "retry-log") or equals(scenario, "unexpected-stderr")) and
+    if ((equals(scenario, "retry-log") or equals(scenario, "retry-transport-log") or
+        equals(scenario, "unexpected-stderr")) and
         (equals(operation, "refresh") or equals(operation, "download")))
     {
         try std.Io.File.stderr().writeStreamingAll(io, if (equals(scenario, "retry-log"))
             "debz acquisition retry failed_attempt=1/6 delay_ms=2000 http_status=503\n"
+        else if (equals(scenario, "retry-transport-log"))
+            "debz acquisition retry failed_attempt=1/6 delay_ms=2000 error=NameServerFailure\n"
         else
             "unexpected acquisition warning\n");
+    }
+    if (equals(operation, "refresh") and
+        (equals(scenario, "retry-unknown-error") or equals(scenario, "retry-malformed") or
+            equals(scenario, "retry-final-failure")))
+    {
+        try std.Io.File.stderr().writeStreamingAll(io, if (equals(scenario, "retry-unknown-error"))
+            "debz acquisition retry failed_attempt=1/6 delay_ms=2000 error=CertificateExpired\n"
+        else if (equals(scenario, "retry-malformed"))
+            "debz acquisition retry failed_attempt=1/6 delay_ms=2000 error=NameServerFailure extra\n"
+        else
+            "debz acquisition retry failed_attempt=1/6 delay_ms=2000 error=NameServerFailure\n");
+        if (equals(scenario, "retry-final-failure")) {
+            try std.Io.File.stdout().writeStreamingAll(io,
+                \\{"operation":"refresh","exit_status":4,"changed":false,"summary":"NameServerFailure","diagnostics":[{"id":"repository_acquisition_failed","message":"NameServerFailure"}]}
+            ++ "\n");
+            std.process.exit(4);
+        }
     }
     if (equals(operation, "refresh") and equals(scenario, "freshness-failure")) {
         try std.Io.File.stdout().writeStreamingAll(io,
             \\{"operation":"refresh","exit_status":4,"changed":false,"summary":"ReleaseExpired","diagnostics":[{"id":"repository_authentication_failed","message":"ReleaseExpired"}]}
-            ++ "\n");
+        ++ "\n");
         std.process.exit(4);
     }
 
@@ -100,9 +120,7 @@ pub fn main(init: std.process.Init) !void {
         if (equals(operation, "install")) try installProgress(io, allocator, root, scenario);
         if (equals(operation, "install")) {
             const arch = option(args, "--architecture") orelse return error.MissingArchitecture;
-            const status = try std.fmt.allocPrint(allocator,
-                "Package: ubuntu-minimal\nStatus: install ok installed\nArchitecture: {s}\nVersion: 1.0\nDescription: offline driver fixture\n\n",
-                .{arch});
+            const status = try std.fmt.allocPrint(allocator, "Package: ubuntu-minimal\nStatus: install ok installed\nArchitecture: {s}\nVersion: 1.0\nDescription: offline driver fixture\n\n", .{arch});
             try root.writeFile(io, .{ .sub_path = "var/lib/dpkg/status", .data = status });
             try root.writeFile(io, .{ .sub_path = "var/lib/dpkg/info/ubuntu-minimal.list", .data = if (equals(scenario, "owned-excluded-device"))
                 "/.\n/usr\n/dev/null\n"

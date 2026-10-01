@@ -503,6 +503,7 @@ suite=$3
 architecture=$4
 workspace=$(realpath -m "$5")
 repository_root=$(pwd -P)
+source_root=$(cd "$(dirname "$0")/.." && pwd -P)
 validate "$uri" "$suite" "$architecture"
 install_progress_limit_seconds=$(install_bound \
   "${DEBZ_REAL_SNAPSHOT_INSTALL_PROGRESS_LIMIT_SECONDS:-$maximum_install_progress_limit_seconds}" \
@@ -558,8 +559,17 @@ printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":tr
   "$source_file" "$suite" "$maximum_release_age_seconds" >"$config_file"
 source_commit=${GITHUB_SHA:-}
 if [[ -z "$source_commit" ]]; then
-  source_commit=$(git -C "$(dirname "$0")/.." rev-parse HEAD)
+  source_commit=$(git -C "$source_root" rev-parse HEAD)
 fi
+retry_transport_errors=$(sed -n '
+  /fn isSafeTransient(err: anyerror) bool/,/=> true,/ {
+    s/^[[:space:]]*error\.\([A-Za-z][A-Za-z0-9_]*\),[[:space:]]*$/\1/p
+  }
+' "$source_root/src/repository_acquisition.zig" | paste -sd'|' -)
+[[ -n "$retry_transport_errors" ]] || {
+  echo "empty acquisition retry transport allowlist" >&2
+  exit 2
+}
 {
   printf 'source_commit=%s\n' "$source_commit"
   printf 'architecture=%s\nsnapshot_uri=%s\nsnapshot_suite=%s\n' \
@@ -763,20 +773,29 @@ run() {
   if [[ "$name" == create ]]; then
     bound=progress
   fi
-  run_candidate "$name" "$bound" "$debz" "$@"
+  local candidate_status=0
+  run_candidate "$name" "$bound" "$debz" "$@" || candidate_status=$?
   if [[ -s "$evidence/$name.stderr" ]]; then
-    local retry_check=0
     local stderr_bytes
     stderr_bytes=$(stat -c '%s' "$evidence/$name.stderr")
+    local retry_log_allowed=1
     if [[ "$name" == refresh || "$name" == download || "$name" == create ]] &&
-      (( stderr_bytes <= 4096 )); then
-      grep -Evq '^debz acquisition retry failed_attempt=[1-6]/6 delay_ms=[1-9][0-9]{0,5} http_status=(429|500|502|503|504)$' \
-        "$evidence/$name.stderr" || retry_check=$?
+      (( stderr_bytes <= 4096 )) &&
+      grep -q '"exit_status":0' "$evidence/$name.json"; then
+      retry_log_allowed=0
+      while IFS= read -r line; do
+        [[ "$line" =~ ^debz\ acquisition\ retry\ failed_attempt=[1-6]/6\ delay_ms=[1-9][0-9]{0,5}\ http_status=(429|500|502|503|504)$ ]] ||
+          [[ "$line" =~ ^debz\ acquisition\ retry\ failed_attempt=[1-6]/6\ delay_ms=[1-9][0-9]{0,5}\ error=($retry_transport_errors)$ ]] ||
+          retry_log_allowed=1
+      done <"$evidence/$name.stderr"
     fi
-    if (( retry_check != 1 )); then
+    if (( retry_log_allowed != 0 )); then
       echo "unexpected candidate stderr during $name" >&2
       return 1
     fi
+  fi
+  if (( candidate_status != 0 )); then
+    return "$candidate_status"
   fi
   grep -q '"exit_status":0' "$evidence/$name.json"
 }

@@ -89,17 +89,14 @@ const Driver = struct {
         errdefer driver.deinit();
         const cwd = try std.process.currentPathAlloc(support.io, support.allocator);
         defer support.allocator.free(cwd);
-        const binary = try std.fmt.allocPrint(support.allocator,
-            "{s}/.zig-cache/issue-214-snapshot-fixture-{s}",
-            .{ cwd, if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug" });
+        const binary = try std.fmt.allocPrint(support.allocator, "{s}/.zig-cache/issue-214-snapshot-fixture-{s}", .{ cwd, if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug" });
         errdefer support.allocator.free(binary);
         if (!fixture_compiled) {
             const binary_arg = try std.fmt.allocPrint(support.allocator, "-femit-bin={s}", .{binary});
             defer support.allocator.free(binary_arg);
             const compiled = try support.runWithTimeout(&.{
-                "zig", "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
-                if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug",
-                binary_arg,
+                "zig",                                                                   "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
+                if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug", binary_arg,
             }, .inherit, 120);
             defer compiled.deinit();
             try compiled.ok();
@@ -137,7 +134,7 @@ const Driver = struct {
             \\  fi
             \\fi
             \\exec "$@"
-            ++ "\n");
+        ++ "\n");
         const strace_path = try driver.work.path("strace");
         defer support.allocator.free(strace_path);
         const executable = try support.run(&.{ "chmod", "0700", strace_path });
@@ -621,7 +618,32 @@ test "snapshot: bounded retry diagnostics remain evidence, unexpected stderr fai
     {
         var f = try Driver.initOffline();
         defer f.deinit();
+        const accepted = try f.offline(.{ .name = "retry-transport-log" });
+        defer accepted.deinit();
+        try accepted.ok();
+        for ([_][]const u8{ "refresh", "download" }) |name| {
+            const path = try std.fmt.allocPrint(support.allocator, ".real-snapshot/fresh/evidence/{s}.stderr", .{name});
+            defer support.allocator.free(path);
+            const log = try f.work.read(path);
+            defer support.allocator.free(log);
+            try testing.expectEqualStrings(
+                "debz acquisition retry failed_attempt=1/6 delay_ms=2000 error=NameServerFailure\n",
+                log,
+            );
+        }
+    }
+    {
+        var f = try Driver.initOffline();
+        defer f.deinit();
         const refused = try f.offline(.{ .name = "unexpected-stderr" });
+        defer refused.deinit();
+        try refused.failsWith("unexpected candidate stderr during refresh");
+        try expectOperations(&f, &.{"refresh"});
+    }
+    for ([_][]const u8{ "retry-unknown-error", "retry-malformed", "retry-final-failure" }) |scenario| {
+        var f = try Driver.initOffline();
+        defer f.deinit();
+        const refused = try f.offline(.{ .name = scenario });
         defer refused.deinit();
         try refused.failsWith("unexpected candidate stderr during refresh");
         try expectOperations(&f, &.{"refresh"});
@@ -1254,15 +1276,11 @@ test "snapshot: reference rejects corrupt cached archive before creating root or
     var packages: std.ArrayList(u8) = .empty;
     defer packages.deinit(support.allocator);
     for ([_][]const u8{ "libc6", "dash", "coreutils", "dpkg" }, 0..) |name, index| {
-        const item = try std.fmt.allocPrint(support.allocator,
-            "{{\"name\":\"{s}\",\"version\":\"1\",\"architecture\":\"{s}\",\"declared_size\":1,\"archive_identity\":{{\"primary\":\"sha512\",\"digests\":[{{\"algorithm\":\"sha512\",\"digest\":\"{s}\"}}]}}}}{s}",
-            .{ name, f.arch, zeros, if (index == 3) "" else "," });
+        const item = try std.fmt.allocPrint(support.allocator, "{{\"name\":\"{s}\",\"version\":\"1\",\"architecture\":\"{s}\",\"declared_size\":1,\"archive_identity\":{{\"primary\":\"sha512\",\"digests\":[{{\"algorithm\":\"sha512\",\"digest\":\"{s}\"}}]}}}}{s}", .{ name, f.arch, zeros, if (index == 3) "" else "," });
         defer support.allocator.free(item);
         try packages.appendSlice(support.allocator, item);
     }
-    const lock_text = try std.fmt.allocPrint(support.allocator,
-        "{{\"schema\":\"https://debz.dev/schema/exact-closure-lock-v3\",\"version\":3,\"target_architecture\":\"{s}\",\"packages\":[{s}]}}\n",
-        .{ f.arch, packages.items });
+    const lock_text = try std.fmt.allocPrint(support.allocator, "{{\"schema\":\"https://debz.dev/schema/exact-closure-lock-v3\",\"version\":3,\"target_architecture\":\"{s}\",\"packages\":[{s}]}}\n", .{ f.arch, packages.items });
     defer support.allocator.free(lock_text);
     try f.work.write(lock_relative, lock_text);
     const reference = try std.fmt.allocPrint(support.allocator, "{s}/tools/real-snapshot-reference.sh", .{
@@ -1273,7 +1291,7 @@ test "snapshot: reference rejects corrupt cached archive before creating root or
     defer support.allocator.free(cache);
     const refused = try support.runIn(&.{
         "bash", reference, f.executable, lock,
-        cache, f.arch, f.workspace,
+        cache,  f.arch,    f.workspace,
     }, .{ .path = f.work.root });
     defer refused.deinit();
     try testing.expect(refused.code != 0);
@@ -1365,6 +1383,8 @@ test "snapshot: runner bounds and native backend safety checks remain explicit" 
         "install progress bounds may only tighten the reviewed limits",
         "kill -ALRM \"$pid\"",
         "--kill-after=30s \"$((install_ceiling_seconds + 30))s\"",
+        "trace=execve,execveat",
+        "isSafeTransient(err: anyerror)",
         "candidate execution trace missing",
         "outside the reviewed script exception during",
         "unexpected candidate stderr during",
