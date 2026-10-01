@@ -1987,7 +1987,8 @@ jobs:
             fi
           fi
           capture_status=0
-          if [ -d "$work/root/var/lib/dpkg/info" ]; then
+          # The candidate root is 0700 root-owned, so test it as root.
+          if sudo test -d "$work/root/var/lib/dpkg/info"; then
             sudo python3 tools/capture-vendor-state.py \
               --reference-root "$PWD/$work/root" \
               --architecture "$ARCHITECTURE" \

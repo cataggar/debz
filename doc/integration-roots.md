@@ -255,7 +255,10 @@ For each audited operation, `native-exec-audit.txt` records:
 The CI diagnostics step re-audits every retained trace against the
 still-present root, using the production pins. It records the results in
 `exec-reaudit.txt`, writes `forbidden-exec.txt` on refusal, and adds the
-allowed count to the job summary.
+allowed count to the job summary. The candidate root is root-owned with mode
+0700, so the step tests for its dpkg database as root before capturing vendor
+state. In run 36836176163 an unprivileged test could not enter the root and
+skipped that capture.
 
 The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
 the native wrapper step (the 180-minute install ceiling plus refresh,
