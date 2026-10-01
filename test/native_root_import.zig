@@ -313,7 +313,8 @@ const UnchangedReport = struct {
     detail: []const u8,
 };
 
-/// Runs the driver's zero-action `upgrade-all` (`Runtime.verifyUnchanged`).
+/// Runs the driver's zero-action `upgrade-all`: production's `Runtime.prepare`
+/// classification, then `Runtime.verifyUnchanged`. It never executes.
 fn unchangedUpgradeAll(
     fixture: *foundation.Fixture,
     driver: []const u8,
@@ -370,26 +371,81 @@ fn rootState(fixture: *foundation.Fixture, root: []const u8, label: []const u8) 
     };
 }
 
-fn expectUnchanged(
+/// Byte-level listing of `var/lib/dpkg` and `var/lib/debz` (where provenance
+/// lives), which `foundation.capture` compares only semantically or not at all.
+/// `times` adds mtimes, proving that nothing was rewritten with equal bytes.
+/// Acquiring the root operation creates and removes its transient record in
+/// `var/lib/debz`, so only that directory's own mtime is never listed.
+fn databaseState(fixture: *foundation.Fixture, root: []const u8, label: []const u8, times: bool) ![]u8 {
+    const log = try std.fmt.allocPrint(fixture.allocator, "{s}.database", .{label});
+    defer fixture.allocator.free(log);
+    const listing =
+        \\format=$2 && cd "$1" && LC_ALL=C && export LC_ALL &&
+        \\set -- var/lib/dpkg $(test ! -d var/lib/debz || echo var/lib/debz) &&
+        \\find "$@" \( -path var/lib/debz -printf "%p %y %m %U:%G %s\n" \) -o -printf "%p %y %m %U:%G %s %l$format\n" | sort &&
+        \\find "$@" -type f -print0 | sort -z | xargs -0r sha256sum
+    ;
+    try fixture.run(&.{ "/bin/sh", "-c", listing, "sh", root, if (times) " %T@" else "" }, log, 60);
+    return support.read(fixture, log, 64 * 1024 * 1024);
+}
+
+/// The path of a `databaseState` line: first field of a listing line, or the
+/// name after `sha256sum`'s two-space separator.
+fn listedPath(line: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, line, "  ")) |at| if (at == 64) return line[at + 2 ..];
+    return line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse line.len];
+}
+
+/// Paths whose listing lines differ between two `databaseState` captures.
+fn changedPaths(allocator: std.mem.Allocator, before: []const u8, after: []const u8) ![]const []const u8 {
+    var changed: std.ArrayList([]const u8) = .empty;
+    for ([_][2][]const u8{ .{ before, after }, .{ after, before } }) |sides| {
+        var lines = std.mem.splitScalar(u8, sides[0], '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var other = std.mem.splitScalar(u8, sides[1], '\n');
+            const present = while (other.next()) |candidate| {
+                if (std.mem.eql(u8, candidate, line)) break true;
+            } else false;
+            if (present) continue;
+            const name = listedPath(line);
+            for (changed.items) |seen| {
+                if (std.mem.eql(u8, seen, name)) break;
+            } else try changed.append(allocator, name);
+        }
+    }
+    return changed.toOwnedSlice(allocator);
+}
+
+const ZeroAction = enum { unchanged, execution_required, refused };
+
+/// Runs one zero-action `upgrade-all` and requires the expected production
+/// classification. The driver never executes, so the whole root, the dpkg
+/// database, and `var/lib/debz` (including provenance) must stay identical
+/// down to mtimes for every outcome.
+fn expectZeroAction(
     fixture: *foundation.Fixture,
     driver: []const u8,
     root: []const u8,
     architecture: []const u8,
     destination: []const u8,
+    expected: ZeroAction,
     detail: []const u8,
 ) !void {
     const before_label = try std.fmt.allocPrint(fixture.allocator, "{s}-before", .{destination});
     defer fixture.allocator.free(before_label);
     const before = try rootState(fixture, root, before_label);
     defer fixture.allocator.free(before);
+    const before_database = try databaseState(fixture, root, before_label, true);
+    defer fixture.allocator.free(before_database);
     var report = try unchangedUpgradeAll(fixture, driver, root, architecture, destination);
     defer report.deinit();
-    const expected_outcome = if (std.mem.eql(u8, detail, "unchanged")) "unchanged" else "refused";
-    if (!std.mem.eql(u8, report.value.outcome, expected_outcome) or report.value.changed or
+    if (!std.mem.eql(u8, report.value.outcome, @tagName(expected)) or
+        report.value.changed != (expected == .execution_required) or
         !std.mem.eql(u8, report.value.detail, detail))
     {
-        std.debug.print("{s}: expected zero-action {s}, got {s} changed={} {s}\n", .{
-            destination, detail, report.value.outcome, report.value.changed, report.value.detail,
+        std.debug.print("{s}: expected zero-action {t} {s}, got {s} changed={} {s}\n", .{
+            destination, expected, detail, report.value.outcome, report.value.changed, report.value.detail,
         });
         return error.ZeroActionUpgradeMismatch;
     }
@@ -398,7 +454,39 @@ fn expectUnchanged(
     const after = try rootState(fixture, root, after_label);
     defer fixture.allocator.free(after);
     if (!std.mem.eql(u8, before, after)) return error.ZeroActionUpgradeChangedRoot;
+    const after_database = try databaseState(fixture, root, after_label, true);
+    defer fixture.allocator.free(after_database);
+    if (!std.mem.eql(u8, before_database, after_database)) {
+        const changed = try changedPaths(fixture.allocator, before_database, after_database);
+        defer fixture.allocator.free(changed);
+        // The first debz operation on a dpkg-only root creates its empty
+        // persistent root-operation lock, as dpkg leaves its own lock files.
+        const first_operation = std.mem.indexOf(u8, before_database, "var/lib/debz ") == null;
+        const created = [_][]const u8{ "var/lib/debz", "var/lib/debz/root-operation.lock" };
+        var unexpected = false;
+        for (changed) |name| {
+            std.debug.print("{s}: zero-action changed {s}\n", .{ destination, name });
+            for (created) |allowed| {
+                if (first_operation and std.mem.eql(u8, name, allowed)) break;
+            } else unexpected = true;
+        }
+        if (unexpected or (first_operation and
+            std.mem.indexOf(u8, after_database, "\nvar/lib/debz/root-operation.lock f 600 0:0 0 ") == null))
+            return error.ZeroActionUpgradeChangedDatabase;
+    }
     try support.assertNoActiveEvidence(fixture, root);
+}
+
+fn expectUnchanged(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    root: []const u8,
+    architecture: []const u8,
+    destination: []const u8,
+    detail: []const u8,
+) !void {
+    const expected: ZeroAction = if (std.mem.eql(u8, detail, "unchanged")) .unchanged else .refused;
+    return expectZeroAction(fixture, driver, root, architecture, destination, expected, detail);
 }
 
 /// A postinst that writes `arch-native` exactly like dpkg's own must leave a
@@ -482,6 +570,199 @@ fn archNative(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8
     }
 }
 
+const zero_handler = "zero-trigger-handler";
+const zero_file_handler = "zero-file-handler";
+const zero_source = "zero-trigger-source";
+const zero_activator = "zero-trigger-activator";
+const zero_trigger = "debz-zero-trigger";
+const zero_files = "usr/share/debz-zero-files";
+
+/// A configured root has no trigger work: no package awaits or has pending
+/// triggers, and `triggers/Unincorp` is absent or empty.
+fn assertNoPendingTriggers(fixture: *foundation.Fixture, root: []const u8) !void {
+    const status = try rootFile(fixture, root, admin ++ "status");
+    defer fixture.allocator.free(status);
+    for ([_][]const u8{ "Triggers-Pending:", "Triggers-Awaited:", " triggers-pending\n", " triggers-awaited\n" }) |marker|
+        if (std.mem.indexOf(u8, status, marker) != null) return error.ZeroActionFixtureHasPendingTriggers;
+    const unincorp = rootFile(fixture, root, admin ++ "triggers/Unincorp") catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer fixture.allocator.free(unincorp);
+    if (unincorp.len != 0) return error.ZeroActionFixtureHasPendingTriggers;
+}
+
+/// Status paragraphs as a sorted multiset, so record order is ignored.
+fn sameParagraphs(allocator: std.mem.Allocator, left: []const u8, right: []const u8) !bool {
+    var sides: [2]std.ArrayList([]const u8) = .{ .empty, .empty };
+    defer for (&sides) |*side| side.deinit(allocator);
+    for ([_][]const u8{ left, right }, &sides) |text, *side| {
+        var paragraphs = std.mem.splitSequence(u8, text, "\n\n");
+        while (paragraphs.next()) |paragraph| {
+            const trimmed = std.mem.trim(u8, paragraph, "\n");
+            if (trimmed.len != 0) try side.append(allocator, trimmed);
+        }
+        std.mem.sort([]const u8, side.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+    }
+    if (sides[0].items.len != sides[1].items.len) return false;
+    for (sides[0].items, sides[1].items) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+    return true;
+}
+
+/// Which database rewrites pinned dpkg may make while proving it has no
+/// pending work. On its own reference root nothing but `status-old` may
+/// change. On a native root dpkg additionally creates its persistent lock
+/// files and rewrites `status` in its own record order (dpkg sorts records by
+/// name and architecture; native keeps install order), which is allowed only
+/// when the paragraph set is identical.
+const PendingNoop = enum { reference, native };
+
+/// Pinned dpkg's own pending-work commands on a copy of `source`. With nothing
+/// pending, neither may run a script or change `triggers/` state, and `status`
+/// may change only as `PendingNoop` allows. Every rewrite is logged.
+fn dpkgPendingNoop(
+    fixture: *foundation.Fixture,
+    dpkg: []const u8,
+    source: []const u8,
+    label: []const u8,
+    architecture: []const u8,
+    kind: PendingNoop,
+) !void {
+    const copy = try cloneRoot(fixture, source, label, architecture);
+    defer fixture.allocator.free(copy);
+    const root_arg = try std.fmt.allocPrint(fixture.allocator, "--root={s}", .{copy});
+    defer fixture.allocator.free(root_arg);
+    const lock_files = [_][]const u8{ admin ++ "lock", admin ++ "lock-frontend", admin ++ "triggers/Lock" };
+    for ([_][2][]const u8{ .{ "--configure", "--pending" }, .{ "--triggers-only", "-a" } }, [_][]const u8{ "configure-pending", "triggers-only" }) |command, name| {
+        const step = try std.fmt.allocPrint(fixture.allocator, "{s}-{s}", .{ label, name });
+        defer fixture.allocator.free(step);
+        const before_label = try std.fmt.allocPrint(fixture.allocator, "{s}-before", .{step});
+        defer fixture.allocator.free(before_label);
+        const before = try databaseState(fixture, copy, before_label, false);
+        defer fixture.allocator.free(before);
+        const status_before = try rootFile(fixture, copy, admin ++ "status");
+        defer fixture.allocator.free(status_before);
+        const trace_before = try rootFile(fixture, copy, support.trace);
+        defer fixture.allocator.free(trace_before);
+        const log = try std.fmt.allocPrint(fixture.allocator, "{s}.log", .{step});
+        defer fixture.allocator.free(log);
+        if (try support.runExit(fixture, &.{ dpkg, "--force-not-root", "--force-bad-path", root_arg, command[0], command[1] }, log) != 0)
+            return error.ReferencePendingFailed;
+        const after_label = try std.fmt.allocPrint(fixture.allocator, "{s}-after", .{step});
+        defer fixture.allocator.free(after_label);
+        const after = try databaseState(fixture, copy, after_label, false);
+        defer fixture.allocator.free(after);
+        const status_after = try rootFile(fixture, copy, admin ++ "status");
+        defer fixture.allocator.free(status_after);
+        const changed = try changedPaths(fixture.allocator, before, after);
+        defer fixture.allocator.free(changed);
+        for (changed) |path_name| {
+            std.debug.print("{s}: dpkg {s} {s} rewrote {s}\n", .{ label, command[0], command[1], path_name });
+            if (std.mem.eql(u8, path_name, admin ++ "status-old")) continue;
+            if (kind == .native) {
+                for (lock_files) |lock| {
+                    if (std.mem.eql(u8, path_name, lock)) break;
+                } else if (std.mem.eql(u8, path_name, admin[0 .. admin.len - 1]) or
+                    std.mem.eql(u8, path_name, admin ++ "triggers"))
+                {
+                    // Directory entries change only with the created lock files.
+                } else if (std.mem.eql(u8, path_name, admin ++ "status")) {
+                    if (!try sameParagraphs(fixture.allocator, status_before, status_after))
+                        return error.ReferencePendingChangedDatabase;
+                } else return error.ReferencePendingChangedDatabase;
+                continue;
+            }
+            return error.ReferencePendingChangedDatabase;
+        }
+        const trace_after = try rootFile(fixture, copy, support.trace);
+        defer fixture.allocator.free(trace_after);
+        if (!std.mem.eql(u8, trace_before, trace_after)) return error.ReferencePendingRanScript;
+    }
+}
+
+/// A fully configured root whose packages declare trigger interest and
+/// activation, with nothing pending, is unchanged by a zero-action
+/// `upgrade-all`: no program, changed=false, and identical status, `triggers/`,
+/// and provenance, as pinned dpkg's `--configure --pending` and
+/// `--triggers-only -a` are no-ops on the same root. Pending work, whether
+/// package states or unincorporated activations, still requires the
+/// `process_triggers` program.
+fn zeroActionTriggers(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, architecture: []const u8) !void {
+    const workspace = "packages/zero-action-triggers";
+    const handler = try support.makePackage(fixture, architecture, "1", zero_handler, workspace, .{
+        .declarations = "interest-noawait " ++ zero_trigger ++ "\n",
+    });
+    defer fixture.allocator.free(handler);
+    const file_handler = try support.makePackage(fixture, architecture, "1", zero_file_handler, workspace, .{
+        .declarations = "interest /" ++ zero_files ++ "\n",
+    });
+    defer fixture.allocator.free(file_handler);
+    const source = try support.makePackage(fixture, architecture, "1", zero_source, workspace, .{
+        .declarations = "activate-noawait " ++ zero_trigger ++ "\n",
+        .extra_files = &.{.{ .path = zero_files ++ "/" ++ zero_source, .content = "file trigger payload\n" }},
+    });
+    defer fixture.allocator.free(source);
+    const activator = try support.makePackage(fixture, architecture, "1", zero_activator, workspace, .{
+        .declarations = "activate-noawait debz-zero-unhandled\n",
+    });
+    defer fixture.allocator.free(activator);
+
+    var scenario = try support.Scenario.init(fixture, "zero-action-triggers", driver, dpkg, architecture, false);
+    defer scenario.deinit();
+    try scenario.phase(.{ .operation = "install", .archives = &.{ handler, file_handler }, .triggers = true, .recovery = true }, false);
+    try scenario.phase(.{ .operation = "install", .archives = &.{source}, .triggers = true, .recovery = true }, false);
+    const trace = try rootFile(fixture, scenario.native_root, support.trace);
+    defer fixture.allocator.free(trace);
+    for ([_][]const u8{ zero_handler, zero_file_handler }) |name| {
+        const triggered = try std.fmt.allocPrint(fixture.allocator, "{s}@1:postinst\t{s}\tpostinst\t{s}\t2\t9:triggered\t", .{ name, name, architecture });
+        defer fixture.allocator.free(triggered);
+        if (std.mem.indexOf(u8, trace, triggered) == null) return error.ZeroActionFixtureTriggerNotProcessed;
+    }
+    for ([_][]const u8{ scenario.reference_root, scenario.native_root }) |root|
+        try assertNoPendingTriggers(fixture, root);
+    try checkProvenance(fixture, scenario.native_root);
+    const unincorporated = try cloneRoot(fixture, scenario.native_root, "zero-action-triggers-unincorp", architecture);
+    defer fixture.allocator.free(unincorporated);
+
+    try expectZeroAction(fixture, driver, scenario.native_root, architecture, "zero-action-triggers/upgrade-all", .unchanged, "unchanged");
+    try expectZeroAction(fixture, driver, scenario.native_root, architecture, "zero-action-triggers/upgrade-all-again", .unchanged, "unchanged");
+    try dpkgPendingNoop(fixture, dpkg, scenario.reference_root, "zero-action-triggers-dpkg", architecture, .reference);
+    try dpkgPendingNoop(fixture, dpkg, scenario.native_root, "zero-action-triggers-dpkg-native", architecture, .native);
+
+    // dpkg incorporates and processes a recorded activation on its next run.
+    try fixture.write("zero-action-triggers-unincorp/" ++ admin ++ "triggers/Unincorp", zero_trigger ++ " -\n", 0o644);
+    try expectZeroAction(fixture, driver, unincorporated, architecture, "zero-action-triggers-unincorp-upgrade-all", .execution_required, "process_triggers");
+
+    var pending = try support.Scenario.init(fixture, "zero-action-pending-triggers", driver, dpkg, architecture, false);
+    defer pending.deinit();
+    try pending.phase(.{ .operation = "install", .archives = &.{handler}, .triggers = true, .recovery = true }, false);
+    try pending.phase(.{ .operation = "install", .archives = &.{source}, .triggers = true, .defer_triggers = true }, false);
+    const deferred = try rootFile(fixture, pending.native_root, admin ++ "status");
+    defer fixture.allocator.free(deferred);
+    if (std.mem.indexOf(u8, deferred, "Triggers-Pending:") == null) return error.ZeroActionFixtureMissingPendingTriggers;
+    try expectZeroAction(fixture, driver, pending.native_root, architecture, "zero-action-pending-triggers/upgrade-all", .execution_required, "process_triggers");
+    try pending.phase(.{ .operation = "process_triggers", .triggers = true }, false);
+    for ([_][]const u8{ pending.reference_root, pending.native_root }) |root|
+        try assertNoPendingTriggers(fixture, root);
+    try expectZeroAction(fixture, driver, pending.native_root, architecture, "zero-action-pending-triggers/processed-upgrade-all", .unchanged, "unchanged");
+
+    // Activations with no interested package anywhere leave nothing to
+    // process. Native installs refuse such a root's trigger authority as empty,
+    // so dpkg installs it on both sides.
+    var activate_only = try support.Scenario.init(fixture, "zero-action-activate-only", driver, dpkg, architecture, false);
+    defer activate_only.deinit();
+    try activate_only.seed(activator);
+    for ([_][]const u8{ activate_only.reference_root, activate_only.native_root }) |root|
+        try assertNoPendingTriggers(fixture, root);
+    try expectZeroAction(fixture, driver, activate_only.native_root, architecture, "zero-action-activate-only/upgrade-all", .unchanged, "unchanged");
+    try expectZeroAction(fixture, driver, activate_only.native_root, architecture, "zero-action-activate-only/upgrade-all-again", .unchanged, "unchanged");
+    try dpkgPendingNoop(fixture, dpkg, activate_only.reference_root, "zero-action-activate-only-dpkg", architecture, .reference);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args = init.minimal.args.iterate();
@@ -498,5 +779,6 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     try run(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try archNative(&fixture, driver, prerequisite.executable, prerequisite.architecture);
+    try zeroActionTriggers(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try support.assertHostUnchanged(allocator, init.io, prerequisite.before);
 }

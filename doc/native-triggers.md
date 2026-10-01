@@ -254,6 +254,23 @@ variants assert `program_compile_rejected`, unchanged full private-root
 snapshots, and no active authority. That fail-closed behavior must not be
 relaxed or represented as native parity.
 
+**Zero-action update with declared triggers.** A zero-action `upgrade-all` on
+a configured root processes only pending trigger work, as dpkg's
+`--configure --pending` does. Interest and activation declarations with nothing
+pending (no `triggers-pending`/`triggers-awaited` package, no pending or
+awaited names, empty `Unincorp`) are not work. That root is `unchanged` with
+`changed=false`, compiles no `process_triggers` program, and leaves status,
+`triggers/` and provenance byte-identical. `test-native-root-import`'s
+`zeroActionTriggers` installs explicit and file interest handlers plus an
+activating source through native trigger processing. Two zero-action updates
+then leave `var/lib/dpkg` and `var/lib/debz` byte- and mtime-identical. Pinned
+dpkg's `--configure --pending` and `--triggers-only -a` run no script and
+change no `status` or `triggers/` bytes on the reference root; only
+`status-old` is rewritten. It also covers activate-only roots with no
+interested package. An unincorporated activation or a deferred
+`Triggers-Pending` still classifies as `execution_required` `process_triggers`,
+and after processing the root is unchanged again.
+
 Unit regressions guard exact declarations and scripts, reference command
 flags, root snapshots, ordering and helper identity. The
 `-Dnative-diversions-only=true` option selects the diversion cases; the
