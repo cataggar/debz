@@ -1436,6 +1436,10 @@ def audit_production_sources() -> None:
         'const global_keyring_path = "/etc/apt/trusted.gpg";',
         'const global_keyring_directory_path = "/etc/apt/trusted.gpg.d";',
     }
+    # A reviewed profile names a target-root logical path; it never opens it.
+    reviewed_profile_paths = {
+        '.source_path = "/etc/apt/sources.list.d/microsoft-prod.list",',
+    }
     process_calls: list[str] = []
     child_calls: list[str] = []
     namespace_calls: list[str] = []
@@ -1470,6 +1474,12 @@ def audit_production_sources() -> None:
                         line_text.strip() in target_apt_paths
                         or (first_test >= 0 and match.start() > first_test)
                     )
+                ):
+                    continue
+                if (
+                    relative == "src/reviewed_repository_profile.zig"
+                    and reason == "ambient APT configuration"
+                    and line_text.strip() in reviewed_profile_paths
                 ):
                     continue
                 line = text.count("\n", 0, match.start()) + 1

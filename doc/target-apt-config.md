@@ -89,7 +89,11 @@ The default requires signed `Valid-Until`; the only alternative allows a
 missing field for a nonzero, bounded maximum Release age. Unknown, duplicate,
 invalid, or missing source-policy paths fail rather than being ignored. This is
 an API-level policy input only; target import does not infer a policy from a
-hostname or publish system-specific defaults.
+hostname or publish system-specific defaults. `repo add` supplies policies
+itself only for exact
+[reviewed freshness profiles](repository-management.md#reviewed-freshness-profiles).
+It derives them from the imported source and keyring bytes and repeats the
+import to confirm those bytes are unchanged.
 
 The canonical `apt-config-snapshot-v2` document records source paths, digests,
 and freshness policies; normalized configuration, repository identities, and

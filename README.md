@@ -105,6 +105,14 @@ Use `--sha256` to pin the descriptor or `--no-refresh` to defer the final
 metadata refresh. See
 [`doc/repository-management.md`](doc/repository-management.md).
 
+Refresh requires a signed `Valid-Until` by default. Microsoft's Ubuntu 24.04
+feed omits that field, so `repo add` for the descriptor above applies a
+reviewed 14-day maximum Release age instead. It does so only for its exact
+`microsoft-prod.list` source, `noble main` on `amd64` or `arm64`, and the
+pinned Microsoft signing key. Separate descriptor structure checks still
+refuse the current upstream package; see
+[reviewed freshness profiles](doc/repository-management.md#reviewed-freshness-profiles).
+
 The installed CLI exposes the limited profile-bound system facade:
 
 ```sh

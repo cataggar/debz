@@ -25,6 +25,7 @@ const repository_acquisition = @import("repository_acquisition.zig");
 const repository_policy = @import("repository_policy.zig");
 const repository_plan = @import("repository_plan.zig");
 const repository_refresh = @import("repository_refresh.zig");
+const reviewed_repository_profile = @import("reviewed_repository_profile.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
 const root_operation_completion = @import("root_operation_completion.zig");
@@ -126,6 +127,7 @@ pub const NativeRecoveryRequest = struct {
     repository: api.Request,
     attempt: *root_operation.Attempt,
     deadline: transaction_executor.Deadline,
+    reviewed_profiles: []const reviewed_repository_profile.Profile = reviewed_repository_profile.production_profiles,
 
     fn validate(self: @This()) !void {
         _ = try self.deadline.remainingMs();
@@ -151,13 +153,19 @@ pub const NativeReceiptRequest = struct {
     expected_receipt_sha256: native_provenance.Digest,
     /// The invocation's original budget, shared with execution or recovery.
     deadline: transaction_executor.Deadline,
+    reviewed_profiles: []const reviewed_repository_profile.Profile = reviewed_repository_profile.production_profiles,
 
     fn validate(self: NativeReceiptRequest) !void {
         try self.recoveryRequest().validate();
     }
 
     fn recoveryRequest(self: @This()) NativeRecoveryRequest {
-        return .{ .repository = self.repository, .attempt = self.attempt, .deadline = self.deadline };
+        return .{
+            .repository = self.repository,
+            .attempt = self.attempt,
+            .deadline = self.deadline,
+            .reviewed_profiles = self.reviewed_profiles,
+        };
     }
 };
 
@@ -435,6 +443,7 @@ fn readNativeRepositoryHistoryObserved(
         .attempt = input.attempt,
         .expected_receipt_sha256 = receipt.document.digest_sha256,
         .deadline = input.deadline,
+        .reviewed_profiles = input.reviewed_profiles,
     };
     var manifest = if (failed) null else try NativeRepositoryManifest.read(allocator, input, original.descriptor, stored, paths);
     defer if (manifest) |*value| value.deinit();
@@ -1108,12 +1117,12 @@ fn nativeRepositorySnapshot(allocator: std.mem.Allocator, input: NativeRecoveryR
     try input.validate();
     const root = input.attempt.coordinator.root;
     var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
-    var snapshot = try target_apt_config.snapshot(allocator, .{
+    var snapshot = try reviewedTargetSnapshot(allocator, .{
         .root_path = input.repository.root,
         .architecture_override = input.attempt.record().target_architecture,
         .limits = targetLimits(input.repository.resources),
         .dependencies = .{ .filesystem = filesystem.interface(), .process = null },
-    });
+    }, input.reviewed_profiles);
     errdefer snapshot.deinit();
     if (RootOperationGuard.checkArchitecture(input.attempt.record(), .{
         .native = snapshot.manifest.manifest.native_architecture,
@@ -1204,7 +1213,7 @@ fn inspectNativeDescriptorMaterial(
         !std.mem.eql(u8, validation.version, descriptor.version) or
         !std.mem.eql(u8, validation.architecture, descriptor.architecture))
         return error.DescriptorIdentityMismatch;
-    var material = try inspectDescriptorMaterial(allocator, &validation, state.architecture, input.repository.network, input.repository.resources);
+    var material = try inspectDescriptorMaterial(allocator, &validation, state.architecture, input.repository.network, input.repository.resources, input.reviewed_profiles);
     errdefer material.deinit();
     if (material.evidence.len != state.managed_files.len) return error.RepositoryStateMismatch;
     for (material.evidence, state.managed_files) |actual, expected| {
@@ -1228,6 +1237,7 @@ fn resumeNativeImportRefresh(
         .attempt = publication.input.attempt,
         .deadline = publication.input.deadline,
         .expected_receipt_sha256 = receipt.digest_sha256,
+        .reviewed_profiles = publication.input.reviewed_profiles,
     };
     var original = try readNativeDescriptorMaterial(allocator, input, descriptor, receipt, current.state);
     defer original.deinit();
@@ -1253,6 +1263,8 @@ fn importNativeDescriptorMaterial(
         return publication.fail(allocator, current, paths, .target_import_failed, err);
     defer snapshot.deinit();
     verifyImportedMaterial(snapshot, material.evidence) catch |err|
+        return publication.fail(allocator, current, paths, .target_import_failed, err);
+    verifyImportedFreshness(snapshot, material) catch |err|
         return publication.fail(allocator, current, paths, .target_import_failed, err);
     const manifest_bytes = try snapshot.manifest.manifest.canonicalJson(allocator);
     defer allocator.free(manifest_bytes);
@@ -1507,6 +1519,7 @@ fn finishNativeRepository(
         .attempt = publication.input.attempt,
         .deadline = publication.input.deadline,
         .expected_receipt_sha256 = receipt.digest_sha256,
+        .reviewed_profiles = publication.input.reviewed_profiles,
     };
     const attempt = input.attempt;
     const root = attempt.coordinator.root;
@@ -1953,6 +1966,9 @@ pub const Backend = struct {
     acquisition_dependencies: ?repository_acquisition.Dependencies = null,
     now_unix: ?i64 = null,
     state_write_hooks: state_module.WriteHooks = .{},
+    /// Reviewed exceptions for signed feeds without `Valid-Until`. Only exact
+    /// source, key and architecture matches receive the bounded policy.
+    reviewed_repository_profiles: []const reviewed_repository_profile.Profile = reviewed_repository_profile.production_profiles,
 
     pub fn interface(self: *Backend) api.Backend {
         return .{ .context = self, .executeFn = executeOpaque };
@@ -2000,6 +2016,8 @@ pub const Backend = struct {
         execution_path: ExecutionPath,
     ) !api.Result {
         const transaction_backend = self.transaction_backend;
+        reviewed_repository_profile.validateProfiles(self.reviewed_repository_profiles) catch
+            return api.failure(.usage, .invalid_request, "policy", "reviewed repository profile is invalid");
         if (!self.legacy_execution_capable and transaction_backend == .legacy_dpkg)
             return mapRootOperationError(error.LegacyCapabilityRequired);
         const native = execution_path == .native_runtime;
@@ -2068,6 +2086,7 @@ pub const Backend = struct {
             .repository = request,
             .attempt = guard.active().?,
             .deadline = budget.executionDeadline(),
+            .reviewed_profiles = self.reviewed_repository_profiles,
         } else null;
         budget.native_input = native_input;
         const native_dependencies: NativeImportRefreshDependencies = .{
@@ -2172,7 +2191,7 @@ pub const Backend = struct {
             return api.failure(.usage, .invalid_root, "target", "target root is unsafe or unavailable");
         defer target_files.deinit();
         var architecture_process = target_apt_config.SystemProcessRunner{ .io = self.io };
-        var before_snapshot = target_apt_config.snapshot(allocator, .{
+        var before_snapshot = reviewedTargetSnapshot(allocator, .{
             .root_path = request.root,
             .architecture_override = if (transaction_backend == .native)
                 guard.active().?.record().target_architecture
@@ -2186,7 +2205,7 @@ pub const Backend = struct {
                 else
                     null,
             },
-        }) catch |err| return api.failure(
+        }, self.reviewed_repository_profiles) catch |err| return api.failure(
             .usage,
             if (err == error.NativeArchitectureUnavailable)
                 .architecture_unavailable
@@ -2463,6 +2482,7 @@ pub const Backend = struct {
             architecture,
             request.network,
             request.resources,
+            self.reviewed_repository_profiles,
         ) catch |err| return progress.fail(
             state_store,
             allocator,
@@ -3748,7 +3768,7 @@ pub const Backend = struct {
             @errorName(err),
         );
 
-        var after_snapshot = target_apt_config.snapshot(allocator, .{
+        var after_snapshot = reviewedTargetSnapshot(allocator, .{
             .root_path = request.root,
             .architecture_override = architecture,
             .limits = targetLimits(request.resources),
@@ -3759,7 +3779,7 @@ pub const Backend = struct {
                 else
                     null,
             },
-        }) catch |err| return progress.fail(
+        }, self.reviewed_repository_profiles) catch |err| return progress.fail(
             state_store,
             allocator,
             .post_install,
@@ -3782,6 +3802,15 @@ pub const Backend = struct {
             );
         }
         verifyImportedMaterial(after_snapshot, material.evidence) catch |err|
+            return progress.fail(
+                state_store,
+                allocator,
+                .post_install,
+                .target_import_failed,
+                "import",
+                @errorName(err),
+            );
+        verifyImportedFreshness(after_snapshot, &material) catch |err|
             return progress.fail(
                 state_store,
                 allocator,
@@ -5438,6 +5467,78 @@ const OperationBudget = struct {
     }
 };
 
+/// Imports target APT configuration, then re-imports it with the bounded
+/// policy of every reviewed profile that exactly matches the imported source
+/// and keyring bytes. The second import must observe identical material, so
+/// the recorded policy always belongs to the material it was derived from.
+fn reviewedTargetSnapshot(
+    allocator: std.mem.Allocator,
+    request: target_apt_config.Request,
+    profiles: []const reviewed_repository_profile.Profile,
+) !target_apt_config.Snapshot {
+    std.debug.assert(request.source_policies.len == 0);
+    var initial = try target_apt_config.snapshot(allocator, request);
+    const policies = reviewedSourcePolicies(allocator, &initial, profiles) catch |err| {
+        initial.deinit();
+        return err;
+    };
+    defer allocator.free(policies);
+    if (policies.len == 0) return initial;
+    defer initial.deinit();
+    var reviewed_request = request;
+    reviewed_request.source_policies = policies;
+    var reviewed = try target_apt_config.snapshot(allocator, reviewed_request);
+    errdefer reviewed.deinit();
+    if (!sameImportedMaterial(initial, reviewed)) return error.TargetConfigurationChanged;
+    return reviewed;
+}
+
+fn reviewedSourcePolicies(
+    allocator: std.mem.Allocator,
+    snapshot: *const target_apt_config.Snapshot,
+    profiles: []const reviewed_repository_profile.Profile,
+) ![]target_apt_config.SourcePolicy {
+    var policies: std.ArrayList(target_apt_config.SourcePolicy) = .empty;
+    errdefer policies.deinit(allocator);
+    if (profiles.len == 0) return policies.toOwnedSlice(allocator);
+    const keyrings = try allocator.alloc(reviewed_repository_profile.Keyring, snapshot.keyring_materials.len);
+    defer allocator.free(keyrings);
+    for (snapshot.keyring_materials, keyrings) |material, *keyring| keyring.* = .{
+        .logical_path = material.logical_path,
+        .primary_fingerprints = material.primary_fingerprints,
+    };
+    for (snapshot.source_materials) |material| {
+        const freshness = try reviewed_repository_profile.sourceFreshness(allocator, profiles, .{
+            .logical_path = material.logical_path,
+            .bytes = material.bytes,
+            .format = material.format,
+        }, keyrings, snapshot.manifest.manifest.native_architecture);
+        if (freshness == .require_valid_until) continue;
+        try policies.append(allocator, .{ .logical_path = material.logical_path, .freshness = freshness });
+    }
+    return policies.toOwnedSlice(allocator);
+}
+
+fn sameImportedMaterial(left: target_apt_config.Snapshot, right: target_apt_config.Snapshot) bool {
+    if (!std.mem.eql(u8, left.manifest.manifest.native_architecture, right.manifest.manifest.native_architecture) or
+        left.source_materials.len != right.source_materials.len or
+        left.keyring_materials.len != right.keyring_materials.len)
+        return false;
+    for (left.source_materials, right.source_materials) |a, b| {
+        if (!std.mem.eql(u8, a.logical_path, b.logical_path) or
+            !std.mem.eql(u8, &a.sha256, &b.sha256) or
+            a.format != b.format)
+            return false;
+    }
+    for (left.keyring_materials, right.keyring_materials) |a, b| {
+        if (!std.mem.eql(u8, a.logical_path, b.logical_path) or
+            !std.mem.eql(u8, &a.sha256, &b.sha256) or
+            a.use != b.use)
+            return false;
+    }
+    return true;
+}
+
 fn repositoryLimits(resources: api.ResourcePolicy) repository_policy.Limits {
     return .{
         .source = .{ .max_sources = resources.maximum_repositories },
@@ -5459,6 +5560,8 @@ const MaterialFile = struct {
     bytes: []const u8,
     sha256: [32]u8,
     kind: enum { source, keyring },
+    /// Set only by an exact reviewed-profile match for this source file.
+    freshness: repository_refresh.ExpiryPolicy = .require_valid_until,
 };
 
 const DescriptorMaterial = struct {
@@ -5489,6 +5592,7 @@ fn inspectDescriptorMaterial(
     architecture: []const u8,
     network: api.NetworkPolicy,
     resources: api.ResourcePolicy,
+    profiles: []const reviewed_repository_profile.Profile,
 ) !DescriptorMaterial {
     var source_files: std.ArrayList(MaterialFile) = .empty;
     defer {
@@ -5527,32 +5631,9 @@ fn inspectDescriptorMaterial(
         source_files.items.len,
     );
     defer allocator.free(documents);
-    for (source_files.items, 0..) |file, index| {
-        documents[index] = .{
-            .bytes = file.bytes,
-            .format = if (std.mem.endsWith(u8, file.logical_path, ".sources"))
-                .deb822
-            else
-                .legacy,
-            .policy = .{
-                .proxy = if (network.proxy_url != null)
-                    .{ .declared = .{ .id = "repository-api-proxy" } }
-                else
-                    .direct,
-                .deadlines = deadlines(network, null),
-            },
-        };
-    }
-    const normalized = try repository_policy.normalizeBinaryRefresh(
-        allocator,
-        documents,
-        architecture,
-        repositoryLimits(resources),
-    );
-    var configuration = switch (normalized) {
-        .diagnostic => return error.MalformedRepositorySource,
-        .configuration => |value| value,
-    };
+    for (source_files.items, 0..) |file, index|
+        documents[index] = descriptorSourceDocument(file, network);
+    var configuration = try normalizeDescriptorDocuments(allocator, documents, architecture, resources);
     errdefer configuration.deinit();
     if (configuration.repositories.len == 0) return error.DynamicRepositoryMaterial;
 
@@ -5567,6 +5648,11 @@ fn inspectDescriptorMaterial(
     }
     var seen_keyrings = std.StringHashMap(void).init(allocator);
     defer seen_keyrings.deinit();
+    var keyring_fingerprints: std.ArrayList(reviewed_repository_profile.Keyring) = .empty;
+    defer {
+        for (keyring_fingerprints.items) |keyring| allocator.free(keyring.primary_fingerprints);
+        keyring_fingerprints.deinit(allocator);
+    }
     for (configuration.repositories) |repository| {
         if (repository.signed_by.len == 0) return error.UnsignedRepository;
         for (repository.signed_by) |logical_path| {
@@ -5585,6 +5671,11 @@ fn inspectDescriptorMaterial(
             if (inspected.primary_fingerprints.len == 0)
                 return error.MalformedPayloadKeyring;
             try seen_keyrings.put(logical_path, {});
+            try keyring_fingerprints.ensureUnusedCapacity(allocator, 1);
+            keyring_fingerprints.appendAssumeCapacity(.{
+                .logical_path = logical_path,
+                .primary_fingerprints = try allocator.dupe([20]u8, inspected.primary_fingerprints),
+            });
             try files.append(allocator, .{
                 .logical_path = try allocator.dupe(u8, logical_path),
                 .bytes = bytes,
@@ -5592,6 +5683,23 @@ fn inspectDescriptorMaterial(
                 .kind = .keyring,
             });
         }
+    }
+    // Sources were appended first, in document order. A profile is judged
+    // against the payload keyring that refresh will authenticate with.
+    var reviewed = false;
+    for (files.items[0..documents.len], documents) |*file, *document| {
+        file.freshness = try reviewed_repository_profile.sourceFreshness(allocator, profiles, .{
+            .logical_path = file.logical_path,
+            .bytes = file.bytes,
+            .format = document.format,
+        }, keyring_fingerprints.items, architecture);
+        document.policy.freshness = file.freshness;
+        if (file.freshness != .require_valid_until) reviewed = true;
+    }
+    if (reviewed) {
+        const replacement = try normalizeDescriptorDocuments(allocator, documents, architecture, resources);
+        configuration.deinit();
+        configuration = replacement;
     }
     std.mem.sort(MaterialFile, files.items, {}, lessMaterialFile);
     const owned_files = try files.toOwnedSlice(allocator);
@@ -5610,6 +5718,42 @@ fn inspectDescriptorMaterial(
         .configuration = configuration,
         .files = owned_files,
         .evidence = evidence,
+    };
+}
+
+fn descriptorSourceDocument(file: MaterialFile, network: api.NetworkPolicy) repository_policy.SourceDocument {
+    return .{
+        .bytes = file.bytes,
+        .format = if (std.mem.endsWith(u8, file.logical_path, ".sources"))
+            .deb822
+        else
+            .legacy,
+        .policy = .{
+            .freshness = file.freshness,
+            .proxy = if (network.proxy_url != null)
+                .{ .declared = .{ .id = "repository-api-proxy" } }
+            else
+                .direct,
+            .deadlines = deadlines(network, null),
+        },
+    };
+}
+
+fn normalizeDescriptorDocuments(
+    allocator: std.mem.Allocator,
+    documents: []const repository_policy.SourceDocument,
+    architecture: []const u8,
+    resources: api.ResourcePolicy,
+) !repository_policy.Configuration {
+    const normalized = try repository_policy.normalizeBinaryRefresh(
+        allocator,
+        documents,
+        architecture,
+        repositoryLimits(resources),
+    );
+    return switch (normalized) {
+        .diagnostic => error.MalformedRepositorySource,
+        .configuration => |value| value,
     };
 }
 
@@ -5685,20 +5829,7 @@ fn changedDescriptorConfiguration(
     defer changed_documents.deinit(allocator);
     for (material.files) |file| {
         if (file.kind != .source) continue;
-        const document: repository_policy.SourceDocument = .{
-            .bytes = file.bytes,
-            .format = if (std.mem.endsWith(u8, file.logical_path, ".sources"))
-                .deb822
-            else
-                .legacy,
-            .policy = .{
-                .proxy = if (network.proxy_url != null)
-                    .{ .declared = .{ .id = "repository-api-proxy" } }
-                else
-                    .direct,
-                .deadlines = deadlines(network, null),
-            },
-        };
+        const document = descriptorSourceDocument(file, network);
         const normalized = try repository_policy.normalizeBinaryRefresh(
             allocator,
             &.{document},
@@ -6736,6 +6867,22 @@ fn verifyImportedMaterial(
 ) !void {
     if (!snapshotContainsManagedMaterial(snapshot, files))
         return error.ImportedDigestMismatch;
+}
+
+/// The imported manifest must carry exactly the reviewed freshness that the
+/// descriptor payload earned, so refresh evidence and target state agree.
+fn verifyImportedFreshness(
+    snapshot: target_apt_config.Snapshot,
+    material: *const DescriptorMaterial,
+) !void {
+    for (material.files) |file| {
+        if (file.kind != .source) continue;
+        const record = for (snapshot.manifest.manifest.sources) |record| {
+            if (std.mem.eql(u8, record.logical_path, file.logical_path)) break record;
+        } else return error.ImportedDigestMismatch;
+        if (!repository_refresh.expiryPoliciesEqual(record.freshness, file.freshness))
+            return error.ImportedFreshnessMismatch;
+    }
 }
 
 fn snapshotContainsManagedMaterial(
@@ -11321,6 +11468,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
         "amd64",
         .{},
         .{},
+        reviewed_repository_profile.production_profiles,
     );
     defer material.deinit();
     try std.testing.expectEqual(@as(usize, 1), material.configuration.repositories.len);
@@ -11370,6 +11518,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
                 "amd64",
                 .{},
                 .{},
+                reviewed_repository_profile.production_profiles,
             ),
         );
     }
@@ -11394,6 +11543,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             "amd64",
             .{},
             .{},
+            reviewed_repository_profile.production_profiles,
         ),
     );
     entries[0].path = @constCast("usr/share/doc/microsoft-prod.list");
@@ -11405,6 +11555,7 @@ test "repository backend extracts static Microsoft-shaped source and keyring mat
             "amd64",
             .{},
             .{},
+            reviewed_repository_profile.production_profiles,
         ),
     );
 }
@@ -11738,6 +11889,7 @@ const RepositoryTestExecutor = struct {
     clock_ms: ?*u64 = null,
     advance_ms_after_install: u64 = 0,
     install_status: ?[]const u8 = null,
+    installed_source: []const u8 = test_repository_source,
     /// Publishes a directory under the operation directory using the name of a
     /// document the backend is about to write, so the very next post-executor
     /// publication fails with the root already mutated.
@@ -11984,7 +12136,7 @@ const RepositoryTestExecutor = struct {
         try self.directory.createDirPath(self.io, "root/usr/share/keyrings");
         try self.directory.writeFile(self.io, .{
             .sub_path = "root/etc" ++ "/apt/sources.list.d/microsoft-prod.list",
-            .data = test_repository_source,
+            .data = self.installed_source,
         });
         try self.directory.writeFile(self.io, .{
             .sub_path = "root/usr/share/keyrings/microsoft-prod.gpg",
@@ -15235,5 +15387,286 @@ test "repository backend rejects an unavailable native backend before root acces
     try std.testing.expectError(
         error.FileNotFound,
         directory.dir.statFile(std.testing.io, "root/var/lib/debz", .{}),
+    );
+}
+
+const reviewed_test_source =
+    "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] " ++
+    "https://packages.microsoft.com/ubuntu/24.04/prod noble main\n";
+
+/// The production Microsoft Noble profile re-pinned to the hermetic fixture
+/// key, so the exact reviewed identity can be exercised end to end.
+const reviewed_test_profiles: []const reviewed_repository_profile.Profile = &.{blk: {
+    var profile = reviewed_repository_profile.microsoft_ubuntu_noble_prod;
+    profile.primary_fingerprints = &.{@import("fixtures/openpgp.zig").primary_fingerprint};
+    break :blk profile;
+}};
+
+/// Replaces the fixture descriptor's single sources.list.d entry, keeping the
+/// uncompressed tar member's block layout and recomputing its header checksum.
+fn reviewedTestDescriptor(source_bytes: []const u8) ![]u8 {
+    const original = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    const bytes = try std.testing.allocator.dupe(u8, original);
+    errdefer std.testing.allocator.free(bytes);
+    const member = "." ++ reviewed_repository_profile.microsoft_ubuntu_noble_prod.source_path;
+    const header = std.mem.indexOf(u8, bytes, member) orelse
+        return error.MissingFixtureSource;
+    if (source_bytes.len > 512) return error.FixtureSourceTooLarge;
+    _ = try std.fmt.bufPrint(bytes[header + 124 ..][0..12], "{o:0>11}\x00", .{source_bytes.len});
+    @memset(bytes[header + 512 ..][0..512], 0);
+    @memcpy(bytes[header + 512 ..][0..source_bytes.len], source_bytes);
+    @memset(bytes[header + 148 ..][0..8], ' ');
+    var checksum: u32 = 0;
+    for (bytes[header..][0..512]) |byte| checksum += byte;
+    _ = try std.fmt.bufPrint(bytes[header + 148 ..][0..8], "{o:0>6}\x00 ", .{checksum});
+    return bytes;
+}
+
+/// Serves a Microsoft-shaped signed Noble feed without `Valid-Until` over
+/// HTTPS at any host, so origin identity is decided only by the profile.
+const ReviewedRepositoryTestAcquisition = struct {
+    descriptor: []const u8,
+    in_release_requests: usize = 0,
+    packages_requests: usize = 0,
+
+    fn dependencies(self: *ReviewedRepositoryTestAcquisition) repository_acquisition.Dependencies {
+        return .{
+            .transport = .{ .context = self, .requestFn = request },
+            .files = .{ .context = self, .readFn = readFile },
+            .clock = .{ .context = self, .nowMsFn = nowMilliseconds, .sleepMsFn = noSleep },
+        };
+    }
+
+    fn request(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        http: repository_acquisition.HttpRequest,
+    ) !repository_acquisition.HttpResponse {
+        const self: *ReviewedRepositoryTestAcquisition = @ptrCast(@alignCast(context.?));
+        const fixture = @import("fixtures/openpgp.zig");
+        if (!std.mem.eql(u8, http.uri.scheme, "https")) return error.NetworkForbidden;
+        var buffer: [512]u8 = undefined;
+        const path = try http.uri.path.toRaw(&buffer);
+        const prefix = "/ubuntu/24.04/prod/dists/noble/";
+        const body: ?[]const u8 = if (!std.mem.startsWith(u8, path, prefix))
+            null
+        else if (std.mem.eql(u8, path[prefix.len..], "InRelease")) blk: {
+            self.in_release_requests += 1;
+            break :blk &fixture.noble_repository_in_release;
+        } else for ([_][]const u8{ "amd64", "arm64", "armhf" }) |architecture| {
+            var name: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&name, "main/binary-{s}/Packages", .{architecture});
+            if (std.mem.eql(u8, path[prefix.len..], expected)) {
+                self.packages_requests += 1;
+                break &fixture.noble_repository_packages;
+            }
+        } else null;
+        return .{
+            .status = if (body == null) 404 else 200,
+            .body = try allocator.dupe(u8, body orelse ""),
+        };
+    }
+
+    fn readFile(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        limit: usize,
+        _: repository_acquisition.Deadlines,
+    ) !repository_acquisition.FileRead {
+        const self: *ReviewedRepositoryTestAcquisition = @ptrCast(@alignCast(context.?));
+        if (!std.mem.endsWith(u8, path, "descriptor.deb")) return error.FileNotFound;
+        if (self.descriptor.len > limit) return error.ResponseTooLarge;
+        return .{ .bytes = try allocator.dupe(u8, self.descriptor), .regular = true };
+    }
+
+    fn nowMilliseconds(_: ?*anyopaque) u64 {
+        return 0;
+    }
+
+    fn noSleep(_: ?*anyopaque, _: u64) !void {}
+};
+
+const ReviewedAddOutcome = struct {
+    result: api.Result,
+    executor_calls: usize,
+    in_release_requests: usize,
+};
+
+fn runReviewedRepositoryAdd(
+    directory: std.Io.Dir,
+    installed_source: []const u8,
+    profiles: []const reviewed_repository_profile.Profile,
+    now_unix: i64,
+) !ReviewedAddOutcome {
+    const descriptor = try reviewedTestDescriptor(installed_source);
+    defer std.testing.allocator.free(descriptor);
+    const root = try repositoryTestRoot(std.testing.allocator, directory);
+    defer std.testing.allocator.free(root);
+    var acquisition: ReviewedRepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{
+        .io = std.testing.io,
+        .directory = directory,
+        .installed_source = installed_source,
+    };
+    var backend: Backend = .{
+        .io = std.testing.io,
+        .executor = executor.interface(),
+        .acquisition_dependencies = acquisition.dependencies(),
+        .now_unix = now_unix,
+        .reviewed_repository_profiles = profiles,
+    };
+    const result = try api.execute(std.testing.allocator, .{
+        .root = root,
+        .descriptor_url = "file:///descriptor.deb",
+        .expected_sha256 = sha256(descriptor),
+        .architecture = "amd64",
+    }, backend.interface());
+    return .{
+        .result = result,
+        .executor_calls = executor.calls,
+        .in_release_requests = acquisition.in_release_requests,
+    };
+}
+
+fn expectReviewedRefusal(
+    installed_source: []const u8,
+    profiles: []const reviewed_repository_profile.Profile,
+    now_unix: i64,
+    expected_error: []const u8,
+) !void {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    var outcome = try runReviewedRepositoryAdd(directory.dir, installed_source, profiles, now_unix);
+    defer outcome.result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.authentication, outcome.result.exit_status);
+    try std.testing.expectEqual(api.DiagnosticId.repository_authentication_failed, outcome.result.diagnostics[0].id);
+    try std.testing.expectEqualStrings(expected_error, outcome.result.diagnostics[0].message);
+    try std.testing.expect(outcome.in_release_requests != 0);
+    try std.testing.expectEqual(@as(usize, 0), outcome.executor_calls);
+    try std.testing.expect(!outcome.result.installed);
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.access(std.testing.io, "root" ++ reviewed_repository_profile.microsoft_ubuntu_noble_prod.source_path, .{}),
+    );
+}
+
+test "repository add applies the reviewed 14-day policy to the verified Microsoft Noble source" {
+    const fixture = @import("fixtures/openpgp.zig");
+    const maximum_age: i64 = @intCast(reviewed_repository_profile.microsoft_maximum_release_age_seconds);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    var outcome = try runReviewedRepositoryAdd(
+        directory.dir,
+        reviewed_test_source,
+        reviewed_test_profiles,
+        fixture.created + maximum_age,
+    );
+    defer outcome.result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, outcome.result.exit_status);
+    try std.testing.expect(outcome.result.installed);
+    try std.testing.expect(outcome.result.refreshed);
+    try std.testing.expectEqual(@as(usize, 1), outcome.executor_calls);
+    // Preflight and the final refresh of the installed source both authenticate.
+    try std.testing.expect(outcome.in_release_requests >= 2);
+
+    const manifest_relative = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "root{s}",
+        .{outcome.result.paths.target_manifest orelse return error.MissingEvidencePath},
+    );
+    defer std.testing.allocator.free(manifest_relative);
+    const manifest_bytes = try directory.dir.readFileAlloc(
+        std.testing.io,
+        manifest_relative,
+        std.testing.allocator,
+        .limited(target_apt_config.maximum_document_bytes),
+    );
+    defer std.testing.allocator.free(manifest_bytes);
+    var manifest = try target_apt_config.decodeManifest(
+        std.testing.allocator,
+        manifest_bytes,
+        target_apt_config.maximum_document_bytes,
+    );
+    defer manifest.deinit();
+    try std.testing.expectEqual(target_apt_config.ArtifactVersion.v2, manifest.manifest.artifact_version);
+    try std.testing.expectEqual(@as(usize, 1), manifest.manifest.sources.len);
+    try std.testing.expectEqualStrings(
+        reviewed_repository_profile.microsoft_ubuntu_noble_prod.source_path,
+        manifest.manifest.sources[0].logical_path,
+    );
+    try std.testing.expectEqual(
+        @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
+        repository_refresh.expiryPolicyMaxAge(manifest.manifest.sources[0].freshness),
+    );
+    try std.testing.expectEqual(@as(usize, 3), manifest.manifest.repository_policies.len);
+    for (manifest.manifest.repository_policies) |policy| try std.testing.expectEqual(
+        @as(?u64, reviewed_repository_profile.microsoft_maximum_release_age_seconds),
+        repository_refresh.expiryPolicyMaxAge(policy.freshness),
+    );
+
+    var replay = try runReviewedRepositoryAdd(
+        directory.dir,
+        reviewed_test_source,
+        reviewed_test_profiles,
+        fixture.created + maximum_age,
+    );
+    defer replay.result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, replay.result.exit_status);
+    try std.testing.expect(!replay.result.changed);
+    try std.testing.expectEqual(@as(usize, 0), replay.executor_calls);
+}
+
+test "repository add refuses a Microsoft Noble Release older than the reviewed 14 days" {
+    const fixture = @import("fixtures/openpgp.zig");
+    const maximum_age: i64 = @intCast(reviewed_repository_profile.microsoft_maximum_release_age_seconds);
+    try expectReviewedRefusal(
+        reviewed_test_source,
+        reviewed_test_profiles,
+        fixture.created + maximum_age + 1,
+        "ReleaseExpired",
+    );
+}
+
+test "repository add keeps Valid-Until mandatory without an exact reviewed match" {
+    const fixture = @import("fixtures/openpgp.zig");
+    const now = fixture.created + 30;
+    // The shipped profile pins Microsoft's signing key, not the fixture key.
+    try expectReviewedRefusal(reviewed_test_source, reviewed_repository_profile.production_profiles, now, "ReleaseMissingValidUntil");
+    try expectReviewedRefusal(reviewed_test_source, &.{}, now, "ReleaseMissingValidUntil");
+    var other_signer = reviewed_test_profiles[0];
+    other_signer.primary_fingerprints = &.{@import("fixtures/openpgp.zig").subkey_fingerprint};
+    try expectReviewedRefusal(reviewed_test_source, &.{other_signer}, now, "ReleaseMissingValidUntil");
+    // Identical signed metadata from another origin is not the reviewed feed.
+    try expectReviewedRefusal(
+        "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] " ++
+            "https://mirror.example.test/ubuntu/24.04/prod noble main\n",
+        reviewed_test_profiles,
+        now,
+        "ReleaseMissingValidUntil",
+    );
+}
+
+test "repository add rejects an invalid reviewed profile before touching the root" {
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    var unbounded = reviewed_test_profiles[0];
+    unbounded.maximum_release_age_seconds = repository_refresh.maximum_missing_valid_until_age_seconds + 1;
+    var outcome = try runReviewedRepositoryAdd(
+        directory.dir,
+        reviewed_test_source,
+        &.{unbounded},
+        @import("fixtures/openpgp.zig").created + 30,
+    );
+    defer outcome.result.deinit();
+    try std.testing.expectEqual(api.ExitStatus.usage, outcome.result.exit_status);
+    try std.testing.expectEqual(api.DiagnosticId.invalid_request, outcome.result.diagnostics[0].id);
+    try std.testing.expectEqual(@as(usize, 0), outcome.in_release_requests);
+    try std.testing.expectError(
+        error.FileNotFound,
+        directory.dir.access(std.testing.io, "root/var/lib/debz", .{}),
     );
 }
