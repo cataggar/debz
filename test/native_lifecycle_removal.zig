@@ -899,6 +899,8 @@ const DirectPurge = struct {
     conffile: bool,
     scripts: bool = true,
     omit_postrm: bool = false,
+    omit_prerm: bool = false,
+    only_postrm: bool = false,
 };
 
 fn directPurgeArchive(fixture: *foundation.Fixture, arch: []const u8, entry: DirectPurge, scenario: []const u8) ![]u8 {
@@ -908,7 +910,11 @@ fn directPurgeArchive(fixture: *foundation.Fixture, arch: []const u8, entry: Dir
         .conffile_content = if (entry.conffile) "configuration 1\n" else null,
         .full_payload = true,
         .no_scripts = !entry.scripts,
-        .scripts = .{ .omit_postrm = entry.omit_postrm },
+        .scripts = .{
+            .omit_postrm = entry.omit_postrm,
+            .omit_prerm = entry.omit_prerm,
+            .only_postrm = entry.only_postrm,
+        },
     });
 }
 
@@ -916,7 +922,7 @@ fn expectPurged(case: *support.Scenario) !void {
     try expectStatus(case, null);
     try expectFile(case, configuration, null);
     try expectFile(case, "usr/share/" ++ name ++ "/data", null);
-    for ([_][]const u8{ "list", "md5sums", "conffiles", "prerm", "postrm" }) |suffix| {
+    for ([_][]const u8{ "list", "md5sums", "conffiles", "preinst", "postinst", "prerm", "postrm" }) |suffix| {
         const info = try std.fmt.allocPrint(case.fixture.allocator, "var/lib/dpkg/info/{s}.{s}", .{ name, suffix });
         defer case.fixture.allocator.free(info);
         try expectFile(case, info, null);
@@ -1003,12 +1009,26 @@ fn expectBlocked(
 
 const Interruption = struct {
     purge: DirectPurge,
+    operation: []const u8 = "purge",
+    prefix: []const u8 = "direct-purge",
     crash: []const u8,
     interrupted: []const Invocation,
     /// Whether the crash landed before the removal half deleted the payload.
     payload: bool,
+    /// The durable native status once the crash child has exited.
+    status: []const u8 = "install ok installed",
+    /// Whether every installed script was durably staged before the crash.
+    staged: bool = false,
     unknown: bool = false,
 };
+
+fn nativeExists(case: *support.Scenario, path: []const u8) !bool {
+    const file = try relative(case, "native", path);
+    defer case.fixture.allocator.free(file);
+    _ = case.fixture.dir.statFile(case.fixture.io, file, .{ .follow_symlinks = false }) catch |err|
+        return if (err == error.FileNotFound) false else err;
+    return true;
+}
 
 fn expectInterruptedRoot(case: *support.Scenario, entry: Interruption) !void {
     const fixture = case.fixture;
@@ -1019,6 +1039,20 @@ fn expectInterruptedRoot(case: *support.Scenario, entry: Interruption) !void {
         true
     else |err| if (err == error.FileNotFound) false else return err;
     if (present != entry.payload) return error.UnexpectedInterruptedPurgePayload;
+    if (entry.purge.scripts) for (support.kinds) |kind| {
+        if ((entry.purge.only_postrm and !std.mem.eql(u8, kind, "postrm")) or
+            (entry.purge.omit_prerm and std.mem.eql(u8, kind, "prerm")) or
+            (entry.purge.omit_postrm and std.mem.eql(u8, kind, "postrm")))
+            continue;
+        const info = try std.fmt.allocPrint(fixture.allocator, "var/lib/dpkg/info/{s}.{s}", .{ name, kind });
+        defer fixture.allocator.free(info);
+        // Removal deletes every installed script except postrm.
+        if (try nativeExists(case, info) != (entry.payload or std.mem.eql(u8, kind, "postrm")))
+            return error.UnexpectedInterruptedPurgeInfo;
+        const staged = try std.fmt.allocPrint(fixture.allocator, "var/lib/debz-lifecycle-scripts/{s}:{s}.{s}", .{ name, case.architecture, kind });
+        defer fixture.allocator.free(staged);
+        if (entry.staged and !try nativeExists(case, staged)) return error.InterruptedPurgeScriptNotStaged;
+    };
     if (entry.purge.conffile) {
         const conffile = try relative(case, "native", configuration);
         defer fixture.allocator.free(conffile);
@@ -1032,13 +1066,15 @@ fn expectInterruptedRoot(case: *support.Scenario, entry: Interruption) !void {
     defer fixture.allocator.free(status_path);
     const status = try support.read(fixture, status_path, 1024 * 1024);
     defer fixture.allocator.free(status);
-    const begin = std.mem.indexOf(u8, status, "Package: " ++ name ++ "\nStatus: install ok installed\n");
-    if (begin == null) return error.InterruptedPurgePublishedTerminalState;
+    const expected = try std.fmt.allocPrint(fixture.allocator, "Package: " ++ name ++ "\nStatus: {s}\n", .{entry.status});
+    defer fixture.allocator.free(expected);
+    if (std.mem.indexOf(u8, status, expected) == null) return error.InterruptedPurgePublishedTerminalState;
 }
 
-/// Crashes at existing boundaries across the remove-to-purge transition of a
-/// direct purge. Recovery either finishes the one journaled purge program with
-/// exact dpkg parity or, for an unknown postrm outcome, stays blocked.
+/// Crashes at journaled boundaries of a remove or a direct purge, including its
+/// remove-to-purge transition. Recovery either finishes the one journaled
+/// program with exact dpkg parity or, for an unknown postrm outcome, stays
+/// blocked.
 fn directPurgeInterrupted(
     fixture: *foundation.Fixture,
     driver: []const u8,
@@ -1046,7 +1082,7 @@ fn directPurgeInterrupted(
     arch: []const u8,
     entry: Interruption,
 ) !void {
-    const label = try std.fmt.allocPrint(fixture.allocator, "direct-purge-recovery-{s}-{s}", .{ entry.purge.label, entry.crash });
+    const label = try std.fmt.allocPrint(fixture.allocator, "{s}-recovery-{s}-{s}", .{ entry.prefix, entry.purge.label, entry.crash });
     defer fixture.allocator.free(label);
     const archive = try directPurgeArchive(fixture, arch, entry.purge, label);
     defer fixture.allocator.free(archive);
@@ -1055,18 +1091,20 @@ fn directPurgeInterrupted(
     try case.seed(archive);
     if (entry.purge.conffile) try bothFile(&case, configuration, "edited configuration\n");
     const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
-    const reference_log = try support.path(fixture.allocator, label, "reference-purge");
+    const reference_label = try std.fmt.allocPrint(fixture.allocator, "reference-{s}", .{entry.operation});
+    defer fixture.allocator.free(reference_label);
+    const reference_log = try support.path(fixture.allocator, label, reference_label);
     defer fixture.allocator.free(reference_log);
     try fixture.directory(reference_log);
     if (try support.reference(fixture, dpkg, case.reference_root, .{
-        .operation = "purge",
+        .operation = entry.operation,
         .packages = &selected,
     }, reference_log) != 0) return error.UnexpectedReferencePurge;
     const crash_log = try support.path(fixture.allocator, label, "interrupted");
     defer fixture.allocator.free(crash_log);
     try fixture.directory(crash_log);
     if (support.native(fixture, driver, case.native_root, arch, .{
-        .operation = "purge",
+        .operation = entry.operation,
         .packages = &selected,
         .recovery = true,
         .crash_at = entry.crash,
@@ -1077,6 +1115,8 @@ fn directPurgeInterrupted(
     } else |err| if (err != error.ChildFailed) return err;
     try expectInterruptedRoot(&case, entry);
     try expectBlocked(&case, &selected, "purge", "blocked-purge", null);
+    if (std.mem.eql(u8, entry.operation, "remove"))
+        try expectBlocked(&case, &selected, "remove", "blocked-remove-reentry", null);
     if (entry.unknown) {
         try expectBlocked(&case, &selected, "recover", "recover", "script_outcome_unknown");
         try expectBlocked(&case, &selected, "remove", "blocked-remove", null);
@@ -1110,7 +1150,10 @@ fn directPurgeInterrupted(
     const recovered_trace = try nativeTrace(&case);
     defer fixture.allocator.free(recovered_trace);
     if (!std.mem.eql(u8, reference_trace, recovered_trace)) return error.DirectPurgeRecoveryReplayedScript;
-    try expectPurged(&case);
+    if (std.mem.eql(u8, entry.operation, "purge"))
+        try expectPurged(&case)
+    else
+        try expectRemoved(&case, entry.purge.conffile);
     std.debug.print("{s}/recover: native/dpkg parity passed\n", .{label});
 }
 
@@ -1120,6 +1163,14 @@ fn directPurgeRecovery(fixture: *foundation.Fixture, driver: []const u8, dpkg: [
     const scriptless_conffile: DirectPurge = .{ .label = "scriptless-conffile", .conffile = true, .scripts = false };
     for ([_]Interruption{
         .{ .purge = scripts_conffile, .crash = "after_script_outcome", .interrupted = &.{prerm_remove}, .payload = true },
+        .{
+            .purge = scripts_conffile,
+            .crash = "after_removal_postrm_outcome",
+            .interrupted = &.{ prerm_remove, postrm_remove },
+            .payload = false,
+            .status = removed_status,
+            .staged = true,
+        },
         .{
             .purge = scripts_conffile,
             .crash = "after_removal_postrm_return_before_outcome",
@@ -1141,6 +1192,93 @@ fn directPurgeRecovery(fixture: *foundation.Fixture, driver: []const u8, dpkg: [
         },
         .{ .purge = scriptless_conffile, .crash = "mutation_target_remove", .interrupted = &.{}, .payload = true },
         .{ .purge = scriptless_conffile, .crash = "during_database_publication", .interrupted = &.{}, .payload = false },
+    }) |entry| try directPurgeInterrupted(fixture, driver, dpkg, arch, entry);
+}
+
+/// Native removal settles the residual status before it runs `postrm remove`.
+const removed_status = "deinstall ok config-files";
+const no_prerm: DirectPurge = .{ .label = "no-prerm", .conffile = false, .omit_prerm = true };
+const no_prerm_conffile: DirectPurge = .{ .label = "no-prerm-conffile", .conffile = true, .omit_prerm = true };
+const only_postrm: DirectPurge = .{ .label = "only-postrm", .conffile = false, .only_postrm = true };
+const only_postrm_conffile: DirectPurge = .{ .label = "only-postrm-conffile", .conffile = true, .only_postrm = true };
+
+fn expectRemoved(case: *support.Scenario, conffile: bool) !void {
+    try expectStatus(case, "Status: deinstall ok config-files\n");
+    try expectFile(case, configuration, if (conffile) "edited configuration\n" else null);
+    try expectFile(case, "usr/share/" ++ name ++ "/data", null);
+    try expectInfoContains(case, "var/lib/dpkg/info/" ++ name ++ ".postrm", "#!/bin/sh");
+}
+
+/// A package with a postrm but no prerm has no earlier script step, so its
+/// maintainer scripts must be staged before removal deletes `info/*` (#328).
+/// Both remove (then purge of the residue) and direct purge match dpkg.
+fn postrmOnlyParity(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    for ([_]DirectPurge{ no_prerm, no_prerm_conffile, only_postrm, only_postrm_conffile }) |entry| {
+        const selected = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
+        for ([_][]const u8{ "remove", "purge" }) |operation| {
+            const label = try std.fmt.allocPrint(fixture.allocator, "postrm-only-{s}-{s}", .{ entry.label, operation });
+            defer fixture.allocator.free(label);
+            const archive = try directPurgeArchive(fixture, arch, entry, label);
+            defer fixture.allocator.free(archive);
+            var case = try support.Scenario.init(fixture, label, driver, dpkg, arch, false);
+            defer case.deinit();
+            try case.seed(archive);
+            if (entry.conffile) try bothFile(&case, configuration, "edited configuration\n");
+            if (std.mem.eql(u8, operation, "remove")) {
+                try phase(&case, .{ .operation = "remove", .packages = &selected }, false, &.{postrm_remove});
+                try expectRemoved(&case, entry.conffile);
+                try phase(&case, .{ .operation = "purge", .packages = &selected }, false, &.{postrm_purge});
+            } else {
+                try phase(&case, .{ .operation = "purge", .packages = &selected }, false, &.{ postrm_remove, postrm_purge });
+            }
+            try expectPurged(&case);
+        }
+    }
+}
+
+/// Crashes during the journaled staging that now precedes removal of a
+/// postrm-only package, between that staging and its postrm, and after
+/// `postrm remove` returns, for both remove and direct purge (#328).
+fn postrmOnlyRecovery(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    if (fixture.oracle_only) return;
+    const purge = "postrm-only-purge";
+    const remove = "postrm-only-remove";
+    for ([_]Interruption{
+        .{ .purge = no_prerm_conffile, .prefix = purge, .crash = "during_database_publication", .interrupted = &.{}, .payload = true },
+        .{ .purge = no_prerm_conffile, .prefix = purge, .crash = "mutation_target_remove", .interrupted = &.{}, .payload = true, .staged = true },
+        .{ .purge = no_prerm_conffile, .prefix = purge, .crash = "after_removal_postrm_outcome", .interrupted = &.{postrm_remove}, .payload = false, .status = removed_status, .staged = true },
+        .{ .purge = only_postrm, .prefix = purge, .crash = "after_removal_postrm_outcome", .interrupted = &.{postrm_remove}, .payload = false, .status = removed_status, .staged = true },
+        .{
+            .purge = no_prerm_conffile,
+            .prefix = purge,
+            .crash = "after_removal_postrm_return_before_outcome",
+            .interrupted = &.{postrm_remove},
+            .payload = false,
+            .staged = true,
+            .unknown = true,
+        },
+        .{ .purge = no_prerm, .operation = "remove", .prefix = remove, .crash = "during_database_publication", .interrupted = &.{}, .payload = true },
+        .{ .purge = only_postrm_conffile, .operation = "remove", .prefix = remove, .crash = "mutation_target_remove", .interrupted = &.{}, .payload = true, .staged = true },
+        .{
+            .purge = no_prerm_conffile,
+            .operation = "remove",
+            .prefix = remove,
+            .crash = "after_removal_postrm_outcome",
+            .interrupted = &.{postrm_remove},
+            .payload = false,
+            .status = removed_status,
+            .staged = true,
+        },
+        .{
+            .purge = no_prerm,
+            .operation = "remove",
+            .prefix = remove,
+            .crash = "after_removal_postrm_return_before_outcome",
+            .interrupted = &.{postrm_remove},
+            .payload = false,
+            .staged = true,
+            .unknown = true,
+        },
     }) |entry| try directPurgeInterrupted(fixture, driver, dpkg, arch, entry);
 }
 
@@ -1168,4 +1306,6 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     try unknownRemoval(fixture, driver, dpkg, arch, first);
     try directPurgeParity(fixture, driver, dpkg, arch);
     try directPurgeRecovery(fixture, driver, dpkg, arch);
+    try postrmOnlyParity(fixture, driver, dpkg, arch);
+    try postrmOnlyRecovery(fixture, driver, dpkg, arch);
 }

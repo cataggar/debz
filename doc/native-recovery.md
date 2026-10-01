@@ -2098,14 +2098,15 @@ This is an inventory of **real process termination** coverage, not a claim
 that every path through a journal is covered. Every cited Zig acceptance
 driver requires child exit **86**, absence of a completion report, and a new
 guarded root for its crash case; a unit-only assertion does not count.
-`src/native_recovery.zig::CrashPoint` has **76** values. The table below
+`src/native_recovery.zig::CrashPoint` has **77** values. The table below
 names all of them: each now has at least one executable process-kill case.
 This is selector coverage, **not** every journaled syscall or operation
 variant. The selected previously unit-only #267 family is bootstrap
 config-slot serialization (seven process cases, including the shared intent
 seam); #293 adds independent postrm cache/checkpoint proofs. Since the
 original 58-row #267 inventory, main also added three real awaited-removal
-script/trigger interruption selectors.
+script/trigger interruption selectors, and #328 added a known `postrm remove`
+outcome selector for remove and direct purge.
 
 In the table, `O` is the durable native `root-operation-v1.json` attempt
 (backend `native`, exact-lock/request/policy/program digests bound to
@@ -2133,7 +2134,10 @@ ordinary/helper/known-failure cases; `C` = conffile, `N` = metadata,
 matrix), `VR` = that file's `route_cases/routeCase` (two additional
 changed-route upgrade selectors, seven guarded roots apiece), and `RM` =
 `test/native_trigger_removal.zig::awaitedRemovalInterruptions` through
-`test-native-triggers-zig` (actual awaited-removal crash children); `MP` =
+`test-native-triggers-zig` (actual awaited-removal crash children); `LR` =
+`test/native_lifecycle_removal.zig::directPurgeInterrupted` through
+`test-native-lifecycle-zig` (`direct-purge-recovery-*` and
+`postrm-only-{remove,purge}-recovery-*` crash children); `MP` =
 `test/native_recovery_publication.zig::cases/runCase` (14 distinct named
 publication/metadata/release/restore seams and a rollback-release control);
 all are
@@ -2182,6 +2186,7 @@ operations using that selector.
 | `after_script_outcome` | O/J: known outcome durable, no script replay; R | B, H, C |
 | `after_script_return_before_outcome` | O/J: script did run, no durable outcome; Q | BC, B, H |
 | `after_removal_postrm_return_before_outcome` | O/J/T: awaited removal postrm registered a trigger but has no durable outcome; Q without re-executing it | RM `registration` |
+| `after_removal_postrm_outcome` | O/J: known `postrm remove` outcome durable, installed scripts staged, removal files gone; R through the rest of remove or purge without rerunning it | LR `postrm-only-*-recovery-*-after_removal_postrm_outcome` |
 | `after_upgrade_postrm_return_before_outcome` | O/J/D: upgrade postrm unknown; Q | V, H |
 | `after_upgrade_postrm_route_publication` | O/J/D: route contract durable, cache/checkpoint owed; R or Q on drift | V #23/#27 |
 | `after_upgrade_postrm_cache_refresh` | O/J/D: private refreshed cache durable, prior managed route slot still absent; R or Q on changed/missing cache, checkpoint or contract | VR `cache-refresh` |
@@ -2276,7 +2281,7 @@ case runs seven real process kills, including independent changed/missing
 cache, checkpoint and contract refusals; a numbered Python case or a unit
 cache test does not substitute for either selector.
 
-**Root-mutation syscall boundaries (#294).** In addition to the 76 native
+**Root-mutation syscall boundaries (#294).** In addition to the 77 native
 `CrashPoint` selectors above, `test-native-recovery-zig-mutation-boundaries`
 selects each of the 13 journal/staging/backup `root_mutation.Boundary` hooks
 by its own name. The version-1 Zig table runs an actual caller-owned native

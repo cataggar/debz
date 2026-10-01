@@ -125,7 +125,9 @@ pub const ScriptOptions = struct {
     before_failure: []const u8 = "",
     after_failure: []const u8 = "",
     omit_postrm: bool = false,
+    omit_prerm: bool = false,
     only_postinst: bool = false,
+    only_postrm: bool = false,
 };
 
 pub fn scripts(fixture: *foundation.Fixture, source: []const u8, package: []const u8, version: []const u8) !void {
@@ -135,7 +137,9 @@ pub fn scripts(fixture: *foundation.Fixture, source: []const u8, package: []cons
 pub fn scriptsWith(fixture: *foundation.Fixture, source: []const u8, package: []const u8, version: []const u8, options: ScriptOptions) !void {
     for (kinds) |kind| {
         if (options.only_postinst and !std.mem.eql(u8, kind, "postinst")) continue;
+        if (options.only_postrm and !std.mem.eql(u8, kind, "postrm")) continue;
         if (options.omit_postrm and std.mem.eql(u8, kind, "postrm")) continue;
+        if (options.omit_prerm and std.mem.eql(u8, kind, "prerm")) continue;
         const body = try std.fmt.allocPrint(fixture.allocator,
             \\#!/bin/sh
             \\printf '%s\t%s\t%s\t%s\t%d' '{s}@{s}:{s}' "$DPKG_MAINTSCRIPT_PACKAGE" "$DPKG_MAINTSCRIPT_NAME" "$DPKG_MAINTSCRIPT_ARCH" "$#" >> /{s}
