@@ -1928,9 +1928,12 @@ top-level reinstall, and the update lock resolved to zero actions. The
 zero-action `upgrade-all` then failed with exit **7**
 `UnsupportedLifecycleConffile`. procps records
 `/etc/sysctl.conf newconffile remove-on-upgrade`, and native installed-package
-lifecycle evidence cannot yet represent a `newconffile` digest. The wrapper
-therefore still does not complete its post-install operations on a fresh
-native root. This probe is bound evidence only, not wrapper-completion proof.
+lifecycle evidence at that source could not represent a `newconffile` digest,
+so the wrapper did not complete its post-install operations. #339 (closing
+#333) has since matched dpkg 1.22.22 for these records in native lifecycle
+evidence and program state. No fresh amd64 wrapper run has confirmed the
+zero-action update since. This probe is bound evidence only, not
+wrapper-completion proof.
 
 An untraced local ReleaseSafe run on a 16-CPU arm64 Neoverse N2 host, using
 the same snapshot and the arm64 lock, unpacked all 175 packages within about
