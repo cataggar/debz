@@ -158,7 +158,13 @@ The live native preflight classifies the dpkg directory before importing the
 selected files. Known compatibility members such as `available` and `*-old`
 are preserved, not rewritten. An unclassified top-level member, nonempty
 `parts/`, or a linked, special, or writable-by-others known member refuses
-before a native mutation. `tmp.ci` is checked separately by the existing
+before a native mutation. `arch-native`, which dpkg's own postinst writes from
+`$DPKG_MAINTSCRIPT_ARCH`, is admitted only as a regular file that is not
+group- or other-writable and whose bounded content is exactly the request's
+target architecture, optionally followed by one newline. Any other value
+refuses with `DatabaseNativeArchitectureMismatch`. It is checked at preflight
+but, like the other compatibility members, is not part of the generation
+digest. `tmp.ci` is checked separately by the existing
 control-staging collision guard, which also refuses occupied and non-directory
 entries before mutation. This complements the typed snapshot importer: a
 healthy modeled subset cannot mask unsupported state elsewhere in an existing

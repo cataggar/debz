@@ -60,6 +60,11 @@ A spawned script runs with:
   `LANG=C`, `LC_ALL=C`, and `PATH=/usr/sbin:/usr/bin:/sbin:/bin`, plus the
   allowlisted request variables. No proxy, credential, or configuration value
   is inherited.
+- **dpkg's umask.** The child sets `umask(022)` immediately before `execve`,
+  as dpkg's `dpkg_program_init` does for its whole process, so files and
+  directories a script creates never inherit the caller's umask. debz's own
+  payload and dpkg-database writes set explicit modes, so they do not depend on
+  the umask either.
 - **No shell.** The script is executed with `execve` on an absolute in-root
   path and an exact argv; no `sh -c` string is ever constructed.
 - **Stdin.** Standard input is `/dev/null`, so scripts cannot block on input.

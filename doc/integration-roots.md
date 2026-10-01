@@ -255,7 +255,10 @@ For each audited operation, `native-exec-audit.txt` records:
 The CI diagnostics step re-audits every retained trace against the
 still-present root, using the production pins. It records the results in
 `exec-reaudit.txt`, writes `forbidden-exec.txt` on refusal, and adds the
-allowed count to the job summary.
+allowed count to the job summary. The candidate root is root-owned with mode
+0700, so the step tests for its dpkg database as root before capturing vendor
+state. In run 36836176163 an unprivileged test could not enter the root and
+skipped that capture.
 
 The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
 the native wrapper step (the 180-minute install ceiling plus refresh,
@@ -1970,6 +1973,25 @@ packages configured. The audit allowed exactly two script queries. Through
 reviewed arm64 identity. Nothing was refused, so the wrapper exited with
 install's status 8 rather than 90. This is evidence for the audit only, not
 for wrapper completion.
+
+CI run 36836176163 then ran the full traced wrapper on a hosted amd64 runner,
+from main `85774a7aa6f8d2cae9ad75f85871451bd5b0bec0` on the
+`20261001T000000Z` pin. Native `install` succeeded after 5,972 seconds, with
+all 175 packages `install ok installed`. Durable progress never paused for
+more than 24 seconds. Final verification reported `exact_match`, and the
+exec audit allowed 98 script `dpkg` queries and forbade none. The zero-action
+`upgrade-all` then refused with exit **7** `UnsupportedDatabaseEntry` and left
+the root unchanged. dpkg's own postinst had written `var/lib/dpkg/arch-native`
+(`amd64` and a newline) from `$DPKG_MAINTSCRIPT_ARCH`, and the live-database
+preflight did not classify that member. The preflight now admits it only with
+the target architecture (see [Package database](package-database.md)). No
+fresh amd64 run has confirmed the update since, so this run is not
+wrapper-completion proof.
+The wrapper's `umask 077` also reached the scripts. `arch-native` was written
+0600, and about 1,000 other script-created entries, mostly Python
+`__pycache__` under `usr/lib`, were owner-only. A few of those are owner-only
+under dpkg too, because their scripts set the mode explicitly. Scripts now
+run under dpkg's `umask 022`.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
