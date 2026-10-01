@@ -1535,6 +1535,13 @@ test "security: final recovery matrix and prior completion are mutation enforced
         "if (!retained_completion) try completion_store.publish(allocator, statement.document);",
     });
     try nativeMutations(&f, "native-final", "src/native_unpack.zig", &.{"var preexisting = try completion_store.read(allocator);"});
+    try nativeMutationsIn(&f, "native-final", "src/native_unpack.zig", "fn readProductionCompletion(", "\nfn ", &.{
+        "nativeAction(.provenance, std.math.maxInt(u32), 0, 0),\n    ) orelse return error.InvalidRecoveryProvenance;",
+        "if (terminal.stage != .terminal or switch (receipt.document.outcome) {",
+        ".succeeded => terminal.result != .succeeded and terminal.result != .recovered,",
+        ".failed => terminal.result != .failed,",
+        ".recovery_required => true,\n    }) return error.InvalidRecoveryProvenance;",
+    });
 }
 
 test "security: recovery entry points execute expected output shape and modes" {
@@ -1684,6 +1691,50 @@ test "security: complete recovery selector graph and pinned fixture handoffs ref
     try nativeMutations(&f, "native-gate", "test/native_recovery_repository.zig", &.{
         "const selected = try selectMode(false, projection_only, execution_only, cli_only);",
         "selected == null or selected == .projection or selected == .execution or selected == .cli",
+    });
+}
+
+test "security: native provenance component tamper coverage stays wired" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-provenance", "build.zig", &.{
+        "            \"native_provenance_binding.test.\",\n",
+        "    workload_native.dependOn(&run_sha512_e2e_tests.step);",
+    });
+    try nativeMutations(&f, "native-provenance", "src/sha512_transaction_e2e_test.zig", &.{
+        "    _ = @import(\"native_provenance_binding_test.zig\");",
+    });
+    try nativeMutations(&f, "native-provenance", "src/native_provenance_binding_test.zig", &.{
+        "test \"native_provenance_binding.test.completed attempt binds every acceptance component\" {",
+        "test \"native_provenance_binding.test.recovered attempt binds every acceptance component\" {",
+        "test \"native_provenance_binding.test.recovery_required attempt keeps typed evidence without success-shaped settlement\" {",
+        "try tamperSettled(&env, &settled);",
+        "try testing.expect(settled.recovered_phase_count >= 1);",
+        "try env.expectSecondOperationRefused();",
+        "for ([_]native_provenance.Outcome{ .succeeded, .failed }) |outcome| {",
+        "\"receipt.evidence_files[{s}] omitted\"",
+        "\"retained {s} bytes\"",
+        "\"completion.transaction_provenance=provenanceDigest\"",
+        "\"live pending trigger claim\"",
+        "\"deferred owner reinstated\"",
+        "try testing.expect(!std.mem.eql(u8, &receipt_digest, &provenance_digest));",
+    });
+    try nativeMutationsIn(&f, "native-workflow", "test/native_recovery_family.zig", "\nfn ownedComponents(", "\nfn ", &.{
+        "const retained_kinds = [_]provenance.EvidenceKind{ .authorization, .program, .execution_request, .intent, .progress, .managed_state, .trigger_events, .script_outcome };",
+        "if (!observed_kinds.contains(kind) and (kind != .script_outcome or check.scripts))",
+        "\"retained-{s}-{d}\"",
+        "outcome_other_terminal,\n        outcome_recovery_required,",
+        "final_database_generation,\n        final_state,",
+        "if (check.outcome == .failed) \"TransactionNotFailed\" else \"TransactionNotSuccessful\"",
+        "else => \"EvidenceMismatch\",",
+        ".expected_error = \"ReceiptMissing\"",
+        ".expected_error = \"CompletionMissing\"",
+        ".expected_error = \"OwnershipMismatch\"",
+    });
+    try nativeMutations(&f, "native-workflow", "test/native_recovery_family.zig", &.{
+        "    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{",
+        "        .state = \"released\",\n        .outcome = .succeeded,\n        .scripts = false,",
+        "        .state = \"pending\",\n        .outcome = .failed,\n        .scripts = true,",
     });
 }
 

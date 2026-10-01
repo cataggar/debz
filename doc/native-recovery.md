@@ -2347,3 +2347,80 @@ The five core completion boundaries (`after_native_receipt`,
 with real children, original receipt and active owner through terminal
 acknowledgment. The mutation matrix does not substitute for every
 package-specific script/trigger path in #86.
+
+### Native provenance component binding (#269)
+
+This maps each #86 acceptance component to the record field that binds it
+and to executable tamper coverage. Every negative case changes or omits
+exactly one binding. It must produce a typed refusal or a typed
+`recovery_required`, and it must never produce a success-shaped summary,
+acknowledgment, or a second active operation.
+
+Test abbreviations:
+
+- **HC**, **HR**, **HQ**: the hermetic, non-root tests in
+  `src/native_provenance_binding_test.zig`, run by
+  `zig build test-sha512-e2e`, and by `zig build test-workload-native` in the
+  required `build-and-test-workload-native` job (Debug and ReleaseSafe, x64
+  and arm64):
+  - `native_provenance_binding.test.completed attempt binds every acceptance component`;
+  - `native_provenance_binding.test.recovered attempt binds every acceptance component`,
+    which loses the process after `info/demo.list` is published and settles
+    with `recovered_phase_count >= 1`;
+  - `native_provenance_binding.test.recovery_required attempt keeps typed evidence without success-shaped settlement`.
+
+  HC and HR share one matrix of about 80 cases; labels are quoted below.
+- **FS** and **FF**: `test/native_recovery_family.zig::ownedComponents`,
+  real processes against pinned dpkg (`test-native-recovery-zig-family`):
+  - FS runs from `ownedSuccess`, with a released owner, a succeeded outcome
+    and `conffile-pkg`;
+  - FF runs from `ownedKnownFailure`, with a pending owner, a failed outcome
+    and a failing postinst.
+
+  Labels are workflow directory names (`retained-<kind>-<n>`,
+  `receipt-<field>`, `receipt-missing`, `completion-missing`,
+  `stale-owner`).
+- **FV**: `verificationRefusals` in the same file.
+- **U1**: `native_transaction_result.test.retained script outcomes bind every exact progress invocation`.
+- **U2**: `native_transaction_result.test.known failure cannot become success or accept unknown outcomes`.
+
+| Component | Bound field(s) | Completed / recovered | Failed | Recovery required |
+| --- | --- | --- | --- | --- |
+| Archive identities | exact-lock v3 package archive identity → receipt `exact_lock_sha256`, `artifact_evidence_sha256`; completion `exact_lock`, `artifact_evidence_sha256`; retained `authorization` | HC/HR `caller lock archive identity` (`LockEvidenceMismatch`), `receipt.exact_lock_sha256`, `receipt.artifact_evidence_sha256`, `completion.exact_lock`, `completion.artifact_evidence_sha256`, `retained authorization bytes`; FS `receipt-exact_lock`, `receipt-artifact_evidence`, `retained-authorization-*` | FF same cases | HQ keeps the original lock-bound attempt owed; resealed receipts refused |
+| DB generation / status | receipt `initial_database_generation_sha256`, `final_database_generation_sha256`, `final_state_sha256` (`package_database_closure_v1`); completion `database_generation_sha256` | HC/HR `receipt.final_database_generation_sha256`, `receipt.final_state_sha256` (`FinalStateMismatch`), `receipt.initial_database_generation_sha256`, `completion.database_generation_sha256`, `live dpkg status`, `live dpkg info list`; FS `receipt-final_database_generation`, `receipt-final_state`; FV `refuse-damaged-database` | FF `changed-database` (`FinalStateMismatch`), `receipt-final_*` | HQ receipt records its interrupted generation; never settles |
+| Filesystem decisions | retained `managed_state` (per-path decisions/digests), progress; diversion/route evidence when present | HC/HR `retained managed_state bytes`, `receipt.evidence_files[managed_state]` omitted/`.sha256`; FS `retained-managed_state-*` | FF `retained-managed_state-*` | HQ: changed payload during recovery → `managed_state_changed` receipt |
+| Maintainer-script launch / outcome | progress `in_flight`/`outcome` records, retained `script_outcome` documents, receipt `script_outcomes_sha256`, `progress_head_sha256`, `progress_record_count` | U1; HC/HR `receipt.script_outcomes_sha256`, `receipt.progress_head_sha256`, `receipt.progress_record_count`, `retained progress bytes`; FS `receipt-script_outcomes`, `retained-progress-*` | FF `retained-script_outcome-*`, `retained-progress-*`, `receipt-script_outcomes` | HQ (no script evidence consumed) |
+| Conffile choice | policy digest (conffile mode) → receipt/completion `policy_sha256`, exact-lock v3 policy (`AuthorizationMismatch`), `managed_state` conffile decisions | HC/HR `caller conffile choice` (`CallerRequestMismatch`), `receipt.policy_sha256`, `completion.policy_sha256`; FS `receipt-policy`, `retained-managed_state-*` (`conffile-pkg`); FV `refuse-request-conffile` | FF `receipt-policy`, `wrong-request` | HQ |
+| Trigger claims | retained `trigger_events`, receipt `trigger_evidence_sha256`; live `triggers/*` in the final closure | HC/HR `receipt.trigger_evidence_sha256`, `retained trigger_events bytes`, `live pending trigger claim`; FS `retained-trigger_events-*`, `receipt-trigger_evidence` | FF same | HQ |
+| Attempt owner / recovery step | receipt `attempt_id`, `root_inode`, `recovered_phase_count`, `execution_intent_sha256`; retained `intent`; completion `attempt_id`; record and deferred owner; progress terminal `provenance` record | HC/HR `receipt.attempt_id`, `receipt.root_inode`, `receipt.recovered_phase_count`, `receipt.execution_intent_sha256`, `completion.attempt_id`, `root-operation record reinstated`, `native intent reinstated`, `deferred owner reinstated`; HR second operation refused while owed; FS `stale-owner` | FF `stale-owner` (`OwnershipMismatch`), `changed-intent`, `retained-intent-*`, `receipt-execution_intent`, `pending-publication-crash` | HQ second operation refused; restart reports the requirement again |
+| Terminal acknowledgment | `Runtime.acknowledge` expected receipt digest; completion `transaction_provenance.document_sha256`; receipt/completion `outcome`; retained terminal `provenance` progress record | HC/HR `finish` (completion digest, `provenanceDigest`, stale digest → `InvalidRecoveryProvenance`), `completion.transaction_provenance=*`, `unavailable`, `receipt.outcome`, `completion.outcome`, `receipt missing`, `completion missing`, `caller completion transaction digest`, `describe recovery_required receipt`; FS `receipt-outcome_*` (`TransactionNotSuccessful`), `receipt-missing`, `completion-missing` | U2; FF `success-not-failure`, `receipt-outcome_*` (`TransactionNotFailed`), `receipt-missing`, `completion-missing`, `verify-unpublished` | HQ `readCompletion` null, `acknowledge` → `RecoveryEvidenceMissing`, caller verification → `ReceiptMissing`; resealed as succeeded/failed → `InvalidRecoveryProvenance` from read, recover, acknowledge and caller verification |
+
+**Three distinct digests.** The receipt `digest_sha256`
+(`debz-native-transaction-provenance-v2`) is the only value that
+`Runtime.acknowledge` and completion `transaction_provenance` accept. The
+published completion-document digest (`debz-root-operation-completion-v2`)
+and `root_operation.provenanceDigest` (`debz-root-operation-provenance-v1`)
+are different values. The latter is the historical record binding stored
+in `provenance_sha256` over the completion digest. HC/HR assert that the
+three values differ, and that substituting either of the other two for the
+receipt is refused.
+
+**Binding added by #269.** `readProductionCompletion` requires the retained
+progress to end in a terminal `provenance` record that matches the receipt
+outcome. Before this change, a `recovery_required` receipt resealed as
+`succeeded` or `failed` kept every evidence digest valid. `recover` then
+reported success, and `acknowledge` cleared the active native evidence
+before any final-state verification. HQ covers both resealed outcomes.
+
+**Wiring.** FS and FF run in the required `native-recovery-zig-family` job.
+`tools/security-audit.py` refuses loss of the hermetic filter and import
+(`native_provenance_binding_wiring_failures`), the `ownedComponents`
+matrix and both of its call sites, and the terminal-record binding in
+`readProductionCompletion`. `test/security-policy.zig` mutation-tests
+those anchors.
+
+**Gaps (follow-ups).** Settled verification does not re-hash live payload
+bytes; changed or deleted payload files still verify (#317). Recovery does
+detect them (HQ). The hermetic and FS fixtures run no maintainer scripts,
+so retained `script_outcome` documents are tampered per component only in
+FF and U1 (#318).
