@@ -1,6 +1,7 @@
 const std = @import("std");
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
+const root_fs = @import("debz").root_fs;
 
 const package = foundation.package;
 
@@ -216,6 +217,47 @@ fn runBootstrap(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const 
     try case.phase(.{ .operation = "install", .archives = &.{archive}, .packages = &names, .ordered_actions = &actions }, false);
 }
 
+/// dpkg forces umask 022 before running maintainer scripts. A caller umask
+/// of 077 must not reach a native script either: both sides create a file and
+/// a directory from postinst and must agree on, and record, 0644 and 0755.
+fn runCallerUmask(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const name = "debz-lifecycle-umask";
+    const archive = try support.makePackage(fixture, arch, "1", name, "packages/caller-umask", .{
+        .postinst_append =
+        \\if [ "$1" = configure ]; then
+        \\    printf 'script file\n' > /var/lib/debz-umask-file
+        \\    /bin/touch -d @1700000000 /var/lib/debz-umask-file
+        \\    /bin/mkdir /var/lib/debz-umask-directory
+        \\fi
+        \\
+        ,
+    });
+    defer fixture.allocator.free(archive);
+    var case = try support.Scenario.init(fixture, "script-caller-umask", driver, dpkg, arch, false);
+    defer case.deinit();
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const relative = try support.path(fixture.allocator, case.name, side);
+        defer fixture.allocator.free(relative);
+        try support.copyProgram(fixture, relative, "/bin/mkdir", "/bin/mkdir");
+        try support.copyProgram(fixture, relative, "/bin/touch", "/bin/touch");
+    }
+    const names = selected(name, arch);
+    try case.phase(.{ .operation = "install", .archives = &.{archive}, .packages = &names, .caller_umask = 0o077 }, false);
+    for ([_][]const u8{ case.reference_root, case.native_root }) |root| {
+        var guarded = try foundation.guardedRoot(fixture.io, root);
+        defer guarded.close(fixture.io);
+        const selected_root: root_fs.Root = .init(fixture.io, guarded);
+        const file = try selected_root.entry(try root_fs.Path.init("var/lib/debz-umask-file"));
+        const directory = try selected_root.entry(try root_fs.Path.init("var/lib/debz-umask-directory"));
+        if (!file.isRegularFile() or file.mode & 0o7777 != 0o644 or
+            !directory.isDirectory() or directory.mode & 0o7777 != 0o755)
+        {
+            std.debug.print("{s}: script file mode {o}, directory mode {o}\n", .{ root, file.mode, directory.mode });
+            return error.ScriptUmaskNotForced;
+        }
+    }
+}
+
 pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const first = try support.makePackage(fixture, arch, "1", package, "packages/script-flows", .{});
     defer fixture.allocator.free(first);
@@ -224,4 +266,5 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     try runScriptFailures(fixture, driver, dpkg, arch, first, second);
     try runDependencies(fixture, driver, dpkg, arch);
     try runBootstrap(fixture, driver, dpkg, arch);
+    try runCallerUmask(fixture, driver, dpkg, arch);
 }

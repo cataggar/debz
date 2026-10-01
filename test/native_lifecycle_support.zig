@@ -349,7 +349,26 @@ pub const Phase = struct {
     rollback_links: []const []const u8 = &.{},
     created_rollback_links: []const []const u8 = &.{},
     fixture_import_drift: ?ImportDrift = null,
+    /// Runs both dpkg and the native driver under this caller umask.
+    caller_umask: ?u9 = null,
 };
+
+/// Prefixes `argv` so it starts under `umask`; the shell execs it directly.
+fn withUmask(allocator: std.mem.Allocator, umask: ?u9, argv: []const []const u8) !std.ArrayList([]const u8) {
+    var wrapped: std.ArrayList([]const u8) = .empty;
+    errdefer wrapped.deinit(allocator);
+    if (umask) |mask| {
+        const command = try std.fmt.allocPrint(allocator, "umask {o:0>4} && exec \"$@\"", .{mask});
+        try wrapped.appendSlice(allocator, &.{ "/bin/sh", "-c", command, "sh" });
+    }
+    try wrapped.appendSlice(allocator, argv);
+    return wrapped;
+}
+
+fn freeUmask(allocator: std.mem.Allocator, umask: ?u9, wrapped: *std.ArrayList([]const u8)) void {
+    if (umask != null) allocator.free(wrapped.items[2]);
+    wrapped.deinit(allocator);
+}
 
 pub fn runExit(fixture: *foundation.Fixture, argv: []const []const u8, log: []const u8) !u8 {
     var bounded: std.ArrayList([]const u8) = .empty;
@@ -416,11 +435,15 @@ pub fn reference(fixture: *foundation.Fixture, executable: []const u8, root: []c
         }
         const log = try path(fixture.allocator, destination, "reference.log");
         defer fixture.allocator.free(log);
-        return runExit(fixture, argv.items, log);
+        var wrapped = try withUmask(fixture.allocator, phase.caller_umask, argv.items);
+        defer freeUmask(fixture.allocator, phase.caller_umask, &wrapped);
+        return runExit(fixture, wrapped.items, log);
     } else return error.InvalidReferenceOperation;
     const log = try path(fixture.allocator, destination, "reference.log");
     defer fixture.allocator.free(log);
-    return runExit(fixture, argv.items, log);
+    var wrapped = try withUmask(fixture.allocator, phase.caller_umask, argv.items);
+    defer freeUmask(fixture.allocator, phase.caller_umask, &wrapped);
+    return runExit(fixture, wrapped.items, log);
 }
 
 pub const Report = struct {
@@ -462,7 +485,9 @@ pub fn native(fixture: *foundation.Fixture, executable: []const u8, root: []cons
     try fixture.environment.put("DEBZ_NATIVE_LIFECYCLE_REQUEST", request);
     const log = try path(fixture.allocator, destination, "native.log");
     defer fixture.allocator.free(log);
-    try fixture.run(&.{executable}, log, 120);
+    var wrapped = try withUmask(fixture.allocator, phase.caller_umask, &.{executable});
+    defer freeUmask(fixture.allocator, phase.caller_umask, &wrapped);
+    try fixture.run(wrapped.items, log, 120);
     const bytes = try read(fixture, report_relative, 64 * 1024);
     defer fixture.allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(Report, fixture.allocator, bytes, .{

@@ -62,6 +62,8 @@ pub const Limits = struct {
 pub const maximum_output_limit = 1024 * 1024;
 pub const maximum_script_path_bytes = 1024;
 pub const maximum_variable_bytes = 256;
+/// The umask dpkg's `dpkg_program_init` sets before it runs any script.
+pub const script_umask: usize = 0o022;
 
 /// Script directories the runner will execute from. `info` holds installed
 /// scripts; `tmp.ci` holds the control members of the package being unpacked.
@@ -1935,6 +1937,10 @@ fn childMain(child: ChildDescriptor) noreturn {
     }
     if (child.setup_only) linux.exit(0);
 
+    // dpkg forces umask 022 process-wide (`lib/dpkg/program.c`
+    // `dpkg_program_init`), so maintainer scripts never inherit the caller's
+    // umask. umask(2) cannot fail.
+    _ = linux.syscall1(.umask, script_umask);
     const executed = linux.errno(linux.execve(child.program.ptr, child.argv, child.envp));
     childFail(streams.status, .execute, executed);
 }
@@ -3342,6 +3348,31 @@ test "maintainer_script.test.system launcher captures bounded output from a sani
     // still issued under the `terminate` policy, and the flag reports only
     // that: it never asserts that a descendant survived.
     try testing.expect(report.issued_descendant_sweep);
+}
+
+test "maintainer_script.test.system launcher forces dpkg's umask over the caller's" {
+    try skipUnlessPosixShell();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\umask
+        \\
+    );
+    defer script.deinit(testing.allocator);
+    const caller = linux.syscall1(.umask, 0o077);
+    defer _ = linux.syscall1(.umask, caller);
+
+    var launcher: SystemLauncher = .{};
+    var report = try run(
+        testing.allocator,
+        script.request(&.{"configure"}),
+        .{ .launcher = launcher.interface() },
+    );
+    defer report.deinit();
+    try testing.expect(report.succeeded());
+    try testing.expectEqualStrings("0022\n", report.stdout);
+    try testing.expectEqual(@as(usize, 0o077), linux.syscall1(.umask, 0o077));
 }
 
 test "maintainer_script.test.system launcher issues no sweep under the detach policy" {

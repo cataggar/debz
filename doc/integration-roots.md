@@ -1984,6 +1984,11 @@ preflight did not classify that member. The preflight now admits it only with
 the target architecture (see [Package database](package-database.md)). No
 fresh amd64 run has confirmed the update since, so this run is not
 wrapper-completion proof.
+The wrapper's `umask 077` also reached the scripts. `arch-native` was written
+0600, and about 1,000 other script-created entries, mostly Python
+`__pycache__` under `usr/lib`, were owner-only. A few of those are owner-only
+under dpkg too, because their scripts set the mode explicitly. Scripts now
+run under dpkg's `umask 022`.
 
 The historical legacy capture workflow ran
 `tools/capture-vendor-state.py` against the explicitly named staged reference
