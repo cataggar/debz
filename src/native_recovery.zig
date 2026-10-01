@@ -1997,6 +1997,141 @@ pub const SettledManagedSummary = struct {
     hashed_bytes: u64 = 0,
 };
 
+/// The first covered path a settled comparison found changed, with what the
+/// final managed snapshot recorded for it, so an operator can restore those
+/// exact bytes. It describes a refusal and never authorizes anything.
+pub const SettledPayloadChange = struct {
+    pub const Reason = enum {
+        /// A recorded entry no longer exists.
+        removed,
+        /// A path recorded absent now exists.
+        appeared,
+        /// The path names another kind, or another kind on the way to it.
+        kind_changed,
+        /// Mode or owner differs.
+        attributes_changed,
+        /// Regular-file size or bytes, or the symbolic link target, differ.
+        content_changed,
+    };
+
+    pub const Owner = struct {
+        package: []const u8,
+        version: []const u8,
+        architecture: []const u8,
+    };
+
+    allocator: std.mem.Allocator,
+    /// Root-relative physical path, as the managed snapshot records it.
+    path: []const u8,
+    reason: Reason,
+    expected_kind: ManagedKind,
+    expected_mode: u32,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_sha256: ?Digest,
+    expected_link_target: ?[]const u8,
+    /// Installed packages whose live database lists the path; a lookup that
+    /// could not run leaves it zero.
+    owner_count: usize = 0,
+    /// The only listing package, or null when none or several list it.
+    owner: ?Owner = null,
+
+    fn init(allocator: std.mem.Allocator, expected: ManagedEntry, reason: Reason) !SettledPayloadChange {
+        const path = try allocator.dupe(u8, expected.path);
+        errdefer allocator.free(path);
+        const target = if (expected.link_target) |value| try allocator.dupe(u8, value) else null;
+        return .{
+            .allocator = allocator,
+            .path = path,
+            .reason = reason,
+            .expected_kind = expected.kind,
+            .expected_mode = expected.mode,
+            .expected_uid = expected.uid,
+            .expected_gid = expected.gid,
+            .expected_sha256 = expected.content_sha256,
+            .expected_link_target = target,
+        };
+    }
+
+    pub fn deinit(self: *SettledPayloadChange) void {
+        self.allocator.free(self.path);
+        if (self.expected_link_target) |value| self.allocator.free(value);
+        if (self.owner) |owner| {
+            self.allocator.free(owner.package);
+            self.allocator.free(owner.version);
+            self.allocator.free(owner.architecture);
+        }
+        self.* = undefined;
+    }
+
+    pub fn setOwner(self: *SettledPayloadChange, owner: Owner) !void {
+        const package = try self.allocator.dupe(u8, owner.package);
+        errdefer self.allocator.free(package);
+        const version = try self.allocator.dupe(u8, owner.version);
+        errdefer self.allocator.free(version);
+        const architecture = try self.allocator.dupe(u8, owner.architecture);
+        self.owner = .{ .package = package, .version = version, .architecture = architecture };
+    }
+
+    /// `settled_payload_diagnostic_prefix` followed by one JSON object with
+    /// the `SettledPayloadDiagnostic` fields.
+    pub fn diagnostic(self: SettledPayloadChange, allocator: std.mem.Allocator) ![]u8 {
+        const owner = self.owner;
+        const fields: SettledPayloadDiagnostic = .{
+            .path = self.path,
+            .reason = self.reason,
+            .expected_kind = self.expected_kind,
+            .expected_mode = self.expected_mode,
+            .expected_uid = self.expected_uid,
+            .expected_gid = self.expected_gid,
+            .expected_sha256 = if (self.expected_sha256) |*value| value else null,
+            .expected_link_target = self.expected_link_target,
+            .owners = self.owner_count,
+            .package = if (owner) |value| value.package else null,
+            .version = if (owner) |value| value.version else null,
+            .architecture = if (owner) |value| value.architecture else null,
+        };
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        errdefer output.deinit();
+        try output.writer.writeAll(settled_payload_diagnostic_prefix);
+        try std.json.Stringify.value(fields, .{}, &output.writer);
+        return output.toOwnedSlice();
+    }
+};
+
+/// Diagnostic text a recorded `LivePayloadChanged` refusal starts with.
+pub const settled_payload_diagnostic_prefix = "LivePayloadChanged ";
+
+/// The stable fields of a recorded `LivePayloadChanged` diagnostic.
+pub const SettledPayloadDiagnostic = struct {
+    path: []const u8,
+    reason: SettledPayloadChange.Reason,
+    expected_kind: ManagedKind,
+    expected_mode: u32,
+    expected_uid: u32,
+    expected_gid: u32,
+    expected_sha256: ?[]const u8,
+    expected_link_target: ?[]const u8,
+    owners: usize,
+    package: ?[]const u8,
+    version: ?[]const u8,
+    architecture: ?[]const u8,
+};
+
+pub fn parseSettledPayloadDiagnostic(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+) !std.json.Parsed(SettledPayloadDiagnostic) {
+    if (!std.mem.startsWith(u8, message, settled_payload_diagnostic_prefix))
+        return error.InvalidDiagnostic;
+    return std.json.parseFromSlice(
+        SettledPayloadDiagnostic,
+        allocator,
+        message[settled_payload_diagnostic_prefix.len..],
+        .{},
+    );
+}
+
 const settled_read_buffer_bytes = 64 * 1024;
 
 fn withinPrefix(path: []const u8, prefix: []const u8) bool {
@@ -2036,6 +2171,20 @@ pub fn verifySettledManagedState(
     document: ManagedStateDocument,
     exemptions: SettledExemptions,
 ) !SettledManagedSummary {
+    return verifySettledManagedStateReporting(allocator, root, document, exemptions, null);
+}
+
+/// `verifySettledManagedState`, which on `LivePayloadChanged` also sets
+/// `change`, when given, to the first changed path. `change` must be null on
+/// entry; the caller deinitializes what it receives. A change description
+/// that cannot be allocated is left null, and the refusal still stands.
+pub fn verifySettledManagedStateReporting(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    document: ManagedStateDocument,
+    exemptions: SettledExemptions,
+    change: ?*?SettledPayloadChange,
+) !SettledManagedSummary {
     if (document.transient != null) return error.InvalidManagedState;
     var summary: SettledManagedSummary = .{};
     const stable = document.stable orelse return summary;
@@ -2049,18 +2198,22 @@ pub fn verifySettledManagedState(
             summary.exempt += 1;
             continue;
         }
-        const matches = settledEntryMatches(root, expected, &summary.hashed_bytes, buffer) catch |err|
-            if (settledShapeChanged(err)) false else return err;
-        if (!matches) return error.LivePayloadChanged;
+        const changed = settledEntryChange(root, expected, &summary.hashed_bytes, buffer) catch |err| blk: {
+            break :blk settledShapeChange(err) orelse return err;
+        };
+        if (changed) |reason| {
+            if (change) |out| out.* = SettledPayloadChange.init(allocator, expected, reason) catch null;
+            return error.LivePayloadChanged;
+        }
         summary.compared += 1;
     }
     return summary;
 }
 
 /// The path no longer names the recorded kind, or changed while it was read.
-fn settledShapeChanged(err: anyerror) bool {
+fn settledShapeChange(err: anyerror) ?SettledPayloadChange.Reason {
     return switch (err) {
-        error.FileNotFound,
+        error.FileNotFound => .removed,
         error.NotDirectory,
         error.NotDir,
         error.SymbolicLinkComponent,
@@ -2070,28 +2223,32 @@ fn settledShapeChanged(err: anyerror) bool {
         error.NotSymbolicLink,
         error.PathChanged,
         error.UnmodeledManagedState,
-        => true,
-        else => false,
+        => .kind_changed,
+        else => null,
     };
 }
 
-fn settledEntryMatches(
+/// Null when the live entry matches the recorded one.
+fn settledEntryChange(
     root: root_fs.Root,
     expected: ManagedEntry,
     hashed_bytes: *u64,
     buffer: []u8,
-) !bool {
+) !?SettledPayloadChange.Reason {
     const probe = try probeManagedEntry(root, expected.path);
     const live = probe.entry;
-    if (live.kind != expected.kind) return false;
+    if (live.kind != expected.kind) return switch (live.kind) {
+        .absent => .removed,
+        else => if (expected.kind == .absent) .appeared else .kind_changed,
+    };
     switch (live.kind) {
-        .absent => return true,
-        .directory => return sameSettledAttributes(expected, live),
+        .absent => return null,
+        .directory => return settledAttributesChange(expected, live),
         .regular => {
             const recorded = expected.content_sha256 orelse
                 return error.InvalidManagedState;
-            if (!sameSettledAttributes(expected, live) or live.size != expected.size)
-                return false;
+            if (settledAttributesChange(expected, live)) |reason| return reason;
+            if (live.size != expected.size) return .content_changed;
             try chargeManagedRead(live.size, hashed_bytes);
             var pinned = try root.pinRegularFile(probe.path);
             defer pinned.close();
@@ -2101,19 +2258,25 @@ fn settledEntryMatches(
             hasher.final(&digest);
             var pinned_entry = live;
             pinnedManagedIdentity(&pinned_entry, observation);
-            return sameSettledAttributes(expected, pinned_entry) and
-                pinned_entry.size == expected.size and
-                std.mem.eql(u8, &hexDigest(digest), &recorded);
+            if (settledAttributesChange(expected, pinned_entry)) |reason| return reason;
+            if (pinned_entry.size != expected.size or
+                !std.mem.eql(u8, &hexDigest(digest), &recorded)) return .content_changed;
+            return null;
         },
         .symlink => {
             const recorded = expected.link_target orelse
                 return error.InvalidManagedState;
             var target: [root_fs.maximum_link_target_bytes]u8 = undefined;
             const observed = try observeManagedSymlink(root, probe, &target);
-            return sameSettledAttributes(expected, observed) and
-                std.mem.eql(u8, observed.link_target.?, recorded);
+            if (settledAttributesChange(expected, observed)) |reason| return reason;
+            if (!std.mem.eql(u8, observed.link_target.?, recorded)) return .content_changed;
+            return null;
         },
     }
+}
+
+fn settledAttributesChange(expected: ManagedEntry, live: ManagedEntry) ?SettledPayloadChange.Reason {
+    return if (sameSettledAttributes(expected, live)) null else .attributes_changed;
 }
 
 fn sameSettledAttributes(expected: ManagedEntry, live: ManagedEntry) bool {
@@ -4182,8 +4345,54 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
             },
             .absent_created => try root.publishFile(try root_fs.Path.init(absent), "resurrected\n", .{}),
         }
-        _ = verifySettledManagedState(allocator, root, managed.document, exemptions) catch |err| {
+        var change: ?SettledPayloadChange = null;
+        defer if (change) |*value| value.deinit();
+        _ = verifySettledManagedStateReporting(allocator, root, managed.document, exemptions, &change) catch |err| {
             try testing.expectEqual(error.LivePayloadChanged, err);
+            const Expected = struct { path: []const u8, reason: SettledPayloadChange.Reason };
+            const expected: Expected = switch (tamper) {
+                .same_size_bytes, .resized => .{ .path = payload, .reason = .content_changed },
+                .removed => .{ .path = payload, .reason = .removed },
+                .replaced_by_symlink, .replaced_by_directory => .{ .path = payload, .reason = .kind_changed },
+                .mode => .{ .path = payload, .reason = .attributes_changed },
+                .link_retargeted => .{ .path = link, .reason = .content_changed },
+                .link_replaced_by_file => .{ .path = link, .reason = .kind_changed },
+                .directory_replaced_by_symlink => .{ .path = directory, .reason = .kind_changed },
+                .absent_created => .{ .path = absent, .reason = .appeared },
+            };
+            const found = change orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(expected.path, found.path);
+            try testing.expectEqual(expected.reason, found.reason);
+            const recorded = for (managed.document.stable.?.entries) |entry| {
+                if (std.mem.eql(u8, entry.path, expected.path)) break entry;
+            } else return error.TestUnexpectedResult;
+            try testing.expectEqual(recorded.kind, found.expected_kind);
+            try testing.expectEqual(recorded.mode, found.expected_mode);
+            if (std.mem.eql(u8, expected.path, payload)) {
+                var bytes_digest: [32]u8 = undefined;
+                Sha256.hash(payload_bytes, &bytes_digest, .{});
+                try testing.expectEqualSlices(u8, &hexDigest(bytes_digest), &found.expected_sha256.?);
+            } else try testing.expect(found.expected_sha256 == null);
+            if (std.mem.eql(u8, expected.path, link))
+                try testing.expectEqualStrings("payload", found.expected_link_target.?)
+            else
+                try testing.expect(found.expected_link_target == null);
+            // No database lookup at this layer.
+            try testing.expectEqual(@as(usize, 0), found.owner_count);
+            try testing.expect(found.owner == null);
+            const text = try found.diagnostic(allocator);
+            defer allocator.free(text);
+            var parsed = try parseSettledPayloadDiagnostic(allocator, text);
+            defer parsed.deinit();
+            try testing.expectEqualStrings(found.path, parsed.value.path);
+            try testing.expectEqual(found.reason, parsed.value.reason);
+            try testing.expectEqual(found.expected_kind, parsed.value.expected_kind);
+            try testing.expectEqual(found.expected_mode, parsed.value.expected_mode);
+            if (found.expected_sha256) |value|
+                try testing.expectEqualStrings(&value, parsed.value.expected_sha256.?)
+            else
+                try testing.expect(parsed.value.expected_sha256 == null);
+            try testing.expect(parsed.value.package == null and parsed.value.version == null);
             switch (tamper) {
                 .removed => {},
                 .replaced_by_symlink => {
@@ -4211,6 +4420,24 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
         };
         std.debug.print("{s}: live tamper verified as settled\n", .{@tagName(tamper)});
         return error.TestUnexpectedResult;
+    }
+    {
+        const recorded = for (managed.document.stable.?.entries) |entry| {
+            if (std.mem.eql(u8, entry.path, payload)) break entry;
+        } else return error.TestUnexpectedResult;
+        var owned = try SettledPayloadChange.init(allocator, recorded, .content_changed);
+        defer owned.deinit();
+        owned.owner_count = 1;
+        try owned.setOwner(.{ .package = "demo", .version = "1:2.0-1", .architecture = "amd64" });
+        const text = try owned.diagnostic(allocator);
+        defer allocator.free(text);
+        var parsed = try parseSettledPayloadDiagnostic(allocator, text);
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 1), parsed.value.owners);
+        try testing.expectEqualStrings("demo", parsed.value.package.?);
+        try testing.expectEqualStrings("1:2.0-1", parsed.value.version.?);
+        try testing.expectEqualStrings("amd64", parsed.value.architecture.?);
+        try testing.expectError(error.InvalidDiagnostic, parseSettledPayloadDiagnostic(allocator, "LivePayloadChanged"));
     }
 
     var transient = managed.document;

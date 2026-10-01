@@ -28439,6 +28439,9 @@ pub const Runtime = struct {
     /// are update-alternatives selections and administration. Their database
     /// records stay bound by the final database generation. `route_conffiles`
     /// names conffile routes lowered from retained route-settlement evidence.
+    /// On `LivePayloadChanged`, `change`, when given, receives the first
+    /// changed path and, from the live database, its single listing package.
+    /// That lookup runs only after a refusal and never changes its outcome.
     /// The caller holds the root-operation lock.
     pub fn verifySettledPayload(
         allocator: std.mem.Allocator,
@@ -28446,6 +28449,7 @@ pub const Runtime = struct {
         program: native_program.Program,
         managed: native_recovery.ManagedStateDocument,
         route_conffiles: []const []const u8,
+        change: ?*?native_recovery.SettledPayloadChange,
     ) !native_recovery.SettledManagedSummary {
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
@@ -28456,12 +28460,50 @@ pub const Runtime = struct {
             program,
             route_conffiles,
         );
-        return native_recovery.verifySettledManagedState(allocator, root, managed, .{
+        return native_recovery.verifySettledManagedStateReporting(allocator, root, managed, .{
             .paths = exempt,
             .prefixes = &.{
                 native_alternatives.selector_directory,
                 native_alternatives.database_directory,
             },
+        }, change) catch |err| {
+            if (err == error.LivePayloadChanged) if (change) |out| if (out.*) |*found| {
+                // A diagnosis that cannot run leaves the owner unknown.
+                describeSettledPayloadOwner(allocator, root, program.target_architecture, found) catch {};
+            };
+            return err;
+        };
+    }
+
+    fn describeSettledPayloadOwner(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        architecture: []const u8,
+        change: *native_recovery.SettledPayloadChange,
+    ) !void {
+        var captured = try captureDatabaseSnapshot(allocator, root, .{});
+        defer captured.deinit();
+        normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+        var database = switch (try package_database.importSnapshot(allocator, .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.InvalidExternalDatabase,
+        };
+        defer database.deinit();
+        const aliases = try detectAliases(allocator, root);
+        defer deinitAliasEvidence(allocator, aliases);
+        var ownership = try indexOwnership(allocator, database.model, aliases);
+        defer ownership.deinit();
+        const owners = ownership.ownersOf(change.path);
+        change.owner_count = owners.len;
+        if (owners.len != 1) return;
+        const record = database.model.packages[owners[0].owner];
+        try change.setOwner(.{
+            .package = record.name,
+            .version = record.version,
+            .architecture = record.architecture,
         });
     }
 

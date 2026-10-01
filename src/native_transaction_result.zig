@@ -470,7 +470,7 @@ pub fn verifyCallerSuccess(
     attempt: *root_operation.Attempt,
     expected_receipt: native_provenance.Digest,
 ) !CallerSuccess {
-    return verifyCaller(allocator, attempt, expected_receipt, .succeeded);
+    return verifyCaller(allocator, attempt, expected_receipt, .succeeded, null);
 }
 
 /// Confirms the actual terminal failure and recorded database, not successful
@@ -480,7 +480,29 @@ pub fn verifyCallerFailure(
     attempt: *root_operation.Attempt,
     expected_receipt: native_provenance.Digest,
 ) !CallerFailure {
-    return verifyCaller(allocator, attempt, expected_receipt, .failed);
+    return verifyCaller(allocator, attempt, expected_receipt, .failed, null);
+}
+
+/// `verifyCallerSuccess`, which on `LivePayloadChanged` also describes the
+/// first changed path in `payload_change`. It must be null on entry; the
+/// caller deinitializes what it receives.
+pub fn verifyCallerSuccessReporting(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+    payload_change: *?native_recovery.SettledPayloadChange,
+) !CallerSuccess {
+    return verifyCaller(allocator, attempt, expected_receipt, .succeeded, payload_change);
+}
+
+/// `verifyCallerFailure` with `verifyCallerSuccessReporting`'s description.
+pub fn verifyCallerFailureReporting(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+    payload_change: *?native_recovery.SettledPayloadChange,
+) !CallerFailure {
+    return verifyCaller(allocator, attempt, expected_receipt, .failed, payload_change);
 }
 
 fn verifyCaller(
@@ -488,6 +510,7 @@ fn verifyCaller(
     attempt: *root_operation.Attempt,
     expected_receipt: native_provenance.Digest,
     comptime expected_outcome: TerminalOutcome,
+    payload_change: ?*?native_recovery.SettledPayloadChange,
 ) !CallerResult(expected_outcome) {
     var receipt = try native_runtime.readCompletion(allocator, attempt) orelse return error.ReceiptMissing;
     errdefer receipt.deinit();
@@ -506,6 +529,7 @@ fn verifyCaller(
         proof,
         expected_outcome,
         null,
+        payload_change,
     );
     try verifyPendingEvidence(allocator, root, proof);
     if (!attempt.locked()) return error.LockLost;
@@ -826,6 +850,7 @@ fn verifyCompletionEvidence(
         proof,
         expected_outcome,
         repository_policy,
+        null,
     );
 }
 
@@ -865,6 +890,7 @@ fn verifyStateEvidence(
     proof: native_provenance.Document,
     expected_outcome: TerminalOutcome,
     repository_policy: ?transaction_executor.Policy,
+    payload_change: ?*?native_recovery.SettledPayloadChange,
 ) anyerror!void {
     try native_provenance.verifyEvidence(allocator, root, proof);
 
@@ -1031,6 +1057,7 @@ fn verifyStateEvidence(
         program.program,
         managed.document,
         route_conffiles.items,
+        payload_change,
     );
 }
 

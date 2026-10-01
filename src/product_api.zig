@@ -164,6 +164,24 @@ pub const NativeCompletionEvidence = struct {
     program_sha256: [32]u8,
 };
 
+/// The product surface that owns a held root attempt this command refused to
+/// recover, and the only way that surface resumes it.
+pub const RecoveryOwner = struct {
+    pub const Surface = enum { repository_bootstrap };
+    pub const ResumePath = enum {
+        /// Restore what the repository's recorded diagnostic names, such as
+        /// the managed payload of an `installed_verification_failed`
+        /// `LivePayloadChanged` record, then rerun the same `debz repo add`
+        /// request. It adopts the held attempt and finishes or refuses it.
+        rerun_same_repository_add,
+    };
+
+    surface: Surface,
+    resume_path: ResumePath,
+    attempt_id: [32]u8,
+    request_sha256: [32]u8,
+};
+
 pub const Result = struct {
     api_version: u32 = api_version,
     operation: Operation,
@@ -177,6 +195,8 @@ pub const Result = struct {
     native_install: ?NativeInstallEvidence = null,
     // Typed native consumers retain this separately; command.v1 omits it.
     native_completion: ?NativeCompletionEvidence = null,
+    // Typed consumers read who owns a refused held attempt; command.v1 omits it.
+    recovery_owner: ?RecoveryOwner = null,
 
     pub fn canonicalJson(self: Result, allocator: std.mem.Allocator) ![]u8 {
         var output: std.Io.Writer.Allocating = .init(allocator);

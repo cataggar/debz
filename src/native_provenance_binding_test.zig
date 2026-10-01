@@ -498,6 +498,28 @@ fn expectCallerPayloadBound(env: *Environment, attempt: *root_operation.Attempt,
         error.LivePayloadChanged,
         native_transaction_result.verifyCallerSuccess(allocator, attempt, receipt_digest),
     );
+    {
+        // The refusal describes the changed path, its recorded bytes and its
+        // installed owner, so an operator can restore exactly that.
+        var change: ?native_recovery.SettledPayloadChange = null;
+        defer if (change) |*value| value.deinit();
+        try testing.expectError(
+            error.LivePayloadChanged,
+            native_transaction_result.verifyCallerSuccessReporting(allocator, attempt, receipt_digest, &change),
+        );
+        const found = change orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(payload_path, found.path);
+        try testing.expectEqual(native_recovery.SettledPayloadChange.Reason.content_changed, found.reason);
+        try testing.expectEqual(native_recovery.ManagedKind.regular, found.expected_kind);
+        var original_digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(original, &original_digest, .{});
+        try testing.expectEqualSlices(u8, &native_recovery.hexDigest(original_digest), &found.expected_sha256.?);
+        try testing.expectEqual(@as(usize, 1), found.owner_count);
+        const owner = found.owner orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings("demo", owner.package);
+        try testing.expectEqualStrings("1.0", owner.version);
+        try testing.expectEqualStrings("amd64", owner.architecture);
+    }
     try testing.expect(try Runtime.hasActiveEvidence(allocator, env.root));
     try testing.expect(try env.exists(root_operation.record_path));
     try env.write(payload_path, original);
