@@ -34386,19 +34386,26 @@ test "native_unpack.test.lifecycle external fixture unchanged upgrade-all" {
     const repository_id: [64]u8 = @splat('a');
     const snapshot: [32]u8 = @splat(0x22);
     var packages: std.ArrayList(exact_lock_v3.Package) = .empty;
-    for (database.model.packages) |package| try packages.append(scratch, .{
-        .name = package.name,
-        .version = package.version,
-        .architecture = package.architecture,
-        .origin = .{ .authenticated_repository = .{
-            .repository_id = repository_id,
-            .repository_snapshot_sha256 = snapshot,
-        } },
-        .archive_identity = .{ .digests = .{ .sha256 = @splat(0x31) }, .primary = .sha256 },
-        .declared_size = 1,
-        .retention = .retained,
-        .dpkg_selection_hold = false,
-    });
+    for (database.model.packages, 0..) |package, index| {
+        var signed_sha256: [32]u8 = @splat(0x31);
+        var derived_sha512: [64]u8 = @splat(0x32);
+        std.mem.writeInt(u64, signed_sha256[0..8], index, .little);
+        std.mem.writeInt(u64, derived_sha512[0..8], index, .little);
+        try packages.append(scratch, .{
+            .name = package.name,
+            .version = package.version,
+            .architecture = package.architecture,
+            .origin = .{ .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            } },
+            .archive_identity = .{ .digests = .{ .sha256 = signed_sha256 }, .primary = .sha256 },
+            .derived_sha512 = derived_sha512,
+            .declared_size = 1,
+            .retention = .retained,
+            .dpkg_selection_hold = false,
+        });
+    }
     var lock = try exact_lock_v3.create(testing.allocator, .{
         .target_architecture = external.architecture,
         .request_sha256 = @splat(7),
@@ -34408,6 +34415,7 @@ test "native_unpack.test.lifecycle external fixture unchanged upgrade-all" {
             .snapshot_sha256 = snapshot,
             .release_sha256 = @splat(3),
             .index_identity = .{ .digests = .{ .sha256 = @splat(4) }, .primary = .sha256 },
+            .archive_binding = .signed_sha256_derived_sha512,
             .signer_fingerprints = &.{@splat(5)},
         }},
         .local_artifacts = &.{},
