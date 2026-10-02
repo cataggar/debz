@@ -1570,18 +1570,9 @@ fn observeManagedEntry(
             break :block result;
         },
         .fifo => block: {
-            const observation = try root.observeNamedPipe(path);
-            var result = base;
-            result.mode = observation.entry.mode;
-            result.uid = observation.entry.uid;
-            result.gid = observation.entry.gid;
-            result.device = observation.entry.device;
-            result.inode = observation.entry.inode;
-            result.link_count = observation.entry.link_count;
-            result.modified_nanoseconds =
-                observation.entry.modified_nanoseconds;
-            result.change_nanoseconds = observation.change_nanoseconds;
-            result.size = observation.entry.size;
+            const observation = try root.observeNamedPipe(probe.path);
+            var result = probe.entry;
+            pinnedManagedIdentity(&result, observation);
             break :block result;
         },
     };
@@ -2243,7 +2234,8 @@ fn settledEntryChange(
     };
     switch (live.kind) {
         .absent => return null,
-        .directory => return settledAttributesChange(expected, live),
+        // A FIFO's recorded state is its metadata; it is never opened.
+        .directory, .fifo => return settledAttributesChange(expected, live),
         .regular => {
             const recorded = expected.content_sha256 orelse
                 return error.InvalidManagedState;
@@ -4266,12 +4258,14 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
     const link = "usr/share/link";
     const directory = "usr/share/dir";
     const absent = "usr/share/removed";
+    const pipe = "usr/share/pipe";
     const conffile = "etc/demo.conf";
     const selection = "etc/alternatives/demo";
     const private = root_operation.namespace_path ++ "/private.json";
     try root.publishFile(try root_fs.Path.init(payload), payload_bytes, .{});
     try root.publishFile(try root_fs.Path.init(nested), "nested\n", .{});
     try root.createSymbolicLink(try root_fs.Path.init(link), "payload");
+    try root.publishNamedPipe(try root_fs.Path.init(pipe), .{ .mode = 0o644 }, .{});
     try root.publishFile(try root_fs.Path.init(conffile), "packaged\n", .{});
     try root.createSymbolicLink(try root_fs.Path.init(selection), "/usr/share/payload");
     try root.publishFile(try root_fs.Path.init(private), "{}\n", .{});
@@ -4280,13 +4274,13 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
         .program_step = 1,
         .substep = 0,
         .ordinal = 0,
-    }, &.{ payload, nested, link, directory, absent, conffile, selection, private }, false);
+    }, &.{ payload, nested, link, directory, absent, pipe, conffile, selection, private }, false);
     var managed = try readManagedState(allocator, root);
     defer managed.deinit();
     const exemptions: SettledExemptions = .{ .paths = &.{conffile}, .prefixes = &.{"etc/alternatives"} };
 
     const summary = try verifySettledManagedState(allocator, root, managed.document, exemptions);
-    try testing.expectEqual(@as(usize, 5), summary.compared);
+    try testing.expectEqual(@as(usize, 6), summary.compared);
     try testing.expectEqual(@as(usize, 3), summary.exempt);
     try testing.expectEqual(@as(u64, payload_bytes.len + "nested\n".len), summary.hashed_bytes);
 
@@ -4312,6 +4306,8 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
         link_replaced_by_file,
         directory_replaced_by_symlink,
         absent_created,
+        fifo_mode,
+        fifo_replaced_by_file,
     };
     for (std.enums.values(Tamper)) |tamper| {
         const payload_path = try root_fs.Path.init(payload);
@@ -4344,6 +4340,11 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
                 try root.createSymbolicLink(try root_fs.Path.init(directory), "dir.real");
             },
             .absent_created => try root.publishFile(try root_fs.Path.init(absent), "resurrected\n", .{}),
+            .fifo_mode => try root.publishNamedPipe(try root_fs.Path.init(pipe), .{ .mode = 0o600 }, .{}),
+            .fifo_replaced_by_file => {
+                try root.removeFile(try root_fs.Path.init(pipe));
+                try root.publishFile(try root_fs.Path.init(pipe), "", .{});
+            },
         }
         var change: ?SettledPayloadChange = null;
         defer if (change) |*value| value.deinit();
@@ -4359,6 +4360,8 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
                 .link_replaced_by_file => .{ .path = link, .reason = .kind_changed },
                 .directory_replaced_by_symlink => .{ .path = directory, .reason = .kind_changed },
                 .absent_created => .{ .path = absent, .reason = .appeared },
+                .fifo_mode => .{ .path = pipe, .reason = .attributes_changed },
+                .fifo_replaced_by_file => .{ .path = pipe, .reason = .kind_changed },
             };
             const found = change orelse return error.TestUnexpectedResult;
             try testing.expectEqualStrings(expected.path, found.path);
@@ -4409,10 +4412,20 @@ test "native_recovery.test.settled managed state binds live payload kind, mode a
                     try root.rename(try root_fs.Path.init("usr/share/dir.real"), try root_fs.Path.init(directory), .fail_if_exists);
                 },
                 .absent_created => try root.removeFile(try root_fs.Path.init(absent)),
+                .fifo_mode, .fifo_replaced_by_file => {
+                    try root.removeFile(try root_fs.Path.init(pipe));
+                    try root.publishNamedPipe(try root_fs.Path.init(pipe), .{ .mode = 0o644 }, .{});
+                },
                 else => {},
             }
             switch (tamper) {
-                .link_retargeted, .link_replaced_by_file, .directory_replaced_by_symlink, .absent_created => {},
+                .link_retargeted,
+                .link_replaced_by_file,
+                .directory_replaced_by_symlink,
+                .absent_created,
+                .fifo_mode,
+                .fifo_replaced_by_file,
+                => {},
                 else => try root.publishFile(payload_path, payload_bytes, .{}),
             }
             _ = try verifySettledManagedState(allocator, root, managed.document, exemptions);
