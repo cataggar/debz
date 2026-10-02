@@ -141,7 +141,7 @@ policy. The frozen Ubuntu `resolute` InRelease is dated 2026-04-23 and therefore
 returns `ReleaseExpired` before mutation. The gate now pins the currently
 valid `stonking` 2026-10-01 snapshot, signed by
 `F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-20:37:08 UTC and Valid-Until Wed, 14 Oct 2026 20:37:08 UTC. Its complete
+23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC. Its complete
 development suite publishes SHA512-only Release and package identities
 supported by exact-lock v3. No clock override, fabricated SHA256, or
 historical replay is used; both architecture parity runs remain necessary

@@ -708,7 +708,9 @@ depends on it: `test/real-snapshot-policy.zig` uses fixed offline inputs.
    freshness PR also touches. Its reviewed-profile pattern is compatible with
    this policy.
 2. **PR A: frozen-release freshness policy.** It contains code, Zig tests and
-   docs on synthetic fixtures, and makes no real-snapshot change.
+   docs on synthetic fixtures, plus the stonking timestamp correction described
+   in the hazard section above; it makes no fixture, admission or CI
+   real-snapshot change.
 3. **PR B: repin tool, manifest and runbook.** It runs in parallel with PR A.
    - The manifest is first recorded for the *current* stonking pin, and the
      offline cross-check proves it covers every in-tree pin.
@@ -727,7 +729,8 @@ depends on it: `test/real-snapshot-policy.zig` uses fixed offline inputs.
    - delete every stonking identity;
    - update `doc/integration-roots.md`, `doc/safety-ci.md`,
      `doc/dpkg-alternatives-reference.md`, `doc/native-recovery.md` and
-     `doc/project-status.md`, including the stale 20:37:08 `Date`;
+     `doc/project-status.md` for the resolute migration; the stale stonking
+     20:37:08 timestamp correction is part of PR A;
    - exercise the tool once, from stonking to resolute;
    - authenticate on amd64 and arm64 through the dispatch lane.
 6. **#257 / #287.** Do not regenerate its signed systemd/udev/sudo proc

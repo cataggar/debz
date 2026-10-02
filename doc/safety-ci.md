@@ -172,7 +172,7 @@ config explicitly binds the unchanged 31-day maximum for a
 missing `Valid-Until`. The gate pins the signed `stonking`
 `https://snapshot.ubuntu.com/ubuntu/20261001T000000Z` snapshot, signed by
 `F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-20:37:08 UTC and Valid-Until Wed, 14 Oct 2026 20:37:08 UTC, instead of
+23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC, instead of
 overriding the clock for frozen
 `resolute`; no CI clock exception, hostname inference, or unbounded immutable
 exemption exists.
