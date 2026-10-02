@@ -1489,7 +1489,7 @@ test "security: core completion and ordinary recovery remain executed and bound"
         "config_content: ?[]const u8 = null,",
         "try fixture.write(config, configuration, 0o755);",
     });
-    try nativeMutationsIn(&f, "native-core", "test/native_recovery_helper.zig", "fn recoveredOrdinary(", "\nfn blockedUnknown(", &.{
+    try nativeMutationsIn(&f, "native-core", "test/native_recovery_helper.zig", "fn recoveredOrdinary(", "\n}\n", &.{
         "if (try invoke(fixture, driver, root, arch, crash_output, .{",
         "try fixture.dir.deleteFile(fixture.io, archive_relative);",
         "const request = try originalRequestFor(fixture, root, intent.intent, case.isolated_helper, case.caller_owned, archive);",
@@ -1566,6 +1566,44 @@ test "security: final recovery matrix and prior completion are mutation enforced
         ".succeeded => terminal.result != .succeeded and terminal.result != .recovered,",
         ".failed => terminal.result != .failed,",
         ".recovery_required => true,\n    }) return error.InvalidRecoveryProvenance;",
+        "if (!std.mem.eql(u8, &retained_progress.document.head_sha256, &receipt.document.progress_head_sha256) or\n        retained_progress.document.records.len != receipt.document.progress_record_count)\n        return error.InvalidRecoveryProgress;",
+        "try native_provenance.verifyScriptOutcomes(receipt.document, retained_progress.document);",
+    });
+    try nativeMutationsIn(&f, "native-final", "src/native_unpack.zig", "fn callerOwnedLifecycleFixture(", "\nfn ", &.{
+        ") catch |err| return .{ .outcome = .refused, .detail = @errorName(err) };",
+    });
+}
+
+test "security: completed and recovered script outcome components are mutation enforced" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    try nativeMutations(&f, "native-final", "test/native_recovery_helper.zig", &.{
+        "try completedScriptComponents(&fixture, driver, reference.executable, reference.architecture);",
+        ".name = \"caller-script-components-recovered\",\n        .crash = \"after_script_outcome\",\n        .caller_owned = true,\n        .isolated_helper = true,\n        .script_components = true,",
+        "try callerScriptComponents(fixture, driver, root, arch, case.name, true);",
+        "try callerScriptComponents(fixture, driver, root, arch, name, false);",
+    });
+    try nativeMutationsIn(&f, "native-final", "test/native_recovery_helper.zig", "fn callerScriptComponents(", "\nfn scriptComponentRefused(", &.{
+        "if (recovered != (receipt.document.recovered_phase_count != 0)) return error.UnexpectedRecoveredPhaseCount;",
+        "\"changed-script_outcome-{d}\"",
+        "\"EvidenceChanged\"",
+        "\"deleted-script_outcome-{d}\"",
+        "\"FileNotFound\"",
+        "if (scripts < 2) return error.MissingRetainedScriptOutcome;",
+        "for (std.enums.values(ScriptReceiptTamper)) |tamper| {",
+        "break :omitted \"EvidenceMissing\";",
+        "break :duplicated \"InvalidRecoveryProgress\";",
+        "break :rebound \"EvidenceMismatch\";",
+        "break :reindexed \"EvidenceMissing\";",
+        "break :summary \"EvidenceMismatch\";",
+        "break :phases \"InvalidRecoveryProgress\";",
+        "break :head \"InvalidRecoveryProgress\";",
+        "forged.evidence_files_sha256 = provenance.evidenceDigest(forged.evidence_files);",
+    });
+    try nativeMutationsIn(&f, "native-final", "test/native_recovery_helper.zig", "fn scriptComponentRefused(", "\nfn completedScriptComponents(", &.{
+        "        .caller_verification = expected_receipt,\n    }), \"refused\", expected_error);",
+        "        .acknowledge = true,\n    }), \"recovery_required\", expected_error);",
+        "try held.owed(fixture, root, receipt);",
     });
 }
 
@@ -1828,11 +1866,14 @@ test "security: native provenance component tamper coverage stays wired" {
         "\"live-payload-bytes\", selected, lock, check, \"LivePayloadChanged\"",
         "\"live-payload-removed\", selected, lock, check, \"LivePayloadChanged\"",
         "\"administrator-conffile-edit\", selected, lock, check",
+        "\"receipt-script_outcome-duplicated\" else \"receipt-script_outcome-omitted\"",
     });
     try nativeMutations(&f, "native-workflow", "test/native_recovery_family.zig", &.{
         "    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{",
         "        .state = \"released\",\n        .outcome = .succeeded,\n        .scripts = false,",
+        "        .state = \"released\",\n        .outcome = .succeeded,\n        .scripts = true,",
         "        .state = \"pending\",\n        .outcome = .failed,\n        .scripts = true,",
+        "    try ownedScriptedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);",
     });
 }
 

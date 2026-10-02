@@ -666,6 +666,55 @@ pub fn verifyEvidence(
     }
 }
 
+/// Binds the receipt's script-outcome summary, and every retained
+/// `script_outcome` document one-to-one, to the exact progress invocations.
+pub fn verifyScriptOutcomes(
+    document: Document,
+    progress: native_recovery.ProgressDocument,
+) !void {
+    const summary = native_recovery.summarizeProgress(progress);
+    if (!std.mem.eql(u8, &hexDigest(summary.script_outcomes_sha256), &document.script_outcomes_sha256))
+        return error.EvidenceMismatch;
+    if (summary.recovered_phase_count != document.recovered_phase_count)
+        return error.InvalidRecoveryProgress;
+    try verifyRetainedScriptOutcomes(progress, document);
+}
+
+pub fn verifyRetainedScriptOutcomes(
+    progress: native_recovery.ProgressDocument,
+    receipt: Document,
+) !void {
+    var count: usize = 0;
+    for (progress.records) |record| {
+        if (record.stage != .outcome or
+            (record.action.kind != .script and record.action.kind != .compensation and
+                record.action.kind != .trigger)) continue;
+        count += 1;
+        if (count > receipt.evidence_files.len) return error.EvidenceMissing;
+        var matches: usize = 0;
+        for (receipt.evidence_files) |file| {
+            if (file.kind != .script_outcome or file.action == null) continue;
+            const action = file.action.?;
+            if (action.kind != record.action.kind or
+                action.program_step != record.action.program_step or
+                action.substep != record.action.substep or
+                action.ordinal != record.action.ordinal) continue;
+            matches += 1;
+            const retained = file.document_sha256 orelse return error.EvidenceMissing;
+            const recorded = record.evidence_sha256 orelse return error.EvidenceMissing;
+            if (!std.mem.eql(u8, &retained, &recorded)) return error.EvidenceMismatch;
+        }
+        if (matches == 0) return error.EvidenceMissing;
+        if (matches != 1) return error.InvalidRecoveryProgress;
+    }
+    var retained: usize = 0;
+    for (receipt.evidence_files) |file|
+        if (file.kind == .script_outcome) {
+            retained += 1;
+        };
+    if (retained != count) return error.InvalidRecoveryProgress;
+}
+
 fn digest(document: Document) Digest {
     var buffer: [4096]u8 = undefined;
     var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);

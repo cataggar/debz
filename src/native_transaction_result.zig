@@ -1012,11 +1012,7 @@ fn verifyStateEvidence(
     };
     if (!terminal_matches)
         return if (expected_outcome == .succeeded) error.TransactionNotSuccessful else error.TransactionNotFailed;
-    const progress_summary = native_recovery.summarizeProgress(progress.document);
-    try equalDigest(native_recovery.hexDigest(progress_summary.script_outcomes_sha256), proof.script_outcomes_sha256);
-    if (progress_summary.recovered_phase_count != proof.recovered_phase_count)
-        return error.InvalidRecoveryProgress;
-    try verifyRetainedScriptOutcomes(progress.document, proof);
+    try native_provenance.verifyScriptOutcomes(proof, progress.document);
     const trigger_bytes = try readEvidence(allocator, root, proof, .trigger_events, native_recovery.maximum_progress_bytes);
     defer allocator.free(trigger_bytes);
     var triggers = try native_recovery.decodeTriggerEvents(allocator, trigger_bytes);
@@ -1061,41 +1057,7 @@ fn verifyStateEvidence(
     );
 }
 
-fn verifyRetainedScriptOutcomes(
-    progress: native_recovery.ProgressDocument,
-    receipt: native_provenance.Document,
-) !void {
-    var count: usize = 0;
-    for (progress.records) |record| {
-        if (record.stage != .outcome or
-            (record.action.kind != .script and record.action.kind != .compensation and
-                record.action.kind != .trigger)) continue;
-        count += 1;
-        if (count > receipt.evidence_files.len) return error.EvidenceMissing;
-        var matches: usize = 0;
-        for (receipt.evidence_files) |file| {
-            if (file.kind != .script_outcome or file.action == null) continue;
-            const action = file.action.?;
-            if (action.kind != record.action.kind or
-                action.program_step != record.action.program_step or
-                action.substep != record.action.substep or
-                action.ordinal != record.action.ordinal) continue;
-            matches += 1;
-            try equalDigest(
-                file.document_sha256 orelse return error.EvidenceMissing,
-                record.evidence_sha256 orelse return error.EvidenceMissing,
-            );
-        }
-        if (matches == 0) return error.EvidenceMissing;
-        if (matches != 1) return error.InvalidRecoveryProgress;
-    }
-    var retained: usize = 0;
-    for (receipt.evidence_files) |file|
-        if (file.kind == .script_outcome) {
-            retained += 1;
-        };
-    if (retained != count) return error.InvalidRecoveryProgress;
-}
+const verifyRetainedScriptOutcomes = native_provenance.verifyRetainedScriptOutcomes;
 
 test "native_transaction_result.test.retained script outcomes bind every exact progress invocation" {
     const testing = std.testing;

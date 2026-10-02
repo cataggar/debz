@@ -30,6 +30,7 @@ const Invocation = struct {
     trigger_execution: bool = false,
     acknowledge: bool = false,
     seed_success_report: bool = false,
+    caller_verification: ?[]const u8 = null,
 };
 
 fn verifyTransport(input: Invocation) !void {
@@ -39,6 +40,10 @@ fn verifyTransport(input: Invocation) !void {
     if (input.isolated_helper and !input.caller_owned) return error.IsolatedHelperRequiresCaller;
     if (input.acknowledge and (!input.caller_owned or !std.mem.eql(u8, input.operation, "recover")))
         return error.AcknowledgmentRequiresRecoveringCaller;
+    if (input.caller_verification != null and
+        (!input.caller_owned or !input.isolated_helper or input.acknowledge or
+            !std.mem.eql(u8, input.operation, "recover")))
+        return error.CallerVerificationRequiresHeldCaller;
 }
 
 fn relative(fixture: *foundation.Fixture, root: []const u8, path: []const u8) ![]u8 {
@@ -164,6 +169,7 @@ fn invoke(
         .isolated_helper = input.isolated_helper,
         .triggers = input.trigger_execution,
         .acknowledge_native = input.acknowledge,
+        .caller_verification = input.caller_verification,
         .crash_at = input.crash_at,
     }, .{});
     defer fixture.allocator.free(encoded);
@@ -825,6 +831,7 @@ const OrdinaryCase = struct {
     caller_owned: bool = false,
     isolated_helper: bool = false,
     known_preinst_failure: bool = false,
+    script_components: bool = false,
 };
 
 fn recoveredOrdinary(
@@ -918,6 +925,11 @@ fn recoveredOrdinary(
     try unchanged(fixture, root, package_before);
     try std.testing.expectEqualSlices(u8, root_before, try projected.rootInventory(fixture, root, case.caller_owned));
     try same(try bytes(fixture, root, provenance_path, 16 * 1024 * 1024), proof_before);
+    if (case.script_components) {
+        if (!case.caller_owned or !case.isolated_helper or case.known_preinst_failure) return error.InvalidScriptComponentCase;
+        try callerScriptComponents(fixture, driver, root, arch, case.name, true);
+        try unchanged(fixture, root, package_before);
+    }
     if (case.caller_owned) {
         const ack_output = try support.path(fixture.allocator, case.name, "caller-ack");
         var acknowledged = try expectReport(try invoke(fixture, driver, root, arch, ack_output, .{
@@ -940,6 +952,244 @@ fn recoveredOrdinary(
     std.debug.print("{s}: real exit 86, evicted archive, pinned dpkg, typed proof, immutable repeat{s}\n", .{
         case.name, if (case.caller_owned) " and caller acknowledgment" else "",
     });
+}
+
+const HeldScriptState = struct {
+    record: []const u8,
+    intent: []const u8,
+    receipt: []const u8,
+    package: []const u8,
+    evidence: []const u8,
+
+    /// The original caller still owns the root: same record and intent, no
+    /// completion, unchanged payload, and the receipt the test last wrote.
+    fn owed(self: HeldScriptState, fixture: *foundation.Fixture, root: []const u8, receipt: []const u8) !void {
+        try same(try bytes(fixture, root, operation_path, 64 * 1024), self.record);
+        try same(try bytes(fixture, root, intent_path, 16 * 1024 * 1024), self.intent);
+        try same(try bytes(fixture, root, provenance_path, 16 * 1024 * 1024), receipt);
+        try missing(fixture, root, completion_path);
+        try unchanged(fixture, root, self.package);
+    }
+
+    fn restored(self: HeldScriptState, fixture: *foundation.Fixture, root: []const u8) !void {
+        try self.owed(fixture, root, self.receipt);
+        try std.testing.expectEqualSlices(u8, self.evidence, try projected.rootInventory(fixture, root, false));
+    }
+};
+
+const ScriptReceiptTamper = enum {
+    omitted,
+    duplicated,
+    rebound,
+    reindexed,
+    script_outcomes,
+    recovered_phase_count,
+    progress_head,
+};
+
+fn fileMode(fixture: *foundation.Fixture, path: []const u8) !u32 {
+    return (try fixture.dir.statFile(fixture.io, path, .{ .follow_symlinks = false })).permissions.toMode();
+}
+
+/// Issue #318 caller matrix. A scripted caller-held attempt, completed or
+/// recovered after `after_script_outcome`, binds each retained script outcome
+/// to its exact progress invocation. Changing, deleting, omitting,
+/// duplicating, rebinding or re-indexing one is refused with a typed error by
+/// settled caller verification (`verifyCallerSuccess`) and by recovery with
+/// acknowledgment. Neither reports success or acknowledges, and the held
+/// record, intent, receipt and payload stay byte-identical.
+fn callerScriptComponents(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    root: []const u8,
+    arch: []const u8,
+    name: []const u8,
+    recovered: bool,
+) !void {
+    const provenance = debz.native_provenance;
+    const allocator = fixture.allocator;
+    const receipt_path = try relative(fixture, root, provenance_path);
+    const receipt_mode = try fileMode(fixture, receipt_path);
+    const receipt_bytes = try support.read(fixture, receipt_path, 16 * 1024 * 1024);
+    var receipt = try provenance.decode(allocator, receipt_bytes);
+    defer receipt.deinit();
+    try std.testing.expectEqual(provenance.Outcome.succeeded, receipt.document.outcome);
+    if (recovered != (receipt.document.recovered_phase_count != 0)) return error.UnexpectedRecoveredPhaseCount;
+    const held: HeldScriptState = .{
+        .record = try bytes(fixture, root, operation_path, 64 * 1024),
+        .intent = try bytes(fixture, root, intent_path, 16 * 1024 * 1024),
+        .receipt = receipt_bytes,
+        .package = try snapshot(fixture, root),
+        .evidence = try projected.rootInventory(fixture, root, false),
+    };
+    var verified = try expectReport(try invoke(fixture, driver, root, arch, try support.path(allocator, name, "caller-verified"), .{
+        .operation = "recover",
+        .caller_owned = true,
+        .isolated_helper = true,
+        .caller_verification = &receipt.document.digest_sha256,
+    }), "applied", "caller_verified");
+    verified.deinit();
+    try held.restored(fixture, root);
+
+    var first_script: ?usize = null;
+    var scripts: usize = 0;
+    for (receipt.document.evidence_files, 0..) |file, index| {
+        if (file.kind != .script_outcome) continue;
+        if (first_script == null) first_script = index;
+        scripts += 1;
+        const path = try relative(fixture, root, file.path);
+        const mode = try fileMode(fixture, path);
+        const original = try support.read(fixture, path, 16 * 1024 * 1024);
+        const changed = try allocator.dupe(u8, original);
+        changed[changed.len - 1] ^= 1;
+        try fixture.write(path, changed, mode);
+        try scriptComponentRefused(fixture, driver, root, arch, name, try std.fmt.allocPrint(allocator, "changed-script_outcome-{d}", .{index}), &receipt.document.digest_sha256, "EvidenceChanged", held, receipt_bytes);
+        try fixture.dir.deleteFile(fixture.io, path);
+        try scriptComponentRefused(fixture, driver, root, arch, name, try std.fmt.allocPrint(allocator, "deleted-script_outcome-{d}", .{index}), &receipt.document.digest_sha256, "FileNotFound", held, receipt_bytes);
+        try fixture.write(path, original, mode);
+        try held.restored(fixture, root);
+    }
+    // The fixture package runs preinst and postinst for install.
+    if (scripts < 2) return error.MissingRetainedScriptOutcome;
+    const script_index = first_script.?;
+
+    for (std.enums.values(ScriptReceiptTamper)) |tamper| {
+        var forged = receipt.document;
+        const original_files = receipt.document.evidence_files;
+        const files = try allocator.alloc(provenance.EvidenceFile, original_files.len + 1);
+        @memcpy(files[0..original_files.len], original_files);
+        var count = original_files.len;
+        var duplicate: ?[]const u8 = null;
+        const expected_error: []const u8 = switch (tamper) {
+            .omitted => omitted: {
+                std.mem.copyForwards(provenance.EvidenceFile, files[script_index .. count - 1], files[script_index + 1 .. count]);
+                count -= 1;
+                break :omitted "EvidenceMissing";
+            },
+            .duplicated => duplicated: {
+                var copy = files[script_index];
+                copy.path = try std.fmt.allocPrint(allocator, "{s}.duplicate", .{copy.path});
+                const source = try relative(fixture, root, files[script_index].path);
+                duplicate = try relative(fixture, root, copy.path);
+                try fixture.write(duplicate.?, try support.read(fixture, source, 16 * 1024 * 1024), try fileMode(fixture, source));
+                files[count] = copy;
+                count += 1;
+                break :duplicated "InvalidRecoveryProgress";
+            },
+            .rebound => rebound: {
+                const digest = &files[script_index].document_sha256.?;
+                digest[0] = if (digest[0] == '0') '1' else '0';
+                break :rebound "EvidenceMismatch";
+            },
+            .reindexed => reindexed: {
+                files[script_index].action.?.ordinal += 1;
+                break :reindexed "EvidenceMissing";
+            },
+            .script_outcomes => summary: {
+                forged.script_outcomes_sha256[0] = if (forged.script_outcomes_sha256[0] == '0') '1' else '0';
+                break :summary "EvidenceMismatch";
+            },
+            .recovered_phase_count => phases: {
+                forged.recovered_phase_count += 1;
+                break :phases "InvalidRecoveryProgress";
+            },
+            .progress_head => head: {
+                forged.progress_head_sha256[0] = if (forged.progress_head_sha256[0] == '0') '1' else '0';
+                break :head "InvalidRecoveryProgress";
+            },
+        };
+        forged.evidence_files = files[0..count];
+        forged.evidence_files_sha256 = provenance.evidenceDigest(forged.evidence_files);
+        provenance.seal(&forged);
+        const forged_bytes = try forged.canonicalJson(allocator);
+        try fixture.write(receipt_path, forged_bytes, receipt_mode);
+        // A recovered caller learns its receipt digest from recovery itself,
+        // so the resealed digest is offered as the expected receipt.
+        try scriptComponentRefused(fixture, driver, root, arch, name, try std.fmt.allocPrint(allocator, "receipt-{s}", .{@tagName(tamper)}), &forged.digest_sha256, expected_error, held, forged_bytes);
+        try fixture.write(receipt_path, receipt_bytes, receipt_mode);
+        if (duplicate) |path| try fixture.dir.deleteFile(fixture.io, path);
+        try held.restored(fixture, root);
+    }
+    var again = try expectReport(try invoke(fixture, driver, root, arch, try support.path(allocator, name, "caller-verified-again"), .{
+        .operation = "recover",
+        .caller_owned = true,
+        .isolated_helper = true,
+        .caller_verification = &receipt.document.digest_sha256,
+    }), "applied", "caller_verified");
+    again.deinit();
+    try held.restored(fixture, root);
+    std.debug.print("{s}: {d} retained script outcomes changed/deleted and {d} receipt script bindings refused by caller verification and acknowledgment\n", .{
+        name, scripts, std.enums.values(ScriptReceiptTamper).len,
+    });
+}
+
+fn scriptComponentRefused(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    root: []const u8,
+    arch: []const u8,
+    name: []const u8,
+    label: []const u8,
+    expected_receipt: []const u8,
+    expected_error: []const u8,
+    held: HeldScriptState,
+    receipt: []const u8,
+) !void {
+    var refused = try expectReport(try invoke(fixture, driver, root, arch, try support.path(fixture.allocator, name, try std.fmt.allocPrint(fixture.allocator, "{s}-verify", .{label})), .{
+        .operation = "recover",
+        .caller_owned = true,
+        .isolated_helper = true,
+        .caller_verification = expected_receipt,
+    }), "refused", expected_error);
+    refused.deinit();
+    try held.owed(fixture, root, receipt);
+    var unacknowledged = try expectReport(try invoke(fixture, driver, root, arch, try support.path(fixture.allocator, name, try std.fmt.allocPrint(fixture.allocator, "{s}-acknowledge", .{label})), .{
+        .operation = "recover",
+        .caller_owned = true,
+        .isolated_helper = true,
+        .acknowledge = true,
+    }), "recovery_required", expected_error);
+    unacknowledged.deinit();
+    try held.owed(fixture, root, receipt);
+}
+
+fn completedScriptComponents(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const name = "caller-script-components-completed";
+    const expected = try fixture.makeRoot(name ++ "/reference", arch);
+    const root = try fixture.makeRoot(name ++ "/native", arch);
+    try installTools(fixture, expected);
+    try installTools(fixture, root);
+    try fixture.directory(name ++ "/reference/var/log");
+    try fixture.directory(name ++ "/native/var/log");
+    const archive = try support.makePackage(fixture, arch, "1", foundation.package, name ++ "/package", .{});
+    try fixture.directory(name ++ "/reference-install");
+    if (try support.reference(fixture, dpkg, expected, .{
+        .operation = "install",
+        .archives = &.{archive},
+    }, name ++ "/reference-install") != 0) return error.ReferenceInstallFailed;
+    var installed = try expectReport(try invoke(fixture, driver, root, arch, name ++ "/install", .{
+        .operation = "install",
+        .archive = archive,
+        .caller_owned = true,
+        .isolated_helper = true,
+    }), "applied", null);
+    defer installed.deinit();
+    try fixture.directory(name ++ "/comparison");
+    try foundation.compare(fixture.*, expected, root, name ++ "/comparison");
+    try callerScriptComponents(fixture, driver, root, arch, name, false);
+    var acknowledged = try expectReport(try invoke(fixture, driver, root, arch, name ++ "/caller-ack", .{
+        .operation = "recover",
+        .caller_owned = true,
+        .isolated_helper = true,
+        .acknowledge = true,
+    }), "applied", null);
+    defer acknowledged.deinit();
+    try missing(fixture, root, operation_path);
+    try missing(fixture, root, intent_path);
+    var terminal = try document(fixture, root, completion_path);
+    defer terminal.deinit();
+    try same(try text(terminal.value, "attempt_id"), installed.value.attempt_id orelse return error.MissingReportBinding);
+    try foundation.compare(fixture.*, expected, root, name ++ "/comparison");
 }
 
 fn blockedUnknown(
@@ -1717,6 +1967,14 @@ pub fn main(init: std.process.Init) !void {
             .isolated_helper = isolated,
             .known_preinst_failure = true,
         });
+    try completedScriptComponents(&fixture, driver, reference.executable, reference.architecture);
+    try recoveredOrdinary(&fixture, driver, reference.executable, reference.architecture, .{
+        .name = "caller-script-components-recovered",
+        .crash = "after_script_outcome",
+        .caller_owned = true,
+        .isolated_helper = true,
+        .script_components = true,
+    });
     for ([_][]const u8{
         "after_execution_intent", "during_filesystem_publication", "during_database_publication",
         "after_script_prepared",  "after_script_outcome",          "after_provenance",

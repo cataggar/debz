@@ -2046,6 +2046,100 @@ fn ownedSuccess(
     std.debug.print("ordinary owned workflow: exact reserve, foreign request refusal, retained receipt, owner verification and finalization matched dpkg\n", .{});
 }
 
+/// Issue #318: a scripted (postinst plus trigger) owned success settles with a
+/// released owner, then binds each retained `script_outcome` per component.
+/// The reference root has no executable `dpkg-trigger`, so dpkg parity for
+/// this package is left to the pinned-dpkg caller matrix in the helper test.
+fn ownedScriptedSuccess(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    helper: []const u8,
+    reference: []const u8,
+    arch: []const u8,
+    source: []const u8,
+    keyring: []const u8,
+    cli: []const u8,
+) !void {
+    const name = "executed/workflow-owned-scripted-success";
+    var scenario = try seededScenario(fixture, driver, helper, reference, arch, name, false);
+    defer scenario.deinit();
+    const selected: []const Selector = &.{.{ .name = "native-trigger-pkg" }};
+    const root_relative = scenario.native_root[fixture.path.len + 1 ..];
+    const lock = try fixture.absolute(try support.path(fixture.allocator, name, "lock.json"));
+    var planned = try ordinaryWorkflow(fixture, driver, &scenario, try support.path(fixture.allocator, name, "plan"), "install", "plan_only", selected, source, keyring, lock);
+    defer planned.deinit();
+    try std.testing.expectEqual(@as(i64, 0), (try field(planned.report.value, "exit_status")).integer);
+    const owner = try support.path(fixture.allocator, root_relative, "var/lib/debz/root-operation-deferred-ack-v1.json");
+    var reserved = try workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "reserve"), .{
+        .ordinary_mode = "reserve",
+        .selectors = selected,
+        .sources = &.{source},
+        .keyrings = &.{keyring},
+        .cache_path = try fixture.absolute(try support.path(fixture.allocator, name, "cache")),
+        .state_path = try fixture.absolute(try support.path(fixture.allocator, name, "state")),
+        .lock_input = lock,
+        .orchestration_id = @splat(17),
+    });
+    defer reserved.deinit();
+    try std.testing.expectEqual(@as(i64, 0), (try field(reserved.report.value, "exit_status")).integer);
+    const bound_owner = try support.path(fixture.allocator, name, "bound.owner.json");
+    try fixture.write(bound_owner, try support.read(fixture, owner, 64 * 1024), 0o644);
+    var executed = try workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "execute"), .{
+        .ordinary_mode = "execute",
+        .selectors = selected,
+        .sources = &.{source},
+        .keyrings = &.{keyring},
+        .cache_path = try fixture.absolute(try support.path(fixture.allocator, name, "cache")),
+        .state_path = try fixture.absolute(try support.path(fixture.allocator, name, "state")),
+        .lock_input = lock,
+        .orchestration_id = @splat(17),
+        .owner_evidence = try fixture.absolute(bound_owner),
+        .capture_evidence = true,
+    });
+    defer executed.deinit();
+    try ordinaryCompletion(fixture, scenario.native_root, executed, lock, "succeeded");
+    try same(try string(try field(executed.evidence.?.value, "native_completion"), "settlement"), "retained");
+    const trace = try support.read(fixture, try support.path(fixture.allocator, root_relative, "native-trigger-trace"), 4096);
+    try same(trace, "configure \ntriggered native-fixture\n");
+    var released = try parse(fixture, owner, 64 * 1024);
+    defer released.deinit();
+    try same(try string(released.value, "state"), "released");
+    const released_path = try support.path(fixture.allocator, name, "released.owner.json");
+    try fixture.write(released_path, try support.read(fixture, owner, 64 * 1024), 0o644);
+    const receipt_path = try support.path(fixture.allocator, root_relative, debz.native_provenance.document_path);
+    const receipt_before = try support.read(fixture, receipt_path, 16 * 1024 * 1024);
+    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{
+        .owner_evidence = try fixture.absolute(released_path),
+        .state = "released",
+        .outcome = .succeeded,
+        .scripts = true,
+        .root_relative = root_relative,
+        .receipt = receipt_path,
+        .owner = owner,
+        .bound_owner = bound_owner,
+        .record = null,
+        .original_receipt = receipt_before,
+        .original_record = null,
+        .payload = "usr/share/debz-fixtures/native-trigger-pkg",
+    });
+    try ownedResultProof(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "verify-released-after-matrix"), lock, try fixture.absolute(released_path), selected, "install", false, null);
+    var finalized = try workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "finalize"), .{
+        .ordinary_mode = "recover",
+        .selectors = selected,
+        .cache_path = try fixture.absolute(try support.path(fixture.allocator, name, "unused-cache")),
+        .state_path = try fixture.absolute(try support.path(fixture.allocator, name, "unused-state")),
+        .orchestration_id = @splat(17),
+        .owner_evidence = try fixture.absolute(released_path),
+        .acknowledgment = "ownership",
+    });
+    defer finalized.deinit();
+    try std.testing.expectEqual(@as(i64, 0), (try field(finalized.report.value, "exit_status")).integer);
+    try support.absent(fixture, owner);
+    try std.testing.expectEqualSlices(u8, receipt_before, try support.read(fixture, receipt_path, 16 * 1024 * 1024));
+    try publicVerify(fixture, cli, scenario.native_root, lock, arch, try support.path(fixture.allocator, name, "verify-owner-cleared"), true);
+    std.debug.print("ordinary owned scripted success: postinst and trigger outcomes retained, component matrix refused, owner finalized\n", .{});
+}
+
 fn reconciliation(
     fixture: *foundation.Fixture,
     driver: []const u8,
@@ -3060,6 +3154,42 @@ fn ownedComponents(
             else => "EvidenceMismatch",
         });
     }
+    var script_tampers: usize = 0;
+    if (check.scripts) {
+        // Issue #318: omitting or duplicating a retained script outcome is
+        // also refused by the completion's receipt binding at this owned
+        // surface. The helper caller matrix reaches the per-invocation errors.
+        const files = receipt.document.evidence_files;
+        const script_index = for (files, 0..) |file, index| {
+            if (file.kind == .script_outcome) break index;
+        } else return error.OwnedComponentNotRetained;
+        for ([_]bool{ false, true }) |duplicate| {
+            const forged_files = try fixture.allocator.alloc(provenance.EvidenceFile, files.len + 1);
+            @memcpy(forged_files[0..files.len], files);
+            var count = files.len;
+            var copy_path: ?[]const u8 = null;
+            if (duplicate) {
+                var copy = files[script_index];
+                copy.path = try std.fmt.allocPrint(fixture.allocator, "{s}.duplicate", .{copy.path});
+                copy_path = try support.path(fixture.allocator, check.root_relative, copy.path);
+                const source = try support.path(fixture.allocator, check.root_relative, files[script_index].path);
+                try fixture.write(copy_path.?, try support.read(fixture, source, 16 * 1024 * 1024), 0o600);
+                forged_files[count] = copy;
+                count += 1;
+            } else {
+                std.mem.copyForwards(provenance.EvidenceFile, forged_files[script_index .. count - 1], forged_files[script_index + 1 .. count]);
+                count -= 1;
+            }
+            var forged = receipt.document;
+            forged.evidence_files = forged_files[0..count];
+            forged.evidence_files_sha256 = provenance.evidenceDigest(forged.evidence_files);
+            provenance.seal(&forged);
+            try fixture.write(check.receipt, try forged.canonicalJson(fixture.allocator), 0o600);
+            try ownedComponentRefused(fixture, driver, scenario, arch, name, if (duplicate) "receipt-script_outcome-duplicated" else "receipt-script_outcome-omitted", selected, lock, check, "EvidenceMismatch");
+            if (copy_path) |path| try fixture.dir.deleteFile(fixture.io, path);
+            script_tampers += 1;
+        }
+    }
     try fixture.write(check.receipt, check.original_receipt, 0o600);
 
     // Issue #317: the final managed snapshot binds the live payload; changed
@@ -3105,8 +3235,8 @@ fn ownedComponents(
     }
     try expectOwnedRecord(fixture, check);
     try std.testing.expectEqualSlices(u8, check.original_receipt, try support.read(fixture, check.receipt, 16 * 1024 * 1024));
-    std.debug.print("owned {s} component matrix: {d} retained, {d} receipt, 2 live payload and 3 settlement tampers refused\n", .{
-        @tagName(check.outcome), retained_cases, std.enums.values(ReceiptTamper).len,
+    std.debug.print("owned {s} component matrix: {d} retained, {d} receipt, {d} script receipt, 2 live payload and 3 settlement tampers refused\n", .{
+        @tagName(check.outcome), retained_cases, std.enums.values(ReceiptTamper).len, script_tampers,
     });
 }
 
@@ -3649,6 +3779,8 @@ pub fn main(init: std.process.Init) !void {
     try batchWorkflow(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli orelse return error.MissingPublicCli);
     _ = phase_arena.reset(.free_all);
     try ownedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);
+    _ = phase_arena.reset(.free_all);
+    try ownedScriptedSuccess(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring, cli.?);
     _ = phase_arena.reset(.free_all);
     try reconciliation(&fixture, driver, helper.?, reference.executable, reference.architecture, source, keyring);
     _ = phase_arena.reset(.free_all);
