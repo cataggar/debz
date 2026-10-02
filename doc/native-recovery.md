@@ -1565,7 +1565,7 @@ external timeout) and is reported as slow progress. The ceiling keeps the
 Debug and ReleaseSafe repository runs within the 35-minute job on runners
 several times slower than usual, such as x64 runners without SHA
 instructions, where Zig Debug code authenticates the bundled helper with
-portable hashing (#307; see [native triggers](native-triggers.md)).
+portable hashing (#307, #324; see [native triggers](native-triggers.md)).
 Before any deadline stops a child, two watchdog snapshots 20 and 10 seconds
 ahead record the process tree's state, CPU, wait channel, syscall and kernel
 stack, the tree CPU consumed between them against wall time, host

@@ -953,11 +953,11 @@ fn verifyStateEvidence(
     try equalDigest(execution.caller.request_sha256, proof.request_sha256);
     try equalDigest(execution.caller.policy_sha256, proof.policy_sha256);
     const helper = request.helper() orelse return error.NativeHelperBindingRequired;
-    const helper_bytes = try readEvidence(allocator, root, proof, .helper_binary, native_provenance.maximum_evidence_file_bytes);
+    const helper_file = try evidenceFile(proof, .helper_binary);
+    const helper_bytes = try readEvidenceFile(allocator, root, helper_file, native_provenance.maximum_evidence_file_bytes);
     defer allocator.free(helper_bytes);
-    var helper_sha256: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(helper_bytes, &helper_sha256, .{});
-    try helper.matches(.{ .bytes = helper_bytes, .sha256 = helper_sha256 });
+    // readEvidenceFile hashed exactly these bytes and required helper_file.sha256.
+    try helper.matchesObserved(helper_bytes.len, helper_file.sha256);
 
     const intent_bytes = try readEvidence(allocator, root, proof, .intent, native_recovery.maximum_intent_bytes);
     defer allocator.free(intent_bytes);
