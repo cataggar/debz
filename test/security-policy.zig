@@ -1743,6 +1743,76 @@ test "security: native provenance component tamper coverage stays wired" {
         "\"live pending trigger claim\"",
         "\"deferred owner reinstated\"",
         "try testing.expect(!std.mem.eql(u8, &receipt_digest, &provenance_digest));",
+        "\"live payload bytes\", error.LivePayloadChanged",
+        "\"live payload removed\", error.LivePayloadChanged",
+        "for (std.enums.values(PayloadReplacement)) |replacement|",
+        "\"caller verify of live payload\", error.LivePayloadChanged",
+        "try expectCallerPayloadBound(env, attempt, receipt.digest_sha256);",
+        "native_transaction_result.verifyCallerSuccessReporting(allocator, attempt, receipt_digest, &change),",
+        "try testing.expectEqualStrings(\"demo\", owner.package);",
+        "try testing.expectEqualStrings(\"1.0\", owner.version);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/native_transaction_result.zig", "\nfn verifyStateEvidence(", "\nfn ", &.{
+        "        &route_conffiles,\n    );",
+        "    _ = try native_runtime.verifySettledPayload(",
+        "        route_conffiles.items,\n",
+        "        payload_change,\n",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/native_transaction_result.zig", "\nfn verifyCaller(", "\nfn ", &.{
+        "        null,\n        payload_change,\n    );",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/native_recovery.zig", "\npub fn verifySettledManagedStateReporting(", "\n}\n", &.{
+        "            if (change) |out| out.* = SettledPayloadChange.init(allocator, expected, reason) catch null;",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/native_recovery.zig", "\ntest \"native_recovery.test.settled managed state binds live payload kind, mode and bytes\" {", "\n}\n", &.{
+        "try testing.expectEqual(expected.reason, found.reason);",
+        "try testing.expectEqualSlices(u8, &hexDigest(bytes_digest), &found.expected_sha256.?);",
+        "try testing.expectEqual(found.reason, parsed.value.reason);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/native_unpack.zig", "\n    pub fn verifySettledPayload(", "\n    }\n", &.{
+        "                describeSettledPayloadOwner(allocator, root, program.target_architecture, found) catch {};",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/native_unpack.zig", "\n    fn describeSettledPayloadOwner(", "\n    }\n", &.{
+        "        const owners = ownership.ownersOf(change.path);",
+        "        if (owners.len != 1) return;",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/production_backend.zig", "\n    fn recoverNative(", "\n    fn ", &.{
+        "                .add => return repositoryOwnedRecovery(.recover, attempt.record(), repository_recovery_resume),",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/production_backend.zig", "\nfn repositoryOwnedRecovery(", "\n}\n", &.{
+        "        .surface = .repository_bootstrap,",
+        "        .resume_path = .rerun_same_repository_add,",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/production_backend.zig", "\ntest \"production native recovery names the repository bootstrap that owns a held attempt\" {", "\n}\n", &.{
+        "try std.testing.expectEqual(api.RecoveryOwner.Surface.repository_bootstrap, owner.surface);",
+        "try std.testing.expectEqual(api.RecoveryOwner.ResumePath.rerun_same_repository_add, owner.resume_path);",
+        "try std.testing.expectEqualStrings(before, after);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/repository_backend.zig", "\nfn nativeRepositoryCheckpointLoaded(", "\nfn ", &.{
+        "    var package_state = verifyNativePackageStateReporting(allocator, input, &payload_change) catch |err| {",
+        "        if (err == error.LivePayloadChanged)\n            return refuseNativeLivePayload(allocator, input, observer, stage, original, err, if (payload_change) |*change| change else null);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/repository_backend.zig", "\nfn refuseNativeLivePayload(", "\nfn ", &.{
+        "    if (retained.receipt.document.outcome != .succeeded or !nativeStageImports(stage, prior.phase)) return cause;",
+        "    publication.persist(allocator, current.state, original.paths) catch |err| return err;",
+        "    const detail: ?[]u8 = if (payload_change) |change| (change.diagnostic(allocator) catch null) else null;",
+        "    return publication.failMessage(allocator, &current, original.paths, .installed_verification_failed, cause, detail orelse @errorName(cause));",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/repository_backend.zig", "\nfn testProjectedNativeImport(", "\nfn ", &.{
+        "try std.testing.expectError(error.LivePayloadChanged, importAndRefreshNative(allocator, input, reporting));",
+        "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, reported.diagnostics[0].id);",
+        "try expectLivePayloadDiagnostic(allocator, reported.diagnostics[0].message, state.state.managed_files[0], state.state.descriptor.?);",
+        "try std.testing.expectError(error.LivePayloadChanged, completeNative(allocator, input));",
+        "try std.testing.expectEqual(root_operation.ProvenanceState.pending, attempt.record().provenance);",
+        "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, failed.state.diagnostic_id.?);",
+        "try expectLivePayloadDiagnostic(allocator, failed.state.diagnostic, state.state.managed_files[0], state.state.descriptor.?);",
+    });
+    try nativeMutationsIn(&f, "native-provenance", "src/repository_backend.zig", "\nfn expectLivePayloadDiagnostic(", "\nfn ", &.{
+        "    var parsed = try native_recovery.parseSettledPayloadDiagnostic(allocator, message);",
+        "    try std.testing.expectEqualStrings(removed.logical_path[1..], fields.path);",
+        "    try std.testing.expectEqualStrings(&expected_sha256, fields.expected_sha256.?);",
+        "    try std.testing.expectEqualStrings(descriptor.package, fields.package.?);",
+        "    try std.testing.expectEqualStrings(descriptor.version, fields.version.?);",
     });
     try nativeMutationsIn(&f, "native-workflow", "test/native_recovery_family.zig", "\nfn ownedComponents(", "\nfn ", &.{
         "const retained_kinds = [_]provenance.EvidenceKind{ .authorization, .program, .execution_request, .intent, .progress, .managed_state, .trigger_events, .script_outcome };",
@@ -1755,6 +1825,9 @@ test "security: native provenance component tamper coverage stays wired" {
         ".expected_error = \"ReceiptMissing\"",
         ".expected_error = \"CompletionMissing\"",
         ".expected_error = \"OwnershipMismatch\"",
+        "\"live-payload-bytes\", selected, lock, check, \"LivePayloadChanged\"",
+        "\"live-payload-removed\", selected, lock, check, \"LivePayloadChanged\"",
+        "\"administrator-conffile-edit\", selected, lock, check",
     });
     try nativeMutations(&f, "native-workflow", "test/native_recovery_family.zig", &.{
         "    try ownedComponents(fixture, driver, &scenario, arch, name, selected, lock, .{",

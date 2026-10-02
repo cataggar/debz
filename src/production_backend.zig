@@ -772,8 +772,12 @@ pub const Backend = struct {
         if (guard.open(allocator, request, .{ .package_transaction = .recover })) |failure|
             return failure;
         const attempt = guard.active().?;
-        if (attempt.record().operation != .package_transaction)
-            return blockedRecovery(.recover, "native attempt belongs to a different product surface");
+        switch (attempt.record().operation) {
+            .package_transaction => {},
+            .repository_bootstrap => |operation| switch (operation) {
+                .add => return repositoryOwnedRecovery(.recover, attempt.record(), repository_recovery_resume),
+            },
+        }
         if (workflow) |directive| {
             const original_operation = workflowSemanticSurface(directive.operation);
             var original_request = request;
@@ -1834,8 +1838,9 @@ pub const Backend = struct {
         // backend is not this backend's to discharge.
         switch (record.operation) {
             .package_transaction => {},
-            .repository_bootstrap => return blockedRecovery(
+            .repository_bootstrap => return repositoryOwnedRecovery(
                 request.operation,
+                record,
                 "an interrupted repository bootstrap owes provenance for this root; rerun the same 'debz repo add' request to finish it",
             ),
         }
@@ -4185,6 +4190,23 @@ fn blockedEvidence(message: []const u8) OwedEvidence {
         .journal = .{ .status = .absent, .detail = "evidence was not evaluated" },
         .blocked = message,
     };
+}
+
+const repository_recovery_resume = "the held native attempt belongs to the repository bootstrap ('debz repo add'), " ++
+    "which alone finishes it: restore any managed payload its installed_verification_failed diagnostic names, " ++
+    "then rerun the same 'debz repo add' request";
+
+/// Only the repository bootstrap finishes its own held attempt, so the
+/// refusal names that surface and how it resumes.
+fn repositoryOwnedRecovery(operation: api.Operation, record: root_operation.Record, message: []const u8) api.Result {
+    var result = blockedRecovery(operation, message);
+    result.recovery_owner = .{
+        .surface = .repository_bootstrap,
+        .resume_path = .rerun_same_repository_add,
+        .attempt_id = record.attempt_id,
+        .request_sha256 = record.request_sha256,
+    };
+    return result;
 }
 
 /// A root whose owed provenance cannot be discharged stays blocked. The
@@ -6602,6 +6624,67 @@ test "production workflow native ownership requires an outer identity before roo
 fn containsString(values: []const []const u8, target: []const u8) bool {
     for (values) |value| if (std.mem.eql(u8, value, target)) return true;
     return false;
+}
+
+test "production native recovery names the repository bootstrap that owns a held attempt" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const Held = enum { verifying, provenance_owed };
+    for (std.enums.values(Held)) |held_state| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.init(allocator, &directory, "");
+        defer fixture.deinit();
+        var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+        defer root.close();
+        const store = root_operation.Store.init(root.root);
+        try store.ensureNamespace();
+        const owed = held_state == .provenance_owed;
+        var held = try root_operation.create(allocator, .{
+            .attempt_id = @splat(0x44),
+            .generation = 3,
+            .install_root = fixture.install_root,
+            .backend = .native,
+            .operation = .{ .repository_bootstrap = .add },
+            .state = if (owed) .completed else .verifying,
+            .phase = if (owed) .provenance else .verification,
+            .step = 2,
+            .mutation_started = true,
+            .outcome = if (owed) .succeeded else .pending,
+            .provenance = .pending,
+            .request_sha256 = @splat(0x11),
+            .policy_sha256 = @splat(0x22),
+            .target_architecture = "amd64",
+            .reserved_unix = 1_700_000_000,
+            .updated_unix = 1_700_000_000,
+        });
+        defer held.deinit();
+        try store.writeAtomic(allocator, held.record);
+        const record_path = try root_fs.Path.init(root_operation.record_path);
+        const before = try root.root.readFileAlloc(allocator, record_path, 1024 * 1024);
+
+        var options = fixture.options();
+        options.source_paths = &.{};
+        options.keyring_paths = &.{};
+        options.lock_input_path = null;
+        options.assume_yes = true;
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native };
+        const result = try backend.execute(allocator, .{ .operation = .recover, .options = options });
+        try std.testing.expectEqual(api.ExitStatus.recovery, result.exit_status);
+        try std.testing.expectEqual(api.ErrorId.root_operation_recovery_required, result.diagnostics[0].id);
+        try std.testing.expect(!result.changed);
+        try std.testing.expect(result.native_completion == null and result.native_install == null);
+        const owner = result.recovery_owner orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(api.RecoveryOwner.Surface.repository_bootstrap, owner.surface);
+        try std.testing.expectEqual(api.RecoveryOwner.ResumePath.rerun_same_repository_add, owner.resume_path);
+        try std.testing.expectEqualSlices(u8, &held.record.attempt_id, &owner.attempt_id);
+        try std.testing.expectEqualSlices(u8, &held.record.request_sha256, &owner.request_sha256);
+        // The held attempt stays exactly as its own surface left it, so the
+        // same `debz repo add` request can still adopt and finish it.
+        const after = try root.root.readFileAlloc(allocator, record_path, 1024 * 1024);
+        try std.testing.expectEqualStrings(before, after);
+    }
 }
 
 fn usesPackageTransaction(operation: api.Operation) bool {

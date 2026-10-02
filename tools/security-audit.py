@@ -3528,6 +3528,9 @@ def native_workflow_acceptance_wiring_failures(
         '.expected_error = "ReceiptMissing"',
         '.expected_error = "CompletionMissing"',
         '.expected_error = "OwnershipMismatch"',
+        '"live-payload-bytes", selected, lock, check, "LivePayloadChanged"',
+        '"live-payload-removed", selected, lock, check, "LivePayloadChanged"',
+        '"administrator-conffile-edit", selected, lock, check',
     ):
         if token not in components:
             failures.append(f"native_recovery_family.zig: owned component tamper matrix lost {token}")
@@ -3543,7 +3546,8 @@ def native_workflow_acceptance_wiring_failures(
 
 
 def native_provenance_binding_wiring_failures(
-    build: str, e2e: str, binding: str,
+    build: str, e2e: str, binding: str, transaction: str, repository: str,
+    recovery: str, unpack: str, production: str,
 ) -> list[str]:
     failures: list[str] = []
     if '            "native_provenance_binding.test.",\n        },\n    });\n    const run_sha512_e2e_tests = b.addRunArtifact(sha512_e2e_tests);' not in build:
@@ -3564,12 +3568,107 @@ def native_provenance_binding_wiring_failures(
         '"live pending trigger claim"',
         '"deferred owner reinstated"',
         "try testing.expect(!std.mem.eql(u8, &receipt_digest, &provenance_digest));",
+        '"live payload bytes", error.LivePayloadChanged',
+        '"live payload removed", error.LivePayloadChanged',
+        "for (std.enums.values(PayloadReplacement)) |replacement|",
+        '"caller verify of live payload", error.LivePayloadChanged',
+        "try expectCallerPayloadBound(env, attempt, receipt.digest_sha256);",
+        "native_transaction_result.verifyCallerSuccessReporting(allocator, attempt, receipt_digest, &change),",
+        'try testing.expectEqualStrings("demo", owner.package);',
+        'try testing.expectEqualStrings("1.0", owner.version);',
     ):
         if token not in binding:
             failures.append(f"native_provenance_binding_test.zig: component tamper coverage lost {token}")
     for token in ("try tamperSettled(&env, &settled);", "try env.expectSecondOperationRefused();"):
         if binding.count(token) != 2:
             failures.append(f"native_provenance_binding_test.zig: completed/recovered and recovery_required coverage requires two {token}")
+    state = transaction.split("\nfn verifyStateEvidence(", 1)[-1].split("\nfn ", 1)[0]
+    for token in (
+        "        &route_conffiles,\n    );",
+        "    _ = try native_runtime.verifySettledPayload(\n        allocator,\n        root,\n        program.program,\n        managed.document,\n        route_conffiles.items,\n        payload_change,\n    );\n}",
+    ):
+        if token not in state:
+            failures.append(f"native_transaction_result.zig: settled verification must bind the live managed payload lost {token}")
+    caller = transaction.split("\nfn verifyCaller(", 1)[-1].split("\nfn ", 1)[0]
+    if "        null,\n        payload_change,\n    );\n    try verifyPendingEvidence(allocator, root, proof);" not in caller:
+        failures.append("native_transaction_result.zig: held caller verification must describe a changed live payload")
+    for start, end, tokens, message in (
+        ("\npub fn verifySettledManagedStateReporting(", "\n}\n", (
+            "            if (change) |out| out.* = SettledPayloadChange.init(allocator, expected, reason) catch null;",
+        ), "native_recovery.zig: a changed live payload must be described"),
+        ('\ntest "native_recovery.test.settled managed state binds live payload kind, mode and bytes" {', "\n}\n", (
+            "try testing.expectEqual(expected.reason, found.reason);",
+            "try testing.expectEqualSlices(u8, &hexDigest(bytes_digest), &found.expected_sha256.?);",
+            "try testing.expectEqual(found.reason, parsed.value.reason);",
+        ), "native_recovery.zig: live payload change description coverage lost"),
+    ):
+        body = recovery.split(start, 1)[-1].split(end, 1)[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"{message} {token}")
+    for start, tokens in (
+        ("\n    pub fn verifySettledPayload(", (
+            "                describeSettledPayloadOwner(allocator, root, program.target_architecture, found) catch {};",
+        )),
+        ("\n    fn describeSettledPayloadOwner(", (
+            "        const owners = ownership.ownersOf(change.path);",
+            "        if (owners.len != 1) return;",
+        )),
+    ):
+        body = unpack.split(start, 1)[-1].split("\n    }\n", 1)[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"native_unpack.zig: a changed live payload must name its installed owner lost {token}")
+    for start, end, tokens in (
+        ("\n    fn recoverNative(", "\n    fn ", (
+            "                .add => return repositoryOwnedRecovery(.recover, attempt.record(), repository_recovery_resume),",
+        )),
+        ("\nfn repositoryOwnedRecovery(", "\n}\n", (
+            "        .surface = .repository_bootstrap,",
+            "        .resume_path = .rerun_same_repository_add,",
+        )),
+        ('\ntest "production native recovery names the repository bootstrap that owns a held attempt" {', "\n}\n", (
+            "try std.testing.expectEqual(api.RecoveryOwner.Surface.repository_bootstrap, owner.surface);",
+            "try std.testing.expectEqual(api.RecoveryOwner.ResumePath.rerun_same_repository_add, owner.resume_path);",
+            "try std.testing.expectEqualStrings(before, after);",
+        )),
+    ):
+        body = production.split(start, 1)[-1].split(end, 1)[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"production_backend.zig: recovery of a repository-owned attempt must name its surface and resume path lost {token}")
+    for start, tokens in (
+        ("\nfn nativeRepositoryCheckpointLoaded(", (
+            "    var package_state = verifyNativePackageStateReporting(allocator, input, &payload_change) catch |err| {",
+            "        if (err == error.LivePayloadChanged)\n            return refuseNativeLivePayload(allocator, input, observer, stage, original, err, if (payload_change) |*change| change else null);",
+        )),
+        ("\nfn refuseNativeLivePayload(", (
+            "    if (retained.receipt.document.outcome != .succeeded or !nativeStageImports(stage, prior.phase)) return cause;",
+            "    publication.persist(allocator, current.state, original.paths) catch |err| return err;",
+            "    const detail: ?[]u8 = if (payload_change) |change| (change.diagnostic(allocator) catch null) else null;",
+            "    return publication.failMessage(allocator, &current, original.paths, .installed_verification_failed, cause, detail orelse @errorName(cause));",
+        )),
+        ("\nfn testProjectedNativeImport(", (
+            "try std.testing.expectError(error.LivePayloadChanged, importAndRefreshNative(allocator, input, reporting));",
+            "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, reported.diagnostics[0].id);",
+            "try expectLivePayloadDiagnostic(allocator, reported.diagnostics[0].message, state.state.managed_files[0], state.state.descriptor.?);",
+            "try std.testing.expectError(error.LivePayloadChanged, completeNative(allocator, input));",
+            "try std.testing.expectEqual(root_operation.ProvenanceState.pending, attempt.record().provenance);",
+            "try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, failed.state.diagnostic_id.?);",
+            "try expectLivePayloadDiagnostic(allocator, failed.state.diagnostic, state.state.managed_files[0], state.state.descriptor.?);",
+        )),
+        ("\nfn expectLivePayloadDiagnostic(", (
+            "    var parsed = try native_recovery.parseSettledPayloadDiagnostic(allocator, message);",
+            "    try std.testing.expectEqualStrings(removed.logical_path[1..], fields.path);",
+            "    try std.testing.expectEqualStrings(&expected_sha256, fields.expected_sha256.?);",
+            "    try std.testing.expectEqualStrings(descriptor.package, fields.package.?);",
+            "    try std.testing.expectEqualStrings(descriptor.version, fields.version.?);",
+        )),
+    ):
+        body = repository.split(start, 1)[-1].split("\nfn ", 1)[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"repository_backend.zig: repository add must record a changed live payload as installed_verification_failed lost {token}")
     return failures
 
 
@@ -3777,6 +3876,11 @@ def audit_ci_pins() -> None:
         (ROOT / "build.zig").read_text(),
         (ROOT / "src/sha512_transaction_e2e_test.zig").read_text(),
         (ROOT / "src/native_provenance_binding_test.zig").read_text(),
+        (ROOT / "src/native_transaction_result.zig").read_text(),
+        (ROOT / "src/repository_backend.zig").read_text(),
+        (ROOT / "src/native_recovery.zig").read_text(),
+        (ROOT / "src/native_unpack.zig").read_text(),
+        (ROOT / "src/production_backend.zig").read_text(),
     ):
         fail(failure)
     for failure in native_report_path_wiring_failures({
@@ -4743,7 +4847,7 @@ def main() -> int:
 
 def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
     """Apply a production policy validator to one bounded, external input."""
-    limit = 2 * 1024 * 1024 if kind in ("native-final", "native-only-candidate") else 1024 * 1024
+    limit = 2 * 1024 * 1024 if kind in ("native-final", "native-only-candidate", "native-provenance") else 1024 * 1024
     try:
         descriptor = os.open(input_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
@@ -4836,6 +4940,11 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             "native-provenance": (
                 "build.zig", "src/sha512_transaction_e2e_test.zig",
                 "src/native_provenance_binding_test.zig",
+                "src/native_transaction_result.zig",
+                "src/repository_backend.zig",
+                "src/native_recovery.zig",
+                "src/native_unpack.zig",
+                "src/production_backend.zig",
             ),
             "reference-root": REFERENCE_ROOT_PATHS,
             "protected-reference": PROTECTED_REFERENCE_PATHS,

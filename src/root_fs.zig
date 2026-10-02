@@ -259,6 +259,12 @@ pub const RegularFileObservation = struct {
     bytes: []u8,
 };
 
+/// Metadata observed after one streamed read of a pinned regular file.
+pub const RegularFileStream = struct {
+    entry: Entry,
+    change_nanoseconds: i128,
+};
+
 /// Metadata and target read from one pinned symbolic-link descriptor.
 pub const SymbolicLinkObservation = struct {
     entry: Entry,
@@ -469,6 +475,37 @@ pub const PinnedRegularFile = struct {
             .entry = after.entry,
             .change_nanoseconds = after.change_nanoseconds,
             .bytes = first,
+        };
+    }
+
+    /// Streams the pinned file once from offset zero through `buffer` into
+    /// `sink.update`, so memory stays bounded by `buffer.len` whatever the
+    /// file size. Every descriptor/name/full-root observation before and
+    /// after the read must still match the pin; any change is `PathChanged`.
+    /// A concurrent same-sized writer can at worst make the streamed bytes
+    /// describe neither version, which a caller comparing a digest of them
+    /// against a recorded digest observes as a mismatch.
+    pub fn observeStreamed(
+        self: *const PinnedRegularFile,
+        buffer: []u8,
+        maximum_bytes: u64,
+        sink: anytype,
+    ) !RegularFileStream {
+        if (buffer.len == 0) return error.InvalidBuffer;
+        const before = try self.metadata();
+        if (before.entry.size > maximum_bytes) return error.FileTooLarge;
+        var offset: u64 = 0;
+        while (offset < before.entry.size) {
+            const length: usize = @intCast(@min(before.entry.size - offset, buffer.len));
+            if (try self.file.readPositionalAll(self.io, buffer[0..length], offset) != length)
+                return error.PathChanged;
+            sink.update(buffer[0..length]);
+            offset += length;
+        }
+        const after = try self.metadata();
+        return .{
+            .entry = after.entry,
+            .change_nanoseconds = after.change_nanoseconds,
         };
     }
 };
@@ -2466,6 +2503,45 @@ fn stableReadUnderAllocationFailure(
     defer allocator.free(observed.bytes);
     if (!std.mem.eql(u8, observed.bytes, "content\n"))
         return error.TestUnexpectedResult;
+}
+
+test "root_fs.test.streamed pinned reads are chunk independent and bounded" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root: Root = .init(testing.io, tmp.dir);
+    const path = try testPath("file");
+    const content = "streamed content spans several fixed buffers\n";
+    try root.publishFile(path, content, .{});
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &expected, .{});
+    var pinned = try root.pinRegularFile(path);
+    defer pinned.close();
+    var actual: [32]u8 = undefined;
+    for ([_]usize{ 1, 7, content.len, 4096 }) |size| {
+        var storage: [4096]u8 = undefined;
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        const observed = try pinned.observeStreamed(storage[0..size], content.len, &hasher);
+        hasher.final(&actual);
+        try testing.expectEqualSlices(u8, &expected, &actual);
+        try testing.expectEqual(@as(u64, content.len), observed.entry.size);
+    }
+    var storage: [8]u8 = undefined;
+    var unused = std.crypto.hash.sha2.Sha256.init(.{});
+    try testing.expectError(error.FileTooLarge, pinned.observeStreamed(&storage, content.len - 1, &unused));
+    try testing.expectError(error.InvalidBuffer, pinned.observeStreamed(storage[0..0], content.len, &unused));
+
+    const empty = try testPath("empty");
+    try root.publishFile(empty, "", .{});
+    var empty_pin = try root.pinRegularFile(empty);
+    defer empty_pin.close();
+    std.crypto.hash.sha2.Sha256.hash("", &expected, .{});
+    var empty_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    _ = try empty_pin.observeStreamed(&storage, 0, &empty_hasher);
+    empty_hasher.final(&actual);
+    try testing.expectEqualSlices(u8, &expected, &actual);
+
+    try root.appendAt(path, 0, "foreign\n", true);
+    try testing.expectError(error.PathChanged, pinned.observeStreamed(&storage, 4096, &unused));
 }
 
 test "root_fs.test.symbolic link publication is bounded and atomic" {

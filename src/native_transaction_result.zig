@@ -470,7 +470,7 @@ pub fn verifyCallerSuccess(
     attempt: *root_operation.Attempt,
     expected_receipt: native_provenance.Digest,
 ) !CallerSuccess {
-    return verifyCaller(allocator, attempt, expected_receipt, .succeeded);
+    return verifyCaller(allocator, attempt, expected_receipt, .succeeded, null);
 }
 
 /// Confirms the actual terminal failure and recorded database, not successful
@@ -480,7 +480,29 @@ pub fn verifyCallerFailure(
     attempt: *root_operation.Attempt,
     expected_receipt: native_provenance.Digest,
 ) !CallerFailure {
-    return verifyCaller(allocator, attempt, expected_receipt, .failed);
+    return verifyCaller(allocator, attempt, expected_receipt, .failed, null);
+}
+
+/// `verifyCallerSuccess`, which on `LivePayloadChanged` also describes the
+/// first changed path in `payload_change`. It must be null on entry; the
+/// caller deinitializes what it receives.
+pub fn verifyCallerSuccessReporting(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+    payload_change: *?native_recovery.SettledPayloadChange,
+) !CallerSuccess {
+    return verifyCaller(allocator, attempt, expected_receipt, .succeeded, payload_change);
+}
+
+/// `verifyCallerFailure` with `verifyCallerSuccessReporting`'s description.
+pub fn verifyCallerFailureReporting(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    expected_receipt: native_provenance.Digest,
+    payload_change: *?native_recovery.SettledPayloadChange,
+) !CallerFailure {
+    return verifyCaller(allocator, attempt, expected_receipt, .failed, payload_change);
 }
 
 fn verifyCaller(
@@ -488,6 +510,7 @@ fn verifyCaller(
     attempt: *root_operation.Attempt,
     expected_receipt: native_provenance.Digest,
     comptime expected_outcome: TerminalOutcome,
+    payload_change: ?*?native_recovery.SettledPayloadChange,
 ) !CallerResult(expected_outcome) {
     var receipt = try native_runtime.readCompletion(allocator, attempt) orelse return error.ReceiptMissing;
     errdefer receipt.deinit();
@@ -506,6 +529,7 @@ fn verifyCaller(
         proof,
         expected_outcome,
         null,
+        payload_change,
     );
     try verifyPendingEvidence(allocator, root, proof);
     if (!attempt.locked()) return error.LockLost;
@@ -826,6 +850,7 @@ fn verifyCompletionEvidence(
         proof,
         expected_outcome,
         repository_policy,
+        null,
     );
 }
 
@@ -865,6 +890,7 @@ fn verifyStateEvidence(
     proof: native_provenance.Document,
     expected_outcome: TerminalOutcome,
     repository_policy: ?transaction_executor.Policy,
+    payload_change: ?*?native_recovery.SettledPayloadChange,
 ) anyerror!void {
     try native_provenance.verifyEvidence(allocator, root, proof);
 
@@ -1007,17 +1033,32 @@ fn verifyStateEvidence(
     if (managed.document.transient != null) return error.InvalidManagedState;
     try verifyDiversionCacheEvidence(allocator, root, proof, managed.document);
     try verifyUnpackDiversionEvidence(allocator, root, proof, managed.document, program.program, progress.document);
+    var route_arena = std.heap.ArenaAllocator.init(allocator);
+    defer route_arena.deinit();
+    var route_conffiles: std.ArrayList([]const u8) = .empty;
     try verifyUnpackRouteSettlementEvidence(
         allocator,
         root,
         proof,
         managed.document,
         program.program,
+        route_arena.allocator(),
+        &route_conffiles,
     );
     switch (expected_outcome) {
         .succeeded => try native_runtime.verifyCompletedState(allocator, root, authorized, proof),
         .failed => try native_runtime.verifyFailedState(allocator, root, authorized, proof),
     }
+    // The database generation above binds the dpkg records; this binds the
+    // live payload the attempt's final managed snapshot covers.
+    _ = try native_runtime.verifySettledPayload(
+        allocator,
+        root,
+        program.program,
+        managed.document,
+        route_conffiles.items,
+        payload_change,
+    );
 }
 
 fn verifyRetainedScriptOutcomes(
@@ -1227,6 +1268,8 @@ fn verifyUnpackRouteSettlementEvidence(
     proof: native_provenance.Document,
     managed: native_recovery.ManagedStateDocument,
     program: native_program.Program,
+    route_arena: std.mem.Allocator,
+    route_conffiles: *std.ArrayList([]const u8),
 ) !void {
     const entries = if (managed.stable) |snapshot| snapshot.entries else &.{};
     var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
@@ -1308,12 +1351,17 @@ fn verifyUnpackRouteSettlementEvidence(
         defer cache.deinit();
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        _ = try native_unpack_route_settlement.lowerSuccess(
+        const lowered = try native_unpack_route_settlement.lowerSuccess(
             arena.allocator(),
             route.contract,
             &parent,
             &cache,
         );
+        // A route-settled conffile stays at its unpack route.
+        for (lowered.routes) |lowered_route| {
+            if (lowered_route.conffile == null) continue;
+            try route_conffiles.append(route_arena, try route_arena.dupe(u8, lowered_route.payload_route));
+        }
     }
     for (proof.evidence_files) |file| {
         if (file.kind != .unpack_route_settlement) continue;

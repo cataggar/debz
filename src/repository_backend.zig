@@ -217,17 +217,30 @@ pub const NativePackageState = union(enum) {
 /// original caller. A known failure never becomes successful installation;
 /// neither result completes repository bootstrap or permits early cleanup.
 pub fn verifyNativePackageState(allocator: std.mem.Allocator, input: NativeReceiptRequest) !NativePackageState {
+    var payload_change: ?native_recovery.SettledPayloadChange = null;
+    defer if (payload_change) |*change| change.deinit();
+    return verifyNativePackageStateReporting(allocator, input, &payload_change);
+}
+
+/// `verifyNativePackageState`, which on `LivePayloadChanged` also describes
+/// the first changed path in `payload_change`; see
+/// `native_transaction_result.verifyCallerSuccessReporting`.
+fn verifyNativePackageStateReporting(
+    allocator: std.mem.Allocator,
+    input: NativeReceiptRequest,
+    payload_change: *?native_recovery.SettledPayloadChange,
+) !NativePackageState {
     var retained = try readRetainedNativeReceipt(allocator, input);
     errdefer retained.deinit();
     switch (retained.receipt.document.outcome) {
         .succeeded => {
-            var verified = try native_transaction_result.verifyCallerSuccess(allocator, input.attempt, input.expected_receipt_sha256);
+            var verified = try native_transaction_result.verifyCallerSuccessReporting(allocator, input.attempt, input.expected_receipt_sha256, payload_change);
             defer verified.deinit();
             try input.validate();
             return .{ .succeeded = retained };
         },
         .failed => {
-            var verified = try native_transaction_result.verifyCallerFailure(allocator, input.attempt, input.expected_receipt_sha256);
+            var verified = try native_transaction_result.verifyCallerFailureReporting(allocator, input.attempt, input.expected_receipt_sha256, payload_change);
             defer verified.deinit();
             try input.validate();
             return .{ .failed = retained };
@@ -971,28 +984,20 @@ fn nativeRepositoryCheckpointLoaded(
         var retained = try retainNativeReceipt(allocator, input);
         defer retained.deinit();
     }
-    var package_state = try verifyNativePackageState(allocator, input);
+    var payload_change: ?native_recovery.SettledPayloadChange = null;
+    defer if (payload_change) |*change| change.deinit();
+    var package_state = verifyNativePackageStateReporting(allocator, input, &payload_change) catch |err| {
+        if (err == error.LivePayloadChanged)
+            return refuseNativeLivePayload(allocator, input, observer, stage, original, err, if (payload_change) |*change| change else null);
+        return err;
+    };
     errdefer package_state.deinit();
     // Borrow the already-admitted root; this adapter does not own its descriptor.
     var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
     const installed = try descriptorIdentityInstalled(allocator, filesystem.interface(), descriptor);
-    var next = if (state.phase == .imported or state.phase == .refreshed or state.phase == .complete) blk: {
-        if (package_state != .succeeded or !installed or !state.installed)
-            return error.RepositoryStateMismatch;
-        break :blk try state_module.create(allocator, state);
-    } else try nativePackageCheckpointState(allocator, state, package_state == .failed, installed, paths.provenance_logical);
+    var next = try nativeCheckpointNext(allocator, state, package_state == .failed, installed, paths.provenance_logical);
     errdefer next.deinit();
-    var publication: NativeCheckpointPublication = .{
-        .allocator = allocator,
-        .input = input.recoveryRequest(),
-        .pins = .{ &original.state_file, &original.plan_file, &original.lock_file },
-        .observer = observer,
-        .result_progress = switch (stage) {
-            .post_install => |dependencies| dependencies.result_progress,
-            .resume_pipeline => |pipeline| pipeline.dependencies.result_progress,
-            else => null,
-        },
-    };
+    var publication = nativeCheckpointPublication(allocator, input, original, observer, stage);
     try publication.persist(allocator, next.state, paths);
     switch (stage) {
         .package => {},
@@ -1008,6 +1013,88 @@ fn nativeRepositoryCheckpointLoaded(
     try validateNativeRepositoryCaller(input.repository, input.attempt);
     try input.attempt.coordinator.validateProjection();
     return .{ .state = next, .package_state = package_state };
+}
+
+fn nativeCheckpointNext(
+    allocator: std.mem.Allocator,
+    state: state_module.State,
+    failed: bool,
+    installed: bool,
+    provenance_path: []const u8,
+) !state_module.OwnedState {
+    if (state.phase == .imported or state.phase == .refreshed or state.phase == .complete) {
+        if (failed or !installed or !state.installed) return error.RepositoryStateMismatch;
+        return state_module.create(allocator, state);
+    }
+    return nativePackageCheckpointState(allocator, state, failed, installed, provenance_path);
+}
+
+fn nativeCheckpointPublication(
+    allocator: std.mem.Allocator,
+    input: NativeReceiptRequest,
+    original: *NativeRepositoryInputs,
+    observer: ?root_fs.PublishObserver,
+    stage: NativeRepositoryStage,
+) NativeCheckpointPublication {
+    return .{
+        .allocator = allocator,
+        .input = input.recoveryRequest(),
+        .pins = .{ &original.state_file, &original.plan_file, &original.lock_file },
+        .observer = observer,
+        .result_progress = switch (stage) {
+            .post_install => |dependencies| dependencies.result_progress,
+            .resume_pipeline => |pipeline| pipeline.dependencies.result_progress,
+            else => null,
+        },
+    };
+}
+
+/// Whether this stage reaches `importNativeDescriptorMaterial`, which records
+/// `installed_verification_failed` when the installed descriptor files differ.
+fn nativeStageImports(stage: NativeRepositoryStage, phase: state_module.Phase) bool {
+    return switch (stage) {
+        .post_install => true,
+        .resume_pipeline => phase != .complete,
+        .package, .completion => false,
+    };
+}
+
+/// Settled native verification refuses a changed live payload (#317) before
+/// the import stage's own installed-file check could run. When that stage
+/// would run, the refusal keeps its durable `installed_verification_failed`
+/// record. Its message is the `native_recovery.SettledPayloadDiagnostic` of
+/// the first changed path (path, recorded kind, mode, owner, SHA-256 or link
+/// target, and the listing package, version and architecture), or the native
+/// error name when no description could be made. A failed transaction or a
+/// completion-only stage stays a raw refusal, as the completion stage's own
+/// installed-file check was. Either way the native error is returned, the
+/// receipt stays unacknowledged and the caller stays owed, so rerunning the
+/// same request after the payload is restored resumes import and completion.
+fn refuseNativeLivePayload(
+    allocator: std.mem.Allocator,
+    input: NativeReceiptRequest,
+    observer: ?root_fs.PublishObserver,
+    stage: NativeRepositoryStage,
+    original: *NativeRepositoryInputs,
+    cause: anyerror,
+    payload_change: ?*const native_recovery.SettledPayloadChange,
+) anyerror {
+    var retained = readRetainedNativeReceipt(allocator, input) catch |err| return err;
+    defer retained.deinit();
+    const prior = original.state.state;
+    if (retained.receipt.document.outcome != .succeeded or !nativeStageImports(stage, prior.phase)) return cause;
+    const root = input.attempt.coordinator.root;
+    var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
+    const installed = descriptorIdentityInstalled(allocator, filesystem.interface(), original.descriptor) catch |err|
+        return err;
+    var current = nativeCheckpointNext(allocator, prior, false, installed, original.paths.provenance_logical) catch |err|
+        return err;
+    defer current.deinit();
+    var publication = nativeCheckpointPublication(allocator, input, original, observer, stage);
+    publication.persist(allocator, current.state, original.paths) catch |err| return err;
+    const detail: ?[]u8 = if (payload_change) |change| (change.diagnostic(allocator) catch null) else null;
+    defer if (detail) |text| allocator.free(text);
+    return publication.failMessage(allocator, &current, original.paths, .installed_verification_failed, cause, detail orelse @errorName(cause));
 }
 
 const NativeCheckpointPublication = struct {
@@ -7633,6 +7720,29 @@ const NativePreparationCase = enum {
 
 const native_preparation_held_status = "Package: held\nStatus: hold ok installed\nArchitecture: amd64\nVersion: 3.0\n\n";
 
+/// The recorded `LivePayloadChanged` diagnostic of a removed descriptor file
+/// names its path, recorded bytes and installed owner in typed fields.
+fn expectLivePayloadDiagnostic(
+    allocator: std.mem.Allocator,
+    message: []const u8,
+    removed: state_module.FileEvidence,
+    descriptor: state_module.Descriptor,
+) !void {
+    var parsed = try native_recovery.parseSettledPayloadDiagnostic(allocator, message);
+    defer parsed.deinit();
+    const fields = parsed.value;
+    try std.testing.expectEqualStrings(removed.logical_path[1..], fields.path);
+    try std.testing.expectEqual(native_recovery.SettledPayloadChange.Reason.removed, fields.reason);
+    try std.testing.expectEqual(native_recovery.ManagedKind.regular, fields.expected_kind);
+    var expected_sha256: [64]u8 = undefined;
+    formatHex(&expected_sha256, &removed.sha256);
+    try std.testing.expectEqualStrings(&expected_sha256, fields.expected_sha256.?);
+    try std.testing.expectEqual(@as(usize, 1), fields.owners);
+    try std.testing.expectEqualStrings(descriptor.package, fields.package.?);
+    try std.testing.expectEqualStrings(descriptor.version, fields.version.?);
+    try std.testing.expectEqualStrings(descriptor.architecture, fields.architecture.?);
+}
+
 fn stageNativePreparationDatabase(root: root_fs.Root, status: []const u8) !void {
     try root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), status, .{});
     try root.dir.createDirPath(root.io, "var/lib/dpkg/info");
@@ -8895,7 +9005,30 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
         try root.publishFile(state_path, original, .{ .permissions = .fromMode(0o600) });
         const source_path = try root_fs.Path.init(state.state.managed_files[0].logical_path[1..]);
         try root.rename(source_path, saved, .fail_if_exists);
-        try std.testing.expectError(error.ManagedFileMissing, importAndRefreshNative(allocator, input, dependencies));
+        // Settled native verification refuses the removed payload (#317)
+        // before the import stage's own installed-file check. The refusal
+        // still records that stage's durable diagnostic, whose message names
+        // the removed path, its recorded digest and its installed owner, and
+        // reports a post-install failure.
+        var dispatch: NativeDispatchProgress = .{};
+        defer dispatch.deinit();
+        var reporting = dependencies;
+        reporting.result_progress = &dispatch;
+        try std.testing.expectError(error.LivePayloadChanged, importAndRefreshNative(allocator, input, reporting));
+        var reported = try dispatch.failure(allocator, input.recoveryRequest(), error.LivePayloadChanged, null);
+        defer reported.deinit();
+        try std.testing.expectEqual(api.ExitStatus.post_install, reported.exit_status);
+        try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, reported.diagnostics[0].id);
+        try expectLivePayloadDiagnostic(allocator, reported.diagnostics[0].message, state.state.managed_files[0], state.state.descriptor.?);
+        try std.testing.expectEqual(api.PhaseState.failed, reported.imported);
+        try std.testing.expect(reported.installed);
+        // The native receipt stays owed to the held caller: completion and
+        // acknowledgment refuse while the payload differs.
+        try std.testing.expectError(error.LivePayloadChanged, completeNative(allocator, input));
+        try std.testing.expectEqual(caller, attempt.record().digest_sha256);
+        try std.testing.expectEqual(root_operation.ProvenanceState.pending, attempt.record().provenance);
+        var owed = (try native_runtime.readCompletion(allocator, attempt)).?;
+        owed.deinit();
         try root.rename(saved, source_path, .fail_if_exists);
         const failed_bytes = try root.readFileAlloc(allocator, state_path, state_module.maximum_document_bytes);
         defer allocator.free(failed_bytes);
@@ -8904,6 +9037,7 @@ fn testProjectedNativeImport(case: RepositoryExecutionCase, projection: *const l
         try std.testing.expect(failed.state.installed);
         try std.testing.expectEqual(state_module.Phase.installed, failed.state.phase);
         try std.testing.expectEqual(api.DiagnosticId.installed_verification_failed, failed.state.diagnostic_id.?);
+        try expectLivePayloadDiagnostic(allocator, failed.state.diagnostic, state.state.managed_files[0], state.state.descriptor.?);
         var crash: NativeReceiptTestCrash = .{ .point = .after_rename };
         try std.testing.expectError(error.InjectedNativeReceiptPublicationFailure, nativeRepositoryCheckpoint(allocator, input, crash.observer(), .{ .post_install = dependencies }));
         try std.testing.expect(try root.entryIfExists(manifest_path) != null);

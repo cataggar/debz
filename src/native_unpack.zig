@@ -2256,6 +2256,62 @@ pub fn relativeListPath(listed: []const u8) ?[]const u8 {
     return text;
 }
 
+/// Physical paths, with dpkg's side files, of every conffile the program
+/// decided on, as routed by the live diversions and alias links. The database
+/// generation check binds the diversion file before this reads it.
+fn settledConffileFamily(
+    arena: std.mem.Allocator,
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: native_program.Program,
+    route_conffiles: []const []const u8,
+) ![]const []const u8 {
+    const diversion_bytes: ?[]u8 = root.readFileAlloc(
+        arena,
+        try root_fs.Path.init(package_database.database_directory ++ "/" ++ package_database.diversions_path),
+        (package_database.Limits{}).max_database_file_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    const records: []const package_database.DiversionRecord = if (diversion_bytes) |bytes|
+        switch (try package_database.interpretDiversions(arena, allocator, bytes, .{})) {
+            .records => |value| value,
+            .diagnostic => return error.InvalidExternalDatabase,
+        }
+    else
+        &.{};
+    const diversions = try native_diversion.Index.init(arena, records);
+    const aliases = try detectAliases(allocator, root);
+    defer deinitAliasEvidence(allocator, aliases);
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (program.steps) |step| {
+        const decision = switch (step.operation) {
+            .apply_conffile_decision => |value| value,
+            else => continue,
+        };
+        const relative = relativeListPath(decision.path) orelse return error.InvalidProgram;
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const physical = canonicalAliasPath(
+            aliases,
+            diversions.physical(relative, decision.package.name),
+            &buffer,
+        ) orelse return error.InvalidProgram;
+        try appendConffileFamily(arena, &paths, physical);
+    }
+    for (route_conffiles) |route| try appendConffileFamily(arena, &paths, route);
+    return paths.items;
+}
+
+fn appendConffileFamily(
+    arena: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    physical: []const u8,
+) !void {
+    for ([_][]const u8{ "", ".dpkg-old", ".dpkg-dist", ".dpkg-new" }) |suffix|
+        try paths.append(arena, try std.fmt.allocPrint(arena, "{s}{s}", .{ physical, suffix }));
+}
+
 // ---------------------------------------------------------------------------
 // Plan model
 // ---------------------------------------------------------------------------
@@ -28374,6 +28430,81 @@ pub const Runtime = struct {
         if (receipt.outcome != .failed)
             return error.TransactionNotFailed;
         try verifyTerminalDatabase(allocator, root, authorization, receipt);
+    }
+
+    /// Binds the live root to the final stable managed snapshot of a settled
+    /// attempt. Conffiles the program decided on are administrator state after
+    /// settlement and are exempt, under their live diversion and alias route
+    /// and with dpkg's `.dpkg-old`, `.dpkg-dist` and `.dpkg-new` siblings; so
+    /// are update-alternatives selections and administration. Their database
+    /// records stay bound by the final database generation. `route_conffiles`
+    /// names conffile routes lowered from retained route-settlement evidence.
+    /// On `LivePayloadChanged`, `change`, when given, receives the first
+    /// changed path and, from the live database, its single listing package.
+    /// That lookup runs only after a refusal and never changes its outcome.
+    /// The caller holds the root-operation lock.
+    pub fn verifySettledPayload(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        program: native_program.Program,
+        managed: native_recovery.ManagedStateDocument,
+        route_conffiles: []const []const u8,
+        change: ?*?native_recovery.SettledPayloadChange,
+    ) !native_recovery.SettledManagedSummary {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const exempt = try settledConffileFamily(
+            arena_state.allocator(),
+            allocator,
+            root,
+            program,
+            route_conffiles,
+        );
+        return native_recovery.verifySettledManagedStateReporting(allocator, root, managed, .{
+            .paths = exempt,
+            .prefixes = &.{
+                native_alternatives.selector_directory,
+                native_alternatives.database_directory,
+            },
+        }, change) catch |err| {
+            if (err == error.LivePayloadChanged) if (change) |out| if (out.*) |*found| {
+                // A diagnosis that cannot run leaves the owner unknown.
+                describeSettledPayloadOwner(allocator, root, program.target_architecture, found) catch {};
+            };
+            return err;
+        };
+    }
+
+    fn describeSettledPayloadOwner(
+        allocator: std.mem.Allocator,
+        root: root_fs.Root,
+        architecture: []const u8,
+        change: *native_recovery.SettledPayloadChange,
+    ) !void {
+        var captured = try captureDatabaseSnapshot(allocator, root, .{});
+        defer captured.deinit();
+        normalizeCapturedNativeArchitecture(&captured.snapshot, architecture);
+        var database = switch (try package_database.importSnapshot(allocator, .{
+            .native_architecture = architecture,
+            .snapshot = captured.snapshot,
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.InvalidExternalDatabase,
+        };
+        defer database.deinit();
+        const aliases = try detectAliases(allocator, root);
+        defer deinitAliasEvidence(allocator, aliases);
+        var ownership = try indexOwnership(allocator, database.model, aliases);
+        defer ownership.deinit();
+        const owners = ownership.ownersOf(change.path);
+        change.owner_count = owners.len;
+        if (owners.len != 1) return;
+        const record = database.model.packages[owners[0].owner];
+        try change.setOwner(.{
+            .package = record.name,
+            .version = record.version,
+            .architecture = record.architecture,
+        });
     }
 
     fn verifyTerminalDatabase(
