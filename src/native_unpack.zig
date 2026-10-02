@@ -28158,13 +28158,16 @@ pub const Runtime = struct {
             identities,
             origins,
         );
-        var triggers = database.model.triggers.interests.len != 0 or
-            database.model.triggers.pending.len != 0;
-        for (installed) |package| {
-            triggers = triggers or package.triggers.len != 0 or
-                package.triggers_pending.len != 0 or package.triggers_awaited.len != 0;
+        const unincorporated = database.model.triggers.pending.len != 0;
+        // A zero-action plan processes only pending trigger work, exactly as
+        // dpkg's `--configure --pending`; declarations alone need authority
+        // only when actions or archives can activate them.
+        var triggers = native_preparation.pendingTriggerWork(installed, unincorporated);
+        if (request.plan.actions.len != 0 or archives.len != 0) {
+            triggers = triggers or database.model.triggers.interests.len != 0;
+            for (installed) |package| triggers = triggers or package.triggers.len != 0;
+            for (archives) |archive| triggers = triggers or archive.triggers.len != 0;
         }
-        for (archives) |archive| triggers = triggers or archive.triggers.len != 0;
         const authority = try lifecycleTriggerAuthority(
             temporary,
             .{ .enabled = triggers, .mode = if (request.plan.actions.len == 0) .process_pending else .transaction },
@@ -28193,6 +28196,7 @@ pub const Runtime = struct {
             .removal_retry = retry,
             .archives = archives,
             .trigger_authority = authority,
+            .unincorporated_triggers = unincorporated,
         });
         if (result == .unchanged) {
             if (unchanged) |state| state.* = .{
@@ -34342,8 +34346,9 @@ fn assertFixtureHelperBootstrap(
 }
 
 // Zero-action `upgrade-all` over a fixture root: every installed package is
-// locked as retained, exactly as an unchanged exact closure would be, and only
-// `Runtime.verifyUnchanged` decides whether the root is unchanged.
+// locked as retained, exactly as an unchanged exact closure would be, and the
+// production `Runtime.prepare` classification plus `Runtime.verifyUnchanged`
+// decide whether the root is unchanged. Neither call mutates the root.
 test "native_unpack.test.lifecycle external fixture unchanged upgrade-all" {
     const raw_request = std.c.getenv("DEBZ_NATIVE_UNCHANGED_REQUEST") orelse
         return error.SkipZigTest;
@@ -34386,6 +34391,7 @@ test "native_unpack.test.lifecycle external fixture unchanged upgrade-all" {
     const repository_id: [64]u8 = @splat('a');
     const snapshot: [32]u8 = @splat(0x22);
     var packages: std.ArrayList(exact_lock_v3.Package) = .empty;
+    // Retained packages need distinct archive identities in a valid lock.
     for (database.model.packages, 0..) |package, index| {
         var signed_sha256: [32]u8 = @splat(0x31);
         var derived_sha512: [64]u8 = @splat(0x32);
@@ -34447,20 +34453,31 @@ test "native_unpack.test.lifecycle external fixture unchanged upgrade-all" {
         .evidence = .{ .plan_sha256 = transaction_executor.planDigest(empty_plan) },
     });
     defer attempt.release();
-    const outcome: struct { refused: bool, detail: []const u8 } = if (Runtime.verifyUnchanged(testing.allocator, .{
+    const prepare_request: Runtime.PrepareRequest = .{
         .attempt = &attempt,
         .plan = &empty_plan,
         .exact_lock = &lock.lock,
         .archives = &.{},
         .policy = .{ .conffile = .keep_existing },
-    })) |_| .{ .refused = false, .detail = "unchanged" } else |err| .{ .refused = true, .detail = @errorName(err) };
+    };
+    // Production classifies with `Runtime.prepare`: `.unchanged` reports
+    // changed=false, while `.prepared` executes a `process_triggers` program
+    // and reports changed=true. The driver stops before that execution.
+    const Outcome = struct { outcome: []const u8, changed: bool, detail: []const u8 };
+    const outcome: Outcome = if (Runtime.prepare(testing.allocator, prepare_request)) |prepared| blk: {
+        var preparation = prepared;
+        defer preparation.deinit();
+        break :blk switch (preparation) {
+            .unchanged => if (Runtime.verifyUnchanged(testing.allocator, prepare_request)) |_|
+                .{ .outcome = "unchanged", .changed = false, .detail = "unchanged" }
+            else |err|
+                .{ .outcome = "refused", .changed = false, .detail = @errorName(err) },
+            .prepared => .{ .outcome = "execution_required", .changed = true, .detail = "process_triggers" },
+            .diagnostic => |value| .{ .outcome = "refused", .changed = false, .detail = @tagName(value.diagnostic.code) },
+        };
+    } else |err| .{ .outcome = "refused", .changed = false, .detail = @errorName(err) };
     try attempt.abandonIfPreMutation(testing.allocator);
-    // verifyUnchanged is read-only, so neither outcome may change the root.
-    const report = try std.json.Stringify.valueAlloc(testing.allocator, .{
-        .outcome = if (outcome.refused) "refused" else "unchanged",
-        .changed = false,
-        .detail = outcome.detail,
-    }, .{});
+    const report = try std.json.Stringify.valueAlloc(testing.allocator, outcome, .{});
     defer testing.allocator.free(report);
     var file = try std.Io.Dir.createFileAbsolute(testing.io, external.report, .{ .exclusive = true });
     defer file.close(testing.io);

@@ -2314,7 +2314,13 @@ exec audit allowed 98 script `dpkg` queries and forbade none. The zero-action
 the root unchanged. dpkg's own postinst had written `var/lib/dpkg/arch-native`
 (`amd64` and a newline) from `$DPKG_MAINTSCRIPT_ARCH`, and the live-database
 preflight did not classify that member. The preflight now admits it only with
-the target architecture (see [Package database](package-database.md)). No
+the target architecture (see [Package database](package-database.md)). The
+same update would next have compiled an empty `process_triggers` pass, because
+the root's packages declare triggers (for example libc-bin's
+`interest-noawait ldconfig`) even though nothing was pending. It would have
+published a new receipt and provenance with `changed=true`. A zero-action update
+now processes only pending trigger work (see [Native
+triggers](native-triggers.md)). No
 fresh amd64 run has confirmed the update since, so this run is not
 wrapper-completion proof.
 The wrapper's `umask 077` also reached the scripts. `arch-native` was written

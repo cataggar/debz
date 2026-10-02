@@ -26,6 +26,9 @@ pub const Request = struct {
     removal_retry: ?native_program.RemovalRetry = null,
     archives: []const native_program.Archive = &.{},
     trigger_authority: ?native_authorization.TriggerAuthority = null,
+    /// `triggers/Unincorp` holds activations not yet incorporated into
+    /// package states; dpkg processes them on its next pending pass.
+    unincorporated_triggers: bool = false,
     ownership_conflicts: []const native_program.OwnershipConflict = &.{},
     unsupported_features: []const []const u8 = &.{},
     limits: native_program.Limits = .{},
@@ -739,6 +742,82 @@ test "native_preparation.test.trigger work cannot disappear without reviewed aut
         fixture.installed[1].state = state;
         try std.testing.expectError(error.TriggerAuthorityRequired, prepare(std.testing.allocator, fixture.request()));
     }
+    fixture.installed[1].state = .installed;
+    var request = fixture.request();
+    request.unincorporated_triggers = true;
+    try std.testing.expectError(error.TriggerAuthorityRequired, prepare(std.testing.allocator, request));
+    // Actions can activate installed declarations, so those need authority too.
+    for ([_]native_program.TriggerKind{ .interest_noawait, .activate_noawait }) |kind| {
+        fixture.installed[1].triggers = &.{.{ .kind = kind, .name = "refresh" }};
+        try std.testing.expectError(error.TriggerAuthorityRequired, prepare(std.testing.allocator, fixture.request()));
+    }
+}
+
+test "native_preparation.test.zero-action plans need trigger authority only for pending work" {
+    const fixture = try Fixture.init(std.testing.allocator, false);
+    defer fixture.deinit(std.testing.allocator);
+    var empty = try exact_lock_v3.create(std.testing.allocator, .{
+        .target_architecture = "amd64",
+        .request_sha256 = fixture.lock.lock.request_sha256,
+        .policy_sha256 = fixture.lock.lock.policy_sha256,
+        .repositories = &.{},
+        .local_artifacts = &.{},
+        .packages = &.{},
+        .verified_origins = true,
+    });
+    defer empty.deinit();
+    fixture.plan.actions = &.{};
+    fixture.plan.ordered_actions = &.{};
+    fixture.plan.download_bytes = 0;
+    fixture.installed[2].state = .installed;
+    var request = fixture.request();
+    request.exact_lock = &empty.lock;
+    request.archives = &.{};
+    request.policy.exact_lock_verification = .locked_packages;
+    // A configured root that declares interest and activation with nothing
+    // pending: dpkg's `--configure --pending` is a no-op, so no program.
+    fixture.installed[0].triggers = &.{.{ .kind = .interest_noawait, .name = "ldconfig" }};
+    fixture.installed[1].triggers = &.{
+        .{ .kind = .activate_noawait, .name = "ldconfig" },
+        .{ .kind = .interest, .name = "/usr/share/refresh" },
+    };
+    fixture.installed[2].triggers = &.{.{ .kind = .activate_noawait, .name = "unhandled" }};
+    try std.testing.expect(!pendingTriggerWork(request.installed.packages, false));
+    var unchanged = try prepareOrUnchanged(std.testing.allocator, request);
+    defer unchanged.deinit();
+    try std.testing.expect(unchanged == .unchanged);
+    try std.testing.expectError(error.EmptyProgram, prepare(std.testing.allocator, request));
+
+    // Every kind of pending work still requires reviewed authority.
+    request.unincorporated_triggers = true;
+    try std.testing.expect(pendingTriggerWork(request.installed.packages, true));
+    try std.testing.expectError(error.TriggerAuthorityRequired, prepareOrUnchanged(std.testing.allocator, request));
+    request.unincorporated_triggers = false;
+    fixture.installed[0].triggers_pending = &.{"ldconfig"};
+    try std.testing.expectError(error.TriggerAuthorityRequired, prepareOrUnchanged(std.testing.allocator, request));
+    fixture.installed[0].triggers_pending = &.{};
+    fixture.installed[1].triggers_awaited = &.{"old"};
+    try std.testing.expectError(error.TriggerAuthorityRequired, prepareOrUnchanged(std.testing.allocator, request));
+    fixture.installed[1].triggers_awaited = &.{};
+    for ([_]native_program.PackageState{ .triggers_pending, .triggers_awaited }) |state| {
+        fixture.installed[0].state = state;
+        try std.testing.expect(pendingTriggerWork(request.installed.packages, false));
+        try std.testing.expectError(error.TriggerAuthorityRequired, prepareOrUnchanged(std.testing.allocator, request));
+    }
+    fixture.installed[0].state = .installed;
+
+    // An authority with nothing pending would only run an empty pass.
+    request.trigger_authority = .{
+        .mode = .process_pending,
+        .defer_triggers = false,
+        .initial_state_sha256 = @splat(0x61),
+        .handlers = &.{},
+        .callers = &.{},
+        .allowed_triggers = &.{"ldconfig"},
+        .maximum_invocations = 256,
+    };
+    try std.testing.expectError(error.TriggerAuthorityWithoutPendingWork, prepareOrUnchanged(std.testing.allocator, request));
+    try std.testing.expectError(error.TriggerAuthorityWithoutPendingWork, prepare(std.testing.allocator, request));
 }
 
 test "native_preparation.test.outputs own text after caller input is released" {
@@ -798,6 +877,19 @@ pub fn prepare(allocator: std.mem.Allocator, request: Request) !Result {
         .diagnostic => |value| .{ .diagnostic = value },
         .unchanged => unreachable,
     };
+}
+
+/// Trigger work dpkg's `--configure --pending` would process: a package
+/// awaiting or holding pending triggers, or unincorporated activations.
+/// Interest and activation declarations alone are not pending work.
+pub fn pendingTriggerWork(packages: []const native_program.InstalledPackage, unincorporated: bool) bool {
+    if (unincorporated) return true;
+    for (packages) |package| {
+        if (package.state == .triggers_pending or package.state == .triggers_awaited or
+            package.triggers_pending.len != 0 or package.triggers_awaited.len != 0)
+            return true;
+    }
+    return false;
 }
 
 /// Classifies an unchanged, fully verified closure without inventing an
@@ -933,16 +1025,20 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
             .dpkg_selection_hold = if (action_index.contains(key)) false else package.hold,
         });
     }
+    const pending_triggers = pendingTriggerWork(request.installed.packages, request.unincorporated_triggers);
     if (request.trigger_authority == null) {
-        for (request.installed.packages) |package| {
-            if (package.state == .triggers_pending or package.state == .triggers_awaited or
-                package.triggers_pending.len != 0 or package.triggers_awaited.len != 0 or
-                package.triggers.len != 0)
-                return error.TriggerAuthorityRequired;
-        }
+        if (pending_triggers) return error.TriggerAuthorityRequired;
         for (request.archives) |archive| {
             if (archive.triggers.len != 0) return error.TriggerAuthorityRequired;
         }
+        // Installed declarations matter only to actions that can activate them.
+        if (actions.len != 0) for (request.installed.packages) |package| {
+            if (package.triggers.len != 0) return error.TriggerAuthorityRequired;
+        };
+    } else if (actions.len == 0 and !pending_triggers) {
+        // dpkg's pending pass is a no-op here; a program would only rewrite
+        // provenance and report a change.
+        return error.TriggerAuthorityWithoutPendingWork;
     }
     if (allow_unchanged and actions.len == 0 and request.trigger_authority == null) {
         if (request.plan.ordered_actions.len != 0 or request.archives.len != 0 or
