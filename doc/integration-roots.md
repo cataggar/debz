@@ -313,12 +313,314 @@ the separate oracle's dpkg database, stages exact-lock interpreter/tool
 payloads for the chroot, attempts to install the closure with the pinned dpkg,
 and captures its root only on success. The candidate root is never seeded from
 the reference. The pinned dpkg reference probes prerequisite and configuration
-readiness before each package phase, without `--force-depends`; at a stall,
-it lets dpkg configure a dependency cycle together, accepting only deferred
-dependency failures and checking the resulting database state. Maintainer
-scripts see `/proc` mounted only in a private mount namespace, which is gone
-before capture. A fresh amd64 rehearsal configured all 175 packages, processed
-pending triggers, and captured the healthy reference root. The reference-only
+readiness before each package phase, without `--force-depends`. The earlier
+reference runner configured dependency cycles together, processed pending
+triggers and captured a healthy 175-package amd64 root, but used unrestricted
+procfs with the host PID view. That rehearsal does **not** establish parity
+with the native invocation-scoped proc environment and must not be replayed
+as a full privileged comparison.
+
+The bounded reference-only launcher in
+`tools/real-snapshot-reference-launcher.zig` now accepts only single-package
+unpack/configure operations and their dry-run probes. It pins the exact dpkg
+executable, SHA512 archive/size and, for an amd64 configure requiring proc,
+the signed systemd, udev or sudo postinst SHA256/size and package selector.
+It runs pinned dpkg as chrooted PID 1 in private mount and PID namespaces,
+with a file-only read-only archive mount and private mount propagation.
+Only exact systemd configure receives the kernel's actual boot ID in a
+read-only mask of `/proc/sys`; exact udev/sudo configure receive read-only
+PID-only procfs without `/proc/sys`; all other operations receive no procfs.
+The launcher verifies PID 1's root, retains only `CAP_CHOWN`,
+`CAP_DAC_OVERRIDE`, `CAP_FOWNER`, `CAP_FSETID`, `CAP_SETGID`, `CAP_SETUID`
+and `CAP_SETFCAP` for dpkg's filesystem/account work, and drops all other
+supported capabilities from its bounding, effective, permitted and
+inheritable sets (including the second 32-bit capability word). It clears
+and verifies ambient capabilities, sets no-new-privileges, and denies module
+loading and subsequent namespace/chroot changes in seccomp. An unknown
+capability beyond the two-word kernel interface, or failure to drop/verify
+any capability, aborts before dpkg launch. The reference uses the kernel's
+8-byte capability header (`pid` at offset 4): Zig 0.16's
+`linux.cap_user_header_t` instead pads its `usize pid` to offset 8 on
+64-bit hosts, which made even unprivileged capget probes fail unpredictably.
+`zig build test-real-snapshot-reference-launcher` (a `security-audit`
+dependency) runs unprivileged, so the audit needs no passwordless sudo; its
+refusal test drops to UID/GID 65534 when started as root and requires the
+reduction to refuse with `EPERM` before installing any seccomp filter or
+dropping a bounding capability. The capability transition itself is proven
+with the same real-root authority the protected launcher uses by the
+separate `zig build test-real-snapshot-reference-launcher-root`, which runs
+`tools/real-snapshot-reference-launcher-root-test.zig` (and the launcher's
+unprivileged tests) through `sudo -n`. That test fails with
+`CapabilityProbeRequiresRoot`, never skips, without UID 0. The required
+Security and dependency policy CI job runs it as an explicit unconditional
+step, and `security-audit` pins that step and wiring. The
+probe deliberately does not use an unprivileged user namespace: on hosted
+ubuntu-24.04, `kernel.apparmor_restrict_unprivileged_userns=1` lets
+`unshare(CLONE_NEWUSER)` succeed under a capability-denying profile whose
+effective set lacks `CAP_SYS_MODULE` while its bounding set keeps it, so a
+namespace probe there observes the LSM, not the launcher.
+It closes host descriptors on
+exec and reports setup failure separately from dpkg's exit. The driver checks
+root-owned, non-writable ancestry and mode-0700 workspaces before root
+mutation; host-side status and snapshot reads refuse symlink ancestors.
+Inherited stdin must be read-only `/dev/null`; stdout and stderr must be
+root-owned, non-writable-by-others, write-only append regular files, with
+the dry-run transport reopening only its protected scratch output as such a
+writer. The launcher checks all three descriptors before any root access
+and again in the child before exec; every other inherited descriptor is
+close-on-exec. Exact proc-configure profiles recheck the installed package's
+status (`install ok unpacked`), amd64 architecture, pinned version and signed
+postinst bytes within the chroot before mounting proc or launching dpkg.
+These offline checks are not a privileged isolation proof.
+
+`zig build test-real-snapshot-reference-protected` is a separate, mandatory
+(never skipped) ReleaseSafe proof target for a **protected** native runner.
+It requires `-Dreference-protected-{launcher,dpkg,root-template,workspace,archive,archive-sha512,archive-size,architecture}`
+and `-Dreference-protected-escape-{probe,archive,archive-sha512,archive-size}`
+with absolute paths. The checkout containing the proof program, the launcher,
+the pinned dpkg 1.22.22 executable, the independently prepared root template,
+the archive and a **new empty** workspace must have root-owned non-writable
+ancestry. The template and workspace must be mode 0700; the template starts
+with an empty dpkg status, empty `/proc` and an empty regular
+`/.debz-reference-archive`. Obtain the archive hash and byte count from an
+independently authenticated lock, and prepare the template's loader/tools from
+independently verified inputs (runtime binding of the full signed closure is
+still #263). Run the target as UID/GID 0 on the matching native architecture,
+with separately disposable roots per case and a new workspace per run. The
+target executes real pinned-dpkg no-act/unpack with an inherited directory fd,
+then rejects altered archive identity/size, a readable stdout, a symlinked
+root/archive and writable ancestry. It records actual process exits and stderr per
+case, checks an unpacked dpkg database entry, and inspects surviving
+root-associated processes and mountpoints after each operation, recording
+the scan (processes, mountinfo entries, the empty regular archive mountpoint
+and empty `/proc`) in each case's JSON. It fails
+instead of passing or skipping when protected inputs are unavailable.
+
+The escape archive's `preinst` is the static
+`tools/real-snapshot-reference-escape-probe.zig`, run by pinned dpkg
+(namespace PID 1) on its own fresh root with an inherited host directory fd.
+It must report `ok` for every check: its parent is PID 1 and no procfs is
+visible; no descriptor above 2 survives; no-new-privileges and a seccomp
+filter are active; effective, permitted, inheritable, bounding and ambient
+capabilities hold nothing outside the allowlist; `/..` is `/`; chroot,
+pivot_root, open_by_handle_at, mount, umount, open_tree, device mknod,
+init/finit/delete_module, sethostname, settimeofday, `AF_PACKET` raw
+sockets, unshare, setns and each namespace clone fail with `EPERM` (clone3
+with `ENOSYS`). `/.debz-reference-archive` must be a mount root bound
+read-only, nosuid, nodev and noexec (`EROFS` on open for writing) whose size
+equals the authenticated escape archive. It then leaves a setsid double-forked sleeper that must be
+gone, with no process rooted in the proof root, when the launcher returns.
+The same binary is also run unconfined as root (`control`) and must report
+`FAIL` for every check except the descriptor and `/..` checks (the
+archive-mount and descendant checks run only when confined), proving each
+check detects the authority it denies. Every attempted operation targets a
+missing path, an invalid argument or the probe's own process. The shared
+network namespace is only reported (#278).
+
+`tools/real-snapshot-reference-protected-stage.sh` stages these inputs for
+the native architecture. Run it as root from a root-owned checkout (every
+ancestor root-owned and not group/world-writable) whose `.real-snapshot` is
+mode 0700, passing a root-owned Zig, a root-owned debz and a new workspace
+beneath `.real-snapshot`. It uses debz to lock and download the distribution
+dpkg's closure from the pinned authenticated Ubuntu snapshot, verifies each
+SHA512 archive before extracting the loader, libraries, tar and GNU `rm`
+into a script-free merged-usr template with `/dev/null`, `/proc` and a 1777
+`/tmp`, downloads and verifies the SHA256-pinned Debian dpkg 1.22.22 with
+`tools/prepare-native-dpkg.py`, builds the ReleaseSafe launcher and static
+probe, builds both proof archives, and writes `reference-protected.args`
+plus an `evidence/staging-manifest.txt` of input hashes. Pass that file's
+options to the target, for example
+`zig build test-real-snapshot-reference-protected $(cat WORKSPACE/reference-protected.args) -Doptimize=ReleaseSafe`.
+It does not run the proof.
+
+On amd64 the stage script also locks and downloads the exact signed
+`systemd`, `udev` and `sudo` archives through debz (one authenticated
+single-package plan each) and extracts only their `postinst` into
+`WORKSPACE/profiles` (0644, listed in the staging manifest); the directory is
+empty on arm64 and passed as the required
+`-Dreference-protected-profile-scripts`. The target then runs the launcher's
+exact proc-configure profiles with the escape probe installed as the root's
+`/bin/sh`, so dpkg's real `postinst configure ""` exec reaches it. On amd64
+the systemd case must see a read-only `hidepid=2` procfs with `/proc/sys`
+masked and a `/proc/sys/kernel/random/boot_id` equal to the host's, and the
+udev/sudo cases a read-only PID-only procfs without `/proc/sys`. In each
+case the followed `/proc/1/root` must be the script's own root (PID 1 is
+dpkg in the same chroot), and the script must start a detached descendant
+that is gone afterwards and leave its package `install ok installed`.
+Altered postinst bytes refuse with `SourceChanged`;
+an installed version other than the pinned one refuses inside the root
+(`ReferenceSetupFailed`, stage 10) before proc is mounted or dpkg runs; a
+selector naming another package, or a configure without its profile, refuses
+with `InvalidProfile`. Each refusal must leave the bound package unpacked and
+the probe unrun. On arm64 all three profiles must refuse with `InvalidProfile`
+(arm64 signed profiles remain unproved).
+
+This gate does **not** prove runtime library binding (#263), or resolve the
+shared host-network decision (#278). An arm64 run is not amd64 evidence.
+
+### Hosted protected reference job
+
+The `protected-reference` job in `.github/workflows/ci.yml` runs this proof
+on hosted `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) runners
+(#268). It runs only on the weekly schedule or a `workflow_dispatch` with
+`run_protected_reference: true`, never on pushes or pull requests. The runner
+checkout is used only to confirm `GITHUB_SHA` and a clean tree and to write a
+`git bundle`. Everything protected happens under `sudo -n env -i`:
+
+1. a **new** mode-0700 tree `/srv/debz-protected/ci-RUN-ATTEMPT-ARCH`
+   (every ancestor root-owned and not group/world-writable);
+2. a root-owned bare repository fetched from the bundle, checked to resolve
+   to `GITHUB_SHA` and pass `git fsck --full`, then a `--no-hardlinks` clone
+   into `TREE/checkout`;
+3. `tools/real-snapshot-reference-protected-ci.sh`, run from that checkout.
+
+The script downloads the pinned Zig 0.16.0 tarball and refuses it unless
+`tools/verify-minisign.py` accepts its pinned name, size, SHA-256 and the
+prehashed minisign signature (file and trusted-comment signatures) under the
+pinned Zig release key. It extracts it with Python's `data` filter. Zig
+0.16's `zig build --fetch` unpacks dependencies into `checkout/zig-pkg`
+with 24 world-writable (0777) shell scripts; the script records them,
+removes group/other write from `zig-pkg` and the global cache (it never
+runs them), and then requires `real-snapshot-reference-tree-check.py
+packages` to find no non-root, group/world-writable, setuid/setgid/sticky
+or escaping-symlink entry. It records a per-file mode and SHA-256 manifest.
+The tree checker then requires root ownership, a single filesystem and no
+group/world-writable entry (except symlinks, sticky directories and
+`/dev/null`) across the whole tree before the build, after the build,
+after staging and after the proof.
+
+Before the proof, each of these must fail closed on its own new workspace,
+which must stay empty:
+- a launcher copy under a mutable ancestor;
+- the host dpkg in place of the pinned one;
+- a swapped archive SHA512;
+- the wrong architecture;
+- missing profile scripts;
+- a reused workspace;
+- a swapped repository keyring (debz's `WrongSigningKey`, with no lock or
+  plan written).
+
+The proof itself runs the target in ReleaseSafe under a 45-minute timeout
+and requires "executed without skips". No proof mount may remain afterwards.
+
+Evidence is always collected, even on failure: exit codes, stderr, manifests
+and the proof workspace's JSON, each bounded at 16 MiB and 256 MiB in total,
+with `SHA256SUMS` and `result.txt`. It is copied out by `sudo -n tar` and
+uploaded with `if-no-files-found: error`. Cleanup always runs: it kills
+processes whose root or cwd lies under the tree, refuses to delete while a
+mount remains, and removes the tree with `rm -rf --one-file-system`.
+`tools/security-audit.py` and `test/security-policy.zig` pin the gate,
+steps, `sudo -n` use and script tokens, so the job cannot silently skip,
+continue on error or lose its protection.
+
+Not covered: a missing-namespace negative (hosted runners cannot withdraw
+namespace support cleanly). The bundle passes through the runner-owned
+checkout, but the protected side binds it to `GITHUB_SHA` and `git fsck`.
+
+PID 1 now refuses supervisor-pipe EOF (including the death-before-`prctl`
+window), not just unexpected bytes, and requires `getppid()` to be 0 because
+its supervisor lies outside the new PID namespace; its installed seccomp policy also refuses
+every Linux `CLONE_NEW*` namespace flag after setup, including `NEWNET`,
+without changing the inherited network namespace. This is independent of
+the native script host's policy (#257) and does not settle #278.
+The launcher independently bounds probe operations to 45 seconds and mutating
+operations to 110 seconds; an expired deadline kills and reaps namespace PID 1
+before returning a distinct error. The outer Python driver retains its
+60/120-second timeouts and captures operation errors separately. A Zig test
+actually kills and reaps a hung child, but that unprivileged test is not a
+substitute for a protected pinned-dpkg descendant-teardown observation.
+
+This reference-only capability reduction is deliberately **stricter** than
+the existing native script runner, which currently drops `CAP_SYS_ADMIN`
+but not `CAP_SYS_MODULE` or all high-numbered capabilities. If a signed
+script needs a capability outside the reference allowlist, the reference
+must refuse rather than borrow the native authority. Such a refusal is
+not proof of a package-state mismatch or permission to expand the
+reference allowlist: native hardening and any resulting behavior change
+need a separate decision and equivalent protected script proofs. Native's
+existing capability syscall also uses the padded Zig header; its correction
+needs independent review in the native worktree, not a silent change to this
+reference-only delta. The
+shared host network view described below also remains under review.
+
+The native exact systemd mode (`src/maintainer_script.zig`) and reference
+mode both clone **mount and PID**, not network, namespaces; mount a fresh
+`ro,nosuid,nodev,noexec,hidepid=2` procfs; and cover `/proc/sys` with a
+read-only boot-ID-only mask before executing a script. Native udev/sudo and
+the reference use the separate `subset=pid` mode without `/proc/sys`.
+Both chroot their PID 1; the reference verifies `/proc/1/root` against its
+pinned root. This matches the native proc **mount flags and mask**, not a
+proof that the resulting script environment is safe or identical: native
+executes the signed script as PID 1, while reference executes pinned dpkg
+as PID 1 and the script as its child.
+
+Without a separate network namespace, `/proc/net` resolves to
+`/proc/self/net` and reports the task's network namespace (see Linux
+[`proc_pid_net(5)`](https://man7.org/linux/man-pages/man5/proc_pid_net.5.html)
+and [`network_namespaces(7)`](https://man7.org/linux/man-pages/man7/network_namespaces.7.html)).
+Masking `/proc/sys` does not hide that network view, and hiding the top-level
+`/proc/net` alone would leave per-PID `/proc/1/net` to assess. Native and
+reference both inherit the host network namespace under the reviewed modes;
+equivalent exposure is **not** evidence of harmless exposure. A proposed
+reference-only refusal for `/proc/net` was removed because it would make
+the reference proc mode narrower than the already approved native mode;
+neither mode now adds a network namespace or a proc-network mask. These
+shared network surfaces need separate native-and-reference hardening review,
+including per-PID views under udev/sudo's PID-only procfs, not a unilateral
+reference change.
+Neither a private PID namespace nor a read-only proc mount isolates network
+syscalls or proves the retained network capabilities harmless.
+
+A disposable **unprivileged** user+network-namespace probe on this host
+changed the visible `/proc/self/net/dev` interface count from three to one.
+Thus adding `CLONE_NEWNET` to the reference alone cannot be called
+behavior-preserving, even if it avoids host network visibility. Any private
+network view would require an explicit reviewed contract for native and
+reference, equivalent pinned-dpkg/signed-script results, and runner-capability
+proof. Existing host sysfs mounts can also retain an old network view; do
+not substitute a host bind mount or assume hiding `/proc/net` removes every
+network surface. The shared view reflects the approved native profile but
+does not establish full parity or resolve future network hardening. The
+signed-lock bindings of dpkg's in-root dynamic loader and runtime libraries
+remain unverified;
+no privileged reference run is authorized on this delta.
+
+This is **not yet an executable full parity gate**: the closed launcher
+refuses `--configure --pending`, `--triggers-only --pending` and **also**
+single-package trigger actions. A disposable unprivileged dpkg 1.22.22
+two-listener fixture shows `--no-triggers --triggers-only listener-a` runs
+only A and leaves B pending; `--no-triggers --configure seed` runs only
+seed. Without `--no-triggers`, configuring seed also runs an unrelated
+pending listener. Even with `--no-triggers`, configuring a selector that is
+itself triggers-pending executes its `triggered` postinst, so the driver must
+check its exact unpacked status and version before any configure. A selected
+listener's attempted recursive dpkg call failed visibly on the frontend
+lock, but a selected fixture postinst directly executed B's postinst
+*despite* `--no-triggers`; B remained triggers-pending in dpkg's database.
+Thus selector isolation applies only to dpkg's own scheduler, not to commands
+inside an authorized maintainer script. These disposable fixtures do not
+authorize arbitrary signed scripts.
+`tools/test_real_snapshot_reference_triggers.py` requires an explicitly
+selected, SHA256-checked pinned dpkg fixture and never runs as root.
+
+A safe later single-listener operation would have to bind the selected
+listener's **triggered** script bytes to the exact authenticated archive,
+verify the pinned installed script, status/trigger queue and version again
+in the launcher before exec, establish that no other script is invoked, and
+compare per-listener ordering and state with pinned dpkg. The current
+launcher has only `configure`/`probe_configure` and an exact
+`["configure", ""]` proc profile for systemd/udev/sudo, not a `triggered`
+profile for any of them. The Python command builder refuses all trigger
+verbs, including attempts to reuse those configure-only profiles. Until
+these distinct identities and closure ordering are proved, finalization
+refuses rather than silently changing `--pending` behavior. Privileged
+namespace/archive-mount, death/timeout cleanup and
+exact result equivalence still require independently protected small-root
+proof and review before any 175-package comparison. The current CI checkout
+and cleanup are not root-owned protected ancestry; arm64 signed script
+profiles are unproved. Running the manual full-reference step there must
+fail closed until the runner's staging and cleanup contract is redesigned.
+The reference-only
 `dev/null` chroot device is excluded from both bounded captures only when no
 package claims it; no package payload path is excluded.
 Both reference and candidate captures use the installed

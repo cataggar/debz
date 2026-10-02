@@ -2321,6 +2321,371 @@ def workload_ci_failures(jobs: dict[str, str], text: str) -> list[str]:
     return failures
 
 
+REFERENCE_ROOT_PATHS = (
+    ".github/workflows/ci.yml",
+    "build.zig",
+    "tools/real-snapshot-reference-launcher.zig",
+    "tools/real-snapshot-reference-launcher-root-test.zig",
+)
+REFERENCE_ROOT_STEP = (
+    "      - name: Prove root reference capability transition\n"
+    "        run: zig build test-real-snapshot-reference-launcher-root --summary all\n"
+)
+
+
+def reference_launcher_root_wiring_failures(
+    ci: str, build: str, launcher: str, root_test: str,
+) -> list[str]:
+    """The root capability proof runs in CI, outside the sudo-free security audit."""
+    failures: list[str] = []
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
+    ))
+    job = jobs.get("security-audit", "")
+    step = re.search(
+        r"(?ms)^      - name: Prove root reference capability transition\n.*?(?=^      - |^\n|\Z)",
+        job,
+    )
+    if (
+        any(line not in job.splitlines() for line in (
+            "    name: Security and dependency policy",
+            "    runs-on: ubuntu-24.04",
+            "        run: zig build security-audit",
+        ))
+        or re.search(r"(?m)^    (?:if|continue-on-error|strategy):", job)
+        or "continue-on-error:" in job
+        or step is None or step.group(0) != REFERENCE_ROOT_STEP
+        or ci.count("test-real-snapshot-reference-launcher-root") != 1
+    ):
+        failures.append(
+            "ci.yml: the security job must unconditionally prove the root reference capability transition"
+        )
+    for token in (
+        'const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);',
+        'audit_step.dependOn(&run_reference_launcher_tests.step);',
+        'b.path("tools/real-snapshot-reference-launcher-root-test.zig")',
+        'const run_reference_launcher_root_tests = b.addSystemCommand(&.{ "sudo", "-n", "--" });',
+        'run_reference_launcher_root_tests.addArtifactArg(reference_launcher_root_tests);',
+        'b.step("test-real-snapshot-reference-launcher-root", ',
+        '.dependOn(&run_reference_launcher_root_tests.step);',
+    ):
+        if build.count(token) != 1:
+            failures.append(f"build.zig: root reference capability step lost {token}")
+    if re.search(r"audit_step\.dependOn\(&run_reference_launcher_root_tests\.step\)", build):
+        failures.append("build.zig: security-audit must not require passwordless sudo")
+    for token in (
+        "pub fn capabilityTransitionProbe() !void {",
+        "if (linux.geteuid() != 0 or linux.getuid() != 0) linux.exit(14);",
+        "if (linux.W.EXITSTATUS(status) == 14) return error.CapabilityProbeRequiresRoot;",
+        'test "reference capability transition fails closed without root authority" {\n'
+        "    try unprivilegedTransitionProbe();\n}",
+        "if (restrictReferencePrivileges() != .PERM) linux.exit(4);",
+    ):
+        if launcher.count(token) != 1:
+            failures.append(f"reference launcher: root capability refusal lost {token}")
+    if (
+        "SkipZigTest" in launcher
+        or launcher.count("capabilityTransitionProbe(") != 1
+        or re.search(r"\.unshare,\s*linux\.CLONE\.NEWUSER", launcher)
+    ):
+        failures.append(
+            "reference launcher: the capability transition must run only in the root step, never skip or use a user namespace"
+        )
+    expected_root_test = (
+        'const launcher = @import("real-snapshot-reference-launcher.zig");\n\n'
+        'test "reference capability transition clears ambient and high bounding privileges as root" {\n'
+        "    try launcher.capabilityTransitionProbe();\n}\n"
+    )
+    code = "\n".join(
+        line for line in root_test.splitlines() if not line.startswith("//!")
+    ).strip() + "\n"
+    if code != expected_root_test:
+        failures.append("reference launcher root test: must run the capability transition without conditions or skips")
+    return failures
+
+
+PROTECTED_REFERENCE_PATHS = (
+    ".github/workflows/ci.yml",
+    "build.zig",
+    "tools/real-snapshot-reference-protected-ci.sh",
+    "tools/real-snapshot-reference-protected-stage.sh",
+    "tools/test_real_snapshot_reference_protected.py",
+    "tools/real-snapshot-reference-escape-probe.zig",
+    "tools/verify-minisign.py",
+    "tools/real-snapshot-reference-tree-check.py",
+)
+PROTECTED_REFERENCE_INPUT = (
+    '      run_protected_reference:\n'
+    '        description: "Stage root-owned inputs and run the protected pinned-dpkg reference proof on amd64 and arm64"\n'
+    '        required: true\n'
+    '        type: boolean\n'
+    '        default: false\n'
+)
+
+PROTECTED_REFERENCE_HEADER = (
+    '  protected-reference:\n'
+    "    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_protected_reference)\n"
+    '    name: Protected pinned-dpkg reference (${{ matrix.architecture }})\n'
+    '    runs-on: ${{ matrix.runner }}\n'
+    '    # Root-run staging: Zig download and package fetch 5, debz build 15,\n'
+    '    # snapshot staging 15, preflight refusals 5 and the proof 45 (its own\n'
+    '    # timeout), leaving 5 for evidence, upload and cleanup.\n'
+    '    timeout-minutes: 90\n'
+    '    strategy:\n'
+    '      fail-fast: false\n'
+    '      matrix:\n'
+    '        include:\n'
+    '          - architecture: amd64\n'
+    '            runner: ubuntu-24.04\n'
+    '          - architecture: arm64\n'
+    '            runner: ubuntu-24.04-arm\n'
+    '    env:\n'
+    '      ARCHITECTURE: ${{ matrix.architecture }}\n'
+    '      PROTECTED_TREE: /srv/debz-protected/ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}\n'
+    '    steps:\n'
+    '      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n'
+    '        with:\n'
+    '          persist-credentials: false\n'
+)
+
+PROTECTED_REFERENCE_BOOTSTRAP = (
+    '      - name: Stage the reviewed commit in a root-owned tree and run the protected proof\n'
+    '        timeout-minutes: 80\n'
+    '        run: |\n'
+    '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n'
+    '          test -z "$(git status --porcelain)"\n'
+    '          bundle="$RUNNER_TEMP/debz-protected-$ARCHITECTURE.bundle"\n'
+    '          git bundle create "$bundle" HEAD\n'
+    '          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n'
+    '            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \\\n'
+    "            bash -euo pipefail -c '\n"
+    '            tree=$1 architecture=$2 expected=$3 bundle=$4\n'
+    '            [[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]\n'
+    '            [[ ${BASH_REMATCH[1]} == "$architecture" && $expected =~ ^[0-9a-f]{40}$ ]]\n'
+    '            umask 022\n'
+    '            install -d -o root -g root -m 0755 /srv/debz-protected\n'
+    '            for ancestor in / /srv /srv/debz-protected; do\n'
+    '              [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]\n'
+    '              (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))\n'
+    '            done\n'
+    '            mkdir -m 0700 -- "$tree"\n'
+    '            install -o root -g root -m 0600 -- "$bundle" "$tree/debz.bundle"\n'
+    '            git init --quiet --bare "$tree/bare.git"\n'
+    '            printf "%s\\n" "$expected" >"$tree/bare.git/shallow"\n'
+    '            git --git-dir="$tree/bare.git" bundle verify "$tree/debz.bundle"\n'
+    '            git --git-dir="$tree/bare.git" fetch --quiet "$tree/debz.bundle" HEAD:refs/heads/protected\n'
+    '            test "$(git --git-dir="$tree/bare.git" rev-parse refs/heads/protected)" = "$expected"\n'
+    '            git --git-dir="$tree/bare.git" symbolic-ref HEAD refs/heads/protected\n'
+    '            git --git-dir="$tree/bare.git" fsck --full --no-dangling\n'
+    '            git clone --quiet --no-hardlinks "file://$tree/bare.git" "$tree/checkout"\n'
+    '            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"\n'
+    '            exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" "$tree" "$architecture" "$expected"\n'
+    '            \' protected-bootstrap "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$bundle"\n'
+)
+
+PROTECTED_REFERENCE_COPY = (
+    '      - name: Copy bounded protected evidence\n'
+    '        if: always()\n'
+    '        run: |\n'
+    '          output="$RUNNER_TEMP/protected-reference-$ARCHITECTURE"\n'
+    '          mkdir -p "$output"\n'
+    '          sudo -n test -d "$PROTECTED_TREE/upload"\n'
+    '          sudo -n tar -C "$PROTECTED_TREE/upload" -cf - . >"$RUNNER_TEMP/protected-evidence.tar"\n'
+    '          tar --no-same-owner --no-same-permissions -C "$output" -xf "$RUNNER_TEMP/protected-evidence.tar"\n'
+    '          test -s "$output/result.txt"\n'
+    '          cat "$output/result.txt"\n'
+)
+
+PROTECTED_REFERENCE_UPLOAD = (
+    '      - name: Upload protected reference evidence\n'
+    '        if: always()\n'
+    '        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2\n'
+    '        with:\n'
+    '          name: protected-reference-${{ matrix.architecture }}\n'
+    '          path: ${{ runner.temp }}/protected-reference-${{ matrix.architecture }}/\n'
+    '          if-no-files-found: error\n'
+    '          retention-days: 14\n'
+)
+
+PROTECTED_REFERENCE_CLEANUP = (
+    '      - name: Kill protected descendants and remove the named tree\n'
+    '        if: always()\n'
+    '        run: |\n'
+    "          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C bash -euo pipefail -c '\n"
+    '            tree=$1\n'
+    '            [[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]\n'
+    '            [[ -e $tree || -L $tree ]] || exit 0\n'
+    '            [[ -d $tree && ! -L $tree ]]\n'
+    '            for attempt in 1 2 3 4 5; do\n'
+    '              victims=()\n'
+    '              for process in /proc/[0-9]*; do\n'
+    '                root=$(readlink "$process/root" 2>/dev/null) || continue\n'
+    '                cwd=$(readlink "$process/cwd" 2>/dev/null) || cwd=\n'
+    '                case "$root/ $cwd/" in\n'
+    '                  *"$tree/"*) victims+=("${process#/proc/}") ;;\n'
+    '                esac\n'
+    '              done\n'
+    '              (( ${#victims[@]} )) || break\n'
+    '              echo "killing protected descendants: ${victims[*]}"\n'
+    '              kill -KILL "${victims[@]}" 2>/dev/null || true\n'
+    '              sleep 1\n'
+    '            done\n'
+    '            (( ${#victims[@]} == 0 ))\n'
+    '            if grep -F " $tree" /proc/self/mountinfo; then\n'
+    '              echo "mounts remain beneath $tree" >&2\n'
+    '              exit 1\n'
+    '            fi\n'
+    '            rm -rf --one-file-system -- "$tree"\n'
+    '            test ! -e "$tree"\n'
+    '            \' protected-cleanup "$PROTECTED_TREE"\n'
+)
+
+
+PROTECTED_REFERENCE_SCRIPT_TOKENS = (
+    "set -euo pipefail",
+    "readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
+    "readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2026.08.18_all.deb",
+    "readonly archive_keyring_deb_sha512=22078b3cf6a876d87cb7e3bffa97999fc87023b890788006fc78c952e2861b655d941be7563c307caa3fcce3b78f75b5f62b8cdd993f0dd646c7775955860fd4",
+    "readonly archive_keyring_deb_size=12718",
+    "readonly archive_keyring_member=./usr/share/keyrings/ubuntu-archive-keyring.gpg",
+    "readonly archive_keyring_sha256=655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835",
+    "readonly archive_keyring_size=2334",
+    "    zig_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00\n    zig_size=55478392\n",
+    "    zig_sha256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17\n    zig_size=51211944\n",
+    '[[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&',
+    '[[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-reference-protected-ci.sh" ]] || {',
+    'test "$(git -C "$checkout" rev-parse HEAD)" = "$commit"',
+    "trap collect EXIT",
+    'step zig-verify 0 "" python3 -I tools/verify-minisign.py --public-key "$zig_public_key" \\',
+    '    archive.extractall(sys.argv[2], filter="data")',
+    "[[ ! -e zig-pkg && ! -L zig-pkg ]]",
+    'chmod -R go-w zig-pkg "$tree/zig-global"',
+    'step zig-pkg-verify 0 "" python3 -I tools/real-snapshot-reference-tree-check.py packages \\',
+    "stage_verified_archive_keyring()",
+    "printf 'path\\trole\\tuid:gid:mode:size\\talgorithm\\tdigest\\n'",
+    "urllib.request.urlopen(request, timeout=300)",
+    "fd = os.open(deb_path, flags)",
+    "verify_fd = os.open(target, flags)",
+    "actual_deb_sha512 != expected_deb_sha512",
+    'parse_ar_member(deb_bytes, "data.tar.zst")',
+    "library.ZSTD_decompress(output, output_limit, source, len(payload))",
+    "keyring = extract_tar_member(data_tar, member)",
+    "actual_keyring_sha256 != expected_keyring_sha256",
+    'require_root_owned_file("staged-keyring", target, target_stat, 0o644)',
+    "os.unlink(target)",
+    'staged_archive_keyring=\nstage_verified_archive_keyring\nreadonly staged_archive_keyring',
+    '"DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
+    'step tree-final 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"',
+    "mutable=$negatives/mutable-ancestor\n[[ ! -e \"$mutable\" && ! -L \"$mutable\" ]]\ninstall -d -o root -g root -m 0777 \"$mutable\"",
+    'negative mutable-ancestor "writable or non-root ancestor" \\',
+    'negative swapped-dpkg "reference dpkg executable is not the pinned architecture artifact" \\',
+    'negative swapped-archive "authenticated archive SHA512 differs" \\',
+    'negative wrong-architecture "reference dpkg executable is not the pinned architecture artifact" \\',
+    'negative unbound-profile-scripts "profile scripts" \\',
+    'step negative-reused-workspace refused "must be new and empty"',
+    """step negative-swapped-keyring refused '"summary":"WrongSigningKey"' swapped_keyring_stage""",
+    '    echo "negative-$name launched before refusing" >&2',
+    'step proof 0 "executed without skips" timeout --signal=TERM --kill-after=60s 45m \\',
+    '"${zenv[@]}" "$zig" build test-real-snapshot-reference-protected "${proof_arguments[@]}" \\',
+    "[[ ${#proof_arguments[@]} == 13 ]]",
+)
+PROTECTED_REFERENCE_SOURCE_TOKENS = {
+    "build.zig": (
+        '        "--profile-scripts",\n'
+        '        b.option([]const u8, "reference-protected-profile-scripts", ',
+        'b.step("test-real-snapshot-reference-protected", ',
+    ),
+    "tools/real-snapshot-reference-protected-stage.sh": (
+        "  for profile in systemd udev sudo; do\n",
+        """  printf -- '-Dreference-protected-profile-scripts=%s\\n' "$profiles"\n""",
+        "staging path is not root-owned and protected: $current (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)",
+        "staging file is not root-owned and protected: $1 (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)",
+    ),
+    "tools/test_real_snapshot_reference_protected.py": (
+        'parser.add_argument("--profile-scripts", type=Path, required=True)',
+        "scripts = profile_scripts(args.profile_scripts, args.architecture)",
+        "profiles = prove_profiles(args, scripts)",
+        '"systemd": ("proc-read-only", "proc-sys-masked", "proc-boot-id"),',
+        '"udev": ("proc-pid-only",),',
+        '"sudo": ("proc-pid-only",),',
+        'probe_detail(output, "proc-boot-id").get("boot_id") != host_boot_id',
+        'require(status, error, "InvalidProfile", name)',
+    ),
+    "tools/real-snapshot-reference-escape-probe.zig": (
+        'const pid_one_root = statIdentity("/proc/1/root", 0);',
+        'report("proc-root", same_root, ',
+        'report("proc-boot-id", ',
+        'report("proc-pid-only", ',
+        'report("proc-sys-masked", ',
+        '"subset=pid"',
+    ),
+    "tools/verify-minisign.py": (
+        'raise VerificationError("only prehashed (ED) minisign signatures are accepted")',
+        "ed25519_verify(key, prehash.digest(), blob[10:])",
+        "ed25519_verify(key, blob[10:] + trusted, global_signature)",
+        'fields[1] != b"file:" + name.encode()',
+    ),
+    "tools/real-snapshot-reference-tree-check.py": (
+        "not stat.S_ISLNK(meta.st_mode) and meta.st_mode & (WRITABLE | SPECIAL)",
+        'failures.append(f"group/other-writable entry: {describe(path, meta)}")',
+        'failures.append(f"protected tree must be mode 0700: {describe(current, meta)}")',
+    ),
+}
+
+
+def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
+    """The protected reference job stages only reviewed, root-owned inputs and cannot skip."""
+    failures: list[str] = []
+    ci = texts.get(".github/workflows/ci.yml", "")
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
+    ))
+    job = jobs.get("protected-reference")
+    on = ci.partition("\nconcurrency:\n")[0]
+    if (
+        ci.count(PROTECTED_REFERENCE_INPUT) != 1 or ci.count("run_protected_reference") != 2
+        or '  schedule:\n    - cron: "23 3 * * 1"\n' not in on
+        or not re.search(r"(?m)^  workflow_dispatch:$", on)
+    ):
+        failures.append(
+            "ci.yml: the protected reference job must run only on the weekly schedule or an explicit dispatch input"
+        )
+    if job is None:
+        failures.append("ci.yml: the protected reference job is missing")
+        job = ""
+    steps = re.split(r"(?m)^(?=      - )", job.partition("    steps:\n")[2])
+    expected_steps = (
+        "      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2\n"
+        "        with:\n          persist-credentials: false\n",
+        PROTECTED_REFERENCE_BOOTSTRAP,
+        PROTECTED_REFERENCE_COPY,
+        PROTECTED_REFERENCE_UPLOAD,
+        PROTECTED_REFERENCE_CLEANUP,
+    )
+    if ci.count("\n" + PROTECTED_REFERENCE_HEADER) != 1 or [step for step in steps if step] != list(expected_steps):
+        failures.append(
+            "ci.yml: the protected reference job must keep its exact root bootstrap, evidence copy, upload and cleanup"
+        )
+    if "continue-on-error" in job or "cataggar/ghr" in job or re.search(r"\bsudo (?!-n )", job):
+        failures.append("ci.yml: the protected reference job must not hide failures or use unprotected tools")
+    script = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
+    for token in PROTECTED_REFERENCE_SCRIPT_TOKENS:
+        if script.count(token) != 1:
+            failures.append(f"protected reference CI script lost {token.strip()}")
+    if re.search(r"(?m)^\s*exit 0\b|\|\|\s*true\b|SkipTest|--skip", script) or script.count(
+        'python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"'
+    ) != 4:
+        failures.append("protected reference CI script must not skip and must check the tree at every stage")
+    for path, tokens in PROTECTED_REFERENCE_SOURCE_TOKENS.items():
+        for token in tokens:
+            if texts.get(path, "").count(token) != 1:
+                failures.append(f"{path}: protected reference wiring lost {token.strip()}")
+    harness = texts.get("tools/test_real_snapshot_reference_protected.py", "")
+    if "SkipTest" in harness or "skipTest" in harness:
+        failures.append("protected reference proof must not skip")
+    return failures
+
+
 def native_recovery_ci_failures(text: str) -> list[str]:
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
@@ -3475,6 +3840,16 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in native_recovery_ci_failures(text):
                 fail(failure)
+            for failure in reference_launcher_root_wiring_failures(*(
+                (ROOT / path).read_text() if (ROOT / path).is_file() else ""
+                for path in REFERENCE_ROOT_PATHS
+            )):
+                fail(failure)
+            for failure in protected_reference_ci_failures({
+                path: (ROOT / path).read_text()
+                for path in PROTECTED_REFERENCE_PATHS if (ROOT / path).is_file()
+            }):
+                fail(failure)
         expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
@@ -4447,6 +4822,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
         "native-lifecycle", "native-fixtures", "native-gate", "native-provenance",
+        "reference-root", "protected-reference",
     }:
         sources = {
             "native-core": ("build.zig", "test/native_recovery_helper.zig", "test/native_lifecycle_support.zig"),
@@ -4461,6 +4837,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
                 "build.zig", "src/sha512_transaction_e2e_test.zig",
                 "src/native_provenance_binding_test.zig",
             ),
+            "reference-root": REFERENCE_ROOT_PATHS,
+            "protected-reference": PROTECTED_REFERENCE_PATHS,
             "native-gate": (
                 "build.zig", "test/native_recovery_helper.zig",
                 "test/native_recovery_family.zig", "test/native_recovery_projected_workflows.zig",
@@ -4513,6 +4891,10 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             failures = native_recovery_gate_wiring_failures(*(texts[path] for path in paths))
         elif kind == "native-provenance":
             failures = native_provenance_binding_wiring_failures(*(texts[path] for path in paths))
+        elif kind == "reference-root":
+            failures = reference_launcher_root_wiring_failures(*(texts.get(path, "") for path in paths))
+        elif kind == "protected-reference":
+            failures = protected_reference_ci_failures(texts)
         else:
             failures = native_lifecycle_fixture_failures(texts)
     elif kind == "release-install-metadata":

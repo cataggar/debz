@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Offline checks for the protected reference CI staging tools (#268)."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+TOOLS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TOOLS))
+
+
+def load(name: str, path: str):
+    spec = importlib.util.spec_from_file_location(name, TOOLS / path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+MINISIGN = load("debz_verify_minisign", "verify-minisign.py")
+TREE = load("debz_reference_tree_check", "real-snapshot-reference-tree-check.py")
+HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protected.py")
+
+ZIG_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
+# The published signature of the pinned x86_64 Zig 0.16.0 archive.
+ZIG_X86_64_MINISIG = (
+    "untrusted comment: signature from minisign secret key\n"
+    "RUSGOq2NVecA2YgO2yM1ni51DC/wp3MuUk5nX9mRT+i07G0aLo26+XusTZAn5zOewoAiWLoo/N73C9+jlA3Y9LFDZz7AnxOfFQc=\n"
+    "trusted comment: timestamp:1776173777\tfile:zig-x86_64-linux-0.16.0.tar.xz\thashed\n"
+    "E8nJ7jSGa4zwOaGg1cn+gbKJK73F0aRyCCObkifI1f7ZF61MAVnb8HdsEZsJQTSUbierXPeDdj/q5gYcQbpsCQ==\n"
+)
+
+
+class Signer:
+    """A throwaway Ed25519 minisign signer built with the OpenSSL CLI."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.key = directory / "secret.pem"
+        subprocess.run([MINISIGN.OPENSSL, "genpkey", "-algorithm", "ED25519", "-out", str(self.key)],
+                       check=True, capture_output=True)
+        der = subprocess.run([MINISIGN.OPENSSL, "pkey", "-in", str(self.key), "-pubout", "-outform", "DER"],
+                             check=True, capture_output=True).stdout
+        self.key_id = bytes(range(1, 9))
+        self.public = base64.b64encode(b"Ed" + self.key_id + der[-32:]).decode()
+
+    def sign(self, message: bytes) -> bytes:
+        path = self.directory / "message"
+        path.write_bytes(message)
+        return subprocess.run(
+            [MINISIGN.OPENSSL, "pkeyutl", "-sign", "-inkey", str(self.key), "-rawin", "-in", str(path)],
+            check=True, capture_output=True,
+        ).stdout
+
+    def minisig(self, payload: bytes, name: str, *, algorithm: bytes = b"ED",
+                key_id: bytes | None = None, comment: str | None = None) -> str:
+        signed = (hashlib.blake2b(payload, digest_size=64).digest() if algorithm == b"ED" else payload)
+        blob = algorithm + (key_id or self.key_id) + self.sign(signed)
+        trusted = (comment or f"timestamp:1\tfile:{name}\thashed").encode()
+        return (
+            "untrusted comment: test\n" + base64.b64encode(blob).decode() + "\n"
+            + "trusted comment: " + trusted.decode() + "\n"
+            + base64.b64encode(self.sign(blob[10:] + trusted)).decode() + "\n"
+        )
+
+
+class MinisignTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-minisign-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.signer = Signer(self.root)
+        self.name = "zig-test-linux-0.16.0.tar.xz"
+        self.payload = b"pinned toolchain bytes\n" * 64
+        self.artifact = self.root / self.name
+        self.artifact.write_bytes(self.payload)
+        self.signature = self.root / f"{self.name}.minisig"
+
+    def verify(self, minisig: str, **overrides) -> str:
+        self.signature.write_text(minisig)
+        arguments = {
+            "public_key": self.signer.public, "artifact": self.artifact,
+            "signature": self.signature, "name": self.name,
+            "sha256": hashlib.sha256(self.payload).hexdigest(), "size": len(self.payload),
+        }
+        arguments.update(overrides)
+        return MINISIGN.verify(**arguments)
+
+    def other_key(self) -> str:
+        other = self.root / "other"
+        other.mkdir()
+        return Signer(other).public
+
+    def test_published_zig_trusted_comment_signature_verifies_with_the_pinned_key(self) -> None:
+        lines = ZIG_X86_64_MINISIG.encode().split(b"\n")
+        raw_key = base64.b64decode(ZIG_KEY)
+        blob = base64.b64decode(lines[1])
+        self.assertEqual((blob[:2], blob[2:10]), (b"ED", raw_key[2:10]))
+        trusted = lines[2][len(b"trusted comment: "):]
+        MINISIGN.ed25519_verify(raw_key[10:], blob[10:] + trusted, base64.b64decode(lines[3]))
+        with self.assertRaises(MINISIGN.VerificationError):
+            MINISIGN.ed25519_verify(raw_key[10:], blob[10:] + trusted + b"x", base64.b64decode(lines[3]))
+
+    def test_prehashed_signature_binds_bytes_name_size_and_digest(self) -> None:
+        self.assertIn("verified zig-test-linux", self.verify(self.signer.minisig(self.payload, self.name)))
+        good = self.signer.minisig(self.payload, self.name)
+        for overrides, message in (
+            ({"sha256": "0" * 64}, "SHA256"),
+            ({"sha256": hashlib.sha256(self.payload).hexdigest().upper()}, "SHA256"),
+            ({"sha256": ""}, "SHA256"),
+            ({"size": len(self.payload) - 1}, "size or SHA256"),
+            ({"name": "zig-other-linux-0.16.0.tar.xz"}, "trusted comment"),
+            ({"public_key": self.other_key()}, "Ed25519"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(MINISIGN.VerificationError, message):
+                self.verify(good, **overrides)
+
+    def test_tampered_or_legacy_signatures_refuse(self) -> None:
+        good = self.signer.minisig(self.payload, self.name)
+        self.artifact.write_bytes(self.payload[:-1] + b"?")
+        with self.assertRaisesRegex(MINISIGN.VerificationError, "SHA256"):
+            self.verify(good)
+        with self.assertRaisesRegex(MINISIGN.VerificationError, "Ed25519"):
+            self.verify(good, sha256=hashlib.sha256(self.artifact.read_bytes()).hexdigest())
+        self.artifact.write_bytes(self.payload)
+        lines = good.split("\n")
+        lines[2] = lines[2].replace("timestamp:1", "timestamp:2")
+        with self.assertRaisesRegex(MINISIGN.VerificationError, "Ed25519"):
+            self.verify("\n".join(lines))
+        with self.assertRaisesRegex(MINISIGN.VerificationError, "prehashed"):
+            self.verify(self.signer.minisig(self.payload, self.name, algorithm=b"Ed"))
+        with self.assertRaisesRegex(MINISIGN.VerificationError, "key id"):
+            self.verify(self.signer.minisig(self.payload, self.name, key_id=b"\0" * 8))
+        with self.assertRaisesRegex(MINISIGN.VerificationError, "trusted comment"):
+            self.verify(self.signer.minisig(self.payload, self.name, comment=f"file:{self.name}"))
+        self.artifact.unlink()
+        self.artifact.symlink_to(self.root / "secret.pem")
+        with self.assertRaises(OSError):
+            self.verify(good)
+
+
+class TreeCheckTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-tree-check-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def test_unprotected_ancestry_and_tree_refuse(self) -> None:
+        self.root.chmod(0o755)
+        failures = TREE.ancestry(str(self.root))
+        self.assertTrue(any(failure.startswith("protected tree must be mode 0700: drwxr-xr-x")
+                            for failure in failures), failures)
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        self.assertTrue(any(failure.startswith("unprotected ancestor: ")
+                            and failure.endswith(f" {temp_root}")
+                            for failure in failures), failures)
+        self.assertEqual(TREE.ancestry("relative"), ["tree path is not canonical and absolute: relative"])
+        (self.root / "writable").write_text("x")
+        (self.root / "writable").chmod(0o666)
+        with mock.patch.object(TREE.os, "lstat", side_effect=root_owned_lstat):
+            failures = TREE.tree_failures(str(self.root))
+        self.assertEqual(len(failures), 1)
+        self.assertIn("group/other-writable entry", failures[0])
+
+    def test_package_sources_must_be_tightened_and_stay_inside(self) -> None:
+        packages = self.root / "zig-pkg"
+        (packages / "pkg").mkdir(parents=True)
+        script = packages / "pkg/autogen.sh"
+        script.write_text("#!/bin/sh\nexit 1\n")
+        script.chmod(0o777)
+        (packages / "pkg/inside").symlink_to("autogen.sh")
+        with mock.patch.object(TREE.os, "lstat", side_effect=root_owned_lstat):
+            failures = TREE.package_failures(str(packages), str(self.root / "loose.txt"))
+            self.assertEqual([failure.split(":")[0] for failure in failures], ["untightened package entry"])
+            script.chmod(0o755)
+            self.assertEqual(TREE.package_failures(str(packages), str(self.root / "tight.txt")), [])
+            manifest = (self.root / "tight.txt").read_text()
+            self.assertIn("0755 " + hashlib.sha256(script.read_bytes()).hexdigest() + " pkg/autogen.sh", manifest)
+            self.assertIn("link autogen.sh pkg/inside", manifest)
+            (packages / "pkg/escape").symlink_to("../../outside")
+            failures = TREE.package_failures(str(packages), str(self.root / "escape.txt"))
+            self.assertEqual(len(failures), 1)
+            self.assertIn("escapes its tree", failures[0])
+            with self.assertRaises(FileExistsError):
+                TREE.package_failures(str(packages), str(self.root / "tight.txt"))
+
+
+REAL_LSTAT = os.lstat
+
+
+def root_owned_lstat(path: str) -> os.stat_result:
+    values = list(REAL_LSTAT(path))
+    values[4:6] = [0, 0]
+    return os.stat_result(values)
+
+
+class ProfileStagingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-profile-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        patch = mock.patch.object(HARNESS, "protected",
+                                  side_effect=lambda path, directory=False: path.stat())
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_arm64_stages_no_amd64_profile_scripts(self) -> None:
+        self.assertEqual(HARNESS.profile_scripts(self.root, "arm64"), {})
+        (self.root / "systemd.postinst").write_text("#!/bin/sh\n")
+        with self.assertRaisesRegex(ValueError, "must not stage amd64 profile scripts"):
+            HARNESS.profile_scripts(self.root, "arm64")
+
+    def test_amd64_requires_exactly_the_bound_postinsts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "profile scripts must be exactly"):
+            HARNESS.profile_scripts(self.root, "amd64")
+        for profile in ("systemd", "udev", "sudo"):
+            (self.root / f"{profile}.postinst").write_text(f"#!/bin/sh\n# {profile}\n")
+        self.assertEqual(sorted(HARNESS.profile_scripts(self.root, "amd64")), ["sudo", "systemd", "udev"])
+        (self.root / "extra.postinst").write_text("#!/bin/sh\n")
+        with self.assertRaisesRegex(ValueError, "profile scripts must be exactly"):
+            HARNESS.profile_scripts(self.root, "amd64")
+        (self.root / "extra.postinst").unlink()
+        (self.root / "udev.postinst").write_bytes(b"#" * (HARNESS.PROFILE_SCRIPT_LIMIT + 1))
+        with self.assertRaisesRegex(ValueError, "exceeds limit"):
+            HARNESS.profile_scripts(self.root, "amd64")
+
+    def test_profile_checks_are_reported_by_the_probe(self) -> None:
+        probe = (TOOLS / "real-snapshot-reference-escape-probe.zig").read_text()
+        views = {check for checks in HARNESS.PROFILE_VIEW_CHECKS.values() for check in checks}
+        for check in (*HARNESS.PROFILE_ESCAPE_CHECKS, *HARNESS.PROFILE_COMMON_CHECKS, *views):
+            self.assertIn(f'"{check}"', probe)
+        self.assertNotIn("no-proc-view", HARNESS.PROFILE_ESCAPE_CHECKS)
+        self.assertEqual(set(HARNESS.PROFILE_VIEW_CHECKS), set(HARNESS.ORDER.PROFILE_VERSIONS))
+
+
+class ProtectedCiScriptTests(unittest.TestCase):
+    def test_refuses_outside_its_root_owned_tree(self) -> None:
+        script = TOOLS / "real-snapshot-reference-protected-ci.sh"
+        for arguments in ((), ("/srv/debz-protected/ci-1-1-amd64", "arm64", "0" * 40),
+                          ("/tmp/elsewhere", "amd64", "0" * 40)):
+            result = subprocess.run(["bash", str(script), *arguments], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("protected reference CI: commit=", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

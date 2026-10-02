@@ -420,6 +420,8 @@ pub fn build(b: *std.Build) void {
             "python3",
             "-m",
             "unittest",
+            "tools/test_real_snapshot_reference_launcher.py",
+            "tools/test_real_snapshot_reference_protected_ci.py",
             "tools/test_vendor_state_capture.py",
             "tools/test_dpkg_config_reference.py",
             "tools/test_dpkg_alternatives_reference.py",
@@ -429,6 +431,76 @@ pub fn build(b: *std.Build) void {
         },
     );
     audit_step.dependOn(&audit_tests.step);
+    const reference_launcher_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-launcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_launcher_module.link_libc = true;
+    const reference_launcher_tests = b.addTest(.{ .root_module = reference_launcher_module });
+    const run_reference_launcher_tests = b.addRunArtifact(reference_launcher_tests);
+    b.step("test-real-snapshot-reference-launcher", "Check bounded reference operation, syscall filters and unprivileged capability refusal")
+        .dependOn(&run_reference_launcher_tests.step);
+    audit_step.dependOn(&run_reference_launcher_tests.step);
+    // The capability transition must be proven with the real root authority the
+    // protected launcher uses. It stays outside security-audit, which must run
+    // without passwordless sudo; CI runs this step explicitly.
+    const reference_launcher_root_module = b.createModule(.{
+        .root_source_file = b.path("tools/real-snapshot-reference-launcher-root-test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reference_launcher_root_module.link_libc = true;
+    const reference_launcher_root_tests = b.addTest(.{ .root_module = reference_launcher_root_module });
+    const run_reference_launcher_root_tests = b.addSystemCommand(&.{ "sudo", "-n", "--" });
+    run_reference_launcher_root_tests.addArtifactArg(reference_launcher_root_tests);
+    b.step("test-real-snapshot-reference-launcher-root", "Prove the reference capability transition as root through sudo -n")
+        .dependOn(&run_reference_launcher_root_tests.step);
+    // The protected proof stages this static probe itself; compiling it here
+    // keeps it building on every audited architecture.
+    const reference_escape_probe = b.addExecutable(.{
+        .name = "real-snapshot-reference-escape-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/real-snapshot-reference-escape-probe.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    audit_step.dependOn(&reference_escape_probe.step);
+    const protected_reference = b.addSystemCommand(
+        &.{ "python3", "tools/test_real_snapshot_reference_protected.py" },
+    );
+    protected_reference.addArgs(&.{
+        "--launcher",
+        b.option([]const u8, "reference-protected-launcher", "Root-owned protected ReleaseSafe launcher") orelse "",
+        "--dpkg",
+        b.option([]const u8, "reference-protected-dpkg", "Root-owned native hash-pinned dpkg 1.22.22") orelse "",
+        "--root-template",
+        b.option([]const u8, "reference-protected-root-template", "New protected script-free reference root template") orelse "",
+        "--workspace",
+        b.option([]const u8, "reference-protected-workspace", "New empty root-owned mode-0700 proof workspace") orelse "",
+        "--archive",
+        b.option([]const u8, "reference-protected-archive", "Protected authenticated test package archive") orelse "",
+        "--archive-sha512",
+        b.option([]const u8, "reference-protected-archive-sha512", "Authenticated archive SHA512") orelse "",
+        "--archive-size",
+        b.fmt("{d}", .{b.option(usize, "reference-protected-archive-size", "Authenticated archive byte size") orelse 0}),
+        "--escape-probe",
+        b.option([]const u8, "reference-protected-escape-probe", "Root-owned static escape probe run unconfined as a control") orelse "",
+        "--escape-archive",
+        b.option([]const u8, "reference-protected-escape-archive", "Protected archive whose preinst is the static escape probe") orelse "",
+        "--escape-archive-sha512",
+        b.option([]const u8, "reference-protected-escape-archive-sha512", "Escape probe archive SHA512") orelse "",
+        "--escape-archive-size",
+        b.fmt("{d}", .{b.option(usize, "reference-protected-escape-archive-size", "Escape probe archive byte size") orelse 0}),
+        "--profile-scripts",
+        b.option([]const u8, "reference-protected-profile-scripts", "Root-owned signed amd64 systemd/udev/sudo postinsts (empty on arm64)") orelse "",
+        "--architecture",
+        b.option([]const u8, "reference-protected-architecture", "Native amd64 or arm64") orelse "",
+    });
+    protected_reference.setCwd(b.path("."));
+    b.step("test-real-snapshot-reference-protected", "Run non-skipped root-owned pinned-dpkg namespace proofs")
+        .dependOn(&protected_reference.step);
 
     const release_test_step = b.step("test-release", "Run deterministic release packaging and audit tests");
     const release_policy_tests = b.addTest(.{
