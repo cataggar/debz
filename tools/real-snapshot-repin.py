@@ -516,9 +516,8 @@ def validate_identity(identity: object, index: int) -> dict:
             fail(f"{where}.mode must be an octal string")
     if not isinstance(identity["size"], int) or isinstance(identity["size"], bool) or identity["size"] < 0:
         fail(f"{where}.size is invalid")
-    bound = identity["version_bound"]
-    if bound is not None and (not isinstance(bound, str) or not bound):
-        fail(f"{where}.version_bound must be a version string or null")
+    if not isinstance(identity["version_bound"], bool):
+        fail(f"{where}.version_bound must be a boolean")
     derived = identity.get("derived_from")
     if (identity["kind"] == "prestate") != (derived is not None):
         fail(f"{where}: exactly the prestate identities list derived_from")
@@ -530,6 +529,8 @@ def validate_identity(identity: object, index: int) -> dict:
             if not PACKAGE_NAME.fullmatch(str(item["package"])) or not isinstance(item["version"], str):
                 fail(f"{where}.derived_from[{item_index}] is invalid")
     validate_provenance(identity["provenance"], architectures, where)
+    if identity["version_bound"] and identity["provenance"] == "pending":
+        fail(f"{where}.version_bound requires recorded provenance")
     consumers = identity["consumers"]
     if not isinstance(consumers, list) or not consumers:
         fail(f"{where} has no consumer")
@@ -1087,10 +1088,11 @@ def identity_status(identity: dict, observed: dict[str, dict | None]) -> tuple[s
                 return "changed", [f"{arch}: derived state depends on changed packages: {', '.join(stale)}"]
         elif value["digest"] != identity["digest"] or value["size"] != identity["size"] or value["mode"] != identity["mode"]:
             return "changed", [f"{arch}: bound bytes changed: {identity['digest']} -> {value['digest']}"]
-        bound = identity["version_bound"]
-        if bound is not None and value["version"] != bound:
-            return "changed", [f"{arch}: consumers bind {bound}, snapshot has {value['version']}"]
         provenance = identity["provenance"]
+        if identity["version_bound"] and provenance != "pending" and value["version"] != provenance["version"]:
+            return "changed", [
+                f"{arch}: version-bound identity moved from {provenance['version']} to {value['version']}"
+            ]
         if provenance == "pending":
             reasons.append(f"{arch}: records first provenance")
             status = "provenance-only"
@@ -1359,9 +1361,8 @@ def record_manifest(
         new = copy.deepcopy(identity)
         if identity["kind"] != "prestate":
             new.update(digest=first["digest"], size=first["size"], mode=first["mode"])
-        if identity["version_bound"] is not None:
-            new["version_bound"] = first["version"]
-            old_name = identity["version_bound"].split(":", 1)[-1]
+        if identity["version_bound"] and identity["provenance"] != "pending":
+            old_name = identity["provenance"]["version"].split(":", 1)[-1]
             new_name = first["version"].split(":", 1)[-1]
             for consumer in new["consumers"]:
                 if consumer["form"] == "fixture" and old_name != new_name:
@@ -1409,7 +1410,9 @@ def zig_bytes_constant(text: str, name: str) -> str | None:
 def consumer_failures(identity: dict, root: Path) -> list[str]:
     failures = []
     hexadecimal = identity["digest"].split(":", 1)[1]
-    version = None if identity["version_bound"] is None else identity["version_bound"].split(":", 1)[-1]
+    version = None
+    if identity["version_bound"] and identity["provenance"] != "pending":
+        version = identity["provenance"]["version"].split(":", 1)[-1]
     version_seen = version is None
     for consumer in identity["consumers"]:
         path = root / consumer["path"]
@@ -1422,7 +1425,7 @@ def consumer_failures(identity: dict, root: Path) -> list[str]:
             if tagged("sha256", data) != identity["digest"] or len(data) != identity["size"]:
                 failures.append(f"{where} bytes do not match {identity['digest']} ({identity['size']} bytes)")
             if version is not None and version not in consumer["path"]:
-                failures.append(f"{where} name does not carry version {identity['version_bound']}")
+                failures.append(f"{where} name does not carry version {identity['provenance']['version']}")
             version_seen = True
             continue
         text = data.decode("utf-8", "replace")
@@ -1434,7 +1437,7 @@ def consumer_failures(identity: dict, root: Path) -> list[str]:
         elif zig_bytes_constant(text, consumer["name"]) != hexadecimal:
             failures.append(f"{where} constant {consumer['name']} is not {identity['digest']}")
     if not version_seen:
-        failures.append(f"{identity['id']} binds version {identity['version_bound']} but no consumer names it")
+        failures.append(f"{identity['id']} is version-bound but no consumer names {identity['provenance']['version']}")
     return failures
 
 

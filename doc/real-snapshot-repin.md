@@ -33,7 +33,7 @@ for the real-snapshot pins:
 | `series` | The reviewed series profile: URI root, component, architectures, keyring, signer fingerprint, request, and pockets with their roles (`bounded`, `frozen`, `witness`). It must equal the built-in profile. |
 | `snapshot` | `pending` (timestamp only) or `probed`: per pocket the `Date`, `Valid-Until`, hash fields, signers, InRelease SHA-256/SHA-512, cleartext `release_sha256`, deadline and per-architecture `binding`; the admission deadline; and the per-architecture closure digest, package counts and versions. A frozen pocket also carries the review reference that accepted its Release. |
 | `uri_consumers` | Files that must name exactly the pinned snapshot URI and no other snapshot timestamp. |
-| `identities` | One record per reviewed byte identity: `id`, `kind` (`script`, `tool_file`, `archive`, `prestate`), `package`, `architectures`, `path`, tagged `digest` (`sha512:` for archives, `sha256:` for members), `size`, `mode`, `version_bound`, `provenance`, `consumers` and `review`. Prestate identities also list `derived_from`. |
+| `identities` | One record per reviewed byte identity: `id`, `kind` (`script`, `tool_file`, `archive`, `prestate`), `package`, `architectures`, `path`, tagged `digest` (`sha512:` for archives, `sha256:` for members), `size`, `mode`, boolean `version_bound`, `provenance`, `consumers` and `review`. Prestate identities also list `derived_from`. |
 | `excluded` | Digest literals in the scanned sources that are not snapshot pins, each with a reason. |
 
 A consumer is a file that pins the identity in one of three forms:
@@ -42,8 +42,11 @@ A consumer is a file that pins the identity in one of three forms:
 - `zig_bytes`: the named Zig byte-array constant equals the digest.
 - `fixture`: the file's own bytes are the identity.
 
-When an identity sets `version_bound`, at least one consumer must name that
-version.
+Admissions are exact-byte-bound by default: a package version change is
+`provenance-only` when the reviewed member bytes, size and mode are unchanged.
+The `version_bound` flag is reserved for reviewed cases where version-keyed
+logic is itself part of the admission; only then must a consumer name the
+provenance version.
 
 The committed manifest starts `pending` at the current pin, `20261001T000000Z`.
 It holds every reviewed identity, but no probe results yet. The tool refuses
@@ -135,9 +138,10 @@ Markdown. Every manifest identity gets a status:
 
 - `unchanged`: same bytes and same provenance.
 - `provenance-only`: the version or archive changed, but the bound bytes did
-  not.
-- `changed`: the bound bytes, size or mode differ, a version-bound
-  identity's version moved, or a prestate's source packages changed version.
+  not and the identity is not explicitly `version_bound`.
+- `changed`: the bound bytes, size or mode differ, an explicitly
+  `version_bound` identity's version moved, or a prestate's source packages
+  changed version.
   Script and tool-file identities get an advisory: "comments or whitespace
   only", "behavioral change; review every hunk", or "no in-tree bytes to
   compare; review the new member". When the in-tree fixture exists, a script
@@ -169,9 +173,10 @@ python3 tools/real-snapshot-repin.py record --report DIR/report.json \
 - It refuses a changed frozen Release without `--accept-frozen-release REF`,
   and refuses that flag when the frozen Release did not change.
 - It refuses a report from another series or older than the current pin.
-- When a version-bound identity moves to a new version, `fixture` consumer
-  paths that embed the old version (without its epoch) are renamed in the
-  manifest. Rename the files in the same commit.
+- Exact-byte-bound identities keep their consumer paths when only provenance
+  changes. When an explicitly `version_bound` identity moves to a new version,
+  `fixture` consumer paths that embed the old version (without its epoch) are
+  renamed in the manifest. Rename those files in the same commit.
 
 `record` changes only the manifest. The repin commit updates the fixtures,
 admissions, constants and URIs itself, then runs `check`.
@@ -187,8 +192,9 @@ python3 tools/real-snapshot-repin.py check
 - the manifest series differs from its built-in profile;
 - a URI consumer does not name the pinned snapshot URI, or names another
   snapshot timestamp;
-- an identity consumer does not pin the identity's digest or bound version,
-  or a fixture's bytes differ;
+- an identity consumer does not pin the identity's digest, an explicitly
+  version-bound consumer does not name the provenance version, or a fixture's
+  bytes differ;
 - a fixture under `src/fixtures/ubuntu-*` is not a manifest consumer;
 - a digest literal is not a manifest identity or an exclusion, or an
   admission disagrees with its identity on path, size or mode. The scan
