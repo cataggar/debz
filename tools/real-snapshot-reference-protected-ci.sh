@@ -20,18 +20,18 @@ unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
 readonly zig_version=0.16.0
 readonly zig_release=https://github.com/cataggar/zig/releases/download/v0.16.0
 readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
-# Pin source: ubuntu-keyring 2026.08.18 (Architecture: all) from
+# Pin source: ubuntu-keyring 2023.11.28.1build1 (Architecture: all) from
 # https://snapshot.ubuntu.com/ubuntu/20261001T000000Z, suite resolute:
-# pool/main/u/ubuntu-keyring/ubuntu-keyring_2026.08.18_all.deb
-# (Size 12718, SHA512 80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35).
+# pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb
+# (Size 11228, SHA512 80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35).
 # The pinned artifact is usr/share/keyrings/ubuntu-archive-keyring.gpg extracted
 # from that deb, deliberately committed as a reviewed trust root.
-readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2026.08.18_all.deb
+readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb
 readonly archive_keyring_deb_sha512=80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35
-readonly archive_keyring_deb_size=12718
+readonly archive_keyring_deb_size=11228
 readonly archive_keyring_member=./usr/share/keyrings/ubuntu-archive-keyring.gpg
 readonly archive_keyring_sha256=80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31
-readonly archive_keyring_size=2334
+readonly archive_keyring_size=3607
 
 [[ $# == 3 && $(id -u) == 0 && $(id -g) == 0 ]] || {
   echo "usage (as root, from the protected clone): $0 TREE ARCHITECTURE COMMIT" >&2
