@@ -471,6 +471,24 @@ class RecordTests(unittest.TestCase):
         with self.assertRaisesRegex(repin.RepinError, "different series"):
             self.diff(value, other)
 
+    def test_series_migration_records_profile_and_fixture_paths_when_allowed(self) -> None:
+        consumers = [
+            {"path": "src/fixtures/ubuntu-old-alpha-1.0.postinst", "form": "fixture"},
+            {"path": "pins.txt", "form": "hex"},
+        ]
+        value = manifest([identity(consumers=consumers)])
+        probe = report({"script:alpha/postinst": {"amd64": observed(version="1.1")}})
+        probe["series"] = dict(probe["series"], name="ubuntu-new")
+        with self.assertRaisesRegex(repin.RepinError, "different series"):
+            repin.record_manifest(value, probe, self.diff(value, probe, ROOT), {}, None)
+        diff = repin.compute_diff(value, probe, ROOT, ROOT, allow_series_migration=True)
+        updated = repin.record_manifest(value, probe, diff, {}, None, allow_series_migration=True)
+        self.assertEqual(updated["series"]["name"], "ubuntu-new")
+        self.assertEqual(
+            [consumer["path"] for consumer in updated["identities"][0]["consumers"]],
+            ["src/fixtures/ubuntu-new-alpha.postinst", "pins.txt"],
+        )
+
     def test_frozen_release_change_requires_acceptance(self) -> None:
         roles = [{"suite": "r", "role": "frozen"}, {"suite": "r-updates", "role": "witness"}]
         value = manifest(pockets=roles)

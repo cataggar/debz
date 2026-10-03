@@ -165,7 +165,7 @@ exact argument shapes that the closure's scripts use on a fresh install, such
 as DEP17 `--no-rename` diversions, `--truename`, `--list` and chrony's
 `--update --add`. No call may pass a `--root`, `--admindir`, `--instdir` or
 `--force*` option. The tool must also match its reviewed per-architecture
-`1.23.7ubuntu2` digest, with no `PATH` shadow. Each allowed call is logged
+`1.23.7ubuntu1` digest, with no `PATH` shadow. Each allowed call is logged
 with its script and PID lineage. These calls hand no transaction step to
 dpkg: dpkg would run the same scripts the same way, the diversion and
 statoverride tools only edit their own databases (and, for `--update`, the
@@ -178,14 +178,12 @@ Evidence members are capped at 128 MiB and the artifact at 512 MiB before
 upload. Bounded, recognized acquisition retry diagnostics remain in the
 evidence; unexpected candidate stderr still fails the gate. Repository
 freshness remains authoritative and repository-specific: the acceptance
-config explicitly binds the unchanged 31-day maximum for a
-missing `Valid-Until`. The gate pins the signed `stonking`
-`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z` snapshot, signed by
-`F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC, instead of
-overriding the clock for frozen
-`resolute`; no CI clock exception, hostname inference, or unbounded immutable
-exemption exists.
+config pins the frozen `resolute` Release SHA-256
+`596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834` and
+requires both `resolute-updates` and `resolute-security` witnesses from the
+same snapshot. The unchanged 31-day maximum applies only to those witnesses
+when they omit `Valid-Until`; no CI clock exception, hostname inference, or
+unbounded immutable exemption exists.
 
 `zig build security-audit` is network-free and rejects:
 

@@ -179,7 +179,7 @@ the mount, preserves the original target, and proves alternate-root isolation.
 The native lifecycle policy permits a separate, invocation-scoped view only
 for `systemd:amd64` `261.2-1ubuntu2`, new-package `postinst
 ["configure", ""]`, signed script SHA-256
-`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+`d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d`
 at `var/lib/dpkg/info/systemd.postinst`. The lifecycle rechecks its bytes and
 pins the root-owned, mode-0755 *empty* `/proc` directory. The runner verifies
 the exact 4,942-byte script again and obtains the kernel's current boot ID
@@ -245,7 +245,7 @@ WSL capability availability remains unverified.
 
 The separate udev admission is limited to `udev:amd64` `261.2-1ubuntu2`,
 new-package `postinst ["configure", ""]`, signed SHA-256
-`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`.
+`b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606`.
 Only the root-owned, mode-0755, 2,533-byte installed dpkg-info script may
 execute. The staged new-package copy, if present, must match its signed
 digest; unexpected aliases refuse. The runner pins the mode-0700 root,
@@ -280,7 +280,7 @@ or establish arm64/WSL namespace support.
 
 Only the authenticated new-package `sudo:amd64` `1.9.17p2-7ubuntu3`
 `postinst ["configure", ""]`, SHA-256
-`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`,
+`fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383`,
 can select the separately bound sudo view. The staged script must match the
 root-owned 1,927-byte installed dpkg-info script; the root is mode 0700 and
 its root-owned `/proc` mountpoint is an empty real directory. The pinned

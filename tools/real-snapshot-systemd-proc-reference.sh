@@ -84,7 +84,7 @@ done
 [[ $(stat -c '%u:%g:%a' "$source_root/proc") == 0:0:755 ]]
 [[ ! -L "$source_root/proc" && -z $(find "$source_root/proc" -mindepth 1 -print -quit) ]]
 [[ $(sha256sum "$source_root/var/lib/dpkg/info/systemd.postinst" | cut -d' ' -f1) == \
-  39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412 ]]
+  d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d ]]
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" \
   -W -f='${Version} ${Status}' systemd) == \
   '261.2-1ubuntu2 install ok half-configured' ]]

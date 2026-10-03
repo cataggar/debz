@@ -84,10 +84,10 @@ pub const Policy = struct {
 };
 
 const snapshot_systemd_sha256 = [32]u8{
-    0x39, 0xdf, 0x51, 0x22, 0x6d, 0x6d, 0xd8, 0x45,
-    0x6a, 0x38, 0x8d, 0x33, 0x15, 0xe7, 0xd0, 0x2b,
-    0x44, 0x6d, 0xce, 0xc9, 0x94, 0x45, 0x15, 0xa1,
-    0x09, 0x93, 0x3c, 0x65, 0xc8, 0xc1, 0xb4, 0x12,
+    0xd9, 0xdf, 0x6a, 0x03, 0xcc, 0xb6, 0xb5, 0x57,
+    0xc1, 0x6a, 0xc1, 0xc6, 0x74, 0x55, 0x7a, 0x66,
+    0xc1, 0xdb, 0x29, 0x0f, 0x3c, 0x6d, 0x3c, 0xad,
+    0xbe, 0xf3, 0x35, 0xe0, 0xce, 0x74, 0xe3, 0x1d,
 };
 
 fn snapshotSystemdIdentity(identity: Identity, arguments: []const []const u8) bool {
@@ -103,10 +103,10 @@ fn snapshotSystemdIdentity(identity: Identity, arguments: []const []const u8) bo
 }
 
 const snapshot_udev_sha256: [32]u8 = .{
-    0x86, 0x1b, 0xa5, 0x7c, 0xdb, 0x3f, 0x94, 0xba,
-    0xe9, 0x4a, 0xf2, 0x37, 0xb9, 0x28, 0x4b, 0x01,
-    0xbc, 0xeb, 0x95, 0x6e, 0xe6, 0x9b, 0xb0, 0x9d,
-    0x3b, 0x54, 0xe3, 0x81, 0x56, 0x73, 0x36, 0xee,
+    0xb7, 0x89, 0x2e, 0x97, 0x5b, 0xcc, 0xe8, 0x96,
+    0xc4, 0x93, 0x8c, 0x22, 0x19, 0xa2, 0x44, 0xfa,
+    0x03, 0x86, 0x3d, 0x5e, 0xff, 0x37, 0xcd, 0x2e,
+    0xb6, 0x6d, 0x2b, 0x85, 0x40, 0xf1, 0x46, 0x06,
 };
 
 fn snapshotUdevIdentity(identity: Identity, arguments: []const []const u8) bool {
@@ -122,10 +122,10 @@ fn snapshotUdevIdentity(identity: Identity, arguments: []const []const u8) bool 
 }
 
 const snapshot_sudo_sha256: [32]u8 = .{
-    0xe7, 0x66, 0x40, 0x7b, 0xf7, 0x0a, 0xd0, 0x3d,
-    0x80, 0x06, 0xde, 0x9f, 0x3f, 0x87, 0x00, 0xf7,
-    0xed, 0x22, 0xb5, 0x32, 0xd8, 0xe2, 0x99, 0xac,
-    0x88, 0xe5, 0x22, 0xe2, 0xc8, 0x0a, 0x2c, 0xb8,
+    0xfd, 0x4c, 0x65, 0x93, 0x2a, 0xb3, 0xab, 0x7c,
+    0xe9, 0x0c, 0x36, 0x33, 0xc4, 0x2b, 0x8e, 0xe7,
+    0xa3, 0x6a, 0xf2, 0xc8, 0x29, 0x21, 0x42, 0xd6,
+    0xe0, 0xcd, 0x13, 0x4d, 0xda, 0x4c, 0x63, 0x83,
 };
 
 fn snapshotSudoIdentity(identity: Identity, arguments: []const []const u8) bool {
@@ -340,14 +340,14 @@ const SnapshotUdevInput = struct {
 
 const snapshot_udev_inputs = [_]SnapshotUdevInput{
     .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
-    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f" },
-    .{ .path = "usr/bin/systemd-hwdb", .size = 19448, .mode = 0o755, .sha256 = "71a197d9d0211bc8617280eef163d921fbed9648fc5b29a5a38f1bc0692ca6d8" },
-    .{ .path = "usr/bin/systemd-sysusers", .size = 73048, .mode = 0o755, .sha256 = "2f4e1f47cd486e8797f8874c6e61f80411c05f01bfe58e84b9811eea6fa97411" },
-    .{ .path = "usr/bin/systemd-tmpfiles", .size = 131024, .mode = 0o755, .sha256 = "8de8ec082f8e887f345c355201c8907ab311960301254e17e96f558798d6d621" },
+    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517" },
+    .{ .path = "usr/bin/systemd-hwdb", .size = 14784, .mode = 0o755, .sha256 = "3502e34f903759c07465fc50b1e9406d89325cb6cc6605f4225d3231ba0a7dfc" },
+    .{ .path = "usr/bin/systemd-sysusers", .size = 68224, .mode = 0o755, .sha256 = "09586bca83f4ea590a821c2bd712bef44f7b8b55f0186085cfdcd023b9d0da1f" },
+    .{ .path = "usr/bin/systemd-tmpfiles", .size = 121544, .mode = 0o755, .sha256 = "13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4" },
     .{ .path = "usr/bin/dpkg-maintscript-helper", .size = 21123, .mode = 0o755, .sha256 = "1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d" },
     .{ .path = "usr/bin/deb-systemd-helper", .size = 24358, .mode = 0o755, .sha256 = "a895d5f077651960b6ca4ed9c53f8b36eae422ae170f61c972d0c6579e9f8732" },
     .{ .path = "usr/sbin/update-rc.d", .size = 18147, .mode = 0o755, .sha256 = "9a85792c1ee2714d34ad2f0dac9becd987cbaedbfe25519dede7378e6c9ebbf1" },
-    .{ .path = "usr/bin/systemctl", .size = 303976, .mode = 0o755, .sha256 = "c51cb41312b3ad45ae4275179d501db82d150f7541ec95e5942f0094f2ffb00a" },
+    .{ .path = "usr/bin/systemctl", .size = 302112, .mode = 0o755, .sha256 = "6394f5e8df92878184de9d4dfb7ac242471cb09daf89d23be4e81ae17e9c03b2" },
     .{ .path = "usr/bin/deb-systemd-invoke", .size = 7135, .mode = 0o755, .sha256 = "92eadae89f4df4cd6088f6316f5390b685faf8d0e312a4e5af3a507caaf81bdb" },
     .{ .path = "usr/lib/tmpfiles.d/static-nodes-permissions.conf", .size = 798, .mode = 0o644, .sha256 = "ca4849c27428fd648f6377dd51a3ab0eb79de69fce1bdc910670012c0cf26f85" },
     .{ .path = "usr/lib/sysusers.d/debian-udev.conf", .size = 143, .mode = 0o644, .sha256 = "e9493928a4ed5399c5619cee0559644099f0625075606baca35b40533286b5e0" },
@@ -493,18 +493,18 @@ pub const SnapshotUdevProc = struct {
 
 const snapshot_sudo_inputs = [_]SnapshotUdevInput{
     .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
-    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f" },
-    .{ .path = "usr/bin/dpkg-query", .size = 142160, .mode = 0o755, .sha256 = "fdab8a6105db8c97503ee3c35c4f686e677adc396b8bb56ead161e122fd9c232" },
-    .{ .path = "usr/bin/systemd-tmpfiles", .size = 131024, .mode = 0o755, .sha256 = "8de8ec082f8e887f345c355201c8907ab311960301254e17e96f558798d6d621" },
+    .{ .path = "usr/bin/dpkg", .size = 322728, .mode = 0o755, .sha256 = "972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517" },
+    .{ .path = "usr/bin/dpkg-query", .size = 142160, .mode = 0o755, .sha256 = "82a19acac53907f83faca7d6494289fe2d074514cf1b09933114635415c2e876" },
+    .{ .path = "usr/bin/systemd-tmpfiles", .size = 121544, .mode = 0o755, .sha256 = "13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4" },
     .{ .path = "usr/bin/dpkg-maintscript-helper", .size = 21123, .mode = 0o755, .sha256 = "1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d" },
     .{ .path = "usr/share/dpkg/sh/dpkg-error.sh", .size = 3228, .mode = 0o644, .sha256 = "d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528" },
-    .{ .path = "usr/bin/update-alternatives", .size = 59864, .mode = 0o755, .sha256 = "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d" },
-    .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "c734a13ce654834fad2af9066cc637e25e6228daa6a9b8ee247bd7d67382e61e" },
-    .{ .path = "usr/bin/gnuchown", .size = 68176, .mode = 0o755, .sha256 = "c80e98d639a25bec6c2b20c38301eb2719317426520a6cf2d6c165acb7dc45fb" },
-    .{ .path = "usr/bin/gnuchmod", .size = 60016, .mode = 0o755, .sha256 = "8038bd44296384090d0ff82dcf4dae77e9915c3d2e68e40f04ab545c0daea580" },
+    .{ .path = "usr/bin/update-alternatives", .size = 59864, .mode = 0o755, .sha256 = "023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45" },
+    .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6" },
+    .{ .path = "usr/bin/gnuchown", .size = 68160, .mode = 0o755, .sha256 = "0e04f6401bfae9a5eafed1da2c738067b007d39a8538ea83ce22271b4cd58fbb" },
+    .{ .path = "usr/bin/gnuchmod", .size = 60000, .mode = 0o755, .sha256 = "787b5abd2db66069fdd2467bf3b6acb089380aa0b4c05771f3c1b2471a24bf94" },
     .{ .path = "usr/lib/tmpfiles.d/sudo.conf", .size = 27, .mode = 0o644, .sha256 = "eed7eb9d7ddaccb3ae13d3225de1302a96754938fea4dc305c43b64cbcb5d0bc" },
     .{ .path = "var/lib/dpkg/info/sudo.list", .size = 2376, .mode = 0o644, .sha256 = "92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f" },
-    .{ .path = "usr/bin/sudo.ws", .size = 282080, .mode = 0o4755, .sha256 = "6937a49a2396307d74c575c4066a8db8bcea21bbc6fa4dc01cadc724e586d4aa" },
+    .{ .path = "usr/bin/sudo.ws", .size = 282080, .mode = 0o4755, .sha256 = "e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43" },
     .{ .path = "usr/share/man/man8/sudo.ws.8.gz", .size = 12804, .mode = 0o644, .sha256 = "43b6a4b66f9eb6a430f64e2b25084a100b2e152cfd8896cb83f9ced170793d75" },
 };
 
@@ -4505,7 +4505,7 @@ test "maintainer_script.test.helper namespace retains alternate-root isolation" 
 test "maintainer_script.test.snapshot systemd proc is bound to the exact signed invocation" {
     const hex = std.fmt.bytesToHex(snapshot_systemd_sha256, .lower);
     try testing.expectEqualStrings(
-        "39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412",
+        "d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d",
         &hex,
     );
     var binding: SnapshotSystemdProc = .{
@@ -4591,7 +4591,7 @@ test "maintainer_script.test.capability header matches the kernel ABI" {
 test "maintainer_script.test.udev PID-only proc rejects unrelated and altered invocations" {
     const hex = std.fmt.bytesToHex(snapshot_udev_sha256, .lower);
     try testing.expectEqualStrings(
-        "861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee",
+        "b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606",
         &hex,
     );
     var binding: SnapshotUdevProc = .{
@@ -4684,7 +4684,7 @@ test "maintainer_script.test.udev PID-only proc rejects occupied mountpoint" {
 test "maintainer_script.test.sudo PID-only proc requires exact signed identity" {
     const hex = std.fmt.bytesToHex(snapshot_sudo_sha256, .lower);
     try testing.expectEqualStrings(
-        "e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8",
+        "fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383",
         &hex,
     );
     var binding: SnapshotSudoProc = .{

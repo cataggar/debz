@@ -1107,7 +1107,7 @@ pub const pinned_tools = [_]ToolBinding{
 pub const snapshot_tools = [_]ToolBinding{.{
     .architecture = "amd64",
     .sha256 = digestLiteral(
-        "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d",
+        "023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45",
     ),
 }};
 
@@ -1118,19 +1118,19 @@ const snapshot_less_postinst_sha256 = digestLiteral(
     "a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4",
 );
 const snapshot_bash_postinst_sha256 = digestLiteral(
-    "e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff",
+    "72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d",
 );
 const snapshot_procps_postinst_sha256 = digestLiteral(
-    "7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
+    "3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
 );
 const snapshot_sudo_rs_postinst_sha256 = digestLiteral(
-    "38c229561b765f727b9b995af9e35c7ae43756761c2018f974efd678b4a06fd1",
+    "8204660f7a77c449041d3639d1075d96e76aeda3050fc0ad7780e9c4cc9a69c0",
 );
 const snapshot_util_linux_postinst_sha256 = digestLiteral(
-    "306c812b4cbdca94057f55e0e8c45a2bf80d7ab86d0e60a915b1f2ac6901a6df",
+    "31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
 );
 const snapshot_console_setup_linux_postinst_sha256 = digestLiteral(
-    "5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a",
+    "6d4e7cc59222fdde22ef49bc1ed1f2c8405c8a537c00af787f3c22a2edee383e",
 );
 const snapshot_python3_preinst_sha256 = digestLiteral(
     "115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f",
@@ -3746,7 +3746,7 @@ test "native_alternatives.test.script authority admits only literal bounded comm
 test "native_alternatives.test.snapshot less preinst pins one quiet removal" {
     const testing = std.testing;
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-less-668-1build1.preinst",
+        "fixtures/ubuntu-resolute-less.preinst",
     );
     try testing.expect(matchesSnapshotLessPreinst(script));
     var authority = try discoverScriptAuthority(testing.allocator, script, .{});
@@ -3787,7 +3787,7 @@ test "native_alternatives.test.snapshot less preinst pins one quiet removal" {
 
 test "native_alternatives.test.signed python3 install preinst has no alternatives transition" {
     const testing = std.testing;
-    const signed = @embedFile("fixtures/ubuntu-stonking-python3-3.14.7-3.preinst");
+    const signed = @embedFile("fixtures/ubuntu-resolute-python3.preinst");
     try testing.expectEqual(@as(usize, 856), signed.len);
     try testing.expect(matchesSnapshotPython3Preinst(signed));
     var script = try discoverScriptAuthority(testing.allocator, signed, .{});
@@ -3835,7 +3835,7 @@ test "native_alternatives.test.protected signed python3 preinst preserves all re
     defer after_root.close();
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-python3-3.14.7-3.preinst"),
+        @embedFile("fixtures/ubuntu-resolute-python3.preinst"),
         .{},
     );
     defer script.deinit();
@@ -3898,7 +3898,7 @@ test "native_alternatives.test.protected signed python3 preinst preserves all re
 test "native_alternatives.test.snapshot less postinst pins one quiet install" {
     const testing = std.testing;
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-less-668-1build1.postinst",
+        "fixtures/ubuntu-resolute-less.postinst",
     );
     try testing.expect(matchesSnapshotLessPostinst(script));
     var authority = try discoverScriptAuthority(testing.allocator, script, .{});
@@ -3960,7 +3960,7 @@ test "native_alternatives.test.snapshot less postinst registers only the pinned 
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-less-668-1build1.postinst"),
+        @embedFile("fixtures/ubuntu-resolute-less.postinst"),
         .{},
     );
     defer script.deinit();
@@ -4034,7 +4034,7 @@ test "native_alternatives.test.snapshot less postinst registers only the pinned 
 test "native_alternatives.test.snapshot util-linux postinst pins the guarded pager install" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst",
+        "fixtures/ubuntu-resolute-util-linux.postinst",
     );
     try testing.expect(matchesSnapshotUtilLinuxPostinst(bytes));
     var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
@@ -4094,7 +4094,7 @@ test "native_alternatives.test.snapshot util-linux preserves the selected less p
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst"),
+        @embedFile("fixtures/ubuntu-resolute-util-linux.postinst"),
         .{},
     );
     defer script.deinit();
@@ -4203,7 +4203,7 @@ test "native_alternatives.test.snapshot util-linux preserves the selected less p
 test "native_alternatives.test.snapshot console-setup pins two literal vtrgb installs" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst",
+        "fixtures/ubuntu-resolute-console-setup-linux.postinst",
     );
     try testing.expect(matchesSnapshotConsoleSetupLinuxPostinst(bytes));
     var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
@@ -4262,7 +4262,7 @@ test "native_alternatives.test.snapshot console-setup successful exit requires b
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst"),
+        @embedFile("fixtures/ubuntu-resolute-console-setup-linux.postinst"),
         .{},
     );
     defer script.deinit();
@@ -4373,7 +4373,7 @@ test "native_alternatives.test.snapshot console-setup successful exit requires b
 test "native_alternatives.test.snapshot bash postinst pins one masked builtins install" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst",
+        "fixtures/ubuntu-resolute-bash.postinst",
     );
     try testing.expect(matchesSnapshotBashPostinst(bytes));
     var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
@@ -4432,7 +4432,7 @@ test "native_alternatives.test.snapshot bash postinst bounds masked tool failure
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst"),
+        @embedFile("fixtures/ubuntu-resolute-bash.postinst"),
         .{},
     );
     defer script.deinit();
@@ -4513,7 +4513,7 @@ test "native_alternatives.test.snapshot bash postinst bounds masked tool failure
 test "native_alternatives.test.signed netcat install matches pinned sorted nc record" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-netcat-openbsd-1.238-1.postinst",
+        "fixtures/ubuntu-resolute-netcat-openbsd.postinst",
     );
     var sha256: [32]u8 = undefined;
     Sha256.hash(bytes, &sha256, .{});
@@ -4649,14 +4649,14 @@ test "native_alternatives.test.signed netcat install matches pinned sorted nc re
 test "native_alternatives.test.signed procps only admits absent providers and immutable groups" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
+        "fixtures/ubuntu-resolute-procps.postinst",
     );
     var sha256: [32]u8 = undefined;
     Sha256.hash(bytes, &sha256, .{});
     try testing.expectEqualSlices(
         u8,
         &digestLiteral(
-            "7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
+            "3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
         ),
         &sha256,
     );
@@ -4797,7 +4797,7 @@ test "native_alternatives.test.signed procps only admits absent providers and im
 test "native_alternatives.test.signed sudo-rs replaces only two owned structural links" {
     const testing = std.testing;
     const bytes = @embedFile(
-        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst",
+        "fixtures/ubuntu-resolute-sudo-rs.postinst",
     );
     try testing.expect(matchesSnapshotSudoRsPostinst(bytes));
     var sha256: [32]u8 = undefined;
@@ -4805,7 +4805,7 @@ test "native_alternatives.test.signed sudo-rs replaces only two owned structural
     try testing.expectEqualSlices(
         u8,
         &digestLiteral(
-            "38c229561b765f727b9b995af9e35c7ae43756761c2018f974efd678b4a06fd1",
+            "8204660f7a77c449041d3639d1075d96e76aeda3050fc0ad7780e9c4cc9a69c0",
         ),
         &sha256,
     );
@@ -4941,7 +4941,7 @@ test "native_alternatives.test.signed sudo overwrite is scoped and capture error
     Sha256.hash(bytes, &observed, .{});
     try testing.expectEqualSlices(
         u8,
-        &digestLiteral("e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8"),
+        &digestLiteral("fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383"),
         &observed,
     );
     var script = try discoverScriptAuthority(testing.allocator, bytes, .{});
@@ -5009,7 +5009,7 @@ test "native_alternatives.test.signed sudo-rs permits only setuid target ctime" 
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst"),
+        @embedFile("fixtures/ubuntu-resolute-sudo-rs.postinst"),
         .{},
     );
     defer script.deinit();
@@ -5168,7 +5168,7 @@ test "native_alternatives.test.snapshot less install cannot remove pager" {
     const testing = std.testing;
     var script = try discoverScriptAuthority(
         testing.allocator,
-        @embedFile("fixtures/ubuntu-stonking-less-668-1build1.preinst"),
+        @embedFile("fixtures/ubuntu-resolute-less.preinst"),
         .{},
     );
     defer script.deinit();

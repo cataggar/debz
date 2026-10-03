@@ -135,16 +135,16 @@ The manual real-snapshot gate now selects the production native backend
 explicitly on amd64 and arm64 and starts from an empty directory with no dpkg
 database or helper placeholder. A Zig comparator owns canonical
 native/reference equality; shell and existing Python tooling are restricted to
-privileged execution and pinned oracle artifact preparation. The gate's
-repository-specific config explicitly binds the finite 31-day missing-expiry
-policy. The frozen Ubuntu `resolute` InRelease is dated 2026-04-23 and therefore
-returns `ReleaseExpired` before mutation. The gate now pins the currently
-valid `stonking` 2026-10-01 snapshot, signed by
-`F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC. Its complete
-development suite publishes SHA512-only Release and package identities
-supported by exact-lock v3. No clock override, fabricated SHA256, or
-historical replay is used; both architecture parity runs remain necessary
+privileged execution and pinned oracle artifact preparation. The gate's repository-specific config pins the frozen Ubuntu `resolute`
+2026-10-01 Release SHA-256
+`596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834` and
+requires fresh same-snapshot `resolute-updates` and `resolute-security`
+witnesses signed by `F6ECB3762474EDA9D21B7022871920D1991BC93C`. The frozen
+Release has no `Valid-Until`; the finite 31-day missing-expiry policy applies
+to the witnesses, not as a clock override for the frozen pocket. Its complete
+stable-series closure publishes SHA512 package identities and SHA256 Release
+identities supported by exact-lock v3. No clock override, fabricated SHA256,
+or historical replay is used; both architecture parity runs remain necessary
 before any cutover claim.
 
 Item 14 adds private native-step journaling, persisted execution inputs, and

@@ -79,11 +79,11 @@ const Driver = struct {
     }
 
     fn validate(self: *Driver, keyring: []const u8) !support.Result {
-        return self.run(keyring, &.{ "--validate", uri, "stonking", self.arch });
+        return self.run(keyring, &.{ "--validate", uri, "resolute", self.arch });
     }
 
     fn accept(self: *Driver, workspace: []const u8) !support.Result {
-        return self.run(self.keyring, &.{ self.executable, uri, "stonking", self.arch, workspace });
+        return self.run(self.keyring, &.{ self.executable, uri, "resolute", self.arch, workspace });
     }
 
     fn initOffline() !Driver {
@@ -188,7 +188,7 @@ const Driver = struct {
             if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0",
             if (config.script_dpkg) "SNAPSHOT_TEST_SCRIPT_DPKG=1" else "SNAPSHOT_TEST_SCRIPT_DPKG=0",
             if (config.script_tools) "SNAPSHOT_TEST_SCRIPT_TOOLS=1" else "SNAPSHOT_TEST_SCRIPT_TOOLS=0",
-            "bash", self.script, self.executable, uri, "stonking", self.arch, self.workspace,
+            "bash", self.script, self.executable, uri, "resolute", self.arch, self.workspace,
         }, .{ .path = self.work.root });
     }
 };
@@ -196,20 +196,20 @@ const Driver = struct {
 test "snapshot: fixed offline inputs accept native architecture and refuse mutable URI, suite, or mismatch" {
     var f = try Driver.init();
     defer f.deinit();
-    const valid = try f.run(f.keyring, &.{ "--validate-values", uri, "stonking", f.arch });
+    const valid = try f.run(f.keyring, &.{ "--validate-values", uri, "resolute", f.arch });
     defer valid.deinit();
     try valid.ok();
     for ([_]struct { uri_arg: []const u8, suite: []const u8, arch: []const u8 }{
-        .{ .uri_arg = "https://snapshot.ubuntu.com/ubuntu/latest", .suite = "stonking", .arch = "amd64" },
+        .{ .uri_arg = "https://snapshot.ubuntu.com/ubuntu/latest", .suite = "resolute", .arch = "amd64" },
         .{ .uri_arg = uri, .suite = "unreviewed", .arch = "amd64" },
-        .{ .uri_arg = uri, .suite = "stonking", .arch = "i386" },
+        .{ .uri_arg = uri, .suite = "resolute", .arch = "i386" },
     }) |invalid| {
         const result = try f.run(f.keyring, &.{ "--validate-values", invalid.uri_arg, invalid.suite, invalid.arch });
         defer result.deinit();
         try testing.expect(result.code != 0);
     }
     const wrong_arch = if (std.mem.eql(u8, f.arch, "amd64")) "arm64" else "amd64";
-    const mismatch = try f.run(f.keyring, &.{ "--validate", uri, "stonking", wrong_arch });
+    const mismatch = try f.run(f.keyring, &.{ "--validate", uri, "resolute", wrong_arch });
     defer mismatch.deinit();
     try mismatch.failsWith("native runner architecture does not match");
 }
@@ -286,9 +286,16 @@ test "snapshot: offline native creation and zero-action update preserve evidence
     const zero = try f.work.read(".real-snapshot/fresh/evidence/update-zero-actions.txt");
     defer support.allocator.free(zero);
     try testing.expectEqualStrings("changed=false\nstatus_unchanged=true\nprovenance_unchanged=true\n", zero);
-    const config = try f.work.read(".real-snapshot/fresh/ubuntu.json");
-    defer support.allocator.free(config);
-    try support.contains(config, "\"maximum_release_age_seconds\":2678400");
+    const frozen_config = try f.work.read(".real-snapshot/fresh/config/resolute.json");
+    defer support.allocator.free(frozen_config);
+    try support.contains(frozen_config, "\"mode\":\"frozen_release_with_witnesses\"");
+    try support.contains(frozen_config, "\"witness_suites\":[\"resolute-updates\",\"resolute-security\"]");
+    const updates_config = try f.work.read(".real-snapshot/fresh/config/resolute-updates.json");
+    defer support.allocator.free(updates_config);
+    try support.contains(updates_config, "\"maximum_release_age_seconds\":2678400");
+    const security_config = try f.work.read(".real-snapshot/fresh/config/resolute-security.json");
+    defer support.allocator.free(security_config);
+    try support.contains(security_config, "\"maximum_release_age_seconds\":2678400");
     const log = try f.work.read("calls.jsonl");
     defer support.allocator.free(log);
     try support.contains(log, "[\"transaction-result\",\"verify\"");
@@ -1720,13 +1727,13 @@ test "snapshot: script dpkg pins are per architecture and bound to the pinned sn
     for ([_][]const u8{
         "readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z\n",
         "readonly script_dpkg_snapshot=20261001T000000Z\n",
-        "readonly script_dpkg_version=1.23.7ubuntu2\n",
-        "readonly script_dpkg_amd64='6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f 322728'\n",
-        "readonly script_dpkg_arm64='d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4 330816'\n",
-        "readonly script_dpkg_divert_amd64='a509fc1a363946770295b613924e2bfa902ddbf76ec2826128685df1569c57d8 125768'\n",
-        "readonly script_dpkg_divert_arm64='6daba35904a8885a334c33e6b4c7c7bc42f501f3f36032a374dfe40e842ed75b 133872'\n",
-        "readonly script_dpkg_statoverride_amd64='6c08816ff0b12106e969537cab83ac4b3358a72b425fe8bf1fc961e2e82ce2ce 55936'\n",
-        "readonly script_dpkg_statoverride_arm64='b837c9d99518225f5b238b215179559a87e7d012072ae0ff414fdc0ea891c3b9 68184'\n",
+        "readonly script_dpkg_version=1.23.7ubuntu1\n",
+        "readonly script_dpkg_amd64='972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517 322728'\n",
+        "readonly script_dpkg_arm64='6c03c9fa2053b5a4e899438c1318ed460f62f01812da7f91f6c35a7e0957692f 330816'\n",
+        "readonly script_dpkg_divert_amd64='e975eecfbceda235ecedc2e35addf5cc5abe05de355202780cf8e47b2f6745eb 125768'\n",
+        "readonly script_dpkg_divert_arm64='50fd191a3a97a17ff0de4bb921ded2d877e5648e197712e8025631c09d456798 133872'\n",
+        "readonly script_dpkg_statoverride_amd64='f8496aa47ff782a4881ebdf9e0a4e4615e81f8c56bc004af51f49954e315ff8c 55936'\n",
+        "readonly script_dpkg_statoverride_arm64='b9c47a676498db293c4f674d63af54656d274e68b7598e235ec50f2380dba0f6 68184'\n",
         "[[ \"$pinned_uri\" == */\"$script_dpkg_snapshot\" ]]",
         "    amd64:dpkg) echo \"$script_dpkg_amd64\" ;;\n",
         "    arm64:dpkg) echo \"$script_dpkg_arm64\" ;;\n",

@@ -75,7 +75,7 @@ without trigger execution, removal, and purge.
 ## Automatic file interests owned by the source
 
 The signed `libglib2.0-0t64:amd64` `2.90.0-1` archive (SHA-512
-`1ce37ac69b92ea9521c93f76aed4ba1a28962abf10481d474ee909ed5d2649596e8e059efcb9f938b97ecea451828274dbb61651c7d014fe1a6a028ce046e79c`)
+`196cdd945ad54fb1fee44db960e3c9aa324aa0cd4b8a25e4ea138bbf48e6f681a672c16312afbf022ad48a7b87c9fdd23a7eb92c295cdedd8f7698009c157d83`)
 owns empty `/usr/share/glib-2.0/schemas` and
 `/usr/lib/x86_64-linux-gnu/gio/modules` directories. Its signed
 124-byte `.triggers` (SHA-256

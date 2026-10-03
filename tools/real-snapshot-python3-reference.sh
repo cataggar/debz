@@ -45,7 +45,7 @@ checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-python3-reference.sh" ]]
 require_protected_file "$checkout/tools/real-snapshot-python3-reference.sh"
 require_protected_file "$checkout/tools/prepare-native-dpkg.py"
-require_protected_file "$checkout/src/fixtures/ubuntu-stonking-python3-3.14.7-3.preinst"
+require_protected_file "$checkout/src/fixtures/ubuntu-resolute-python3.preinst"
 require_protected_path "$checkout/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$checkout/.real-snapshot") == 0:0:700 ]]
 
@@ -72,7 +72,7 @@ python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned
 [[ $(sha256sum "$pinned" | cut -d' ' -f1) == \
   0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5 ]]
 
-digest=1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6
+digest=616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa
 [[ $(jq -r '.packages[] | select(.name == "python3" and .version == "3.14.7-3" and .architecture == "amd64") | .archive_identity.digests[] | select(.algorithm == "sha512") | .digest' "$lock") == "$digest" ]]
 [[ $(jq -r '.packages[] | select(.name == "python3" and .version == "3.14.7-3" and .architecture == "amd64") | .declared_size' "$lock") == 23672 ]]
 [[ $(stat -c '%s' "$archive") == 23672 ]]
@@ -81,7 +81,7 @@ require_protected_file "$source_root/var/lib/dpkg/info/python3.preinst"
 require_protected_file "$source_root/var/lib/dpkg/info/python3-minimal.list"
 require_protected_file "$source_root/usr/bin/update-alternatives"
 [[ $(sha256sum "$source_root/usr/bin/update-alternatives" | cut -d' ' -f1) == \
-  3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d ]]
+  023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45 ]]
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/var/lib/dpkg/info/python3-minimal.list") == \
   0:0:644:781:1 ]]
 [[ $(sha256sum "$source_root/var/lib/dpkg/info/python3-minimal.list" | cut -d' ' -f1) == \
@@ -92,7 +92,7 @@ require_protected_file "$source_root/usr/bin/update-alternatives"
 [[ $(sha256sum "$source_root/var/lib/dpkg/info/python3.preinst" | cut -d' ' -f1) == \
   115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f ]]
 cmp "$source_root/var/lib/dpkg/info/python3.preinst" \
-  "$checkout/src/fixtures/ubuntu-stonking-python3-3.14.7-3.preinst"
+  "$checkout/src/fixtures/ubuntu-resolute-python3.preinst"
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
   -f='${Version} ${Status}' python3) == '3.14.7-3 install ok unpacked' ]]
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/dev/null") == 0:0:600:0:1 ||

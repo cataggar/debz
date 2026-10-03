@@ -12,17 +12,17 @@ The same `tools/prepare-native-dpkg.py` receipt also binds the sibling
 pin does not admit a production `dpkg-query` dependency or broaden the separate
 signed-maintainer-script exception.
 
-The 2026-10-01 Ubuntu `stonking` amd64 snapshot, signed by
-`F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC, has a separate
-executable pin for `dpkg` 1.23.7ubuntu2. Its authenticated exact lock names the archive
+The 2026-10-01 Ubuntu `resolute` amd64 snapshot, signed by
+`F6ECB3762474EDA9D21B7022871920D1991BC93C`, has a separate executable
+pin for `dpkg` 1.23.7ubuntu1. Its authenticated exact lock names the archive
 SHA-512
-`e2de124c6741eddc498badd81b0bf0fee0845e617d81e90ca8cb28dba16946cd23a193cc5e67dbc3dc50f3f9b0b6eab31318a9172b69282586d8bdc20fc9f19c`;
+`3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d`;
 the archive's `usr/bin/update-alternatives` has SHA-256
-`3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d`.
+`023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45`.
 The installed file must still be root-owned, mode 0755, single-linked, and
-exactly match that digest. This additional identity does not change the
-dpkg 1.22.22 reference observations below or admit an arm64 snapshot tool.
+exactly match that digest. This additional amd64 identity does not change the
+dpkg 1.22.22 reference observations below; the real-snapshot acceptance wrapper
+also binds the separate arm64 `dpkg`/`dpkg-divert`/`dpkg-statoverride` identities.
 Before `dpkg` is configured on a fresh root, its authenticated alternatives
 README conffile can be staged as `etc/alternatives/README.dpkg-new`. Native
 capture admits only this spelling and the existing `README` spelling with the
@@ -129,7 +129,7 @@ are in the canonical observation.
 When a registration adds a slave, existing candidates retain their targets
 by slave **name**, not by their former position in the record; a candidate
 without that slave has an empty target line. Both pinned 1.22.22 and snapshot
-1.23.7ubuntu2 tools produced the same sorted record in a two-provider probe
+1.23.7ubuntu1 tools produced the same sorted record in a two-provider probe
 that inserted `b-man` between existing `a-man` and `z-man` slaves (record
 SHA-256 `0b7c0ad2bb53aaab05bd57d81db15dcee652a89a7e677ba6c8eb5c9dfef746bb`).
 
@@ -252,7 +252,7 @@ tool, extra shell tokens, dynamic shell construction, unpinned tools, extra
 groups, cycles, traversal, special files, or changed identities require
 recovery without repair or replay.
 
-The authenticated `stonking` amd64 `less` 668-1build1 archive (SHA-512
+The authenticated `resolute` amd64 `less` 668-1build1 archive (SHA-512
 `957502bf7fc7f49b0e146362e9c4bdf094c6c93fcca25dd1a47f47c6f17dec5b525f793c87ea03867411039ebef402a85f702766cd7c46d916beb53c81f0da45`)
 ships a 292-byte `preinst` (SHA-256
 `c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94`).
@@ -296,7 +296,7 @@ script at step 976 before launch.
 The same signed amd64 snapshot's `bash` 5.3-3ubuntu1 archive (SHA-512
 `05fc4be7d1457e8e853a04c259d73c2c16de18154275612051f0d8efd6d4ec74c23f85b80c6a60c11e217aa4756a6a27650dd03502733b53141ac69c0732d3b4`)
 ships a 492-byte `postinst` (SHA-256
-`e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff`).
+`72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d`).
 It invokes the literal `update-alternatives --install
 /usr/share/man/man7/builtins.7.gz builtins.7.gz
 /usr/share/man/man7/bash-builtins.7.gz 10 || true`, split over shell
@@ -357,7 +357,7 @@ establishes full installation or native/reference parity.
 
 The next script is the authenticated `procps:amd64` 2:4.0.6-3ubuntu1
 `postinst` (3,559 bytes, SHA-256
-`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`)
+`3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8`)
 from archive SHA-512
 `1e9ae9a5912c64c42dcfa5582f04c4bcda21261f7c98dfc45110e2a413666998b5eedfc9f0e53c794b2f7227762f7dd17976572d4b223aa3669e5c4280e15cbf`.
 For `["configure", ""]`, its shell function is called only with the four
@@ -395,15 +395,15 @@ alternatives group. It later refused **before launching** the unrelated
 that symlink, nor does the earlier procps success establish full parity.
 
 The signed `sudo-rs:amd64` 0.2.14-1ubuntu4 archive (SHA-512
-`aeff8aeba736d791c7a2c12b6a46ba7964c5729e63d46bf457700db221d54aa1672beec0df1b15ae584852a57d9607c7a370d041469a24e8192dc84d2b332ea2`)
+`61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189`)
 ships the exact 2,100-byte `postinst` (SHA-256
-`38c229561b765f727b9b995af9e35c7ae43756761c2018f974efd678b4a06fd1`).
+`8204660f7a77c449041d3639d1075d96e76aeda3050fc0ad7780e9c4cc9a69c0`).
 For `["configure", ""]`, it calls `set_perms root root 4755` on both
 `/usr/lib/cargo/bin/sudo` and `/usr/lib/cargo/bin/su`, then invokes a literal
 `update-alternatives --install /usr/bin/sudo sudo /usr/lib/cargo/bin/sudo 50`
 with six literal slaves. The earlier `sudo:amd64` 1.9.17p2-7ubuntu3
 archive (SHA-512
-`92d4e2391529356a959f226ed9da03119736f5e7c68458ea3cc7413caeb1dcbe610ccdfad3474516fca862153cfa149a0a4bb712e985158a9410cfa0363474f7`)
+`7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d`)
 owns **two** existing generic symlinks:
 `/usr/bin/sudoedit -> sudo.ws` and
 `/usr/share/man/man8/sudoedit.8.gz -> sudo.ws.8.gz`. The exact signed
@@ -448,7 +448,7 @@ The new failed root is retained for recovery.
 
 The later signed `sudo:amd64` `1.9.17p2-7ubuntu3` postinst (1,927 bytes,
 SHA-256
-`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`)
+`fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383`)
 encounters a different boundary. Its previously registered 464-byte
 priority-50 `sudo-rs` group and selectors still exist, but signed sudo
 unpack restores `/usr/bin/sudoedit -> sudo.ws` and
@@ -513,7 +513,7 @@ The exact root paths, lock and CAS rehash are in
 This verifies only sudo's signed transition, not full installation parity.
 
 The separate signed `python3:amd64` `3.14.7-3` archive (SHA-512
-`1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6`)
+`616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa`)
 ships an 856-byte preinst (SHA-256
 `115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f`).
 For exactly `["install"]` its alternatives line is
@@ -521,10 +521,10 @@ For exactly `["install"]` its alternatives line is
 the `upgrade)` hooks are unreachable. The `/usr/bin/python3 -> python3.14`
 link belongs instead to signed `python3-minimal:amd64` `3.14.7-3` (archive
 SHA-512
-`3a23950e7a9bb65cf6e40a97bb05f7a7402c04d7167f2bc4d152c05ff8abaee45cbdbc298e937d3a0ff5c49758537e92a4f8880a1aec7629274a4790eae38bdf`).
+`e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5`).
 There is no `python3` alternatives record or selector, and
 `/usr/share/doc/python3/html` is absent. Both pinned dpkg 1.22.22 and
-snapshot 1.23.7ubuntu2 `update-alternatives`, invoked with `--root` on a
+snapshot 1.23.7ubuntu1 `update-alternatives`, invoked with `--root` on a
 protected disposable root, return **2** with `alternative name
 (/usr/bin/python3) must not contain '/' and spaces`, without touching that
 root. This is an invalid *name*, not a valid `--auto python3` transition.
@@ -624,7 +624,7 @@ was **not** the earlier local branch's final closure mismatch: after three
 successful deferred callbacks, ordinal 3 at step **1428** remained
 `prepared` with **no script outcome**. The signed configure-only procps
 postinst SHA-256
-`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+`3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8`
 was pending `/usr/lib/sysctl.d`; its separate `triggered` admission was
 not present in #254. Native execution returned `InvalidAlternativesScriptAuthority`
 (exit 8). This root is retained for read-only evidence, never resumed as
@@ -649,7 +649,7 @@ root is never reused.
 The signed `util-linux:amd64` 2.42.2-1ubuntu2 archive (SHA-512
 `5001310ad3c9236ca3e9910f047dfb3a73696d3b4d4fcd919a241d8694588f9af46ac2237aba8fe8313b524f7cf4f3b1236a86f6942746c68beed68d6a13df62`)
 ships the exact 2,155-byte `postinst` (SHA-256
-`306c812b4cbdca94057f55e0e8c45a2bf80d7ab86d0e60a915b1f2ac6901a6df`).
+`31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9`).
 It assigns `OS=linux`, tests that constant and `command -v
 update-alternatives`, then runs one literal, continued command:
 `update-alternatives --install /usr/bin/pager pager /bin/more 50 --slave
@@ -657,7 +657,7 @@ update-alternatives`, then runs one literal, continued command:
 /usr/share/man/man1/more.1.gz`. The existing `pager` record already selects
 the priority-77 `/usr/bin/less` provider with that slave; `/bin/more` and
 its manpage are root-owned regular files. The exact snapshot tool has SHA-256
-`3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d`.
+`023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45`.
 
 The interrupted root was **copied only for disposable reference probes**;
 its package status was already `install ok installed`, so pinned dpkg 1.22.22
@@ -699,9 +699,9 @@ recorded in the [integration roots](integration-roots.md); no full-closure
 parity follows from this bounded comparison.
 
 The signed `console-setup-linux:all` 1.248ubuntu3 archive (SHA-512
-`b5ad0ebf1b9a526b5af67422b720b29b4e2738ebd945871223bef8241e59b47558f51a31e9638b8e5ce84ea1b42334682f86f9c3d62de224e7c55caa7a5e0f14`,
+`511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b`,
 6,207,548 bytes) ships the exact 6,448-byte postinst (SHA-256
-`5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`).
+`6d4e7cc59222fdde22ef49bc1ed1f2c8405c8a537c00af787f3c22a2edee383e`).
 Its only alternatives-related assignment is the literal
 `CONFIGDIR=/etc/console-setup`; the next two unconditional commands register
 `"$CONFIGDIR/vtrgb"` at priority 50 and `"$CONFIGDIR/vtrgb.vga"` at priority

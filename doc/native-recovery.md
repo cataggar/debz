@@ -580,8 +580,8 @@ known failure still needs the failed-after-mutation claim and provenance;
 unknown outcomes remain
 recovery-required and must never rerun the script.
 
-The reviewed amd64 `stonking` snapshot admits an additional exact executable
-digest for `dpkg` 1.23.7ubuntu2. The older dpkg 1.22.22 pins remain intact;
+The reviewed amd64 `resolute` snapshot admits an additional exact executable
+digest for `dpkg` 1.23.7ubuntu1. The older dpkg 1.22.22 pins remain intact;
 the new pin does not authorize arm64, another executable digest, or a wider
 script command grammar. The exact `less` 668-1build1 amd64 preinst has one
 script-digest-bound exception for its literal `--quiet --remove pager /bin/less`
@@ -600,7 +600,7 @@ is accepted only with the exact pinned README bytes and metadata and is
 included in the pre-script managed-path observation; other staging entries
 remain refused.
 
-The signed `bash` 5.3-3ubuntu1 amd64 postinst has a separate allowance bound
+The signed `bash` 5.3-2ubuntu1 amd64 postinst has a separate allowance bound
 to its exact script digest for one literal priority-10 `builtins.7.gz`
 install followed by `|| true`. Only a new-package `postinst configure` with
 exactly `["configure", ""]` and the snapshot amd64 tool is admitted. The
@@ -610,10 +610,11 @@ its actual outcome is journaled. Normal return permits only an unchanged
 group or the typed install transition, with immutable inputs and unmentioned
 groups unchanged; unknown or malformed state still requires recovery.
 
-The authenticated 2026-10-01 `stonking` snapshot is signed by
-`F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC. Its
-`util-linux` 2.42.2-1ubuntu2 amd64 postinst has a separate
+The authenticated 2026-10-01 `resolute` snapshot is signed by
+`F6ECB3762474EDA9D21B7022871920D1991BC93C`; its frozen Release SHA-256 is
+`596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834` and
+it is admitted with fresh `resolute-updates`/`resolute-security` witnesses. Its
+`util-linux` 2.41.3-3ubuntu2.2 amd64 postinst has a separate
 exact-digest allowance for its `OS=linux` and `command -v
 update-alternatives` guard followed by one literal continued `--install`
 of `/bin/more` at priority 50 into the existing `pager` group. It is admitted

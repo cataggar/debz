@@ -16,7 +16,7 @@ on:
         description: "Pinned snapshot suite/codename"
         required: true
         type: string
-        default: "stonking"
+        default: "resolute"
       run_arm64_dpkg_oracles:
         description: "Capture pinned dpkg 1.22.22 ARM64 oracle evidence"
         required: true
@@ -1669,9 +1669,9 @@ jobs:
       - name: Test real acceptance input validation
         run: |
           tools/real-snapshot-acceptance.sh --validate-values \
-            https://snapshot.ubuntu.com/ubuntu/20261001T000000Z stonking amd64
+            https://snapshot.ubuntu.com/ubuntu/20261001T000000Z resolute amd64
           ! tools/real-snapshot-acceptance.sh --validate-values \
-            https://example.invalid stonking amd64
+            https://example.invalid resolute amd64
       - name: Run static security audit
         run: zig build security-audit
       - name: Prove root reference capability transition
