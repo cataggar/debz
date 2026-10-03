@@ -3,6 +3,7 @@ const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const statoverride = @import("native_lifecycle_statoverride.zig");
 const fifo = @import("native_fifo_fixture.zig");
+const symlink_chains = @import("native_lifecycle_symlink_chains.zig");
 
 fn failureMarker(case: *support.Scenario, content: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
@@ -282,4 +283,5 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     try dependencyFailures(fixture, driver, dpkg, arch);
     try ownership(fixture, driver, dpkg, arch);
     try fifoPayload(fixture, driver, dpkg, arch);
+    try symlink_chains.run(fixture, driver, dpkg, arch);
 }

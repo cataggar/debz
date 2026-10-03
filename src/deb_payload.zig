@@ -1202,7 +1202,7 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
                     allocator.free(target);
                     return setTarFailure(diagnostic, stage, .unsafe_link, member, offset + 157, entries.items.len);
                 }
-            } else if (hasSymlinkAncestor(&paths, target)) {
+            } else if (hasSymlinkAncestor(&paths, target) or isSameOrBeneath(target, path)) {
                 allocator.free(target);
                 return setTarFailure(diagnostic, stage, .conflicting_path, member, offset + 157, entries.items.len);
             }
@@ -1272,6 +1272,9 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
         if (bytes.len - offset < 512 or !allZero(bytes[offset .. offset + 512]))
             return setTarFailure(diagnostic, stage, .tar_trailing_data, member, offset, entries.items.len);
     }
+    if (firstInvalidSymlinkChain(allocator, entries.items) catch
+        return setTarFailure(diagnostic, stage, .out_of_memory, member, offset, entries.items.len)) |index|
+        return setTarFailure(diagnostic, stage, .conflicting_path, member, entries.items[index].header_offset + 157, index);
     return .{
         .compression = member.compression,
         .compressed_bytes = member.size,
@@ -1394,15 +1397,60 @@ fn hasSymlinkAncestor(paths: *const std.StringHashMap(EntryKind), path: []const 
     return false;
 }
 
+fn isSameOrBeneath(path: []const u8, ancestor: []const u8) bool {
+    return std.mem.startsWith(u8, path, ancestor) and
+        (path.len == ancestor.len or path[ancestor.len] == '/');
+}
+
+/// Rejects a symlink that would make an earlier symlink's target resolve
+/// through it as a directory. Paths beneath an in-archive symlink cannot be
+/// extracted by dpkg either, because symlinks are only renamed into place
+/// after the whole archive has been unpacked.
+///
+/// A symlink whose path *equals* an earlier target is the next hop of a
+/// chain such as `libx.so.3 -> libx.so.4 -> libx.so.4.8.0`. dpkg creates each
+/// symlink from its literal bytes and never resolves it, so such a chain is
+/// valid in either archive order and is only checked once the archive is
+/// complete, by `firstInvalidSymlinkChain`.
 fn makesExistingLinkTargetSymlinkMediated(entries: []const Entry, path: []const u8) bool {
     for (entries) |entry| {
         if (entry.kind != .symlink) continue;
         const target = entry.link_target.?;
-        if (std.mem.eql(u8, target, path) or
-            (target.len > path.len and std.mem.startsWith(u8, target, path) and target[path.len] == '/'))
+        if (target.len > path.len and std.mem.startsWith(u8, target, path) and target[path.len] == '/')
             return true;
     }
     return false;
+}
+
+const max_symlink_chain_hops = 40;
+
+/// Returns the first symlink, in archive order, whose canonical chain of
+/// exact in-archive symlink hops cycles or exceeds Linux's 40-hop follow
+/// limit before reaching a non-symlink path. Prefix mediation is already
+/// refused while entries are inventoried, so every hop is an exact path match
+/// and the result depends only on the final set of symlinks, not on their tar
+/// order.
+fn firstInvalidSymlinkChain(allocator: std.mem.Allocator, entries: []const Entry) error{OutOfMemory}!?usize {
+    var symlinks = std.StringHashMap(usize).init(allocator);
+    defer symlinks.deinit();
+    for (entries, 0..) |entry, index| {
+        if (entry.kind == .symlink) try symlinks.put(entry.path, index);
+    }
+    if (symlinks.count() == 0) return null;
+    for (entries, 0..) |entry, start| {
+        if (entry.kind != .symlink) continue;
+        var cursor = start;
+        var chain: [max_symlink_chain_hops]usize = undefined;
+        var hops: usize = 0;
+        while (true) {
+            for (chain[0..hops]) |seen| if (seen == cursor) return start;
+            if (hops == max_symlink_chain_hops) return start;
+            chain[hops] = cursor;
+            hops += 1;
+            cursor = symlinks.get(entries[cursor].link_target.?) orelse break;
+        }
+    }
+    return null;
 }
 
 fn validChecksum(header: []const u8) bool {
@@ -2412,6 +2460,136 @@ test "rejects duplicate paths special files unsafe links and entry bombs" {
     for (checksum_header) |byte| checksum += byte;
     writeOctal(checksum_header[148..156], checksum);
     try std.testing.expectError(error.Unsupported, parseTarTest(allocator, tar.items, member, .{}));
+}
+
+const ChainEntry = struct { path: []const u8, kind: u8 = '2', link: []const u8 = "" };
+
+const orders_of_three = [_][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 }, .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 } };
+
+fn chainTarDiagnostic(allocator: std.mem.Allocator, entries: []const ChainEntry) !?Diagnostic {
+    var tar: std.ArrayList(u8) = .empty;
+    defer tar.deinit(allocator);
+    for (entries) |entry| {
+        const mode: u32 = switch (entry.kind) {
+            '2' => 0o777,
+            '5' => 0o755,
+            else => 0o644,
+        };
+        try appendTarEntry(allocator, &tar, entry.path, entry.kind, mode, entry.link, "");
+    }
+    try finishTar(allocator, &tar);
+    const member: deb_archive.Member = .{ .kind = .data, .compression = .uncompressed, .name = "data.tar", .header = .{ .start = 0, .end = 0 }, .content = .{ .start = 20, .end = 20 + tar.items.len }, .timestamp = 0, .size = tar.items.len };
+    var diagnostic: Diagnostic = undefined;
+    var inventory = parseTar(allocator, tar.items, member, .data_tar, .{}, false, &diagnostic) catch return diagnostic;
+    freeInventory(allocator, &inventory);
+    return null;
+}
+
+fn expectChainAccepted(entries: []const ChainEntry) !void {
+    if (try chainTarDiagnostic(std.testing.allocator, entries)) |diagnostic| {
+        std.debug.print("unexpected {s} at entry {any}\n", .{ @tagName(diagnostic.code), diagnostic.entry_index });
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn expectChainRejected(entries: []const ChainEntry, code: Code, entry_index: usize) !void {
+    const diagnostic = (try chainTarDiagnostic(std.testing.allocator, entries)) orelse return error.TestExpectedError;
+    try std.testing.expectEqual(code, diagnostic.code);
+    try std.testing.expectEqual(@as(?usize, entry_index), diagnostic.entry_index);
+}
+
+test "accepts acyclic in-archive symlink chains in any tar order" {
+    const lib = "usr/lib/aarch64-linux-gnu";
+    const prefix = [_]ChainEntry{
+        .{ .path = "usr", .kind = '5' },
+        .{ .path = "usr/lib", .kind = '5' },
+        .{ .path = lib, .kind = '5' },
+        .{ .path = lib ++ "/libcurl-gnutls.so.4.8.0", .kind = '0' },
+    };
+    // dpkg-deb emits symlinks last and sorted by name, so the head of the
+    // libcurl3t64-gnutls chain precedes the hop it names.
+    const head = ChainEntry{ .path = lib ++ "/libcurl-gnutls.so.3", .link = "libcurl-gnutls.so.4" };
+    const tail = ChainEntry{ .path = lib ++ "/libcurl-gnutls.so.4", .link = "libcurl-gnutls.so.4.8.0" };
+    try expectChainAccepted(&(prefix ++ [_]ChainEntry{ head, tail }));
+    try expectChainAccepted(&(prefix ++ [_]ChainEntry{ tail, head }));
+    // The chain may also precede the regular file it finally names.
+    try expectChainAccepted(&([_]ChainEntry{ prefix[0], prefix[1], prefix[2], head, tail, prefix[3] }));
+
+    // A three-hop chain mixing relative, parent-relative, and absolute
+    // literals is accepted in every order, before or after its target.
+    const hops = [_]ChainEntry{
+        .{ .path = "usr/bin/tool", .link = "../lib/tool" },
+        .{ .path = "usr/lib/tool", .link = "/usr/share/tool" },
+        .{ .path = "usr/share/tool", .link = "real/tool" },
+    };
+    const target = ChainEntry{ .path = "usr/share/real/tool", .kind = '0' };
+    for (orders_of_three) |order| {
+        try expectChainAccepted(&.{ target, hops[order[0]], hops[order[1]], hops[order[2]] });
+        try expectChainAccepted(&.{ hops[order[0]], hops[order[1]], hops[order[2]], target });
+    }
+
+    // Converging chains, a chain to a directory, and a chain whose final
+    // target is outside the archive are all valid dpkg payloads.
+    try expectChainAccepted(&.{
+        .{ .path = "x", .link = "b" },
+        .{ .path = "y", .link = "b" },
+        .{ .path = "b", .link = "dir" },
+        .{ .path = "dir", .kind = '5' },
+        .{ .path = "dir/file", .kind = '0' },
+        .{ .path = "z", .link = "y" },
+        .{ .path = "dangling", .link = "x-missing" },
+        .{ .path = "to-dangling", .link = "dangling" },
+    });
+}
+
+test "rejects symlink cycles, escapes, and symlink-mediated paths in any tar order" {
+    // The first symlink in archive order whose chain never terminates is
+    // reported, whichever entry closes the cycle.
+    try expectChainRejected(&.{ .{ .path = "a", .link = "b" }, .{ .path = "b", .link = "a" } }, .conflicting_path, 0);
+    try expectChainRejected(&.{ .{ .path = "b", .link = "a" }, .{ .path = "a", .link = "b" } }, .conflicting_path, 0);
+    const cycle = [_]ChainEntry{
+        .{ .path = "usr/lib/a", .link = "../share/b" },
+        .{ .path = "usr/share/b", .link = "/usr/c" },
+        .{ .path = "usr/c", .link = "lib/a" },
+    };
+    for (orders_of_three) |order|
+        try expectChainRejected(&.{ cycle[order[0]], cycle[order[1]], cycle[order[2]] }, .conflicting_path, 0);
+    // A chain that leads into a cycle never terminates either.
+    try expectChainRejected(&.{ .{ .path = "file", .kind = '0' }, .{ .path = "x", .link = "a" }, .{ .path = "a", .link = "b" }, .{ .path = "b", .link = "a" } }, .conflicting_path, 1);
+    try expectChainRejected(&.{ .{ .path = "a", .link = "b" }, .{ .path = "b", .link = "a" }, .{ .path = "x", .link = "a" } }, .conflicting_path, 0);
+
+    var names: [max_symlink_chain_hops + 2][]u8 = undefined;
+    for (&names, 0..) |*name, index| name.* = try std.fmt.allocPrint(std.testing.allocator, "n{d}", .{index});
+    defer {
+        for (names) |name| std.testing.allocator.free(name);
+    }
+    var overlong: [max_symlink_chain_hops + 2]ChainEntry = undefined;
+    for (0..max_symlink_chain_hops + 1) |index|
+        overlong[index] = .{ .path = names[index], .link = names[index + 1] };
+    overlong[max_symlink_chain_hops + 1] = .{ .path = names[max_symlink_chain_hops + 1], .kind = '0' };
+    try expectChainAccepted(overlong[1..]);
+    try expectChainRejected(&overlong, .conflicting_path, 0);
+
+    // A symlink naming itself, or a path beneath itself, is a cycle too.
+    try expectChainRejected(&.{.{ .path = "a", .link = "a" }}, .conflicting_path, 0);
+    try expectChainRejected(&.{ .{ .path = "usr", .kind = '5' }, .{ .path = "usr/a", .link = "/usr/a" } }, .conflicting_path, 1);
+    try expectChainRejected(&.{.{ .path = "a", .link = "a/b" }}, .conflicting_path, 0);
+    try expectChainRejected(&.{ .{ .path = "usr", .kind = '5' }, .{ .path = "usr/a", .link = "../usr/a/x" } }, .conflicting_path, 1);
+
+    // A target that resolves through another in-archive symlink as a
+    // directory stays refused in both orders.
+    try expectChainRejected(&.{ .{ .path = "a", .link = "b/c" }, .{ .path = "b", .link = "safe" } }, .conflicting_path, 1);
+    try expectChainRejected(&.{ .{ .path = "b", .link = "safe" }, .{ .path = "a", .link = "b/c" } }, .conflicting_path, 1);
+
+    // dpkg renames symlinks into place only after the whole archive, so an
+    // entry beneath an in-archive symlink cannot be extracted in either order.
+    try expectChainRejected(&.{ .{ .path = "d", .link = "real" }, .{ .path = "d/file", .kind = '0' } }, .conflicting_path, 1);
+    try expectChainRejected(&.{ .{ .path = "d/file", .kind = '0' }, .{ .path = "d", .link = "real" } }, .conflicting_path, 1);
+
+    // A chain hop that leaves the archive root is refused wherever it sits.
+    const escape = [_]ChainEntry{ .{ .path = "usr/a", .link = "b" }, .{ .path = "usr/b", .link = "../../etc" } };
+    try expectChainRejected(&.{ escape[0], escape[1] }, .unsafe_link, 1);
+    try expectChainRejected(&.{ escape[1], escape[0] }, .unsafe_link, 0);
 }
 
 test "accepts GNU base headers but rejects GNU and PAX extension records" {
