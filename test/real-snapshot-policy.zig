@@ -1909,3 +1909,28 @@ test "snapshot: runner bounds and native backend safety checks remain explicit" 
         "update-zero-actions.txt",
     }) |required| try support.contains(runner, required);
 }
+
+test "snapshot: every in-tree real-snapshot pin is a reviewed repin manifest identity" {
+    const tool = "tools/real-snapshot-repin.py";
+    const passed = try support.runWithTimeout(&.{ "python3", tool, "check" }, .inherit, 120);
+    defer passed.deinit();
+    try passed.ok();
+    try support.contains(passed.stdout, "check passed: ");
+
+    const manifest = try source("tools/fixtures/real-snapshot/pin-v1.json");
+    defer support.allocator.free(manifest);
+    const identities = std.mem.indexOf(u8, manifest, "\"identities\": [") orelse return error.MissingIdentities;
+    const marker = "\"digest\": \"sha256:";
+    const at = (std.mem.indexOfPos(u8, manifest, identities, marker) orelse return error.MissingIdentityDigest) + marker.len;
+    manifest[at] = if (manifest[at] == '0') '1' else '0';
+    var work = try support.Work.init();
+    defer work.deinit();
+    try work.write("pin.json", manifest);
+    const path = try work.path("pin.json");
+    defer support.allocator.free(path);
+    const failed = try support.runWithTimeout(&.{ "python3", tool, "check", "--manifest", path }, .inherit, 120);
+    defer failed.deinit();
+    try testing.expectEqual(@as(u8, 1), failed.code);
+    try failed.failsWith("does not pin sha256:");
+    try failed.failsWith("is absent from the manifest");
+}

@@ -1987,7 +1987,7 @@ WORKLOAD_PARTITIONS = {
         "run_package_cache_archive_tests",
     )),
     "workload_release": ("test-workload-release", (
-        "run_apt_schema_tests", "native_only_rehearsal",
+        "run_apt_schema_tests", "native_only_rehearsal", "run_snapshot_repin_tests",
     )),
 }
 WORKLOAD_HELP_BINDING = "addHelpFlagTests(b, workload_core, cli, case.args, case.usage);"
