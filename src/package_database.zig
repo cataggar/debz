@@ -1618,34 +1618,29 @@ const Importer = struct {
         defer seen.deinit();
         var lines = Lines.init(bytes);
         while (lines.next()) |line| {
-            const value = try self.text(.info_triggers, name, line);
-            if (value.len == 0 or value[0] == '#') continue;
+            if (!line.terminated) return self.fail(.info_triggers, .unterminated_line, name, line.number);
+            if (line.text.len > self.options.limits.max_line_bytes) {
+                return self.fail(.info_triggers, .line_too_long, name, line.number);
+            }
+            const parsed = parseTriggerLine(
+                line.text,
+                self.options.limits.max_trigger_name_bytes,
+            ) catch |err| return self.fail(.info_triggers, switch (err) {
+                error.ControlCharacter => .control_character,
+                error.InvalidDeclaration => .invalid_trigger_declaration,
+                error.InvalidName => .invalid_trigger_name,
+            }, name, line.number);
+            const declaration = parsed orelse continue;
             if (declarations.items.len >= self.options.limits.max_trigger_declarations_per_package) {
                 return self.fail(.info_triggers, .trigger_limit, name, line.number);
             }
-            var tokens = std.mem.tokenizeScalar(u8, value, ' ');
-            const kind_text = tokens.next() orelse
-                return self.fail(.info_triggers, .invalid_trigger_declaration, name, line.number);
-            const trigger = tokens.next() orelse
-                return self.fail(.info_triggers, .invalid_trigger_declaration, name, line.number);
-            if (tokens.next() != null) {
-                return self.fail(.info_triggers, .invalid_trigger_declaration, name, line.number);
-            }
-            const kind = declarationKind(kind_text) orelse
-                return self.fail(.info_triggers, .invalid_trigger_declaration, name, line.number);
-            if (trigger.len > self.options.limits.max_trigger_name_bytes or !validTriggerName(trigger)) {
-                return self.fail(.info_triggers, .invalid_trigger_name, name, line.number);
-            }
             seen.beginKey();
-            try seen.appendKey(kind.spelling());
-            try seen.appendKey(trigger);
+            try seen.appendKey(declaration.kind.spelling());
+            try seen.appendKey(declaration.name);
             if (!try seen.insertKey()) {
                 return self.fail(.info_triggers, .duplicate_trigger_declaration, name, line.number);
             }
-            try declarations.append(self.scratch, .{
-                .kind = kind,
-                .name = trigger,
-            });
+            try declarations.append(self.scratch, declaration);
         }
         return try self.arena.dupe(TriggerDeclaration, declarations.items);
     }
@@ -3207,6 +3202,51 @@ pub fn writeTriggerDeclarations(
     return output.toOwnedSlice() catch error.OutOfMemory;
 }
 
+const TriggerLineError = error{ ControlCharacter, InvalidDeclaration, InvalidName };
+
+/// Reads one `triggers` line as dpkg 1.22.22 `trig_parse_ci` does
+/// (`lib/dpkg/triglib.c`): leading blanks are skipped, a `#` then starts a
+/// comment, trailing blanks are trimmed, and an empty line declares nothing.
+/// Blanks are dpkg's `c_iswhite` space and tab. Other control bytes refuse
+/// even in comments, so an installed file always imports again.
+fn parseTriggerLine(text: []const u8, max_name_bytes: usize) TriggerLineError!?TriggerDeclaration {
+    for (text) |byte| {
+        if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return error.ControlCharacter;
+    }
+    const value = std.mem.trim(u8, text, " \t");
+    if (value.len == 0 or value[0] == '#') return null;
+    var tokens = std.mem.tokenizeAny(u8, value, " \t");
+    const kind = declarationKind(tokens.next().?) orelse return error.InvalidDeclaration;
+    const trigger = tokens.next() orelse return error.InvalidDeclaration;
+    if (tokens.next() != null) return error.InvalidDeclaration;
+    if (trigger.len > max_name_bytes or !validTriggerName(trigger)) return error.InvalidName;
+    return .{ .kind = kind, .name = trigger };
+}
+
+/// Whether `bytes`, read exactly as the importer reads
+/// `info/<stem>.triggers`, declares `declarations` in order. Publishing a
+/// package's `triggers` member verbatim relies on this to keep the bytes and
+/// the recorded declarations one fact.
+pub fn triggerFileDeclares(
+    bytes: []const u8,
+    declarations: []const TriggerDeclaration,
+    limits: Limits,
+) bool {
+    var lines = Lines.init(bytes);
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (!line.terminated or line.text.len > limits.max_line_bytes) return false;
+        const parsed = parseTriggerLine(line.text, limits.max_trigger_name_bytes) catch return false;
+        const declaration = parsed orelse continue;
+        if (count == declarations.len) return false;
+        const expected = declarations[count];
+        if (expected.kind != declaration.kind or !std.mem.eql(u8, expected.name, declaration.name))
+            return false;
+        count += 1;
+    }
+    return count == declarations.len;
+}
+
 fn writeTriggerPackage(
     writer: *std.Io.Writer,
     package: Identity,
@@ -4097,6 +4137,70 @@ test "package_database.test.corrupt info files are rejected with exact locations
         .info_triggers,
         .invalid_trigger_declaration,
     );
+    const trigger_cases = [_]struct { bytes: []const u8, code: Code }{
+        .{ .bytes = "# comment\x01\n", .code = .control_character },
+        .{ .bytes = "interest solo\r\n", .code = .control_character },
+        .{ .bytes = "interest solo other\n", .code = .invalid_trigger_declaration },
+        .{ .bytes = "interest\tsolo\tother\n", .code = .invalid_trigger_declaration },
+        .{ .bytes = "interest#solo\n", .code = .invalid_trigger_declaration },
+        .{ .bytes = "interest so|lo\n", .code = .invalid_trigger_name },
+        .{ .bytes = "interest solo", .code = .unterminated_line },
+    };
+    for (trigger_cases) |case| {
+        try expectImportSurface(
+            minimalSnapshot(minimal_status, &.{
+                .{ .name = "solo.list", .bytes = minimal_list },
+                .{ .name = "solo.triggers", .bytes = case.bytes },
+            }),
+            .info_triggers,
+            case.code,
+        );
+    }
+}
+
+test "package_database.test.triggers files are read with dpkg blank and comment rules" {
+    // dpkg 1.22.22 `trig_parse_ci` skips leading blanks, then `#` comments,
+    // trims trailing blanks and ignores empty lines; blanks are space and tab.
+    const bytes = "# Triggers added by dh_makeshlibs/14.5ubuntu1\n\n \t\n" ++
+        "  # indented comment\n\tactivate-noawait\tldconfig \t\n" ++
+        "interest-await   /usr/share/solo  \n";
+    var database = switch (try importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = minimalSnapshot(minimal_status, &.{
+            .{ .name = "solo.list", .bytes = minimal_list },
+            .{ .name = "solo.triggers", .bytes = bytes },
+        }),
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    const declarations = database.model.find("solo", "amd64").?.trigger_declarations.?;
+    try testing.expectEqual(@as(usize, 2), declarations.len);
+    try testing.expectEqual(TriggerDeclarationKind.activate_noawait, declarations[0].kind);
+    try testing.expectEqualStrings("ldconfig", declarations[0].name);
+    try testing.expectEqual(TriggerDeclarationKind.interest_await, declarations[1].kind);
+    try testing.expectEqualStrings("/usr/share/solo", declarations[1].name);
+    try testing.expect(triggerFileDeclares(bytes, declarations, .{}));
+    try testing.expect(!triggerFileDeclares(bytes, declarations[0..1], .{}));
+    try testing.expect(!triggerFileDeclares(bytes ++ "activate solo\n", declarations, .{}));
+    try testing.expect(!triggerFileDeclares("activate-noawait ldconfig\ninterest /usr/share/solo\n", declarations, .{}));
+    try testing.expect(triggerFileDeclares("", &.{}, .{}));
+    try testing.expect(triggerFileDeclares("# nothing\n\n", &.{}, .{}));
+    try testing.expect(!triggerFileDeclares("# nothing", &.{}, .{}));
+
+    var comments_only = switch (try importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = minimalSnapshot(minimal_status, &.{
+            .{ .name = "solo.list", .bytes = minimal_list },
+            .{ .name = "solo.triggers", .bytes = "# nothing\n" },
+        }),
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer comments_only.deinit();
+    try testing.expectEqual(@as(usize, 0), comments_only.model.find("solo", "amd64").?.trigger_declarations.?.len);
 }
 
 test "package_database.test.info directory entries must be safe qualified regular files" {

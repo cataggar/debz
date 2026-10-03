@@ -31,7 +31,7 @@ the engine refuses to approximate. Call `deinit` on a successful model.
 | `metadata` | `templates`, `shlibs`, and `symbols` retained verbatim with digests and never interpreted. |
 | `conffiles` | Declarations including Debian `remove-on-upgrade`, each resolved against the payload. |
 | `checksums` | Parsed and verified `md5sums` entries bound to payload file indexes. |
-| `triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations with await policy and name/path target classification. |
+| `triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations with await policy and name/path target classification, plus the exact member bytes and mode, which are installed verbatim. Comments and blank lines follow dpkg; control bytes other than tab refuse anywhere. |
 | `features` | The supported features this archive actually uses, for corpus inventory and cutover gates. |
 | `digest` | Deterministic SHA-256 of the complete modeled application. |
 

@@ -8787,7 +8787,13 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
             }
             break :block scripts[0..script_count];
         } else &.{};
-        const trigger_declarations = if (builder.request.trigger_execution) block: {
+        // dpkg installs a shipped `triggers` member verbatim, even one that
+        // only holds comments; without trigger execution any declaration
+        // was already handed off above.
+        const trigger_member = model.triggers_member;
+        const trigger_declarations = if (trigger_member != null and
+            (builder.request.trigger_execution or model.triggers.len == 0))
+        block: {
             const declarations = try builder.arena.alloc(
                 package_database.TriggerDeclaration,
                 model.triggers.len,
@@ -8805,7 +8811,7 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
                     .name = trigger.target,
                 };
             }
-            break :block if (declarations.len == 0) null else declarations;
+            break :block declarations;
         } else null;
         try changes.append(builder.allocator, .{ .put_package = .{
             .fields = try statusFields(builder, item, model, .unpacked),
@@ -8816,6 +8822,10 @@ fn stageDatabase(builder: *Builder) PlanError!package_database_changes.Plan {
             else
                 item.declared_conffiles.items,
             .trigger_declarations = trigger_declarations,
+            .trigger_file = if (trigger_declarations != null) .{
+                .bytes = model.metadataBytes(trigger_member.?),
+                .mode = trigger_member.?.mode,
+            } else null,
             .scripts = lifecycle_scripts,
             .metadata = .{ .replace = stagedArchiveMetadata(builder.arena, model) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -12630,6 +12640,11 @@ fn supportedArchiveMetadata(model: *const archive_application.Model) bool {
     return true;
 }
 
+/// A `triggers` file holding only comments or blank lines declares nothing.
+fn declaresTriggers(record: package_database.PackageRecord) bool {
+    return (record.trigger_declarations orelse return false).len != 0;
+}
+
 fn stagedArchiveMetadata(
     allocator: std.mem.Allocator,
     model: *const archive_application.Model,
@@ -12887,8 +12902,7 @@ fn materializeConfigure(
             record.status.error_state != .ok or
             record.status.want == .hold or
             (request.borrowed_attempt == null and record.scripts.len != 0) or
-            (!request.planning.trigger_execution and
-                record.trigger_declarations != null) or
+            (!request.planning.trigger_execution and declaresTriggers(record.*)) or
             record.triggers_pending.len != 0 or
             record.triggers_awaited.len != 0)
             return .{ .outcome = .refused, .detail = "package_not_unpacked" };
@@ -13578,8 +13592,7 @@ fn materializeRemoval(
             configVersionField(record.*) == .invalid)
             return .{ .outcome = .refused, .detail = "config_version" };
         if ((request.borrowed_attempt == null and record.scripts.len != 0) or
-            (!request.planning.trigger_execution and
-                record.trigger_declarations != null) or
+            (!request.planning.trigger_execution and declaresTriggers(record.*)) or
             record.triggers_pending.len != 0 or record.triggers_awaited.len != 0)
             return .{ .outcome = .handoff, .detail = "script_or_trigger" };
 
@@ -14445,6 +14458,23 @@ fn snapshotMetadata(
     return result;
 }
 
+/// Restoring a record restores its exact installed `triggers` bytes; the
+/// change plan proves they still declare the recorded set.
+fn snapshotTriggerFile(
+    allocator: std.mem.Allocator,
+    snapshot: package_database.Snapshot,
+    record: package_database.PackageRecord,
+) !?package_database_changes.StagedTriggerFile {
+    if (record.trigger_declarations == null) return null;
+    const name = try std.fmt.allocPrint(allocator, "{s}.triggers", .{record.info_stem});
+    defer allocator.free(name);
+    const entry = for (snapshot.info) |candidate| {
+        if (std.mem.eql(u8, candidate.name, name)) break candidate;
+    } else return error.InstalledInfoMissing;
+    if (entry.kind != .regular) return error.InstalledInfoMismatch;
+    return .{ .bytes = entry.bytes, .mode = entry.mode };
+}
+
 fn snapshotScripts(
     allocator: std.mem.Allocator,
     snapshot: package_database.Snapshot,
@@ -14531,6 +14561,7 @@ fn materializeRestoredPackageState(
         .md5sums = initial.md5sums,
         .declared_conffiles = initial.declared_conffiles,
         .trigger_declarations = initial.trigger_declarations,
+        .trigger_file = try snapshotTriggerFile(owned, initial_snapshot, initial.*),
         .scripts = try snapshotScripts(owned, initial_snapshot, initial.*),
         .metadata = .{ .replace = try snapshotMetadata(owned, initial_snapshot, initial.*) },
     } };

@@ -91,7 +91,7 @@ database path component.
 | `var/lib/dpkg/info/*.list` | Parse bounded absolute package paths, build the ownership index, and publish the exact final owned path set. |
 | `var/lib/dpkg/info/*.md5sums` | Parse and publish lowercase MD5 plus canonical relative logical archive paths, not diversion destinations. |
 | `var/lib/dpkg/info/*.{preinst,postinst,prerm,postrm}` | Validate regular no-follow files and preserve or replace them according to lifecycle state. |
-| `var/lib/dpkg/info/*.triggers` | Parse and publish the package trigger declarations. |
+| `var/lib/dpkg/info/*.triggers` | Install a shipped `triggers` control member verbatim, as dpkg does, and parse it only for its declarations. The plan proves the exact bytes re-import to the staged declarations. A re-put without new bytes keeps a semantically equal installed file. |
 | `var/lib/dpkg/triggers/File` and `Unincorp` | Parse and publish interests, activations, awaiting packages, and pending work. Lock files are never package state. |
 | `var/lib/dpkg/arch` | Preserve a validated unique foreign-architecture list. Native architecture comes from the authorized request and must agree with healthy installed state. |
 | `var/lib/dpkg/arch-native` | Accept dpkg's postinst-written native architecture only as a safe regular file holding the request's target architecture and at most one newline; any other value refuses before mutation. Native never writes it. |

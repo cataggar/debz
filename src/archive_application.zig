@@ -471,6 +471,9 @@ pub const Model = struct {
     conffiles: []Conffile,
     checksums: []Checksum,
     triggers: []Trigger,
+    /// The exact `triggers` control member, when shipped. dpkg installs it
+    /// verbatim as `info/<stem>.triggers`; `triggers` is only its meaning.
+    triggers_member: ?MetadataMember = null,
     features: Features,
     /// Deterministic digest of the complete modeled application. Stable across
     /// processes and machines for identical archive bytes and expectations.
@@ -710,6 +713,7 @@ const Builder = struct {
     conffiles: std.ArrayList(Conffile) = .empty,
     checksums: std.ArrayList(Checksum) = .empty,
     triggers: std.ArrayList(Trigger) = .empty,
+    triggers_member: ?MetadataMember = null,
     index: std.StringHashMapUnmanaged(usize) = .empty,
     content_digests: std.AutoHashMapUnmanaged(usize, [16]u8) = .empty,
     features: Features,
@@ -810,6 +814,7 @@ fn build(
         .conffiles = owned.conffiles,
         .checksums = owned.checksums,
         .triggers = owned.triggers,
+        .triggers_member = builder.triggers_member,
         .features = builder.features,
         .digest = undefined,
     };
@@ -1154,6 +1159,13 @@ fn buildTriggers(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
         const line = content[offset..line_end];
         const record_offset = entry.content_offset + offset;
         offset = line_end + 1;
+        // The member is installed verbatim, so even a comment must stay
+        // readable by the package database importer: tab is dpkg's only
+        // other blank, and every other control byte refuses.
+        for (line) |byte| {
+            if ((byte < 0x20 and byte != '\t') or byte == 0x7f)
+                return reject(diagnostic, .triggers, .invalid_triggers, record_offset, null);
+        }
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
         const separator = std.mem.indexOfAny(u8, trimmed, " \t") orelse
@@ -1191,6 +1203,15 @@ fn buildTriggers(builder: *Builder, diagnostic: *Diagnostic) BuildError!void {
             .target = target,
         }) catch return reject(diagnostic, .triggers, .out_of_memory, record_offset, null);
     }
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &digest, .{});
+    builder.triggers_member = .{
+        .name = entry.path,
+        .mode = entry.mode,
+        .size = content.len,
+        .sha256 = digest,
+        .content = .{ .offset = entry.content_offset, .length = content.len },
+    };
 }
 
 fn parseTriggerDirective(text: []const u8) ?TriggerDirective {
@@ -1437,6 +1458,14 @@ fn computeDigest(model: *const Model) [32]u8 {
         writer.tag(trigger.await_policy);
         writer.tag(trigger.target_kind);
         writer.text(trigger.target);
+    }
+    // Appended only when shipped, so applications without the member keep
+    // their digest. Its bytes are published verbatim and so are bound here.
+    if (model.triggers_member) |member| {
+        writer.text(member.name);
+        writer.number(member.mode);
+        writer.number(member.size);
+        writer.digest(&member.sha256);
     }
 
     return writer.final();
@@ -1761,6 +1790,10 @@ test "archive_application.test.model exposes application-ready payload metadata"
     try testing.expectEqual(TriggerDirective.activate_await, model.triggers[1].directive);
     try testing.expectEqual(AwaitPolicy.awaited, model.triggers[1].await_policy);
     try testing.expectEqual(TriggerTargetKind.name, model.triggers[1].target_kind);
+    try testing.expectEqualStrings(
+        "# comment\ninterest-noawait /usr/share/demo\nactivate-await demo-trigger\n",
+        model.metadataBytes(model.triggers_member.?),
+    );
 
     try testing.expectEqual(@as(usize, 1), model.checksums.len);
     try testing.expectEqualStrings("usr/share/demo/file", model.checksums[0].path);
@@ -2254,6 +2287,54 @@ test "archive_application.test.trigger declarations fail closed" {
         .invalid_triggers,
         .trigger_declaration,
     );
+    // The member is published verbatim, so a comment must stay importable.
+    try expectRejected(
+        .{ .control = &.{.{ .path = "triggers", .content = "# comment\x01\nactivate demo\n" }} },
+        .invalid_triggers,
+        .trigger_declaration,
+    );
+    try expectRejected(
+        .{ .control = &.{.{ .path = "triggers", .content = "# windows\r\nactivate demo\n" }} },
+        .invalid_triggers,
+        .trigger_declaration,
+    );
+}
+
+test "archive_application.test.triggers member bytes are retained exactly and bound" {
+    const variants = [_][]const u8{
+        "activate demo\n",
+        "# Triggers added by dh_makeshlibs\nactivate demo\n",
+        " \tactivate\tdemo \n\n",
+        "# nothing declared\n",
+    };
+    var digests: [variants.len + 1][32]u8 = undefined;
+    for (variants, 0..) |content, index| {
+        var result = try prepareArchive(.{ .control = &.{.{ .path = "triggers", .mode = 0o640, .content = content }} });
+        switch (result) {
+            .diagnostic => return error.TestUnexpectedResult,
+            .model => |*model| {
+                defer model.deinit();
+                const member = model.triggers_member.?;
+                try testing.expectEqualStrings(content, model.metadataBytes(member));
+                try testing.expectEqual(@as(u32, 0o640), member.mode);
+                try testing.expectEqual(@as(u64, content.len), member.size);
+                try testing.expectEqual(@as(usize, if (index == 3) 0 else 1), model.triggers.len);
+                digests[index] = model.digest;
+            },
+        }
+    }
+    var result = try prepareArchive(.{});
+    switch (result) {
+        .diagnostic => return error.TestUnexpectedResult,
+        .model => |*model| {
+            defer model.deinit();
+            try testing.expect(model.triggers_member == null);
+            digests[variants.len] = model.digest;
+        },
+    }
+    for (digests, 0..) |digest, index| {
+        for (digests[index + 1 ..]) |other| try testing.expect(!std.mem.eql(u8, &digest, &other));
+    }
 }
 
 test "archive_application.test.conffile declarations must match the payload" {

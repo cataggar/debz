@@ -40,7 +40,7 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `info/*.list` | Bounded canonical absolute paths, including dpkg's `/.` root entry; duplicates rejected; ownership index published. |
 | `info/*.md5sums` | Lowercase MD5 plus canonical relative as-shipped payload paths. dpkg installs a shipped member verbatim, so import also accepts leading `./` pairs, which dpkg strips on lookup; other noncanonical spellings, including dpkg's leading `/` and trailing `/`, and duplicates under both spellings are refused. Each entry keeps its listed spelling, so `writeMd5sums` reproduces the imported bytes and order exactly. Partial `Replaces` may leave entries that are no longer in the live `.list`, as dpkg does. |
 | `info/*.conffiles` | Declared conffiles, each of which must appear in the package's status `Conffiles`. |
-| `info/*.triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations. |
+| `info/*.triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations, read with dpkg's `trig_parse_ci` rules: space and tab separate, leading-blank `#` lines are comments, and blank lines are skipped. A comment-only file declares nothing. Other control bytes refuse even in comments. |
 | `info/*.{preinst,postinst,prerm,postrm}` | Regular executable files with safe modes; size, mode, and SHA-256 recorded. |
 | `info/*.config` | Root-owned executable-mode inert metadata typed per package by mode, uid/gid, size, and SHA-256; exact bytes retained without execution. |
 | `info/*.alternatives` | Root-owned inert binary metadata retained with exact bytes, mode, size, and SHA-256; direct dpkg does not interpret it. |
