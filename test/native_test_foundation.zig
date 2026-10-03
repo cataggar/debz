@@ -283,6 +283,8 @@ pub const Fixture = struct {
     pub const BuildOptions = struct {
         zero_time_path: ?[]const u8 = null,
         compression: enum { gzip, none } = .gzip,
+        /// Paths left out of `md5sums`, as `dh_md5sums` leaves out conffiles.
+        md5sums_omit: []const []const u8 = &.{},
     };
 
     /// Assemble a package from a fixture-owned source tree, including the
@@ -312,6 +314,10 @@ pub const Fixture = struct {
             while (try walker.next(self.io)) |entry| {
                 if (entry.kind != .file or std.mem.eql(u8, entry.path, "DEBIAN") or
                     std.mem.startsWith(u8, entry.path, "DEBIAN/")) continue;
+                const omitted = for (options.md5sums_omit) |omit| {
+                    if (std.mem.eql(u8, omit, entry.path)) break true;
+                } else false;
+                if (omitted) continue;
                 const relative = try self.allocator.dupe(u8, entry.path);
                 errdefer self.allocator.free(relative);
                 const bytes = try root.readFileAlloc(self.allocator, try root_fs.Path.initPackage(relative), max_database_bytes);
