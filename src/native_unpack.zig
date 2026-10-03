@@ -2533,7 +2533,8 @@ pub const PackagePlan = struct {
     application_sha256: [32]u8,
     paths: []const PlannedPath,
     removals: []const Removal,
-    /// Canonical `.list` content, sorted, with dpkg's `/.` root record.
+    /// Canonical `.list` content in dpkg publication order, with dpkg's
+    /// `/.` root record.
     list_paths: []const []const u8,
     md5sums: []const package_database.Md5sumEntry,
     conffiles: []const PlannedConffile = &.{},
@@ -8014,8 +8015,6 @@ fn publishRecords(builder: *Builder, item: *PackageWork) PlanError!void {
                 try absoluteSpelling(builder, conffile.path),
         );
     }
-    const first_payload_path: usize = if (item.model.root != null) 1 else 0;
-    std.mem.sort([]const u8, item.list_paths.items[first_payload_path..], {}, lessPath);
     std.mem.sort(package_database.Md5sumEntry, item.md5sums.items, {}, lessMd5sum);
 }
 
@@ -37461,9 +37460,9 @@ test "native_unpack.test.ownership lists include only archive-declared root entr
             defer planned.deinit();
             const list = planned.database.find("info/demo.list") orelse return error.TestUnexpectedResult;
             const expected = if (include_root)
-                if (include_file) "/.\n/!file\n/usr/share/demo/file\n" else "/.\n"
+                if (include_file) "/.\n/usr/share/demo/file\n/!file\n" else "/.\n"
             else if (include_file)
-                "/!file\n/usr/share/demo/file\n"
+                "/usr/share/demo/file\n/!file\n"
             else
                 "";
             try testing.expectEqualStrings(expected, list.bytes);

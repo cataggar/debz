@@ -59,6 +59,9 @@
     "dpkg": {
       "$ref": "#/$defs/file"
     },
+    "dpkg_query": {
+      "$ref": "#/$defs/file"
+    },
     "schema": {
       "const": "https://debz.dev/schema/native-dpkg-reference-receipt-v1"
     },
@@ -73,6 +76,7 @@
     "architecture",
     "archive",
     "dpkg",
+    "dpkg_query",
     "schema",
     "update_alternatives",
     "version"

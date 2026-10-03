@@ -25,11 +25,13 @@ PINS = {
     "amd64": {
         "archive": "3e800c6d75e8e709007ed1c356e5fa8509a75c1694fb0a1183709abc9cfdc1f3",
         "executable": "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
+        "dpkg_query": "095817337215129933918cacae5fd62e86202fe238591bea207a75b73561e8c5",
         "update_alternatives": "b02b581c6a7f85679f32efe18c9aaeb05316847fa90d3d3fda30b57defab9b13",
     },
     "arm64": {
         "archive": "1142468e57f69e13d174f517dff739508c61ee97d81c182c120cd6b281d8cdfa",
         "executable": "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79",
+        "dpkg_query": "a5377f6b04e6d251d013c13a2399cb83db8462bf249949b5d76ae0e22842e83a",
         "update_alternatives": "35616ec58ba58f3fb8b4820bdf893c47a842d56684b3335ba6ebf6df86b27cc5",
     },
 }
@@ -106,6 +108,10 @@ def receipt_document(
             prefix / "usr/bin/dpkg",
             PINS[architecture]["executable"],
         ),
+        "dpkg_query": file_binding(
+            prefix / "usr/bin/dpkg-query",
+            PINS[architecture]["dpkg_query"],
+        ),
         "schema": "https://debz.dev/schema/native-dpkg-reference-receipt-v1",
         "update_alternatives": file_binding(
             prefix / "usr/bin/update-alternatives",
@@ -151,6 +157,7 @@ def verify_receipt(path: Path, architecture: str) -> dict[str, object]:
             "architecture",
             "archive",
             "dpkg",
+            "dpkg_query",
             "schema",
             "update_alternatives",
             "version",
@@ -165,6 +172,7 @@ def verify_receipt(path: Path, architecture: str) -> dict[str, object]:
         raise RuntimeError("pinned reference receipt archive mismatch")
     for name, key, relative in (
         ("dpkg", "executable", "usr/bin/dpkg"),
+        ("dpkg_query", "dpkg_query", "usr/bin/dpkg-query"),
         (
             "update_alternatives",
             "update_alternatives",
@@ -209,6 +217,20 @@ def update_alternatives_version(executable: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in match.groups())
 
 
+def dpkg_query_version(executable: str) -> tuple[int, int, int]:
+    result = subprocess.run(
+        [executable, "--version"], check=True, capture_output=True, text=True,
+        timeout=10, env={**os.environ, "LC_ALL": "C"},
+    )
+    match = re.search(
+        r"\bversion (\d+)\.(\d+)\.(\d+)\b",
+        result.stdout.partition("\n")[0],
+    )
+    if match is None:
+        raise RuntimeError(f"unrecognized dpkg-query reference version: {executable}")
+    return tuple(int(part) for part in match.groups())
+
+
 def select(executable: Path | None, architecture: str, *, root_accounts: bool = False) -> str:
     if architecture not in PINS:
         raise RuntimeError(f"unsupported reference architecture: {architecture}")
@@ -235,6 +257,24 @@ def select(executable: Path | None, architecture: str, *, root_accounts: bool = 
         file=sys.stderr,
     )
     return selected
+
+
+def select_dpkg_query(executable: Path, architecture: str) -> str:
+    if architecture not in PINS:
+        raise RuntimeError(f"unsupported reference architecture: {architecture}")
+    if not executable.is_absolute() or executable.resolve(strict=True) != executable:
+        raise RuntimeError(
+            "pinned dpkg-query reference must be an absolute, non-symlink path"
+        )
+    verify_file(executable, PINS[architecture]["dpkg_query"])
+    found = dpkg_query_version(str(executable))
+    if found != tuple(int(part) for part in VERSION.split(".")):
+        raise RuntimeError("pinned dpkg-query reference version mismatch")
+    print(
+        f"Query reference: dpkg-query ({'.'.join(map(str, found))})",
+        file=sys.stderr,
+    )
+    return str(executable)
 
 
 def select_update_alternatives(executable: Path, architecture: str) -> str:
@@ -290,6 +330,10 @@ def prepare(
     executable = prefix / "usr/bin/dpkg"
     if prefix.exists():
         select(executable, architecture, root_accounts=True)
+        select_dpkg_query(
+            prefix / "usr/bin/dpkg-query",
+            architecture,
+        )
         select_update_alternatives(
             prefix / "usr/bin/update-alternatives",
             architecture,
@@ -310,6 +354,10 @@ def prepare(
         staged = workspace / "prefix"
         subprocess.run(["dpkg-deb", "--extract", str(archive), str(staged)], check=True, timeout=60)
         select(staged / "usr/bin/dpkg", architecture, root_accounts=True)
+        select_dpkg_query(
+            staged / "usr/bin/dpkg-query",
+            architecture,
+        )
         select_update_alternatives(
             staged / "usr/bin/update-alternatives",
             architecture,
