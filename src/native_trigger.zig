@@ -355,6 +355,174 @@ pub fn triggerAuthorized(authority: Authority, trigger: []const u8) bool {
     return false;
 }
 
+pub const interest_directory = package_database.database_directory ++ "/" ++
+    package_database.triggers_directory;
+pub const file_interest_path = package_database.database_directory ++ "/" ++
+    package_database.triggers_file_path;
+pub const maximum_interest_bytes: usize = 64 * 1024 * 1024;
+
+/// How the helper admitted one activation.
+pub const Admission = enum {
+    /// The trigger is one the authority's handlers are interested in.
+    authorized,
+    /// Neither the authority nor the live root has interest in the trigger,
+    /// so it is queued exactly like `dpkg-trigger` and incorporation drops
+    /// it without awaiting the caller.
+    no_interest,
+};
+
+/// Interest observed in the live root's trigger database, mirroring dpkg
+/// 1.22.22 `lib/dpkg/triglib.c`:
+/// - an explicit trigger has interest when `triggers/<name>` exists
+///   (`trk_explicit_start`, lines 287-302; a missing file activates nobody,
+///   `trk_explicit_activate_awaiter`, lines 317-345);
+/// - a file trigger has interest when a `triggers/File` record names it or
+///   one of its parent directories (`trig_file_interests_ensure`, lines
+///   527-570, and `trig_path_activate_byname` with
+///   `trig_file_activate_parents`, lines 593-624).
+/// Pending `triggers/Unincorp` activations never count as interest.
+pub const LiveInterest = struct {
+    named: bool = false,
+    file: bool = false,
+};
+
+/// dpkg's directory-prefix rule: `/a/b/c` activates `/a/b/c`, `/a/b`, and
+/// `/a`, because `trig_file_activate_parents` strips one trailing component
+/// at a time.
+fn pathInterestCovers(interest: []const u8, trigger: []const u8) bool {
+    if (interest.len == 0 or interest[0] != '/') return false;
+    if (std.mem.eql(u8, interest, trigger)) return true;
+    return trigger.len > interest.len and
+        std.mem.startsWith(u8, trigger, interest) and
+        trigger[interest.len] == '/';
+}
+
+fn validInterestPackage(token: []const u8) bool {
+    const text = if (std.mem.endsWith(u8, token, "/noawait"))
+        token[0 .. token.len - "/noawait".len]
+    else
+        token;
+    if (text.len == 0 or text.len > 255) return false;
+    if (std.mem.indexOfScalar(u8, text, ':')) |colon|
+        return package_database.validPackageName(text[0..colon]) and
+            package_database.validArchitecture(text[colon + 1 ..]);
+    return package_database.validPackageName(text);
+}
+
+fn interestLines(bytes: []const u8) !std.mem.SplitIterator(u8, .scalar) {
+    if (bytes.len > maximum_interest_bytes) return error.TriggerInterestMalformed;
+    const body = if (std.mem.endsWith(u8, bytes, "\n"))
+        bytes[0 .. bytes.len - 1]
+    else
+        bytes;
+    if (body.len == 0 and bytes.len != 0) return error.TriggerInterestMalformed;
+    return std.mem.splitScalar(u8, body, '\n');
+}
+
+/// Validates a named interest file with the same record grammar the native
+/// database importer accepts. An empty file is malformed there too.
+pub fn validateNamedInterest(bytes: []const u8) !void {
+    if (bytes.len == 0) return error.TriggerInterestMalformed;
+    var lines = try interestLines(bytes);
+    while (lines.next()) |line| {
+        if (!validInterestPackage(line)) return error.TriggerInterestMalformed;
+    }
+}
+
+/// Validates every `triggers/File` record and reports whether one names
+/// `trigger` or a parent directory of it.
+pub fn fileInterestCovers(bytes: []const u8, trigger: []const u8) !bool {
+    var covered = false;
+    if (bytes.len == 0) return false;
+    var lines = try interestLines(bytes);
+    while (lines.next()) |line| {
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse
+            return error.TriggerInterestMalformed;
+        const path = line[0..space];
+        if (path.len == 0 or path[0] != '/' or
+            !package_database.validTriggerName(path) or
+            !validInterestPackage(line[space + 1 ..]))
+            return error.TriggerInterestMalformed;
+        if (pathInterestCovers(path, trigger)) covered = true;
+    }
+    return covered;
+}
+
+fn readInterestFile(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    text: []const u8,
+) !?[]u8 {
+    const path = root_fs.Path.init(text) catch
+        return error.TriggerInterestUnreadable;
+    return root.readFileAlloc(
+        allocator,
+        path,
+        maximum_interest_bytes,
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.TriggerInterestUnreadable,
+    };
+}
+
+/// Reads only the interest record that decides `trigger`, relative to the
+/// root descriptor and without following any symbolic link. Unreadable and
+/// malformed records fail closed with their own errors.
+pub fn readLiveInterest(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    trigger: []const u8,
+) !LiveInterest {
+    if (trigger.len != 0 and trigger[0] == '/') {
+        if (!package_database.validTriggerName(trigger))
+            return error.InvalidArguments;
+        const bytes = (try readInterestFile(
+            allocator,
+            root,
+            file_interest_path,
+        )) orelse return .{};
+        defer allocator.free(bytes);
+        return .{ .file = try fileInterestCovers(bytes, trigger) };
+    }
+    if (!package_database.validPackageName(trigger) or
+        trigger.len > maximum_helper_argument_bytes)
+        return error.InvalidArguments;
+    var buffer: [interest_directory.len + 1 + maximum_helper_argument_bytes]u8 =
+        undefined;
+    const path = std.fmt.bufPrint(
+        &buffer,
+        "{s}/{s}",
+        .{ interest_directory, trigger },
+    ) catch return error.InvalidArguments;
+    const bytes = (try readInterestFile(allocator, root, path)) orelse
+        return .{};
+    defer allocator.free(bytes);
+    try validateNamedInterest(bytes);
+    return .{ .named = true };
+}
+
+/// Admits an authorized trigger, or one nobody is interested in when the
+/// live root has been observed. An interested but unauthorized trigger,
+/// including a file trigger whose parent directory an authorized interest
+/// covers, stays refused: native incorporation only models exact names.
+pub fn admitTrigger(
+    authority: Authority,
+    trigger: []const u8,
+    live: ?LiveInterest,
+) error{UnauthorizedActivation}!Admission {
+    if (triggerAuthorized(authority, trigger)) return .authorized;
+    const observed = live orelse return error.UnauthorizedActivation;
+    if (trigger.len != 0 and trigger[0] == '/') {
+        if (observed.file) return error.UnauthorizedActivation;
+        for (authority.allowed_triggers) |allowed| {
+            if (pathInterestCovers(allowed, trigger))
+                return error.UnauthorizedActivation;
+        }
+    } else if (observed.named) return error.UnauthorizedActivation;
+    return .no_interest;
+}
+
 pub fn stateDigest(model: package_database.Model) [32]u8 {
     var hash = Sha256.init(.{});
     hash.update("debz-native-trigger-state-v1\x00");
@@ -670,7 +838,23 @@ fn decodeOperationEvidence(
     };
 }
 
+/// Authorizes the caller and its trigger. `live` is the root's observed
+/// interest state; without it only authorized triggers are admitted.
 pub fn authorizeInvocation(
+    operation: ?OperationEvidence,
+    authority: ?Authority,
+    script: ?ActiveScript,
+    request: HelperRequest,
+    live: ?LiveInterest,
+) !Admission {
+    try authorizeCaller(operation, authority, script, request);
+    return admitTrigger(authority.?, request.trigger, live);
+}
+
+/// Every check except the trigger name: the operation must be held in its
+/// script phase by the authorized program and attempt, and the active
+/// script must be an authorized caller matching the request.
+pub fn authorizeCaller(
     operation: ?OperationEvidence,
     authority: ?Authority,
     script: ?ActiveScript,
@@ -693,7 +877,6 @@ pub fn authorizeInvocation(
             &active_authority.attempt_id,
         ) or
         !callerAuthorized(active_authority, active_script) or
-        !triggerAuthorized(active_authority, request.trigger) or
         !std.mem.eql(u8, request.package, active_script.package) or
         !std.mem.eql(
             u8,
@@ -732,12 +915,22 @@ pub fn runHelper(
     );
     defer allocator.free(operation_bytes);
     const operation = try decodeOperationEvidence(allocator, operation_bytes);
-    try authorizeInvocation(
+    try authorizeCaller(
         operation,
         authority.authority,
         script.script,
         request,
     );
+    // The live root is read only after the held operation, program, attempt,
+    // and caller have been proven.
+    _ = if (triggerAuthorized(authority.authority, request.trigger))
+        Admission.authorized
+    else
+        try admitTrigger(
+            authority.authority,
+            request.trigger,
+            try readLiveInterest(allocator, root, request.trigger),
+        );
 
     var lock_file = root.openRegularFile(
         try root_fs.Path.init(queue_lock_path),
@@ -1038,36 +1231,39 @@ test "native_trigger invocation authority refuses absent stale and mismatched ev
         .attempt_id = @splat(0x44),
         .program_sha256 = @splat(0x33),
     };
-    try authorizeInvocation(operation, authority, script, request);
+    try std.testing.expectEqual(
+        Admission.authorized,
+        try authorizeInvocation(operation, authority, script, request, null),
+    );
     try std.testing.expectError(
         error.NoActiveOperation,
-        authorizeInvocation(null, authority, script, request),
+        authorizeInvocation(null, authority, script, request, null),
     );
     try std.testing.expectError(
         error.NoTriggerAuthority,
-        authorizeInvocation(operation, null, script, request),
+        authorizeInvocation(operation, null, script, request, null),
     );
     try std.testing.expectError(
         error.NoActiveScript,
-        authorizeInvocation(operation, authority, null, request),
+        authorizeInvocation(operation, authority, null, request, null),
     );
     var stale_operation = operation;
     stale_operation.attempt_id[0] ^= 1;
     try std.testing.expectError(
         error.UnauthorizedActivation,
-        authorizeInvocation(stale_operation, authority, script, request),
+        authorizeInvocation(stale_operation, authority, script, request, null),
     );
     var stale_script = script;
     stale_script.script_sha256[0] ^= 1;
     try std.testing.expectError(
         error.UnauthorizedActivation,
-        authorizeInvocation(operation, authority, stale_script, request),
+        authorizeInvocation(operation, authority, stale_script, request, null),
     );
     var mismatched_request = request;
     mismatched_request.package = "other";
     try std.testing.expectError(
         error.UnauthorizedActivation,
-        authorizeInvocation(operation, authority, script, mismatched_request),
+        authorizeInvocation(operation, authority, script, mismatched_request, null),
     );
 }
 
@@ -1087,4 +1283,307 @@ test "native_trigger queue entry bound fails before allocation growth" {
         error.QueueLimit,
         Queue.parse(std.testing.allocator, bytes.items),
     );
+}
+
+const test_handlers = [_]Handler{.{
+    .package = "receiver",
+    .version = "1",
+    .architecture = "amd64",
+    .source = .installed_package,
+    .postinst_sha256 = @as([32]u8, @splat(0x11)),
+    .declarations_sha256 = @splat(0x22),
+}};
+const test_callers = [_]Caller{.{
+    .package = "caller",
+    .version = "2",
+    .architecture = "amd64",
+    .source = .new_package,
+    .kind = .postinst,
+    .script_sha256 = @splat(0x66),
+}};
+const test_authority: Authority = .{
+    .program_sha256 = @splat(0x33),
+    .attempt_id = @splat(0x44),
+    .initial_state_sha256 = @splat(0x55),
+    .handlers = &test_handlers,
+    .callers = &test_callers,
+    .allowed_triggers = &.{ "/usr/lib/debz", "debz-trigger" },
+    .maximum_invocations = 8,
+};
+const test_script: ActiveScript = .{
+    .program_sha256 = @splat(0x33),
+    .package = "caller",
+    .version = "2",
+    .architecture = "amd64",
+    .kind = .postinst,
+    .source = .new_package,
+    .script_sha256 = @splat(0x66),
+};
+const test_operation: OperationEvidence = .{
+    .state = .mutating,
+    .phase = .script,
+    .attempt_id = @splat(0x44),
+    .program_sha256 = @splat(0x33),
+};
+
+fn testRequest(trigger: []const u8, mode: package_database.AwaitMode) HelperRequest {
+    return .{
+        .mode = mode,
+        .trigger = trigger,
+        .package = "caller",
+        .architecture = "amd64",
+    };
+}
+
+test "native_trigger no-interest admission follows dpkg live interest rules" {
+    const none: LiveInterest = .{};
+    const request = testRequest("libc-upgrade", .noawait);
+    try std.testing.expectEqual(
+        Admission.no_interest,
+        try authorizeInvocation(test_operation, test_authority, test_script, request, none),
+    );
+    // Without an observed live root only authorized triggers are admitted.
+    try std.testing.expectError(
+        error.UnauthorizedActivation,
+        authorizeInvocation(test_operation, test_authority, test_script, request, null),
+    );
+    try std.testing.expectError(
+        error.UnauthorizedActivation,
+        admitTrigger(test_authority, "libc-upgrade", .{ .named = true }),
+    );
+    try std.testing.expectEqual(
+        Admission.authorized,
+        try admitTrigger(test_authority, "debz-trigger", .{ .named = true }),
+    );
+    try std.testing.expectEqual(
+        Admission.no_interest,
+        try admitTrigger(test_authority, "/usr/share/debz/unwatched", none),
+    );
+    try std.testing.expectError(
+        error.UnauthorizedActivation,
+        admitTrigger(test_authority, "/usr/share/debz/unwatched", .{ .file = true }),
+    );
+    // An authorized directory interest covers its children, which dpkg would
+    // activate through `trig_file_activate_parents`; native incorporation
+    // matches exact names only, so this stays refused.
+    try std.testing.expectError(
+        error.UnauthorizedActivation,
+        admitTrigger(test_authority, "/usr/lib/debz/child", none),
+    );
+    try std.testing.expectEqual(
+        Admission.no_interest,
+        try admitTrigger(test_authority, "/usr/lib/debz-sibling", none),
+    );
+    try std.testing.expectEqual(
+        Admission.authorized,
+        try admitTrigger(test_authority, "/usr/lib/debz", .{ .file = true }),
+    );
+
+    // Every non-trigger check still refuses a no-interest activation.
+    var stale_operation = test_operation;
+    stale_operation.attempt_id[0] ^= 1;
+    var wrong_phase = test_operation;
+    wrong_phase.phase = .trigger;
+    var wrong_state = test_operation;
+    wrong_state.state = .recovering;
+    var wrong_program = test_operation;
+    wrong_program.program_sha256.?[0] ^= 1;
+    for ([_]OperationEvidence{ stale_operation, wrong_phase, wrong_state, wrong_program }) |operation|
+        try std.testing.expectError(
+            error.UnauthorizedActivation,
+            authorizeInvocation(operation, test_authority, test_script, request, none),
+        );
+    var unknown_caller = test_script;
+    unknown_caller.script_sha256[0] ^= 1;
+    var wrong_kind = test_script;
+    wrong_kind.kind = .preinst;
+    for ([_]ActiveScript{ unknown_caller, wrong_kind }) |script|
+        try std.testing.expectError(
+            error.UnauthorizedActivation,
+            authorizeInvocation(test_operation, test_authority, script, request, none),
+        );
+    var other_package = request;
+    other_package.package = "receiver";
+    var other_architecture = request;
+    other_architecture.architecture = "arm64";
+    for ([_]HelperRequest{ other_package, other_architecture }) |mismatched|
+        try std.testing.expectError(
+            error.UnauthorizedActivation,
+            authorizeInvocation(test_operation, test_authority, test_script, mismatched, none),
+        );
+}
+
+test "native_trigger live interest records use dpkg prefixes and fail closed" {
+    const records = "/usr/share/debz pkg\n/usr/lib/other other:arm64/noawait\n";
+    try std.testing.expect(try fileInterestCovers(records, "/usr/share/debz"));
+    try std.testing.expect(try fileInterestCovers(records, "/usr/share/debz/a/b"));
+    try std.testing.expect(try fileInterestCovers(records, "/usr/lib/other/x"));
+    try std.testing.expect(!try fileInterestCovers(records, "/usr/share/debzz"));
+    try std.testing.expect(!try fileInterestCovers(records, "/usr/share"));
+    try std.testing.expect(!try fileInterestCovers("", "/usr/share/debz"));
+    inline for ([_][]const u8{
+        "\n",
+        "relative pkg\n",
+        "/usr/share/debz\n",
+        "/usr/share/debz pkg extra\n",
+        "/usr/share/debz Bad\n",
+        "/usr//debz pkg\n",
+        "/usr/share/debz/ pkg\n",
+        "/usr/../debz pkg\n",
+        "/usr/share/debz pkg:\n",
+        "/usr/share/debz pkg\n\n/usr/x pkg\n",
+        "/usr/share/debz pkg/sometimes\n",
+    }) |malformed| try std.testing.expectError(
+        error.TriggerInterestMalformed,
+        fileInterestCovers(malformed, "/usr/share/unrelated"),
+    );
+    try validateNamedInterest("pkg\nother:arm64/noawait\n");
+    try validateNamedInterest("pkg");
+    inline for ([_][]const u8{ "", "\n", "pkg\n\nother\n", "two words\n", "pkg/await\n" }) |malformed|
+        try std.testing.expectError(
+            error.TriggerInterestMalformed,
+            validateNamedInterest(malformed),
+        );
+}
+
+const TestRoot = struct {
+    tmp: std.testing.TmpDir,
+    root: root_fs.Root,
+
+    fn init(operation: OperationEvidence) !TestRoot {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        errdefer tmp.cleanup();
+        const root = root_fs.Root.init(std.testing.io, tmp.dir);
+        const allocator = std.testing.allocator;
+        try root.createDirectoryPath(try root_fs.Path.init(namespace_path), .fromMode(0o755));
+        try root.createDirectoryPath(try root_fs.Path.init(interest_directory), .fromMode(0o755));
+        const authority = try authorityJson(allocator, test_authority);
+        defer allocator.free(authority);
+        try root.publishFile(try root_fs.Path.init(authority_path), authority, .{});
+        const program = hex(test_script.program_sha256);
+        const caller = hex(test_script.script_sha256);
+        const script = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schema\":\"https://debz.dev/schema/native-lifecycle-script-v1\"," ++
+                "\"program_sha256\":\"{s}\",\"step\":1,\"package\":\"caller\"," ++
+                "\"version\":\"2\",\"architecture\":\"amd64\",\"kind\":\"postinst\"," ++
+                "\"source\":\"new_package\",\"script_sha256\":\"{s}\"," ++
+                "\"arguments\":[\"configure\",\"\"],\"outcome\":\"in_flight\",\"exit_code\":null}}\n",
+            .{ &program, &caller },
+        );
+        defer allocator.free(script);
+        try root.publishFile(try root_fs.Path.init(script_record_path), script, .{});
+        const attempt = hex(operation.attempt_id);
+        const operation_program = hex(operation.program_sha256.?);
+        const record = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schema\":\"https://debz.dev/schema/root-operation-record-v1\"," ++
+                "\"attempt_id\":\"{s}\",\"state\":\"{s}\",\"phase\":\"{s}\"," ++
+                "\"program_sha256\":\"{s}\"}}\n",
+            .{ &attempt, @tagName(operation.state), @tagName(operation.phase), &operation_program },
+        );
+        defer allocator.free(record);
+        try root.publishFile(try root_fs.Path.init(operation_record_path), record, .{});
+        return .{ .tmp = tmp, .root = root };
+    }
+
+    fn deinit(self: *TestRoot) void {
+        self.tmp.cleanup();
+    }
+
+    fn write(self: TestRoot, path: []const u8, bytes: []const u8) !void {
+        try self.root.publishFile(try root_fs.Path.init(path), bytes, .{});
+    }
+
+    fn queue(self: TestRoot) ![]u8 {
+        return self.root.readFileAlloc(
+            std.testing.allocator,
+            try root_fs.Path.init(interest_directory ++ "/Unincorp"),
+            maximum_queue_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => try std.testing.allocator.dupe(u8, "<absent>"),
+            else => err,
+        };
+    }
+
+    fn run(self: TestRoot, trigger: []const u8, mode: package_database.AwaitMode) !void {
+        try runHelper(std.testing.allocator, std.testing.io, self.root, testRequest(trigger, mode));
+    }
+
+    fn expectQueue(self: TestRoot, expected: []const u8) !void {
+        const bytes = try self.queue();
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+};
+
+test "native_trigger helper queues no-interest activations like dpkg-trigger" {
+    var case = try TestRoot.init(test_operation);
+    defer case.deinit();
+    // dpkg-trigger writes `<trigger> -` for --no-await and the caller for an
+    // awaited activation (`do_trigger`, src/trigger/main.c lines 174-208).
+    try case.write(interest_directory ++ "/Unincorp", "");
+    try case.run("libc-upgrade", .noawait);
+    try case.expectQueue("libc-upgrade -\n");
+    try case.run("debz-unwatched", .awaited);
+    try case.expectQueue("libc-upgrade -\ndebz-unwatched caller\n");
+    try case.run("/usr/share/debz/unwatched", .noawait);
+    try case.expectQueue("libc-upgrade -\ndebz-unwatched caller\n/usr/share/debz/unwatched -\n");
+    // A pending activation is not interest: the same trigger is queued again.
+    try case.run("libc-upgrade", .awaited);
+    try case.expectQueue(
+        "libc-upgrade caller -\ndebz-unwatched caller\n/usr/share/debz/unwatched -\n",
+    );
+    // An authorized trigger never reads interest state, even a malformed one.
+    try case.write(interest_directory ++ "/debz-trigger", "Malformed Record\n");
+    try case.run("debz-trigger", .noawait);
+}
+
+test "native_trigger helper refuses interested and unreadable live interest" {
+    var case = try TestRoot.init(test_operation);
+    defer case.deinit();
+    try case.write(interest_directory ++ "/Unincorp", "");
+    try case.write(interest_directory ++ "/libc-upgrade", "systemd/noawait\n");
+    try std.testing.expectError(error.UnauthorizedActivation, case.run("libc-upgrade", .noawait));
+    try case.write(interest_directory ++ "/File", "/usr/share/debz other\n");
+    try std.testing.expectError(error.UnauthorizedActivation, case.run("/usr/share/debz", .noawait));
+    try std.testing.expectError(error.UnauthorizedActivation, case.run("/usr/share/debz/child", .noawait));
+    try case.run("/usr/share/debzz", .noawait);
+    try case.expectQueue("/usr/share/debzz -\n");
+
+    try case.write(interest_directory ++ "/debz-malformed", "\n");
+    try std.testing.expectError(error.TriggerInterestMalformed, case.run("debz-malformed", .noawait));
+    try case.write(interest_directory ++ "/File", "/usr/share/debz\n");
+    try std.testing.expectError(error.TriggerInterestMalformed, case.run("/usr/share/other", .noawait));
+    try case.root.removeFile(try root_fs.Path.init(file_interest_path));
+    try case.root.createSymbolicLink(try root_fs.Path.init(file_interest_path), "Unincorp");
+    try std.testing.expectError(error.TriggerInterestUnreadable, case.run("/usr/share/other", .noawait));
+    try case.root.createSymbolicLink(try root_fs.Path.init(interest_directory ++ "/debz-link"), "/dev/null");
+    try std.testing.expectError(error.TriggerInterestUnreadable, case.run("debz-link", .noawait));
+    try case.root.createDirectoryPath(try root_fs.Path.init(interest_directory ++ "/debz-directory"), .fromMode(0o755));
+    try std.testing.expectError(error.TriggerInterestUnreadable, case.run("debz-directory", .noawait));
+    try case.expectQueue("/usr/share/debzz -\n");
+}
+
+test "native_trigger helper reads no interest state outside a held operation" {
+    var wrong_phase = test_operation;
+    wrong_phase.phase = .trigger;
+    var case = try TestRoot.init(wrong_phase);
+    defer case.deinit();
+    // A planted interest symlink would be TriggerInterestUnreadable if it were
+    // read; the operation check must refuse first.
+    try case.root.createSymbolicLink(try root_fs.Path.init(interest_directory ++ "/libc-upgrade"), "/etc/shadow");
+    try std.testing.expectError(error.UnauthorizedActivation, case.run("libc-upgrade", .noawait));
+    try case.expectQueue("<absent>");
+}
+
+test "native_trigger helper refuses a symlinked trigger directory" {
+    var case = try TestRoot.init(test_operation);
+    defer case.deinit();
+    try case.root.createDirectoryPath(try root_fs.Path.init("elsewhere"), .fromMode(0o755));
+    try case.root.publishFile(try root_fs.Path.init("elsewhere/libc-upgrade"), "systemd\n", .{});
+    try case.root.removeDirectory(try root_fs.Path.init(interest_directory));
+    try case.root.createSymbolicLink(try root_fs.Path.init(interest_directory), "../../../elsewhere");
+    try std.testing.expectError(error.TriggerInterestUnreadable, case.run("libc-upgrade", .noawait));
+    try std.testing.expectError(error.TriggerInterestUnreadable, case.run("/usr/share/other", .noawait));
 }

@@ -1525,6 +1525,8 @@ test "security: final recovery matrix and prior completion are mutation enforced
         "try blockedUnknown(&fixture, driver, reference.executable, reference.architecture, true);",
         "try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, false);",
         "try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, true);",
+        "try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, false);",
+        "try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, true);",
         "for ([_]Corruption{ .intent, .progress, .artifact, .managed_root, .completed_phase }) |which|",
         "try corruptedOrdinary(&fixture, driver, reference.architecture, which);",
     });
@@ -1534,11 +1536,21 @@ test "security: final recovery matrix and prior completion are mutation enforced
         "try std.testing.expectEqualSlices(u8, stable, try rootWithoutActiveClaim(fixture, scenario.native_root));",
         "try same(try stickyActiveClaim(fixture, scenario.native_root), original_claim);",
     });
-    try nativeMutationsIn(&f, "native-final", "test/native_recovery_helper.zig", "fn triggerOutcome(", "\nconst Corruption =", &.{
+    try nativeMutationsIn(&f, "native-final", "test/native_recovery_helper.zig", "fn triggerOutcome(", "\nfn noInterestOutcome(", &.{
         "\"after_trigger_outcome\"",
         "if (events.value.events.len != 2) return error.IncorrectTriggerEventCount;",
         "observed[0].origin != .automatic or observed[1].origin != .dynamic",
         "try same(observed[1].trigger, \"debz-b\");",
+        ".acknowledge = true,",
+    });
+    try nativeMutationsIn(&f, "native-final", "test/native_recovery_helper.zig", "fn noInterestOutcome(", "\nconst Corruption =", &.{
+        "\"after_script_outcome\"",
+        ".activations = &.{ \"debz-unwatched\", \"/usr/share/debz-unwatched/child\" },",
+        ".activation_await = true,",
+        "\"debz-unwatched \"",
+        "std.mem.indexOf(u8, line, \"debz-trigger-source\") == null",
+        "std.mem.indexOf(u8, status, \"Triggers-Awaited:\") != null or",
+        "std.mem.indexOf(u8, status, \"Triggers-Pending:\") != null",
         ".acknowledge = true,",
     });
     try nativeMutationsIn(&f, "native-final", "test/native_recovery_helper.zig", "fn corruptedOrdinary(", "\nfn caseRun(", &.{
