@@ -18,6 +18,7 @@ const package = foundation.package;
 
 test {
     _ = @import("native_failure_schema_validation.zig");
+    _ = dpkg_query;
 }
 
 fn failureMarker(case: *support.Scenario, content: []const u8) !void {

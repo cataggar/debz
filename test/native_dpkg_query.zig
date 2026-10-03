@@ -86,6 +86,94 @@ fn verifyReceiptBinding(
         return error.ReferenceReceiptMismatch;
 }
 
+fn syntheticReceipt(
+    allocator: std.mem.Allocator,
+    architecture: []const u8,
+    digest_hex: []const u8,
+    size: u64,
+    include_query: bool,
+) ![]u8 {
+    if (!include_query) {
+        return std.fmt.allocPrint(allocator,
+            \\{{
+            \\  "architecture": "{s}",
+            \\  "archive": {{}},
+            \\  "dpkg": {{}},
+            \\  "schema": "{s}",
+            \\  "update_alternatives": {{}},
+            \\  "version": "{s}"
+            \\}}
+            \\
+        , .{ architecture, receipt_schema, reference_version });
+    }
+    return std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "architecture": "{s}",
+        \\  "archive": {{}},
+        \\  "dpkg": {{}},
+        \\  "dpkg_query": {{
+        \\    "sha256": "{s}",
+        \\    "size": {d}
+        \\  }},
+        \\  "schema": "{s}",
+        \\  "update_alternatives": {{}},
+        \\  "version": "{s}"
+        \\}}
+        \\
+    , .{ architecture, digest_hex, size, receipt_schema, reference_version });
+}
+
+fn verifySyntheticReceipt(
+    receipt: []const u8,
+    architecture: []const u8,
+    digest_hex: []const u8,
+    size: u64,
+) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = receipt_name,
+        .data = receipt,
+    });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, receipt_name, std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    try verifyReceiptBinding(std.testing.allocator, std.testing.io, path, architecture, digest_hex, size);
+}
+
+test "dpkg-query reference receipt binding validates every bound attribute" {
+    const allocator = std.testing.allocator;
+    const architecture = "arm64";
+    const digest_hex = try expectedDpkgQueryDigest(architecture);
+    const size = 199328;
+    const valid = try syntheticReceipt(allocator, architecture, digest_hex, size, true);
+    defer allocator.free(valid);
+
+    try verifySyntheticReceipt(valid, architecture, digest_hex, size);
+    try std.testing.expectError(
+        error.InvalidReferenceReceipt,
+        verifySyntheticReceipt(valid, "amd64", digest_hex, size),
+    );
+
+    var wrong_digest = try allocator.dupe(u8, digest_hex);
+    defer allocator.free(wrong_digest);
+    wrong_digest[0] = if (wrong_digest[0] == '0') '1' else '0';
+    try std.testing.expectError(
+        error.ReferenceReceiptMismatch,
+        verifySyntheticReceipt(valid, architecture, wrong_digest, size),
+    );
+    try std.testing.expectError(
+        error.ReferenceReceiptMismatch,
+        verifySyntheticReceipt(valid, architecture, digest_hex, size + 1),
+    );
+
+    const legacy = try syntheticReceipt(allocator, architecture, digest_hex, size, false);
+    defer allocator.free(legacy);
+    try std.testing.expectError(
+        error.InvalidReferenceReceipt,
+        verifySyntheticReceipt(legacy, architecture, digest_hex, size),
+    );
+}
+
 fn selectReferenceDpkgQuery(allocator: std.mem.Allocator, io: std.Io, dpkg: []const u8, architecture: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(dpkg)) return error.InvalidReferencePath;
     const bin = std.fs.path.dirname(dpkg) orelse return error.InvalidReferencePath;
