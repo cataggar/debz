@@ -649,8 +649,8 @@ source of truth for:
 - identity records, each with these fields: `id`, `kind`
   (`script` | `tool_file` | `archive` | `prestate`), `package`,
   `architectures`, `member`/`path`, `sha256`, `size`, `mode`,
-  `version_bound`, `provenance` (version, archive SHA-512 per architecture),
-  `consumers` (files and constants) and `review`.
+  boolean `version_bound`, `provenance` (version, archive SHA-512 per
+  architecture), `consumers` (files and constants) and `review`.
 
 **Offline enforcement (Zig).** `test/real-snapshot-policy.zig` gains a
 manifest cross-check in normal CI. It fails in these cases:

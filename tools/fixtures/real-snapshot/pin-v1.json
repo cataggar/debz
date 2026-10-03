@@ -74,7 +74,7 @@
       "provenance": "pending",
       "review": "#249",
       "size": 4942,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -116,7 +116,7 @@
       "provenance": "pending",
       "review": "#251",
       "size": 2533,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -166,7 +166,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 1927,
-      "version_bound": "1.9.17p2-7ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -211,7 +211,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 856,
-      "version_bound": "3.14.7-3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -240,7 +240,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 292,
-      "version_bound": "668-1build1"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -273,7 +273,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 374,
-      "version_bound": "668-1build1"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -306,7 +306,7 @@
       "provenance": "pending",
       "review": "#235",
       "size": 492,
-      "version_bound": "5.3-3ubuntu1"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -339,7 +339,7 @@
       "provenance": "pending",
       "review": "#240",
       "size": 3559,
-      "version_bound": "2:4.0.6-3ubuntu1"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -368,7 +368,7 @@
       "provenance": "pending",
       "review": "#331",
       "size": 2100,
-      "version_bound": "0.2.14-1ubuntu4"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -397,7 +397,7 @@
       "provenance": "pending",
       "review": "#331",
       "size": 2155,
-      "version_bound": "2.42.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -430,7 +430,7 @@
       "provenance": "pending",
       "review": "#247",
       "size": 6448,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -463,7 +463,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 414,
-      "version_bound": "1.238-1"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -492,7 +492,7 @@
       "provenance": "pending",
       "review": "#250",
       "size": 6993,
-      "version_bound": "4.8-4ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -521,7 +521,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 204,
-      "version_bound": "4.8-4ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -550,7 +550,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 698,
-      "version_bound": "4.8-4ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -575,7 +575,7 @@
       "provenance": "pending",
       "review": "#249",
       "size": 4330,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -600,7 +600,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 32119,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -625,7 +625,7 @@
       "provenance": "pending",
       "review": "#249",
       "size": 174753,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -650,7 +650,7 @@
       "provenance": "pending",
       "review": "#243",
       "size": 677,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -675,7 +675,7 @@
       "provenance": "pending",
       "review": "#244",
       "size": 576415,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -700,7 +700,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 3301,
-      "version_bound": "6.19.0-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -725,7 +725,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 15912,
-      "version_bound": "6.19.0-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -750,7 +750,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 129856,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -791,7 +791,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 322728,
-      "version_bound": "1.23.7ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -820,7 +820,7 @@
       "provenance": "pending",
       "review": "#322",
       "size": 330816,
-      "version_bound": "1.23.7ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -845,7 +845,7 @@
       "provenance": "pending",
       "review": "#366",
       "size": 125768,
-      "version_bound": "1.23.7ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -870,7 +870,7 @@
       "provenance": "pending",
       "review": "#366",
       "size": 133872,
-      "version_bound": "1.23.7ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -895,7 +895,7 @@
       "provenance": "pending",
       "review": "#366",
       "size": 55936,
-      "version_bound": "1.23.7ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -920,7 +920,7 @@
       "provenance": "pending",
       "review": "#366",
       "size": 68184,
-      "version_bound": "1.23.7ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -945,7 +945,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 21123,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -966,7 +966,7 @@
       "provenance": "pending",
       "review": "#253",
       "size": 142160,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -999,7 +999,7 @@
       "provenance": "pending",
       "review": "#253",
       "size": 3228,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1040,7 +1040,7 @@
       "provenance": "pending",
       "review": "#229",
       "size": 59864,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1061,7 +1061,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 100,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1082,7 +1082,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 19448,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1107,7 +1107,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 798,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1132,7 +1132,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 143,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1153,7 +1153,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 73048,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1178,7 +1178,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 131024,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1199,7 +1199,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 303976,
-      "version_bound": "261.2-1ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1220,7 +1220,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 24358,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1241,7 +1241,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 18147,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1262,7 +1262,7 @@
       "provenance": "pending",
       "review": "#252",
       "size": 7135,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1287,7 +1287,7 @@
       "provenance": "pending",
       "review": "#253",
       "size": 64096,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1308,7 +1308,7 @@
       "provenance": "pending",
       "review": "#253",
       "size": 68176,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1329,7 +1329,7 @@
       "provenance": "pending",
       "review": "#253",
       "size": 60016,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1354,7 +1354,7 @@
       "provenance": "pending",
       "review": "#253",
       "size": 27,
-      "version_bound": "1.9.17p2-7ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1379,7 +1379,7 @@
       "provenance": "pending",
       "review": "#242",
       "size": 282080,
-      "version_bound": "1.9.17p2-7ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1404,7 +1404,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 12804,
-      "version_bound": "1.9.17p2-7ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1429,7 +1429,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 158,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1454,7 +1454,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 155,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1483,7 +1483,7 @@
       "provenance": "pending",
       "review": "#254",
       "size": 23672,
-      "version_bound": "3.14.7-3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1508,7 +1508,7 @@
       "provenance": "pending",
       "review": "#254",
       "size": 25858,
-      "version_bound": "3.14.7-3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1533,7 +1533,7 @@
       "provenance": "pending",
       "review": "#242",
       "size": 954870,
-      "version_bound": "1.9.17p2-7ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1558,7 +1558,7 @@
       "provenance": "pending",
       "review": "#331",
       "size": 590768,
-      "version_bound": "0.2.14-1ubuntu4"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1587,7 +1587,7 @@
       "provenance": "pending",
       "review": "#247",
       "size": 6207548,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1612,7 +1612,7 @@
       "provenance": "pending",
       "review": "#249",
       "size": 108150,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1637,7 +1637,7 @@
       "provenance": "pending",
       "review": "#251",
       "size": 333804,
-      "version_bound": "4.8-4ubuntu2"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1662,7 +1662,7 @@
       "provenance": "pending",
       "review": "#256",
       "size": 1613714,
-      "version_bound": null
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1684,7 +1684,7 @@
       "provenance": "pending",
       "review": "#356",
       "size": 12718,
-      "version_bound": "2026.08.18"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1710,7 +1710,7 @@
       "provenance": "pending",
       "review": "#356",
       "size": 2334,
-      "version_bound": "2026.08.18"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1749,7 +1749,7 @@
       "provenance": "pending",
       "review": "#242",
       "size": 2376,
-      "version_bound": "1.9.17p2-7ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1776,7 +1776,7 @@
       "provenance": "pending",
       "review": "#254",
       "size": 918,
-      "version_bound": "3.14.7-3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1807,7 +1807,7 @@
       "provenance": "pending",
       "review": "#254",
       "size": 781,
-      "version_bound": "3.14.7-3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1838,7 +1838,7 @@
       "provenance": "pending",
       "review": "#248",
       "size": 41489,
-      "version_bound": "1.248ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1873,7 +1873,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 464,
-      "version_bound": "1.9.17p2-7ubuntu3"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1920,7 +1920,7 @@
       "provenance": "pending",
       "review": "#220",
       "size": 658,
-      "version_bound": "0.2.14-1ubuntu4"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1951,7 +1951,7 @@
       "provenance": "pending",
       "review": "#256",
       "size": 124,
-      "version_bound": "2.90.0-1"
+      "version_bound": false
     },
     {
       "architectures": [
@@ -1998,7 +1998,7 @@
       "provenance": "pending",
       "review": "#254",
       "size": 96,
-      "version_bound": "3.14.7-3"
+      "version_bound": false
     }
   ],
   "schema": "io.github.cataggar.debz.real-snapshot-pin.v1",

@@ -557,8 +557,8 @@ fn expectAbsent(haystack: []const u8, needle: []const u8) !void {
 const bounded = "[{\"suite\":\"stable\",\"role\":\"bounded\"}]";
 
 /// Writes the in-tree consumers that a checked-in repin manifest pins.
-fn writeTree(h: *Harness, uri: []const u8, postinst_name: []const u8, postinst: []const u8, gamma: []const u8) !void {
-    try h.work.write(try h.print("tree/src/fixtures/ubuntu-alpha-{s}-postinst", .{postinst_name}), postinst);
+fn writeTree(h: *Harness, uri: []const u8, postinst: []const u8, gamma: []const u8) !void {
+    try h.work.write("tree/src/fixtures/ubuntu-alpha-postinst", postinst);
     try h.work.write("tree/src/native_unpack.zig", try h.print(
         "const snapshot_beta_tool_sha256 = .{{ {s} }};\n" ++
             "const beta_inputs = .{{.{{ .path = \"usr/bin/beta-tool\", .size = {d}, .mode = 0o755, .sha256 = \"{s}\" }}}};\n",
@@ -586,13 +586,13 @@ test "repin: synthetic signed snapshots drive probe, diff, record and check acro
     const profile = try h.writeProfile("synthetic-main", "main", try h.fingerprint(), bounded);
     const identities = try h.print(
         "[{{\"id\":\"script:alpha/postinst\",\"kind\":\"script\",\"package\":\"alpha\",\"architectures\":[\"amd64\",\"arm64\"]," ++
-            "\"path\":\"postinst\",\"digest\":\"sha256:{s}\",\"size\":{d},\"mode\":\"0755\",\"version_bound\":\"1.0\"," ++
-            "\"provenance\":\"pending\",\"consumers\":[{{\"path\":\"src/fixtures/ubuntu-alpha-1.0-postinst\",\"form\":\"fixture\"}}],\"review\":\"#1\"}}," ++
+            "\"path\":\"postinst\",\"digest\":\"sha256:{s}\",\"size\":{d},\"mode\":\"0755\",\"version_bound\":false," ++
+            "\"provenance\":\"pending\",\"consumers\":[{{\"path\":\"src/fixtures/ubuntu-alpha-postinst\",\"form\":\"fixture\"}}],\"review\":\"#1\"}}," ++
             "{{\"id\":\"file:beta/usr/bin/beta-tool\",\"kind\":\"tool_file\",\"package\":\"beta\",\"architectures\":[\"amd64\",\"arm64\"]," ++
-            "\"path\":\"usr/bin/beta-tool\",\"digest\":\"sha256:{s}\",\"size\":{d},\"mode\":\"0755\",\"version_bound\":null," ++
+            "\"path\":\"usr/bin/beta-tool\",\"digest\":\"sha256:{s}\",\"size\":{d},\"mode\":\"0755\",\"version_bound\":false," ++
             "\"provenance\":\"pending\",\"consumers\":[{{\"path\":\"src/native_unpack.zig\",\"form\":\"zig_bytes\",\"name\":\"snapshot_beta_tool_sha256\"}}],\"review\":\"#1\"}}," ++
             "{{\"id\":\"archive:gamma\",\"kind\":\"archive\",\"package\":\"gamma\",\"architectures\":[\"amd64\"]," ++
-            "\"path\":null,\"digest\":\"sha512:{s}\",\"size\":{d},\"mode\":null,\"version_bound\":\"1.0\"," ++
+            "\"path\":null,\"digest\":\"sha512:{s}\",\"size\":{d},\"mode\":null,\"version_bound\":false," ++
             "\"provenance\":\"pending\",\"consumers\":[{{\"path\":\"tools/real-snapshot-acceptance.sh\",\"form\":\"hex\"}}],\"review\":\"#1\"}}]",
         .{
             try sha256Hex(allocator, postinst_1_0), postinst_1_0.len,
@@ -604,7 +604,7 @@ test "repin: synthetic signed snapshots drive probe, diff, record and check acro
     try h.writeDebz("synthetic-main", "");
     const uri_1 = try h.print("file://{s}/{s}", .{ try h.path("main"), try h.timestamp(t1) });
     const uri_2 = try h.print("file://{s}/{s}", .{ try h.path("main"), try h.timestamp(t2) });
-    try writeTree(&h, uri_1, "1.0", postinst_1_0, gamma_1);
+    try writeTree(&h, uri_1, postinst_1_0, gamma_1);
     const manifest = try h.path("synthetic-main.pin.json");
     const tree = try h.path("tree");
     const check_args = [_][]const u8{ "check", "--manifest", manifest, "--root", tree, "--profile", try h.path("synthetic-main.profile.json") };
@@ -670,21 +670,19 @@ test "repin: synthetic signed snapshots drive probe, diff, record and check acro
         "--reviewed", "script:alpha/postinst=" ++ reviewed, "--reviewed", "archive:gamma=" ++ reviewed,
     }, 0)).stdout, try h.print("recorded {s}: 0 unchanged, 1 provenance-only, 2 changed, 0 missing", .{try h.timestamp(t2)}));
     const repinned = try h.read("synthetic-main.pin.json");
-    try contains(repinned, "\"path\": \"src/fixtures/ubuntu-alpha-1.1-postinst\"");
+    try contains(repinned, "\"path\": \"src/fixtures/ubuntu-alpha-postinst\"");
     try contains(repinned, "\"review\": \"#330\"");
 
     // The tree still pins the old bytes, so the offline check fails until the
     // consumers carry the reviewed identities.
     const stale = try h.repin(&check_args, 1);
-    try contains(stale.stderr, "script:alpha/postinst consumer src/fixtures/ubuntu-alpha-1.1-postinst does not exist");
-    try contains(stale.stderr, "fixture src/fixtures/ubuntu-alpha-1.0-postinst is not a manifest identity consumer");
+    try contains(stale.stderr, "script:alpha/postinst consumer src/fixtures/ubuntu-alpha-postinst bytes do not match");
     try contains(stale.stderr, try h.print("archive:gamma consumer tools/real-snapshot-acceptance.sh does not pin sha512:{s}", .{gamma_2}));
     try contains(stale.stderr, try h.print("URI consumer tools/real-snapshot-acceptance.sh does not pin {s}", .{uri_2}));
     try contains(stale.stderr, "in-tree pin tools/real-snapshot-acceptance.sh:4");
-    try h.work.directory.dir.deleteFile(io, "tree/src/fixtures/ubuntu-alpha-1.0-postinst");
     const member = try h.read("ws/t2/members/script_alpha_postinst@amd64");
     try std.testing.expectEqualStrings(postinst_1_1, member);
-    try writeTree(&h, uri_2, "1.1", member, gamma_2);
+    try writeTree(&h, uri_2, member, gamma_2);
     try contains(
         (try h.repin(&check_args, 0)).stdout,
         try h.print("check passed: 3 identities for synthetic-main {s} (probed)", .{try h.timestamp(t2)}),

@@ -63,7 +63,7 @@ def identity(**overrides) -> dict:
         "digest": sha256(SCRIPT),
         "size": len(SCRIPT),
         "mode": "0755",
-        "version_bound": "1.0",
+        "version_bound": False,
         "provenance": "pending",
         "consumers": [{"path": "pins.txt", "form": "hex"}],
         "review": "#1",
@@ -272,6 +272,8 @@ class ManifestTests(unittest.TestCase):
             (lambda m: m.update(extra=1), "unknown"),
             (lambda m: m["identities"][0].update(digest=SCRIPT.hex()), "algorithm-tagged"),
             (lambda m: m["identities"][0].update(digest=sha512(SCRIPT)), "members bind SHA-256"),
+            (lambda m: m["identities"][0].update(version_bound="1.0"), "version_bound must be a boolean"),
+            (lambda m: m["identities"][0].update(version_bound=True), "version_bound requires recorded provenance"),
             (lambda m: m["identities"][0].update(consumers=[]), "no consumer"),
             (lambda m: m["identities"][0].update(review="PR 1"), "review"),
             (lambda m: m["identities"].append(copy.deepcopy(m["identities"][0])), "duplicate identity"),
@@ -285,7 +287,8 @@ class ManifestTests(unittest.TestCase):
                 repin.validate_manifest(value)
 
     def test_built_in_profiles_cannot_be_replaced(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        (ROOT / ".tmp").mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="real-snapshot-repin-profile-", dir=ROOT / ".tmp") as directory:
             path = Path(directory) / "profile.json"
             replacement = profile()
             replacement["name"] = "ubuntu-stonking"
@@ -309,13 +312,17 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(repin.identity_status(recorded, {"amd64": rebuilt})[0], "provenance-only")
         self.assertEqual(repin.identity_status(recorded, {"amd64": observed(digest=sha256(b"x"))})[0], "changed")
         self.assertEqual(repin.identity_status(recorded, {"amd64": observed(mode="0644")})[0], "changed")
-        self.assertEqual(repin.identity_status(recorded, {"amd64": observed(version="1.1")})[0], "changed")
+        self.assertEqual(repin.identity_status(recorded, {"amd64": observed(version="1.1")})[0], "provenance-only")
+        version_bound = dict(recorded, version_bound=True)
+        status, reasons = repin.identity_status(version_bound, {"amd64": observed(version="1.1")})
+        self.assertEqual(status, "changed")
+        self.assertIn("version-bound identity moved", reasons[0])
         self.assertEqual(repin.identity_status(recorded, {"amd64": None})[0], "missing")
         self.assertEqual(repin.identity_status(recorded, {})[0], "missing")
 
-    def test_unbound_version_change_with_same_bytes_is_provenance_only(self) -> None:
-        unbound = identity(version_bound=None, provenance={"version": "1.0", "archives": {"amd64": sha512(b"1.0")}})
-        status, reasons = repin.identity_status(unbound, {"amd64": observed(version="1.1")})
+    def test_exact_byte_identity_version_change_with_same_bytes_is_provenance_only(self) -> None:
+        exact = identity(provenance={"version": "1.0", "archives": {"amd64": sha512(b"1.0")}})
+        status, reasons = repin.identity_status(exact, {"amd64": observed(version="1.1")})
         self.assertEqual(status, "provenance-only")
         self.assertIn("archive", reasons[0])
 
@@ -402,15 +409,38 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(updated["identities"][0]["digest"], sha256(changed))
         self.assertEqual(updated["identities"][0]["review"], "cataggar/debz#2")
 
-    def test_version_change_renames_versioned_fixture_consumers(self) -> None:
+    def test_exact_byte_version_change_keeps_fixture_consumers(self) -> None:
         consumers = [
             {"path": "src/fixtures/ubuntu-alpha-1.0-postinst", "form": "fixture"},
             {"path": "pins-1.0.txt", "form": "hex"},
         ]
-        value = manifest([identity(version_bound="1:1.0", consumers=consumers)])
+        value = manifest([identity(consumers=consumers, provenance={"version": "1:1.0", "archives": {"amd64": sha512(b"1.0")}})])
         probe = report({"script:alpha/postinst": {"amd64": observed(version="1:1.1")}})
-        updated = repin.record_manifest(value, probe, self.diff(value, probe), {"script:alpha/postinst": "#3"}, None)
-        self.assertEqual(updated["identities"][0]["version_bound"], "1:1.1")
+        updated = repin.record_manifest(value, probe, self.diff(value, probe), {}, None)
+        self.assertEqual(updated["identities"][0]["version_bound"], False)
+        self.assertEqual(updated["identities"][0]["provenance"]["version"], "1:1.1")
+        self.assertEqual(
+            [consumer["path"] for consumer in updated["identities"][0]["consumers"]],
+            ["src/fixtures/ubuntu-alpha-1.0-postinst", "pins-1.0.txt"],
+        )
+
+    def test_explicit_version_bound_identity_requires_review_and_renames_fixture(self) -> None:
+        consumers = [
+            {"path": "src/fixtures/ubuntu-alpha-1.0-postinst", "form": "fixture"},
+            {"path": "pins-1.0.txt", "form": "hex"},
+        ]
+        value = manifest([identity(
+            version_bound=True,
+            consumers=consumers,
+            provenance={"version": "1:1.0", "archives": {"amd64": sha512(b"1.0")}},
+        )])
+        probe = report({"script:alpha/postinst": {"amd64": observed(version="1:1.1")}})
+        diff = self.diff(value, probe)
+        with self.assertRaisesRegex(repin.RepinError, "changed without re-review: script:alpha/postinst"):
+            repin.record_manifest(value, probe, diff, {}, None)
+        updated = repin.record_manifest(value, probe, diff, {"script:alpha/postinst": "#3"}, None)
+        self.assertEqual(updated["identities"][0]["version_bound"], True)
+        self.assertEqual(updated["identities"][0]["provenance"]["version"], "1:1.1")
         self.assertEqual(
             [consumer["path"] for consumer in updated["identities"][0]["consumers"]],
             ["src/fixtures/ubuntu-alpha-1.1-postinst", "pins-1.0.txt"],
@@ -547,7 +577,7 @@ class CheckTests(unittest.TestCase):
             ]),
             identity(
                 id="file:beta/usr/bin/beta", kind="tool_file", package="beta", path="usr/bin/beta",
-                digest=sha256(TOOL), size=len(TOOL), version_bound=None,
+                digest=sha256(TOOL), size=len(TOOL), version_bound=False,
                 consumers=[{"path": "src/maintainer_script.zig", "form": "hex"}],
             ),
         ])
@@ -592,7 +622,7 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(any("constant snapshot_alpha_sha256" in failure for failure in failures))
         self.assertTrue(any("disagrees with file:beta/usr/bin/beta" in failure for failure in failures))
 
-    def test_uri_and_version_consumers_are_enforced(self) -> None:
+    def test_uri_consumers_are_enforced_and_default_admissions_ignore_versions(self) -> None:
         script = self.root / "tools/real-snapshot-synthetic.sh"
         script.write_text(script.read_text() + f"old=file:///x/{'snapshot.ubuntu.com/ubuntu/20260101T000000Z'}\n")
         self.assertTrue(any("pins another snapshot" in failure for failure in self.failures()))
@@ -600,7 +630,13 @@ class CheckTests(unittest.TestCase):
         moved["snapshot"]["timestamp"] = T1
         self.assertTrue(any("does not pin file:///synthetic/snapshot/" + T1 in failure for failure in self.failures(moved)))
         renamed = copy.deepcopy(self.manifest)
-        renamed["identities"][0]["version_bound"] = "1.1"
+        renamed["identities"][0]["provenance"] = {"version": "1.1", "archives": {"amd64": sha512(b"1.1")}}
+        self.assertFalse(any("version" in failure for failure in self.failures(renamed)))
+
+    def test_explicit_version_bound_consumers_are_enforced(self) -> None:
+        renamed = copy.deepcopy(self.manifest)
+        renamed["identities"][0]["version_bound"] = True
+        renamed["identities"][0]["provenance"] = {"version": "1.1", "archives": {"amd64": sha512(b"1.1")}}
         self.assertTrue(any("does not carry version 1.1" in failure for failure in self.failures(renamed)))
 
     def test_series_must_match_its_reviewed_profile(self) -> None:
