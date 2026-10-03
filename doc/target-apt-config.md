@@ -94,6 +94,10 @@ itself only for exact
 [reviewed freshness profiles](repository-management.md#reviewed-freshness-profiles).
 It derives them from the imported source and keyring bytes and repeats the
 import to confirm those bytes are unchanged.
+Target-root configuration has no witness relation, so it refuses
+`frozen_release_with_witnesses` in source policies, manifests and
+`apt-config-snapshot-v2` documents; supporting it would require a new snapshot
+schema.
 
 The canonical `apt-config-snapshot-v2` document records source paths, digests,
 and freshness policies; normalized configuration, repository identities, and

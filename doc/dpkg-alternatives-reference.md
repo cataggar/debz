@@ -9,7 +9,7 @@ below; all state outside that boundary remains fail-closed.
 
 The 2026-10-01 Ubuntu `stonking` amd64 snapshot, signed by
 `F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-20:37:08 UTC and Valid-Until Wed, 14 Oct 2026 20:37:08 UTC, has a separate
+23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC, has a separate
 executable pin for `dpkg` 1.23.7ubuntu2. Its authenticated exact lock names the archive
 SHA-512
 `e2de124c6741eddc498badd81b0bf0fee0845e617d81e90ca8cb28dba16946cd23a193cc5e67dbc3dc50f3f9b0b6eab31318a9172b69282586d8bdc20fc9f19c`;

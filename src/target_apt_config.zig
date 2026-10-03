@@ -231,7 +231,7 @@ fn validateSerializableManifest(manifest: Manifest) ValidationError!void {
     }
     for (manifest.sources) |record| {
         if (!validLogicalPath(record.logical_path) or
-            !repository_refresh.validExpiryPolicy(record.freshness))
+            !targetExpiryPolicy(record.freshness))
             return error.InvalidPath;
     }
     if (!validLowerHex(&manifest.configuration_id)) return error.InvalidIdentity;
@@ -245,7 +245,7 @@ fn validateSerializableManifest(manifest: Manifest) ValidationError!void {
             return error.InvalidIdentity;
         for (manifest.repository_policies, manifest.repository_ids) |policy, id| {
             if (!std.mem.eql(u8, &policy.repository_id, &id) or
-                !repository_refresh.validExpiryPolicy(policy.freshness))
+                !targetExpiryPolicy(policy.freshness))
                 return error.InvalidIdentity;
             if (manifest.artifact_version == .v1 and
                 policy.freshness != .require_valid_until)
@@ -781,13 +781,20 @@ fn validateSourcePolicies(policies: []const SourcePolicy, maximum: usize) !void 
     if (policies.len > maximum) return error.InvalidSourcePolicy;
     for (policies, 0..) |policy, index| {
         if (!validLogicalPath(policy.logical_path) or
-            !repository_refresh.validExpiryPolicy(policy.freshness))
+            !targetExpiryPolicy(policy.freshness))
             return error.InvalidSourcePolicy;
         for (policies[0..index]) |previous| {
             if (std.mem.eql(u8, previous.logical_path, policy.logical_path))
                 return error.InvalidSourcePolicy;
         }
     }
+}
+
+/// Target-root APT configuration has no witness relation, so it cannot
+/// express `frozen_release_with_witnesses`; apt-config-snapshot-v2 refuses it.
+fn targetExpiryPolicy(policy: repository_refresh.ExpiryPolicy) bool {
+    return policy != .frozen_release_with_witnesses and
+        repository_refresh.validExpiryPolicy(policy);
 }
 
 fn sourceFreshness(
@@ -1156,7 +1163,7 @@ fn createManifestVersion(
     const sources = try owned.alloc(SourceRecord, input.sources.len);
     for (input.sources, 0..) |record, index| {
         if (!validLogicalPath(record.logical_path) or
-            !repository_refresh.validExpiryPolicy(record.freshness))
+            !targetExpiryPolicy(record.freshness))
             return error.InvalidPath;
         if (artifact_version == .v1 and record.freshness != .require_valid_until)
             return error.InvalidIdentity;
@@ -1199,7 +1206,7 @@ fn createManifestVersion(
         );
         for (repository_policies, repository_ids) |policy, id| {
             if (!std.mem.eql(u8, &policy.repository_id, &id) or
-                !repository_refresh.validExpiryPolicy(policy.freshness))
+                !targetExpiryPolicy(policy.freshness))
                 return error.InvalidIdentity;
             if (artifact_version == .v1 and
                 policy.freshness != .require_valid_until)
@@ -1487,7 +1494,7 @@ fn parseFreshness(wire: WireFreshness) ValidationError!repository_refresh.Expiry
             .allow_missing_valid_until_with_max_age_seconds = wire.maximum_release_age_seconds orelse return error.InvalidIdentity,
         },
     };
-    if (!repository_refresh.validExpiryPolicy(policy))
+    if (!targetExpiryPolicy(policy))
         return error.InvalidIdentity;
     return policy;
 }
@@ -2454,6 +2461,48 @@ test "target_apt_config carries per-repository archive binding declarations" {
         .root_path = root_path,
         .architecture_override = "amd64",
         .dependencies = .{ .filesystem = files.interface() },
+    }));
+}
+
+test "target_apt_config refuses frozen release freshness" {
+    const frozen: repository_refresh.ExpiryPolicy = .{
+        .frozen_release_with_witnesses = .{ .release_digest = .{ .sha256 = @splat(7) } },
+    };
+    try std.testing.expect(repository_refresh.validExpiryPolicy(frozen));
+    try std.testing.expectError(error.InvalidSourcePolicy, validateSourcePolicies(
+        &.{.{ .logical_path = "/etc/apt/sources.list", .freshness = frozen }},
+        1,
+    ));
+    const repositories = [_][64]u8{@splat('a')};
+    try std.testing.expectError(error.InvalidPath, createManifest(std.testing.allocator, .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &.{.{
+            .logical_path = "/etc/apt/sources.list",
+            .sha256 = @splat(1),
+            .format = .legacy,
+            .freshness = frozen,
+        }},
+        .configuration_id = @splat('b'),
+        .repository_ids = &repositories,
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
+    }));
+    try std.testing.expectError(error.InvalidIdentity, createManifest(std.testing.allocator, .{
+        .native_architecture = "amd64",
+        .foreign_architectures = &.{},
+        .sources = &.{.{
+            .logical_path = "/etc/apt/sources.list",
+            .sha256 = @splat(1),
+            .format = .legacy,
+        }},
+        .configuration_id = @splat('b'),
+        .repository_ids = &repositories,
+        .repository_policies = &.{.{ .repository_id = @splat('a'), .freshness = frozen }},
+        .keyrings = &.{},
+        .global_trust_compatibility = false,
+        .exclusions = &.{},
     }));
 }
 
@@ -3535,6 +3584,7 @@ test "target_apt_config v2 decoder rejects malformed policy documents within bou
             "\"maximum_release_age_seconds\":null",
         "\"mode\":\"allow_missing_valid_until_with_max_age_seconds\"," ++
             "\"maximum_release_age_seconds\":2678401",
+        "\"mode\":\"frozen_release_with_witnesses\",\"maximum_release_age_seconds\":null",
     };
     for (invalid_policies) |invalid_policy| {
         const malformed = try std.mem.concat(allocator, u8, &.{

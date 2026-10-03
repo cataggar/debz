@@ -39,6 +39,44 @@ future bound. `repo add` selects the exception automatically only for exact
 [reviewed freshness profiles](repository-management.md#reviewed-freshness-profiles).
 Currently that is Microsoft's Ubuntu 24.04 feed, with a 14-day maximum.
 
+`frozen_release_with_witnesses` admits a frozen release pocket (one whose
+signed Release has no `Valid-Until`, such as Ubuntu `resolute`) without a
+clock override and without replaying historical time. It never compares the
+frozen pocket's own `Date` with the clock beyond the future-skew bound.
+Instead:
+
+1. The Release cleartext must match the configured algorithm-tagged
+   `release_digest`, a `content_digest.Value`
+   (`ReleaseFrozenDigestMismatch`), and the Release must have no
+   `Valid-Until` (`ReleaseFrozenValidUntilPresent`). SHA-256 is the only
+   accepted algorithm for now, because Release files publish only SHA-256 and
+   provenance records the cleartext as SHA-256; any other algorithm or an
+   all-zero digest is `InvalidConfiguration`.
+2. `RefreshPolicy.frozen_witnesses` must name one to four witnesses, built by
+   `witnessEvidence` from authenticated results of the same refresh. An empty
+   list, a witness that is itself frozen, or an expired witness is
+   `ReleaseFrozenWitnessUnavailable`. `refreshAuthenticated` therefore never
+   admits a frozen pocket alone, and unauthenticated `refresh` refuses the
+   mode.
+3. Each witness must have the same URI, component and architecture and a
+   different suite (`ReleaseFrozenWitnessTargetMismatch`). At least one primary
+   fingerprint must have a `valid` signature on both Releases
+   (`ReleaseFrozenWitnessSignerMismatch`). `Origin` and `Label` must be equal
+   (`ReleaseFrozenWitnessOriginMismatch`), and the witness's signed `Date` must
+   not be older than the frozen pocket's (`ReleaseFrozenWitnessOlder`).
+4. Every witness must still be fresh under its own policy at the same `now`:
+   `Valid-Until` plus grace, or `Date` plus its maximum age. The admission
+   deadline is the earliest witness deadline.
+
+The decisions (pin, admission deadline, and each witness's repository ID,
+snapshot digest, signed `Date`, deadline and shared fingerprint) are recorded
+in `PolicyDecisions.frozen`. Frozen snapshots use repository snapshot v5 in
+the separate `repository-refresh-v5` cache namespace; every other repository
+keeps v4 bytes and namespace. A cache-only reload reuses a frozen admission
+only with the same witness repository IDs and snapshot digests
+(`ReleaseFrozenWitnessChanged` otherwise), revalidates the stored decision, and
+re-admits through the witnesses at the current time.
+
 Provenance records the authentication mode, signature digest, verification
 time, accepted signature index, primary/signing fingerprints, public-key and
 hash algorithm identifiers, and signature creation/expiration. Cache snapshots

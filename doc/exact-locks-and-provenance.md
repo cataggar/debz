@@ -232,6 +232,15 @@ remain decodable, but a repository-backed lock carrying the old snapshot
 digest fails replay against a newly computed digest and requires reviewed
 regeneration; it never silently acquires the exception. Transaction
 provenance retains the same fail-closed snapshot comparison.
+Authenticated snapshot digest version 4 is used only for
+`frozen_release_with_witnesses` repositories. It hashes the version 3 inputs
+plus the pinned Release digest (algorithm name and bytes), the admission
+deadline, and each witness's
+repository ID, snapshot digest, signed `Date`, deadline and shared signer
+fingerprint. A lock therefore binds a frozen pocket's witnesses through
+`Repository.snapshot_sha256`, even when a witness contributes no locked
+package. Every non-frozen snapshot keeps its version 3 digest, so existing
+locks are unchanged; exact-lock v3 does not change.
 The production CLI permits initial lock resolution only on non-mutating
 `plan` and `download` operations. The package-family API exposes that path as
 `resolve_lock`; all image mutations continue to require the reviewed lock.

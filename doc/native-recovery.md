@@ -612,7 +612,7 @@ groups unchanged; unknown or malformed state still requires recovery.
 
 The authenticated 2026-10-01 `stonking` snapshot is signed by
 `F6ECB3762474EDA9D21B7022871920D1991BC93C` with Date Wed, 30 Sep 2026
-20:37:08 UTC and Valid-Until Wed, 14 Oct 2026 20:37:08 UTC. Its
+23:37:07 UTC and Valid-Until Wed, 14 Oct 2026 23:37:07 UTC. Its
 `util-linux` 2.42.2-1ubuntu2 amd64 postinst has a separate
 exact-digest allowance for its `OS=linux` and `command -v
 update-alternatives` guard followed by one literal continued `--install`

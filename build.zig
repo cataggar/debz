@@ -2057,6 +2057,7 @@ fn installReleaseFiles(
         "package-database.md",
         "product-api.md",
         "project-status.md",
+        "real-snapshot-stable-series.md",
         "repository-management.md",
         "release-installation.md",
         "release-tooling.md",

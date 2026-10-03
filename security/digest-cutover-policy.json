@@ -134,7 +134,7 @@
       "id": "raw-control-and-compatibility-fields",
       "kind": "raw_32_byte_field",
       "classification": "fixed_control_and_versioned_compatibility",
-      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony, signed sudo and signed python3 control verifiers), or protocol controls, including the bounded known-postrm-failure retry proof bound to the original attempt; other fields belong to frozen version-specific compatibility structures. Current package content authority is typed.",
+      "rationale": "These exact raw 32-byte fields are domain-separated document, policy, state, signature, pinned script/tool (including the reviewed chrony, signed sudo and signed python3 control verifiers), or protocol controls, including the bounded known-postrm-failure retry proof bound to the original attempt and the domain-separated snapshot digests of same-snapshot frozen-release freshness witnesses; other fields belong to frozen version-specific compatibility structures. Current package content authority is typed.",
       "paths": [
         "src/apt_system_api.zig",
         "src/apt_system_cli.zig",
@@ -166,6 +166,7 @@
         "src/production_backend.zig",
         "src/repository_api.zig",
         "src/repository_backend.zig",
+        "src/repository_refresh.zig",
         "src/repository_state.zig",
         "src/root_mutation.zig",
         "src/root_operation.zig",
