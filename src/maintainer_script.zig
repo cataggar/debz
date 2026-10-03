@@ -746,6 +746,8 @@ pub const SetupStage = enum {
     pipe,
     /// `/dev/null` could not be opened for the child's stdin.
     stdin_device,
+    /// A private network namespace could not be created before spawn.
+    network_namespace,
     fork,
     /// The child could not create its own session and process group.
     session,
@@ -753,6 +755,8 @@ pub const SetupStage = enum {
     standard_streams,
     /// Root entry or private helper namespace setup failed.
     root_isolation,
+    /// Private loopback setup failed inside the child namespace.
+    network_setup,
     snapshot_proc,
     working_directory,
     /// `execve` of the script failed.
@@ -806,8 +810,21 @@ pub const Outcome = union(enum) {
         return switch (self) {
             .exited, .signaled, .timed_out, .cancelled, .output_limit_exceeded => true,
             .setup_failed => |failure| switch (failure.stage) {
-                .root_isolation, .working_directory, .execute, .session, .standard_streams => true,
-                .snapshot_proc, .pipe, .stdin_device, .fork, .launcher, .wait => false,
+                .root_isolation,
+                .working_directory,
+                .execute,
+                .session,
+                .standard_streams,
+                .network_setup,
+                => true,
+                .network_namespace,
+                .snapshot_proc,
+                .pipe,
+                .stdin_device,
+                .fork,
+                .launcher,
+                .wait,
+                => false,
             },
             .rejected => false,
         };
@@ -1157,6 +1174,7 @@ pub fn policyDigest(policy: Policy) [32]u8 {
         hash.update("exact-udev-pid-only-v1\x00");
     if (policy.snapshot_sudo_proc)
         hash.update("exact-sudo-pid-only-v1\x00");
+    hash.update("private-network-loopback-v1\x00");
     hashString(&hash, @tagName(policy.capture));
     hashString(&hash, @tagName(policy.descendants));
     hashNumber(&hash, policy.limits.timeout_ms);
@@ -1613,13 +1631,15 @@ fn launchConfigured(
         } else null,
     };
 
-    const forked = if (invocation.snapshot_proc != null)
-        linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD), 0)
-    else
-        linux.fork();
+    const clone_flags = linux.CLONE.NEWNET |
+        if (invocation.snapshot_proc != null)
+            linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD)
+        else
+            @intFromEnum(linux.SIG.CHLD);
+    const forked = linux.clone2(clone_flags, 0);
     switch (linux.errno(forked)) {
         .SUCCESS => {},
-        else => |err| return setupFailure(.fork, @intFromEnum(err)),
+        else => |err| return setupFailure(.network_namespace, @intFromEnum(err)),
     }
     const pid: i32 = @intCast(forked);
     if (pid == 0) childMain(child);
@@ -1851,6 +1871,8 @@ fn childMain(child: ChildDescriptor) noreturn {
         const grouped = linux.errno(linux.setpgid(0, 0));
         if (grouped != .SUCCESS) childFail(child.status_write, .session, grouped);
     }
+    const network_ready = setupPrivateLoopback();
+    if (network_ready != .SUCCESS) childFail(child.status_write, .network_setup, network_ready);
 
     var streams: ChildStreams = .{
         .input = child.null_fd,
@@ -1940,10 +1962,10 @@ fn childMain(child: ChildDescriptor) noreturn {
         const setup = setupSnapshotProc(proc, null);
         if (setup != .SUCCESS)
             childFail(streams.status, .snapshot_proc, setup);
-        const sealed = sealSnapshotProcDescriptors();
-        if (sealed != .SUCCESS)
-            childFail(streams.status, .snapshot_proc, sealed);
     }
+    const sealed = sealInheritedDescriptors();
+    if (sealed != .SUCCESS)
+        childFail(streams.status, .standard_streams, sealed);
     if (child.setup_only) linux.exit(0);
 
     // dpkg forces umask 022 process-wide (`lib/dpkg/program.c`
@@ -2199,15 +2221,35 @@ fn restrictSnapshotProcPrivileges(failure_stage: ?*u8) linux.E {
     return .SUCCESS;
 }
 
-fn sealSnapshotProcDescriptors() linux.E {
+fn sealInheritedDescriptors() linux.E {
     // Keep the status pipe usable for exec failures, but pass no inherited
-    // host-root descriptor into the signed script.
+    // host-root or socket descriptor into the script.
     return linux.errno(linux.syscall3(
         .close_range,
         3,
         std.math.maxInt(u32),
         close_range_cloexec,
     ));
+}
+
+fn setupPrivateLoopback() linux.E {
+    const fd_result = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(fd_result) != .SUCCESS) return linux.errno(fd_result);
+    const fd: i32 = @intCast(fd_result);
+    defer _ = linux.close(fd);
+    var request: linux.ifreq = .{
+        .ifrn = .{ .name = .{ 'l', 'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+        .ifru = undefined,
+    };
+    const fetched = linux.errno(linux.ioctl(fd, linux.SIOCGIFFLAGS, @intFromPtr(&request)));
+    if (fetched != .SUCCESS) return fetched;
+    request.ifru.flags.UP = true;
+    const applied = linux.errno(linux.ioctl(fd, linux.SIOCSIFFLAGS, @intFromPtr(&request)));
+    if (applied != .SUCCESS) return applied;
+    const verified = linux.errno(linux.ioctl(fd, linux.SIOCGIFFLAGS, @intFromPtr(&request)));
+    if (verified != .SUCCESS) return verified;
+    if (!request.ifru.flags.UP or !request.ifru.flags.LOOPBACK) return .NODEV;
+    return .SUCCESS;
 }
 
 const HelperExposure = struct { root: i32 = -1, err: linux.E = .SUCCESS };
@@ -3230,6 +3272,20 @@ fn skipUnlessPosixShell() !void {
     shell.close(testing.io);
 }
 
+fn skipUnlessPython3() !void {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var python = std.Io.Dir.openFileAbsolute(testing.io, "/usr/bin/python3", .{ .mode = .read_only }) catch
+        return error.SkipZigTest;
+    python.close(testing.io);
+}
+
+fn skipUnlessHostFile(path: []const u8) !void {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var file = std.Io.Dir.openFileAbsolute(testing.io, path, .{ .mode = .read_only }) catch
+        return error.SkipZigTest;
+    file.close(testing.io);
+}
+
 fn writeExecutableScript(
     directory: *std.testing.TmpDir,
     sub_path: []const u8,
@@ -3303,6 +3359,111 @@ const HostScript = struct {
     }
 };
 
+fn requirePrivateNetworkNamespace() bool {
+    return std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null;
+}
+
+fn skipIfPrivateNetworkUnavailable(report: *const Report) !bool {
+    switch (report.outcome) {
+        .setup_failed => |failure| if (failure.stage == .network_namespace and
+            failure.errno == @intFromEnum(linux.E.PERM))
+        {
+            try testing.expect(!report.outcome.spawned());
+            if (requirePrivateNetworkNamespace())
+                return error.NativeHelperNamespaceRequired;
+            return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+const SockaddrIn = extern struct {
+    family: linux.sa_family_t,
+    port: u16,
+    addr: [4]u8,
+    zero: [8]u8 = .{0} ** 8,
+};
+
+const SockaddrUn = extern struct {
+    family: linux.sa_family_t,
+    path: [108]u8,
+};
+
+const LoopbackListener = struct {
+    fd: i32,
+    port: u16,
+};
+
+fn openLoopbackListener() !LoopbackListener {
+    const opened = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.TestSocketUnavailable;
+    const fd: i32 = @intCast(opened);
+    errdefer _ = linux.close(fd);
+    var address: SockaddrIn = .{
+        .family = linux.AF.INET,
+        .port = 0,
+        .addr = .{ 127, 0, 0, 1 },
+    };
+    const bound = linux.errno(linux.bind(
+        fd,
+        @ptrCast(&address),
+        @sizeOf(SockaddrIn),
+    ));
+    if (bound != .SUCCESS) return error.TestSocketUnavailable;
+    const listened = linux.errno(linux.listen(fd, 1));
+    if (listened != .SUCCESS) return error.TestSocketUnavailable;
+    var observed: SockaddrIn = undefined;
+    var length: linux.socklen_t = @sizeOf(SockaddrIn);
+    const named = linux.errno(linux.getsockname(
+        fd,
+        @ptrCast(&observed),
+        &length,
+    ));
+    if (named != .SUCCESS or length < @sizeOf(SockaddrIn)) return error.TestSocketUnavailable;
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, observed.port) };
+}
+
+fn openAbstractUnixListener(name: []const u8) !i32 {
+    if (name.len == 0 or name.len + 1 > 108) return error.TestSocketUnavailable;
+    const opened = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.TestSocketUnavailable;
+    const fd: i32 = @intCast(opened);
+    errdefer _ = linux.close(fd);
+    var address: SockaddrUn = .{
+        .family = linux.AF.UNIX,
+        .path = .{0} ** 108,
+    };
+    @memcpy(address.path[1 .. 1 + name.len], name);
+    const bound = linux.errno(linux.bind(
+        fd,
+        @ptrCast(&address),
+        @intCast(@offsetOf(SockaddrUn, "path") + 1 + name.len),
+    ));
+    if (bound != .SUCCESS) return error.TestSocketUnavailable;
+    const listened = linux.errno(linux.listen(fd, 1));
+    if (listened != .SUCCESS) return error.TestSocketUnavailable;
+    return fd;
+}
+
+fn countOpenFds() !usize {
+    var dir = try std.Io.Dir.openDirAbsolute(testing.io, "/proc/self/fd", .{
+        .iterate = true,
+        .follow_symlinks = false,
+    });
+    defer dir.close(testing.io);
+    var iterator = dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(testing.io)) |_| count += 1;
+    return count;
+}
+
+fn currentNetworkNamespace(buffer: *[128]u8) ![]const u8 {
+    const read = linux.readlink("/proc/self/ns/net", buffer, buffer.len);
+    if (linux.errno(read) != .SUCCESS) return error.TestNetworkNamespaceUnavailable;
+    return buffer[0..read];
+}
+
 test "maintainer_script.test.system launcher captures bounded output from a sanitized child" {
     try skipUnlessPosixShell();
     var directory = testing.tmpDir(.{});
@@ -3332,6 +3493,7 @@ test "maintainer_script.test.system launcher captures bounded output from a sani
         .{ .launcher = launcher.interface() },
     );
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqual(@as(u8, 3), report.outcome.exited);
     try testing.expect(!report.succeeded());
@@ -3379,9 +3541,237 @@ test "maintainer_script.test.system launcher forces dpkg's umask over the caller
         .{ .launcher = launcher.interface() },
     );
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
     try testing.expect(report.succeeded());
     try testing.expectEqualStrings("0022\n", report.stdout);
     try testing.expectEqual(@as(usize, 0o077), linux.syscall1(.umask, 0o077));
+}
+
+test "maintainer_script.test.system launcher uses private loopback and seals inherited sockets" {
+    try skipUnlessPosixShell();
+    try skipUnlessPython3();
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    const listener = try openLoopbackListener();
+    defer _ = linux.close(listener.fd);
+    const abstract_name = try std.fmt.allocPrint(
+        testing.allocator,
+        "debz278-{d}-{d}",
+        .{ linux.getpid(), monotonicMs() },
+    );
+    defer testing.allocator.free(abstract_name);
+    const unix_listener = try openAbstractUnixListener(abstract_name);
+    defer _ = linux.close(unix_listener);
+    var leaked: [2]i32 = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&leaked, .{})));
+    defer closePipe(&leaked);
+
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\exec python3 - "$@" <<'PY'
+        \\import errno, os, socket, sys
+        \\port = int(sys.argv[1])
+        \\abstract_name = sys.argv[2]
+        \\leaked_fd = int(sys.argv[3])
+        \\
+        \\def emit(key, value):
+        \\    print(f"{key}={value}")
+        \\
+        \\emit("proc_net", "present" if os.path.isdir("/proc/net") else "absent")
+        \\interfaces = []
+        \\try:
+        \\    with open("/proc/net/dev", "r", encoding="utf-8") as handle:
+        \\        for line in handle.readlines()[2:]:
+        \\            if ":" in line:
+        \\                interfaces.append(line.split(":", 1)[0].strip())
+        \\except OSError as exc:
+        \\    emit("interfaces_error", str(exc.errno))
+        \\emit("interfaces", ",".join(sorted(interfaces)))
+        \\default_route = "false"
+        \\try:
+        \\    with open("/proc/net/route", "r", encoding="utf-8") as handle:
+        \\        for line in handle.readlines()[1:]:
+        \\            fields = line.split()
+        \\            if len(fields) >= 2 and fields[1] == "00000000":
+        \\                default_route = "true"
+        \\except OSError:
+        \\    pass
+        \\emit("default_route", default_route)
+        \\
+        \\try:
+        \\    socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
+        \\    emit("socket_tcp", "ok")
+        \\except OSError as exc:
+        \\    emit("socket_tcp", f"errno:{exc.errno}")
+        \\
+        \\try:
+        \\    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        \\    probe.settimeout(0.2)
+        \\    probe.connect(("127.0.0.1", port))
+        \\    emit("host_tcp_connect", "ok")
+        \\    probe.close()
+        \\except OSError as exc:
+        \\    emit("host_tcp_connect", f"denied:{exc.errno}")
+        \\
+        \\try:
+        \\    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        \\    server.bind(("127.0.0.1", 0))
+        \\    server.listen(1)
+        \\    client = socket.create_connection(("127.0.0.1", server.getsockname()[1]), timeout=0.2)
+        \\    accepted, _ = server.accept()
+        \\    accepted.close()
+        \\    client.close()
+        \\    server.close()
+        \\    emit("bind_loopback", "ok")
+        \\except OSError as exc:
+        \\    emit("bind_loopback", f"errno:{exc.errno}")
+        \\
+        \\try:
+        \\    unix_probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        \\    unix_probe.settimeout(0.2)
+        \\    unix_probe.connect("\\0" + abstract_name)
+        \\    emit("abstract_unix_connect", "ok")
+        \\    unix_probe.close()
+        \\except OSError as exc:
+        \\    emit("abstract_unix_connect", f"denied:{exc.errno}")
+        \\
+        \\try:
+        \\    os.write(leaked_fd, b"x")
+        \\    emit("inherited_fd", "ok")
+        \\except OSError as exc:
+        \\    emit("inherited_fd", f"sealed:{exc.errno}")
+        \\PY
+        \\
+    );
+    defer script.deinit(testing.allocator);
+    const port = try std.fmt.allocPrint(testing.allocator, "{d}", .{listener.port});
+    defer testing.allocator.free(port);
+    const fd = try std.fmt.allocPrint(testing.allocator, "{d}", .{leaked[1]});
+    defer testing.allocator.free(fd);
+
+    var launcher: SystemLauncher = .{};
+    var report = try run(
+        testing.allocator,
+        script.request(&.{ port, abstract_name, fd }),
+        .{ .launcher = launcher.interface() },
+    );
+    defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
+
+    try testing.expectEqual(@as(u8, 0), report.outcome.exited);
+    try testing.expectEqualStrings("", report.stderr);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "proc_net=present\n") != null);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "interfaces=lo\n") != null);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "default_route=false\n") != null);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "socket_tcp=ok\n") != null);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "host_tcp_connect=denied:") != null);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "bind_loopback=ok\n") != null);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "abstract_unix_connect=denied:") != null);
+    try testing.expect(std.mem.indexOf(u8, report.stdout, "inherited_fd=sealed:9\n") != null);
+}
+
+test "maintainer_script.test.debconf confmodule reexec works with sealed descriptors" {
+    try skipUnlessPosixShell();
+    try skipUnlessHostFile("/usr/share/debconf/confmodule");
+    try skipUnlessHostFile("/usr/share/debconf/frontend");
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\. /usr/share/debconf/confmodule
+        \\db_version 2.0 >/dev/null
+        \\printf 'debconf-reexec=%s\n' "${DEBIAN_HAS_FRONTEND:-missing}"
+        \\db_stop
+        \\
+    );
+    defer script.deinit(testing.allocator);
+
+    var launcher: SystemLauncher = .{};
+    var report = try run(
+        testing.allocator,
+        script.request(&.{"configure"}),
+        .{ .launcher = launcher.interface() },
+    );
+    defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
+
+    if (!report.succeeded())
+        std.debug.print("debconf outcome={any} stdout={s} stderr={s}\n", .{
+            report.outcome,
+            report.stdout,
+            report.stderr,
+        });
+    try testing.expect(report.succeeded());
+    try testing.expect(std.mem.indexOf(u8, report.stderr, "debconf-reexec=1\n") != null);
+}
+
+test "maintainer_script.test.repeated private netns launches do not leak parent fds" {
+    try skipUnlessPosixShell();
+    try skipUnlessHostFile("/usr/bin/readlink");
+    var parent_buffer: [128]u8 = undefined;
+    const parent_netns = try currentNetworkNamespace(&parent_buffer);
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    var script = try HostScript.init(testing.allocator, &directory, "demo.postinst",
+        \\#!/bin/sh
+        \\exec /usr/bin/readlink /proc/self/ns/net
+        \\
+    );
+    defer script.deinit(testing.allocator);
+    const baseline_fds = try countOpenFds();
+    const launches: usize = 200;
+    var seen: std.StringHashMap(void) = .init(testing.allocator);
+    defer {
+        var iterator = seen.keyIterator();
+        while (iterator.next()) |key| testing.allocator.free(key.*);
+        seen.deinit();
+    }
+    var reused: usize = 0;
+    const started = monotonicMs();
+    for (0..launches) |_| {
+        var launcher: SystemLauncher = .{};
+        var report = try run(
+            testing.allocator,
+            script.request(&.{"configure"}),
+            .{ .launcher = launcher.interface() },
+        );
+        if (try skipIfPrivateNetworkUnavailable(&report)) {
+            report.deinit();
+            return;
+        }
+        try testing.expect(report.succeeded());
+        const child_netns = std.mem.trim(u8, report.stdout, &std.ascii.whitespace);
+        try testing.expect(!std.mem.eql(u8, parent_netns, child_netns));
+        const entry = try seen.getOrPut(child_netns);
+        if (entry.found_existing) {
+            reused += 1;
+        } else {
+            entry.key_ptr.* = try testing.allocator.dupe(u8, child_netns);
+        }
+        report.deinit();
+        try testing.expectEqual(baseline_fds, try countOpenFds());
+    }
+    const elapsed_ms = monotonicMs() - started;
+    if (std.c.getenv("DEBZ_SCRIPT_NETNS_BENCH_OUT")) |path| {
+        var output = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(path), .{
+            .truncate = true,
+            .permissions = .fromMode(0o644),
+        });
+        defer output.close(testing.io);
+        var buffer: [256]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buffer,
+            "script-netns launches={d} elapsed_ms={d} per_launch_us={d} unique_netns={d} reused_netns={d} parent_fds={d}\n",
+            .{
+                launches,
+                elapsed_ms,
+                (elapsed_ms * 1000) / launches,
+                seen.count(),
+                reused,
+                baseline_fds,
+            },
+        );
+        try output.writeStreamingAll(testing.io, line);
+    }
 }
 
 test "maintainer_script.test.system launcher issues no sweep under the detach policy" {
@@ -3401,6 +3791,7 @@ test "maintainer_script.test.system launcher issues no sweep under the detach po
     var launcher: SystemLauncher = .{};
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqual(@as(u8, 0), report.outcome.exited);
     try testing.expect(!report.terminated_process_group);
@@ -3426,6 +3817,7 @@ test "maintainer_script.test.system launcher reports a script terminated by a si
         .{ .launcher = launcher.interface() },
     );
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqual(@as(u32, 9), report.outcome.signaled);
     try testing.expect(report.outcome.spawned());
@@ -3454,6 +3846,7 @@ test "maintainer_script.test.system launcher terminates the script process tree 
     var launcher: SystemLauncher = .{};
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqualStrings("timed_out", @tagName(report.outcome));
     try testing.expect(report.terminated_process_group);
@@ -3501,6 +3894,7 @@ test "maintainer_script.test.system launcher cancels a running script" {
         .cancellation = cancellation.interface(),
     });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqualStrings("cancelled", @tagName(report.outcome));
     try testing.expect(report.terminated_process_group);
@@ -3529,6 +3923,7 @@ test "maintainer_script.test.system launcher bounds a script that closed its own
     const started = monotonicMs();
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqualStrings("timed_out", @tagName(report.outcome));
     try testing.expect(report.terminated_process_group);
@@ -3559,6 +3954,7 @@ test "maintainer_script.test.system launcher cancels a script that closed its ow
         .cancellation = cancellation.interface(),
     });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqualStrings("cancelled", @tagName(report.outcome));
     try testing.expect(report.terminated_process_group);
@@ -3713,6 +4109,7 @@ test "maintainer_script.test.system launcher fails closed when output exceeds th
     var launcher: SystemLauncher = .{};
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqualStrings("output_limit_exceeded", @tagName(report.outcome));
     try testing.expectEqual(@as(usize, 64), report.output_bytes);
@@ -3736,6 +4133,11 @@ fn reportWithoutStandardStreams(script: *const HostScript, channel: [2]i32) nore
 
     const code: u8 = switch (report.outcome) {
         .exited => |value| value,
+        .setup_failed => |failure| if (failure.stage == .network_namespace and
+            failure.errno == @intFromEnum(linux.E.PERM))
+            201
+        else
+            200,
         else => 200,
     };
     writeAllRaw(channel[1], &[_]u8{code});
@@ -3798,6 +4200,11 @@ test "maintainer_script.test.system launcher installs standard streams the paren
     const status = (try reapChild(pid, false)).?;
     try testing.expect(linux.W.IFEXITED(status));
     try testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    if (payload.items.len >= 1 and payload.items[0] == 201) {
+        if (requirePrivateNetworkNamespace())
+            return error.NativeHelperNamespaceRequired;
+        return;
+    }
 
     // The script still saw an empty /dev/null stdin and both captured streams,
     // so the runner's pipes were installed on 0, 1, and 2 with CLOEXEC cleared.
@@ -3824,6 +4231,7 @@ test "maintainer_script.test.system launcher combines interleaved output when re
     var launcher: SystemLauncher = .{};
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqual(@as(u8, 0), report.outcome.exited);
     try testing.expect(report.succeeded());
@@ -3867,6 +4275,7 @@ test "maintainer_script.test.system launcher enters the alternate root before ex
         .policy = .{ .limits = .{ .timeout_ms = 20_000, .termination_grace_ms = 500 } },
     }, .{ .launcher = launcher.interface() });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
 
     try testing.expectEqual(Isolation.chroot, report.isolation);
     try testing.expect(report.outcome.spawned());
@@ -4008,13 +4417,15 @@ test "maintainer_script.test.private helper namespace preserves target bytes" {
     defer probe.deinit(testing.allocator);
     switch (probe.outcome) {
         .exited => |code| try testing.expectEqual(@as(u8, 0), code),
-        .setup_failed => |failure| {
-            try testing.expectEqual(SetupStage.root_isolation, failure.stage);
-            try testing.expectEqual(@intFromEnum(linux.E.PERM), failure.errno);
-            if (std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
-                return error.NativeHelperNamespaceRequired;
-            try mount.verify(testing.allocator);
-            return;
+        .setup_failed => |failure| switch (failure.stage) {
+            .network_namespace, .root_isolation => {
+                try testing.expectEqual(@intFromEnum(linux.E.PERM), failure.errno);
+                if (requirePrivateNetworkNamespace())
+                    return error.NativeHelperNamespaceRequired;
+                try mount.verify(testing.allocator);
+                return;
+            },
+            else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
     }
@@ -4035,6 +4446,7 @@ test "maintainer_script.test.private helper namespace preserves target bytes" {
     var launcher: SystemLauncher = .{};
     var report = try run(testing.allocator, request, .{ .launcher = launcher.interface() });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
     try testing.expect(report.succeeded());
     try testing.expectEqualStrings(
         "native-helper\nnative-helper\n" ++ original_body,
@@ -4072,9 +4484,14 @@ test "maintainer_script.test.helper namespace retains alternate-root isolation" 
     defer report.deinit();
     switch (report.outcome) {
         .setup_failed => |failure| switch (failure.stage) {
+            .network_namespace => {
+                try testing.expectEqual(@intFromEnum(linux.E.PERM), failure.errno);
+                if (requirePrivateNetworkNamespace())
+                    return error.NativeHelperNamespaceRequired;
+            },
             .root_isolation => {
                 try testing.expectEqual(@intFromEnum(linux.E.PERM), failure.errno);
-                if (std.c.getenv("DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE") != null)
+                if (requirePrivateNetworkNamespace())
                     return error.NativeHelperNamespaceRequired;
             },
             .execute => try testing.expectEqual(@intFromEnum(linux.E.NOENT), failure.errno),
@@ -4383,7 +4800,7 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
     var status: [2]i32 = undefined;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
     const forked = linux.clone2(
-        linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
+        linux.CLONE.NEWNET | linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
         0,
     );
     if (linux.errno(forked) != .SUCCESS) {
@@ -4405,6 +4822,8 @@ test "maintainer_script.test.private PID1 mounts masked read-only boot ID and te
             0,
         ));
         if (death != .SUCCESS) testSnapshotProcFailure(status[1], 2, death);
+        const network_ready = setupPrivateLoopback();
+        if (network_ready != .SUCCESS) testSnapshotProcFailure(status[1], 18, network_ready);
         const private = linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
         if (private != .SUCCESS) testSnapshotProcFailure(status[1], 3, private);
         const entered = linux.errno(linux.chdir(root_path.ptr));
@@ -4495,7 +4914,7 @@ test "maintainer_script.test.private PID1 udev proc hides all sysctl and tears d
     var status: [2]i32 = undefined;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
     const forked = linux.clone2(
-        linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
+        linux.CLONE.NEWNET | linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
         0,
     );
     if (linux.errno(forked) != .SUCCESS) {
@@ -4517,6 +4936,7 @@ test "maintainer_script.test.private PID1 udev proc hides all sysctl and tears d
                 0,
                 0,
             )) == .SUCCESS and
+            setupPrivateLoopback() == .SUCCESS and
             linux.errno(linux.mount(
                 null,
                 "/",
@@ -4583,7 +5003,7 @@ test "maintainer_script.test.private PID1 udev proc hides all sysctl and tears d
     try testing.expect((try root.entryIfExists(try root_fs.Path.init("proc/sys"))) == null);
 }
 
-test "maintainer_script.test.snapshot proc seals inherited host-root descriptors" {
+test "maintainer_script.test.exec boundary seals inherited host-root descriptors" {
     if (builtin.os.tag != .linux) return;
     var status: [2]i32 = undefined;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.pipe2(&status, .{ .CLOEXEC = true })));
@@ -4596,7 +5016,7 @@ test "maintainer_script.test.snapshot proc seals inherited host-root descriptors
         if (linux.errno(opened) == .SUCCESS) {
             const fd: i32 = @intCast(opened);
             const before = linux.fcntl(fd, linux.F.GETFD, 0);
-            const sealed = sealSnapshotProcDescriptors();
+            const sealed = sealInheritedDescriptors();
             const after = linux.fcntl(fd, linux.F.GETFD, 0);
             if (fd > 2 and linux.errno(before) == .SUCCESS and before == 0 and
                 sealed == .SUCCESS and linux.errno(after) == .SUCCESS and after == 1)
@@ -4892,6 +5312,8 @@ fn testMaskedProcWorker(
         0,
     ));
     if (death != .SUCCESS) testSnapshotProcFailure(status_fd, 2, death);
+    const network_ready = setupPrivateLoopback();
+    if (network_ready != .SUCCESS) testSnapshotProcFailure(status_fd, 18, network_ready);
     const private = linux.errno(linux.mount(null, "/", null, linux.MS.REC | linux.MS.PRIVATE, 0));
     if (private != .SUCCESS) testSnapshotProcFailure(status_fd, 3, private);
     const entered = linux.errno(linux.chdir(root_path.ptr));
@@ -4958,7 +5380,7 @@ test "maintainer_script.test.private proc views die on deadline and parent crash
             const owner = if (parent_crash)
                 linux.fork()
             else
-                linux.clone2(linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD), 0);
+                linux.clone2(linux.CLONE.NEWNET | linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD), 0);
             if (linux.errno(owner) != .SUCCESS) {
                 _ = linux.close(status[0]);
                 _ = linux.close(status[1]);
@@ -4972,7 +5394,7 @@ test "maintainer_script.test.private proc views die on deadline and parent crash
                 if (!parent_crash)
                     testMaskedProcWorker(root_path, descriptor, status[1], true);
                 const worker = linux.clone2(
-                    linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
+                    linux.CLONE.NEWNET | linux.CLONE.NEWNS | linux.CLONE.NEWPID | @intFromEnum(linux.SIG.CHLD),
                     0,
                 );
                 if (linux.errno(worker) != .SUCCESS)
