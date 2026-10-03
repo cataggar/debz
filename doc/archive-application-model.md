@@ -81,7 +81,8 @@ Supported:
 - uncompressed, gzip, xz, and zstd control and data members;
 - POSIX USTAR and GNU base headers with bounded GNU long-name and long-link
   records;
-- regular files, directories, symbolic links, and backward hard links;
+- regular files, directories, symbolic links, backward hard links, and
+  data-member FIFOs (see [FIFO payloads](#fifo-payloads-288));
 - permission and special mode bits, numeric uid/gid, bounded USTAR owner and
   group names, and modification time;
 - the control members `control`, `conffiles`, `md5sums`, `triggers`, `preinst`,
@@ -94,8 +95,8 @@ Rejected before mutation, with the classification in parentheses:
 
 - PAX extended and global headers, archive xattrs, ACLs, labels, and malformed
   or dangling GNU extension records (`tar_extension`);
-- devices, FIFOs, sockets, sparse entries, and unknown type flags
-  (`file_type`);
+- devices, sockets, control-member FIFOs, sparse entries, and unknown type
+  flags (`file_type`);
 - mode bits outside the permission and special bits, and malformed owner or
   group metadata (`file_metadata`);
 - unrecognized or unsupported compression and trailing compressed data
@@ -176,17 +177,25 @@ authentication of `validate` and `inspectLocal` and additionally inventory
 data-member FIFOs (tar typeflag `6`). A FIFO entry must have zero size and
 empty link fields and a safe normalized path; its mode, numeric uid/gid, USTAR
 owner/group names, and mtime are retained. A control-member FIFO, a device, a
-socket, and every other special-file type remain `unsupported_file_type`.
+socket, and every other special-file type remain `unsupported_file_type`, as
+does a FIFO anywhere in a `repository_descriptor` package.
 `archive_application.prepare` uses these entry points and models each FIFO as
 `FileKind.fifo`, reporting it in `Features.fifos`; FIFOs carry no `md5sums`
 line and cannot be the target of a hard link.
 
-Only the native application path accepts FIFOs, because only it can publish
-them through journaled [root mutation](root-mutation.md#fifos-288). Every other
-consumer keeps `deb_payload.validate` / `deb_payload.inspectLocal`, which still
-refuse FIFO-bearing archives with `unsupported_file_type` before any mutation;
-in particular, repository admission, the package cache, and the production and
-transaction backends do not yet admit FIFO-bearing repository archives.
+Only paths that immediately consume the native application model accept FIFOs,
+because only that model publishes them through journaled
+[root mutation](root-mutation.md#fifos-288). Plain `deb_payload.validate` and
+`deb_payload.inspectLocal` still refuse FIFO-bearing archives with
+`unsupported_file_type`; package-cache admission, repository-backend dpkg
+execution, transaction-executor artifact validation, and the legacy production
+backend therefore fail closed before a FIFO can be handed to dpkg. The native
+production backend admits a signed FIFO archive only on the `.native` path
+that immediately revalidates the archive as an application model and executes
+through journaled root mutation. The signed `fifo-closure` case of
+`test-native-recovery-zig-parity` proves that whole native path for a signed
+exact-lock closure (see
+[native lifecycle](native-lifecycle.md#install-side-differential-inventory-266)).
 
 ## Limits
 

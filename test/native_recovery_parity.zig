@@ -5,6 +5,8 @@ const support = @import("native_lifecycle_support.zig");
 const family = @import("native_recovery_family.zig");
 const oracle = @import("native_recovery_oracle.zig");
 const retained = @import("native_recovery_parity_evidence.zig");
+const fifo = @import("native_fifo_fixture.zig");
+const statoverride = @import("native_lifecycle_statoverride.zig");
 const options = @import("native_test_options");
 
 const namespace = "var/lib/debz/";
@@ -189,16 +191,24 @@ fn public(
     return parsed;
 }
 
-fn generate(fixture: *foundation.Fixture, python: []const u8, suite: []const u8, arch: []const u8) !struct { source: []const u8, keyring: []const u8 } {
-    const directory = try std.fmt.allocPrint(fixture.allocator, "parity/{s}", .{suite});
+const Signed = struct { repository: []const u8, source: []const u8, keyring: []const u8 };
+
+fn generate(fixture: *foundation.Fixture, python: []const u8, suite: []const u8, arch: []const u8) !Signed {
+    return generateIn(fixture, python, suite, arch, try std.fmt.allocPrint(fixture.allocator, "parity/{s}", .{suite}), &.{});
+}
+
+fn generateIn(fixture: *foundation.Fixture, python: []const u8, suite: []const u8, arch: []const u8, directory: []const u8, extra_debs: []const []const u8) !Signed {
     try fixture.directory(directory);
     const script = try std.fs.path.join(fixture.allocator, &.{ options.repository, "tools/generate-integration-repository.py" });
     const repository = try fixture.absolute(try support.path(fixture.allocator, directory, "repository"));
-    try fixture.run(&.{ python, script, "--output", repository, "--suite", suite, "--architecture", arch, "--signed-parity" }, try support.path(fixture.allocator, directory, "generator.log"), 120);
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(fixture.allocator, &.{ python, script, "--output", repository, "--suite", suite, "--architecture", arch, "--signed-parity" });
+    for (extra_debs) |deb| try argv.appendSlice(fixture.allocator, &.{ "--extra-deb", deb });
+    try fixture.run(argv.items, try support.path(fixture.allocator, directory, "generator.log"), 120);
     const keyring = try support.path(fixture.allocator, repository, "fixture-keyring.gpg");
     const source = try support.path(fixture.allocator, directory, "repository.sources");
     try fixture.write(source, try std.fmt.allocPrint(fixture.allocator, "Types: deb\nURIs: file://{s}\nSuites: {s}\nComponents: main\nArchitectures: {s}\nSigned-By: {s}\n", .{ repository, suite, arch, keyring }), 0o644);
-    return .{ .source = try fixture.absolute(source), .keyring = keyring };
+    return .{ .repository = repository, .source = try fixture.absolute(source), .keyring = keyring };
 }
 
 fn execute(
@@ -417,6 +427,255 @@ fn execute(
         std.mem.eql(u8, &original[2].digest, &(try identity(fixture, roots[2])).digest);
 }
 
+pub const fifo_case = "fifo-closure";
+const fifo_package = "signed-fifo";
+const fifo_base = "usr/share/" ++ fifo_package;
+const fifo_conffile = "etc/" ++ fifo_package ++ ".conf";
+const fifo_override = "#42420 #42421 0620 /" ++ fifo_base ++ "/overridden\n";
+const fifo_versions = [_][]const u8{ "1.0-1", "2.0-1" };
+
+/// Builds both generations of the signed FIFO package once with the real
+/// `dpkg-deb`; every suite publishes these exact bytes in its signed index.
+fn fifoArchives(fixture: *foundation.Fixture, arch: []const u8) ![2][]const u8 {
+    const workspace = "parity/fifo-packages";
+    const first = try fifo.build(fixture, arch, .{
+        .workspace = workspace,
+        .name = fifo_package,
+        .version = fifo_versions[0],
+        .pipes = &.{
+            .{ .path = fifo_base ++ "/pipe", .mode = "0640" },
+            .{ .path = fifo_base ++ "/becomes-file", .mode = "0600" },
+            .{ .path = fifo_base ++ "/obsolete", .mode = "0644" },
+            .{ .path = fifo_base ++ "/overridden", .mode = "0644" },
+        },
+        .links = &.{.{ .path = fifo_base ++ "/link-becomes-pipe", .target = "data" }},
+        .extra_files = &.{.{ .path = fifo_base ++ "/file-becomes-pipe", .content = "regular in 1.0-1\n" }},
+        .conffile_path = fifo_conffile,
+        .conffile_content = "signed fifo configuration 1.0-1\n",
+    });
+    const second = try fifo.build(fixture, arch, .{
+        .workspace = workspace,
+        .name = fifo_package,
+        .version = fifo_versions[1],
+        .pipes = &.{
+            .{ .path = fifo_base ++ "/pipe", .mode = "2660" },
+            .{ .path = fifo_base ++ "/file-becomes-pipe", .mode = "0600" },
+            .{ .path = fifo_base ++ "/link-becomes-pipe", .mode = "0644" },
+            .{ .path = fifo_base ++ "/overridden", .mode = "0644" },
+            .{ .path = fifo_base ++ "/introduced/pipe", .mode = "0600" },
+        },
+        .extra_files = &.{.{ .path = fifo_base ++ "/becomes-file", .content = "regular in 2.0-1\n" }},
+        .conffile_path = fifo_conffile,
+        .conffile_content = "signed fifo configuration 2.0-1\n",
+    });
+    return .{ first, second };
+}
+
+/// Every locked package must bind the published signed bytes by SHA-512,
+/// SHA-256, and size; the closure must select exactly the expected FIFO
+/// generation, whose bytes carry the expected data-member FIFOs under
+/// repository admission.
+fn verifyFifoLock(fixture: *foundation.Fixture, repository: []const u8, lock: debz.exact_lock_v3.Lock, version: []const u8, fifos: usize) !void {
+    if (lock.repositories.len != 1 or lock.local_artifacts.len != 0) return error.UnexpectedFifoClosure;
+    var selected: usize = 0;
+    for (lock.packages) |entry| {
+        if (entry.origin != .authenticated_repository) return error.UnexpectedFifoClosure;
+        if (entry.archive_identity.primary != .sha512 or entry.archive_identity.digests.sha512 == null or
+            entry.archive_identity.digests.sha256 == null) return error.MissingSignedArchiveIdentity;
+        const filename = try std.fmt.allocPrint(fixture.allocator, "pool/main/{s}_{s}_{s}.deb", .{ entry.name, entry.version, entry.architecture });
+        const path = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}", .{ repository, filename });
+        var file = try std.Io.Dir.openFileAbsolute(fixture.io, path, .{ .follow_symlinks = false, .allow_directory = false });
+        defer file.close(fixture.io);
+        var reader = file.reader(fixture.io, &.{});
+        const bytes = try reader.interface.allocRemaining(fixture.allocator, .limited(8 * 1024 * 1024));
+        if (entry.declared_size != bytes.len) return error.SignedArchiveSizeMismatch;
+        try entry.archive_identity.verify(bytes);
+        if (!std.mem.eql(u8, entry.name, fifo_package)) continue;
+        if (!std.mem.eql(u8, entry.version, version)) return error.UnexpectedFifoClosure;
+        selected += 1;
+        var validation = switch (debz.deb_payload.validateForApplication(fixture.allocator, bytes, .{
+            .repository = "signed-fifo-closure",
+            .package = entry.name,
+            .version = entry.version,
+            .architecture = entry.architecture,
+            .requested_package = entry.name,
+            .requested_version = entry.version,
+            .requested_architecture = entry.architecture,
+            .filename = filename,
+            .size = entry.declared_size,
+            .archive_identity = entry.archive_identity,
+        }, .{})) {
+            .validation => |value| value,
+            .diagnostic => |diagnostic| {
+                std.debug.print("signed FIFO archive {s}: {s}\n", .{ path, diagnostic.message() });
+                return error.SignedFifoArchiveRefused;
+            },
+        };
+        defer validation.deinit();
+        var observed: usize = 0;
+        for (validation.data.entries) |item| {
+            if (item.kind == .fifo) observed += 1;
+        }
+        if (observed != fifos) return error.UnexpectedFifoClosure;
+    }
+    if (selected != 1) return error.UnexpectedFifoClosure;
+}
+
+fn fifoReceipt(fixture: *foundation.Fixture, root: []const u8, arch: []const u8, lock_relative: []const u8) !void {
+    var lock_doc = try family.parse(fixture, lock_relative, 1024 * 1024);
+    defer lock_doc.deinit();
+    const digest = try family.string(lock_doc.value, "digest_sha256");
+    var receipt = try rootDocument(fixture, root, provenance_path);
+    defer receipt.deinit();
+    var completion = try rootDocument(fixture, root, completion_path);
+    defer completion.deinit();
+    try text(receipt.value, "outcome", "succeeded");
+    try text(receipt.value, "exact_lock_sha256", digest);
+    const binding = try family.field(completion.value, "transaction_provenance");
+    try text(binding, "document_sha256", try family.string(receipt.value, "digest_sha256"));
+    try text(completion.value, "attempt_id", try family.string(receipt.value, "attempt_id"));
+    try support.absent(fixture, try relative(fixture, root, operation_path));
+    try support.absent(fixture, try relative(fixture, root, intent_path));
+    try retained.verify(fixture, root, arch, digest, false);
+}
+
+fn fifoItem(result: std.json.Value, version: []const u8, arch: []const u8, detail: []const u8) !void {
+    try flag(result, "changed", true);
+    const items = try family.field(result, "items");
+    if (items != .array or items.array.items.len != 1) return error.UnexpectedConsumerItem;
+    try text(items.array.items[0], "package", fifo_package);
+    try text(items.array.items[0], "version", version);
+    try text(items.array.items[0], "architecture", arch);
+    try text(items.array.items[0], "detail", detail);
+}
+
+/// Signed exact-lock FIFO closure: the public core consumer plans and installs
+/// one generation, upgrades across FIFO, regular-file, and symbolic-link
+/// transitions under a stat override, removes it with a remove lock that the
+/// production workflow resolves and the public CLI executes, and the native
+/// engine purges it. Every phase is compared
+/// with pinned dpkg over the whole root, including `status`, `info/*.list`,
+/// `info/*.md5sums`, conffiles, and `statoverride`.
+fn fifoClosure(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    cli: []const u8,
+    helper: []const u8,
+    dpkg: []const u8,
+    python: []const u8,
+    arch: []const u8,
+    suite: []const u8,
+    archives: [2][]const u8,
+) !void {
+    const name = try std.fmt.allocPrint(fixture.allocator, "parity/{s}/{s}", .{ suite, fifo_case });
+    _ = fixture.environment.swapRemove("DEBZ_NATIVE_LIFECYCLE_REQUEST");
+    defer _ = fixture.environment.swapRemove("DEBZ_NATIVE_WORKFLOW_REQUEST");
+    const signed = try generateIn(fixture, python, suite, arch, try support.path(fixture.allocator, name, "signed"), &archives);
+    var scenario = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer scenario.deinit();
+    for ([_][]const u8{ "native-helper-target", "essential-core" }) |seed|
+        try scenario.seed(try std.fmt.allocPrint(fixture.allocator, "{s}/pool/main/{s}_1.0-1_{s}.deb", .{ signed.repository, seed, arch }));
+    var helper_file = try std.Io.Dir.cwd().openFile(fixture.io, helper, .{});
+    defer helper_file.close(fixture.io);
+    var helper_reader = helper_file.reader(fixture.io, &.{});
+    const helper_bytes = try helper_reader.interface.allocRemaining(fixture.allocator, .limited(32 * 1024 * 1024));
+    try fixture.write(try relative(fixture, scenario.native_root, helper_path), helper_bytes, 0o755);
+    try statoverride.seed(&scenario, fifo_override);
+    const roots = [_][]const u8{ scenario.reference_root, scenario.native_root };
+    const original = try identity(fixture, scenario.native_root);
+    const pool = [_][]const u8{
+        try std.fmt.allocPrint(fixture.allocator, "{s}/pool/main/{s}_{s}_{s}.deb", .{ signed.repository, fifo_package, fifo_versions[0], arch }),
+        try std.fmt.allocPrint(fixture.allocator, "{s}/pool/main/{s}_{s}_{s}.deb", .{ signed.repository, fifo_package, fifo_versions[1], arch }),
+    };
+    const cache = try fixture.absolute(try support.path(fixture.allocator, name, "core-cache"));
+    const state = try fixture.absolute(try support.path(fixture.allocator, name, "core-state"));
+    const common: []const []const u8 = &.{
+        "--install-root",        scenario.native_root, "--architecture", arch,
+        "--cache-path",          cache,                "--state-path",   state,
+        "--source",              signed.source,        "--keyring",      signed.keyring,
+        "--transaction-backend", "native",             "--conffile",     "keep-existing",
+        "--json",
+    };
+    const fifo_counts = [_]usize{ 4, 5 };
+    for (fifo_versions, pool, fifo_counts, 0..) |version, archive_path, fifos, index| {
+        const label = if (index == 0) "install" else "upgrade";
+        const selector = try std.fmt.allocPrint(fixture.allocator, "{s}={s}", .{ fifo_package, version });
+        const lock_relative = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}.lock.json", .{ name, label });
+        const lock_path = try fixture.absolute(lock_relative);
+        const before = try foundation.capture(fixture.allocator, fixture.io, scenario.native_root);
+        var plan = try public(fixture, cli, try std.fmt.allocPrint(fixture.allocator, "{s}/{s}-plan", .{ name, label }), "plan", common, &.{ "--lock-output", lock_path, selector }, 0);
+        defer plan.deinit();
+        if (!std.mem.eql(u8, before, try foundation.capture(fixture.allocator, fixture.io, scenario.native_root)))
+            return error.PlanMutatedInstalledRoot;
+        var lock = try debz.exact_lock_v3.decode(fixture.allocator, try support.read(fixture, lock_relative, 1024 * 1024), 1024 * 1024);
+        defer lock.deinit();
+        try verifyFifoLock(fixture, signed.repository, lock.lock, version, fifos);
+        var result = try public(fixture, cli, try std.fmt.allocPrint(fixture.allocator, "{s}/{s}-execute", .{ name, label }), "install", common, &.{ "--lock-input", lock_path, "--assume-yes", "--noninteractive", selector }, 0);
+        defer result.deinit();
+        try fifoItem(result.value, version, arch, label);
+        try referencePhase(fixture, dpkg, scenario.reference_root, "keep_existing", 0, &.{archive_path}, try std.fmt.allocPrint(fixture.allocator, "{s}/{s}-reference", .{ name, label }));
+        const destination = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}-compare", .{ name, label });
+        try fixture.directory(destination);
+        try support.compare(fixture, scenario.reference_root, scenario.native_root, destination, true);
+        try fifoReceipt(fixture, scenario.native_root, arch, lock_relative);
+        var proof = try public(fixture, cli, try std.fmt.allocPrint(fixture.allocator, "{s}/{s}-proof", .{ name, label }), "transaction-result", &.{ "verify", "--transaction-backend", "native", "--install-root", scenario.native_root, "--architecture", arch, "--lock-input", lock_path, "--json" }, &.{}, 0);
+        proof.deinit();
+    }
+    try fifo.expect(fixture, &roots, fifo_base ++ "/pipe", 0o2660, 0, 0);
+    try fifo.expect(fixture, &roots, fifo_base ++ "/file-becomes-pipe", 0o600, 0, 0);
+    try fifo.expect(fixture, &roots, fifo_base ++ "/link-becomes-pipe", 0o644, 0, 0);
+    try fifo.expect(fixture, &roots, fifo_base ++ "/introduced/pipe", 0o600, 0, 0);
+    try fifo.expect(fixture, &roots, fifo_base ++ "/overridden", 0o620, 42420, 42421);
+    try fifo.expectAbsent(fixture, &roots, fifo_base ++ "/obsolete");
+
+    // The public CLI cannot emit a remove lock, so the production remove
+    // workflow resolves it and the public CLI executes it.
+    const remove_relative = try support.path(fixture.allocator, name, "remove.lock.json");
+    const remove_lock = try fixture.absolute(remove_relative);
+    const selectors = [_]family.Selector{.{ .name = fifo_package }};
+    var remove_plan = try family.workflow(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "remove-plan"), .{
+        .ordinary_operation = "remove",
+        .ordinary_mode = "plan_only",
+        .selectors = &selectors,
+        .sources = &.{signed.source},
+        .keyrings = &.{signed.keyring},
+        .cache_path = cache,
+        .state_path = state,
+        .lock_output = remove_lock,
+    });
+    defer remove_plan.deinit();
+    if ((try family.field(remove_plan.report.value, "exit_status")).integer != 0) return error.UnexpectedConsumerResult;
+    var removed = try public(fixture, cli, try support.path(fixture.allocator, name, "remove-execute"), "remove", common, &.{ "--lock-input", remove_lock, "--assume-yes", "--noninteractive", fifo_package }, 0);
+    defer removed.deinit();
+    try fifoItem(removed.value, fifo_versions[1], arch, "remove");
+    const selected = [_]foundation.PackageIdentity{.{ .name = fifo_package, .architecture = arch }};
+    const remove_reference = try support.path(fixture.allocator, name, "remove-reference");
+    try fixture.directory(remove_reference);
+    if (try support.reference(fixture, dpkg, scenario.reference_root, .{ .operation = "remove", .packages = &selected, .triggers = true }, remove_reference) != 0)
+        return error.UnexpectedReferenceResult;
+    const remove_compare = try support.path(fixture.allocator, name, "remove-compare");
+    try fixture.directory(remove_compare);
+    try support.compare(fixture, scenario.reference_root, scenario.native_root, remove_compare, true);
+    try fifoReceipt(fixture, scenario.native_root, arch, remove_relative);
+    for ([_][]const u8{ "/pipe", "/file-becomes-pipe", "/link-becomes-pipe", "/introduced/pipe", "/overridden" }) |suffix|
+        try fifo.expectAbsent(fixture, &roots, try std.fmt.allocPrint(fixture.allocator, "{s}{s}", .{ fifo_base, suffix }));
+    for (roots) |root| {
+        const configuration = try support.read(fixture, try relative(fixture, root, fifo_conffile), 1024);
+        if (!std.mem.eql(u8, configuration, "signed fifo configuration 2.0-1\n")) return error.UnexpectedFifoConffile;
+    }
+
+    // The driver runs every external fixture whose request variable is set,
+    // so only the lifecycle purge request may be visible to it.
+    _ = fixture.environment.swapRemove("DEBZ_NATIVE_WORKFLOW_REQUEST");
+    defer _ = fixture.environment.swapRemove("DEBZ_NATIVE_LIFECYCLE_REQUEST");
+    try scenario.phase(.{ .operation = "purge", .packages = &selected }, false);
+    try fifo.expectAbsent(fixture, &roots, fifo_base);
+    try fifo.expectAbsent(fixture, &roots, fifo_conffile);
+    const observed = try identity(fixture, scenario.native_root);
+    if (original.inode != observed.inode or !std.mem.eql(u8, &original.digest, &observed.digest))
+        return error.PackageOwnedHelperChanged;
+}
+
 fn referencePhase(fixture: *foundation.Fixture, dpkg: []const u8, root: []const u8, policy: []const u8, expected: u8, archives: []const []const u8, destination: []const u8) !void {
     try fixture.directory(destination);
     const result = try support.reference(fixture, dpkg, root, .{ .operation = "install", .archives = archives, .policy = policy, .triggers = true }, destination);
@@ -455,8 +714,21 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch {};
     var rows: std.ArrayList(oracle.ParityRow) = .empty;
+    var fifo_archives: ?[2][]const u8 = null;
+    var fifo_closures: usize = 0;
     for (oracle.parity_suites) |suite| {
         if (selected) |filter| if (!std.mem.startsWith(u8, filter, suite)) continue;
+        const fifo_selector = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ suite, fifo_case });
+        if (selected == null or std.mem.eql(u8, selected.?, fifo_selector)) {
+            if (fifo_archives == null) fifo_archives = try fifoArchives(&fixture, reference.architecture);
+            fifoClosure(&fixture, driver, cli, helper, reference.executable, python, reference.architecture, suite, fifo_archives.?) catch |err| {
+                std.debug.print("signed FIFO closure {s}: {s}\n", .{ fifo_selector, @errorName(err) });
+                return err;
+            };
+            fifo_closures += 1;
+            std.debug.print("signed FIFO closure {s}: install, upgrade, remove and purge matched pinned dpkg\n", .{fifo_selector});
+            if (selected != null) continue;
+        }
         const signed = try generate(&fixture, python, suite, reference.architecture);
         for (oracle.parity_cases) |case| {
             if (selected) |filter| {
@@ -478,8 +750,11 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("signed consumer parity {s}/{s}: {s}\n", .{ suite, case.id, if (actual) "core + FAMILY + dpkg matched" else "mismatch" });
         }
     }
-    if (selected == null) try oracle.validateConsumerParity(rows.items, reference.architecture) else {
-        if (rows.items.len != 1 or !rows.items[0].matched) return error.ConsumerParityMismatch;
-    }
+    if (selected == null) {
+        try oracle.validateConsumerParity(rows.items, reference.architecture);
+        if (fifo_closures != oracle.parity_suites.len) return error.MissingSignedFifoClosure;
+    } else if (fifo_closures == 1) {
+        if (rows.items.len != 0) return error.ConsumerParityMismatch;
+    } else if (rows.items.len != 1 or !rows.items[0].matched) return error.ConsumerParityMismatch;
     try support.assertHostUnchanged(allocator, init.io, reference.before);
 }

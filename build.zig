@@ -1381,7 +1381,7 @@ pub fn build(b: *std.Build) void {
     const parity_case = b.option([]const u8, "native-zig-recovery-parity-case", "Run one suite/case for signed consumer parity debugging");
     if (parity_case) |case|
         recovery_parity.addArgs(&.{ "--case", case });
-    b.step("test-native-recovery-zig-parity", "Run 30 signed cases through real core, FAMILY, and dpkg consumers")
+    b.step("test-native-recovery-zig-parity", "Run 30 signed cases and 2 signed FIFO closures through real core, FAMILY, and dpkg consumers")
         .dependOn(&recovery_parity.step);
 
     const recovery_helper_module = b.createModule(.{

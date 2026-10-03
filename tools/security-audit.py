@@ -3348,6 +3348,12 @@ def native_consumer_receipt_wiring_failures(parity: str, evidence: str) -> list[
         "try retained.verify(fixture, root, arch, digest, case.exit_status != 0);",
         "try support.absent(fixture, try relative(fixture, root, completion_path));",
         "return error.HeldConsumerMutatedRoot;",
+        "try verifyFifoLock(fixture, signed.repository, lock.lock, version, fifos);",
+        "try fifoReceipt(fixture, scenario.native_root, arch, lock_relative);",
+        "try support.compare(fixture, scenario.reference_root, scenario.native_root, remove_compare, true);",
+        "try fifoReceipt(fixture, scenario.native_root, arch, remove_relative);",
+        'try scenario.phase(.{ .operation = "purge", .packages = &selected }, false);',
+        "if (fifo_closures != oracle.parity_suites.len) return error.MissingSignedFifoClosure;",
     ):
         if token not in parity:
             failures.append(f"native_recovery_parity.zig: required per-case receipt check lost {token}")

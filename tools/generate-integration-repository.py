@@ -8,7 +8,9 @@ import gzip
 import hashlib
 import importlib.util
 import io
+import lzma
 import pathlib
+import re
 import shutil
 import tarfile
 
@@ -184,6 +186,61 @@ def package_specs(suite: str, architecture: str, *, signed_parity: bool = False)
     return specs
 
 
+def ar_members(deb: bytes) -> dict[str, bytes]:
+    if not deb.startswith(b"!<arch>\n"):
+        raise RuntimeError("extra package is not an ar archive")
+    members: dict[str, bytes] = {}
+    offset = 8
+    while offset < len(deb):
+        header = deb[offset : offset + 60]
+        if len(header) != 60 or header[58:60] != b"`\n":
+            raise RuntimeError("extra package has a malformed ar header")
+        name = header[:16].decode("ascii").strip().removesuffix("/")
+        size = int(header[48:58].decode("ascii").strip())
+        start = offset + 60
+        if name in members or start + size > len(deb):
+            raise RuntimeError("extra package has duplicate or truncated ar members")
+        members[name] = deb[start : start + size]
+        offset = start + size + (size % 2)
+    return members
+
+
+def extra_control(deb: bytes) -> str:
+    members = ar_members(deb)
+    if members.get("debian-binary") != b"2.0\n":
+        raise RuntimeError("extra package lacks debian-binary 2.0")
+    names = [name for name in members if name.startswith("control.tar")]
+    if len(names) != 1:
+        raise RuntimeError("extra package needs exactly one control member")
+    raw = members[names[0]]
+    if names[0] == "control.tar.gz":
+        raw = gzip.decompress(raw)
+    elif names[0] == "control.tar.xz":
+        raw = lzma.decompress(raw)
+    elif names[0] != "control.tar":
+        raise RuntimeError(f"unsupported extra control compression {names[0]}")
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        controls = [member for member in archive.getmembers() if member.isfile() and member.name in ("control", "./control")]
+        if len(controls) != 1:
+            raise RuntimeError("extra package needs exactly one control file")
+        stream = archive.extractfile(controls[0])
+        assert stream is not None
+        text = stream.read().decode("utf-8")
+    if not text.endswith("\n") or "\n\n" in text:
+        raise RuntimeError("extra package control must be one newline-terminated paragraph")
+    for line in text.splitlines():
+        if line.startswith(("Filename:", "Size:", "SHA256:", "SHA512:", "MD5sum:")):
+            raise RuntimeError("extra package control must not carry repository fields")
+    return text
+
+
+def control_field(text: str, name: str) -> str:
+    match = re.search(rf"(?m)^{re.escape(name)}: ([^\n]+)$", text)
+    if match is None:
+        raise RuntimeError(f"extra package control lacks {name}")
+    return match.group(1).strip()
+
+
 def write_repository(
     output: pathlib.Path,
     suite: str,
@@ -191,6 +248,7 @@ def write_repository(
     *,
     signed_parity: bool = False,
     sha256_only: bool = False,
+    extra_debs: list[pathlib.Path] | None = None,
 ) -> None:
     if signed_parity and sha256_only:
         raise ValueError("--signed-parity requires published SHA512 records")
@@ -225,6 +283,33 @@ def write_repository(
             "Description": f"debz hermetic fixture {package}",
         }
         paragraphs.append("".join(f"{key}: {value}\n" for key, value in paragraph.items()).encode() + b"\n")
+
+    # Prebuilt packages, such as FIFO payloads written by the real dpkg-deb,
+    # keep their exact bytes and control paragraph; only the repository
+    # transport fields are appended.
+    seen = {(package, version) for package, version, *_ in package_specs(suite, architecture, signed_parity=signed_parity)}
+    for extra in extra_debs or []:
+        deb = extra.read_bytes()
+        control = extra_control(deb)
+        package = control_field(control, "Package")
+        version = control_field(control, "Version")
+        package_arch = control_field(control, "Architecture")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", package) or not re.fullmatch(r"[0-9][A-Za-z0-9.+~-]*", version):
+            raise RuntimeError(f"extra package identity is not a plain fixture identity: {package} {version}")
+        if package_arch not in (architecture, "all"):
+            raise RuntimeError(f"extra package architecture {package_arch} is not {architecture} or all")
+        if (package, version) in seen:
+            raise RuntimeError(f"extra package duplicates {package} {version}")
+        seen.add((package, version))
+        filename = f"pool/main/{package}_{version}_{package_arch}.deb"
+        (output / filename).write_bytes(deb)
+        transport = {
+            "Filename": filename,
+            "Size": str(len(deb)),
+            "SHA256": hashlib.sha256(deb).hexdigest(),
+            **({} if sha256_only else {"SHA512": hashlib.sha512(deb).hexdigest()}),
+        }
+        paragraphs.append((control + "".join(f"{key}: {value}\n" for key, value in transport.items())).encode() + b"\n")
 
     packages = b"".join(paragraphs)
     packages_path = packages_dir / "Packages"
@@ -365,6 +450,7 @@ def main() -> None:
     parser.add_argument("--architecture", required=True, choices=("amd64", "arm64"))
     parser.add_argument("--signed-parity", action="store_true")
     parser.add_argument("--sha256-only", action="store_true")
+    parser.add_argument("--extra-deb", action="append", default=[], type=pathlib.Path)
     parser.add_argument("--descriptor-output", type=pathlib.Path)
     parser.add_argument("--descriptor-repository-url")
     parser.add_argument(
@@ -383,12 +469,15 @@ def main() -> None:
         raise SystemExit("--descriptor-script-case requires --descriptor-output")
     if args.signed_parity and args.sha256_only:
         raise SystemExit("--signed-parity and --sha256-only are mutually exclusive")
+    if any(not path.is_absolute() for path in args.extra_deb):
+        raise SystemExit("--extra-deb must be absolute")
     write_repository(
         args.output,
         args.suite,
         args.architecture,
         signed_parity=args.signed_parity,
         sha256_only=args.sha256_only,
+        extra_debs=args.extra_deb,
     )
     if args.descriptor_output is not None:
         scripts = None

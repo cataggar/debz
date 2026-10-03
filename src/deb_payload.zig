@@ -447,13 +447,14 @@ fn validateInternal(
     bytes: []const u8,
     request: ValidationRequest,
     limits: Limits,
-    inventory_fifos: bool,
+    inventory_fifos_for_application: bool,
 ) Result {
     var ownership_transferred = false;
     const descriptor_profile = switch (request) {
         .repository => false,
         .local => |expected| expected.profile == .repository_descriptor,
     };
+    const inventory_fifos = inventory_fifos_for_application and !descriptor_profile;
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     switch (request) {
@@ -1661,6 +1662,7 @@ fn testDeb(allocator: std.mem.Allocator, bad_data_path: ?[]const u8) ![]u8 {
 const DescriptorTestOptions = struct {
     extra_control_fields: []const u8 = "",
     extra_data_path: ?[]const u8 = null,
+    extra_data_kind: u8 = '0',
     control_root_mode: u32 = 0o755,
     data_root_mode: u32 = 0o755,
     script_mode: u32 = 0o755,
@@ -1744,7 +1746,7 @@ fn descriptorTestDeb(allocator: std.mem.Allocator, options: DescriptorTestOption
     try appendTarEntry(allocator, &data, "./usr/share/lintian/overrides", '5', 0o755, "", "");
     try appendTarEntry(allocator, &data, "./usr/share/lintian/overrides/repo-config", '0', 0o644, "", "override");
     if (options.extra_data_path) |path|
-        try appendTarEntry(allocator, &data, path, '0', 0o644, "", "unexpected");
+        try appendTarEntry(allocator, &data, path, options.extra_data_kind, 0o644, "", if (options.extra_data_kind == '0') "unexpected" else "");
     try finishTar(allocator, &data);
 
     var ar: std.ArrayList(u8) = .empty;
@@ -1775,6 +1777,86 @@ fn metadataDigest(bytes: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     return digest;
+}
+
+fn specialTestDeb(allocator: std.mem.Allocator, data_kind: u8, control_kind: ?u8) ![]u8 {
+    const fixture = @import("fixtures/archive.zig");
+    return fixture.deb(
+        allocator,
+        "Package: demo\nVersion: 1.0\nArchitecture: amd64\n",
+        if (control_kind) |kind| &.{.{ .path = "./extension", .kind = kind }} else &.{},
+        &.{
+            .{ .path = "./usr/", .kind = '5', .mode = 0o755 },
+            .{ .path = "./usr/share/", .kind = '5', .mode = 0o755 },
+            .{ .path = "./usr/share/demo.pipe", .kind = data_kind, .mode = 0o2640 },
+        },
+    );
+}
+
+test "application admission inventories data FIFOs and every other consumer refuses them" {
+    const allocator = std.testing.allocator;
+    const fifo = try specialTestDeb(allocator, '6', null);
+    defer allocator.free(fifo);
+    var repository = switch (validateForApplication(allocator, fifo, expectedFor(fifo), .{})) {
+        .validation => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer repository.deinit();
+    var local = switch (inspectLocalForApplication(allocator, fifo, .{ .sha256 = metadataDigest(fifo), .size = fifo.len }, .{})) {
+        .validation => |value| value,
+        .diagnostic => return error.UnexpectedDiagnostic,
+    };
+    defer local.deinit();
+    for ([_]*const Validation{ &repository, &local }) |validation| {
+        const pipe = validation.data.entries[validation.data.entries.len - 1];
+        try std.testing.expectEqual(EntryKind.fifo, pipe.kind);
+        try std.testing.expectEqualStrings("usr/share/demo.pipe", pipe.path);
+        try std.testing.expectEqual(@as(u32, 0o2640), pipe.mode);
+        try std.testing.expectEqual(@as(u64, 0), pipe.size);
+    }
+    const repository_refusal = validate(allocator, fifo, expectedFor(fifo), .{}).diagnostic;
+    try std.testing.expectEqual(Stage.data_tar, repository_refusal.stage);
+    try std.testing.expectEqual(Code.unsupported_file_type, repository_refusal.code);
+    const local_refusal = inspectLocal(allocator, fifo, .{ .sha256 = metadataDigest(fifo), .size = fifo.len }, .{}).diagnostic;
+    try std.testing.expectEqual(Stage.data_tar, local_refusal.stage);
+    try std.testing.expectEqual(Code.unsupported_file_type, local_refusal.code);
+
+    inline for (.{ '3', '4', '7', 's', 'X' }) |typeflag| {
+        const special = try specialTestDeb(allocator, typeflag, null);
+        defer allocator.free(special);
+        const repository_failure = validateForApplication(allocator, special, expectedFor(special), .{}).diagnostic;
+        try std.testing.expectEqual(Stage.data_tar, repository_failure.stage);
+        try std.testing.expectEqual(Code.unsupported_file_type, repository_failure.code);
+        try std.testing.expectEqual(Code.unsupported_file_type, validate(allocator, special, expectedFor(special), .{}).diagnostic.code);
+        try std.testing.expectEqual(Code.unsupported_file_type, inspectLocalForApplication(allocator, special, .{}, .{}).diagnostic.code);
+        try std.testing.expectEqual(Code.unsupported_file_type, inspectLocal(allocator, special, .{}, .{}).diagnostic.code);
+    }
+
+    inline for (.{ '3', '4', '6', '7', 's' }) |typeflag| {
+        const control = try specialTestDeb(allocator, '0', typeflag);
+        defer allocator.free(control);
+        const control_failure = validateForApplication(allocator, control, expectedFor(control), .{}).diagnostic;
+        try std.testing.expectEqual(Stage.control_tar, control_failure.stage);
+        try std.testing.expectEqual(Code.unsupported_file_type, control_failure.code);
+        try std.testing.expectEqual(Code.unsupported_file_type, validate(allocator, control, expectedFor(control), .{}).diagnostic.code);
+        try std.testing.expectEqual(Code.unsupported_file_type, inspectLocalForApplication(allocator, control, .{}, .{}).diagnostic.code);
+        try std.testing.expectEqual(Code.unsupported_file_type, inspectLocal(allocator, control, .{}, .{}).diagnostic.code);
+    }
+
+    // Repository descriptors carry only keyrings, sources, and documentation.
+    for ([_][]const u8{ "./usr/share/doc/repo-config/pipe", "./etc/" ++ "apt/sources.list.d/pipe.list" }) |path| {
+        const descriptor = try descriptorTestDeb(allocator, .{ .extra_data_path = path, .extra_data_kind = '6' });
+        defer allocator.free(descriptor);
+        const descriptor_failure = inspectLocalForApplication(allocator, descriptor, .{ .profile = .repository_descriptor }, .{}).diagnostic;
+        try std.testing.expectEqual(Stage.data_tar, descriptor_failure.stage);
+        try std.testing.expectEqual(Code.unsupported_file_type, descriptor_failure.code);
+        try std.testing.expectEqual(Code.unsupported_file_type, inspectLocal(allocator, descriptor, .{ .profile = .repository_descriptor }, .{}).diagnostic.code);
+        var generic = switch (inspectLocalForApplication(allocator, descriptor, .{}, .{})) {
+            .validation => |value| value,
+            .diagnostic => return error.UnexpectedDiagnostic,
+        };
+        generic.deinit();
+    }
 }
 
 test "full validation inventories scripts conffiles and payload without unpacking" {
