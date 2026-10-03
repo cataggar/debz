@@ -15933,8 +15933,8 @@ fn lifecycleTriggerAuthority(
             });
         }
     }
-    if (handlers.items.len == 0 or allowed.items.len == 0)
-        return error.TriggerAuthorityEmpty;
+    // Activate-only roots still need an authority so native trigger steps can
+    // observe the live root and prove there is no interested handler.
     return .{
         .mode = options.mode,
         .defer_triggers = options.defer_triggers,

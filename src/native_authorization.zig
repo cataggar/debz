@@ -527,7 +527,8 @@ pub fn create(
 
     var trigger_authority: ?TriggerAuthority = null;
     if (input.trigger_authority) |trigger| {
-        if (trigger.handlers.len == 0 or trigger.allowed_triggers.len == 0)
+        if ((trigger.handlers.len == 0) !=
+            (trigger.allowed_triggers.len == 0))
             return error.InvalidTriggerAuthority;
         const handlers = try owned.alloc(TriggerHandler, trigger.handlers.len);
         for (trigger.handlers, 0..) |handler, index| {
@@ -2215,6 +2216,44 @@ test "native_authorization.test.trigger-only authority needs no synthetic action
         defer std.testing.allocator.free(roundtrip);
         try std.testing.expectEqualStrings(document, roundtrip);
     }
+}
+
+test "native_authorization.test.empty trigger authority requires paired empty handlers and triggers" {
+    const handlers = [_]TriggerHandler{.{
+        .package = "app",
+        .version = "1.2",
+        .architecture = "amd64",
+        .source = .new_package,
+        .postinst_sha256 = null,
+        .declarations_sha256 = @splat(0x31),
+    }};
+    var input = testInput();
+    input.trigger_authority = .{
+        .mode = .transaction,
+        .defer_triggers = false,
+        .initial_state_sha256 = @splat(0x32),
+        .handlers = &.{},
+        .callers = &.{},
+        .allowed_triggers = &.{},
+        .maximum_invocations = 8,
+    };
+    var no_interest = try create(std.testing.allocator, input);
+    defer no_interest.deinit();
+    try std.testing.expectEqual(@as(usize, 0), no_interest.authorization.trigger_authority.?.handlers.len);
+    try std.testing.expectEqual(@as(usize, 0), no_interest.authorization.trigger_authority.?.allowed_triggers.len);
+
+    input.trigger_authority.?.allowed_triggers = &.{"debz-trigger"};
+    try std.testing.expectError(
+        error.InvalidTriggerAuthority,
+        create(std.testing.allocator, input),
+    );
+
+    input.trigger_authority.?.handlers = &handlers;
+    input.trigger_authority.?.allowed_triggers = &.{};
+    try std.testing.expectError(
+        error.InvalidTriggerAuthority,
+        create(std.testing.allocator, input),
+    );
 }
 
 test "native_authorization.test.derived trigger final mode binds base and bounds" {
