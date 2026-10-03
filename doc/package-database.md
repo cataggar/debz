@@ -38,7 +38,7 @@ All paths are relative to `var/lib/dpkg` inside the selected root.
 | `arch` | Unique validated foreign architectures. The native architecture comes from the authorized request and may not be listed. |
 | `info/format` | Must be format `1` when present. |
 | `info/*.list` | Bounded canonical absolute paths, including dpkg's `/.` root entry; duplicates rejected; ownership index published. |
-| `info/*.md5sums` | Lowercase MD5 plus canonical relative as-shipped payload paths. Partial `Replaces` may leave entries that are no longer in the live `.list`, as dpkg does. |
+| `info/*.md5sums` | Lowercase MD5 plus canonical relative as-shipped payload paths. dpkg installs a shipped member verbatim, so import also accepts leading `./` pairs, which dpkg strips on lookup; other noncanonical spellings, including dpkg's leading `/` and trailing `/`, and duplicates under both spellings are refused. Each entry keeps its listed spelling, so `writeMd5sums` reproduces the imported bytes and order exactly. Partial `Replaces` may leave entries that are no longer in the live `.list`, as dpkg does. |
 | `info/*.conffiles` | Declared conffiles, each of which must appear in the package's status `Conffiles`. |
 | `info/*.triggers` | `interest`, `interest-await`, `interest-noawait`, `activate`, `activate-await`, and `activate-noawait` declarations. |
 | `info/*.{preinst,postinst,prerm,postrm}` | Regular executable files with safe modes; size, mode, and SHA-256 recorded. |

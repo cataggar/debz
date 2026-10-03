@@ -361,6 +361,20 @@ pub fn build(b: *std.Build) void {
     const run_repository_backend_tests = b.addRunArtifact(repository_backend_tests);
     repository_add_step.dependOn(&run_repository_backend_tests.step);
     workload_core.dependOn(&repository_add_tests.step);
+    // Manual evidence against the live Microsoft Noble repository. It needs
+    // network access and sudo, so it is opt-in and never part of CI.
+    const live_repository_add = b.step(
+        "test-live-repository-add",
+        "Manual live packages.microsoft.com repo add evidence (requires -Dlive-repository-tests=true, network and sudo)",
+    );
+    if (b.option(bool, "live-repository-tests", "Enable network-backed manual repository evidence steps") orelse false) {
+        const live_repository_add_run = b.addSystemCommand(&.{ "sh", "tools/test-live-repository-add.sh" });
+        live_repository_add_run.addArtifactArg(cli);
+        live_repository_add_run.has_side_effects = true;
+        live_repository_add.dependOn(&live_repository_add_run.step);
+    } else {
+        live_repository_add.dependOn(&b.addFail("test-live-repository-add requires -Dlive-repository-tests=true").step);
+    }
 
     const fuzz_tests = b.addTest(.{
         .root_module = b.createModule(.{

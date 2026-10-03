@@ -225,6 +225,22 @@ pub const Md5sumEntry = struct {
     /// Canonical relative payload path, without a leading slash.
     path: []const u8,
     digest: [16]u8,
+    /// Exact listed spelling when it differs from `path`. dpkg installs a
+    /// shipped md5sums member verbatim, so `./usr/x` stays `./usr/x` on disk
+    /// and is resolved to `usr/x` only for lookup.
+    listed: ?[]const u8 = null,
+
+    /// The spelling written to `info/*.md5sums`.
+    pub fn spelling(self: Md5sumEntry) []const u8 {
+        return self.listed orelse self.path;
+    }
+
+    /// True when `listed` is absent or is `path` behind leading `./` pairs.
+    pub fn listedConsistent(self: Md5sumEntry) bool {
+        const listed = self.listed orelse return true;
+        return listed.len != self.path.len and
+            std.mem.eql(u8, package_path.skipDotSlash(listed), self.path);
+    }
 };
 
 pub const ScriptKind = enum {
@@ -1541,7 +1557,8 @@ const Importer = struct {
             }
             const digest = parseHexDigest(16, value[0..32]) orelse
                 return self.fail(.info_md5sums, .invalid_checksum, name, line.number);
-            const path = value[34..];
+            const listed = value[34..];
+            const path = package_path.skipDotSlash(listed);
             if (path.len > self.options.limits.max_path_bytes) {
                 return self.fail(.info_md5sums, .path_too_long, name, line.number);
             }
@@ -1551,7 +1568,11 @@ const Importer = struct {
             if (!try seen.insert(path)) {
                 return self.fail(.info_md5sums, .duplicate_checksum, name, line.number);
             }
-            try entries.append(self.scratch, .{ .path = path, .digest = digest });
+            try entries.append(self.scratch, .{
+                .path = path,
+                .digest = digest,
+                .listed = if (listed.len == path.len) null else listed,
+            });
         }
         return try self.arena.dupe(Md5sumEntry, entries.items);
     }
@@ -2930,6 +2951,9 @@ const Validator = struct {
             }
             self.keys.reset();
             for (entries) |entry| {
+                if (!entry.listedConsistent()) {
+                    return self.fail(.cross_file, .invalid_path, record.name);
+                }
                 if (!try self.keys.insert(entry.path)) {
                     return self.fail(.cross_file, .duplicate_checksum, record.name);
                 }
@@ -3156,7 +3180,7 @@ pub fn writeMd5sums(
     errdefer output.deinit();
     for (entries) |entry| {
         writeHex(&output.writer, &entry.digest) catch return error.OutOfMemory;
-        output.writer.print("  {s}\n", .{entry.path}) catch return error.OutOfMemory;
+        output.writer.print("  {s}\n", .{entry.spelling()}) catch return error.OutOfMemory;
     }
     return output.toOwnedSlice() catch error.OutOfMemory;
 }
@@ -3591,6 +3615,66 @@ test "package_database.test.literal package paths round trip every database surf
     try testing.expectEqualStrings(overrides, try writeStatOverrides(allocator, database.model.stat_overrides));
 }
 
+test "package_database.test.md5sums resolve leading dot-slash pairs like dpkg" {
+    // dpkg installs a shipped md5sums verbatim; packages-microsoft-prod uses
+    // `./etc/...` spellings that dpkg resolves to the listed payload paths.
+    var database = switch (try importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = minimalSnapshot(minimal_status, &.{
+            .{ .name = "solo.list", .bytes = minimal_list },
+            .{ .name = "solo.md5sums", .bytes = "5d41402abc4b2a76b9719d911017c592  ./usr/bin/solo\n" },
+        }),
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => |value| {
+            std.debug.print("dot-slash md5sums rejected: {any}\n", .{value});
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer database.deinit();
+    const record = database.model.find("solo", "amd64").?;
+    try testing.expectEqual(@as(usize, 1), record.md5sums.?.len);
+    try testing.expectEqualStrings("usr/bin/solo", record.md5sums.?[0].path);
+    try testing.expectEqualStrings("./usr/bin/solo", record.md5sums.?[0].listed.?);
+}
+
+test "package_database.test.md5sums keep their listed bytes and order" {
+    // Lookup uses the dot-slash-free path; rewriting a record reproduces the
+    // file dpkg installed, unsorted and with its original spellings.
+    const sums =
+        "5d41402abc4b2a76b9719d911017c592  ./usr/bin/solo\n" ++
+        "7d793037a0760186574b0282f2f435e7  usr/share/doc/solo/copyright\n" ++
+        "0cc175b9c0f1b6a831c399e269772661  ././etc/solo.conf\n";
+    var database = switch (try importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = minimalSnapshot(minimal_status, &.{
+            .{ .name = "solo.list", .bytes = minimal_list },
+            .{ .name = "solo.md5sums", .bytes = sums },
+        }),
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    const entries = database.model.find("solo", "amd64").?.md5sums.?;
+    try testing.expectEqual(@as(usize, 3), entries.len);
+    try testing.expectEqualStrings("usr/bin/solo", entries[0].path);
+    try testing.expectEqualStrings("usr/share/doc/solo/copyright", entries[1].path);
+    try testing.expect(entries[1].listed == null);
+    try testing.expectEqualStrings("etc/solo.conf", entries[2].path);
+    try testing.expectEqualStrings("././etc/solo.conf", entries[2].listed.?);
+    const written = try writeMd5sums(testing.allocator, entries);
+    defer testing.allocator.free(written);
+    try testing.expectEqualStrings(sums, written);
+
+    for ([_]Md5sumEntry{
+        .{ .path = "usr/bin/solo", .digest = @splat(0), .listed = "usr/bin/solo" },
+        .{ .path = "usr/bin/solo", .digest = @splat(0), .listed = "./usr/bin/other" },
+        .{ .path = "usr/bin/solo", .digest = @splat(0), .listed = "/usr/bin/solo" },
+    }) |entry| try testing.expect(!entry.listedConsistent());
+    try testing.expect((Md5sumEntry{ .path = "usr/bin/solo", .digest = @splat(0) }).listedConsistent());
+}
+
 test "package_database.test.inert metadata is typed without interpreting its bytes" {
     const extra = [_]InfoEntry{
         .{ .name = "toolz.config", .bytes = "#!/bin/sh\nexit 0\n", .mode = 0o755 },
@@ -3966,6 +4050,23 @@ test "package_database.test.corrupt info files are rejected with exact locations
         .{
             .bytes = "5d41402abc4b2a76b9719d911017c592  usr/bin/solo\n" ++
                 "5d41402abc4b2a76b9719d911017c592  usr/bin/solo\n",
+            .code = .duplicate_checksum,
+        },
+        .{ .bytes = "5d41402abc4b2a76b9719d911017c592  .//usr/bin/solo\n", .code = .invalid_path },
+        .{ .bytes = "5d41402abc4b2a76b9719d911017c592  ./\n", .code = .invalid_path },
+        .{ .bytes = "5d41402abc4b2a76b9719d911017c592  ./usr/./bin/solo\n", .code = .invalid_path },
+        // dpkg's path_skip_slash_dotslash also strips leading `/`, and its
+        // parser drops one trailing `/`; native keeps both spellings refused.
+        .{ .bytes = "5d41402abc4b2a76b9719d911017c592  /./usr/bin/solo\n", .code = .invalid_path },
+        .{ .bytes = "5d41402abc4b2a76b9719d911017c592  ./usr/bin/solo/\n", .code = .invalid_path },
+        .{
+            .bytes = "5d41402abc4b2a76b9719d911017c592  usr/bin/solo\n" ++
+                "5d41402abc4b2a76b9719d911017c592  ./usr/bin/solo\n",
+            .code = .duplicate_checksum,
+        },
+        .{
+            .bytes = "5d41402abc4b2a76b9719d911017c592  ./usr/bin/solo\n" ++
+                "5d41402abc4b2a76b9719d911017c592  ././usr/bin/solo\n",
             .code = .duplicate_checksum,
         },
     };

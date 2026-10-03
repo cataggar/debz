@@ -31,6 +31,26 @@ pub fn nonRoot(path: []const u8) bool {
     return canonical(path, false);
 }
 
+/// dpkg resolves md5sums paths after skipping leading `./` pairs, so a
+/// shipped `./usr/share/demo` names the payload file `usr/share/demo`.
+pub fn skipDotSlash(path: []const u8) []const u8 {
+    var rest = path;
+    while (std.mem.startsWith(u8, rest, "./")) rest = rest[2..];
+    return rest;
+}
+
+test "package_path.test.md5sums dot-slash pairs are skipped without other normalization" {
+    try std.testing.expectEqualStrings("usr/share/demo", skipDotSlash("./usr/share/demo"));
+    try std.testing.expectEqualStrings("usr/share/demo", skipDotSlash("././usr/share/demo"));
+    try std.testing.expectEqualStrings("usr/share/demo", skipDotSlash("usr/share/demo"));
+    try std.testing.expectEqualStrings("/usr/share/demo", skipDotSlash(".//usr/share/demo"));
+    try std.testing.expectEqualStrings("../escape", skipDotSlash("./../escape"));
+    try std.testing.expectEqualStrings("usr/./demo", skipDotSlash("./usr/./demo"));
+    try std.testing.expectEqualStrings(".hidden", skipDotSlash(".hidden"));
+    try std.testing.expect(!relative(skipDotSlash(".//usr/share/demo")));
+    try std.testing.expect(!relative(skipDotSlash("./../escape")));
+}
+
 test "package_path.test.literal Linux names retain traversal and encoding guards" {
     const path = "/usr/lib/systemd/system/system-systemd\\x2dmute\\x2dconsole.slice";
     try std.testing.expect(nonRoot(path));

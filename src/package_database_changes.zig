@@ -475,6 +475,7 @@ const Builder = struct {
         for (entries) |entry| {
             if (entry.path.len > limits.max_path_bytes) return self.fail(.path_too_long, package);
             if (!database.validRelativePath(entry.path)) return self.fail(.invalid_path, package);
+            if (!entry.listedConsistent()) return self.fail(.invalid_path, package);
             if (!try self.scratch_index.insert(entry.path)) {
                 return self.fail(.duplicate_checksum, package);
             }
@@ -1778,6 +1779,33 @@ test "package_database_changes.test.unsafe or ambiguous change sets fail before 
     };
     defer stale_manifest.deinit();
     try testing.expect(stale_manifest.find("info/toolz.md5sums") != null);
+
+    var listed_manifest = switch (try plan(testing.allocator, source, &.{
+        .{ .put_md5sums = .{
+            .identity = .{ .name = "toolz", .architecture = "amd64" },
+            .entries = &.{
+                .{ .path = "usr/bin/toolz", .digest = @splat(0xab), .listed = "./usr/bin/toolz" },
+                .{ .path = "etc/toolz.conf", .digest = @splat(0xcd) },
+            },
+        } },
+    }, .{})) {
+        .plan => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer listed_manifest.deinit();
+    try testing.expectEqualStrings(
+        "abababababababababababababababab  ./usr/bin/toolz\n" ++
+            "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd  etc/toolz.conf\n",
+        listed_manifest.find("info/toolz.md5sums").?.bytes,
+    );
+    for ([_][]const u8{ "usr/bin/toolz", "./usr/bin/other", "/usr/bin/toolz" }) |listed| {
+        try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
+            .{ .put_md5sums = .{
+                .identity = .{ .name = "toolz", .architecture = "amd64" },
+                .entries = &.{.{ .path = "usr/bin/toolz", .digest = @splat(0), .listed = listed }},
+            } },
+        }, .{}), .invalid_path);
+    }
 
     try expectPlanDiagnostic(try plan(testing.allocator, source, &.{
         .{ .remove_info = .{

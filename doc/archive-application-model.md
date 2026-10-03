@@ -134,7 +134,20 @@ responsibility outside the dpkg replacement boundary.
 A missing `md5sums` member is supported because Debian packages do not
 universally ship one, and `dh_md5sums` omits conffiles by default. Every entry
 that is present must name a regular payload file, or a hard link to one, and
-must match the exact linked bytes.
+must match the exact linked bytes. As in dpkg, leading `./` pairs are removed
+before the path is matched, so `./etc/x` names `etc/x`. Any other
+noncanonical spelling is refused, and so is a path listed under both
+spellings. dpkg 1.22.22's `path_skip_slash_dotslash` also strips leading `/`,
+and its `parse_filehash_buffer` drops one trailing `/`; the model refuses both
+spellings rather than widen the accepted set.
+
+Each `Checksum` keeps its `listed` spelling, and `Features.checksum_manifest`
+records that the member exists, even when it is empty. dpkg's
+`pkg_infodb_update` installs a shipped member as `info/<pkg>.md5sums`
+verbatim. `write_filehash_except` generates one only when the package shipped
+none. Native publication follows both rules. It writes the shipped lines in
+their order and spelling, and generates sorted entries for every regular file
+otherwise. The listed spelling is part of the model digest.
 
 ## Fixture inventory and the v1 support decision
 
@@ -142,11 +155,13 @@ The pinned fixtures currently exercise a deliberately small part of the profile.
 
 | Fixture | Exercised features |
 |---|---|
-| `src/fixtures/packages-microsoft-prod*.deb` | Uncompressed control and data tars, USTAR headers, archive root record, directories, regular files, root ownership, `control` only. |
+| `src/fixtures/packages-microsoft-prod{,-depends}_1.1_all.deb` | Uncompressed control and data tars, USTAR headers, archive root record, directories, regular files, root ownership, `control` only. |
+| `src/fixtures/packages-microsoft-prod_1.2-ubuntu24.04_all.deb` | The reviewed upstream Microsoft Noble descriptor: `./`-prefixed `md5sums`, three `conffiles`, `preinst`/`postinst`/`prerm`, and a data tar without a root record. |
 | `src/fixtures/deb-payload/*.tar{,.gz,.xz,.zst}` | Uncompressed, gzip, xz, and zstd control and data members. |
 | `tools/generate-integration-repository.py` packages | gzip control and data members, `control`, `conffiles`, `triggers` with `interest-noawait` on a path target, an executable `postinst`, inert `templates`/`shlibs`/`symbols`, dependencies, `Pre-Depends`, `Provides`, `Conflicts`, `Breaks`, `Replaces`, `Essential`, `Protected`, and `Multi-Arch`. |
 
-No pinned archive-application fixture ships `md5sums`, symbolic or hard links,
+Apart from that upstream descriptor's `md5sums`, no pinned archive-application
+fixture ships `md5sums`, symbolic or hard links,
 setuid or setgid payload entries, non-root ownership, GNU long names,
 or `remove-on-upgrade` conffiles. The installed-state vendor reference contains
 seven bounded `*.config` members but no archive bytes. The separate
