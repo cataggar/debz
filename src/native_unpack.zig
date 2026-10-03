@@ -1645,6 +1645,9 @@ pub const Code = enum {
     duplicate_archive_path,
     unowned_path_refused,
     multi_arch_content_mismatch,
+    /// An installed `Multi-Arch: same` sibling's `md5sums` does not list a
+    /// shared non-conffile path, so its recorded digest cannot be compared.
+    multi_arch_checksum_unrecorded,
     replaces_unsatisfied,
     invalid_replaces,
     forced_overwrite_unsupported,
@@ -6179,7 +6182,12 @@ fn ownershipConflict(item: *const PackageWork, path: []const u8, holder: Owner) 
 
 /// `Multi-Arch: same` siblings share only byte-identical files. The digest
 /// the holder published is compared against the digest this payload ships;
-/// anything else is a conflict, exactly as dpkg reports it.
+/// anything else is a conflict, exactly as dpkg reports it. A path the
+/// holder's `md5sums` omits is refused with its own code rather than
+/// compared against the root alone. Conffiles never reach this check: an
+/// installed sibling's conffile is handed off before claims are planned,
+/// because dpkg compares it against the sibling's `Conffiles` hash and
+/// defers its digest to configure, which native does not model.
 const MultiArchShare = enum { none, existing, transaction };
 
 fn sharedMultiArch(
@@ -6230,14 +6238,21 @@ fn sharedMultiArch(
         .regular, .hardlink => {
             const desired = effectiveFile(item, claim) orelse
                 return builder.fail(mismatch);
-            const recorded = try holderChecksum(
+            const recorded = switch (try holderChecksum(
                 builder,
                 owner,
                 holder,
                 owned,
                 claim.path,
-            ) orelse
-                return builder.fail(mismatch);
+            )) {
+                .recorded => |digest| digest,
+                .unrecorded => {
+                    var unrecorded = mismatch;
+                    unrecorded.code = .multi_arch_checksum_unrecorded;
+                    return builder.fail(unrecorded);
+                },
+                .unresolved => return builder.fail(mismatch),
+            };
             if (!std.mem.eql(u8, &recorded, &desired.md5) or
                 observed.kind != .regular or
                 !optionalDigestEqual(observed.content_sha256, desired.sha256) or
@@ -6833,6 +6848,15 @@ fn effectiveFile(
     return item.effective_files[claim.file];
 }
 
+const HolderChecksum = union(enum) {
+    recorded: [16]u8,
+    /// The holder has no `md5sums`, or its `md5sums` omits the path. A
+    /// shipped manifest is published verbatim, so it may list a subset.
+    unrecorded,
+    /// The holder's listed spelling does not resolve to the claimed path.
+    unresolved,
+};
+
 /// The digest the holder published for one path.
 ///
 /// A `Multi-Arch: same` sibling can co-own every path it ships, so the
@@ -6844,28 +6868,28 @@ fn holderChecksum(
     holder: Owner,
     owned: OwnedEntry,
     path: []const u8,
-) PlanError!?[16]u8 {
+) PlanError!HolderChecksum {
     const found = try builder.checksums.getOrPut(builder.allocator, owner);
     if (!found.found_existing) {
         found.value_ptr.* = .empty;
-        const recorded = holder.record.md5sums orelse return null;
-        for (recorded) |entry| {
+        if (holder.record.md5sums) |recorded| for (recorded) |entry| {
             try found.value_ptr.put(
                 builder.allocator,
                 entry.path,
                 entry.digest,
             );
-        }
+        };
     }
-    const listed = relativeListPath(owned.listed) orelse return null;
+    const listed = relativeListPath(owned.listed) orelse return .unresolved;
     var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
     const canonical = canonicalAliasPath(
         builder.aliases,
         builder.diversions.physical(listed, holder.identity.name),
         &buffer,
-    ) orelse return null;
-    if (!std.mem.eql(u8, canonical, path)) return null;
-    return found.value_ptr.get(listed);
+    ) orelse return .unresolved;
+    if (!std.mem.eql(u8, canonical, path)) return .unresolved;
+    const digest = found.value_ptr.get(listed) orelse return .unrecorded;
+    return .{ .recorded = digest };
 }
 
 /// True when the claimant declares an exact `Replaces` that the holder's
@@ -38532,6 +38556,254 @@ test "native_unpack.test.multi arch siblings share only identical content" {
         &other_program,
         &.{.{ .artifact = 0, .bytes = other_bytes }},
     ), .multi_arch_content_mismatch);
+}
+
+test "native_unpack.test.Multi-Arch siblings refuse a shared path their md5sums omits" {
+    const status =
+        \\Package: demo
+        \\Status: install ok unpacked
+        \\Architecture: arm64
+        \\Version: 1.0
+        \\Multi-Arch: same
+        \\Description: sibling
+        \\
+        \\
+    ;
+    const other_line = try md5Line(testing.allocator, "other\n", "usr/share/demo/other");
+    defer testing.allocator.free(other_line);
+    const wrong_line = try md5Line(testing.allocator, "different\n", "./usr/share/demo/shared");
+    defer testing.allocator.free(wrong_line);
+    const Case = struct { md5sums: ?[]const u8, code: Code };
+    for ([_]Case{
+        .{ .md5sums = null, .code = .multi_arch_checksum_unrecorded },
+        .{ .md5sums = "", .code = .multi_arch_checksum_unrecorded },
+        .{ .md5sums = other_line, .code = .multi_arch_checksum_unrecorded },
+        .{ .md5sums = wrong_line, .code = .multi_arch_content_mismatch },
+    }) |case| {
+        const list: package_database.InfoEntry = .{
+            .name = "demo:arm64.list",
+            .bytes = "/.\n/usr/share/demo/other\n/usr/share/demo/shared\n",
+        };
+        const info: []const package_database.InfoEntry = if (case.md5sums) |bytes|
+            &.{ list, .{ .name = "demo:arm64.md5sums", .bytes = bytes } }
+        else
+            &.{list};
+        var fixture: Fixture = undefined;
+        try fixture.initFull(status, info, "arm64\n");
+        defer fixture.deinit();
+        try seedFile(fixture.root(), "usr/share/demo/shared", "shared\n");
+        try fixture.root().applyMetadata(
+            try root_fs.Path.init("usr/share/demo/shared"),
+            .{
+                .mode = 0o644,
+                .uid = currentUid(),
+                .gid = currentGid(),
+                .modified_nanoseconds = test_mtime_ns,
+            },
+        );
+        var data = [_]Entry{.{ .path = "usr/share/demo/shared", .content = "shared\n" }};
+        const bytes = try buildOwnedArchive(.{
+            .package = "demo",
+            .version = "1.0",
+            .architecture = "amd64",
+            .control_fields = "Multi-Arch: same\n",
+        }, &data);
+        defer testing.allocator.free(bytes);
+        var model = try modelOf(bytes);
+        defer model.deinit();
+        const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+        var artifacts: [1]native_program.ProgramArtifact = undefined;
+        const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+        try expectRefusal(try planFor(
+            &fixture,
+            &program,
+            &.{.{ .artifact = 0, .bytes = bytes }},
+        ), case.code);
+    }
+}
+
+fn md5Hex(content: []const u8) [32]u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(content, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn expectSiblingConffileHandoff(result: Result) !void {
+    switch (result) {
+        .plan => |value| {
+            var owned = value;
+            owned.deinit();
+            return error.TestUnexpectedResult;
+        },
+        .refusal => |value| {
+            var owned = value;
+            defer owned.deinit();
+            std.debug.print("unexpected refusal: {any}\n", .{owned.diagnostic});
+            return error.TestUnexpectedResult;
+        },
+        .handoff => |value| {
+            var owned = value;
+            defer owned.deinit();
+            for (owned.items) |item| {
+                if (item.feature == .conffile and
+                    std.mem.eql(u8, item.package, "demo") and
+                    std.mem.eql(u8, item.architecture, "amd64") and
+                    std.mem.endsWith(u8, item.detail, "etc/demo.conf")) return;
+            }
+            return error.TestUnexpectedResult;
+        },
+    }
+}
+
+// dh_md5sums leaves conffiles out of md5sums. dpkg's tarobject compares a
+// shared conffile against the sibling's Conffiles hash
+// (md5hash_prev_conffile), never its md5sums, and syncs the digest at
+// configure (deferred_configure_ghost_conffile). Native does not model that
+// exchange, so an installed sibling's conffile is handed off before claims
+// reach the md5sums comparison, whatever the bytes or the manifests list.
+test "native_unpack.test.Multi-Arch shared conffiles hand off before md5sums are consulted" {
+    const conf = "key=value\n";
+    const status = try std.fmt.allocPrint(testing.allocator,
+        \\Package: demo
+        \\Status: install ok installed
+        \\Architecture: arm64
+        \\Version: 1.0
+        \\Multi-Arch: same
+        \\Conffiles:
+        \\ /etc/demo.conf {s}
+        \\Description: sibling
+        \\
+        \\
+    , .{md5Hex(conf)});
+    defer testing.allocator.free(status);
+    const shared_line = try md5Line(testing.allocator, "shared\n", "usr/share/demo/shared");
+    defer testing.allocator.free(shared_line);
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "demo:arm64.list", .bytes = "/.\n/etc/demo.conf\n/usr/share/demo/shared\n" },
+        .{ .name = "demo:arm64.md5sums", .bytes = shared_line },
+    };
+    for ([_][]const u8{ conf, "key=other\n" }) |incoming| {
+        for ([_]ConffileCapability{ .handoff, .unpack }) |capability| {
+            var fixture: Fixture = undefined;
+            try fixture.initFull(status, &info, "arm64\n");
+            defer fixture.deinit();
+            try seedFile(fixture.root(), "etc/demo.conf", conf);
+            try seedFile(fixture.root(), "usr/share/demo/shared", "shared\n");
+            try fixture.root().applyMetadata(
+                try root_fs.Path.init("usr/share/demo/shared"),
+                .{
+                    .mode = 0o644,
+                    .uid = currentUid(),
+                    .gid = currentGid(),
+                    .modified_nanoseconds = test_mtime_ns,
+                },
+            );
+            var data = [_]Entry{
+                .{ .path = "etc/demo.conf", .content = incoming },
+                .{ .path = "usr/share/demo/shared", .content = "shared\n" },
+            };
+            const bytes = try buildOwnedArchive(.{
+                .package = "demo",
+                .version = "1.0",
+                .architecture = "amd64",
+                .control_fields = "Multi-Arch: same\n",
+                .control = &.{
+                    .{ .path = "conffiles", .content = "/etc/demo.conf\n" },
+                    .{ .path = "md5sums", .content = shared_line },
+                },
+            }, &data);
+            defer testing.allocator.free(bytes);
+            var model = try modelOf(bytes);
+            defer model.deinit();
+            const steps = [_]native_program.Step{unpackStep(0, &model, 0, null, false)};
+            var artifacts: [1]native_program.ProgramArtifact = undefined;
+            const program = try singleProgram(&fixture, &model, bytes, &steps, &artifacts);
+            try expectSiblingConffileHandoff(try plan(testing.allocator, .{
+                .program = &program,
+                .snapshot = fixture.snapshot(),
+                .archives = &.{.{ .artifact = 0, .bytes = bytes }},
+                .root = fixture.root(),
+                .interoperability = .isolated_root,
+                .conffiles = capability,
+            }));
+        }
+    }
+}
+
+test "native_unpack.test.fresh Multi-Arch siblings share one staged conffile their md5sums omit" {
+    const shared_line = try md5Line(testing.allocator, "shared\n", "usr/share/demo/shared");
+    defer testing.allocator.free(shared_line);
+    for ([_][]const u8{ "key=value\n", "key=other\n" }) |arm64_conf| {
+        var fixture: Fixture = undefined;
+        try fixture.initFull(empty_status, &.{}, "arm64\n");
+        defer fixture.deinit();
+        var built: [2][]u8 = undefined;
+        var models: [2]archive_application.Model = undefined;
+        for ([_][]const u8{ "amd64", "arm64" }, [_][]const u8{ "key=value\n", arm64_conf }, 0..) |arch, conf, index| {
+            var data = [_]Entry{
+                .{ .path = "etc/demo.conf", .content = conf, .uid = currentUid(), .gid = currentGid() },
+                .{ .path = "usr/share/demo/shared", .content = "shared\n" },
+            };
+            built[index] = try buildOwnedArchive(.{
+                .package = "demo",
+                .version = "1",
+                .architecture = arch,
+                .control_fields = "Multi-Arch: same\n",
+                .control = &.{
+                    .{ .path = "conffiles", .content = "/etc/demo.conf\n" },
+                    .{ .path = "md5sums", .content = shared_line },
+                },
+            }, &data);
+            models[index] = try modelOf(built[index]);
+        }
+        defer for (&built, &models) |bytes, *model| {
+            model.deinit();
+            testing.allocator.free(bytes);
+        };
+        var database = try fixture.database();
+        defer database.deinit();
+        const artifacts = [_]native_program.ProgramArtifact{
+            testArtifact(0, &models[0], built[0].len),
+            testArtifact(1, &models[1], built[1].len),
+        };
+        const steps = [_]native_program.Step{
+            unpackStep(0, &models[0], 0, null, false),
+            unpackStep(1, &models[1], 1, null, false),
+        };
+        const program = testProgram(database.generation.sha256, 0, &artifacts, &steps);
+        const result = try plan(testing.allocator, .{
+            .program = &program,
+            .snapshot = fixture.snapshot(),
+            .archives = &.{
+                .{ .artifact = 0, .bytes = built[0] },
+                .{ .artifact = 1, .bytes = built[1] },
+            },
+            .root = fixture.root(),
+            .interoperability = .isolated_root,
+            .conffiles = .unpack,
+        });
+        if (!std.mem.eql(u8, arm64_conf, "key=value\n")) {
+            // dpkg finds no configured sibling Conffiles hash yet, hashes the
+            // staged .dpkg-new instead, and refuses the differing payload.
+            try expectRefusal(result, .multi_arch_content_mismatch);
+            continue;
+        }
+        var planned = try expectPlan(result);
+        defer planned.deinit();
+        var staged: usize = 0;
+        for (planned.filesystem) |change| switch (change) {
+            .file => |file| {
+                try testing.expect(!std.mem.eql(u8, file.path, "etc/demo.conf"));
+                if (std.mem.eql(u8, file.path, "etc/demo.conf.dpkg-new")) staged += 1;
+            },
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 1), staged);
+        for ([_][]const u8{ "info/demo:amd64.md5sums", "info/demo:arm64.md5sums" }) |name|
+            try testing.expectEqualStrings(shared_line, planned.database.find(name).?.bytes);
+        const status = planned.database.find("status").?.bytes;
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, status, "/etc/demo.conf newconffile"));
+    }
 }
 
 test "native_unpack.test.merged usr is normalized and dpkg namespace is reserved" {
