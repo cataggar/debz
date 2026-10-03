@@ -1275,6 +1275,9 @@ fn parseTar(allocator: std.mem.Allocator, bytes: []const u8, member: deb_archive
     if (firstInvalidSymlinkChain(allocator, entries.items) catch
         return setTarFailure(diagnostic, stage, .out_of_memory, member, offset, entries.items.len)) |index|
         return setTarFailure(diagnostic, stage, .conflicting_path, member, entries.items[index].header_offset + 157, index);
+    if (firstSymlinkMediatedDotDot(allocator, &paths, entries.items) catch
+        return setTarFailure(diagnostic, stage, .out_of_memory, member, offset, entries.items.len)) |index|
+        return setTarFailure(diagnostic, stage, .conflicting_path, member, entries.items[index].header_offset + 157, index);
     return .{
         .compression = member.compression,
         .compressed_bytes = member.size,
@@ -1362,16 +1365,45 @@ fn canonicalLookupPath(path: []const u8) bool {
 fn resolveLink(allocator: std.mem.Allocator, path: []const u8, raw: []const u8, hardlink: bool, maximum: usize) ![]u8 {
     if (hardlink) return canonicalPath(allocator, raw, maximum, false);
     if (raw.len == 0) return error.Unsafe;
-    if (raw[0] == '/') return canonicalPath(allocator, raw[1..], maximum, false);
-    const parent_end = std.mem.lastIndexOfScalar(u8, path, '/') orelse 0;
+    if (raw[0] == '/') return canonicalLinkTarget(allocator, raw[1..], maximum, false);
+    const parent = linkParent(path);
     var joined: std.ArrayList(u8) = .empty;
     defer joined.deinit(allocator);
-    if (parent_end != 0) {
-        try joined.appendSlice(allocator, path[0..parent_end]);
+    if (parent.len != 0) {
+        try joined.appendSlice(allocator, parent);
         try joined.append(allocator, '/');
     }
     try joined.appendSlice(allocator, raw);
-    return canonicalPath(allocator, joined.items, maximum, true);
+    return canonicalLinkTarget(allocator, joined.items, maximum, true);
+}
+
+fn linkParent(path: []const u8) []const u8 {
+    const end = std.mem.lastIndexOfScalar(u8, path, '/') orelse 0;
+    return path[0..end];
+}
+
+fn canonicalLinkTarget(allocator: std.mem.Allocator, joined: []const u8, maximum: usize, allow_dotdot: bool) ![]u8 {
+    if (joined.len > maximum) return error.TooLong;
+    var components = std.mem.splitScalar(u8, joined, '/');
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (!allow_dotdot or output.items.len == 0) return error.Unsafe;
+            const slash = std.mem.lastIndexOfScalar(u8, output.items, '/') orelse {
+                output.clearRetainingCapacity();
+                continue;
+            };
+            output.shrinkRetainingCapacity(slash);
+            continue;
+        }
+        for (component) |byte| if (byte < 0x20 or byte == 0x7f) return error.Unsafe;
+        if (output.items.len != 0) try output.append(allocator, '/');
+        try output.appendSlice(allocator, component);
+        if (output.items.len > maximum) return error.TooLong;
+    }
+    return output.toOwnedSlice(allocator);
 }
 
 fn pathConflict(paths: *const std.StringHashMap(EntryKind), path: []const u8, kind: EntryKind) bool {
@@ -1448,6 +1480,43 @@ fn firstInvalidSymlinkChain(allocator: std.mem.Allocator, entries: []const Entry
             chain[hops] = cursor;
             hops += 1;
             cursor = symlinks.get(entries[cursor].link_target.?) orelse break;
+        }
+    }
+    return null;
+}
+
+/// Rejects a relative symlink target whose lexical `..` would step out of a
+/// path that is, or lies beneath, an in-archive symlink. dpkg installs the
+/// literal symlink target and lets the kernel resolve it later, so component
+/// canonicalization must not turn that symlink-mediated walk into a safe
+/// archive-relative path.
+fn firstSymlinkMediatedDotDot(
+    allocator: std.mem.Allocator,
+    paths: *const std.StringHashMap(EntryKind),
+    entries: []const Entry,
+) error{OutOfMemory}!?usize {
+    var prefix: std.ArrayList(u8) = .empty;
+    defer prefix.deinit(allocator);
+    for (entries, 0..) |entry, index| {
+        if (entry.kind != .symlink) continue;
+        const literal = entry.link_literal.?;
+        if (literal[0] == '/' or std.mem.indexOf(u8, literal, "..") == null) continue;
+        prefix.clearRetainingCapacity();
+        try prefix.appendSlice(allocator, linkParent(entry.path));
+        var components = std.mem.splitScalar(u8, literal, '/');
+        while (components.next()) |component| {
+            if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+            if (std.mem.eql(u8, component, "..")) {
+                if (paths.get(prefix.items) == .symlink or hasSymlinkAncestor(paths, prefix.items)) return index;
+                const slash = std.mem.lastIndexOfScalar(u8, prefix.items, '/') orelse {
+                    prefix.clearRetainingCapacity();
+                    continue;
+                };
+                prefix.shrinkRetainingCapacity(slash);
+                continue;
+            }
+            if (prefix.items.len != 0) try prefix.append(allocator, '/');
+            try prefix.appendSlice(allocator, component);
         }
     }
     return null;
@@ -2466,7 +2535,19 @@ const ChainEntry = struct { path: []const u8, kind: u8 = '2', link: []const u8 =
 
 const orders_of_three = [_][3]usize{ .{ 0, 1, 2 }, .{ 0, 2, 1 }, .{ 1, 0, 2 }, .{ 1, 2, 0 }, .{ 2, 0, 1 }, .{ 2, 1, 0 } };
 
-fn chainTarDiagnostic(allocator: std.mem.Allocator, entries: []const ChainEntry) !?Diagnostic {
+const LinkTarResult = union(enum) {
+    inventory: TarInventory,
+    diagnostic: Diagnostic,
+
+    fn deinit(self: *LinkTarResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .inventory => |*inventory| freeInventory(allocator, inventory),
+            .diagnostic => {},
+        }
+    }
+};
+
+fn linkTarResult(allocator: std.mem.Allocator, entries: []const ChainEntry) !LinkTarResult {
     var tar: std.ArrayList(u8) = .empty;
     defer tar.deinit(allocator);
     for (entries) |entry| {
@@ -2480,9 +2561,18 @@ fn chainTarDiagnostic(allocator: std.mem.Allocator, entries: []const ChainEntry)
     try finishTar(allocator, &tar);
     const member: deb_archive.Member = .{ .kind = .data, .compression = .uncompressed, .name = "data.tar", .header = .{ .start = 0, .end = 0 }, .content = .{ .start = 20, .end = 20 + tar.items.len }, .timestamp = 0, .size = tar.items.len };
     var diagnostic: Diagnostic = undefined;
-    var inventory = parseTar(allocator, tar.items, member, .data_tar, .{}, false, &diagnostic) catch return diagnostic;
-    freeInventory(allocator, &inventory);
-    return null;
+    const inventory = parseTar(allocator, tar.items, member, .data_tar, .{}, false, &diagnostic) catch
+        return .{ .diagnostic = diagnostic };
+    return .{ .inventory = inventory };
+}
+
+fn chainTarDiagnostic(allocator: std.mem.Allocator, entries: []const ChainEntry) !?Diagnostic {
+    var result = try linkTarResult(allocator, entries);
+    defer result.deinit(allocator);
+    return switch (result) {
+        .inventory => null,
+        .diagnostic => |diagnostic| diagnostic,
+    };
 }
 
 fn expectChainAccepted(entries: []const ChainEntry) !void {
@@ -2496,6 +2586,101 @@ fn expectChainRejected(entries: []const ChainEntry, code: Code, entry_index: usi
     const diagnostic = (try chainTarDiagnostic(std.testing.allocator, entries)) orelse return error.TestExpectedError;
     try std.testing.expectEqual(code, diagnostic.code);
     try std.testing.expectEqual(@as(?usize, entry_index), diagnostic.entry_index);
+}
+
+fn expectLinkRejected(entries: []const ChainEntry, code: Code, entry_index: usize) !void {
+    var result = try linkTarResult(std.testing.allocator, entries);
+    defer result.deinit(std.testing.allocator);
+    const diagnostic = switch (result) {
+        .inventory => return error.TestExpectedError,
+        .diagnostic => |value| value,
+    };
+    try std.testing.expectEqual(code, diagnostic.code);
+    try std.testing.expectEqual(@as(?usize, entry_index), diagnostic.entry_index);
+}
+
+const link_target_prefix = [_]ChainEntry{
+    .{ .path = "usr", .kind = '5' },
+    .{ .path = "usr/bin", .kind = '5' },
+    .{ .path = "usr/bin/data", .kind = '0' },
+    .{ .path = "usr/lib", .kind = '5' },
+    .{ .path = "usr/lib/sub", .kind = '5' },
+};
+
+test "symlink targets canonicalize dot and empty components" {
+    const cases = [_]struct { path: []const u8, link: []const u8, target: []const u8 }{
+        .{ .path = "usr/bin/X11", .link = ".", .target = "usr/bin" },
+        .{ .path = "usr/bin/current", .link = "./data", .target = "usr/bin/data" },
+        .{ .path = "usr/bin/slashed", .link = ".//data/", .target = "usr/bin/data" },
+        .{ .path = "usr/lib/inner", .link = "sub/./x", .target = "usr/lib/sub/x" },
+        .{ .path = "usr/lib/up", .link = "./../bin/./data", .target = "usr/bin/data" },
+        .{ .path = "usr/lib/absolute", .link = "/usr/./lib//sub/", .target = "usr/lib/sub" },
+        .{ .path = "usr/lib/root", .link = "../..", .target = "" },
+        .{ .path = "usr/lib/slash", .link = "/", .target = "" },
+        .{ .path = "usr/lib/absolute-root", .link = "/./.", .target = "" },
+        .{ .path = "top", .link = ".", .target = "" },
+    };
+    for (cases) |case| {
+        var result = try linkTarResult(std.testing.allocator, &(link_target_prefix ++ [_]ChainEntry{.{ .path = case.path, .link = case.link }}));
+        defer result.deinit(std.testing.allocator);
+        switch (result) {
+            .inventory => |*inventory| {
+                const entry = inventory.entries[inventory.entries.len - 1];
+                try std.testing.expectEqualStrings(case.link, entry.link_literal.?);
+                try std.testing.expectEqualStrings(case.target, entry.link_target.?);
+            },
+            .diagnostic => |diagnostic| {
+                std.debug.print("{s} -> {s}: {s}\n", .{ case.path, case.link, @tagName(diagnostic.code) });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "symlink targets refuse root escape canonicalization bypasses" {
+    const cases = [_]struct { path: []const u8, link: []const u8 }{
+        .{ .path = "x", .link = "../etc" },
+        .{ .path = "x", .link = "a/../../etc" },
+        .{ .path = "x", .link = "./a/../../etc" },
+        .{ .path = "x", .link = "a/../../etc/" },
+        .{ .path = "x", .link = "a//..//../../etc" },
+        .{ .path = "usr/x", .link = "./../../etc" },
+        .{ .path = "usr/x", .link = "../..//etc" },
+        .{ .path = "usr/x", .link = "/.." },
+        .{ .path = "usr/x", .link = "/a/../../etc" },
+        .{ .path = "usr/x", .link = "/usr/./../etc" },
+    };
+    for (cases) |case|
+        try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{.{ .path = case.path, .link = case.link }}), .unsafe_link, link_target_prefix.len);
+
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{.{ .path = "usr/hard", .kind = '1', .link = "usr/bin/./data" }}), .unsafe_link, link_target_prefix.len);
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{.{ .path = "usr/hard", .kind = '1', .link = "usr//bin/data" }}), .unsafe_link, link_target_prefix.len);
+}
+
+test "symlink targets refuse symlink-mediated dotdot and descendant walks" {
+    const x11 = ChainEntry{ .path = "usr/bin/X11", .link = "." };
+    const escape = ChainEntry{ .path = "usr/escape", .link = "bin/X11/../../.." };
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{ x11, escape }), .conflicting_path, link_target_prefix.len + 1);
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{ escape, x11 }), .conflicting_path, link_target_prefix.len);
+
+    const share = ChainEntry{ .path = "usr/lib/share", .link = "../bin" };
+    const beneath = ChainEntry{ .path = "usr/beneath", .link = "lib/share/missing/../.." };
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{ share, beneath }), .conflicting_path, link_target_prefix.len + 1);
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{ beneath, share }), .conflicting_path, link_target_prefix.len);
+
+    const descendant = ChainEntry{ .path = "usr/descendant", .link = "bin//X11/./child/" };
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{ x11, descendant }), .conflicting_path, link_target_prefix.len + 1);
+    try expectLinkRejected(&(link_target_prefix ++ [_]ChainEntry{ descendant, x11 }), .conflicting_path, link_target_prefix.len + 1);
+
+    var lexical = try linkTarResult(std.testing.allocator, &(link_target_prefix ++ [_]ChainEntry{ x11, .{ .path = "usr/lib/peer", .link = "../bin/../lib/./sub" } }));
+    defer lexical.deinit(std.testing.allocator);
+    switch (lexical) {
+        .inventory => |*inventory| try std.testing.expectEqualStrings("usr/lib/sub", inventory.entries[inventory.entries.len - 1].link_target.?),
+        .diagnostic => |diagnostic| {
+            std.debug.print("unexpected {s} at entry {any}\n", .{ @tagName(diagnostic.code), diagnostic.entry_index });
+            return error.TestUnexpectedResult;
+        },
+    }
 }
 
 test "accepts acyclic in-archive symlink chains in any tar order" {
