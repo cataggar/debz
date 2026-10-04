@@ -86,9 +86,9 @@ case "$proof_root" in "$source_root"/*) echo "proof root must not nest in source
 [[ $(stat -c '%u:%g:%a' "$source_root/proc") == 0:0:755 ]]
 [[ ! -L "$source_root/proc" && -z $(find "$source_root/proc" -mindepth 1 -print -quit) ]]
 for control in \
-  'var/lib/dpkg/info/udev.postinst:2533:755:b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606' \
+  'var/lib/dpkg/info/udev.postinst:2578:755:b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606' \
   'usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517' \
-  'usr/bin/systemd-tmpfiles:131024:755:13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4' \
+  'usr/bin/systemd-tmpfiles:121544:755:13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4' \
   'usr/lib/tmpfiles.d/static-nodes-permissions.conf:798:644:ca4849c27428fd648f6377dd51a3ab0eb79de69fce1bdc910670012c0cf26f85' \
   'usr/lib/sysusers.d/debian-udev.conf:143:644:e9493928a4ed5399c5619cee0559644099f0625075606baca35b40533286b5e0'; do
   IFS=: read -r name size mode digest <<<"$control"
@@ -100,7 +100,7 @@ done
 require_protected_file "$source_root/var/lib/dpkg/status"
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" \
   -W -f='${Version} ${Status}' udev) == \
-  '261.2-1ubuntu2 install ok half-configured' ]]
+  '259.5-0ubuntu3.4 install ok half-configured' ]]
 python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
 
 cp -a --reflink=auto -- "$source_root" "$proof_root"

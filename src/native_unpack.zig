@@ -18898,7 +18898,7 @@ fn snapshotSystemdProcIsBound(
 ) bool {
     return std.mem.eql(u8, architecture, "amd64") and
         std.mem.eql(u8, package.name, "systemd") and
-        std.mem.eql(u8, package.version, "261.2-1ubuntu2") and
+        std.mem.eql(u8, package.version, "259.5-0ubuntu3.4") and
         std.mem.eql(u8, package.architecture, "amd64") and
         kind == .postinst and source == .new_package and
         action_kind == .script and
@@ -18945,7 +18945,7 @@ fn snapshotSudoProcIsBound(
 ) bool {
     return std.mem.eql(u8, architecture, "amd64") and
         std.mem.eql(u8, package.name, "sudo") and
-        std.mem.eql(u8, package.version, "1.9.17p2-7ubuntu3") and
+        std.mem.eql(u8, package.version, "1.9.17p2-1ubuntu3.1") and
         std.mem.eql(u8, package.architecture, "amd64") and
         kind == .postinst and source == .new_package and
         action_kind == .script and
@@ -18966,7 +18966,7 @@ fn snapshotPython3PreinstIsBound(
 ) bool {
     return std.mem.eql(u8, architecture, "amd64") and
         std.mem.eql(u8, package.name, "python3") and
-        std.mem.eql(u8, package.version, "3.14.7-3") and
+        std.mem.eql(u8, package.version, "3.14.3-0ubuntu2") and
         std.mem.eql(u8, package.architecture, "amd64") and
         kind == .preinst and source == .new_package and
         action_kind == .script and
@@ -19033,7 +19033,7 @@ fn snapshotUdevProcIsBound(
 ) bool {
     return std.mem.eql(u8, architecture, "amd64") and
         std.mem.eql(u8, package.name, "udev") and
-        std.mem.eql(u8, package.version, "261.2-1ubuntu2") and
+        std.mem.eql(u8, package.version, "259.5-0ubuntu3.4") and
         std.mem.eql(u8, package.architecture, "amd64") and
         kind == .postinst and source == .new_package and
         action_kind == .script and
@@ -19064,7 +19064,7 @@ fn verifySnapshotUdevPostinstPaths(
 test "native_unpack.test.signed systemd configure uses only matching staged and installed bytes" {
     const package: native_program.PackageIdentity = .{
         .name = "systemd",
-        .version = "261.2-1ubuntu2",
+        .version = "259.5-0ubuntu3.4",
         .architecture = "amd64",
     };
     const digest: native_program.Digest = snapshot_systemd_postinst_sha256.*;
@@ -19089,7 +19089,7 @@ test "native_unpack.test.signed systemd configure uses only matching staged and 
     }{
         .{ .architecture = "arm64" },
         .{ .package = .{ .name = "other", .version = package.version, .architecture = "amd64" } },
-        .{ .package = .{ .name = package.name, .version = "261.2-1ubuntu3", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "259.5-0ubuntu3.5", .architecture = "amd64" } },
         .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
         .{ .kind = .preinst },
         .{ .source = .installed_package },
@@ -19153,7 +19153,7 @@ test "native_unpack.test.signed systemd configure uses only matching staged and 
 test "native_unpack.test.signed udev PID-only proc requires exact configure and installed controls" {
     const package: native_program.PackageIdentity = .{
         .name = "udev",
-        .version = "261.2-1ubuntu2",
+        .version = "259.5-0ubuntu3.4",
         .architecture = "amd64",
     };
     const digest: native_program.Digest = snapshot_udev_postinst_sha256.*;
@@ -19178,7 +19178,7 @@ test "native_unpack.test.signed udev PID-only proc requires exact configure and 
     }{
         .{ .architecture = "arm64" },
         .{ .package = .{ .name = "other", .version = package.version, .architecture = "amd64" } },
-        .{ .package = .{ .name = package.name, .version = "261.2-1ubuntu3", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "259.5-0ubuntu3.5", .architecture = "amd64" } },
         .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
         .{ .kind = .preinst },
         .{ .source = .installed_package },
@@ -19242,7 +19242,7 @@ test "native_unpack.test.signed udev PID-only proc requires exact configure and 
 test "native_unpack.test.signed sudo PID-only proc requires exact configure and installed controls" {
     const package: native_program.PackageIdentity = .{
         .name = "sudo",
-        .version = "1.9.17p2-7ubuntu3",
+        .version = "1.9.17p2-1ubuntu3.1",
         .architecture = "amd64",
     };
     const digest: native_program.Digest = snapshot_sudo_postinst_sha256.*;
@@ -19267,7 +19267,7 @@ test "native_unpack.test.signed sudo PID-only proc requires exact configure and 
     }{
         .{ .architecture = "arm64" },
         .{ .package = .{ .name = "sudo-rs", .version = package.version, .architecture = "amd64" } },
-        .{ .package = .{ .name = package.name, .version = "1.9.17p2-7ubuntu4", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "1.9.17p2-1ubuntu3.2", .architecture = "amd64" } },
         .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
         .{ .kind = .preinst },
         .{ .source = .installed_package },
@@ -19337,7 +19337,7 @@ test "native_unpack.test.signed python3 preinst is inert only for exact install 
     const script = @embedFile("fixtures/ubuntu-resolute-python3.preinst");
     const package: native_program.PackageIdentity = .{
         .name = "python3",
-        .version = "3.14.7-3",
+        .version = "3.14.3-0ubuntu2",
         .architecture = "amd64",
     };
     const digest: native_program.Digest = snapshot_python3_preinst_sha256.*;
@@ -19389,14 +19389,14 @@ test "native_unpack.test.signed python3 preinst is inert only for exact install 
     }{
         .{ .architecture = "arm64" },
         .{ .package = .{ .name = "python3-minimal", .version = package.version, .architecture = "amd64" } },
-        .{ .package = .{ .name = package.name, .version = "3.14.7-4", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "3.14.3-0ubuntu3", .architecture = "amd64" } },
         .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
         .{ .kind = .postinst },
         .{ .source = .installed_package },
         .{ .action_kind = .trigger },
         .{ .arguments = &.{} },
         .{ .arguments = &.{ "install", "" } },
-        .{ .arguments = &.{ "upgrade", "3.14.7-3" } },
+        .{ .arguments = &.{ "upgrade", "3.14.3-0ubuntu2" } },
     }) |case| {
         try testing.expect(!snapshotPython3PreinstIsBound(
             case.architecture,
@@ -19670,7 +19670,7 @@ fn keyboardPreinstTemplates(
     model: *const archive_application.Model,
 ) ?archive_application.MetadataMember {
     if (!std.mem.eql(u8, package.name, "keyboard-configuration") or
-        !std.mem.eql(u8, package.version, "1.248ubuntu3") or
+        !std.mem.eql(u8, package.version, "1.237ubuntu3.1") or
         !std.mem.eql(u8, package.architecture, "all") or
         !std.mem.eql(u8, model.facts.package, package.name) or
         !std.mem.eql(u8, model.facts.version, package.version) or
@@ -19686,7 +19686,7 @@ fn keyboardPreinstTemplates(
     const expected = parseHex(32, keyboard_templates_sha256) orelse unreachable;
     for (model.metadata) |member| {
         if (std.mem.eql(u8, member.name, "templates") and
-            member.mode == 0o644 and member.size == 576415 and
+            member.mode == 0o644 and member.size == 629034 and
             std.mem.eql(u8, &member.sha256, &expected))
             return member;
     }
@@ -19773,7 +19773,7 @@ fn iproutePostinstTemplates(
     model: *const archive_application.Model,
 ) ?archive_application.MetadataMember {
     if (!std.mem.eql(u8, package.name, "iproute2") or
-        !std.mem.eql(u8, package.version, "6.19.0-1ubuntu2") or
+        !std.mem.eql(u8, package.version, "6.19.0-1ubuntu1.1") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, model.facts.package, package.name) or
         !std.mem.eql(u8, model.facts.version, package.version) or
@@ -19843,22 +19843,34 @@ fn provenBootstrappedPreinstRecord(
     const script = record.script(.preinst) orelse return false;
     const digest = parseHex(32, &call.script_sha256) orelse return false;
     if (std.mem.eql(u8, package.name, "keyboard-configuration") and
-        std.mem.eql(u8, package.version, "1.248ubuntu3") and
-        std.mem.eql(u8, package.architecture, "all") and
-        std.mem.eql(u8, &call.script_sha256, keyboard_preinst_sha256))
-    {
-        const template = record.metadataMember(.templates) orelse return false;
-        const expected = parseHex(32, keyboard_templates_sha256) orelse unreachable;
-        if (template.size != 576415 or template.mode != 0o644 or
-            template.uid != 0 or template.gid != 0 or
-            !std.mem.eql(u8, &template.sha256, &expected))
-            return false;
-    }
+        !matchesSnapshotKeyboardPreinstRecord(
+            package,
+            &call.script_sha256,
+            record.metadataMember(.templates),
+        ))
+        return false;
     return record.status.want == .install and record.status.error_state == .ok and
         record.status.current == .unpacked and record.paths != null and
         std.mem.eql(u8, record.version, package.version) and
         std.mem.eql(u8, record.info_stem, package.name) and
         std.mem.eql(u8, &script.sha256, &digest);
+}
+
+fn matchesSnapshotKeyboardPreinstRecord(
+    package: native_program.PackageIdentity,
+    script_sha256: []const u8,
+    maybe_template: ?package_database.RetainedMetadata,
+) bool {
+    if (!std.mem.eql(u8, package.name, "keyboard-configuration") or
+        !std.mem.eql(u8, package.version, "1.237ubuntu3.1") or
+        !std.mem.eql(u8, package.architecture, "all") or
+        !std.mem.eql(u8, script_sha256, keyboard_preinst_sha256))
+        return false;
+    const template = maybe_template orelse return false;
+    const expected = parseHex(32, keyboard_templates_sha256) orelse unreachable;
+    return template.size == 629034 and template.mode == 0o644 and
+        template.uid == 0 and template.gid == 0 and
+        std.mem.eql(u8, &template.sha256, &expected);
 }
 
 fn provenIpRoutePostinstRecord(
@@ -20344,6 +20356,28 @@ fn stageIpRoutePostinstTemplates(
     );
 }
 
+fn isSnapshotKeyboardPreinstStage(
+    package: native_program.PackageIdentity,
+    step: native_program.Step,
+) bool {
+    return std.mem.eql(u8, package.name, "keyboard-configuration") and
+        std.mem.eql(u8, package.version, "1.237ubuntu3.1") and
+        std.mem.eql(u8, package.architecture, "all") and
+        step.operation == .run_maintainer_script and
+        step.operation.run_maintainer_script.kind == .preinst;
+}
+
+fn isSnapshotIpRoutePostinstStage(
+    package: native_program.PackageIdentity,
+    step: native_program.Step,
+) bool {
+    return std.mem.eql(u8, package.name, "iproute2") and
+        std.mem.eql(u8, package.version, "6.19.0-1ubuntu1.1") and
+        std.mem.eql(u8, package.architecture, "amd64") and
+        step.operation == .run_maintainer_script and
+        step.operation.run_maintainer_script.kind == .postinst;
+}
+
 fn removalRunsInstalledScript(
     program: *const native_program.Program,
     sequence: u32,
@@ -20379,16 +20413,8 @@ fn stageLifecycleScripts(
 ) !MaterializationResult {
     const key = try lifecyclePackageKey(scratch, package);
     const step = program.steps[execution.program_step];
-    const keyboard_preinst = std.mem.eql(u8, package.name, "keyboard-configuration") and
-        std.mem.eql(u8, package.version, "1.248ubuntu3") and
-        std.mem.eql(u8, package.architecture, "all") and
-        step.operation == .run_maintainer_script and
-        step.operation.run_maintainer_script.kind == .preinst;
-    const iproute_postinst = std.mem.eql(u8, package.name, "iproute2") and
-        std.mem.eql(u8, package.version, "6.19.0-1ubuntu2") and
-        std.mem.eql(u8, package.architecture, "amd64") and
-        step.operation == .run_maintainer_script and
-        step.operation.run_maintainer_script.kind == .postinst;
+    const keyboard_preinst = isSnapshotKeyboardPreinstStage(package, step);
+    const iproute_postinst = isSnapshotIpRoutePostinstStage(package, step);
     if (staging.packages.contains(key)) {
         if (stage_config) if (lifecycleArchiveIndex(models, package)) |model_index| {
             if (models[model_index].script(.config)) |config| {
@@ -20783,7 +20809,7 @@ fn snapshotConsoleSetupPostinstUsesInfo(
 ) bool {
     return std.mem.eql(u8, architecture, "amd64") and
         std.mem.eql(u8, package.name, "console-setup") and
-        std.mem.eql(u8, package.version, "1.248ubuntu3") and
+        std.mem.eql(u8, package.version, "1.237ubuntu3.1") and
         std.mem.eql(u8, package.architecture, "all") and
         kind == .postinst and source == .new_package and
         action_kind == .script and
@@ -20804,7 +20830,7 @@ fn snapshotChronyPostinstUsesInfo(
 ) bool {
     return std.mem.eql(u8, architecture, "amd64") and
         std.mem.eql(u8, package.name, "chrony") and
-        std.mem.eql(u8, package.version, "4.8-4ubuntu2") and
+        std.mem.eql(u8, package.version, "4.8-2ubuntu1") and
         std.mem.eql(u8, package.architecture, "amd64") and
         kind == .postinst and source == .new_package and
         action_kind == .script and
@@ -20819,6 +20845,7 @@ const SignedSnapshotControlError =
         InvalidConsoleSetupPostinstControl,
         InvalidChronyPostinstControl,
         InvalidPython3PreinstControl,
+        InvalidAlternativesScriptAuthority,
     };
 
 fn verifyAuthenticatedSnapshotArtifact(
@@ -20862,10 +20889,22 @@ fn verifySnapshotConsoleSetupArtifact(
 ) !void {
     return verifyAuthenticatedSnapshotArtifact(
         artifacts,
-        .{ .name = "console-setup", .version = "1.248ubuntu3", .architecture = "all" },
-        108150,
+        .{ .name = "console-setup", .version = "1.237ubuntu3.1", .architecture = "all" },
+        102654,
         console_setup_archive_sha512,
         error.InvalidConsoleSetupPostinstControl,
+    );
+}
+
+fn verifySnapshotChronyArtifact(
+    artifacts: []const native_program.ProgramArtifact,
+) !void {
+    return verifyAuthenticatedSnapshotArtifact(
+        artifacts,
+        .{ .name = "chrony", .version = "4.8-2ubuntu1", .architecture = "amd64" },
+        341784,
+        chrony_archive_sha512,
+        error.InvalidChronyPostinstControl,
     );
 }
 
@@ -20963,14 +21002,14 @@ fn snapshotConsoleSetupPostinstInfoPath(
     if (selected == .staged) {
         try verifyConsoleSetupControlFile(allocator, root, .{
             .path = candidate,
-            .size = 4330,
+            .size = 4555,
             .mode = 0o755,
             .sha256 = console_setup_postinst_sha256,
         });
     }
     // Debconf resolves the config and templates beside the postinst's argv[0].
     for ([_]ConsoleSetupControlFile{
-        .{ .path = "var/lib/dpkg/info/console-setup.postinst", .size = 4330, .mode = 0o755, .sha256 = console_setup_postinst_sha256 },
+        .{ .path = "var/lib/dpkg/info/console-setup.postinst", .size = 4555, .mode = 0o755, .sha256 = console_setup_postinst_sha256 },
         .{ .path = "var/lib/dpkg/info/console-setup.config", .size = 32119, .mode = 0o755, .sha256 = "9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8" },
         .{ .path = "var/lib/dpkg/info/console-setup.templates", .size = 154958, .mode = 0o644, .sha256 = "c0d53d7485c72b8894340e7f5c2557c2247c3fe033dfbad56bbdc3dc659dc379" },
     }) |binding| try verifyConsoleSetupControlFile(allocator, root, binding);
@@ -20996,13 +21035,7 @@ fn snapshotChronyPostinstInfoPath(
     package: native_program.PackageIdentity,
     candidate: []const u8,
 ) ![]const u8 {
-    try verifyAuthenticatedSnapshotArtifact(
-        program.artifacts,
-        .{ .name = "chrony", .version = "4.8-4ubuntu2", .architecture = "amd64" },
-        333804,
-        chrony_archive_sha512,
-        error.InvalidChronyPostinstControl,
-    );
+    try verifySnapshotChronyArtifact(program.artifacts);
     const installed = try lifecycleInstalledScriptPath(
         allocator,
         root,
@@ -21016,12 +21049,12 @@ fn snapshotChronyPostinstInfoPath(
     if (selected == .staged)
         try verifySignedDebconfControlFile(allocator, root, .{
             .path = candidate,
-            .size = 6993,
+            .size = 6953,
             .mode = 0o755,
             .sha256 = chrony_postinst_sha256,
         }, error.InvalidChronyPostinstControl);
     for ([_]SignedDebconfControlFile{
-        .{ .path = "var/lib/dpkg/info/chrony.postinst", .size = 6993, .mode = 0o755, .sha256 = chrony_postinst_sha256 },
+        .{ .path = "var/lib/dpkg/info/chrony.postinst", .size = 6953, .mode = 0o755, .sha256 = chrony_postinst_sha256 },
         .{ .path = "var/lib/dpkg/info/chrony.config", .size = 204, .mode = 0o755, .sha256 = "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0" },
         .{ .path = "var/lib/dpkg/info/chrony.templates", .size = 698, .mode = 0o644, .sha256 = "1f0ffe9e66ddc6593446ef924cf6dc80a445b161f0e1876ffac417f0a32841cf" },
     }) |binding| try verifySignedDebconfControlFile(
@@ -21832,7 +21865,7 @@ fn snapshotBashPostinstIsBound(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, package.name, "bash") or
-        !std.mem.eql(u8, package.version, "5.3-3ubuntu1") or
+        !std.mem.eql(u8, package.version, "5.3-2ubuntu1") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -21853,7 +21886,7 @@ fn snapshotProcpsPostinstIsInert(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, package.name, "procps") or
-        !std.mem.eql(u8, package.version, "2:4.0.6-3ubuntu1") or
+        !std.mem.eql(u8, package.version, "2:4.0.4-9ubuntu1") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -21877,7 +21910,7 @@ fn snapshotProcpsTriggerPostinstIsInert(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, package.name, "procps") or
-        !std.mem.eql(u8, package.version, "2:4.0.6-3ubuntu1") or
+        !std.mem.eql(u8, package.version, "2:4.0.4-9ubuntu1") or
         kind != .postinst or source != .new_package or
         action_kind != .trigger or
         arguments.len != 2 or
@@ -21945,7 +21978,7 @@ fn snapshotSudoRsPostinstIsBound(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, package.name, "sudo-rs") or
-        !std.mem.eql(u8, package.version, "0.2.14-1ubuntu4") or
+        !std.mem.eql(u8, package.version, "0.2.13-0ubuntu1.2") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -21988,7 +22021,7 @@ fn snapshotConsoleSetupLinuxPostinstIsBound(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "all") or
         !std.mem.eql(u8, package.name, "console-setup-linux") or
-        !std.mem.eql(u8, package.version, "1.248ubuntu3") or
+        !std.mem.eql(u8, package.version, "1.237ubuntu3.1") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -22023,33 +22056,7 @@ fn verifyConsoleSetupProviders(
     root: root_fs.Root,
     program: *const native_program.Program,
 ) !void {
-    const expected_archive = (try content_digest.Value.parse(
-        .sha512,
-        "511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b",
-    )).sha512;
-    var found = false;
-    for (program.artifacts) |artifact| {
-        if (!std.mem.eql(u8, artifact.package.name, "console-setup-linux") or
-            !std.mem.eql(u8, artifact.package.architecture, "all"))
-            continue;
-        const identity = artifact.identity() orelse
-            return error.InvalidAlternativesScriptAuthority;
-        const observed = identity.digests.sha512 orelse
-            return error.InvalidAlternativesScriptAuthority;
-        if (found or
-            !std.mem.eql(u8, artifact.package.version, "1.248ubuntu3") or
-            artifact.size != 6207548 or identity.primary != .sha512 or
-            !std.crypto.timing_safe.eql([64]u8, observed, expected_archive))
-            return error.InvalidAlternativesScriptAuthority;
-        const origin = artifact.origin_v2 orelse
-            return error.InvalidAlternativesScriptAuthority;
-        switch (origin) {
-            .authenticated_repository => {},
-            else => return error.InvalidAlternativesScriptAuthority,
-        }
-        found = true;
-    }
-    if (!found) return error.InvalidAlternativesScriptAuthority;
+    try verifySnapshotConsoleSetupLinuxArtifact(program.artifacts);
     for ([_]ConsoleSetupFileBinding{
         .{
             .path = "var/lib/dpkg/info/console-setup-linux.list",
@@ -22078,57 +22085,24 @@ fn verifyConsoleSetupProviders(
     }
 }
 
+fn verifySnapshotConsoleSetupLinuxArtifact(
+    artifacts: []const native_program.ProgramArtifact,
+) !void {
+    return verifyAuthenticatedSnapshotArtifact(
+        artifacts,
+        .{ .name = "console-setup-linux", .version = "1.237ubuntu3.1", .architecture = "all" },
+        6206020,
+        "511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b",
+        error.InvalidAlternativesScriptAuthority,
+    );
+}
+
 fn verifySudoRsStructuralOwner(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     program: *const native_program.Program,
 ) !void {
-    const expected_artifacts = [_]struct {
-        name: []const u8,
-        version: []const u8,
-        size: u64,
-        sha512: []const u8,
-    }{
-        .{
-            .name = "sudo",
-            .version = "1.9.17p2-7ubuntu3",
-            .size = 954870,
-            .sha512 = "7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d",
-        },
-        .{
-            .name = "sudo-rs",
-            .version = "0.2.14-1ubuntu4",
-            .size = 590768,
-            .sha512 = "61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189",
-        },
-    };
-    for (expected_artifacts) |expected| {
-        const digest = (try content_digest.Value.parse(.sha512, expected.sha512)).sha512;
-        var found = false;
-        for (program.artifacts) |artifact| {
-            if (!std.mem.eql(u8, artifact.package.name, expected.name) or
-                !std.mem.eql(u8, artifact.package.architecture, "amd64"))
-                continue;
-            const identity = artifact.identity() orelse
-                return error.InvalidAlternativesScriptAuthority;
-            const observed = identity.digests.sha512 orelse
-                return error.InvalidAlternativesScriptAuthority;
-            if (found or
-                !std.mem.eql(u8, artifact.package.version, expected.version) or
-                artifact.size != expected.size or
-                identity.primary != .sha512 or
-                !std.crypto.timing_safe.eql([64]u8, observed, digest))
-                return error.InvalidAlternativesScriptAuthority;
-            const origin = artifact.origin_v2 orelse
-                return error.InvalidAlternativesScriptAuthority;
-            switch (origin) {
-                .authenticated_repository => {},
-                else => return error.InvalidAlternativesScriptAuthority,
-            }
-            found = true;
-        }
-        if (!found) return error.InvalidAlternativesScriptAuthority;
-    }
+    try verifySudoRsStructuralOwnerArtifacts(program.artifacts);
     const expected_files = [_]struct {
         path: []const u8,
         mode: u32,
@@ -22173,6 +22147,37 @@ fn verifySudoRsStructuralOwner(
         if (!std.crypto.timing_safe.eql([32]u8, observed, digest))
             return error.InvalidAlternativesScriptAuthority;
     }
+}
+
+fn verifySudoRsStructuralOwnerArtifacts(
+    artifacts: []const native_program.ProgramArtifact,
+) !void {
+    const expected_artifacts = [_]struct {
+        name: []const u8,
+        version: []const u8,
+        size: u64,
+        sha512: []const u8,
+    }{
+        .{
+            .name = "sudo",
+            .version = "1.9.17p2-1ubuntu3.1",
+            .size = 954828,
+            .sha512 = "7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d",
+        },
+        .{
+            .name = "sudo-rs",
+            .version = "0.2.13-0ubuntu1.2",
+            .size = 596110,
+            .sha512 = "61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189",
+        },
+    };
+    for (expected_artifacts) |expected| try verifyAuthenticatedSnapshotArtifact(
+        artifacts,
+        .{ .name = expected.name, .version = expected.version, .architecture = "amd64" },
+        expected.size,
+        expected.sha512,
+        error.InvalidAlternativesScriptAuthority,
+    );
 }
 
 fn verifySnapshotSudoStructuralOwner(
@@ -22261,28 +22266,7 @@ fn verifySnapshotPython3PreinstInputs(
             !std.mem.eql(u8, observed.target, binding.target))
             return error.InvalidPython3PreinstControl;
     }
-    for ([_]struct {
-        package: native_program.PackageIdentity,
-        size: u64,
-        sha512: []const u8,
-    }{
-        .{
-            .package = .{ .name = "python3", .version = "3.14.7-3", .architecture = "amd64" },
-            .size = 23672,
-            .sha512 = "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
-        },
-        .{
-            .package = .{ .name = "python3-minimal", .version = "3.14.7-3", .architecture = "amd64" },
-            .size = 25858,
-            .sha512 = "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
-        },
-    }) |binding| try verifyAuthenticatedSnapshotArtifact(
-        program.artifacts,
-        binding.package,
-        binding.size,
-        binding.sha512,
-        error.InvalidPython3PreinstControl,
-    );
+    try verifySnapshotPython3PreinstArtifacts(program.artifacts);
     for ([_]SignedDebconfControlFile{
         .{ .path = "var/lib/dpkg/info/python3.preinst", .size = 856, .mode = 0o755, .sha256 = snapshot_python3_preinst_sha256 },
         .{ .path = "var/lib/dpkg/info/python3.list", .size = 918, .mode = 0o644, .sha256 = "d830caf623e35ec940e8f6d185455faa601a627052b1daffe3e4741b960bb1a3" },
@@ -22300,6 +22284,126 @@ fn verifySnapshotPython3PreinstInputs(
         root,
         0,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    );
+}
+
+fn verifySnapshotPython3PreinstArtifacts(
+    artifacts: []const native_program.ProgramArtifact,
+) !void {
+    for ([_]struct {
+        package: native_program.PackageIdentity,
+        size: u64,
+        sha512: []const u8,
+    }{
+        .{
+            .package = .{ .name = "python3", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+            .size = 22938,
+            .sha512 = "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
+        },
+        .{
+            .package = .{ .name = "python3-minimal", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+            .size = 25808,
+            .sha512 = "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
+        },
+    }) |binding| try verifyAuthenticatedSnapshotArtifact(
+        artifacts,
+        binding.package,
+        binding.size,
+        binding.sha512,
+        error.InvalidPython3PreinstControl,
+    );
+}
+
+test "native_unpack.test.snapshot authenticated artifacts bind resolute provenance" {
+    const Helper = struct {
+        fn artifact(
+            index: u32,
+            package: native_program.PackageIdentity,
+            size: u64,
+            sha512: []const u8,
+        ) !native_program.ProgramArtifact {
+            const digest = (try content_digest.Value.parse(.sha512, sha512)).sha512;
+            return .{
+                .index = index,
+                .package = package,
+                .archive_identity = content_digest.JsonIdentity.init(
+                    try content_digest.Identity.init(.{ .sha512 = digest }, .sha512),
+                ),
+                .size = size,
+                .application_sha256 = @splat('0'),
+                .origin_v2 = .{ .authenticated_repository = .{
+                    .repository_id = @splat('0'),
+                    .repository_snapshot_sha256 = @splat('0'),
+                } },
+            };
+        }
+    };
+
+    const chrony = try Helper.artifact(
+        0,
+        .{ .name = "chrony", .version = "4.8-2ubuntu1", .architecture = "amd64" },
+        341784,
+        chrony_archive_sha512,
+    );
+    try verifySnapshotChronyArtifact(&.{chrony});
+
+    const console_setup_linux = try Helper.artifact(
+        1,
+        .{ .name = "console-setup-linux", .version = "1.237ubuntu3.1", .architecture = "all" },
+        6206020,
+        "511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b",
+    );
+    try verifySnapshotConsoleSetupLinuxArtifact(&.{console_setup_linux});
+
+    const sudo = try Helper.artifact(
+        2,
+        .{ .name = "sudo", .version = "1.9.17p2-1ubuntu3.1", .architecture = "amd64" },
+        954828,
+        "7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d",
+    );
+    const sudo_rs = try Helper.artifact(
+        3,
+        .{ .name = "sudo-rs", .version = "0.2.13-0ubuntu1.2", .architecture = "amd64" },
+        596110,
+        "61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189",
+    );
+    try verifySudoRsStructuralOwnerArtifacts(&.{ sudo, sudo_rs });
+
+    const python3 = try Helper.artifact(
+        4,
+        .{ .name = "python3", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+        22938,
+        "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
+    );
+    const python3_minimal = try Helper.artifact(
+        5,
+        .{ .name = "python3-minimal", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+        25808,
+        "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
+    );
+    try verifySnapshotPython3PreinstArtifacts(&.{ python3, python3_minimal });
+
+    var changed = chrony;
+    changed.package.version = "4.8-2ubuntu2";
+    try testing.expectError(
+        error.InvalidChronyPostinstControl,
+        verifySnapshotChronyArtifact(&.{changed}),
+    );
+    changed = console_setup_linux;
+    changed.size += 1;
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        verifySnapshotConsoleSetupLinuxArtifact(&.{changed}),
+    );
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        verifySudoRsStructuralOwnerArtifacts(&.{sudo}),
+    );
+    changed = python3_minimal;
+    changed.size += 1;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3PreinstArtifacts(&.{ python3, changed }),
     );
 }
 
@@ -22359,13 +22463,13 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
         sha512: []const u8,
     }{
         .{
-            .package = .{ .name = "python3", .version = "3.14.7-3", .architecture = "amd64" },
-            .size = 23672,
+            .package = .{ .name = "python3", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+            .size = 22938,
             .sha512 = "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
         },
         .{
-            .package = .{ .name = "python3-minimal", .version = "3.14.7-3", .architecture = "amd64" },
-            .size = 25858,
+            .package = .{ .name = "python3-minimal", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+            .size = 25808,
             .sha512 = "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
         },
     };
@@ -22472,7 +22576,7 @@ test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure"
     );
     const sudo_rs: native_program.PackageIdentity = .{
         .name = "sudo-rs",
-        .version = "0.2.14-1ubuntu4",
+        .version = "0.2.13-0ubuntu1.2",
         .architecture = "amd64",
     };
     try testing.expect(try snapshotSudoRsPostinstIsBound(
@@ -22516,7 +22620,7 @@ test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure"
         ),
     );
     wrong = sudo_rs;
-    wrong.version = "0.2.14-1ubuntu3";
+    wrong.version = "0.2.13-0ubuntu1.1";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
         snapshotSudoRsPostinstIsBound(
@@ -22655,7 +22759,7 @@ test "native_unpack.test.snapshot console-setup requires signed fresh amd64 conf
     );
     const package: native_program.PackageIdentity = .{
         .name = "console-setup-linux",
-        .version = "1.248ubuntu3",
+        .version = "1.237ubuntu3.1",
         .architecture = "all",
     };
     try testing.expect(try snapshotConsoleSetupLinuxPostinstIsBound(
@@ -22694,7 +22798,7 @@ test "native_unpack.test.snapshot console-setup requires signed fresh amd64 conf
     }{
         .{ .architecture = "arm64" },
         .{ .package = .{ .name = "console-setup", .version = package.version, .architecture = "all" } },
-        .{ .package = .{ .name = package.name, .version = "1.248ubuntu4", .architecture = "all" } },
+        .{ .package = .{ .name = package.name, .version = "1.237ubuntu3.2", .architecture = "all" } },
         .{ .package = .{ .name = package.name, .version = package.version, .architecture = "amd64" } },
         .{ .kind = .preinst },
         .{ .source = .installed_package },
@@ -22773,7 +22877,7 @@ test "native_unpack.test.snapshot console-setup provider metadata and hash are e
 test "native_unpack.test.signed console-setup postinst uses info only for bound configure" {
     const package: native_program.PackageIdentity = .{
         .name = "console-setup",
-        .version = "1.248ubuntu3",
+        .version = "1.237ubuntu3.1",
         .architecture = "all",
     };
     const digest: native_program.Digest = console_setup_postinst_sha256.*;
@@ -22798,7 +22902,7 @@ test "native_unpack.test.signed console-setup postinst uses info only for bound 
     }{
         .{ .architecture = "arm64" },
         .{ .package = .{ .name = "console-setup-linux", .version = package.version, .architecture = "all" } },
-        .{ .package = .{ .name = package.name, .version = "1.248ubuntu4", .architecture = "all" } },
+        .{ .package = .{ .name = package.name, .version = "1.237ubuntu3.2", .architecture = "all" } },
         .{ .package = .{ .name = package.name, .version = package.version, .architecture = "amd64" } },
         .{ .kind = .preinst },
         .{ .source = .installed_package },
@@ -22848,7 +22952,7 @@ test "native_unpack.test.signed console-setup postinst uses info only for bound 
         .index = 7,
         .package = package,
         .archive_identity = content_digest.JsonIdentity.init(identity),
-        .size = 108150,
+        .size = 102654,
         .application_sha256 = @splat('0'),
         .origin_v2 = .{ .authenticated_repository = .{
             .repository_id = @splat('0'),
@@ -22865,7 +22969,7 @@ test "native_unpack.test.signed console-setup postinst uses info only for bound 
         verifySnapshotConsoleSetupArtifact(&.{ artifact, artifact }),
     );
     var changed_artifact = artifact;
-    changed_artifact.package.version = "1.248ubuntu4";
+    changed_artifact.package.version = "1.237ubuntu3.2";
     try testing.expectError(
         error.InvalidConsoleSetupPostinstControl,
         verifySnapshotConsoleSetupArtifact(&.{changed_artifact}),
@@ -22950,7 +23054,7 @@ test "native_unpack.test.signed console-setup debconf sidecars require unchanged
 test "native_unpack.test.signed chrony postinst selects installed info only for exact configure" {
     const package: native_program.PackageIdentity = .{
         .name = "chrony",
-        .version = "4.8-4ubuntu2",
+        .version = "4.8-2ubuntu1",
         .architecture = "amd64",
     };
     const digest: native_program.Digest = chrony_postinst_sha256.*;
@@ -22975,7 +23079,7 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
     }{
         .{ .architecture = "arm64" },
         .{ .package = .{ .name = "other", .version = package.version, .architecture = "amd64" } },
-        .{ .package = .{ .name = package.name, .version = "4.8-4ubuntu3", .architecture = "amd64" } },
+        .{ .package = .{ .name = package.name, .version = "4.8-2ubuntu2", .architecture = "amd64" } },
         .{ .package = .{ .name = package.name, .version = package.version, .architecture = "arm64" } },
         .{ .kind = .preinst },
         .{ .source = .installed_package },
@@ -23021,7 +23125,7 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
         .index = 7,
         .package = package,
         .archive_identity = content_digest.JsonIdentity.init(identity),
-        .size = 333804,
+        .size = 341784,
         .application_sha256 = @splat('0'),
         .origin_v2 = .{ .authenticated_repository = .{
             .repository_id = @splat('0'),
@@ -23031,7 +23135,7 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
     try verifyAuthenticatedSnapshotArtifact(
         &.{artifact},
         package,
-        333804,
+        341784,
         chrony_archive_sha512,
         error.InvalidChronyPostinstControl,
     );
@@ -23043,17 +23147,17 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
         verifyAuthenticatedSnapshotArtifact(
             invalid_artifacts,
             package,
-            333804,
+            341784,
             chrony_archive_sha512,
             error.InvalidChronyPostinstControl,
         ),
     );
     var changed = artifact;
-    changed.package.version = "4.8-4ubuntu3";
+    changed.package.version = "4.8-2ubuntu2";
     try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
         &.{changed},
         package,
-        333804,
+        341784,
         chrony_archive_sha512,
         error.InvalidChronyPostinstControl,
     ));
@@ -23062,7 +23166,7 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
     try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
         &.{changed},
         package,
-        333804,
+        341784,
         chrony_archive_sha512,
         error.InvalidChronyPostinstControl,
     ));
@@ -23071,7 +23175,7 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
     try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
         &.{changed},
         package,
-        333804,
+        341784,
         chrony_archive_sha512,
         error.InvalidChronyPostinstControl,
     ));
@@ -23084,7 +23188,7 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
     try testing.expectError(error.InvalidChronyPostinstControl, verifyAuthenticatedSnapshotArtifact(
         &.{changed},
         package,
-        333804,
+        341784,
         chrony_archive_sha512,
         error.InvalidChronyPostinstControl,
     ));
@@ -23092,7 +23196,7 @@ test "native_unpack.test.signed chrony postinst selects installed info only for 
 
 test "native_unpack.test.signed chrony debconf controls reject metadata or byte changes" {
     for ([_]SignedDebconfControlFile{
-        .{ .path = "var/lib/dpkg/info/chrony.postinst", .size = 6993, .mode = 0o755, .sha256 = chrony_postinst_sha256 },
+        .{ .path = "var/lib/dpkg/info/chrony.postinst", .size = 6953, .mode = 0o755, .sha256 = chrony_postinst_sha256 },
         .{ .path = "var/lib/dpkg/info/chrony.config", .size = 204, .mode = 0o755, .sha256 = "77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0" },
         .{ .path = "var/lib/dpkg/info/chrony.templates", .size = 698, .mode = 0o644, .sha256 = "1f0ffe9e66ddc6593446ef924cf6dc80a445b161f0e1876ffac417f0a32841cf" },
     }) |binding| {
@@ -23143,7 +23247,7 @@ test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure
     );
     const procps: native_program.PackageIdentity = .{
         .name = "procps",
-        .version = "2:4.0.6-3ubuntu1",
+        .version = "2:4.0.4-9ubuntu1",
         .architecture = "amd64",
     };
     try testing.expect(try snapshotProcpsPostinstIsInert(
@@ -23172,7 +23276,7 @@ test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure
         .{ .architecture = "arm64", .package = procps, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
         .{ .architecture = "amd64", .package = .{ .name = "procps", .version = procps.version, .architecture = "arm64" }, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
         .{ .architecture = "amd64", .package = .{ .name = "other", .version = procps.version, .architecture = "amd64" }, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
-        .{ .architecture = "amd64", .package = .{ .name = "procps", .version = "4.0.6-3ubuntu1", .architecture = "amd64" }, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
+        .{ .architecture = "amd64", .package = .{ .name = "procps", .version = "4.0.4-9ubuntu1", .architecture = "amd64" }, .kind = .postinst, .source = .new_package, .arguments = &.{ "configure", "" } },
         .{ .architecture = "amd64", .package = procps, .kind = .preinst, .source = .new_package, .arguments = &.{ "configure", "" } },
         .{ .architecture = "amd64", .package = procps, .kind = .postinst, .source = .installed_package, .arguments = &.{ "configure", "" } },
         .{ .architecture = "amd64", .package = procps, .kind = .postinst, .source = .new_package, .arguments = &.{"configure"} },
@@ -23197,7 +23301,7 @@ test "native_unpack.test.signed procps trigger requires bound callback and absen
     );
     const procps: native_program.PackageIdentity = .{
         .name = "procps",
-        .version = "2:4.0.6-3ubuntu1",
+        .version = "2:4.0.4-9ubuntu1",
         .architecture = "amd64",
     };
     const arguments: []const []const u8 = &.{ "triggered", "/usr/lib/sysctl.d" };
@@ -23337,7 +23441,7 @@ test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" 
     );
     const bash: native_program.PackageIdentity = .{
         .name = "bash",
-        .version = "5.3-3ubuntu1",
+        .version = "5.3-2ubuntu1",
         .architecture = "amd64",
     };
     try testing.expect(try snapshotBashPostinstIsBound(
@@ -23386,7 +23490,7 @@ test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" 
         snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
     );
     other = bash;
-    other.version = "5.3-3ubuntu2";
+    other.version = "5.3-2ubuntu2";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
         snapshotBashPostinstIsBound(script, "amd64", other, .postinst, .new_package, &.{ "configure", "" }),
@@ -40492,7 +40596,7 @@ test "native_unpack.test.keyboard signed templates bind only the dependent boots
     };
     const bytes = try archive_application.test_fixtures.build(testing.allocator, .{
         .package = "keyboard-configuration",
-        .version = "1.248ubuntu3",
+        .version = "1.237ubuntu3.1",
         .architecture = "all",
         .control = &control,
     });
@@ -40501,9 +40605,35 @@ test "native_unpack.test.keyboard signed templates bind only the dependent boots
     defer model.deinit();
     const identity: native_program.PackageIdentity = .{
         .name = "keyboard-configuration",
-        .version = "1.248ubuntu3",
+        .version = "1.237ubuntu3.1",
         .architecture = "all",
     };
+    const expected_template = parseHex(32, keyboard_templates_sha256).?;
+    var retained_template: package_database.RetainedMetadata = .{
+        .kind = .templates,
+        .mode = 0o644,
+        .size = 629034,
+        .sha256 = expected_template,
+    };
+    try testing.expect(matchesSnapshotKeyboardPreinstRecord(
+        identity,
+        keyboard_preinst_sha256,
+        retained_template,
+    ));
+    retained_template.size = 629033;
+    try testing.expect(!matchesSnapshotKeyboardPreinstRecord(
+        identity,
+        keyboard_preinst_sha256,
+        retained_template,
+    ));
+    retained_template.size = 629034;
+    var wrong_identity = identity;
+    wrong_identity.version = "1.237ubuntu3.2";
+    try testing.expect(!matchesSnapshotKeyboardPreinstRecord(
+        wrong_identity,
+        keyboard_preinst_sha256,
+        retained_template,
+    ));
     var steps = [_]native_program.Step{
         bootstrapStep(0, &model, 0),
         .{
@@ -40544,13 +40674,13 @@ test "native_unpack.test.keyboard signed templates bind only the dependent boots
     const expected_script = parseHex(32, keyboard_preinst_sha256).?;
     model.scripts[0].sha256 = expected_script;
     model.metadata[0].sha256 = parseHex(32, keyboard_templates_sha256).?;
-    model.metadata[0].size = 576415;
+    model.metadata[0].size = 629034;
     try testing.expect(keyboardPreinstTemplates(program, authorization, 1, identity, &model) != null);
     var altered_identity = identity;
     altered_identity.architecture = "amd64";
     try testing.expect(keyboardPreinstTemplates(program, authorization, 1, altered_identity, &model) == null);
     altered_identity = identity;
-    altered_identity.version = "1.248ubuntu4";
+    altered_identity.version = "1.237ubuntu3.2";
     try testing.expect(keyboardPreinstTemplates(program, authorization, 1, altered_identity, &model) == null);
 
     steps[2].requires = &.{1};
@@ -40575,7 +40705,7 @@ test "native_unpack.test.keyboard signed templates bind only the dependent boots
         .package = identity.name,
         .version = identity.version,
         .architecture = identity.architecture,
-        .prior_version = "1.248ubuntu3",
+        .prior_version = "1.237ubuntu3.1",
         .artifact = null,
     }};
     wrong_authorization.actions = &wrong_actions;
@@ -40607,7 +40737,7 @@ test "native_unpack.test.iproute postinst templates require exact signed bootstr
     };
     const bytes = try archive_application.test_fixtures.build(testing.allocator, .{
         .package = "iproute2",
-        .version = "6.19.0-1ubuntu2",
+        .version = "6.19.0-1ubuntu1.1",
         .architecture = "amd64",
         .control = &control,
     });
@@ -40616,7 +40746,7 @@ test "native_unpack.test.iproute postinst templates require exact signed bootstr
     defer model.deinit();
     const identity: native_program.PackageIdentity = .{
         .name = "iproute2",
-        .version = "6.19.0-1ubuntu2",
+        .version = "6.19.0-1ubuntu1.1",
         .architecture = "amd64",
     };
     var steps = [_]native_program.Step{
@@ -40688,7 +40818,7 @@ test "native_unpack.test.iproute postinst templates require exact signed bootstr
     try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
     program.target_architecture = "amd64";
     var wrong = identity;
-    wrong.version = "6.19.0-1ubuntu3";
+    wrong.version = "6.19.0-1ubuntu1.2";
     try testing.expect(iproutePostinstTemplates(program, authorization, 4, wrong, &model) == null);
     wrong = identity;
     wrong.architecture = "arm64";
@@ -40734,6 +40864,63 @@ test "native_unpack.test.iproute postinst templates require exact signed bootstr
     model.metadata[0].mode = 0o644;
     model.scripts[1].sha256[0] ^= 1;
     try testing.expect(iproutePostinstTemplates(program, authorization, 4, identity, &model) == null);
+}
+
+test "native_unpack.test.snapshot template staging selectors bind resolute identities" {
+    const keyboard: native_program.PackageIdentity = .{
+        .name = "keyboard-configuration",
+        .version = "1.237ubuntu3.1",
+        .architecture = "all",
+    };
+    var step: native_program.Step = .{
+        .sequence = 0,
+        .phase = .unpack,
+        .requires = &.{},
+        .operation = .{ .run_maintainer_script = .{
+            .package = keyboard,
+            .kind = .preinst,
+            .source = .new_package,
+            .script_sha256 = @splat('0'),
+            .arguments = &.{"install"},
+            .environment_policy_sha256 = zeroDigest(),
+            .failure = .{ .state = .half_installed, .unwind = null, .recovery_required = false },
+        } },
+    };
+    try testing.expect(isSnapshotKeyboardPreinstStage(keyboard, step));
+    try testing.expect(!isSnapshotIpRoutePostinstStage(keyboard, step));
+    var wrong_keyboard = keyboard;
+    wrong_keyboard.version = "1.237ubuntu3.2";
+    try testing.expect(!isSnapshotKeyboardPreinstStage(wrong_keyboard, step));
+    wrong_keyboard = keyboard;
+    wrong_keyboard.architecture = "amd64";
+    try testing.expect(!isSnapshotKeyboardPreinstStage(wrong_keyboard, step));
+    step.operation.run_maintainer_script.kind = .postinst;
+    try testing.expect(!isSnapshotKeyboardPreinstStage(keyboard, step));
+
+    const iproute: native_program.PackageIdentity = .{
+        .name = "iproute2",
+        .version = "6.19.0-1ubuntu1.1",
+        .architecture = "amd64",
+    };
+    step.operation.run_maintainer_script = .{
+        .package = iproute,
+        .kind = .postinst,
+        .source = .new_package,
+        .script_sha256 = @splat('0'),
+        .arguments = &.{ "configure", "" },
+        .environment_policy_sha256 = zeroDigest(),
+        .failure = .{ .state = .half_configured, .unwind = null, .recovery_required = false },
+    };
+    try testing.expect(isSnapshotIpRoutePostinstStage(iproute, step));
+    try testing.expect(!isSnapshotKeyboardPreinstStage(iproute, step));
+    var wrong_iproute = iproute;
+    wrong_iproute.version = "6.19.0-1ubuntu1.2";
+    try testing.expect(!isSnapshotIpRoutePostinstStage(wrong_iproute, step));
+    wrong_iproute = iproute;
+    wrong_iproute.architecture = "arm64";
+    try testing.expect(!isSnapshotIpRoutePostinstStage(wrong_iproute, step));
+    step.operation.run_maintainer_script.kind = .preinst;
+    try testing.expect(!isSnapshotIpRoutePostinstStage(iproute, step));
 }
 
 test "native_unpack.test.failed iproute postinst cannot schedule unpacked systemd" {
@@ -43011,7 +43198,7 @@ test "native_unpack.test.lifecycle evidence carries disappearing newconffile rec
         \\Package: procps
         \\Status: install ok installed
         \\Architecture: amd64
-        \\Version: 2:4.0.6-3ubuntu1
+        \\Version: 2:4.0.4-9ubuntu1
         \\Conffiles:
         \\ /etc/sysctl.conf newconffile remove-on-upgrade
         \\ /etc/init.d/procps {s}
@@ -43131,7 +43318,7 @@ test "native_unpack.test.verifyUnchanged preserves procps-shaped newconffile sta
         \\Package: procps
         \\Status: install ok installed
         \\Architecture: amd64
-        \\Version: 2:4.0.6-3ubuntu1
+        \\Version: 2:4.0.4-9ubuntu1
         \\Conffiles:
         \\ /etc/sysctl.conf newconffile remove-on-upgrade
         \\Description: procps
@@ -43161,7 +43348,7 @@ test "native_unpack.test.verifyUnchanged preserves procps-shaped newconffile sta
         .local_artifacts = &.{},
         .packages = &.{.{
             .name = "procps",
-            .version = "2:4.0.6-3ubuntu1",
+            .version = "2:4.0.4-9ubuntu1",
             .architecture = "amd64",
             .origin = .{ .authenticated_repository = .{
                 .repository_id = repository_id,

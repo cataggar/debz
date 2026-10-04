@@ -83,7 +83,7 @@ case "$proof_root" in "$source_root"/*) exit 2 ;; esac
 [[ ! -L "$source_root/proc" && -z $(find "$source_root/proc" -mindepth 1 -print -quit) ]]
 
 for control in \
-  'var/lib/dpkg/info/sudo.postinst:1927:755:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383' \
+  'var/lib/dpkg/info/sudo.postinst:1747:755:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383' \
   'var/lib/dpkg/info/sudo.list:2376:644:92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f' \
   'usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517' \
   'usr/bin/dpkg-maintscript-helper:21123:755:1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d' \
@@ -102,9 +102,9 @@ require_protected_file "$source_root/var/lib/dpkg/alternatives/sudo"
 [[ $(sha256sum "$source_root/var/lib/dpkg/alternatives/sudo" | cut -d' ' -f1) == \
   4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6 ]]
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' sudo) == '1.9.17p2-7ubuntu3 install ok unpacked' ]]
+  -f='${Version} ${Status}' sudo) == '1.9.17p2-1ubuntu3.1 install ok unpacked' ]]
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' sudo-rs) == '0.2.14-1ubuntu4 install ok installed' ]]
+  -f='${Version} ${Status}' sudo-rs) == '0.2.13-0ubuntu1.2 install ok installed' ]]
 for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit:sudo.ws' \
   'usr/share/man/man8/sudoedit.8.gz:/etc/alternatives/sudoedit.8.gz:sudo.ws.8.gz'; do
   IFS=: read -r name target payload_target <<<"$link"
@@ -150,7 +150,7 @@ timeout --signal=TERM --kill-after=5s 120s \
     '\'' sh
   '
 [[ $(dpkg-query --admindir="$proof_root/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' sudo) == '1.9.17p2-7ubuntu3 install ok installed' ]]
+  -f='${Version} ${Status}' sudo) == '1.9.17p2-1ubuntu3.1 install ok installed' ]]
 [[ $(stat -c '%u:%g:%s:%a:%h' "$proof_root/var/lib/dpkg/alternatives/sudo") == 0:0:658:644:1 ]]
 [[ $(sha256sum "$proof_root/var/lib/dpkg/alternatives/sudo" | cut -d' ' -f1) == \
   c583a377d2d7bc241422c91f43738f8e278e159e8e3bb2aa53d5bdeaf782e845 ]]
@@ -161,6 +161,6 @@ for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit' \
 done
 [[ ! -e "$proof_root/proc/sys" && -z $(find "$proof_root/proc" -mindepth 1 -print -quit) ]]
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' sudo) == '1.9.17p2-7ubuntu3 install ok unpacked' ]]
+  -f='${Version} ${Status}' sudo) == '1.9.17p2-1ubuntu3.1 install ok unpacked' ]]
 printf 'pinned_dpkg_exit=0 sudo_status=installed sudo_record_bytes=658 sudo_record_sha256=%s proc_sys=absent\n' \
   "$(sha256sum "$proof_root/var/lib/dpkg/alternatives/sudo" | cut -d' ' -f1)"

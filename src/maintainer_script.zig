@@ -89,10 +89,11 @@ const snapshot_systemd_sha256 = [32]u8{
     0xc1, 0xdb, 0x29, 0x0f, 0x3c, 0x6d, 0x3c, 0xad,
     0xbe, 0xf3, 0x35, 0xe0, 0xce, 0x74, 0xe3, 0x1d,
 };
+const snapshot_systemd_postinst_size = 5037;
 
 fn snapshotSystemdIdentity(identity: Identity, arguments: []const []const u8) bool {
     return std.mem.eql(u8, identity.package, "systemd") and
-        std.mem.eql(u8, identity.version, "261.2-1ubuntu2") and
+        std.mem.eql(u8, identity.version, "259.5-0ubuntu3.4") and
         std.mem.eql(u8, identity.architecture, "amd64") and
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/systemd.postinst") and
@@ -108,10 +109,11 @@ const snapshot_udev_sha256: [32]u8 = .{
     0x03, 0x86, 0x3d, 0x5e, 0xff, 0x37, 0xcd, 0x2e,
     0xb6, 0x6d, 0x2b, 0x85, 0x40, 0xf1, 0x46, 0x06,
 };
+const snapshot_udev_postinst_size = 2578;
 
 fn snapshotUdevIdentity(identity: Identity, arguments: []const []const u8) bool {
     return std.mem.eql(u8, identity.package, "udev") and
-        std.mem.eql(u8, identity.version, "261.2-1ubuntu2") and
+        std.mem.eql(u8, identity.version, "259.5-0ubuntu3.4") and
         std.mem.eql(u8, identity.architecture, "amd64") and
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/udev.postinst") and
@@ -127,10 +129,11 @@ const snapshot_sudo_sha256: [32]u8 = .{
     0xa3, 0x6a, 0xf2, 0xc8, 0x29, 0x21, 0x42, 0xd6,
     0xe0, 0xcd, 0x13, 0x4d, 0xda, 0x4c, 0x63, 0x83,
 };
+const snapshot_sudo_postinst_size = 1747;
 
 fn snapshotSudoIdentity(identity: Identity, arguments: []const []const u8) bool {
     return std.mem.eql(u8, identity.package, "sudo") and
-        std.mem.eql(u8, identity.version, "1.9.17p2-7ubuntu3") and
+        std.mem.eql(u8, identity.version, "1.9.17p2-1ubuntu3.1") and
         std.mem.eql(u8, identity.architecture, "amd64") and
         identity.kind == .postinst and
         std.mem.eql(u8, identity.script_path, "var/lib/dpkg/info/sudo.postinst") and
@@ -312,7 +315,7 @@ pub const SnapshotSystemdProc = struct {
         defer allocator.free(observed.bytes);
         if (observed.entry.uid != 0 or observed.entry.gid != 0 or
             observed.entry.mode != 0o755 or observed.entry.link_count != 1 or
-            observed.entry.size != 4942)
+            observed.entry.size != snapshot_systemd_postinst_size)
             return error.InvalidSnapshotSystemdScript;
         if (!std.crypto.timing_safe.eql(
             [32]u8,
@@ -445,11 +448,14 @@ pub const SnapshotUdevProc = struct {
             if (try self.root.entryIfExists(try root_fs.Path.init(path)) != null)
                 return error.InvalidSnapshotUdevTool;
         }
-        const observed = try self.script.observeStableAlloc(allocator, 2533);
+        const observed = try self.script.observeStableAlloc(
+            allocator,
+            snapshot_udev_postinst_size,
+        );
         defer allocator.free(observed.bytes);
         if (observed.entry.uid != 0 or observed.entry.gid != 0 or
             observed.entry.mode != 0o755 or observed.entry.link_count != 1 or
-            observed.entry.size != 2533 or
+            observed.entry.size != snapshot_udev_postinst_size or
             !std.crypto.timing_safe.eql(
                 [32]u8,
                 hashBytes(observed.bytes),
@@ -607,11 +613,14 @@ pub const SnapshotSudoProc = struct {
             if (try self.root.entryIfExists(try root_fs.Path.init(path)) != null)
                 return error.InvalidSnapshotSudoTool;
         }
-        const observed = try self.script.observeStableAlloc(allocator, 1927);
+        const observed = try self.script.observeStableAlloc(
+            allocator,
+            snapshot_sudo_postinst_size,
+        );
         defer allocator.free(observed.bytes);
         if (observed.entry.uid != 0 or observed.entry.gid != 0 or
             observed.entry.mode != 0o755 or observed.entry.link_count != 1 or
-            observed.entry.size != 1927 or
+            observed.entry.size != snapshot_sudo_postinst_size or
             !std.crypto.timing_safe.eql(
                 [32]u8,
                 hashBytes(observed.bytes),
@@ -4508,6 +4517,7 @@ test "maintainer_script.test.snapshot systemd proc is bound to the exact signed 
         "d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d",
         &hex,
     );
+    try testing.expectEqual(@as(u64, 5037), snapshot_systemd_postinst_size);
     var binding: SnapshotSystemdProc = .{
         .allocator = testing.allocator,
         .root_path = @constCast("/srv/roots/target"),
@@ -4520,7 +4530,7 @@ test "maintainer_script.test.snapshot systemd proc is bound to the exact signed 
     var request = testRequest();
     request.identity = .{
         .package = "systemd",
-        .version = "261.2-1ubuntu2",
+        .version = "259.5-0ubuntu3.4",
         .architecture = "amd64",
         .kind = .postinst,
         .script_path = "var/lib/dpkg/info/systemd.postinst",
@@ -4548,9 +4558,9 @@ test "maintainer_script.test.snapshot systemd proc is bound to the exact signed 
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
     request.identity.package = "systemd";
     request.identity.script_path = "var/lib/dpkg/info/systemd.postinst";
-    request.identity.version = "261.2-1ubuntu3";
+    request.identity.version = "259.5-0ubuntu3.5";
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
-    request.identity.version = "261.2-1ubuntu2";
+    request.identity.version = "259.5-0ubuntu3.4";
     request.identity.architecture = "arm64";
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
     request.identity.architecture = "amd64";
@@ -4594,6 +4604,7 @@ test "maintainer_script.test.udev PID-only proc rejects unrelated and altered in
         "b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606",
         &hex,
     );
+    try testing.expectEqual(@as(u64, 2578), snapshot_udev_postinst_size);
     var binding: SnapshotUdevProc = .{
         .allocator = testing.allocator,
         .root = undefined,
@@ -4609,7 +4620,7 @@ test "maintainer_script.test.udev PID-only proc rejects unrelated and altered in
     var request = testRequest();
     request.identity = .{
         .package = "udev",
-        .version = "261.2-1ubuntu2",
+        .version = "259.5-0ubuntu3.4",
         .architecture = "amd64",
         .kind = .postinst,
         .script_path = "var/lib/dpkg/info/udev.postinst",
@@ -4643,9 +4654,9 @@ test "maintainer_script.test.udev PID-only proc rejects unrelated and altered in
     request.identity.package = "other";
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
     request.identity.package = "udev";
-    request.identity.version = "261.2-1ubuntu3";
+    request.identity.version = "259.5-0ubuntu3.5";
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
-    request.identity.version = "261.2-1ubuntu2";
+    request.identity.version = "259.5-0ubuntu3.4";
     request.identity.architecture = "arm64";
     try testing.expectEqual(RejectionReason.invalid_snapshot_proc, validate(request).?);
     request.identity.architecture = "amd64";
@@ -4687,6 +4698,7 @@ test "maintainer_script.test.sudo PID-only proc requires exact signed identity" 
         "fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383",
         &hex,
     );
+    try testing.expectEqual(@as(u64, 1747), snapshot_sudo_postinst_size);
     var binding: SnapshotSudoProc = .{
         .allocator = testing.allocator,
         .root = undefined,
@@ -4701,7 +4713,7 @@ test "maintainer_script.test.sudo PID-only proc requires exact signed identity" 
     var request = testRequest();
     request.identity = .{
         .package = "sudo",
-        .version = "1.9.17p2-7ubuntu3",
+        .version = "1.9.17p2-1ubuntu3.1",
         .architecture = "amd64",
         .kind = .postinst,
         .script_path = "var/lib/dpkg/info/sudo.postinst",
@@ -4724,7 +4736,7 @@ test "maintainer_script.test.sudo PID-only proc requires exact signed identity" 
     ));
     for ([_]struct {
         package: []const u8 = "sudo",
-        version: []const u8 = "1.9.17p2-7ubuntu3",
+        version: []const u8 = "1.9.17p2-1ubuntu3.1",
         architecture: []const u8 = "amd64",
         kind: Kind = .postinst,
         path: []const u8 = "var/lib/dpkg/info/sudo.postinst",
@@ -4732,7 +4744,7 @@ test "maintainer_script.test.sudo PID-only proc requires exact signed identity" 
         arguments: []const []const u8 = &.{ "configure", "" },
     }{
         .{ .package = "sudo-rs" },
-        .{ .version = "1.9.17p2-7ubuntu4" },
+        .{ .version = "1.9.17p2-1ubuntu3.2" },
         .{ .architecture = "arm64" },
         .{ .kind = .preinst },
         .{ .path = "var/lib/debz-lifecycle-scripts/sudo.postinst" },
@@ -5051,7 +5063,7 @@ test "maintainer_script.test.signed systemd postinst uses scoped masked proc" {
         .root = root_path,
         .identity = .{
             .package = "systemd",
-            .version = "261.2-1ubuntu2",
+            .version = "259.5-0ubuntu3.4",
             .architecture = "amd64",
             .kind = .postinst,
             .script_path = "var/lib/dpkg/info/systemd.postinst",
@@ -5088,7 +5100,7 @@ test "maintainer_script.test.signed udev postinst uses only PID proc and applies
         .root = root_path,
         .identity = .{
             .package = "udev",
-            .version = "261.2-1ubuntu2",
+            .version = "259.5-0ubuntu3.4",
             .architecture = "amd64",
             .kind = .postinst,
             .script_path = "var/lib/dpkg/info/udev.postinst",
@@ -5131,7 +5143,7 @@ test "maintainer_script.test.signed sudo postinst repairs only pinned alternativ
         .root = root_path,
         .identity = .{
             .package = "sudo",
-            .version = "1.9.17p2-7ubuntu3",
+            .version = "1.9.17p2-1ubuntu3.1",
             .architecture = "amd64",
             .kind = .postinst,
             .script_path = "var/lib/dpkg/info/sudo.postinst",

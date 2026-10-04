@@ -323,7 +323,7 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
     tampered[-2] ^= 0x01
     for name, profile, selector, script, version, expected in (
         ("profile-tampered-script", "systemd", "systemd:amd64", bytes(tampered), None, "SourceChanged"),
-        ("profile-wrong-version", "systemd", "systemd:amd64", scripts["systemd"], "261.2-1ubuntu1",
+        ("profile-wrong-version", "systemd", "systemd:amd64", scripts["systemd"], "259.5-0ubuntu3.3",
          "ReferenceSetupFailed"),
         ("profile-wrong-selector", "systemd", "udev:amd64", scripts["systemd"], None, "InvalidProfile"),
         ("profile-unbound-configure", "none", "systemd:amd64", scripts["systemd"], None, "InvalidProfile"),

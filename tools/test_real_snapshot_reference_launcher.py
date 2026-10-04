@@ -179,7 +179,7 @@ class ReferenceLauncherTests(unittest.TestCase):
 
     def test_trigger_verbs_refuse_without_a_triggered_script_profile(self) -> None:
         package = ORDER.Package(
-            "sudo", "1.9.17p2-7ubuntu3", "amd64",
+            "sudo", "1.9.17p2-1ubuntu3.1", "amd64",
             "a" * 128, 42, self.root / "sudo.deb",
         )
 
