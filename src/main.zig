@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
         try stderr.print("debz: unknown command '{s}'\n", .{command});
         try stderr.writeAll(usage);
         try stderr.flush();
-        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        std.process.exit(@backingInt(api.ExitStatus.usage));
     };
     var requested_output: api.OutputFormat = .human;
     const parsed = parse(init.arena.allocator(), operation, &args, &requested_output) catch |err| {
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try stdout.flush();
         try stderr.flush();
-        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        std.process.exit(@backingInt(api.ExitStatus.usage));
     };
     if (parsed.help) {
         try stdout.print("Usage: debz {s} [common options] [packages...]\n\n{s}", .{
@@ -116,13 +116,13 @@ pub fn main(init: std.process.Init) !void {
         try render(init.arena.allocator(), stdout, stderr, parsed.request.options.output, internal);
         try stdout.flush();
         try stderr.flush();
-        std.process.exit(@intFromEnum(internal.exit_status));
+        std.process.exit(@backingInt(internal.exit_status));
     };
     try render(init.arena.allocator(), stdout, stderr, parsed.request.options.output, result);
     if (result.exit_status != .success) {
         try stdout.flush();
         try stderr.flush();
-        std.process.exit(@intFromEnum(result.exit_status));
+        std.process.exit(@backingInt(result.exit_status));
     }
 }
 
@@ -138,7 +138,7 @@ fn parse(
     var keyrings: std.ArrayList([]const u8) = .empty;
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
-    var seen: std.EnumSet(SingleOption) = .initEmpty();
+    var seen: std.EnumSet(SingleOption) = .{};
     var options: api.CommonOptions = .{
         .install_root = "",
         .cache_path = "",

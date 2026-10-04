@@ -432,7 +432,7 @@ fn pointSpan(offset: usize) deb822.Span {
 
 fn testContext(architecture: []const u8) Context {
     return .{
-        .repository_id = .{ .bytes = [_]u8{'a'} ** 64 },
+        .repository_id = .{ .bytes = @splat('a') },
         .component = "main",
         .architecture = architecture,
         .source_location = "dists/stable/main/binary-amd64/Packages",
