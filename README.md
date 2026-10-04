@@ -22,6 +22,11 @@ not republished or refreshed. C declarations use the exact GitHub
 `cataggar/translate-c` revision recorded in `build.zig.zon`.
 CI on this compatibility branch is manual-only; neither CI nor release
 publication is dispatched as part of the source port.
+The compatibility port is tracked in
+[PR #383](https://github.com/cataggar/debz/pull/383). Local acceptance covers
+the default test graph, all 376 safe-mode tests, and static safe-mode CLI
+compilation for `x86_64-linux-musl` and `aarch64-linux-musl`. Native ARM and
+macOS runtime checks remain consumer/platform gates.
 
 ```sh
 zig build
