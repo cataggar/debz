@@ -66,7 +66,7 @@ Zstandard libzstd
 =================
 
 Source package: https://github.com/cataggar/zstd
-Commit: 45b6dfcd9d0ffdba99fb653c66b233179b9f7229
+Commit: 71502da18ccdacac0c2049c033dedbbf25a40b93
 Upstream: https://github.com/facebook/zstd (Zstandard 1.6.0)
 License: BSD-3-Clause
 
@@ -106,18 +106,18 @@ POSSIBILITY OF SUCH DAMAGE.
 musl libc
 =========
 
-Source: https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/libc/musl
+Source: https://codeberg.org/ziglang/zig/src/tag/0.17.0/lib/libc/musl
 Upstream baseline: musl 1.2.5
-Bundled snapshot: 1.2.5+zig.0.16.0.24fdd5b7a4c1
-Zig toolchain commit: 24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8
+Bundled snapshot: 1.2.5+zig.0.17.0.7647adab80dd
+Zig toolchain commit: 7647adab80dd088f4de3610fd245915a912eb6ad
 Official Zig source archive:
-https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz
+https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz
 SHA-256:
-43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf
+b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd
 License: MIT
 
 The release binaries statically link the musl implementation supplied by Zig
-0.16.0. The version above is an exact Zig toolchain snapshot identifier, not a
+0.17.0. The version above is an exact Zig toolchain snapshot identifier, not a
 claim that the modified bundled tree is an unmodified upstream musl release.
 
 musl as a whole is licensed under the following standard MIT license:
@@ -160,11 +160,42 @@ is Copyright © 2011 Valentin Ochs under an MIT-style license. Architecture
 ports and other files remain covered by the permissive terms documented in the
 bundled musl COPYRIGHT file.
 
+translate-c build tooling and generated-binding support
+======================================================
+
+Source: https://github.com/cataggar/translate-c
+Commit: 62d06a5d3e93c82727544e8113e4762a315ca0ed
+License: MIT
+
+The translator runs only during the build. Its MIT-licensed Zig helper modules
+support the generated private bindings; no translator executable is installed
+or invoked by debz at runtime.
+
+Copyright (c) Zig contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
 OpenPGP verifier
 ================
 
 The production OpenPGP verifier adds no third-party dependency. It uses Zig
-0.16.0 standard-library SHA-1 (fingerprints only), SHA-256, SHA-512, RSA, and
+0.17.0 standard-library SHA-1 (fingerprints only), SHA-256, SHA-512, RSA, and
 Ed25519 verification primitives under Zig's MIT license.
 
 The checked-in OpenPGP fixture bytes were generated with Python cryptography

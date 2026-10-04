@@ -44,9 +44,10 @@
       "name": "libzstd",
       "source": "https://github.com/cataggar/zstd",
       "upstream": "https://github.com/facebook/zstd",
-      "archive": "https://github.com/cataggar/zstd/archive/45b6dfcd9d0ffdba99fb653c66b233179b9f7229.tar.gz",
-      "commit": "45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
-      "zig_hash": "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
+      "archive": "https://github.com/cataggar/zstd/archive/71502da18ccdacac0c2049c033dedbbf25a40b93.tar.gz",
+      "commit": "71502da18ccdacac0c2049c033dedbbf25a40b93",
+      "zig_hash": "zstd-1.6.0-Nyx42kDXOwDefxNDxCG5s0p5PgGoAnYCCeDAgwyGxcrW",
+      "archive_zig_hash": "zstd-1.6.0-Nyx42nbYOwBGNLCV3_VPmuHUh7voiJK2Dqm6OBEBfiod",
       "version": "1.6.0",
       "license": "BSD-3-Clause",
       "runtime_linkage": "static_archive_in_debz",
@@ -62,15 +63,15 @@
     },
     {
       "name": "musl",
-      "source": "https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/libc/musl",
+      "source": "https://codeberg.org/ziglang/zig/src/tag/0.17.0/lib/libc/musl",
       "upstream": "https://musl.libc.org/",
       "upstream_version": "1.2.5",
       "zig_musl_baseline_commit": "0098e650fbceae74c8c468716c0810476f72ec47",
-      "toolchain_version": "0.16.0",
-      "toolchain_commit": "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8",
-      "toolchain_source_archive": "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
-      "toolchain_source_sha256": "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
-      "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+      "toolchain_version": "0.17.0",
+      "toolchain_commit": "7647adab80dd088f4de3610fd245915a912eb6ad",
+      "toolchain_source_archive": "https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz",
+      "toolchain_source_sha256": "b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd",
+      "version": "1.2.5+zig.0.17.0.7647adab80dd",
       "license": "MIT",
       "runtime_linkage": "static_libc_in_debz",
       "vulnerability_sources": [
@@ -89,12 +90,12 @@
         {
           "id": "CVE-2025-26519",
           "disposition": "patched_in_toolchain",
-          "rationale": "Zig commit 8a3aebaee0a68d037a6f311bc5c1b426e8e1884c applies Rich Felker's mitigation to the bundled iconv implementation and is an ancestor of the Zig 0.16.0 toolchain commit."
+          "rationale": "Zig 0.17.0 retains the iconv implementation from the reviewed mitigation commit 8a3aebaee0a68d037a6f311bc5c1b426e8e1884c byte-for-byte (SHA256 d04b46b1e88f70e31681c21f7208464306dd4011457bb7ec114fb97f7c44aec2). The authenticated release source archive was verified against its published SHA256."
         },
         {
           "id": "CVE-2026-40200",
           "disposition": "not_affected",
-          "rationale": "Zig 0.16.0 removes musl src/stdlib/qsort.c and supplies qsort from lib/c/stdlib.zig using std.mem.sortUnstableContext, so the vulnerable musl smoothsort implementation is not present."
+          "rationale": "Zig 0.17.0 does not contain musl src/stdlib/qsort.c and supplies qsort from lib/c/stdlib.zig using std.mem.sortUnstableContext, so the vulnerable musl smoothsort implementation is not present."
         },
         {
           "id": "CVE-2026-6042",
@@ -102,6 +103,16 @@
           "rationale": "The affected iconv GB18030 decoder remains in the toolchain source snapshot, but debz and its pinned static libraries do not use iconv; static linking therefore excludes that object from the release executable."
         }
       ]
+    }
+  ],
+  "build_dependencies": [
+    {
+      "name": "translate_c",
+      "source": "https://github.com/cataggar/translate-c",
+      "commit": "62d06a5d3e93c82727544e8113e4762a315ca0ed",
+      "zig_hash": "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+      "license": "MIT",
+      "runtime_linkage": "build_tool_only"
     }
   ],
   "allowed_production_licenses": [

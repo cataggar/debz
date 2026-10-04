@@ -30,7 +30,7 @@
       },
       {
         "name": "musl",
-        "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+        "version": "1.2.5+zig.0.17.0.7647adab80dd",
         "linkage": "static_libc_in_debz",
         "license": "MIT"
       }

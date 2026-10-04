@@ -15,10 +15,9 @@ deterministic mutation logs its seed and case indexes for exact replay.
 
 The same tests are native `std.testing.fuzz` targets with seed corpora, so
 coverage-guided runs can use `zig build fuzz --fuzz=<cases>` on Zig toolchains
-where the built-in fuzzer is available. CI uses the deterministic runner
-because Zig 0.16.0's built-in Linux test runner currently fails to compile in
-fuzz instrumentation mode due to its internal stack-trace type mismatch; this
-is an explicit toolchain limitation, not a green substitute sanitizer gate.
+where the built-in fuzzer is available. The historical Zig 0.16 runner limitation
+motivated the deterministic CI runner, which remains the bounded corpus gate
+on 0.17; it is not presented as a C sanitizer gate.
 
 Targets cover DEB822, Debian versions and relations, sources, control/status,
 Release/Packages, signed envelopes and OpenPGP packets, gzip/xz/zstd

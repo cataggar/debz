@@ -235,18 +235,18 @@ def audit_dependencies() -> None:
         "license": musl.get("license"),
         "runtime_linkage": musl.get("runtime_linkage"),
     } != {
-        "source": "https://codeberg.org/ziglang/zig/src/tag/0.16.0/lib/libc/musl",
+        "source": "https://codeberg.org/ziglang/zig/src/tag/0.17.0/lib/libc/musl",
         "upstream_version": "1.2.5",
         "zig_musl_baseline_commit": "0098e650fbceae74c8c468716c0810476f72ec47",
-        "toolchain_version": "0.16.0",
-        "toolchain_commit": "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8",
-        "toolchain_source_archive": "https://ziglang.org/download/0.16.0/zig-0.16.0.tar.xz",
-        "toolchain_source_sha256": "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
-        "version": "1.2.5+zig.0.16.0.24fdd5b7a4c1",
+        "toolchain_version": "0.17.0",
+        "toolchain_commit": "7647adab80dd088f4de3610fd245915a912eb6ad",
+        "toolchain_source_archive": "https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz",
+        "toolchain_source_sha256": "b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd",
+        "version": "1.2.5+zig.0.17.0.7647adab80dd",
         "license": "MIT",
         "runtime_linkage": "static_libc_in_debz",
     }:
-        fail("musl provenance differs from the reviewed Zig 0.16.0 toolchain snapshot")
+        fail("musl provenance differs from the reviewed Zig 0.17.0 toolchain snapshot")
     musl_exceptions = {
         item.get("id"): item.get("disposition")
         for item in musl.get("reviewed_exceptions", [])
@@ -287,15 +287,29 @@ def audit_dependencies() -> None:
             "4b73f2ec19a99ef465282fbce633e8deb33691b3",
         ),
         "zstd": (
-            "https://github.com/cataggar/zstd/archive/"
-            "45b6dfcd9d0ffdba99fb653c66b233179b9f7229.tar.gz",
-            "zstd-1.6.0-Nyx42oXYOwBmgYjxuZ626Tlfrk3xMm0DYTwXB2nkhQBc",
+            "git+https://github.com/cataggar/zstd#"
+            "71502da18ccdacac0c2049c033dedbbf25a40b93",
+            "zstd-1.6.0-Nyx42kDXOwDefxNDxCG5s0p5PgGoAnYCCeDAgwyGxcrW",
             "libzstd",
-            "45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+            "71502da18ccdacac0c2049c033dedbbf25a40b93",
         ),
     }
+    translator = {
+        "name": "translate_c",
+        "source": "https://github.com/cataggar/translate-c",
+        "commit": "62d06a5d3e93c82727544e8113e4762a315ca0ed",
+        "zig_hash": "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+        "license": "MIT",
+        "runtime_linkage": "build_tool_only",
+    }
+    if policy.get("build_dependencies") != [translator]:
+        fail("build dependency policy differs from the reviewed exact translator")
     found = {name: (url, digest) for name, url, digest in dependency_blocks}
     expected_pins = {name: values[:2] for name, values in expected.items()}
+    expected_pins["translate_c"] = (
+        "git+https://github.com/cataggar/translate-c#" + translator["commit"],
+        translator["zig_hash"],
+    )
     if found != expected_pins:
         fail(f"build.zig.zon dependencies differ from reviewed exact pins: {found!r}")
     for manifest_name, (url, digest, policy_name, commit) in expected.items():
@@ -365,8 +379,8 @@ def audit_dependencies() -> None:
         "Zstandard libzstd",
         "0BSD",
         "musl libc",
-        "1.2.5+zig.0.16.0.24fdd5b7a4c1",
-        "43186959edc87d5c7a1be7b7d2a25efffd22ce5807c7af99067f86f99641bfdf",
+        "1.2.5+zig.0.17.0.7647adab80dd",
+        "b6c7f1728f043700d6529bac980800792f824256a9d2f1839b3d62beed0b8abd",
         "MIT",
     ):
         if required not in notices:

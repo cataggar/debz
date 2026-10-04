@@ -1,8 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("lzma.h");
-    @cInclude("zstd.h");
-});
+const c = @import("compression");
 
 pub const Compression = enum {
     gzip,

@@ -89,10 +89,10 @@ class SecurityAuditTests(unittest.TestCase):
         }
         musl = dependencies["musl"]
         self.assertEqual(musl["upstream_version"], "1.2.5")
-        self.assertEqual(musl["toolchain_version"], "0.16.0")
+        self.assertEqual(musl["toolchain_version"], "0.17.0")
         self.assertEqual(
             musl["toolchain_commit"],
-            "24fdd5b7a4c1c8b5deb5b56756b9dbc8e08c86a8",
+            "7647adab80dd088f4de3610fd245915a912eb6ad",
         )
         self.assertEqual(
             {

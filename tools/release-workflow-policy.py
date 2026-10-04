@@ -54,7 +54,7 @@ def main() -> None:
         'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main',
         'python3 tools/release.py version "$GITHUB_REF_NAME" --expect "zon=$zon_version"',
         '--expect "binary=$(release-root/bin/debz version)"',
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         '-Dversion="$VERSION"',
         "python3 tools/release.py binary",
         "python3 tools/release.py audit",
