@@ -73,9 +73,9 @@ python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned
   0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5 ]]
 
 digest=616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa
-[[ $(jq -r '.packages[] | select(.name == "python3" and .version == "3.14.7-3" and .architecture == "amd64") | .archive_identity.digests[] | select(.algorithm == "sha512") | .digest' "$lock") == "$digest" ]]
-[[ $(jq -r '.packages[] | select(.name == "python3" and .version == "3.14.7-3" and .architecture == "amd64") | .declared_size' "$lock") == 23672 ]]
-[[ $(stat -c '%s' "$archive") == 23672 ]]
+[[ $(jq -r '.packages[] | select(.name == "python3" and .version == "3.14.3-0ubuntu2" and .architecture == "amd64") | .archive_identity.digests[] | select(.algorithm == "sha512") | .digest' "$lock") == "$digest" ]]
+[[ $(jq -r '.packages[] | select(.name == "python3" and .version == "3.14.3-0ubuntu2" and .architecture == "amd64") | .declared_size' "$lock") == 22938 ]]
+[[ $(stat -c '%s' "$archive") == 22938 ]]
 [[ $(sha512sum "$archive" | cut -d' ' -f1) == "$digest" ]]
 require_protected_file "$source_root/var/lib/dpkg/info/python3.preinst"
 require_protected_file "$source_root/var/lib/dpkg/info/python3-minimal.list"
@@ -94,7 +94,7 @@ require_protected_file "$source_root/usr/bin/update-alternatives"
 cmp "$source_root/var/lib/dpkg/info/python3.preinst" \
   "$checkout/src/fixtures/ubuntu-resolute-python3.preinst"
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' python3) == '3.14.7-3 install ok unpacked' ]]
+  -f='${Version} ${Status}' python3) == '3.14.3-0ubuntu2 install ok unpacked' ]]
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/dev/null") == 0:0:600:0:1 ||
    $(stat -c '%u:%g:%a:%s:%h' "$source_root/dev/null") == 0:0:644:0:1 ]]
 [[ -d "$source_root/proc" && ! -L "$source_root/proc" &&
@@ -157,7 +157,7 @@ timeout --signal=TERM --kill-after=5s 120s \
     '\'' sh
   '
 [[ $(dpkg-query --admindir="$dpkg_root/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' python3) == '3.14.7-3 install ok unpacked' ]]
+  -f='${Version} ${Status}' python3) == '3.14.3-0ubuntu2 install ok unpacked' ]]
 [[ $(alternatives_fingerprint "$dpkg_root") == "$before" ]]
 cmp "$script_root/dev/null" "$dpkg_root/dev/null"
 [[ $(stat -c '%u:%g:%a:%s' "$script_root/dev/null") == \

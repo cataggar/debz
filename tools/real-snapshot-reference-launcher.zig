@@ -78,9 +78,9 @@ const ScriptBinding = struct {
     digest: []const u8,
 };
 const script_bindings = [_]ScriptBinding{
-    .{ .name = "systemd", .version = "261.2-1ubuntu2", .size = 4942, .digest = "39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412" },
-    .{ .name = "udev", .version = "261.2-1ubuntu2", .size = 2533, .digest = "861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee" },
-    .{ .name = "sudo", .version = "1.9.17p2-7ubuntu3", .size = 1927, .digest = "e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8" },
+    .{ .name = "systemd", .version = "259.5-0ubuntu3.4", .size = 5037, .digest = "d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d" },
+    .{ .name = "udev", .version = "259.5-0ubuntu3.4", .size = 2578, .digest = "b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606" },
+    .{ .name = "sudo", .version = "1.9.17p2-1ubuntu3.1", .size = 1747, .digest = "fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383" },
 };
 const dpkg_digests = [_][]const u8{
     "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
@@ -1370,43 +1370,64 @@ test "reference standard streams refuse directory-backed stdin and readable host
 }
 
 test "reference proc profile is bound to the installed dpkg status version" {
+    try std.testing.expectEqualStrings("systemd", script_bindings[0].name);
+    try std.testing.expectEqualStrings("259.5-0ubuntu3.4", script_bindings[0].version);
+    try std.testing.expectEqual(@as(u64, 5037), script_bindings[0].size);
+    try std.testing.expectEqualStrings(
+        "d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d",
+        script_bindings[0].digest,
+    );
+    try std.testing.expectEqualStrings("udev", script_bindings[1].name);
+    try std.testing.expectEqualStrings("259.5-0ubuntu3.4", script_bindings[1].version);
+    try std.testing.expectEqual(@as(u64, 2578), script_bindings[1].size);
+    try std.testing.expectEqualStrings(
+        "b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606",
+        script_bindings[1].digest,
+    );
+    try std.testing.expectEqualStrings("sudo", script_bindings[2].name);
+    try std.testing.expectEqualStrings("1.9.17p2-1ubuntu3.1", script_bindings[2].version);
+    try std.testing.expectEqual(@as(u64, 1747), script_bindings[2].size);
+    try std.testing.expectEqualStrings(
+        "fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383",
+        script_bindings[2].digest,
+    );
     const binding = script_bindings[0];
     const valid =
         "Package: other\nVersion: 1\nArchitecture: amd64\n" ++
         "Status: install ok installed\n\n" ++
-        "Package: systemd\nVersion: 261.2-1ubuntu2\nArchitecture: amd64\n" ++
+        "Package: systemd\nVersion: 259.5-0ubuntu3.4\nArchitecture: amd64\n" ++
         "Status: install ok unpacked\n\n";
     try std.testing.expect(bindingStatusMatches(valid, binding));
     try std.testing.expect(!bindingStatusMatches(
-        "Package: systemd\nVersion: 261.2-1ubuntu3\nArchitecture: amd64\n" ++
+        "Package: systemd\nVersion: 259.5-0ubuntu3.5\nArchitecture: amd64\n" ++
             "Status: install ok unpacked\n\n",
         binding,
     ));
     try std.testing.expect(!bindingStatusMatches(
-        "Package: systemd\nVersion: 261.2-1ubuntu2\nArchitecture: arm64\n" ++
+        "Package: systemd\nVersion: 259.5-0ubuntu3.4\nArchitecture: arm64\n" ++
             "Status: install ok unpacked\n\n",
         binding,
     ));
     try std.testing.expect(!bindingStatusMatches(
-        "Package: systemd\nVersion: 261.2-1ubuntu2\nArchitecture: amd64\n" ++
+        "Package: systemd\nVersion: 259.5-0ubuntu3.4\nArchitecture: amd64\n" ++
             "Status: install ok triggers-pending\n\n",
         binding,
     ));
     try std.testing.expect(!bindingStatusMatches(valid ++
-        "Package: systemd\nVersion: 261.2-1ubuntu2\nArchitecture: amd64\n" ++
+        "Package: systemd\nVersion: 259.5-0ubuntu3.4\nArchitecture: amd64\n" ++
         "Status: install ok unpacked\n\n", binding));
     try std.testing.expect(!bindingStatusMatches(
-        "Package: systemd\nVersion: 261.2-1ubuntu2\nVersion: 261.2-1ubuntu2\n" ++
+        "Package: systemd\nVersion: 259.5-0ubuntu3.4\nVersion: 259.5-0ubuntu3.4\n" ++
             "Architecture: amd64\nStatus: install ok unpacked\n\n",
         binding,
     ));
     try std.testing.expect(!bindingStatusMatches(
-        "Package: systemd\nversion: 261.2-1ubuntu3\nVersion: 261.2-1ubuntu2\n" ++
+        "Package: systemd\nversion: 259.5-0ubuntu3.5\nVersion: 259.5-0ubuntu3.4\n" ++
             "Architecture: amd64\nStatus: install ok unpacked\n\n",
         binding,
     ));
     try std.testing.expect(!bindingStatusMatches(
-        "Package: systemd\nVersion: 261.2-1ubuntu2\nArchitecture: amd64\n" ++
+        "Package: systemd\nVersion: 259.5-0ubuntu3.4\nArchitecture: amd64\n" ++
             "Status: install ok unpacked\n continued\n\n",
         binding,
     ));

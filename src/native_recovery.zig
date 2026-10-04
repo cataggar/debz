@@ -4192,9 +4192,9 @@ test "native_recovery.test.script outcome rejects changed disposition evidence" 
 test "native_recovery.test.exact proc setup failures are durable and never spawned" {
     const testing = std.testing;
     for ([_]struct { package: []const u8, version: []const u8 }{
-        .{ .package = "systemd", .version = "261.2-1ubuntu2" },
-        .{ .package = "udev", .version = "261.2-1ubuntu2" },
-        .{ .package = "sudo", .version = "1.9.17p2-7ubuntu3" },
+        .{ .package = "systemd", .version = "259.5-0ubuntu3.4" },
+        .{ .package = "udev", .version = "259.5-0ubuntu3.4" },
+        .{ .package = "sudo", .version = "1.9.17p2-1ubuntu3.1" },
     }) |case| {
         var temporary = testing.tmpDir(.{});
         defer temporary.cleanup();

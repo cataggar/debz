@@ -22,9 +22,9 @@ MAXIMUM_ARCHIVE_BYTES = 512 * 1024 * 1024
 NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*\Z")
 DIGEST = re.compile(r"[a-f0-9]{128}\Z")
 PROFILE_VERSIONS = {
-    "systemd": "261.2-1ubuntu2",
-    "udev": "261.2-1ubuntu2",
-    "sudo": "1.9.17p2-7ubuntu3",
+    "systemd": "259.5-0ubuntu3.4",
+    "udev": "259.5-0ubuntu3.4",
+    "sudo": "1.9.17p2-1ubuntu3.1",
 }
 
 

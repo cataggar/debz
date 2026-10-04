@@ -87,7 +87,7 @@ done
   d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d ]]
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" \
   -W -f='${Version} ${Status}' systemd) == \
-  '261.2-1ubuntu2 install ok half-configured' ]]
+  '259.5-0ubuntu3.4 install ok half-configured' ]]
 python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
 boot_id=$(cat /proc/sys/kernel/random/boot_id)
 [[ "$boot_id" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]

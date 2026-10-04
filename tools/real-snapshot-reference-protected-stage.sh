@@ -11,7 +11,7 @@ umask 077
 trap 'echo "protected staging failed at line $LINENO" >&2' ERR
 
 readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
-readonly snapshot_suite=stonking
+readonly snapshot_suite=resolute
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 # The distribution dpkg's locked dependency closure supplies every runtime
 # library and tar the pinned Debian dpkg and its helpers load in the root.
