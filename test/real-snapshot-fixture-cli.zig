@@ -68,16 +68,29 @@ pub fn main(init: std.process.Init) !void {
                         archive_identity: struct { primary: []const u8 },
                     }{.{ .name = "ubuntu-minimal", .declared_size = 1, .archive_identity = .{ .primary = "sha512" } }},
                     .repositories = [_]struct {
+                        release_sha256: []const u8,
                         index_identity: struct { primary: []const u8 },
                         signer_fingerprints: [1][]const u8,
-                    }{.{
-                        .index_identity = .{ .primary = "sha512" },
-                        .signer_fingerprints = .{if (equals(scenario, "unreviewed-signer") or
-                            (equals(scenario, "unreviewed-update-signer") and equals(intent, "upgrade-all")))
-                            "unreviewed"
-                        else
-                            signer},
-                    }},
+                    }{
+                        .{
+                            .release_sha256 = "596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834",
+                            .index_identity = .{ .primary = "sha256" },
+                            .signer_fingerprints = .{if (equals(scenario, "unreviewed-signer") or
+                                (equals(scenario, "unreviewed-update-signer") and equals(intent, "upgrade-all")))
+                                "unreviewed"
+                            else
+                                signer},
+                        },
+                        .{
+                            .release_sha256 = "16d93e5e9358047ac2f5d671abcac2bb3f2945532452720cd9a17320c19c4f24",
+                            .index_identity = .{ .primary = "sha256" },
+                            .signer_fingerprints = .{if (equals(scenario, "unreviewed-signer") or
+                                (equals(scenario, "unreviewed-update-signer") and equals(intent, "upgrade-all")))
+                                "unreviewed"
+                            else
+                                signer},
+                        },
+                    },
                     .digest_sha256 = if (equals(intent, "install"))
                         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     else

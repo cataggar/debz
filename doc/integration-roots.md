@@ -136,9 +136,12 @@ The real-snapshot candidate is selected explicitly with
 through the default legacy executor. The opt-in `ubuntu-real-snapshot` job in
 the existing manual `.github/workflows/ci.yml` dispatch runs on
 `ubuntu-24.04` amd64 and `ubuntu-24.04-arm` arm64 against
-`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z`, suite `stonking`,
-component `main`, and the explicit Ubuntu archive keyring. Inputs remain fixed to that reviewed snapshot until its signed validity
-window requires a fresh reviewed pin.
+`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z`, suite `resolute`,
+component `main`, and the explicit Ubuntu archive keyring. The frozen
+`resolute` Release is admitted only when its signed cleartext SHA-256 is the
+reviewed `596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834`
+and fresh same-snapshot `resolute-updates` and `resolute-security` witnesses
+both pass.
 Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
 regular, non-symlink Ubuntu archive keyring instead of installing trust material
 on the host. The authenticated lock must identify the reviewed Ubuntu 2018
@@ -245,19 +248,19 @@ Such an exec is allowed only when all of these hold:
   architecture. Each tool is checked separately: a wrong `dpkg-statoverride`
   refuses only the `dpkg-statoverride` calls, and the audit still fails.
 
-The reviewed identities are from dpkg `1.23.7ubuntu2` in the
-`20261001T000000Z` snapshot. Each digest was taken from that architecture's
+The reviewed identities are from dpkg `1.23.7ubuntu1` in the
+`20261001T000000Z` resolute snapshot. Each digest was taken from that architecture's
 authenticated archive, whose SHA-512 matched the signed lock, and is never
 shared across architectures or tools:
 
 | Architecture | File | Bytes | SHA-256 |
 | --- | --- | ---: | --- |
-| amd64 | `/usr/bin/dpkg` | 322,728 | `6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f` |
-| amd64 | `/usr/bin/dpkg-divert` | 125,768 | `a509fc1a363946770295b613924e2bfa902ddbf76ec2826128685df1569c57d8` |
-| amd64 | `/usr/bin/dpkg-statoverride` | 55,936 | `6c08816ff0b12106e969537cab83ac4b3358a72b425fe8bf1fc961e2e82ce2ce` |
-| arm64 | `/usr/bin/dpkg` | 330,816 | `d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4` |
-| arm64 | `/usr/bin/dpkg-divert` | 133,872 | `6daba35904a8885a334c33e6b4c7c7bc42f501f3f36032a374dfe40e842ed75b` |
-| arm64 | `/usr/bin/dpkg-statoverride` | 68,184 | `b837c9d99518225f5b238b215179559a87e7d012072ae0ff414fdc0ea891c3b9` |
+| amd64 | `/usr/bin/dpkg` | 322,728 | `972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517` |
+| amd64 | `/usr/bin/dpkg-divert` | 125,768 | `e975eecfbceda235ecedc2e35addf5cc5abe05de355202780cf8e47b2f6745eb` |
+| amd64 | `/usr/bin/dpkg-statoverride` | 55,936 | `f8496aa47ff782a4881ebdf9e0a4e4615e81f8c56bc004af51f49954e315ff8c` |
+| arm64 | `/usr/bin/dpkg` | 330,816 | `6c03c9fa2053b5a4e899438c1318ed460f62f01812da7f91f6c35a7e0957692f` |
+| arm64 | `/usr/bin/dpkg-divert` | 133,872 | `50fd191a3a97a17ff0de4bb921ded2d877e5648e197712e8025631c09d456798` |
+| arm64 | `/usr/bin/dpkg-statoverride` | 68,184 | `b9c47a676498db293c4f674d63af54656d274e68b7598e235ec50f2380dba0f6` |
 
 The pins are bound to that snapshot. A different pinned snapshot makes the
 audit fail with exit 91 until the pins are reviewed again, as does an
@@ -696,19 +699,18 @@ either capture or any mismatch fails the manual job; the always-run cleanup
 retains available diagnostics even after earlier failure.
 
 This gate is not a completed parity claim until both architecture captures
-compare successfully. The previously pinned `resolute` release is frozen with
-an InRelease dated 2026-04-23 and expired under the finite policy. The newly
-pinned `stonking` release is signed by
-`F6ECB3762474EDA9D21B7022871920D1991BC93C` and advertises Date
-Wed, 30 Sep 2026 23:37:07 UTC and Valid-Until Wed, 14 Oct 2026
-23:37:07 UTC; repository authentication must
-verify those signed fields before planning. The repository config explicitly selects
-`allow_missing_valid_until_with_max_age_seconds` with the unchanged 31-day
-maximum. That policy is part of normalized repository identity, authenticated
-snapshot provenance, and exact-lock identity. Current exact-lock v3 and
-acquisition contracts support the SHA512-only Release, Packages, and archive
-identities published by `stonking`; no fabricated SHA256 or historical-time
-replay is allowed. Full install/reinstall/upgrade/remove/purge, crash/restart,
+compare successfully. The pinned `resolute` Release is frozen (Date Thu,
+23 Apr 2026 17:07:15 UTC, no `Valid-Until`) and is accepted only by
+`frozen_release_with_witnesses` with reviewed SHA-256
+`596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834`.
+The same snapshot must also authenticate `resolute-updates` and
+`resolute-security`; each witness has no `Valid-Until`, so the unchanged
+31-day maximum age applies to witnesses and the admission deadline is the
+earliest witness deadline. That policy is part of normalized repository
+identity, authenticated snapshot provenance, and exact-lock identity. Current
+exact-lock v3 and acquisition contracts support the SHA512 package/archive
+identities and SHA256 Release identities published by `resolute`; no
+fabricated SHA256 or historical-time replay is allowed. Full install/reinstall/upgrade/remove/purge, crash/restart,
 archive-evicted recovery, and passing native/reference comparisons still
 require executed evidence from both architectures.
 
@@ -746,7 +748,7 @@ retained, not reused; neither completed closure nor native/reference parity
 has been established.
 
 A subsequent authenticated fresh-root replay with the exact amd64
-`dpkg` 1.23.7ubuntu2 `update-alternatives` pin and staged
+`dpkg` 1.23.7ubuntu1 `update-alternatives` pin and staged
 `README.dpkg-new` guard passed step 708: `mawk`'s postinst exited
 successfully. It reached step 822, where `base-files`' preinst also
 exited successfully, then refused its unpack with
@@ -804,7 +806,7 @@ persisted a zero-exit `less.postinst configure` outcome at step 888. Its
 `pager.1.gz` slave, and the generic and selector links target the expected
 paths. Execution continued until step 976, where `bash` 5.3-3ubuntu1
 `postinst` (SHA-256
-`e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff`)
+`72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d`)
 was prepared but refused **before launch** with `InvalidAlternativesScript`.
 That authenticated script uses a multiline `update-alternatives --install`
 for `builtins.7.gz`, followed by `|| true`; this shell wrapper is outside the
@@ -866,7 +868,7 @@ persisted exit 0**, with the pinned 221-byte `nc` record and all eight
 generic/selector links. It continued through step 1062, then refused
 **before launch** at step 1065 with `InvalidAlternativesScript` for
 `procps:amd64` 2:4.0.6-3ubuntu1 `postinst configure` (signed script SHA-256
-`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`,
+`3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8`,
 arguments `["configure", ""]`). That script builds several `--install`
 commands inside a parameterized `check_alternatives` function. No procps
 script outcome was persisted; the failed root is retained for recovery and
@@ -1037,7 +1039,7 @@ The same root subsequently persisted `libpam-runtime.postinst` exit 0
 at step 1215 and its installed state at step 1216. The **next distinct
 blocker** is step 1217: authenticated `keyboard-configuration:all`
 1.248ubuntu3 preinst SHA-256
-`2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703`
+`01fb97dc9c6e15e5d44fa78e028b12a77c59616109e5635f346917870448971f`
 launched with `install`, exited 10 without output, and its `abort-install`
 postrm exited 0. The executor returned
 `native recovery_required: package_already_present` after the unwind. This
@@ -1147,10 +1149,10 @@ its reviewed signer was `f6ecb3762474eda9d21b7022871920d1991bc93c`.
 All 175 downloaded archives (67,976,788 bytes) were independently rehashed
 and size-checked against their SHA-512-primary signed lock identities.
 The exact installed keyboard preinst SHA-256
-`2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703`
+`01fb97dc9c6e15e5d44fa78e028b12a77c59616109e5635f346917870448971f`
 ran with `["install"]` at step **1217**, exited **0**, and emitted no output.
 Its authenticated adjacent templates member SHA-256 was
-`4fd265213c939f2b74618c997a3695b30ca9a0b9ee5439dcda4d1f0cc9d01328`;
+`0aefded2b21462af94c0e199ea71f6df2e93c4919b18909197b05631f0075d66`;
 the retained keyboard status is `install ok installed`.
 The next signed script failure was `iproute2:amd64` postinst step **1230**,
 SHA-256 `bb5318e85da2497d1b2b6fcdf2d612bd02ec54bc5d9f86005506d8e91bb79d3a`,
@@ -1255,10 +1257,10 @@ not the entire root.
 
 The next distinct refusal is **before script launch** at step 1292:
 `console-setup-linux:all` 1.248ubuntu3 new-package `postinst` SHA-256
-`5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`,
+`6d4e7cc59222fdde22ef49bc1ed1f2c8405c8a537c00af787f3c22a2edee383e`,
 arguments `["configure", ""]`, returned `InvalidAlternativesScript`.
 The archive was rehashed against the same signed lock (SHA-512
-`b5ad0ebf1b9a526b5af67422b720b29b4e2738ebd945871223bef8241e59b47558f51a31e9638b8e5ce84ea1b42334682f86f9c3d62de224e7c55caa7a5e0f14`);
+`511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b`);
 its installed and archive scripts match. After `CONFIGDIR=/etc/console-setup`,
 the script contains two `update-alternatives --install /etc/vtrgb vtrgb
 "$CONFIGDIR/vtrgb"` (priority 50) and `"$CONFIGDIR/vtrgb.vga"` (priority 20)
@@ -1288,7 +1290,7 @@ and 297 output bytes, and left util-linux `install ok installed`. The
 is byte-identical to the prior pinned dpkg/tool reference record; both
 selector links still choose `/usr/bin/less` and its manpage. The next
 refusal is the signed `console-setup-linux:all` postinst step **1292**,
-SHA-256 `5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`,
+SHA-256 `6d4e7cc59222fdde22ef49bc1ed1f2c8405c8a537c00af787f3c22a2edee383e`,
 with `["configure", ""]`: `InvalidAlternativesScript` **before launch**,
 only `script prepared` in the journal and no outcome file. The operation
 remains `recovery_required`; preserve the interrupted root, not a fresh
@@ -1327,7 +1329,7 @@ at step 1428, libc-bin, debianutils and libselinux1 triggered postinst
 callbacks persisted exit 0. The next callback, ordinal 3, was only
 `prepared`; no outcome exists. `procps:amd64` 2:4.0.6-3ubuntu1 has
 `Triggers-Pending: /usr/lib/sysctl.d` and a bound postinst SHA-256
-`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`.
+`3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8`.
 Its exact script exits the `triggered` branch before any alternatives
 command, but the existing snapshot procps authorization admits only
 `["configure", ""]`. The attempted
@@ -1349,7 +1351,7 @@ bytes) were independently rehashed, size-checked against the lock, and
 matched against the exact CAS object set; the report is
 `evidence/cas-rehash.tsv`. The signed
 `console-setup-linux:all` postinst SHA-256
-`5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a`
+`6d4e7cc59222fdde22ef49bc1ed1f2c8405c8a537c00af787f3c22a2edee383e`
 **spawned** at step **1292** with `["configure", ""]`, durably exited **0**
 with 1,038 output bytes, and left its package `install ok installed`.
 The root-owned, 78-byte `vtrgb` record SHA-256
@@ -1368,7 +1370,7 @@ The next callback, ordinal 3, has only a `prepared` record and **no**
 outcome; native install exited 8 with `InvalidAlternativesScriptAuthority`.
 `procps:amd64` remains `triggers-pending` for `/usr/lib/sysctl.d`; its
 installed postinst SHA-256
-`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+`3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8`
 has a separately bound configure-only admission, not authorization for
 `["triggered", "/usr/lib/sysctl.d"]`. That callback refused before launch.
 Preserve this interrupted root for recovery; it is never a fresh retry or
@@ -1380,7 +1382,7 @@ procps-trigger branch** had also persisted this same signed
 subsequent trigger admission and terminal failed receipt are **not** part
 of this console-only change. The signed `console-setup` archive
 (108150 bytes, SHA-512
-`2ea052bd7c02091ce7afea7262e2340fdaeb9f362af79e4a1b42265ad98ace237b10770275970f89c81acf2c57bc2cc50234c2357adb167e84041c1c5479a330`)
+`776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832`)
 was independently rehashed and its control members compared with the installed
 copies in the retained root. On disposable **copies** only, pinned dpkg
 1.22.22 `--configure console-setup:all` exited 0 after running the installed
@@ -1394,7 +1396,7 @@ console-setup/codesetcode` -> `10 ... doesn't exist`. The original root
 lacked that question, and that staged path has no adjacent templates; removing
 only the installed config in another copy did **not** reproduce the failure.
 The installed templates (174753 bytes, SHA-256
-`dbddc3ff45db9d1417abff0f21eef1aba5fbd1f1bc0cdb15eba4e3f86f2e1b81`)
+`c0d53d7485c72b8894340e7f5c2557c2247c3fe033dfbad56bbdc3dc659dc379`)
 are necessary to match debconf's signed input. The exact
 archive/script/package/amd64/`["configure", ""]` exception selects `info/`
 only after confirming the original staged candidate and all three installed
@@ -1435,7 +1437,7 @@ candidate has SHA-256
 `779b486a1a5b36f67c213cb7a454bff2e6ec19ce69b121142d1db4e65b44a9ad`.
 The terminal receipt archives the exact signed `console-setup:all`
 `postinst ["configure", ""]` at step 1297 (SHA-256
-`e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d`):
+`6abadbbad6760a44a9379584efaca6d82d10be0e80c6c76aa7fcfd0f02518056`):
 it spawned, exited **0** with zero output bytes, and reached `install ok
 installed`. Debconf recorded `console-setup/codesetcode=guess`, the installed
 postinst/config/templates still match their signed metadata, and the earlier
@@ -1444,7 +1446,7 @@ proves this console-setup correction, **not** full 175-package parity.
 
 In that local root, the next distinct failure is at step 1328: signed
 `systemd:amd64` 261.2-1ubuntu2 `postinst ["configure", ""]` (SHA-256
-`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`)
+`d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d`)
 launched and exited **1** with 1702 stderr bytes. Its retained outcome
 reports that `/proc/` is not mounted and is required for `systemd-tmpfiles`;
 `systemd` remains `install ok half-configured`. The deferred trigger callbacks
@@ -1470,7 +1472,7 @@ independently rehashed, size-checked against the lock and matched
 against the exact object set in `evidence/cas-rehash.tsv`.
 
 The exact signed `console-setup:all` postinst SHA-256
-`e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d`
+`6abadbbad6760a44a9379584efaca6d82d10be0e80c6c76aa7fcfd0f02518056`
 **spawned** at step **1297** with `["configure", ""]`, durably exited
 **0** with zero output bytes, and left `console-setup` `install ok
 installed`. Debconf recorded `console-setup/codesetcode=guess`; the
@@ -1480,7 +1482,7 @@ byte-identical to its pinned reference (SHA-256
 `1fe9c0439ed1d49f6e06fad9d0a4ece1fba6826116f5cf26ba98e313c36570d3`).
 The **first later signed failure** was `systemd:amd64` 261.2-1ubuntu2
 postinst SHA-256
-`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+`d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d`
 at step **1328**: it spawned, exited **1** with 1,702 stderr bytes,
 reported that `/proc/` was not mounted but required for
 `systemd-tmpfiles`, and left systemd `install ok half-configured`.
@@ -1538,12 +1540,12 @@ with ReleaseSafe binary SHA-256
 `da698f05b1e6b6cb1c8d7f115d4740d8795ff8b9bd4aaca6d4a361d2a6afbc47`.
 Its durable receipt records signed `systemd:amd64` `261.2-1ubuntu2`
 postinst SHA-256
-`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+`d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d`
 at step 1328 with `["configure", ""]`, `spawned=true`, exit 0 and 748
 bytes of captured output. `systemd` is `install ok installed`, and no
 `/proc/sys` remains in the host-visible root. The **next** signed script,
 `chrony:amd64` `4.8-4ubuntu2` postinst SHA-256
-`bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`,
+`5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272`,
 exited 10 at step 1344 with `["configure", ""]` and zero output.
 `chrony` remains half-configured; the operation recorded
 `failed_after_mutation` (exit 7), and the deferred procps trigger was not
@@ -1567,7 +1569,7 @@ The genuinely **new**, empty, elevated amd64 workspace
 `.real-snapshot/amd64-systemd-249-combined-signed-1` authenticated the
 reviewed Ubuntu signer
 `f6ecb3762474eda9d21b7022871920d1991bc93c` and keyring SHA-256
-`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`.
+`80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`.
 Its 175-package immutable `stonking` lock SHA-256 was
 `655cb3f7ab9b8e1ef1e7868710eaf81d3dd6023486e6aee1f6b11767b57b6f81`;
 all 175 downloaded SHA-512-primary CAS archives (67,976,788 bytes) were
@@ -1577,13 +1579,13 @@ exact object-set match (`evidence/cas-rehash.tsv` SHA-256
 The ReleaseSafe candidate SHA-256 was
 `9d3228b0b19c421ec1fb9b1d141cc31e0ef4c697ac1001f99f2f953827b2c1c4`.
 The retained signed `systemd:amd64` postinst SHA-256
-`39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412`
+`d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d`
 **spawned** at step **1328** with `["configure", ""]`, durably exited **0**
 with 748 captured output bytes, and step **1329** durably recorded
 `installed`. No `/proc/sys` remains in the host-visible root.
 
 The **first later signed script failure** was `chrony:amd64` postinst
-SHA-256 `bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`
+SHA-256 `5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272`
 at step **1344**, which spawned, exited **10** with zero output, and remained
 half-configured. Deferred trigger processing later reached the **separately
 unauthorized** procps callback at step **1428** ordinal 3, refused before
@@ -1623,9 +1625,9 @@ This second interrupted root is retained read-only and does not prove a
 successful installation or full native/reference parity.
 
 The authenticated `chrony:amd64` archive is SHA-512
-`5265963d95267643abec7fbadb5c76ae39a1a940e2b12a48d685c6859bcf44fa318c0f48c509b3c19811cc877b450a92c9fcad5a3212e7b78f441234d54cdcd9`
+`10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b`
 (333,804 bytes). Its exact postinst, config, and templates have SHA-256
-`bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`,
+`5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272`,
 `77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0`,
 and `1f0ffe9e66ddc6593446ef924cf6dc80a445b161f0e1876ffac417f0a32841cf`.
 The failed root has no debconf row for
@@ -1669,7 +1671,7 @@ signed chrony postinst step 1344 with `["configure", ""]`, `spawned=true`,
 installed`; debconf registered the signed boolean default `true`, and
 `/proc/sys` is still absent outside the invocation. The **first subsequent
 failure** is signed `udev:amd64` `261.2-1ubuntu2` postinst SHA-256
-`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`:
+`b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606`:
 it exited 1 at step 1357 with 349 stderr bytes stating that `/proc/` is
 required for `systemd-tmpfiles`. The native operation recorded
 `failed_after_mutation` (exit 7); the deferred procps trigger did not run.
@@ -1697,7 +1699,7 @@ The **genuinely new**, empty authenticated amd64 workspace
 used that same protected checkout and root-owned candidate. The reviewed
 signer was `f6ecb3762474eda9d21b7022871920d1991bc93c`, the keyring
 SHA-256 was
-`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`,
+`80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`,
 and the ReleaseSafe binary SHA-256 was
 `0cd7ae62568d10e1cc8875a9d5912dd71cfc646f56c2155936dad0a3e32ce85c`.
 The immutable 175-package lock SHA-256 was
@@ -1711,14 +1713,14 @@ substitutions, with SHA-256
 `cfa860317c8844ed0aba0503b3db7b36594327099c141cc4a0d4b4d80884f666`.
 
 The exact signed `chrony:amd64` postinst SHA-256
-`bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935`
+`5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272`
 **spawned** at step **1344**, ran `["configure", ""]`, and durably exited
 **0** with 846 output bytes. Step **1345** completed its `installed`
 transition with result `applied`; final `chrony` status remains
 `install ok installed` and debconf records the signed boolean value
 `true`. No `/proc/sys` remains in the host-visible root. The **first
 subsequent signed script failure** was `udev:amd64` postinst SHA-256
-`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`
+`b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606`
 at step **1357**: it spawned, exited **1**, and emitted 349 stderr bytes
 requiring `/proc/` for `systemd-tmpfiles`; `udev` is half-configured.
 Later, the separately unauthorized procps deferred trigger at step **1428**
@@ -1735,7 +1737,7 @@ used a root-owned checkout beneath `/root` and a root-owned, mode-0700
 were independently rehashed against their locked SHA-512 digests. In
 `amd64-udev-proof-new-3`, a traced exec stop copied the root **before** the
 exact signed staged udev postinst SHA-256
-`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`
+`b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606`
 ran with `["configure", ""]`. Its durable lifecycle record identified
 step 1357 as `in_flight`; `/proc` was empty. The source run deliberately
 stopped with exit 88 and is interrupted, not a completed installation or
@@ -1797,7 +1799,7 @@ empty and no private mount survived the callback.
 
 The installation did **not** complete. Its first subsequent blocker was
 `sudo:amd64` `1.9.17p2-7ubuntu3` postinst at step 1376, SHA-256
-`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`:
+`fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383`:
 the action remained **prepared**, without a sudo script outcome or launch.
 The ReleaseSafe process aborted (exit 134) inside
 `native_alternatives.capture` while preparing the alternatives boundary;
@@ -1833,7 +1835,7 @@ The **genuinely new** authenticated amd64 workspace
 `/var/lib/debz-udev-reference-251/checkout/.real-snapshot/amd64-udev-251-protected-signed-1`
 used that same protected checkout and an empty root. Its reviewed signer
 was `f6ecb3762474eda9d21b7022871920d1991bc93c`, keyring SHA-256
-`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`,
+`80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`,
 and ReleaseSafe candidate SHA-256
 `0646ef35175e782efc3ecd82052e5efd4db74a7cfc1283535a5775ccd9e5991a`.
 The immutable 175-package lock SHA-256 was
@@ -1846,7 +1848,7 @@ The protected runner's two bounded timeout substitutions have SHA-256
 `cfa860317c8844ed0aba0503b3db7b36594327099c141cc4a0d4b4d80884f666`.
 
 The exact signed `udev:amd64` postinst SHA-256
-`861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee`
+`b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606`
 **spawned** at step **1357** with `["configure", ""]` and durably exited
 **0** (182 stderr bytes, no stdout). Step **1358** completed its
 `installed` transition with result `applied`; final udev status remains
@@ -1942,7 +1944,7 @@ A **genuinely new**, empty amd64 root at
 `/var/lib/debz-sudo-reference-252/checkout/.real-snapshot/amd64-sudo-252-protected-signed-1`
 independently authenticated signer
 `f6ecb3762474eda9d21b7022871920d1991bc93c`, keyring SHA-256
-`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`,
+`80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`,
 and ReleaseSafe binary SHA-256
 `5a90838763721b07343212d5d62fcfd8fa32c92d1577550e84473ea930734e4b`.
 Its signed 175-package lock has SHA-256
@@ -1953,7 +1955,7 @@ size-checked and rehashed against the **exact** object set. The sorted
 `4b0501bcb7f26f2be2dfead5176a38e01643b08ee295d2f8cd2c2ff2e4191d54`.
 
 The exact signed `sudo:amd64` postinst SHA-256
-`e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8`
+`fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383`
 **spawned** at step **1376** with `["configure", ""]`, durably exited
 **0** (zero stdout, 126 stderr bytes), and completed `succeeded`.
 Step **1377** applied the installed transition: sudo is `install ok
@@ -2090,7 +2092,7 @@ The first subsequent refusal was deferred callback ordinal **3** at
 step **1428**, **prepared only**, with no spawn or outcome; the three
 preceding callbacks completed successfully. `procps:amd64` remained
 `triggers-pending` for `/usr/lib/sysctl.d`; its exact signed postinst
-SHA-256 `7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+SHA-256 `3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8`
 has configure-only admission on this branch, not an authorized
 `["triggered", "/usr/lib/sysctl.d"]` callback. `create.json` recorded
 `InvalidAlternativesScriptAuthority` and exit **8**. The earlier
@@ -2122,7 +2124,7 @@ The snapshot `vtrgb` record remained byte-identical to pinned dpkg.
 **This is not a successful install**: earlier in the same new root,
 `console-setup:all` 1.248ubuntu3 `postinst configure` at step 1297
 (script SHA-256
-`e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d`)
+`6abadbbad6760a44a9379584efaca6d82d10be0e80c6c76aa7fcfd0f02518056`)
 actually exited **10**, with zero output bytes. Its journal records
 `completed failed`, and the package remains `install ok half-configured`.
 The transaction processed its deferred trigger callbacks, including procps,
@@ -2149,7 +2151,7 @@ The ReleaseSafe executable SHA-256 was
 `936df94bb4f5a03a2d17ad42381535b5548e6f9fffa68f110926f51abe6fd425`.
 Signed `python3` preinst step 1383 again exited 0. The exact
 signed procps postinst SHA-256
-`7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3`
+`3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8`
 then **spawned** for deferred trigger step **1428**, ordinal **3**,
 with `["triggered", "/usr/lib/sysctl.d"]`, durably exited **0** with
 zero output, and completed `succeeded`; `procps` ended `install ok
@@ -2223,7 +2225,7 @@ root-owned checkout
 cache and state. Its ReleaseSafe executable SHA-256 was
 `9f8bc04254dba33a14c8391ca07d1f3a86e66e8720a0df97d9c3e0fca5748030`;
 its protected keyring SHA-256 was
-`655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835`.
+`80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`.
 Fresh authenticated metadata signed by
 `f6ecb3762474eda9d21b7022871920d1991bc93c` produced a 175-package
 `stonking` amd64 lock (file SHA-256

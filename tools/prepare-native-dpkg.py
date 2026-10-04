@@ -49,6 +49,45 @@ def verify_file(path: Path, expected: str) -> None:
         raise RuntimeError(f"pinned reference digest mismatch: {path}")
 
 
+def host_architecture() -> str | None:
+    return {
+        "x86_64": "amd64",
+        "aarch64": "arm64",
+    }.get(platform.machine())
+
+
+def verify_archive_metadata(archive: Path, architecture: str) -> None:
+    result = subprocess.run(
+        ["dpkg-deb", "--field", str(archive), "Version", "Architecture"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "LC_ALL": "C"},
+    )
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        field, separator, value = line.partition(":")
+        if separator != ":":
+            raise RuntimeError(
+                f"pinned reference archive metadata mismatch: {archive}"
+            )
+        values[field] = value.strip()
+    if values != {"Version": VERSION, "Architecture": architecture}:
+        raise RuntimeError(
+            f"pinned reference archive metadata mismatch: {archive}"
+        )
+
+
+def verify_extracted_bindings(prefix: Path, architecture: str) -> None:
+    verify_file(prefix / "usr/bin/dpkg", PINS[architecture]["executable"])
+    verify_file(prefix / "usr/bin/dpkg-query", PINS[architecture]["dpkg_query"])
+    verify_file(
+        prefix / "usr/bin/update-alternatives",
+        PINS[architecture]["update_alternatives"],
+    )
+
+
 def canonical_json(document: object) -> str:
     return json.dumps(document, indent=2, sort_keys=True) + "\n"
 
@@ -324,20 +363,29 @@ def prepare(
         validate_fixture_root(fixture_root)
     if architecture not in PINS:
         raise RuntimeError(f"unsupported reference architecture: {architecture}")
+    native = architecture == host_architecture()
     prefix = (fixture_root or ROOT) / ".cache/native-dpkg-reference" / VERSION / architecture
     if prefix.resolve() != prefix:
         raise RuntimeError("private reference prefix must not traverse symlinks")
     executable = prefix / "usr/bin/dpkg"
     if prefix.exists():
-        select(executable, architecture, root_accounts=True)
-        select_dpkg_query(
-            prefix / "usr/bin/dpkg-query",
-            architecture,
-        )
-        select_update_alternatives(
-            prefix / "usr/bin/update-alternatives",
-            architecture,
-        )
+        if native:
+            select(executable, architecture, root_accounts=True)
+            select_dpkg_query(
+                prefix / "usr/bin/dpkg-query",
+                architecture,
+            )
+            select_update_alternatives(
+                prefix / "usr/bin/update-alternatives",
+                architecture,
+            )
+        else:
+            verify_extracted_bindings(prefix, architecture)
+            print(
+                f"Foreign reference: dpkg {VERSION} ({architecture}) not executed on "
+                f"{platform.machine()}",
+                file=sys.stderr,
+            )
         receipt = prefix / RECEIPT
         if not receipt.exists():
             archive_url, archive = download_archive(architecture, fixture_archive, fixture_root)
@@ -351,17 +399,26 @@ def prepare(
         archive_url, content = download_archive(architecture, fixture_archive, fixture_root)
         archive.write_bytes(content)
         verify_file(archive, PINS[architecture]["archive"])
+        verify_archive_metadata(archive, architecture)
         staged = workspace / "prefix"
         subprocess.run(["dpkg-deb", "--extract", str(archive), str(staged)], check=True, timeout=60)
-        select(staged / "usr/bin/dpkg", architecture, root_accounts=True)
-        select_dpkg_query(
-            staged / "usr/bin/dpkg-query",
-            architecture,
-        )
-        select_update_alternatives(
-            staged / "usr/bin/update-alternatives",
-            architecture,
-        )
+        if native:
+            select(staged / "usr/bin/dpkg", architecture, root_accounts=True)
+            select_dpkg_query(
+                staged / "usr/bin/dpkg-query",
+                architecture,
+            )
+            select_update_alternatives(
+                staged / "usr/bin/update-alternatives",
+                architecture,
+            )
+        else:
+            verify_extracted_bindings(staged, architecture)
+            print(
+                f"Foreign reference: dpkg {VERSION} ({architecture}) not executed on "
+                f"{platform.machine()}",
+                file=sys.stderr,
+            )
         write_receipt(architecture, archive_url, content, staged)
         staged.rename(prefix)
     verify_receipt(prefix / RECEIPT, architecture)

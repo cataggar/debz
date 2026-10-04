@@ -18885,7 +18885,7 @@ fn lifecycleInvocationPolicy(
 }
 
 const snapshot_systemd_postinst_sha256 =
-    "39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412";
+    "d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d";
 
 fn snapshotSystemdProcIsBound(
     architecture: []const u8,
@@ -18927,10 +18927,10 @@ fn verifySnapshotSystemdPostinstPaths(
 }
 
 const snapshot_udev_postinst_sha256 =
-    "861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee";
+    "b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606";
 
 const snapshot_sudo_postinst_sha256 =
-    "e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8";
+    "fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383";
 const snapshot_python3_preinst_sha256 =
     "115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f";
 
@@ -19334,7 +19334,7 @@ test "native_unpack.test.signed sudo PID-only proc requires exact configure and 
 }
 
 test "native_unpack.test.signed python3 preinst is inert only for exact install identity" {
-    const script = @embedFile("fixtures/ubuntu-stonking-python3-3.14.7-3.preinst");
+    const script = @embedFile("fixtures/ubuntu-resolute-python3.preinst");
     const package: native_program.PackageIdentity = .{
         .name = "python3",
         .version = "3.14.7-3",
@@ -19654,9 +19654,9 @@ fn bootstrappedFreshPreinst(
 }
 
 const keyboard_preinst_sha256 =
-    "2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703";
+    "01fb97dc9c6e15e5d44fa78e028b12a77c59616109e5635f346917870448971f";
 const keyboard_templates_sha256 =
-    "4fd265213c939f2b74618c997a3695b30ca9a0b9ee5439dcda4d1f0cc9d01328";
+    "0aefded2b21462af94c0e199ea71f6df2e93c4919b18909197b05631f0075d66";
 const iproute_postinst_sha256 =
     "bb5318e85da2497d1b2b6fcdf2d612bd02ec54bc5d9f86005506d8e91bb79d3a";
 const iproute_templates_sha256 =
@@ -20764,13 +20764,13 @@ fn lifecycleScriptPath(
 }
 
 const console_setup_postinst_sha256 =
-    "e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d";
+    "6abadbbad6760a44a9379584efaca6d82d10be0e80c6c76aa7fcfd0f02518056";
 const console_setup_archive_sha512 =
-    "2ea052bd7c02091ce7afea7262e2340fdaeb9f362af79e4a1b42265ad98ace237b10770275970f89c81acf2c57bc2cc50234c2357adb167e84041c1c5479a330";
+    "776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832";
 const chrony_postinst_sha256 =
-    "bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935";
+    "5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272";
 const chrony_archive_sha512 =
-    "5265963d95267643abec7fbadb5c76ae39a1a940e2b12a48d685c6859bcf44fa318c0f48c509b3c19811cc877b450a92c9fcad5a3212e7b78f441234d54cdcd9";
+    "10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b";
 
 fn snapshotConsoleSetupPostinstUsesInfo(
     architecture: []const u8,
@@ -20972,7 +20972,7 @@ fn snapshotConsoleSetupPostinstInfoPath(
     for ([_]ConsoleSetupControlFile{
         .{ .path = "var/lib/dpkg/info/console-setup.postinst", .size = 4330, .mode = 0o755, .sha256 = console_setup_postinst_sha256 },
         .{ .path = "var/lib/dpkg/info/console-setup.config", .size = 32119, .mode = 0o755, .sha256 = "9a7ae3220597dbd88f86f01784a47d9181c6d571a30080ccab2c77eaad0314e8" },
-        .{ .path = "var/lib/dpkg/info/console-setup.templates", .size = 174753, .mode = 0o644, .sha256 = "dbddc3ff45db9d1417abff0f21eef1aba5fbd1f1bc0cdb15eba4e3f86f2e1b81" },
+        .{ .path = "var/lib/dpkg/info/console-setup.templates", .size = 154958, .mode = 0o644, .sha256 = "c0d53d7485c72b8894340e7f5c2557c2247c3fe033dfbad56bbdc3dc659dc379" },
     }) |binding| try verifyConsoleSetupControlFile(allocator, root, binding);
     return installed;
 }
@@ -22025,7 +22025,7 @@ fn verifyConsoleSetupProviders(
 ) !void {
     const expected_archive = (try content_digest.Value.parse(
         .sha512,
-        "b5ad0ebf1b9a526b5af67422b720b29b4e2738ebd945871223bef8241e59b47558f51a31e9638b8e5ce84ea1b42334682f86f9c3d62de224e7c55caa7a5e0f14",
+        "511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b",
     )).sha512;
     var found = false;
     for (program.artifacts) |artifact| {
@@ -22093,13 +22093,13 @@ fn verifySudoRsStructuralOwner(
             .name = "sudo",
             .version = "1.9.17p2-7ubuntu3",
             .size = 954870,
-            .sha512 = "92d4e2391529356a959f226ed9da03119736f5e7c68458ea3cc7413caeb1dcbe610ccdfad3474516fca862153cfa149a0a4bb712e985158a9410cfa0363474f7",
+            .sha512 = "7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d",
         },
         .{
             .name = "sudo-rs",
             .version = "0.2.14-1ubuntu4",
             .size = 590768,
-            .sha512 = "aeff8aeba736d791c7a2c12b6a46ba7964c5729e63d46bf457700db221d54aa1672beec0df1b15ae584852a57d9607c7a370d041469a24e8192dc84d2b332ea2",
+            .sha512 = "61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189",
         },
     };
     for (expected_artifacts) |expected| {
@@ -22145,7 +22145,7 @@ fn verifySudoRsStructuralOwner(
             .path = "usr/bin/sudo.ws",
             .mode = 0o4755,
             .size = 282080,
-            .sha256 = "6937a49a2396307d74c575c4066a8db8bcea21bbc6fa4dc01cadc724e586d4aa",
+            .sha256 = "e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43",
         },
         .{
             .path = "usr/share/man/man8/sudo.ws.8.gz",
@@ -22269,12 +22269,12 @@ fn verifySnapshotPython3PreinstInputs(
         .{
             .package = .{ .name = "python3", .version = "3.14.7-3", .architecture = "amd64" },
             .size = 23672,
-            .sha512 = "1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6",
+            .sha512 = "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
         },
         .{
             .package = .{ .name = "python3-minimal", .version = "3.14.7-3", .architecture = "amd64" },
             .size = 25858,
-            .sha512 = "3a23950e7a9bb65cf6e40a97bb05f7a7402c04d7167f2bc4d152c05ff8abaee45cbdbc298e937d3a0ff5c49758537e92a4f8880a1aec7629274a4790eae38bdf",
+            .sha512 = "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
         },
     }) |binding| try verifyAuthenticatedSnapshotArtifact(
         program.artifacts,
@@ -22288,7 +22288,7 @@ fn verifySnapshotPython3PreinstInputs(
         .{ .path = "var/lib/dpkg/info/python3.list", .size = 918, .mode = 0o644, .sha256 = "d830caf623e35ec940e8f6d185455faa601a627052b1daffe3e4741b960bb1a3" },
         .{ .path = "var/lib/dpkg/info/python3-minimal.list", .size = 781, .mode = 0o644, .sha256 = "a0d9c1023aeef88ea89781862449be6b65cf84157b7d894aacd0c536b0940ba8" },
         .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
-        .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "c734a13ce654834fad2af9066cc637e25e6228daa6a9b8ee247bd7d67382e61e" },
+        .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6" },
     }) |binding| try verifySignedDebconfControlFile(
         allocator,
         root,
@@ -22361,12 +22361,12 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
         .{
             .package = .{ .name = "python3", .version = "3.14.7-3", .architecture = "amd64" },
             .size = 23672,
-            .sha512 = "1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6",
+            .sha512 = "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
         },
         .{
             .package = .{ .name = "python3-minimal", .version = "3.14.7-3", .architecture = "amd64" },
             .size = 25858,
-            .sha512 = "3a23950e7a9bb65cf6e40a97bb05f7a7402c04d7167f2bc4d152c05ff8abaee45cbdbc298e937d3a0ff5c49758537e92a4f8880a1aec7629274a4790eae38bdf",
+            .sha512 = "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
         },
     };
     var artifacts: [identities.len]native_program.ProgramArtifact = undefined;
@@ -22468,7 +22468,7 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
 
 test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst",
+        "fixtures/ubuntu-resolute-sudo-rs.postinst",
     );
     const sudo_rs: native_program.PackageIdentity = .{
         .name = "sudo-rs",
@@ -22560,7 +22560,7 @@ test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure"
 
 test "native_unpack.test.snapshot util-linux requires signed fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst",
+        "fixtures/ubuntu-resolute-util-linux.postinst",
     );
     const util_linux: native_program.PackageIdentity = .{
         .name = "util-linux",
@@ -22651,7 +22651,7 @@ test "native_unpack.test.snapshot util-linux requires signed fresh amd64 configu
 
 test "native_unpack.test.snapshot console-setup requires signed fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst",
+        "fixtures/ubuntu-resolute-console-setup-linux.postinst",
     );
     const package: native_program.PackageIdentity = .{
         .name = "console-setup-linux",
@@ -22895,9 +22895,9 @@ test "native_unpack.test.signed console-setup postinst uses info only for bound 
 test "native_unpack.test.signed console-setup debconf sidecars require unchanged root-owned files" {
     const binding: ConsoleSetupControlFile = .{
         .path = "var/lib/dpkg/info/console-setup.templates",
-        .size = 174753,
+        .size = 154958,
         .mode = 0o644,
-        .sha256 = "dbddc3ff45db9d1417abff0f21eef1aba5fbd1f1bc0cdb15eba4e3f86f2e1b81",
+        .sha256 = "c0d53d7485c72b8894340e7f5c2557c2247c3fe033dfbad56bbdc3dc659dc379",
     };
     const digest = parseHex(32, binding.sha256).?;
     var entry: root_fs.Entry = .{
@@ -23131,7 +23131,7 @@ test "native_unpack.test.signed chrony debconf controls reject metadata or byte 
 
 test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
+        "fixtures/ubuntu-resolute-procps.postinst",
     );
     const procps: native_program.PackageIdentity = .{
         .name = "procps",
@@ -23185,7 +23185,7 @@ test "native_unpack.test.snapshot procps postinst requires fresh amd64 configure
 
 test "native_unpack.test.signed procps trigger requires bound callback and absent proc sys" {
     const script_bytes = @embedFile(
-        "fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst",
+        "fixtures/ubuntu-resolute-procps.postinst",
     );
     const procps: native_program.PackageIdentity = .{
         .name = "procps",
@@ -23314,7 +23314,7 @@ test "native_unpack.test.signed procps trigger requires bound callback and absen
     );
     const tool = parseHex(
         32,
-        "3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d",
+        "023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45",
     ).?;
     try testing.expect(native_alternatives.matchesSnapshotTool("amd64", tool));
     var wrong_tool = tool;
@@ -23325,7 +23325,7 @@ test "native_unpack.test.signed procps trigger requires bound callback and absen
 
 test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst",
+        "fixtures/ubuntu-resolute-bash.postinst",
     );
     const bash: native_program.PackageIdentity = .{
         .name = "bash",
@@ -23393,7 +23393,7 @@ test "native_unpack.test.snapshot bash postinst requires fresh amd64 configure" 
 
 test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-less-668-1build1.postinst",
+        "fixtures/ubuntu-resolute-less.postinst",
     );
     const less: native_program.PackageIdentity = .{
         .name = "less",
@@ -23462,7 +23462,7 @@ test "native_unpack.test.snapshot less postinst requires fresh amd64 configure" 
 
 test "native_unpack.test.snapshot less preinst requires fresh amd64 install" {
     const script = @embedFile(
-        "fixtures/ubuntu-stonking-less-668-1build1.preinst",
+        "fixtures/ubuntu-resolute-less.preinst",
     );
     const less: native_program.PackageIdentity = .{
         .name = "less",
@@ -41023,7 +41023,7 @@ test "native_unpack.test.signed glib empty directories do not activate their own
     std.crypto.hash.sha2.Sha512.hash(bytes, &digest, .{});
     const signed = (try content_digest.Value.parse(
         .sha512,
-        "1ce37ac69b92ea9521c93f76aed4ba1a28962abf10481d474ee909ed5d2649596e8e059efcb9f938b97ecea451828274dbb61651c7d014fe1a6a028ce046e79c",
+        "196cdd945ad54fb1fee44db960e3c9aa324aa0cd4b8a25e4ea138bbf48e6f681a672c16312afbf022ad48a7b87c9fdd23a7eb92c295cdedd8f7698009c157d83",
     )).sha512;
     try testing.expectEqual(signed, digest);
     var opened = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(root_path));

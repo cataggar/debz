@@ -3,12 +3,15 @@ set -euo pipefail
 umask 077
 
 readonly pinned_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
-readonly pinned_suite=stonking
+readonly pinned_suite=resolute
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 readonly max_download_bytes=$((1536 * 1024 * 1024))
 readonly max_package_bytes=$((512 * 1024 * 1024))
 readonly max_cache_bytes=$((2 * 1024 * 1024 * 1024))
 readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
+readonly frozen_release_sha256=596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834
+readonly updates_release_sha256=16d93e5e9358047ac2f5d671abcac2bb3f2945532452720cd9a17320c19c4f24
+readonly security_release_sha256=bda7516aa5ed1aa2c8ebcbe36a07276f599559917a9de8fe5de041e99c9a2a10
 # Command bounds; see "Acceptance time bounds" in doc/integration-roots.md.
 # Native install alone is bounded by time without durable progress, up to a
 # fixed ceiling, because a complete traced install can exceed any short limit.
@@ -25,13 +28,13 @@ readonly mutation_progress_log=var/lib/debz/root-mutation-v2.log
 # version come from each architecture's authenticated dpkg archive in the
 # pinned snapshot, never from another architecture or snapshot.
 readonly script_dpkg_snapshot=20261001T000000Z
-readonly script_dpkg_version=1.23.7ubuntu2
-readonly script_dpkg_amd64='6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f 322728'
-readonly script_dpkg_arm64='d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4 330816'
-readonly script_dpkg_divert_amd64='a509fc1a363946770295b613924e2bfa902ddbf76ec2826128685df1569c57d8 125768'
-readonly script_dpkg_divert_arm64='6daba35904a8885a334c33e6b4c7c7bc42f501f3f36032a374dfe40e842ed75b 133872'
-readonly script_dpkg_statoverride_amd64='6c08816ff0b12106e969537cab83ac4b3358a72b425fe8bf1fc961e2e82ce2ce 55936'
-readonly script_dpkg_statoverride_arm64='b837c9d99518225f5b238b215179559a87e7d012072ae0ff414fdc0ea891c3b9 68184'
+readonly script_dpkg_version=1.23.7ubuntu1
+readonly script_dpkg_amd64='972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517 322728'
+readonly script_dpkg_arm64='6c03c9fa2053b5a4e899438c1318ed460f62f01812da7f91f6c35a7e0957692f 330816'
+readonly script_dpkg_divert_amd64='e975eecfbceda235ecedc2e35addf5cc5abe05de355202780cf8e47b2f6745eb 125768'
+readonly script_dpkg_divert_arm64='50fd191a3a97a17ff0de4bb921ded2d877e5648e197712e8025631c09d456798 133872'
+readonly script_dpkg_statoverride_amd64='f8496aa47ff782a4881ebdf9e0a4e4615e81f8c56bc004af51f49954e315ff8c 55936'
+readonly script_dpkg_statoverride_arm64='b9c47a676498db293c4f674d63af54656d274e68b7598e235ec50f2380dba0f6 68184'
 
 validate_values() {
   local uri=$1 suite=$2 architecture=$3
@@ -628,11 +631,11 @@ root=$workspace/root
 cache=$workspace/cache
 state=$workspace/state
 evidence=$workspace/evidence
-source_file=$workspace/ubuntu.sources
-config_file=$workspace/ubuntu.json
+source_dir=$workspace/sources
+config_dir=$workspace/config
 lock=$evidence/ubuntu-minimal.lock.json
 update_lock=$evidence/ubuntu-minimal.update.lock.json
-mkdir -p "$root" "$cache" "$state" "$evidence"
+mkdir -p "$root" "$cache" "$state" "$evidence" "$source_dir" "$config_dir"
 [[ -z $(find "$root" -mindepth 1 -print -quit) ]]
 printf 'install_root_exists=true\ndpkg_database_present=false\nhelper_placeholder_present=false\npackage_state_present=false\n' \
   >"$evidence/fresh-root-before.txt"
@@ -648,16 +651,31 @@ capture_root_layout() {
   } >"$evidence/root-layout.txt"
 }
 trap capture_root_layout EXIT
-cat >"$source_file" <<EOF
+write_source() {
+  local target=$1 suite_name=$2
+  cat >"$target" <<EOF
 Types: deb
 URIs: $uri
-Suites: $suite
+Suites: $suite_name
 Components: main
 Architectures: $architecture
 Signed-By: $keyring
 EOF
-printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
-  "$source_file" "$suite" "$maximum_release_age_seconds" >"$config_file"
+}
+write_source "$source_dir/resolute.sources" resolute
+write_source "$source_dir/resolute-updates.sources" resolute-updates
+write_source "$source_dir/resolute-security.sources" resolute-security
+printf '{"source_path":"%s","priority":500,"immutable":true,"freshness":{"mode":"frozen_release_with_witnesses","frozen_release_digest":"sha256:%s","witness_suites":["resolute-updates","resolute-security"]}}\n' \
+  "$source_dir/resolute.sources" "$frozen_release_sha256" >"$config_dir/resolute.json"
+for witness in resolute-updates resolute-security; do
+  printf '{"source_path":"%s","priority":500,"immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
+    "$source_dir/$witness.sources" "$maximum_release_age_seconds" >"$config_dir/$witness.json"
+done
+config_args=(
+  --config "$config_dir/resolute.json"
+  --config "$config_dir/resolute-updates.json"
+  --config "$config_dir/resolute-security.json"
+)
 source_commit=${GITHUB_SHA:-}
 if [[ -z "$source_commit" ]]; then
   source_commit=$(git -C "$(dirname "$0")/.." rev-parse HEAD)
@@ -670,14 +688,13 @@ fi
     "$(date -u +%s)" "${GITHUB_WORKFLOW:-local}" "${GITHUB_RUN_ID:-local}" \
     "${GITHUB_RUN_ATTEMPT:-local}" "${GITHUB_JOB:-local}"
   printf 'candidate_backend=native\nreference_backend=pinned-dpkg-oracle\n'
-  printf 'repository_freshness=allow_missing_valid_until_with_max_age_seconds:%s\n' \
-    "$maximum_release_age_seconds"
+  printf 'repository_freshness=frozen_release_with_witnesses:%s:witnesses=resolute-updates,resolute-security:maximum_witness_age=%s\n' \
+    "$frozen_release_sha256" "$maximum_release_age_seconds"
   printf 'program_sha256=%s\nkeyring_sha256=%s\n' \
     "$(sha256sum "$debz" | cut -d' ' -f1)" \
     "$(sha256sum "$keyring" | cut -d' ' -f1)"
-  printf 'source_profile_sha256=%s\nrepository_profile_sha256=%s\n' \
-    "$(sha256sum "$source_file" | cut -d' ' -f1)" \
-    "$(sha256sum "$config_file" | cut -d' ' -f1)"
+  sha256sum "$source_dir"/*.sources | sed 's#^.*/##; s#^#source_profile_sha256 #'
+  sha256sum "$config_dir"/*.json | sed 's#^.*/##; s#^#repository_profile_sha256 #'
   printf 'operation_limit=%s\nverification_limit=%s\n' \
     "$operation_limit" "$verification_limit"
   printf 'install_progress_limit_seconds=%s\ninstall_ceiling_seconds=%s\n' \
@@ -689,7 +706,7 @@ common=(
   --cache-path "$cache"
   --state-path "$state"
   --architecture "$architecture"
-  --config "$config_file"
+  "${config_args[@]}"
   --keyring "$keyring"
   --deadline-ms 300000
   --lock-wait-ms 30000
@@ -906,14 +923,19 @@ verify_result() {
 }
 
 review_lock() {
-  jq -e --arg arch "$architecture" '
+  jq -e --arg arch "$architecture" \
+    --arg frozen "$frozen_release_sha256" \
+    --arg updates "$updates_release_sha256" \
+    --arg security "$security_release_sha256" '
     .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
     .version == 3 and
     .target_architecture == $arch and
     ([.packages[] | select(.name == "ubuntu-minimal")] | length) == 1 and
     all(.packages[]; .archive_identity.primary == "sha512") and
-    (.repositories | length) == 1 and
-    all(.repositories[]; .index_identity.primary == "sha512") and
+    (.repositories | length) >= 2 and (.repositories | length) <= 3 and
+    all(.repositories[]; .index_identity.primary == "sha256") and
+    ([.repositories[].release_sha256] | index($frozen) != null and index($updates) != null) and
+    all(.repositories[].release_sha256; . == $frozen or . == $updates or . == $security) and
     ([.repositories[].signer_fingerprints[]] | unique) ==
       ["f6ecb3762474eda9d21b7022871920d1991bc93c"]
   ' "$1" >/dev/null

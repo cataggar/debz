@@ -85,7 +85,7 @@ done
 [[ $(stat -c '%u:%g:%a' "$source_root/proc") == 0:0:755 ]]
 [[ ! -L "$source_root/proc" && -z $(find "$source_root/proc" -mindepth 1 -print -quit) ]]
 for control in \
-  'chrony.postinst:6993:755:bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935' \
+  'chrony.postinst:6993:755:5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272' \
   'chrony.config:204:755:77661a87b10380b637663d35d01f334c99887ba0dfb625f0c3cc14d995dd83f0' \
   'chrony.templates:698:644:1f0ffe9e66ddc6593446ef924cf6dc80a445b161f0e1876ffac417f0a32841cf'; do
   IFS=: read -r name size mode digest <<<"$control"

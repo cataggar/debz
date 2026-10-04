@@ -2,15 +2,15 @@
   "excluded": [
     {
       "digest": "sha256:0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
-      "reason": "pinned dpkg 1.22.22 reference binary built by tools/prepare-native-dpkg.py; not a snapshot member"
+      "reason": "pinned dpkg 1.22.22 private Debian reference prepared by tools/prepare-native-dpkg.py; external oracle, not the resolute snapshot dpkg pin"
     },
     {
       "digest": "sha256:b02b581c6a7f85679f32efe18c9aaeb05316847fa90d3d3fda30b57defab9b13",
-      "reason": "update-alternatives of the pinned dpkg 1.22.22 reference build (amd64), from tools/prepare-native-dpkg.py"
+      "reason": "update-alternatives from the pinned dpkg 1.22.22 private Debian reference (amd64); external oracle, not the resolute snapshot dpkg pin"
     },
     {
       "digest": "sha256:35616ec58ba58f3fb8b4820bdf893c47a842d56684b3335ba6ebf6df86b27cc5",
-      "reason": "update-alternatives of the pinned dpkg 1.22.22 reference build (arm64), from tools/prepare-native-dpkg.py"
+      "reason": "update-alternatives from the pinned dpkg 1.22.22 private Debian reference (arm64); external oracle, not the resolute snapshot dpkg pin"
     },
     {
       "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -65,15 +65,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412",
+      "digest": "sha256:d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d",
       "id": "script:systemd/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "systemd",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#249",
-      "size": 4942,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:ec71e0bf325cde92f823c6a72a6596f2fb2a5af4ae576540d0bbaab0eb2f687f837c36f12c308c73455c8ef3144fe6fb4001b3f63c62b58fffa93234c95f4d5e"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
+      "review": "#330",
+      "size": 5037,
       "version_bound": false
     },
     {
@@ -107,15 +112,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee",
+      "digest": "sha256:b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606",
       "id": "script:udev/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "udev",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#251",
-      "size": 2533,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:2a4016406898dbaa6625858099fca0a1e1efed735a1a1909d4baf254a52989d9ca3b3d4d10fa94051d7cb8e1484680945d214739361da0e5b628cc0394f9e884"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
+      "review": "#330",
+      "size": 2578,
       "version_bound": false
     },
     {
@@ -157,15 +167,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8",
+      "digest": "sha256:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383",
       "id": "script:sudo/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "sudo",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#252",
-      "size": 1927,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d"
+        },
+        "version": "1.9.17p2-1ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 1747,
       "version_bound": false
     },
     {
@@ -199,7 +214,7 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-python3-3.14.7-3.preinst"
+          "path": "src/fixtures/ubuntu-resolute-python3.preinst"
         }
       ],
       "digest": "sha256:115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f",
@@ -208,7 +223,12 @@
       "mode": "0755",
       "package": "python3",
       "path": "preinst",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
       "review": "#220",
       "size": 856,
       "version_bound": false
@@ -228,7 +248,7 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-less-668-1build1.preinst"
+          "path": "src/fixtures/ubuntu-resolute-less.preinst"
         }
       ],
       "digest": "sha256:c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94",
@@ -237,7 +257,12 @@
       "mode": "0755",
       "package": "less",
       "path": "preinst",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:957502bf7fc7f49b0e146362e9c4bdf094c6c93fcca25dd1a47f47c6f17dec5b525f793c87ea03867411039ebef402a85f702766cd7c46d916beb53c81f0da45"
+        },
+        "version": "668-1build1"
+      },
       "review": "#220",
       "size": 292,
       "version_bound": false
@@ -261,7 +286,7 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-less-668-1build1.postinst"
+          "path": "src/fixtures/ubuntu-resolute-less.postinst"
         }
       ],
       "digest": "sha256:a33a1e6ef5a22e63a66e42853fc0bcff3107b4653d7b5cea891354a5f28db6c4",
@@ -270,7 +295,12 @@
       "mode": "0755",
       "package": "less",
       "path": "postinst",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:957502bf7fc7f49b0e146362e9c4bdf094c6c93fcca25dd1a47f47c6f17dec5b525f793c87ea03867411039ebef402a85f702766cd7c46d916beb53c81f0da45"
+        },
+        "version": "668-1build1"
+      },
       "review": "#220",
       "size": 374,
       "version_bound": false
@@ -294,18 +324,23 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-bash-5.3-3ubuntu1.postinst"
+          "path": "src/fixtures/ubuntu-resolute-bash.postinst"
         }
       ],
-      "digest": "sha256:e9afaa3227a21e68002bd60a88e054d8f98d2d0e548d1d690c9bba5c3c9577ff",
+      "digest": "sha256:72dfde3dbe58a2eb3766ac52a485626b27213cd9b6fa7b14705cde793620343d",
       "id": "script:bash/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "bash",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#235",
-      "size": 492,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:a36c3eb45112744eda764ba120137da8d3fc1bfc70636bb71154eb581e278b297f74d28549aef8bb00bf68c5079003b6bbf5ad5f359f3b8bdff910e5680993dd"
+        },
+        "version": "5.3-2ubuntu1"
+      },
+      "review": "#330",
+      "size": 491,
       "version_bound": false
     },
     {
@@ -327,18 +362,23 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-procps-4.0.6-3ubuntu1.postinst"
+          "path": "src/fixtures/ubuntu-resolute-procps.postinst"
         }
       ],
-      "digest": "sha256:7c2ba424ad233bd238474b9d6e565a719fbd6902fd75f617bc3e6e915084c9d3",
+      "digest": "sha256:3dbc0b33e45028e59dca33a1f29e41cba3aebe369b6d67a2e26c40ef8ce383b8",
       "id": "script:procps/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "procps",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#240",
-      "size": 3559,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:09fc456161f965166a3c87dc6bc021cee539ac3729026250b161f24f552eb0a49bdd1029e3dfa13c18bec444a3a0bd1ce2dbb230a4a97e5c0ade92f1e3223542"
+        },
+        "version": "2:4.0.4-9ubuntu1"
+      },
+      "review": "#330",
+      "size": 2757,
       "version_bound": false
     },
     {
@@ -356,18 +396,23 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-sudo-rs-0.2.14-1ubuntu4.postinst"
+          "path": "src/fixtures/ubuntu-resolute-sudo-rs.postinst"
         }
       ],
-      "digest": "sha256:38c229561b765f727b9b995af9e35c7ae43756761c2018f974efd678b4a06fd1",
+      "digest": "sha256:8204660f7a77c449041d3639d1075d96e76aeda3050fc0ad7780e9c4cc9a69c0",
       "id": "script:sudo-rs/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "sudo-rs",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#331",
-      "size": 2100,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189"
+        },
+        "version": "0.2.13-0ubuntu1.2"
+      },
+      "review": "#330",
+      "size": 2101,
       "version_bound": false
     },
     {
@@ -385,18 +430,23 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-util-linux-2.42.2-1ubuntu2.postinst"
+          "path": "src/fixtures/ubuntu-resolute-util-linux.postinst"
         }
       ],
-      "digest": "sha256:306c812b4cbdca94057f55e0e8c45a2bf80d7ab86d0e60a915b1f2ac6901a6df",
+      "digest": "sha256:31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9",
       "id": "script:util-linux/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "util-linux",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#331",
-      "size": 2155,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:271b4df2ee3ee790cdf1791dfffdaf87280a99a4df0bb0bc82c3d3f325484da98c05475961f8eb73410be9079fea05c2a2f4c94375deab6cdcb864b0ce21e7cc"
+        },
+        "version": "2.41.3-3ubuntu2.2"
+      },
+      "review": "#330",
+      "size": 2112,
       "version_bound": false
     },
     {
@@ -418,18 +468,23 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-console-setup-linux-1.248ubuntu3.postinst"
+          "path": "src/fixtures/ubuntu-resolute-console-setup-linux.postinst"
         }
       ],
-      "digest": "sha256:5ab31be5894edd94864e54a95d2cbebd46b2b934bffa76a764fc5a52f2915e6a",
+      "digest": "sha256:6d4e7cc59222fdde22ef49bc1ed1f2c8405c8a537c00af787f3c22a2edee383e",
       "id": "script:console-setup-linux/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "console-setup-linux",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#247",
-      "size": 6448,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 6457,
       "version_bound": false
     },
     {
@@ -451,7 +506,7 @@
         },
         {
           "form": "fixture",
-          "path": "src/fixtures/ubuntu-stonking-netcat-openbsd-1.238-1.postinst"
+          "path": "src/fixtures/ubuntu-resolute-netcat-openbsd.postinst"
         }
       ],
       "digest": "sha256:81abc862db99e322e5d6cda436769bc21b9394ce287ea35d057761b6313cb6ef",
@@ -460,7 +515,12 @@
       "mode": "0755",
       "package": "netcat-openbsd",
       "path": "postinst",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:07815dc90927d1c8ace73a1f3506eb9ec9f1283e45043794b6c3c0354a8ee234c5c35912d4e546f5e8b84a46b8e32a093bf55fd8bd16a2de72bfe83ae1cedb55"
+        },
+        "version": "1.234-1"
+      },
       "review": "#220",
       "size": 414,
       "version_bound": false
@@ -483,15 +543,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:bb241b43aefd9b8f6822b75a91a4b9eabf15ac75d6505584b58046910a209935",
+      "digest": "sha256:5629c0b5bc1601ae9e8f0f8cc7b660d4df659af55db2b90c7960f1e40c5c9272",
       "id": "script:chrony/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "chrony",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#250",
-      "size": 6993,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b"
+        },
+        "version": "4.8-2ubuntu1"
+      },
+      "review": "#330",
+      "size": 6953,
       "version_bound": false
     },
     {
@@ -518,7 +583,12 @@
       "mode": "0755",
       "package": "chrony",
       "path": "config",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b"
+        },
+        "version": "4.8-2ubuntu1"
+      },
       "review": "#220",
       "size": 204,
       "version_bound": false
@@ -547,7 +617,12 @@
       "mode": "0644",
       "package": "chrony",
       "path": "templates",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b"
+        },
+        "version": "4.8-2ubuntu1"
+      },
       "review": "#220",
       "size": 698,
       "version_bound": false
@@ -566,15 +641,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:e64fb42e4d5e120dfdb889b00aa747ee00ef6c31bf8edcd3230de33f1823d19d",
+      "digest": "sha256:6abadbbad6760a44a9379584efaca6d82d10be0e80c6c76aa7fcfd0f02518056",
       "id": "script:console-setup/postinst",
       "kind": "script",
       "mode": "0755",
       "package": "console-setup",
       "path": "postinst",
-      "provenance": "pending",
-      "review": "#249",
-      "size": 4330,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 4555,
       "version_bound": false
     },
     {
@@ -597,7 +677,12 @@
       "mode": "0755",
       "package": "console-setup",
       "path": "config",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832"
+        },
+        "version": "1.237ubuntu3.1"
+      },
       "review": "#220",
       "size": 32119,
       "version_bound": false
@@ -616,15 +701,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:dbddc3ff45db9d1417abff0f21eef1aba5fbd1f1bc0cdb15eba4e3f86f2e1b81",
+      "digest": "sha256:c0d53d7485c72b8894340e7f5c2557c2247c3fe033dfbad56bbdc3dc659dc379",
       "id": "script:console-setup/templates",
       "kind": "script",
       "mode": "0644",
       "package": "console-setup",
       "path": "templates",
-      "provenance": "pending",
-      "review": "#249",
-      "size": 174753,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 154958,
       "version_bound": false
     },
     {
@@ -641,15 +731,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:2633dc09bf75db633726ab7e2fff9d8a29fe06f53e3c5915f9221ffef57a8703",
+      "digest": "sha256:01fb97dc9c6e15e5d44fa78e028b12a77c59616109e5635f346917870448971f",
       "id": "script:keyboard-configuration/preinst",
       "kind": "script",
       "mode": "0755",
       "package": "keyboard-configuration",
       "path": "preinst",
-      "provenance": "pending",
-      "review": "#243",
-      "size": 677,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:fc8a82af073afb5b0e2fef05fbcc0652aa2bea538017b1dd5dfe1e93fad8e30b9ac0a2400e9f3444e21facb9e06ef03ce15f43ad45ca32a4e8c93bcc0088e36f"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 368,
       "version_bound": false
     },
     {
@@ -666,15 +761,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:4fd265213c939f2b74618c997a3695b30ca9a0b9ee5439dcda4d1f0cc9d01328",
+      "digest": "sha256:0aefded2b21462af94c0e199ea71f6df2e93c4919b18909197b05631f0075d66",
       "id": "script:keyboard-configuration/templates",
       "kind": "script",
       "mode": "0644",
       "package": "keyboard-configuration",
       "path": "templates",
-      "provenance": "pending",
-      "review": "#244",
-      "size": 576415,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:fc8a82af073afb5b0e2fef05fbcc0652aa2bea538017b1dd5dfe1e93fad8e30b9ac0a2400e9f3444e21facb9e06ef03ce15f43ad45ca32a4e8c93bcc0088e36f"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 629034,
       "version_bound": false
     },
     {
@@ -697,7 +797,12 @@
       "mode": "0755",
       "package": "iproute2",
       "path": "postinst",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:4d1316421f7e564f0117f6b798158d13ea1c5ce5922fab2adf2e1e01da64fef8f97a510c80b2ce541744c8a647be7a34f2172775a8b63f84dbc59e99a93978c2"
+        },
+        "version": "6.19.0-1ubuntu1.1"
+      },
       "review": "#220",
       "size": 3301,
       "version_bound": false
@@ -722,7 +827,12 @@
       "mode": "0644",
       "package": "iproute2",
       "path": "templates",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:4d1316421f7e564f0117f6b798158d13ea1c5ce5922fab2adf2e1e01da64fef8f97a510c80b2ce541744c8a647be7a34f2172775a8b63f84dbc59e99a93978c2"
+        },
+        "version": "6.19.0-1ubuntu1.1"
+      },
       "review": "#220",
       "size": 15912,
       "version_bound": false
@@ -747,7 +857,12 @@
       "mode": "0755",
       "package": "dash",
       "path": "usr/bin/dash",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:88708284cc49c5c8c23a2e5b93fc86cf68d95e94b8cbc25507a2266f28c7d3484281243cfef388db77dd4bf70d22e2ba1cd4f507829efaf56a2986c04e09d75c"
+        },
+        "version": "0.5.12-12ubuntu3"
+      },
       "review": "#252",
       "size": 129856,
       "version_bound": false
@@ -782,14 +897,19 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f",
+      "digest": "sha256:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517",
       "id": "file:dpkg/usr/bin/dpkg@amd64",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg",
-      "provenance": "pending",
-      "review": "#252",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 322728,
       "version_bound": false
     },
@@ -811,14 +931,19 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:d622099d3b73899228a9333421d11700982562775300c590adbfb15f3615d4b4",
+      "digest": "sha256:6c03c9fa2053b5a4e899438c1318ed460f62f01812da7f91f6c35a7e0957692f",
       "id": "file:dpkg/usr/bin/dpkg@arm64",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg",
-      "provenance": "pending",
-      "review": "#322",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 330816,
       "version_bound": false
     },
@@ -836,14 +961,19 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:a509fc1a363946770295b613924e2bfa902ddbf76ec2826128685df1569c57d8",
+      "digest": "sha256:e975eecfbceda235ecedc2e35addf5cc5abe05de355202780cf8e47b2f6745eb",
       "id": "file:dpkg/usr/bin/dpkg-divert@amd64",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg-divert",
-      "provenance": "pending",
-      "review": "#366",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 125768,
       "version_bound": false
     },
@@ -861,14 +991,19 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:6daba35904a8885a334c33e6b4c7c7bc42f501f3f36032a374dfe40e842ed75b",
+      "digest": "sha256:50fd191a3a97a17ff0de4bb921ded2d877e5648e197712e8025631c09d456798",
       "id": "file:dpkg/usr/bin/dpkg-divert@arm64",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg-divert",
-      "provenance": "pending",
-      "review": "#366",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 133872,
       "version_bound": false
     },
@@ -886,14 +1021,19 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:6c08816ff0b12106e969537cab83ac4b3358a72b425fe8bf1fc961e2e82ce2ce",
+      "digest": "sha256:f8496aa47ff782a4881ebdf9e0a4e4615e81f8c56bc004af51f49954e315ff8c",
       "id": "file:dpkg/usr/bin/dpkg-statoverride@amd64",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg-statoverride",
-      "provenance": "pending",
-      "review": "#366",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 55936,
       "version_bound": false
     },
@@ -911,14 +1051,19 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:b837c9d99518225f5b238b215179559a87e7d012072ae0ff414fdc0ea891c3b9",
+      "digest": "sha256:b9c47a676498db293c4f674d63af54656d274e68b7598e235ec50f2380dba0f6",
       "id": "file:dpkg/usr/bin/dpkg-statoverride@arm64",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg-statoverride",
-      "provenance": "pending",
-      "review": "#366",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 68184,
       "version_bound": false
     },
@@ -942,7 +1087,12 @@
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg-maintscript-helper",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
       "review": "#252",
       "size": 21123,
       "version_bound": false
@@ -957,14 +1107,19 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:fdab8a6105db8c97503ee3c35c4f686e677adc396b8bb56ead161e122fd9c232",
+      "digest": "sha256:82a19acac53907f83faca7d6494289fe2d074514cf1b09933114635415c2e876",
       "id": "file:dpkg/usr/bin/dpkg-query",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/dpkg-query",
-      "provenance": "pending",
-      "review": "#253",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 142160,
       "version_bound": false
     },
@@ -996,7 +1151,12 @@
       "mode": "0644",
       "package": "dpkg",
       "path": "usr/share/dpkg/sh/dpkg-error.sh",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
       "review": "#253",
       "size": 3228,
       "version_bound": false
@@ -1031,14 +1191,19 @@
           "path": "doc/dpkg-alternatives-reference.md"
         }
       ],
-      "digest": "sha256:3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d",
+      "digest": "sha256:023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45",
       "id": "file:dpkg/usr/bin/update-alternatives",
       "kind": "tool_file",
       "mode": "0755",
       "package": "dpkg",
       "path": "usr/bin/update-alternatives",
-      "provenance": "pending",
-      "review": "#229",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#330",
       "size": 59864,
       "version_bound": false
     },
@@ -1058,7 +1223,12 @@
       "mode": "0644",
       "package": "dpkg",
       "path": "etc/alternatives/README",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d"
+        },
+        "version": "1.23.7ubuntu1"
+      },
       "review": "#220",
       "size": 100,
       "version_bound": false
@@ -1073,15 +1243,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:71a197d9d0211bc8617280eef163d921fbed9648fc5b29a5a38f1bc0692ca6d8",
+      "digest": "sha256:3502e34f903759c07465fc50b1e9406d89325cb6cc6605f4225d3231ba0a7dfc",
       "id": "file:udev/usr/bin/systemd-hwdb",
       "kind": "tool_file",
       "mode": "0755",
       "package": "udev",
       "path": "usr/bin/systemd-hwdb",
-      "provenance": "pending",
-      "review": "#252",
-      "size": 19448,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:2a4016406898dbaa6625858099fca0a1e1efed735a1a1909d4baf254a52989d9ca3b3d4d10fa94051d7cb8e1484680945d214739361da0e5b628cc0394f9e884"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
+      "review": "#330",
+      "size": 14784,
       "version_bound": false
     },
     {
@@ -1104,7 +1279,12 @@
       "mode": "0644",
       "package": "udev",
       "path": "usr/lib/tmpfiles.d/static-nodes-permissions.conf",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:2a4016406898dbaa6625858099fca0a1e1efed735a1a1909d4baf254a52989d9ca3b3d4d10fa94051d7cb8e1484680945d214739361da0e5b628cc0394f9e884"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
       "review": "#252",
       "size": 798,
       "version_bound": false
@@ -1129,7 +1309,12 @@
       "mode": "0644",
       "package": "udev",
       "path": "usr/lib/sysusers.d/debian-udev.conf",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:2a4016406898dbaa6625858099fca0a1e1efed735a1a1909d4baf254a52989d9ca3b3d4d10fa94051d7cb8e1484680945d214739361da0e5b628cc0394f9e884"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
       "review": "#252",
       "size": 143,
       "version_bound": false
@@ -1144,15 +1329,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:2f4e1f47cd486e8797f8874c6e61f80411c05f01bfe58e84b9811eea6fa97411",
+      "digest": "sha256:09586bca83f4ea590a821c2bd712bef44f7b8b55f0186085cfdcd023b9d0da1f",
       "id": "file:systemd/usr/bin/systemd-sysusers",
       "kind": "tool_file",
       "mode": "0755",
       "package": "systemd",
       "path": "usr/bin/systemd-sysusers",
-      "provenance": "pending",
-      "review": "#252",
-      "size": 73048,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:ec71e0bf325cde92f823c6a72a6596f2fb2a5af4ae576540d0bbaab0eb2f687f837c36f12c308c73455c8ef3144fe6fb4001b3f63c62b58fffa93234c95f4d5e"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
+      "review": "#330",
+      "size": 68224,
       "version_bound": false
     },
     {
@@ -1169,15 +1359,20 @@
           "path": "tools/real-snapshot-udev-reference.sh"
         }
       ],
-      "digest": "sha256:8de8ec082f8e887f345c355201c8907ab311960301254e17e96f558798d6d621",
+      "digest": "sha256:13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4",
       "id": "file:systemd/usr/bin/systemd-tmpfiles",
       "kind": "tool_file",
       "mode": "0755",
       "package": "systemd",
       "path": "usr/bin/systemd-tmpfiles",
-      "provenance": "pending",
-      "review": "#252",
-      "size": 131024,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:ec71e0bf325cde92f823c6a72a6596f2fb2a5af4ae576540d0bbaab0eb2f687f837c36f12c308c73455c8ef3144fe6fb4001b3f63c62b58fffa93234c95f4d5e"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
+      "review": "#330",
+      "size": 121544,
       "version_bound": false
     },
     {
@@ -1190,15 +1385,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:c51cb41312b3ad45ae4275179d501db82d150f7541ec95e5942f0094f2ffb00a",
+      "digest": "sha256:6394f5e8df92878184de9d4dfb7ac242471cb09daf89d23be4e81ae17e9c03b2",
       "id": "file:systemd/usr/bin/systemctl",
       "kind": "tool_file",
       "mode": "0755",
       "package": "systemd",
       "path": "usr/bin/systemctl",
-      "provenance": "pending",
-      "review": "#252",
-      "size": 303976,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:ec71e0bf325cde92f823c6a72a6596f2fb2a5af4ae576540d0bbaab0eb2f687f837c36f12c308c73455c8ef3144fe6fb4001b3f63c62b58fffa93234c95f4d5e"
+        },
+        "version": "259.5-0ubuntu3.4"
+      },
+      "review": "#330",
+      "size": 302112,
       "version_bound": false
     },
     {
@@ -1217,7 +1417,12 @@
       "mode": "0755",
       "package": "init-system-helpers",
       "path": "usr/bin/deb-systemd-helper",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5"
+        },
+        "version": "1.69"
+      },
       "review": "#252",
       "size": 24358,
       "version_bound": false
@@ -1238,7 +1443,12 @@
       "mode": "0755",
       "package": "init-system-helpers",
       "path": "usr/sbin/update-rc.d",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5"
+        },
+        "version": "1.69"
+      },
       "review": "#252",
       "size": 18147,
       "version_bound": false
@@ -1259,7 +1469,12 @@
       "mode": "0755",
       "package": "init-system-helpers",
       "path": "usr/bin/deb-systemd-invoke",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:8db5ef8d468542689fb47d78a28d4936762339e9b001d6655074a3357e39ff9933b1be7feebda417f42d1a7bd5b447e3476b0dc3964a245a60212a37728cebb5"
+        },
+        "version": "1.69"
+      },
       "review": "#252",
       "size": 7135,
       "version_bound": false
@@ -1278,14 +1493,19 @@
           "path": "src/native_unpack.zig"
         }
       ],
-      "digest": "sha256:c734a13ce654834fad2af9066cc637e25e6228daa6a9b8ee247bd7d67382e61e",
+      "digest": "sha256:0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6",
       "id": "file:gnu-coreutils/usr/bin/gnurm",
       "kind": "tool_file",
       "mode": "0755",
       "package": "gnu-coreutils",
       "path": "usr/bin/gnurm",
-      "provenance": "pending",
-      "review": "#253",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:edba37f987b7af07cb3e161769ef976a806139164b7d8d532fa8cdcedc648c2bfee8010535ef953878a96854403152af467ead168fb5a12e73ccbc861f97e03b"
+        },
+        "version": "9.7-3ubuntu2.1"
+      },
+      "review": "#330",
       "size": 64096,
       "version_bound": false
     },
@@ -1299,15 +1519,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:c80e98d639a25bec6c2b20c38301eb2719317426520a6cf2d6c165acb7dc45fb",
+      "digest": "sha256:0e04f6401bfae9a5eafed1da2c738067b007d39a8538ea83ce22271b4cd58fbb",
       "id": "file:gnu-coreutils/usr/bin/gnuchown",
       "kind": "tool_file",
       "mode": "0755",
       "package": "gnu-coreutils",
       "path": "usr/bin/gnuchown",
-      "provenance": "pending",
-      "review": "#253",
-      "size": 68176,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:edba37f987b7af07cb3e161769ef976a806139164b7d8d532fa8cdcedc648c2bfee8010535ef953878a96854403152af467ead168fb5a12e73ccbc861f97e03b"
+        },
+        "version": "9.7-3ubuntu2.1"
+      },
+      "review": "#330",
+      "size": 68160,
       "version_bound": false
     },
     {
@@ -1320,15 +1545,20 @@
           "path": "src/maintainer_script.zig"
         }
       ],
-      "digest": "sha256:8038bd44296384090d0ff82dcf4dae77e9915c3d2e68e40f04ab545c0daea580",
+      "digest": "sha256:787b5abd2db66069fdd2467bf3b6acb089380aa0b4c05771f3c1b2471a24bf94",
       "id": "file:gnu-coreutils/usr/bin/gnuchmod",
       "kind": "tool_file",
       "mode": "0755",
       "package": "gnu-coreutils",
       "path": "usr/bin/gnuchmod",
-      "provenance": "pending",
-      "review": "#253",
-      "size": 60016,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:edba37f987b7af07cb3e161769ef976a806139164b7d8d532fa8cdcedc648c2bfee8010535ef953878a96854403152af467ead168fb5a12e73ccbc861f97e03b"
+        },
+        "version": "9.7-3ubuntu2.1"
+      },
+      "review": "#330",
+      "size": 60000,
       "version_bound": false
     },
     {
@@ -1351,7 +1581,12 @@
       "mode": "0644",
       "package": "sudo",
       "path": "usr/lib/tmpfiles.d/sudo.conf",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d"
+        },
+        "version": "1.9.17p2-1ubuntu3.1"
+      },
       "review": "#253",
       "size": 27,
       "version_bound": false
@@ -1370,14 +1605,19 @@
           "path": "src/native_unpack.zig"
         }
       ],
-      "digest": "sha256:6937a49a2396307d74c575c4066a8db8bcea21bbc6fa4dc01cadc724e586d4aa",
+      "digest": "sha256:e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43",
       "id": "file:sudo/usr/bin/sudo.ws",
       "kind": "tool_file",
       "mode": "04755",
       "package": "sudo",
       "path": "usr/bin/sudo.ws",
-      "provenance": "pending",
-      "review": "#242",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d"
+        },
+        "version": "1.9.17p2-1ubuntu3.1"
+      },
+      "review": "#330",
       "size": 282080,
       "version_bound": false
     },
@@ -1401,7 +1641,12 @@
       "mode": "0644",
       "package": "sudo",
       "path": "usr/share/man/man8/sudo.ws.8.gz",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d"
+        },
+        "version": "1.9.17p2-1ubuntu3.1"
+      },
       "review": "#220",
       "size": 12804,
       "version_bound": false
@@ -1426,7 +1671,12 @@
       "mode": "0644",
       "package": "console-setup-linux",
       "path": "etc/console-setup/vtrgb",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b"
+        },
+        "version": "1.237ubuntu3.1"
+      },
       "review": "#220",
       "size": 158,
       "version_bound": false
@@ -1451,7 +1701,12 @@
       "mode": "0644",
       "package": "console-setup-linux",
       "path": "etc/console-setup/vtrgb.vga",
-      "provenance": "pending",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b"
+        },
+        "version": "1.237ubuntu3.1"
+      },
       "review": "#220",
       "size": 155,
       "version_bound": false
@@ -1474,15 +1729,20 @@
           "path": "doc/dpkg-alternatives-reference.md"
         }
       ],
-      "digest": "sha512:1943e1345282b90dffed86d986d467e3d81e266a9925e8a12524bd853c8ef3a7f531a296d93772bfa3d86e04dd97600b66bd3c22e382be48627326998975c6b6",
+      "digest": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
       "id": "archive:python3",
       "kind": "archive",
       "mode": null,
       "package": "python3",
       "path": null,
-      "provenance": "pending",
-      "review": "#254",
-      "size": 23672,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#330",
+      "size": 22938,
       "version_bound": false
     },
     {
@@ -1499,15 +1759,20 @@
           "path": "doc/dpkg-alternatives-reference.md"
         }
       ],
-      "digest": "sha512:3a23950e7a9bb65cf6e40a97bb05f7a7402c04d7167f2bc4d152c05ff8abaee45cbdbc298e937d3a0ff5c49758537e92a4f8880a1aec7629274a4790eae38bdf",
+      "digest": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
       "id": "archive:python3-minimal",
       "kind": "archive",
       "mode": null,
       "package": "python3-minimal",
       "path": null,
-      "provenance": "pending",
-      "review": "#254",
-      "size": 25858,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#330",
+      "size": 25808,
       "version_bound": false
     },
     {
@@ -1524,15 +1789,20 @@
           "path": "doc/dpkg-alternatives-reference.md"
         }
       ],
-      "digest": "sha512:92d4e2391529356a959f226ed9da03119736f5e7c68458ea3cc7413caeb1dcbe610ccdfad3474516fca862153cfa149a0a4bb712e985158a9410cfa0363474f7",
+      "digest": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d",
       "id": "archive:sudo",
       "kind": "archive",
       "mode": null,
       "package": "sudo",
       "path": null,
-      "provenance": "pending",
-      "review": "#242",
-      "size": 954870,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d"
+        },
+        "version": "1.9.17p2-1ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 954828,
       "version_bound": false
     },
     {
@@ -1549,15 +1819,20 @@
           "path": "doc/dpkg-alternatives-reference.md"
         }
       ],
-      "digest": "sha512:aeff8aeba736d791c7a2c12b6a46ba7964c5729e63d46bf457700db221d54aa1672beec0df1b15ae584852a57d9607c7a370d041469a24e8192dc84d2b332ea2",
+      "digest": "sha512:61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189",
       "id": "archive:sudo-rs",
       "kind": "archive",
       "mode": null,
       "package": "sudo-rs",
       "path": null,
-      "provenance": "pending",
-      "review": "#331",
-      "size": 590768,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189"
+        },
+        "version": "0.2.13-0ubuntu1.2"
+      },
+      "review": "#330",
+      "size": 596110,
       "version_bound": false
     },
     {
@@ -1578,15 +1853,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha512:b5ad0ebf1b9a526b5af67422b720b29b4e2738ebd945871223bef8241e59b47558f51a31e9638b8e5ce84ea1b42334682f86f9c3d62de224e7c55caa7a5e0f14",
+      "digest": "sha512:511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b",
       "id": "archive:console-setup-linux",
       "kind": "archive",
       "mode": null,
       "package": "console-setup-linux",
       "path": null,
-      "provenance": "pending",
-      "review": "#247",
-      "size": 6207548,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 6206020,
       "version_bound": false
     },
     {
@@ -1603,15 +1883,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha512:2ea052bd7c02091ce7afea7262e2340fdaeb9f362af79e4a1b42265ad98ace237b10770275970f89c81acf2c57bc2cc50234c2357adb167e84041c1c5479a330",
+      "digest": "sha512:776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832",
       "id": "archive:console-setup",
       "kind": "archive",
       "mode": null,
       "package": "console-setup",
       "path": null,
-      "provenance": "pending",
-      "review": "#249",
-      "size": 108150,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:776ebf749c2a621ff9835b86b69efe1c838e948ac8265fab0f2c5eb91875ae67f1313800854b3a8a962359dfa40bee3e59cc5cf956a215ed82e15529bf622832"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
+      "size": 102654,
       "version_bound": false
     },
     {
@@ -1628,15 +1913,20 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha512:5265963d95267643abec7fbadb5c76ae39a1a940e2b12a48d685c6859bcf44fa318c0f48c509b3c19811cc877b450a92c9fcad5a3212e7b78f441234d54cdcd9",
+      "digest": "sha512:10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b",
       "id": "archive:chrony",
       "kind": "archive",
       "mode": null,
       "package": "chrony",
       "path": null,
-      "provenance": "pending",
-      "review": "#251",
-      "size": 333804,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:10372993d1a2c8cd496e66791f42cce262316f0b0e442453d933eb6119b15b5f4de5234ab962e25ecca6d5a7de0621277539fdb03ee1a5e0d0830636ab523e7b"
+        },
+        "version": "4.8-2ubuntu1"
+      },
+      "review": "#330",
+      "size": 341784,
       "version_bound": false
     },
     {
@@ -1653,15 +1943,20 @@
           "path": "doc/native-triggers.md"
         }
       ],
-      "digest": "sha512:1ce37ac69b92ea9521c93f76aed4ba1a28962abf10481d474ee909ed5d2649596e8e059efcb9f938b97ecea451828274dbb61651c7d014fe1a6a028ce046e79c",
+      "digest": "sha512:196cdd945ad54fb1fee44db960e3c9aa324aa0cd4b8a25e4ea138bbf48e6f681a672c16312afbf022ad48a7b87c9fdd23a7eb92c295cdedd8f7698009c157d83",
       "id": "archive:libglib2.0-0t64",
       "kind": "archive",
       "mode": null,
       "package": "libglib2.0-0t64",
       "path": null,
-      "provenance": "pending",
-      "review": "#256",
-      "size": 1613714,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:196cdd945ad54fb1fee44db960e3c9aa324aa0cd4b8a25e4ea138bbf48e6f681a672c16312afbf022ad48a7b87c9fdd23a7eb92c295cdedd8f7698009c157d83"
+        },
+        "version": "2.88.0-1ubuntu0.1"
+      },
+      "review": "#330",
+      "size": 1597886,
       "version_bound": false
     },
     {
@@ -1675,15 +1970,21 @@
           "path": "tools/real-snapshot-reference-protected-ci.sh"
         }
       ],
-      "digest": "sha512:22078b3cf6a876d87cb7e3bffa97999fc87023b890788006fc78c952e2861b655d941be7563c307caa3fcce3b78f75b5f62b8cdd993f0dd646c7775955860fd4",
+      "digest": "sha512:80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35",
       "id": "archive:ubuntu-keyring",
       "kind": "archive",
       "mode": null,
       "package": "ubuntu-keyring",
       "path": null,
-      "provenance": "pending",
-      "review": "#356",
-      "size": 12718,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35",
+          "arm64": "sha512:80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35"
+        },
+        "version": "2023.11.28.1build1"
+      },
+      "review": "#330",
+      "size": 11228,
       "version_bound": false
     },
     {
@@ -1701,15 +2002,21 @@
           "path": "doc/integration-roots.md"
         }
       ],
-      "digest": "sha256:655e378ede8af51ed5f2ffe3669b38f124593abc1aa769c2cc76ef5986a2f835",
+      "digest": "sha256:80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31",
       "id": "file:ubuntu-keyring/usr/share/keyrings/ubuntu-archive-keyring.gpg",
       "kind": "tool_file",
       "mode": "0644",
       "package": "ubuntu-keyring",
       "path": "usr/share/keyrings/ubuntu-archive-keyring.gpg",
-      "provenance": "pending",
-      "review": "#356",
-      "size": 2334,
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35",
+          "arm64": "sha512:80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35"
+        },
+        "version": "2023.11.28.1build1"
+      },
+      "review": "#330",
+      "size": 3607,
       "version_bound": false
     },
     {
@@ -1737,7 +2044,7 @@
       "derived_from": [
         {
           "package": "sudo",
-          "version": "1.9.17p2-7ubuntu3"
+          "version": "1.9.17p2-1ubuntu3.1"
         }
       ],
       "digest": "sha256:92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f",
@@ -1746,8 +2053,13 @@
       "mode": "0644",
       "package": "sudo",
       "path": "var/lib/dpkg/info/sudo.list",
-      "provenance": "pending",
-      "review": "#242",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d"
+        },
+        "version": "1.9.17p2-1ubuntu3.1"
+      },
+      "review": "#330",
       "size": 2376,
       "version_bound": false
     },
@@ -1764,7 +2076,7 @@
       "derived_from": [
         {
           "package": "python3",
-          "version": "3.14.7-3"
+          "version": "3.14.3-0ubuntu2"
         }
       ],
       "digest": "sha256:d830caf623e35ec940e8f6d185455faa601a627052b1daffe3e4741b960bb1a3",
@@ -1773,8 +2085,13 @@
       "mode": "0644",
       "package": "python3",
       "path": "var/lib/dpkg/info/python3.list",
-      "provenance": "pending",
-      "review": "#254",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#330",
       "size": 918,
       "version_bound": false
     },
@@ -1795,7 +2112,7 @@
       "derived_from": [
         {
           "package": "python3-minimal",
-          "version": "3.14.7-3"
+          "version": "3.14.3-0ubuntu2"
         }
       ],
       "digest": "sha256:a0d9c1023aeef88ea89781862449be6b65cf84157b7d894aacd0c536b0940ba8",
@@ -1804,8 +2121,13 @@
       "mode": "0644",
       "package": "python3-minimal",
       "path": "var/lib/dpkg/info/python3-minimal.list",
-      "provenance": "pending",
-      "review": "#254",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#330",
       "size": 781,
       "version_bound": false
     },
@@ -1826,7 +2148,7 @@
       "derived_from": [
         {
           "package": "console-setup-linux",
-          "version": "1.248ubuntu3"
+          "version": "1.237ubuntu3.1"
         }
       ],
       "digest": "sha256:fcbd5a4757d10f8e93472331cff45fd91667dad80b16e6e3dffd4a550097c79f",
@@ -1835,8 +2157,13 @@
       "mode": null,
       "package": "console-setup-linux",
       "path": "var/lib/dpkg/info/console-setup-linux.list",
-      "provenance": "pending",
-      "review": "#248",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:511e2f220d1f2afb6c0ae80d9488b6863b884f2db26e54d9cd343ca212c8061e6fbf637131fbd6f93673f3f9d47fe22515b22eca96a1cdf65e9e768fd2bbbb5b"
+        },
+        "version": "1.237ubuntu3.1"
+      },
+      "review": "#330",
       "size": 41489,
       "version_bound": false
     },
@@ -1861,7 +2188,7 @@
       "derived_from": [
         {
           "package": "sudo",
-          "version": "1.9.17p2-7ubuntu3"
+          "version": "1.9.17p2-1ubuntu3.1"
         }
       ],
       "digest": "sha256:4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6",
@@ -1870,8 +2197,13 @@
       "mode": null,
       "package": "sudo",
       "path": "var/lib/dpkg/alternatives/sudo",
-      "provenance": "pending",
-      "review": "#220",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:7c7d957235034e0b60e9b83e511a925966fbb52b0f758ea68538cecfecf37e57f75bc4415ebba6202ac744cf8aa257e6be7a225803fa14af58cb7e2c1625484d"
+        },
+        "version": "1.9.17p2-1ubuntu3.1"
+      },
+      "review": "#330",
       "size": 464,
       "version_bound": false
     },
@@ -1904,11 +2236,11 @@
       "derived_from": [
         {
           "package": "sudo",
-          "version": "1.9.17p2-7ubuntu3"
+          "version": "1.9.17p2-1ubuntu3.1"
         },
         {
           "package": "sudo-rs",
-          "version": "0.2.14-1ubuntu4"
+          "version": "0.2.13-0ubuntu1.2"
         }
       ],
       "digest": "sha256:c583a377d2d7bc241422c91f43738f8e278e159e8e3bb2aa53d5bdeaf782e845",
@@ -1917,8 +2249,13 @@
       "mode": null,
       "package": "sudo-rs",
       "path": "var/lib/dpkg/alternatives/sudo",
-      "provenance": "pending",
-      "review": "#220",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:61360abddf8f4f8101bed23bd4a8308ae5d3afa33b812d0b7c9443cf8b6671b23ce572568198bfc06eb0a6200d8faf3d10b631d409f9ee17ab084bd3fd835189"
+        },
+        "version": "0.2.13-0ubuntu1.2"
+      },
+      "review": "#330",
       "size": 658,
       "version_bound": false
     },
@@ -1939,7 +2276,7 @@
       "derived_from": [
         {
           "package": "libglib2.0-0t64",
-          "version": "2.90.0-1"
+          "version": "2.88.0-1ubuntu0.1"
         }
       ],
       "digest": "sha256:7ad0cfea75305b62f9ac8daf97f4304d922a54afb9713b7493aeb285336b9a91",
@@ -1948,8 +2285,13 @@
       "mode": null,
       "package": "libglib2.0-0t64",
       "path": "var/lib/dpkg/info/libglib2.0-0t64:amd64.triggers",
-      "provenance": "pending",
-      "review": "#256",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:196cdd945ad54fb1fee44db960e3c9aa324aa0cd4b8a25e4ea138bbf48e6f681a672c16312afbf022ad48a7b87c9fdd23a7eb92c295cdedd8f7698009c157d83"
+        },
+        "version": "2.88.0-1ubuntu0.1"
+      },
+      "review": "#330",
       "size": 124,
       "version_bound": false
     },
@@ -1986,7 +2328,7 @@
       "derived_from": [
         {
           "package": "python3",
-          "version": "3.14.7-3"
+          "version": "3.14.3-0ubuntu2"
         }
       ],
       "digest": "sha256:3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc",
@@ -1995,8 +2337,13 @@
       "mode": null,
       "package": "python3",
       "path": "dev/null",
-      "provenance": "pending",
-      "review": "#254",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#330",
       "size": 96,
       "version_bound": false
     }
@@ -2009,11 +2356,19 @@
     ],
     "component": "main",
     "keyring": "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
-    "name": "ubuntu-stonking",
+    "name": "ubuntu-resolute",
     "pockets": [
       {
-        "role": "bounded",
-        "suite": "stonking"
+        "role": "frozen",
+        "suite": "resolute"
+      },
+      {
+        "role": "witness",
+        "suite": "resolute-updates"
+      },
+      {
+        "role": "witness",
+        "suite": "resolute-security"
       }
     ],
     "request": "ubuntu-minimal",
@@ -2021,7 +2376,454 @@
     "uri_root": "https://snapshot.ubuntu.com/ubuntu"
   },
   "snapshot": {
-    "status": "pending",
+    "admission_deadline": 1793479100,
+    "closures": {
+      "amd64": {
+        "digest": "sha256:03fc9d79075819b663127e6702c49ea5c96d81f4a2d847b3886f76e4158a1113",
+        "package_count": 177,
+        "packages": {
+          "adduser": "3.153ubuntu1",
+          "apt": "3.2.0",
+          "base-files": "14ubuntu6.2",
+          "base-passwd": "3.6.8",
+          "bash": "5.3-2ubuntu1",
+          "bsdutils": "1:2.41.3-3ubuntu2.2",
+          "chrony": "4.8-2ubuntu1",
+          "console-setup": "1.237ubuntu3.1",
+          "console-setup-linux": "1.237ubuntu3.1",
+          "coreutils": "9.5-1ubuntu2+0.0.0~ubuntu25",
+          "coreutils-from-gnu": "0.0.0~ubuntu25",
+          "dash": "0.5.12-12ubuntu3",
+          "debconf": "1.5.92",
+          "debconf-i18n": "1.5.92",
+          "debianutils": "5.23.2build1",
+          "dhcpcd-base": "1:10.3.0-7",
+          "diffutils": "1:3.12-1ubuntu0.1",
+          "distro-info": "1.15",
+          "distro-info-data": "0.72-0ubuntu0.26.04.1",
+          "dpkg": "1.23.7ubuntu1",
+          "e2fsprogs": "1.47.2-3ubuntu4",
+          "eject": "2.41.3-3ubuntu2.2",
+          "ethtool": "1:6.19-1",
+          "findutils": "4.10.0-3build2",
+          "gcc-16-base": "16-20260322-1ubuntu1",
+          "gnu-coreutils": "9.7-3ubuntu2.1",
+          "gpgv": "2.4.8-4ubuntu3.1",
+          "grep": "3.12-1",
+          "gzip": "1.14-1~exp2ubuntu1.1",
+          "hostname": "3.25build1",
+          "init": "1.69",
+          "init-system-helpers": "1.69",
+          "iproute2": "6.19.0-1ubuntu1.1",
+          "iputils-ping": "3:20250605-1ubuntu1",
+          "kbd": "2.7.1-2ubuntu2",
+          "keyboard-configuration": "1.237ubuntu3.1",
+          "kmod": "34.2-2ubuntu2",
+          "less": "668-1build1",
+          "libacl1": "2.3.2-2",
+          "libapparmor1": "5.0.2-0ubuntu1~26.04.1",
+          "libapt-pkg7.0": "3.2.0",
+          "libatomic1": "16-20260322-1ubuntu1",
+          "libattr1": "1:2.5.2-4ubuntu0.1",
+          "libaudit-common": "1:4.1.2-1ubuntu0.1",
+          "libaudit1": "1:4.1.2-1ubuntu0.1",
+          "libblkid1": "2.41.3-3ubuntu2.2",
+          "libbpf1": "1:1.6.3-1ubuntu1",
+          "libbsd0": "0.12.2-2build2",
+          "libbz2-1.0": "1.0.8-6ubuntu0.1",
+          "libc-bin": "2.43-2ubuntu2.4",
+          "libc-gconv-modules-extra": "2.43-2ubuntu2.4",
+          "libc6": "2.43-2ubuntu2.4",
+          "libcap-ng0": "0.8.5-4build5",
+          "libcap2": "1:2.75-10ubuntu2",
+          "libcap2-bin": "1:2.75-10ubuntu2",
+          "libcom-err2": "1.47.2-3ubuntu4",
+          "libcrypt1": "1:4.5.1-1",
+          "libdb5.3t64": "5.3.28+dfsg2-10ubuntu1",
+          "libdebconfclient0": "0.280ubuntu1",
+          "libedit2": "3.1-20251016-1",
+          "libelf1t64": "0.194-4",
+          "libexpat1": "2.7.4-1ubuntu0.2",
+          "libext2fs2t64": "1.47.2-3ubuntu4",
+          "libffi8": "3.5.2-4",
+          "libgcc-s1": "16-20260322-1ubuntu1",
+          "libgcrypt20": "1.12.0-2ubuntu1.1",
+          "libglib2.0-0t64": "2.88.0-1ubuntu0.1",
+          "libgmp10": "2:6.3.0+dfsg-5ubuntu2",
+          "libgnutls30t64": "3.8.12-2ubuntu1.1",
+          "libgpg-error0": "1.58-2",
+          "libgssapi-krb5-2": "1.22.1-2ubuntu4.1",
+          "libhogweed6t64": "3.10.2-1",
+          "libidn2-0": "2.3.8-4build1",
+          "libjson-c5": "0.18+ds-3",
+          "libk5crypto3": "1.22.1-2ubuntu4.1",
+          "libkeyutils1": "1.6.3-6ubuntu3",
+          "libkmod2": "34.2-2ubuntu2",
+          "libkrb5-3": "1.22.1-2ubuntu4.1",
+          "libkrb5support0": "1.22.1-2ubuntu4.1",
+          "liblocale-gettext-perl": "1.07-8",
+          "liblz4-1": "1.10.0-8",
+          "liblzma5": "5.8.3-1",
+          "libmd0": "1.1.0-2build4",
+          "libmnl0": "1.0.5-3build1",
+          "libmount1": "2.41.3-3ubuntu2.2",
+          "libncursesw6": "6.6+20251231-1",
+          "libnetplan1": "1.2-1ubuntu5.1",
+          "libnettle8t64": "3.10.2-1",
+          "libnewt0.52": "0.52.25-1ubuntu3",
+          "libp11-kit0": "0.26.2-2",
+          "libpam-modules": "1.7.0-5ubuntu3.2",
+          "libpam-modules-bin": "1.7.0-5ubuntu3.2",
+          "libpam-runtime": "1.7.0-5ubuntu3.2",
+          "libpam0g": "1.7.0-5ubuntu3.2",
+          "libpcre2-8-0": "10.46-1build1",
+          "libpopt0": "1.19+dfsg-2build1",
+          "libproc2-0": "2:4.0.4-9ubuntu1",
+          "libpython3-stdlib": "3.14.3-0ubuntu2",
+          "libpython3.14-minimal": "3.14.4-1ubuntu0.2",
+          "libpython3.14-stdlib": "3.14.4-1ubuntu0.2",
+          "libreadline8t64": "8.3-4",
+          "libseccomp2": "2.6.0-2ubuntu5",
+          "libselinux1": "3.9-4build1",
+          "libsemanage-common": "3.9-1build1",
+          "libsemanage2": "3.9-1build1",
+          "libsepol2": "3.9-2",
+          "libslang2": "2.3.3-5build1",
+          "libsmartcols1": "2.41.3-3ubuntu2.2",
+          "libsqlite3-0": "3.46.1-9ubuntu0.3",
+          "libss2": "1.47.2-3ubuntu4",
+          "libssl3t64": "3.5.5-1ubuntu3.6",
+          "libstdc++6": "16-20260322-1ubuntu1",
+          "libsystemd-shared": "259.5-0ubuntu3.4",
+          "libsystemd0": "259.5-0ubuntu3.4",
+          "libtasn1-6": "4.21.0-2",
+          "libtext-charwidth-perl": "0.04-11build4",
+          "libtext-iconv-perl": "1.7-8.1",
+          "libtext-wrapi18n-perl": "0.06-10",
+          "libtinfo6": "6.6+20251231-1",
+          "libtirpc-common": "1.3.7-0.1",
+          "libtirpc3t64": "1.3.7-0.1",
+          "libudev1": "259.5-0ubuntu3.4",
+          "libunistring5": "1.3-2build1",
+          "libuuid1": "2.41.3-3ubuntu2.2",
+          "libxtables12": "1.8.11-2ubuntu3",
+          "libxxhash0": "0.8.3-2build1",
+          "libyaml-0-2": "0.2.5-2build3",
+          "libzstd1": "1.5.7+dfsg-3",
+          "locales": "2.43-2ubuntu2.4",
+          "login": "1:4.16.0-2+really2.41.3-3ubuntu2.2",
+          "login.defs": "1:4.17.4-2ubuntu3",
+          "logsave": "1.47.2-3ubuntu4",
+          "lsb-release": "12.1-2build1",
+          "mawk": "1.3.4.20260129-1",
+          "media-types": "14.0.0build1",
+          "mount": "2.41.3-3ubuntu2.2",
+          "ncurses-base": "6.6+20251231-1",
+          "ncurses-bin": "6.6+20251231-1",
+          "netbase": "6.5build1",
+          "netcat-openbsd": "1.234-1",
+          "netplan-generator": "1.2-1ubuntu5.1",
+          "netplan.io": "1.2-1ubuntu5.1",
+          "openssl-provider-legacy": "3.5.5-1ubuntu3.6",
+          "passwd": "1:4.17.4-2ubuntu3",
+          "perl-base": "5.40.1-7ubuntu0.3",
+          "procps": "2:4.0.4-9ubuntu1",
+          "python-apt-common": "3.1.0ubuntu1.1",
+          "python3": "3.14.3-0ubuntu2",
+          "python3-apt": "3.1.0ubuntu1.1",
+          "python3-cffi-backend": "2.0.0-3build1",
+          "python3-minimal": "3.14.3-0ubuntu2",
+          "python3-netplan": "1.2-1ubuntu5.1",
+          "python3-yaml": "6.0.3-1build1",
+          "python3.14": "3.14.4-1ubuntu0.2",
+          "python3.14-minimal": "3.14.4-1ubuntu0.2",
+          "readline-common": "8.3-4",
+          "sed": "4.9-2ubuntu1",
+          "sensible-utils": "0.0.26build1",
+          "sudo": "1.9.17p2-1ubuntu3.1",
+          "sudo-common": "1.2ubuntu",
+          "sudo-rs": "0.2.13-0ubuntu1.2",
+          "systemd": "259.5-0ubuntu3.4",
+          "systemd-sysv": "259.5-0ubuntu3.4",
+          "sysvinit-utils": "3.15-5ubuntu1",
+          "tar": "1.35+dfsg-4ubuntu0.4",
+          "tzdata": "2026c-0ubuntu0.26.04.1",
+          "ubuntu-keyring": "2023.11.28.1build1",
+          "ubuntu-minimal": "1.570.4",
+          "ubuntu-pro-client": "37.2ubuntu0.1",
+          "ucf": "3.0052ubuntu1",
+          "udev": "259.5-0ubuntu3.4",
+          "util-linux": "2.41.3-3ubuntu2.2",
+          "vim-common": "2:9.1.2141-1ubuntu4.9",
+          "vim-tiny": "2:9.1.2141-1ubuntu4.9",
+          "whiptail": "0.52.25-1ubuntu3",
+          "xkb-data": "2.46-2",
+          "zlib1g": "1:1.3.dfsg+really1.3.1-1ubuntu3.1"
+        },
+        "pockets": {
+          "resolute": 107,
+          "resolute-security": 55,
+          "resolute-updates": 15
+        }
+      },
+      "arm64": {
+        "digest": "sha256:0a999fd1f40bb1b75231efe8f7c8e492e8e9a249afc03c585b484e9375bfdd91",
+        "package_count": 177,
+        "packages": {
+          "adduser": "3.153ubuntu1",
+          "apt": "3.2.0",
+          "base-files": "14ubuntu6.2",
+          "base-passwd": "3.6.8",
+          "bash": "5.3-2ubuntu1",
+          "bsdutils": "1:2.41.3-3ubuntu2.2",
+          "chrony": "4.8-2ubuntu1",
+          "console-setup": "1.237ubuntu3.1",
+          "console-setup-linux": "1.237ubuntu3.1",
+          "coreutils": "9.5-1ubuntu2+0.0.0~ubuntu25",
+          "coreutils-from-gnu": "0.0.0~ubuntu25",
+          "dash": "0.5.12-12ubuntu3",
+          "debconf": "1.5.92",
+          "debconf-i18n": "1.5.92",
+          "debianutils": "5.23.2build1",
+          "dhcpcd-base": "1:10.3.0-7",
+          "diffutils": "1:3.12-1ubuntu0.1",
+          "distro-info": "1.15",
+          "distro-info-data": "0.72-0ubuntu0.26.04.1",
+          "dpkg": "1.23.7ubuntu1",
+          "e2fsprogs": "1.47.2-3ubuntu4",
+          "eject": "2.41.3-3ubuntu2.2",
+          "ethtool": "1:6.19-1",
+          "findutils": "4.10.0-3build2",
+          "gcc-16-base": "16-20260322-1ubuntu1",
+          "gnu-coreutils": "9.7-3ubuntu2.1",
+          "gpgv": "2.4.8-4ubuntu3.1",
+          "grep": "3.12-1",
+          "gzip": "1.14-1~exp2ubuntu1.1",
+          "hostname": "3.25build1",
+          "init": "1.69",
+          "init-system-helpers": "1.69",
+          "iproute2": "6.19.0-1ubuntu1.1",
+          "iputils-ping": "3:20250605-1ubuntu1",
+          "kbd": "2.7.1-2ubuntu2",
+          "keyboard-configuration": "1.237ubuntu3.1",
+          "kmod": "34.2-2ubuntu2",
+          "less": "668-1build1",
+          "libacl1": "2.3.2-2",
+          "libapparmor1": "5.0.2-0ubuntu1~26.04.1",
+          "libapt-pkg7.0": "3.2.0",
+          "libatomic1": "16-20260322-1ubuntu1",
+          "libattr1": "1:2.5.2-4ubuntu0.1",
+          "libaudit-common": "1:4.1.2-1ubuntu0.1",
+          "libaudit1": "1:4.1.2-1ubuntu0.1",
+          "libblkid1": "2.41.3-3ubuntu2.2",
+          "libbpf1": "1:1.6.3-1ubuntu1",
+          "libbsd0": "0.12.2-2build2",
+          "libbz2-1.0": "1.0.8-6ubuntu0.1",
+          "libc-bin": "2.43-2ubuntu2.4",
+          "libc-gconv-modules-extra": "2.43-2ubuntu2.4",
+          "libc6": "2.43-2ubuntu2.4",
+          "libcap-ng0": "0.8.5-4build5",
+          "libcap2": "1:2.75-10ubuntu2",
+          "libcap2-bin": "1:2.75-10ubuntu2",
+          "libcom-err2": "1.47.2-3ubuntu4",
+          "libcrypt1": "1:4.5.1-1",
+          "libdb5.3t64": "5.3.28+dfsg2-10ubuntu1",
+          "libdebconfclient0": "0.280ubuntu1",
+          "libedit2": "3.1-20251016-1",
+          "libelf1t64": "0.194-4",
+          "libexpat1": "2.7.4-1ubuntu0.2",
+          "libext2fs2t64": "1.47.2-3ubuntu4",
+          "libffi8": "3.5.2-4",
+          "libgcc-s1": "16-20260322-1ubuntu1",
+          "libgcrypt20": "1.12.0-2ubuntu1.1",
+          "libglib2.0-0t64": "2.88.0-1ubuntu0.1",
+          "libgmp10": "2:6.3.0+dfsg-5ubuntu2",
+          "libgnutls30t64": "3.8.12-2ubuntu1.1",
+          "libgpg-error0": "1.58-2",
+          "libgssapi-krb5-2": "1.22.1-2ubuntu4.1",
+          "libhogweed6t64": "3.10.2-1",
+          "libidn2-0": "2.3.8-4build1",
+          "libjson-c5": "0.18+ds-3",
+          "libk5crypto3": "1.22.1-2ubuntu4.1",
+          "libkeyutils1": "1.6.3-6ubuntu3",
+          "libkmod2": "34.2-2ubuntu2",
+          "libkrb5-3": "1.22.1-2ubuntu4.1",
+          "libkrb5support0": "1.22.1-2ubuntu4.1",
+          "liblocale-gettext-perl": "1.07-8",
+          "liblz4-1": "1.10.0-8",
+          "liblzma5": "5.8.3-1",
+          "libmd0": "1.1.0-2build4",
+          "libmnl0": "1.0.5-3build1",
+          "libmount1": "2.41.3-3ubuntu2.2",
+          "libncursesw6": "6.6+20251231-1",
+          "libnetplan1": "1.2-1ubuntu5.1",
+          "libnettle8t64": "3.10.2-1",
+          "libnewt0.52": "0.52.25-1ubuntu3",
+          "libp11-kit0": "0.26.2-2",
+          "libpam-modules": "1.7.0-5ubuntu3.2",
+          "libpam-modules-bin": "1.7.0-5ubuntu3.2",
+          "libpam-runtime": "1.7.0-5ubuntu3.2",
+          "libpam0g": "1.7.0-5ubuntu3.2",
+          "libpcre2-8-0": "10.46-1build1",
+          "libpopt0": "1.19+dfsg-2build1",
+          "libproc2-0": "2:4.0.4-9ubuntu1",
+          "libpython3-stdlib": "3.14.3-0ubuntu2",
+          "libpython3.14-minimal": "3.14.4-1ubuntu0.2",
+          "libpython3.14-stdlib": "3.14.4-1ubuntu0.2",
+          "libreadline8t64": "8.3-4",
+          "libseccomp2": "2.6.0-2ubuntu5",
+          "libselinux1": "3.9-4build1",
+          "libsemanage-common": "3.9-1build1",
+          "libsemanage2": "3.9-1build1",
+          "libsepol2": "3.9-2",
+          "libslang2": "2.3.3-5build1",
+          "libsmartcols1": "2.41.3-3ubuntu2.2",
+          "libsqlite3-0": "3.46.1-9ubuntu0.3",
+          "libss2": "1.47.2-3ubuntu4",
+          "libssl3t64": "3.5.5-1ubuntu3.6",
+          "libstdc++6": "16-20260322-1ubuntu1",
+          "libsystemd-shared": "259.5-0ubuntu3.4",
+          "libsystemd0": "259.5-0ubuntu3.4",
+          "libtasn1-6": "4.21.0-2",
+          "libtext-charwidth-perl": "0.04-11build4",
+          "libtext-iconv-perl": "1.7-8.1",
+          "libtext-wrapi18n-perl": "0.06-10",
+          "libtinfo6": "6.6+20251231-1",
+          "libtirpc-common": "1.3.7-0.1",
+          "libtirpc3t64": "1.3.7-0.1",
+          "libudev1": "259.5-0ubuntu3.4",
+          "libunistring5": "1.3-2build1",
+          "libuuid1": "2.41.3-3ubuntu2.2",
+          "libxtables12": "1.8.11-2ubuntu3",
+          "libxxhash0": "0.8.3-2build1",
+          "libyaml-0-2": "0.2.5-2build3",
+          "libzstd1": "1.5.7+dfsg-3",
+          "locales": "2.43-2ubuntu2.4",
+          "login": "1:4.16.0-2+really2.41.3-3ubuntu2.2",
+          "login.defs": "1:4.17.4-2ubuntu3",
+          "logsave": "1.47.2-3ubuntu4",
+          "lsb-release": "12.1-2build1",
+          "mawk": "1.3.4.20260129-1",
+          "media-types": "14.0.0build1",
+          "mount": "2.41.3-3ubuntu2.2",
+          "ncurses-base": "6.6+20251231-1",
+          "ncurses-bin": "6.6+20251231-1",
+          "netbase": "6.5build1",
+          "netcat-openbsd": "1.234-1",
+          "netplan-generator": "1.2-1ubuntu5.1",
+          "netplan.io": "1.2-1ubuntu5.1",
+          "openssl-provider-legacy": "3.5.5-1ubuntu3.6",
+          "passwd": "1:4.17.4-2ubuntu3",
+          "perl-base": "5.40.1-7ubuntu0.3",
+          "procps": "2:4.0.4-9ubuntu1",
+          "python-apt-common": "3.1.0ubuntu1.1",
+          "python3": "3.14.3-0ubuntu2",
+          "python3-apt": "3.1.0ubuntu1.1",
+          "python3-cffi-backend": "2.0.0-3build1",
+          "python3-minimal": "3.14.3-0ubuntu2",
+          "python3-netplan": "1.2-1ubuntu5.1",
+          "python3-yaml": "6.0.3-1build1",
+          "python3.14": "3.14.4-1ubuntu0.2",
+          "python3.14-minimal": "3.14.4-1ubuntu0.2",
+          "readline-common": "8.3-4",
+          "sed": "4.9-2ubuntu1",
+          "sensible-utils": "0.0.26build1",
+          "sudo": "1.9.17p2-1ubuntu3.1",
+          "sudo-common": "1.2ubuntu",
+          "sudo-rs": "0.2.13-0ubuntu1.2",
+          "systemd": "259.5-0ubuntu3.4",
+          "systemd-sysv": "259.5-0ubuntu3.4",
+          "sysvinit-utils": "3.15-5ubuntu1",
+          "tar": "1.35+dfsg-4ubuntu0.4",
+          "tzdata": "2026c-0ubuntu0.26.04.1",
+          "ubuntu-keyring": "2023.11.28.1build1",
+          "ubuntu-minimal": "1.570.4",
+          "ubuntu-pro-client": "37.2ubuntu0.1",
+          "ucf": "3.0052ubuntu1",
+          "udev": "259.5-0ubuntu3.4",
+          "util-linux": "2.41.3-3ubuntu2.2",
+          "vim-common": "2:9.1.2141-1ubuntu4.9",
+          "vim-tiny": "2:9.1.2141-1ubuntu4.9",
+          "whiptail": "0.52.25-1ubuntu3",
+          "xkb-data": "2.46-2",
+          "zlib1g": "1:1.3.dfsg+really1.3.1-1ubuntu3.1"
+        },
+        "pockets": {
+          "resolute": 107,
+          "resolute-updates": 70
+        }
+      }
+    },
+    "pockets": [
+      {
+        "binding": {
+          "amd64": "exact_lock",
+          "arm64": "exact_lock"
+        },
+        "date": "Thu, 23 Apr 2026 17:07:15 UTC",
+        "deadline": 1793479100,
+        "hash_fields": [
+          "MD5Sum",
+          "SHA1",
+          "SHA256"
+        ],
+        "in_release_sha256": "sha256:45f95ce276cdba3e41870516a130e03c58b8b7a79e9546b0efe9e526d255740c",
+        "in_release_sha512": "sha512:19cb43d45e0f810f25198723c6a158a40470e784a9a9416e0e7b82ce12b499bf83482da4a85d551fbc347a173cb9bc8e350630041e20d4dce7f83c0bd08b52a3",
+        "release_sha256": "sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834",
+        "review": "#330",
+        "role": "frozen",
+        "signers": [
+          "f6ecb3762474eda9d21b7022871920d1991bc93c"
+        ],
+        "suite": "resolute",
+        "valid_until": null
+      },
+      {
+        "binding": {
+          "amd64": "exact_lock",
+          "arm64": "exact_lock"
+        },
+        "date": "Wed, 30 Sep 2026 20:38:20 UTC",
+        "deadline": 1793479100,
+        "hash_fields": [
+          "MD5Sum",
+          "SHA1",
+          "SHA256"
+        ],
+        "in_release_sha256": "sha256:802e675dd9de4c7f3916434a95e7c1d8eec0e82886622d7805ab19a2c6fe0365",
+        "in_release_sha512": "sha512:8f3f484a45a5f15a9923b2f2409c0decc00f5027f63ffc6c0218f228e7ed71484a8cdf5831f08485740a1f457930506bcdcb527df23c17fe4f81fd2005f8ec08",
+        "release_sha256": "sha256:16d93e5e9358047ac2f5d671abcac2bb3f2945532452720cd9a17320c19c4f24",
+        "role": "witness",
+        "signers": [
+          "f6ecb3762474eda9d21b7022871920d1991bc93c"
+        ],
+        "suite": "resolute-updates",
+        "valid_until": null
+      },
+      {
+        "binding": {
+          "amd64": "exact_lock",
+          "arm64": "refresh_only"
+        },
+        "date": "Wed, 30 Sep 2026 21:10:36 UTC",
+        "deadline": 1793481036,
+        "hash_fields": [
+          "MD5Sum",
+          "SHA1",
+          "SHA256"
+        ],
+        "in_release_sha256": "sha256:1d5041572116a8b23aabf79ac7439ad8af83d57ad3fb0f9aa0d4523ec10c5908",
+        "in_release_sha512": "sha512:66a27e777d6c252021a2aac3c939a3c3f058baa0b322fe4cfebb7a11184c9de5a8b8e3864a234a5f4b21f26ce47fec46166388b347bf987d88e0503c578800c1",
+        "release_sha256": "sha256:bda7516aa5ed1aa2c8ebcbe36a07276f599559917a9de8fe5de041e99c9a2a10",
+        "role": "witness",
+        "signers": [
+          "f6ecb3762474eda9d21b7022871920d1991bc93c"
+        ],
+        "suite": "resolute-security",
+        "valid_until": null
+      }
+    ],
+    "status": "probed",
     "timestamp": "20261001T000000Z"
   },
   "uri_consumers": [

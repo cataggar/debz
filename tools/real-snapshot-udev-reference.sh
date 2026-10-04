@@ -86,9 +86,9 @@ case "$proof_root" in "$source_root"/*) echo "proof root must not nest in source
 [[ $(stat -c '%u:%g:%a' "$source_root/proc") == 0:0:755 ]]
 [[ ! -L "$source_root/proc" && -z $(find "$source_root/proc" -mindepth 1 -print -quit) ]]
 for control in \
-  'var/lib/dpkg/info/udev.postinst:2533:755:861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee' \
-  'usr/bin/dpkg:322728:755:6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f' \
-  'usr/bin/systemd-tmpfiles:131024:755:8de8ec082f8e887f345c355201c8907ab311960301254e17e96f558798d6d621' \
+  'var/lib/dpkg/info/udev.postinst:2533:755:b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606' \
+  'usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517' \
+  'usr/bin/systemd-tmpfiles:131024:755:13f968f41bac6dfdca7dc4fb346551b8a02e5ff148da3384f48fe04d37246fb4' \
   'usr/lib/tmpfiles.d/static-nodes-permissions.conf:798:644:ca4849c27428fd648f6377dd51a3ab0eb79de69fce1bdc910670012c0cf26f85' \
   'usr/lib/sysusers.d/debian-udev.conf:143:644:e9493928a4ed5399c5619cee0559644099f0625075606baca35b40533286b5e0'; do
   IFS=: read -r name size mode digest <<<"$control"

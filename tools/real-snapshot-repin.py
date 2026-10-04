@@ -1127,12 +1127,20 @@ def fixture_bytes(identity: dict, root: Path) -> bytes | None:
     return None
 
 
-def compute_diff(manifest: dict, report: dict, report_directory: Path, root: Path) -> dict:
-    if manifest["series"] != report["series"]:
+def compute_diff(manifest: dict, report: dict, report_directory: Path, root: Path, allow_series_migration: bool = False) -> dict:
+    if manifest["series"] != report["series"] and not allow_series_migration:
         fail("the report and manifest describe different series profiles")
+    comparison_manifest = manifest
+    if manifest["series"] != report["series"]:
+        comparison_manifest = copy.deepcopy(manifest)
+        comparison_manifest["series"] = copy.deepcopy(report["series"])
+        comparison_manifest["snapshot"] = {
+            "timestamp": report["timestamp"],
+            "status": "pending",
+        }
     statuses = []
     reported = report["identities"]
-    for identity in manifest["identities"]:
+    for identity in comparison_manifest["identities"]:
         observed = reported.get(identity["id"], {})
         status, reasons = identity_status(identity, observed)
         entry = {"id": identity["id"], "status": status, "reasons": reasons}
@@ -1151,7 +1159,7 @@ def compute_diff(manifest: dict, report: dict, report_directory: Path, root: Pat
                 ))
         statuses.append(entry)
     closures = {}
-    old_closures = manifest["snapshot"].get("closures", {})
+    old_closures = comparison_manifest["snapshot"].get("closures", {})
     for arch, closure in report["closures"].items():
         old = old_closures.get(arch, {}).get("packages", {})
         new = {name: entry["version"] for name, entry in closure["packages"].items()}
@@ -1162,12 +1170,13 @@ def compute_diff(manifest: dict, report: dict, report_directory: Path, root: Pat
                 f"{name} {old[name]} -> {new[name]}" for name in set(old) & set(new) if old[name] != new[name]
             ),
         }
-    pinned_frozen = frozen_pocket(manifest["snapshot"])
+    pinned_frozen = frozen_pocket(comparison_manifest["snapshot"])
     reported_frozen = frozen_pocket(report)
     return {
         "series": report["series"]["name"],
         "from": manifest["snapshot"]["timestamp"],
         "to": report["timestamp"],
+        "series_migration": manifest["series"]["name"] if manifest["series"] != report["series"] else None,
         "frozen_release": None if reported_frozen is None else {
             "pinned": None if pinned_frozen is None else pinned_frozen["release_sha256"],
             "probed": reported_frozen["release_sha256"],
@@ -1263,7 +1272,7 @@ def diff_summary(diff: dict, findings: list[dict]) -> str:
 def diff_command(args: argparse.Namespace) -> int:
     manifest = validate_manifest(load_json(args.manifest))
     report = load_report(args.report)
-    diff = compute_diff(manifest, report, args.report.parent, args.root.resolve())
+    diff = compute_diff(manifest, report, args.report.parent, args.root.resolve(), args.allow_series_migration)
     findings = []
     texts = []
     for number in args.pr or []:
@@ -1303,10 +1312,38 @@ def parse_reviews(values: list[str]) -> dict[str, str]:
     return reviews
 
 
+def migrated_fixture_path(identity: dict, series_name: str) -> str:
+    member = str(identity["path"] or "").replace("/", "-")
+    if not member:
+        fail(f"{identity['id']} fixture consumer cannot be renamed without a member path")
+    return f"src/fixtures/{series_name}-{identity['package']}.{member}"
+
+
+def refresh_exclusion_reasons(manifest: dict) -> None:
+    reasons = {
+        "sha256:0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5":
+            "pinned dpkg 1.22.22 private Debian reference prepared by tools/prepare-native-dpkg.py; external oracle, not the resolute snapshot dpkg pin",
+        "sha256:b02b581c6a7f85679f32efe18c9aaeb05316847fa90d3d3fda30b57defab9b13":
+            "update-alternatives from the pinned dpkg 1.22.22 private Debian reference (amd64); external oracle, not the resolute snapshot dpkg pin",
+        "sha256:35616ec58ba58f3fb8b4820bdf893c47a842d56684b3335ba6ebf6df86b27cc5":
+            "update-alternatives from the pinned dpkg 1.22.22 private Debian reference (arm64); external oracle, not the resolute snapshot dpkg pin",
+    }
+    for item in manifest.get("excluded", []):
+        reason = reasons.get(item.get("digest"))
+        if reason is not None:
+            item["reason"] = reason
+
+
 def record_manifest(
-    manifest: dict, report: dict, diff: dict, reviews: dict[str, str], accept_frozen: str | None
+    manifest: dict,
+    report: dict,
+    diff: dict,
+    reviews: dict[str, str],
+    accept_frozen: str | None,
+    allow_series_migration: bool = False,
 ) -> dict:
-    if report["series"]["name"] != manifest["series"]["name"]:
+    series_migration = report["series"]["name"] != manifest["series"]["name"]
+    if series_migration and not allow_series_migration:
         fail("the report is for a different series")
     if timestamp_seconds(report["timestamp"]) < timestamp_seconds(manifest["snapshot"]["timestamp"]):
         fail(f"the report snapshot {report['timestamp']} is older than the current pin")
@@ -1328,6 +1365,8 @@ def record_manifest(
         fail("--accept-frozen-release needs a PR or issue reference")
 
     updated = copy.deepcopy(manifest)
+    if series_migration:
+        updated["series"] = copy.deepcopy(report["series"])
     previous_frozen = frozen_pocket(manifest["snapshot"])
     pockets = []
     for pocket in report["pockets"]:
@@ -1361,6 +1400,10 @@ def record_manifest(
         new = copy.deepcopy(identity)
         if identity["kind"] != "prestate":
             new.update(digest=first["digest"], size=first["size"], mode=first["mode"])
+        if series_migration:
+            for consumer in new["consumers"]:
+                if consumer["form"] == "fixture" and consumer["path"].startswith("src/fixtures/ubuntu-"):
+                    consumer["path"] = migrated_fixture_path(identity, report["series"]["name"])
         if identity["version_bound"] and identity["provenance"] != "pending":
             old_name = identity["provenance"]["version"].split(":", 1)[-1]
             new_name = first["version"].split(":", 1)[-1]
@@ -1380,14 +1423,22 @@ def record_manifest(
             new["review"] = reviews[identity["id"]]
         identities.append(new)
     updated["identities"] = identities
+    refresh_exclusion_reasons(updated)
     return validate_manifest(updated)
 
 
 def record_command(args: argparse.Namespace) -> int:
     manifest = validate_manifest(load_json(args.manifest))
     report = load_report(args.report)
-    diff = compute_diff(manifest, report, args.report.parent, args.root.resolve())
-    updated = record_manifest(manifest, report, diff, parse_reviews(args.reviewed or []), args.accept_frozen_release)
+    diff = compute_diff(manifest, report, args.report.parent, args.root.resolve(), args.allow_series_migration)
+    updated = record_manifest(
+        manifest,
+        report,
+        diff,
+        parse_reviews(args.reviewed or []),
+        args.accept_frozen_release,
+        args.allow_series_migration,
+    )
     write_json(args.manifest, updated)
     counts = {status: sum(1 for entry in diff["identities"] if entry["status"] == status) for status in STATUSES}
     print(f"recorded {report['timestamp']}: " + ", ".join(f"{count} {status}" for status, count in counts.items()))
@@ -1514,6 +1565,11 @@ def check_manifest(manifest: dict, root: Path, profile: dict | None = None) -> l
         for other in sorted(others):
             failures.append(f"URI consumer {relative} pins another snapshot {other}")
     digests: dict[str, dict] = {}
+    for pocket in manifest["snapshot"].get("pockets", []):
+        digests[pocket["release_sha256"].split(":", 1)[1]] = {"id": f"release:{pocket['suite']}", "path": None, "size": None}
+        digests[pocket["in_release_sha256"].split(":", 1)[1]] = {"id": f"in-release:{pocket['suite']}", "path": None, "size": None}
+    for arch, closure in manifest["snapshot"].get("closures", {}).items():
+        digests[closure["digest"].split(":", 1)[1]] = {"id": f"closure:{arch}", "path": None, "size": None}
     for identity in manifest["identities"]:
         failures += consumer_failures(identity, root)
         digests.setdefault(identity["digest"].split(":", 1)[1], identity)
@@ -1583,6 +1639,7 @@ def main(argv: list[str] | None = None) -> int:
     diff_parser.add_argument("--pr", type=int, action="append")
     diff_parser.add_argument("--pr-diff-file", type=Path, action="append")
     diff_parser.add_argument("--root", type=Path, default=ROOT)
+    diff_parser.add_argument("--allow-series-migration", action="store_true")
 
     record_parser = commands.add_parser("record", help="rewrite the manifest from a probe report")
     record_parser.add_argument("--report", type=Path, required=True)
@@ -1590,6 +1647,7 @@ def main(argv: list[str] | None = None) -> int:
     record_parser.add_argument("--reviewed", action="append", metavar="ID=REF")
     record_parser.add_argument("--accept-frozen-release", metavar="REF")
     record_parser.add_argument("--root", type=Path, default=ROOT)
+    record_parser.add_argument("--allow-series-migration", action="store_true")
 
     check_parser = commands.add_parser("check", help="offline: verify in-tree pins against the manifest")
     check_parser.add_argument("--manifest", type=Path, default=ROOT / DEFAULT_MANIFEST)

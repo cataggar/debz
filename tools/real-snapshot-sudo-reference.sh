@@ -83,12 +83,12 @@ case "$proof_root" in "$source_root"/*) exit 2 ;; esac
 [[ ! -L "$source_root/proc" && -z $(find "$source_root/proc" -mindepth 1 -print -quit) ]]
 
 for control in \
-  'var/lib/dpkg/info/sudo.postinst:1927:755:e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8' \
+  'var/lib/dpkg/info/sudo.postinst:1927:755:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383' \
   'var/lib/dpkg/info/sudo.list:2376:644:92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f' \
-  'usr/bin/dpkg:322728:755:6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f' \
+  'usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517' \
   'usr/bin/dpkg-maintscript-helper:21123:755:1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d' \
   'usr/share/dpkg/sh/dpkg-error.sh:3228:644:d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528' \
-  'usr/bin/update-alternatives:59864:755:3e5fbdcf3b36bcfb7af1b406152c3a088acccc27c7b3e42d59ca0527a6259d9d' \
+  'usr/bin/update-alternatives:59864:755:023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45' \
   'usr/lib/tmpfiles.d/sudo.conf:27:644:eed7eb9d7ddaccb3ae13d3225de1302a96754938fea4dc305c43b64cbcb5d0bc'; do
   IFS=: read -r name size mode digest <<<"$control"
   file="$source_root/$name"
