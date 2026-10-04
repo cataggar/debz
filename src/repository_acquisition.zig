@@ -714,7 +714,7 @@ pub const Production = struct {
             &header_buffer,
             stageTimeout(self.io, started_ms, request_value.deadlines.read_ms, request_value.deadlines.overall_ms),
         );
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         const location = if (response.head.location) |value| try allocator.dupe(u8, value) else null;
         errdefer if (location) |value| allocator.free(value);
         var transfer_buffer: [64]u8 = undefined;
@@ -745,7 +745,7 @@ pub const Production = struct {
         const protocol = std.http.Client.Protocol.fromScheme(endpoint.uri.scheme) orelse
             return error.UnsupportedUriScheme;
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const borrowed_host = try endpoint.uri.getHost(&host_buffer);
+        const borrowed_host = try std.Io.net.HostName.fromUri(endpoint.uri, &host_buffer);
         const host_bytes = try allocator.dupe(u8, borrowed_host.bytes);
         return .{
             .protocol = protocol,
@@ -1191,6 +1191,30 @@ test "production transport rejects ambiguous explicit proxy configuration" {
         .max_response_bytes = 16,
         .authorization = null,
     }));
+}
+
+test "explicit proxy owns decoded host and retains scheme and port defaults" {
+    const allocator = std.testing.allocator;
+    const plain = try Production.makeProxy(allocator, .{
+        .uri = try Uri.parse("http://PrOxY%2Eexample.:3128"),
+    });
+    defer allocator.free(plain.host.bytes);
+    try std.testing.expectEqualStrings("PrOxY.example.", plain.host.bytes);
+    try std.testing.expectEqual(std.http.Client.Protocol.plain, plain.protocol);
+    try std.testing.expectEqual(@as(u16, 3128), plain.port);
+    const secure = try Production.makeProxy(allocator, .{
+        .uri = try Uri.parse("https://proxy.example"),
+    });
+    defer allocator.free(secure.host.bytes);
+    try std.testing.expectEqual(std.http.Client.Protocol.tls, secure.protocol);
+    try std.testing.expectEqual(@as(u16, 443), secure.port);
+}
+
+test "explicit proxy rejects decoded malformed host" {
+    try std.testing.expectError(error.InvalidHostName, Production.makeProxy(
+        std.testing.allocator,
+        .{ .uri = try Uri.parse("http://bad%2fhost/") },
+    ));
 }
 
 fn fixedBackoff(_: u16) u64 {

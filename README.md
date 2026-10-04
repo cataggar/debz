@@ -15,13 +15,26 @@ attestations.
 
 ## Build
 
+This source compatibility branch requires Zig 0.17.0 (Linux 5.10+ or
+macOS 15+). It retains the exact package acquisition, offline closure, lock,
+and deadline behavior of `4d3fc47`; released binaries and package inputs are
+not republished or refreshed. C declarations use the exact GitHub
+`cataggar/translate-c` revision recorded in `build.zig.zon`.
+CI on this compatibility branch is manual-only; neither CI nor release
+publication is dispatched as part of the source port.
+The compatibility port is tracked in
+[PR #383](https://github.com/cataggar/debz/pull/383). Local acceptance covers
+the default test graph, all 376 safe-mode tests, and static safe-mode CLI
+compilation for `x86_64-linux-musl` and `aarch64-linux-musl`. Native ARM and
+macOS runtime checks remain consumer/platform gates.
+
 ```sh
 zig build
 zig build test
 zig build run -- --help
 zig build -Dversion=0.3.0
 zig build install --prefix "$PWD/install-root"
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
+zig build -Dtarget=x86_64-linux-musl -Doptimize=safe \
   release-install --prefix "$PWD/release-root"
 ```
 

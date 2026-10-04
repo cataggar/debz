@@ -149,7 +149,7 @@ pub const Result = struct {
         try writer.writeAll(",\"operation\":");
         try writeJsonString(writer, self.operation.spelling());
         try writer.writeAll(",\"exit_status\":");
-        try writer.print("{d}", .{@intFromEnum(self.exit_status)});
+        try writer.print("{d}", .{@backingInt(self.exit_status)});
         try writer.writeAll(",\"changed\":");
         try writer.writeAll(if (self.changed) "true" else "false");
         try writer.writeAll(",\"summary\":");
