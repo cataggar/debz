@@ -10,19 +10,19 @@ release_prefix=$root/release
 rm -rf "$root"
 mkdir -p "$root"
 
-"$zig" build \
+"$zig" build -j2 \
   --cache-dir "$root/gnu-cache" \
   -Dtarget=x86_64-linux-gnu \
-  -Doptimize=ReleaseSafe \
+  -Doptimize=safe \
   -Dversion="$version" \
   install --prefix "$gnu_prefix"
 
 test -x "$gnu_prefix/bin/debz"
 test ! -e "$gnu_prefix/share/debz/runtime-dependencies.json"
-if "$zig" build \
+if "$zig" build -j2 \
   --cache-dir "$root/gnu-cache" \
   -Dtarget=x86_64-linux-gnu \
-  -Doptimize=ReleaseSafe \
+  -Doptimize=safe \
   -Dversion="$version" \
   release-install --prefix "$root/invalid-gnu-release" >/dev/null 2>&1
 then
@@ -30,10 +30,10 @@ then
   exit 1
 fi
 
-"$zig" build \
+"$zig" build -j2 \
   --cache-dir "$root/release-cache" \
   -Dtarget=x86_64-linux-musl \
-  -Doptimize=ReleaseSafe \
+  -Doptimize=safe \
   -Dversion="$version" \
   release-install --prefix "$release_prefix"
 

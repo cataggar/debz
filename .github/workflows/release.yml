@@ -50,13 +50,13 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Build complete ReleaseSafe install prefix
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ steps.release.outputs.version }}
-        run: zig build -Dtarget="$TARGET" -Doptimize=ReleaseSafe -Dversion="$VERSION" release-install --prefix "$PWD/release-root"
+        run: zig build -j2 -Dtarget="$TARGET" -Doptimize=safe -Dversion="$VERSION" release-install --prefix "$PWD/release-root"
       - name: Validate built version and package binary
         env:
           EPOCH: ${{ steps.release.outputs.epoch }}

@@ -9,7 +9,7 @@ network-derived input.
 
 ## Local prerequisites
 
-- Zig 0.16.0 and liblzma development files;
+- Zig 0.17.0 and liblzma development files;
 - Python 3 with `cryptography`;
 - `dpkg` only for the full install/configure/remove/recovery lane.
 

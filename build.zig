@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 const liblzma_build = @import("build/liblzma.zig");
 
 const package_version = "0.3.0";
@@ -23,7 +24,7 @@ pub fn build(b: *std.Build) void {
     });
     const zstd = zstd_dependency.artifact("zstd");
 
-    // Zig 0.16 exposes paths from dependencies without build.zig files, so
+    // Zig exposes paths from dependencies without build.zig files, so
     // the repository-local module can compile the exact upstream XZ sources.
     const xz_dependency = b.dependency("xz", .{});
     const liblzma = liblzma_build.addStaticLibrary(b, xz_dependency, target, optimize);
@@ -32,7 +33,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         // libsolv relies on C's wrapping arithmetic and null-based container
         // offset idioms that Zig safety instrumentation rejects.
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
         .shared = false,
         .conda = false,
         .@"multi-semantics" = false,
@@ -45,6 +46,23 @@ pub fn build(b: *std.Build) void {
         .tools = false,
     });
     const libsolv = libsolv_dependency.artifact("solv");
+    const translate_c = b.dependency("translate_c", .{});
+    const solver_bindings: Translator = .init(translate_c, .{
+        .c_source_file = b.path("build/solver.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    solver_bindings.addIncludePath(libsolv_dependency.path("src"));
+    solver_bindings.linkLibrary(libsolv);
+    const compression_bindings: Translator = .init(translate_c, .{
+        .c_source_file = b.path("build/compression.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compression_bindings.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    compression_bindings.addIncludePath(zstd_dependency.path("lib"));
+    compression_bindings.linkLibrary(liblzma);
+    compression_bindings.linkLibrary(zstd);
 
     const debz = b.addModule("debz", .{
         .root_source_file = b.path("src/debz.zig"),
@@ -52,6 +70,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     debz.addOptions("debz_build_options", build_options);
+    debz.addImport("libsolv", solver_bindings.mod);
+    debz.addImport("compression", compression_bindings.mod);
     debz.addIncludePath(libsolv_dependency.path("src"));
     debz.addIncludePath(xz_dependency.path("src/liblzma/api"));
     debz.addIncludePath(zstd_dependency.path("lib"));
@@ -80,7 +100,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cli = b.addRunArtifact(cli);
     run_cli.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cli.addArgs(args);
+    run_cli.addPassthruArgs();
     b.step("run", "Run the debz CLI").dependOn(&run_cli.step);
 
     const tests = b.addTest(.{ .root_module = debz });
@@ -368,14 +388,14 @@ fn installReleaseFiles(
         const install = b.addInstallFile(b.path(file.source), file.destination);
         b.getInstallStep().dependOn(&install.step);
         regular_modes.step.dependOn(&install.step);
-        regular_modes.addArg(b.getInstallPath(.prefix, file.destination));
+        regular_modes.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = file.destination } });
     }
     for (docs) |name| {
         const destination = b.fmt("share/doc/debz/doc/{s}", .{name});
         const install = b.addInstallFile(b.path(b.fmt("doc/{s}", .{name})), destination);
         b.getInstallStep().dependOn(&install.step);
         regular_modes.step.dependOn(&install.step);
-        regular_modes.addArg(b.getInstallPath(.prefix, destination));
+        regular_modes.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = destination } });
     }
     for (schemas) |name| {
         const source = b.path(b.fmt("schema/{s}", .{name}));
@@ -384,14 +404,14 @@ fn installReleaseFiles(
             const install = b.addInstallFile(source, destination);
             b.getInstallStep().dependOn(&install.step);
             regular_modes.step.dependOn(&install.step);
-            regular_modes.addArg(b.getInstallPath(.prefix, destination));
+            regular_modes.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = destination } });
         }
     }
     b.getInstallStep().dependOn(&regular_modes.step);
 
     const executable_mode = b.addSystemCommand(&.{ "chmod", "0755" });
     executable_mode.step.dependOn(&install_cli.step);
-    executable_mode.addArg(b.getInstallPath(.bin, "debz"));
+    executable_mode.addFileArg(.{ .relative = .{ .base = .install_bin, .sub_path = "debz" } });
     b.getInstallStep().dependOn(&executable_mode.step);
 
     const runtime_metadata = b.addInstallFile(
@@ -406,6 +426,6 @@ fn installReleaseFiles(
     }
     const runtime_metadata_mode = b.addSystemCommand(&.{ "chmod", "0644" });
     runtime_metadata_mode.step.dependOn(&runtime_metadata.step);
-    runtime_metadata_mode.addArg(b.getInstallPath(.prefix, "share/debz/runtime-dependencies.json"));
+    runtime_metadata_mode.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "share/debz/runtime-dependencies.json" } });
     release_install.dependOn(&runtime_metadata_mode.step);
 }

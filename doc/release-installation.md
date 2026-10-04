@@ -22,8 +22,8 @@ available as `debz.version` to Zig consumers and is printed verbatim by
 `debz version`.
 
 Published Linux x64 and arm64 release binaries are fully static executables.
-They include MIT-licensed musl from the exact Zig 0.16.0 toolchain snapshot
-`1.2.5+zig.0.16.0.24fdd5b7a4c1`, BSD-licensed libsolv and libzstd, and
+They include MIT-licensed musl from the exact Zig 0.17.0 toolchain snapshot
+`1.2.5+zig.0.17.0.7647adab80dd`, BSD-licensed libsolv and libzstd, and
 0BSD-licensed liblzma, with no target-system shared-library requirement. The
 musl identifier records the upstream 1.2.5 baseline plus the exact modified Zig
 toolchain revision; it does not claim an unmodified upstream musl release.

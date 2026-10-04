@@ -714,7 +714,7 @@ pub const Production = struct {
             &header_buffer,
             stageTimeout(self.io, started_ms, request_value.deadlines.read_ms, request_value.deadlines.overall_ms),
         );
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         const location = if (response.head.location) |value| try allocator.dupe(u8, value) else null;
         errdefer if (location) |value| allocator.free(value);
         var transfer_buffer: [64]u8 = undefined;
@@ -745,7 +745,7 @@ pub const Production = struct {
         const protocol = std.http.Client.Protocol.fromScheme(endpoint.uri.scheme) orelse
             return error.UnsupportedUriScheme;
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const borrowed_host = try endpoint.uri.getHost(&host_buffer);
+        const borrowed_host = try std.Io.net.HostName.fromUri(endpoint.uri, &host_buffer);
         const host_bytes = try allocator.dupe(u8, borrowed_host.bytes);
         return .{
             .protocol = protocol,

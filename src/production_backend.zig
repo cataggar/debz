@@ -1114,8 +1114,8 @@ fn deadlines(overall: ?u64) repository_acquisition.Deadlines {
 }
 
 test "product API operations exhaustively deny host-root execution" {
-    inline for (std.meta.fields(api.Operation)) |field| {
-        const operation: api.Operation = @enumFromInt(field.value);
+    inline for (@typeInfo(api.Operation).@"enum".field_values) |value| {
+        const operation: api.Operation = @fromBackingInt(@intCast(value));
         var request: api.Request = .{
             .operation = operation,
             .options = .{
