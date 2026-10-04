@@ -1209,6 +1209,32 @@
     },
     {
       "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_alternatives.zig"
+        }
+      ],
+      "digest": "sha256:dae71fcd81f5373b8f1c19b300d10317dd3d323f577b7e5a45a50301fa217807",
+      "id": "file:dpkg/usr/bin/update-alternatives@arm64",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "dpkg",
+      "path": "usr/bin/update-alternatives",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5"
+        },
+        "version": "1.23.7ubuntu1"
+      },
+      "review": "#386",
+      "size": 68032,
+      "version_bound": false
+    },
+    {
+      "architectures": [
         "amd64"
       ],
       "consumers": [

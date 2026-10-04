@@ -1104,12 +1104,20 @@ pub const pinned_tools = [_]ToolBinding{
     },
 };
 
-pub const snapshot_tools = [_]ToolBinding{.{
-    .architecture = "amd64",
-    .sha256 = digestLiteral(
-        "023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45",
-    ),
-}};
+pub const snapshot_tools = [_]ToolBinding{
+    .{
+        .architecture = "amd64",
+        .sha256 = digestLiteral(
+            "023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45",
+        ),
+    },
+    .{
+        .architecture = "arm64",
+        .sha256 = digestLiteral(
+            "dae71fcd81f5373b8f1c19b300d10317dd3d323f577b7e5a45a50301fa217807",
+        ),
+    },
+};
 
 const snapshot_less_preinst_sha256 = digestLiteral(
     "c72b2f152d56cae58b8f39efe22e6f0d85d676c4ac3060f40cfe0c463f1f8d94",
@@ -1220,12 +1228,12 @@ pub fn matchesSnapshotTool(
     architecture: []const u8,
     sha256: [32]u8,
 ) bool {
-    return std.mem.eql(u8, architecture, "amd64") and
-        std.crypto.timing_safe.eql(
-            [32]u8,
-            snapshot_tools[0].sha256,
-            sha256,
-        );
+    for (snapshot_tools) |binding| {
+        if (std.mem.eql(u8, architecture, binding.architecture) and
+            std.crypto.timing_safe.eql([32]u8, binding.sha256, sha256))
+            return true;
+    }
+    return false;
 }
 
 pub fn pinnedTool(architecture: []const u8) ?ToolBinding {

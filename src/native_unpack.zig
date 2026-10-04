@@ -21966,7 +21966,7 @@ fn snapshotUtilLinuxPostinstIsBound(
     if (!std.mem.eql(u8, architecture, "amd64") or
         !std.mem.eql(u8, package.architecture, "amd64") or
         !std.mem.eql(u8, package.name, "util-linux") or
-        !std.mem.eql(u8, package.version, "2.42.2-1ubuntu2") or
+        !std.mem.eql(u8, package.version, "2.41.3-3ubuntu2.2") or
         kind != .postinst or source != .new_package or
         arguments.len != 2 or
         !std.mem.eql(u8, arguments[0], "configure") or
@@ -22564,7 +22564,7 @@ test "native_unpack.test.snapshot util-linux requires signed fresh amd64 configu
     );
     const util_linux: native_program.PackageIdentity = .{
         .name = "util-linux",
-        .version = "2.42.2-1ubuntu2",
+        .version = "2.41.3-3ubuntu2.2",
         .architecture = "amd64",
     };
     try testing.expect(try snapshotUtilLinuxPostinstIsBound(
@@ -22608,7 +22608,7 @@ test "native_unpack.test.snapshot util-linux requires signed fresh amd64 configu
         ),
     );
     wrong = util_linux;
-    wrong.version = "2.41.3-3ubuntu3";
+    wrong.version = "2.41.3-3ubuntu2.3";
     try testing.expectError(
         error.InvalidAlternativesScriptAuthority,
         snapshotUtilLinuxPostinstIsBound(
@@ -22716,9 +22716,17 @@ test "native_unpack.test.snapshot console-setup requires signed fresh amd64 conf
         "amd64",
         native_alternatives.snapshot_tools[0].sha256,
     ));
+    try testing.expect(native_alternatives.matchesSnapshotTool(
+        "arm64",
+        native_alternatives.snapshot_tools[1].sha256,
+    ));
     try testing.expect(!native_alternatives.matchesSnapshotTool(
         "amd64",
         native_alternatives.pinned_tools[0].sha256,
+    ));
+    try testing.expect(!native_alternatives.matchesSnapshotTool(
+        "arm64",
+        native_alternatives.snapshot_tools[0].sha256,
     ));
 }
 

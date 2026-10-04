@@ -12,17 +12,23 @@ The same `tools/prepare-native-dpkg.py` receipt also binds the sibling
 pin does not admit a production `dpkg-query` dependency or broaden the separate
 signed-maintainer-script exception.
 
-The 2026-10-01 Ubuntu `resolute` amd64 snapshot, signed by
-`F6ECB3762474EDA9D21B7022871920D1991BC93C`, has a separate executable
-pin for `dpkg` 1.23.7ubuntu1. Its authenticated exact lock names the archive
-SHA-512
-`3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d`;
-the archive's `usr/bin/update-alternatives` has SHA-256
-`023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45`.
+The 2026-10-01 Ubuntu `resolute` snapshot, signed by
+`F6ECB3762474EDA9D21B7022871920D1991BC93C`, has separate executable
+pins for `dpkg` 1.23.7ubuntu1. Its authenticated exact locks name the amd64
+archive SHA-512
+`3d6a718ca8d51387c3cdfc432dd6fa533976f6d9ab6455b397f1c3cbfec12c1ce3293e00d37009602c309c353a42d25057f021c98d78d5947d8de021fb83400d`
+and arm64 archive SHA-512
+`824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5`.
+The archives' `usr/bin/update-alternatives` files are architecture-specific
+ELF executables: amd64 SHA-256
+`023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45`,
+arm64 SHA-256
+`dae71fcd81f5373b8f1c19b300d10317dd3d323f577b7e5a45a50301fa217807`.
 The installed file must still be root-owned, mode 0755, single-linked, and
-exactly match that digest. This additional amd64 identity does not change the
-dpkg 1.22.22 reference observations below; the real-snapshot acceptance wrapper
-also binds the separate arm64 `dpkg`/`dpkg-divert`/`dpkg-statoverride` identities.
+exactly match the target architecture's digest. These snapshot identities do not
+change the dpkg 1.22.22 reference observations below; the real-snapshot
+acceptance wrapper also binds the separate arm64
+`dpkg`/`dpkg-divert`/`dpkg-statoverride` identities.
 Before `dpkg` is configured on a fresh root, its authenticated alternatives
 README conffile can be staged as `etc/alternatives/README.dpkg-new`. Native
 capture admits only this spelling and the existing `README` spelling with the
@@ -646,9 +652,9 @@ authenticated native outcome does not establish pinned-reference
 parity or authorize the separate glib settlement; the interrupted
 root is never reused.
 
-The signed `util-linux:amd64` 2.42.2-1ubuntu2 archive (SHA-512
-`5001310ad3c9236ca3e9910f047dfb3a73696d3b4d4fcd919a241d8694588f9af46ac2237aba8fe8313b524f7cf4f3b1236a86f6942746c68beed68d6a13df62`)
-ships the exact 2,155-byte `postinst` (SHA-256
+The signed `util-linux:amd64` 2.41.3-3ubuntu2.2 archive (SHA-512
+`271b4df2ee3ee790cdf1791dfffdaf87280a99a4df0bb0bc82c3d3f325484da98c05475961f8eb73410be9079fea05c2a2f4c94375deab6cdcb864b0ce21e7cc`)
+ships the exact 2,112-byte `postinst` (SHA-256
 `31f01940fe6aa22a9b35b54029eb5e4dd4ea5146dd2bacdb495d0d37eb210fc9`).
 It assigns `OS=linux`, tests that constant and `command -v
 update-alternatives`, then runs one literal, continued command:
