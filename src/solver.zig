@@ -6,19 +6,7 @@ const repository_refresh = @import("repository_refresh.zig");
 const source = @import("source.zig");
 const exact_lock_module = @import("exact_lock.zig");
 
-const libsolv = @cImport({
-    @cDefine("LIBSOLV_INTERNAL", "1");
-    @cInclude("solv/evr.h");
-    @cInclude("solv/pool.h");
-    @cInclude("solv/poolarch.h");
-    @cInclude("solv/problems.h");
-    @cInclude("solv/queue.h");
-    @cInclude("solv/repo.h");
-    @cInclude("solv/rules.h");
-    @cInclude("solv/solver.h");
-    @cInclude("solv/solvable.h");
-    @cInclude("solv/transaction.h");
-});
+const libsolv = @import("libsolv_c");
 
 pub const InstallReason = enum {
     manual,
@@ -283,7 +271,7 @@ pub const Context = opaque {
     ) std.mem.Allocator.Error!*Context {
         const context = try createWithAllocator(allocator);
         errdefer context.destroy();
-        const architecture_z = try allocator.dupeZ(u8, architecture);
+        const architecture_z = try allocator.dupeSentinel(u8, architecture, 0);
         defer allocator.free(architecture_z);
         libsolv.pool_setarch(internal(context).pool, architecture_z);
         internal(context).target_architecture = try allocator.dupe(u8, architecture);
@@ -488,7 +476,7 @@ pub const Context = opaque {
         }
         try validateAvailableRecords(input.packages.records, limits);
 
-        const repository_name = try state.allocator.dupeZ(u8, input.repository_id.slice());
+        const repository_name = try state.allocator.dupeSentinel(u8, input.repository_id.slice(), 0);
         defer state.allocator.free(repository_name);
         const repo = libsolv.repo_create(state.pool, repository_name) orelse
             return error.PoolAllocationFailed;
@@ -1979,8 +1967,8 @@ fn validatedLearntTrace(
 }
 
 fn lessProblem(_: void, a: ProblemNode, b: ProblemNode) bool {
-    if (@intFromEnum(a.kind) != @intFromEnum(b.kind))
-        return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+    if (@backingInt(a.kind) != @backingInt(b.kind))
+        return @backingInt(a.kind) < @backingInt(b.kind);
     const package_order = std.mem.order(u8, a.package orelse "", b.package orelse "");
     if (package_order != .eq) return package_order == .lt;
     const dependency_order = std.mem.order(u8, a.dependency orelse "", b.dependency orelse "");
@@ -2299,8 +2287,8 @@ fn hex32(bytes: [32]u8) [64]u8 {
 }
 
 fn lessAction(_: void, a: PlanAction, b: PlanAction) bool {
-    const rank_a = @intFromEnum(a.kind);
-    const rank_b = @intFromEnum(b.kind);
+    const rank_a = @backingInt(a.kind);
+    const rank_b = @backingInt(b.kind);
     if (rank_a != rank_b) return rank_a < rank_b;
     const name_order = std.mem.order(u8, a.package, b.package);
     if (name_order != .eq) return name_order == .lt;

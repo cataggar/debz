@@ -885,7 +885,7 @@ fn verifyPkcs1(
             parts[message_parts.len + 1] = trailer;
             std.crypto.Certificate.rsa.PKCS1v1_5Signature.concatVerify(
                 len,
-                padded,
+                &padded,
                 parts[0 .. message_parts.len + 2],
                 public_key,
                 Hash,
