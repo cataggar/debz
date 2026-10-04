@@ -52,7 +52,7 @@ pub const Signature = struct {
     member: Member,
 };
 
-pub const max_signatures = std.meta.fields(SignatureKind).len;
+pub const max_signatures = @typeInfo(SignatureKind).@"enum".field_names.len;
 
 /// Borrows member names and byte ranges from the input passed to `parse`.
 /// Signature entries are structurally recognized only; callers must supply an
@@ -398,8 +398,8 @@ fn classify(name: []const u8) ?Classification {
 }
 
 fn classifiedSignature(name: []const u8) ?SignatureKind {
-    inline for (std.meta.fields(SignatureKind)) |field| {
-        const kind: SignatureKind = @enumFromInt(field.value);
+    inline for (@typeInfo(SignatureKind).@"enum".field_names) |field_name| {
+        const kind: SignatureKind = @field(SignatureKind, field_name);
         if (std.mem.eql(u8, name, kind.memberName())) return kind;
     }
     return null;

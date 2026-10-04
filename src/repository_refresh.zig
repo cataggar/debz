@@ -649,7 +649,7 @@ fn validateConfiguration(
         !std.ascii.eqlIgnoreCase(repository.base_uri.scheme, "http") and
         !std.ascii.eqlIgnoreCase(repository.base_uri.scheme, "https"))
         return error.InvalidConfiguration;
-    var seen: std.EnumSet(Compression) = .initEmpty();
+    var seen: std.EnumSet(Compression) = .{};
     for (refresh_policy.compression_order) |item| {
         if (seen.contains(item)) return error.InvalidConfiguration;
         seen.insert(item);
@@ -1017,10 +1017,10 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
     }) |length| try appendInt(&bytes, allocator, u64, @intCast(length));
     try appendInt(&bytes, allocator, u32, @intCast(manifest.selected_path.len));
     try bytes.appendSlice(allocator, &.{
-        @intFromEnum(manifest.authentication),
-        @intFromEnum(manifest.authentication_mode),
-        @intFromEnum(manifest.origin_source),
-        @intFromEnum(manifest.compression),
+        @backingInt(manifest.authentication),
+        @backingInt(manifest.authentication_mode),
+        @backingInt(manifest.origin_source),
+        @backingInt(manifest.compression),
         @intFromBool(manifest.valid_until_unix != null) |
             (@as(u8, @intFromBool(manifest.future_date_accepted)) << 1) |
             (@as(u8, @intFromBool(manifest.valid_until_required)) << 2) |
@@ -1046,7 +1046,7 @@ fn encodeSnapshot(allocator: std.mem.Allocator, manifest: SnapshotManifest) ![]u
         @splat(0);
     try bytes.appendSlice(allocator, &signature_digest_bytes);
     for (manifest.signature_results) |result| {
-        try appendInt(&bytes, allocator, u32, @intFromEnum(result.status));
+        try appendInt(&bytes, allocator, u32, @backingInt(result.status));
         try bytes.appendSlice(allocator, if (result.primary_fingerprint) |*value| value else &@as([20]u8, @splat(0)));
         try bytes.appendSlice(allocator, if (result.signing_fingerprint) |*value| value else &@as([20]u8, @splat(0)));
         try appendInt(&bytes, allocator, i64, result.signature_creation orelse std.math.minInt(i64));
@@ -1129,14 +1129,14 @@ fn decodeSnapshot(allocator: std.mem.Allocator, bytes: []const u8) !SnapshotMani
     errdefer allocator.free(signature_results);
     for (signature_results) |*result| {
         const status_int = reader.int(u32);
-        if (status_int > @intFromEnum(openpgp.ResultStatus.signer_not_accepted))
+        if (status_int > @backingInt(openpgp.ResultStatus.signer_not_accepted))
             return error.CorruptSnapshot;
         const primary = reader.array(20);
         const signing = reader.array(20);
         const creation = reader.int(i64);
         const expiration = reader.int(i64);
         result.* = .{
-            .status = @enumFromInt(status_int),
+            .status = @fromBackingInt(@intCast(status_int)),
             .primary_fingerprint = if (allZero(&primary)) null else primary,
             .signing_fingerprint = if (allZero(&signing)) null else signing,
             .signature_creation = if (creation == std.math.minInt(i64)) null else creation,

@@ -147,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
         if (args.next()) |argument| {
             try stderr.print("debz: unexpected argument '{s}' for 'debz version'\n", .{argument});
             try stderr.flush();
-            std.process.exit(@intFromEnum(api.ExitStatus.usage));
+            std.process.exit(@backingInt(api.ExitStatus.usage));
         }
         try stdout.print("{s}\n", .{debz.version});
         return;
@@ -162,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
         try stderr.print("debz: unknown command '{s}'\n", .{command});
         try stderr.writeAll(root_help);
         try stderr.flush();
-        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        std.process.exit(@backingInt(api.ExitStatus.usage));
     };
     var requested_output: api.OutputFormat = .human;
     const request = parse(init.arena.allocator(), operation, &args, &requested_output) catch |err| {
@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try stdout.flush();
         try stderr.flush();
-        std.process.exit(@intFromEnum(api.ExitStatus.usage));
+        std.process.exit(@backingInt(api.ExitStatus.usage));
     };
 
     var backend_context: debz.ProductionBackend = .{ .io = init.io };
@@ -187,13 +187,13 @@ pub fn main(init: std.process.Init) !void {
         try render(init.arena.allocator(), stdout, stderr, request.options.output, internal);
         try stdout.flush();
         try stderr.flush();
-        std.process.exit(@intFromEnum(internal.exit_status));
+        std.process.exit(@backingInt(internal.exit_status));
     };
     try render(init.arena.allocator(), stdout, stderr, request.options.output, result);
     if (result.exit_status != .success) {
         try stdout.flush();
         try stderr.flush();
-        std.process.exit(@intFromEnum(result.exit_status));
+        std.process.exit(@backingInt(result.exit_status));
     }
 }
 
@@ -336,7 +336,7 @@ fn parse(
     var keyrings: std.ArrayList([]const u8) = .empty;
     var foreign_architectures: std.ArrayList([]const u8) = .empty;
     var forces: std.ArrayList(api.ForcePolicy) = .empty;
-    var seen: std.EnumSet(SingleOption) = .initEmpty();
+    var seen: std.EnumSet(SingleOption) = .{};
     var options: api.CommonOptions = .{
         .install_root = "",
         .cache_path = "",

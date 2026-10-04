@@ -1,10 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       ubuntu_snapshot_uri:
@@ -17,8 +13,6 @@ on:
         required: true
         type: string
         default: "resolute"
-  schedule:
-    - cron: "23 3 * * 1"
 
 permissions:
   contents: read
@@ -44,7 +38,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Install metadata decompression dependency
         run: |
@@ -80,7 +74,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Install audited system dependency
         run: |
@@ -125,7 +119,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Build, package, and audit v0.3.0 binary assets
         env:
@@ -199,7 +193,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Install metadata decompression dependency
         run: |
@@ -240,7 +234,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Install bounded fixture prerequisites
         run: |
@@ -292,7 +286,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Install bounded fixture prerequisites
         run: |
@@ -345,7 +339,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: 0.17.0
           use-cache: false
       - name: Install test runner prerequisites
         run: |

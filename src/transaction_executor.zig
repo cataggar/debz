@@ -2136,8 +2136,8 @@ pub const SystemProcessRunner = struct {
         self.last_stderr = diagnostics;
         const termination: ProcessTermination = switch (result.term) {
             .exited => |code| .{ .exited = code },
-            .signal => |signal| .{ .signaled = @intFromEnum(signal) },
-            .stopped => |signal| .{ .signaled = @intFromEnum(signal) },
+            .signal => |signal| .{ .signaled = @backingInt(signal) },
+            .stopped => |signal| .{ .signaled = @backingInt(signal) },
             .unknown => |status| .{ .signaled = status },
         };
         return .{ .termination = termination, .stderr = diagnostics };
