@@ -85,7 +85,7 @@ require_protected_file "$source_root/usr/bin/update-alternatives"
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/var/lib/dpkg/info/python3-minimal.list") == \
   0:0:644:781:1 ]]
 [[ $(sha256sum "$source_root/var/lib/dpkg/info/python3-minimal.list" | cut -d' ' -f1) == \
-  a0d9c1023aeef88ea89781862449be6b65cf84157b7d894aacd0c536b0940ba8 ]]
+  82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519 ]]
 [[ -L "$source_root/usr/bin/python3" &&
    $(readlink "$source_root/usr/bin/python3") == python3.14 ]]
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/var/lib/dpkg/info/python3.preinst") == 0:0:755:856:1 ]]

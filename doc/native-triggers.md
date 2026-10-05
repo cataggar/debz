@@ -74,12 +74,12 @@ without trigger execution, removal, and purge.
 
 ## Automatic file interests owned by the source
 
-The signed `libglib2.0-0t64:amd64` `2.90.0-1` archive (SHA-512
+The signed `libglib2.0-0t64:amd64` `2.88.0-1ubuntu0.1` archive (SHA-512
 `196cdd945ad54fb1fee44db960e3c9aa324aa0cd4b8a25e4ea138bbf48e6f681a672c16312afbf022ad48a7b87c9fdd23a7eb92c295cdedd8f7698009c157d83`)
 owns empty `/usr/share/glib-2.0/schemas` and
 `/usr/lib/x86_64-linux-gnu/gio/modules` directories. Its signed
-124-byte `.triggers` (SHA-256
-`7ad0cfea75305b62f9ac8daf97f4304d922a54afb9713b7493aeb285336b9a91`)
+171-byte `.triggers` (SHA-256
+`d87291948921b5707a14673f459846076a00d98e671a47b907b1761fab7bbe93`)
 registers awaited interest in the first and no-await interest in the
 second. A fresh authenticated native 175-package run incorrectly emitted
 both as *automatic self* activations. After its signed

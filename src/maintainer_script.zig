@@ -509,7 +509,7 @@ const snapshot_sudo_inputs = [_]SnapshotUdevInput{
     .{ .path = "usr/bin/gnuchown", .size = 68160, .mode = 0o755, .sha256 = "0e04f6401bfae9a5eafed1da2c738067b007d39a8538ea83ce22271b4cd58fbb" },
     .{ .path = "usr/bin/gnuchmod", .size = 60000, .mode = 0o755, .sha256 = "787b5abd2db66069fdd2467bf3b6acb089380aa0b4c05771f3c1b2471a24bf94" },
     .{ .path = "usr/lib/tmpfiles.d/sudo.conf", .size = 27, .mode = 0o644, .sha256 = "eed7eb9d7ddaccb3ae13d3225de1302a96754938fea4dc305c43b64cbcb5d0bc" },
-    .{ .path = "var/lib/dpkg/info/sudo.list", .size = 2376, .mode = 0o644, .sha256 = "92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f" },
+    .{ .path = "var/lib/dpkg/info/sudo.list", .size = 2376, .mode = 0o644, .sha256 = "39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8" },
     .{ .path = "usr/bin/sudo.ws", .size = 282080, .mode = 0o4755, .sha256 = "e3886de6023478ef338471aca89d36888d84216484795035165aee9b142f6a43" },
     .{ .path = "usr/share/man/man8/sudo.ws.8.gz", .size = 12804, .mode = 0o644, .sha256 = "43b6a4b66f9eb6a430f64e2b25084a100b2e152cfd8896cb83f9ced170793d75" },
 };

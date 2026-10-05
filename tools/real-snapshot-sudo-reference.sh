@@ -84,7 +84,7 @@ case "$proof_root" in "$source_root"/*) exit 2 ;; esac
 
 for control in \
   'var/lib/dpkg/info/sudo.postinst:1747:755:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383' \
-  'var/lib/dpkg/info/sudo.list:2376:644:92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f' \
+  'var/lib/dpkg/info/sudo.list:2376:644:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8' \
   'usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517' \
   'usr/bin/dpkg-maintscript-helper:21123:755:1cd744cc0b6371329a6a5dbcf459329a08f8632b5f71e18463d0f0749fd0265d' \
   'usr/share/dpkg/sh/dpkg-error.sh:3228:644:d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528' \

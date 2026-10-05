@@ -22061,7 +22061,7 @@ fn verifyConsoleSetupProviders(
         .{
             .path = "var/lib/dpkg/info/console-setup-linux.list",
             .size = 41489,
-            .sha256 = "fcbd5a4757d10f8e93472331cff45fd91667dad80b16e6e3dffd4a550097c79f",
+            .sha256 = "7ce7d005cb9f6144ee42373153611b01a1ab8f867f7174e3c0bf105ca2f7790f",
         },
         .{
             .path = "etc/console-setup/vtrgb",
@@ -22113,7 +22113,7 @@ fn verifySudoRsStructuralOwner(
             .path = "var/lib/dpkg/info/sudo.list",
             .mode = 0o644,
             .size = 2376,
-            .sha256 = "92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f",
+            .sha256 = "39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8",
         },
         .{
             .path = "usr/bin/sudo.ws",
@@ -22269,8 +22269,8 @@ fn verifySnapshotPython3PreinstInputs(
     try verifySnapshotPython3PreinstArtifacts(program.artifacts);
     for ([_]SignedDebconfControlFile{
         .{ .path = "var/lib/dpkg/info/python3.preinst", .size = 856, .mode = 0o755, .sha256 = snapshot_python3_preinst_sha256 },
-        .{ .path = "var/lib/dpkg/info/python3.list", .size = 918, .mode = 0o644, .sha256 = "d830caf623e35ec940e8f6d185455faa601a627052b1daffe3e4741b960bb1a3" },
-        .{ .path = "var/lib/dpkg/info/python3-minimal.list", .size = 781, .mode = 0o644, .sha256 = "a0d9c1023aeef88ea89781862449be6b65cf84157b7d894aacd0c536b0940ba8" },
+        .{ .path = "var/lib/dpkg/info/python3.list", .size = 918, .mode = 0o644, .sha256 = "383196acd094063e8e49dc4511deb7094e264a41d872bb889d21b197a550f628" },
+        .{ .path = "var/lib/dpkg/info/python3-minimal.list", .size = 781, .mode = 0o644, .sha256 = "82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519" },
         .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
         .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6" },
     }) |binding| try verifySignedDebconfControlFile(
@@ -41213,7 +41213,7 @@ test "native_unpack.test.signed glib empty directories do not activate their own
         2 * 1024 * 1024,
     );
     defer testing.allocator.free(bytes);
-    try testing.expectEqual(@as(usize, 1613714), bytes.len);
+    try testing.expectEqual(@as(usize, 1597886), bytes.len);
     var digest: [64]u8 = undefined;
     std.crypto.hash.sha2.Sha512.hash(bytes, &digest, .{});
     const signed = (try content_digest.Value.parse(
@@ -41232,7 +41232,7 @@ test "native_unpack.test.signed glib empty directories do not activate their own
     var control_digest: [32]u8 = undefined;
     Sha256.hash(declarations, &control_digest, .{});
     try testing.expectEqual(
-        parseHex(32, "7ad0cfea75305b62f9ac8daf97f4304d922a54afb9713b7493aeb285336b9a91").?,
+        parseHex(32, "d87291948921b5707a14673f459846076a00d98e671a47b907b1761fab7bbe93").?,
         control_digest,
     );
     var model = try modelOf(bytes);

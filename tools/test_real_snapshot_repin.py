@@ -333,8 +333,10 @@ class StatusTests(unittest.TestCase):
             derived_from=[{"package": "alpha", "version": "1.0"}, {"package": "beta", "version": "2.0"}],
         )
         same = observed(derived={"alpha": "1.0", "beta": "2.0"})
+        same.update(digest=None, size=None, mode=None)
         self.assertEqual(repin.identity_status(prestate, {"amd64": same})[0], "provenance-only")
         moved = observed(derived={"alpha": "1.0", "beta": "2.1"})
+        moved.update(digest=None, size=None, mode=None)
         status, reasons = repin.identity_status(prestate, {"amd64": moved})
         self.assertEqual(status, "changed")
         self.assertIn("beta 2.0 -> 2.1", reasons[0])
@@ -741,6 +743,21 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(repin.tar_member(data, "data.tar", "usr/bin/beta"), (TOOL, 0o4755))
             with self.assertRaisesRegex(repin.RepinError, "has no member"):
                 repin.tar_member(data, "data.tar", "usr/bin/gamma")
+
+    def test_dpkg_ownership_list_uses_data_tar_order(self) -> None:
+        data = deb(
+            {},
+            {
+                ".": (b"", 0o755),
+                "usr": (b"", 0o755),
+                "usr/bin/tool": (TOOL, 0o755),
+                "usr/share/doc/beta/": (b"", 0o755),
+            },
+        )
+        self.assertEqual(
+            repin.dpkg_ownership_list(data),
+            b"/.\n/usr\n/usr/bin/tool\n/usr/share/doc/beta\n",
+        )
 
     def test_malformed_packages_are_refused(self) -> None:
         with self.assertRaisesRegex(repin.RepinError, "not an ar archive"):
