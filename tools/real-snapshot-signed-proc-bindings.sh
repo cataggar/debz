@@ -142,7 +142,8 @@ done
 jq -e '
   .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
   .target_architecture == "amd64" and
-  all(.packages[]; .archive_identity.primary == "sha512") and
+  all(.packages[]; .archive_identity.primary == "sha512" and
+    ([.archive_identity.digests[] | select(.algorithm == "sha512")] | length) == 1) and
   ([.packages[] | select(.name == "udev" and .version == "259.5-0ubuntu3.4" and
     .architecture == "amd64")] | length) == 1 and
   ([.packages[] | select(.name == "sudo" and .version == "1.9.17p2-1ubuntu3.1" and
@@ -155,12 +156,23 @@ listing=$snapshot/evidence/members.tsv
 : >"$listing"
 while IFS=$'\t' read -r name digest size; do
   object=$snapshot/cache/packages-v2/objects/sha512-$digest
-  [[ -f "$object" && ! -L "$object" && $(stat -c %s "$object") == "$size" ]]
-  [[ $(sha512sum "$object" | cut -d' ' -f1) == "$digest" ]]
+  [[ -f "$object" && ! -L "$object" ]] || {
+    echo "locked archive is not a regular file: $name $object" >&2
+    exit 1
+  }
+  [[ $(stat -c %s "$object") == "$size" ]] || {
+    echo "locked archive size mismatch: $name expected $size" >&2
+    exit 1
+  }
+  [[ $(sha512sum "$object" | cut -d' ' -f1) == "$digest" ]] || {
+    echo "locked archive sha512 mismatch: $name $digest" >&2
+    exit 1
+  }
   archive[$name]=$object
   dpkg-deb --fsys-tarfile "$object" | tar -t |
     sed -e 's#^\./##' -e 's#/$##' -e "s#^#$name\t#" >>"$listing"
-done < <(jq -r '.packages[] | [.name, .archive_identity.digests[0].digest,
+done < <(jq -r '.packages[] | [.name,
+  (.archive_identity.digests[] | select(.algorithm == "sha512") | .digest),
   .declared_size] | @tsv' "$lock")
 
 extract() { # member mode destination
