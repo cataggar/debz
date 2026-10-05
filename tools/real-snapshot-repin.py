@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -83,6 +84,18 @@ SNAPSHOT_INPUT_ENTRY = re.compile(
 )
 FIXTURE_GLOB = "src/fixtures/ubuntu-*"
 PIN_SCRIPT_GLOB = "tools/real-snapshot-*.sh"
+PROTECTED_STAGE_SCRIPT = "tools/real-snapshot-reference-protected-stage.sh"
+REFERENCE_LAUNCHER = "tools/real-snapshot-reference-launcher.zig"
+SCRIPT_BINDING_ENTRY = re.compile(
+    r'\.\{\s*\.name\s*=\s*"(?P<name>[a-z0-9+.-]+)",\s*'
+    r'\.version\s*=\s*"(?P<version>[^"]+)",\s*'
+    r'\.size\s*=\s*(?P<size>[0-9]+),\s*'
+    r'\.digest\s*=\s*"(?P<digest>[0-9a-f]{%d})"\s*\}' % SHA256_HEX
+)
+STAGE_PROFILE_LOOP = re.compile(r"(?m)^\s*for\s+profile\s+in\s+(?P<body>[^;\n]+);\s*do")
+STAGE_WITNESS_ARRAY = re.compile(
+    r"(?ms)^\s*readonly\s+snapshot_witness_suites=\((?P<body>[^)]*)\)"
+)
 
 PROFILES: dict[str, dict] = {
     "ubuntu-stonking": {
@@ -1542,6 +1555,150 @@ def bound_paths(identity: dict) -> set[str]:
     return {identity["path"]}
 
 
+def shell_readonly_scalars(text: str) -> dict[str, str]:
+    values = {}
+    for line in text.splitlines():
+        match = re.match(r"^\s*readonly\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if match is None:
+            continue
+        raw = match.group(2).strip()
+        if raw.startswith("("):
+            continue
+        try:
+            words = shlex.split(raw, comments=True, posix=True)
+        except ValueError:
+            continue
+        if len(words) == 1:
+            values[match.group(1)] = words[0]
+    return values
+
+
+def shell_readonly_array(text: str, pattern: re.Pattern[str]) -> list[str] | None:
+    match = pattern.search(text)
+    if match is None:
+        return None
+    try:
+        return shlex.split(match.group("body"), comments=True, posix=True)
+    except ValueError:
+        return None
+
+
+def protected_stage_profile_coupling_failures(manifest: dict, root: Path) -> list[str]:
+    """Check the protected stage, launcher profile pins and manifest agree.
+
+    The amd64 protected stage extracts postinsts from the configured snapshot
+    repositories, while the launcher independently pins those same postinsts by
+    version, byte size and SHA-256. This local check makes that cross-file
+    contract explicit so a suite revert cannot silently strand profile pins on
+    another series until the protected CI proof runs.
+    """
+    stage_path = root / PROTECTED_STAGE_SCRIPT
+    launcher_path = root / REFERENCE_LAUNCHER
+    if not stage_path.exists() and not launcher_path.exists():
+        return []
+    failures = []
+    if not stage_path.is_file() or stage_path.is_symlink():
+        return [f"protected profile coupling: {PROTECTED_STAGE_SCRIPT} does not exist"]
+    if not launcher_path.is_file() or launcher_path.is_symlink():
+        return [f"protected profile coupling: {REFERENCE_LAUNCHER} does not exist"]
+    stage = stage_path.read_text(encoding="utf-8")
+    launcher = launcher_path.read_text(encoding="utf-8")
+
+    frozen_pockets = [pocket for pocket in manifest["series"]["pockets"] if pocket["role"] == "frozen"]
+    if frozen_pockets:
+        if len(frozen_pockets) != 1:
+            failures.append("protected stage profile coupling: series must have exactly one frozen pocket")
+        else:
+            frozen_suite = frozen_pockets[0]["suite"]
+            witness_suites = [
+                pocket["suite"] for pocket in manifest["series"]["pockets"] if pocket["role"] == "witness"
+            ]
+            scalars = shell_readonly_scalars(stage)
+            if scalars.get("snapshot_uri") != snapshot_uri(manifest["series"], manifest["snapshot"]["timestamp"]):
+                failures.append(
+                    f"protected stage profile coupling: {PROTECTED_STAGE_SCRIPT} does not pin "
+                    f"{snapshot_uri(manifest['series'], manifest['snapshot']['timestamp'])}"
+                )
+            if scalars.get("snapshot_suite") != frozen_suite:
+                failures.append(
+                    f"protected stage profile coupling: snapshot_suite={scalars.get('snapshot_suite')!r}, "
+                    f"expected frozen suite {frozen_suite!r}"
+                )
+            stage_witnesses = shell_readonly_array(stage, STAGE_WITNESS_ARRAY)
+            if stage_witnesses != witness_suites:
+                failures.append(
+                    f"protected stage profile coupling: snapshot_witness_suites={stage_witnesses!r}, "
+                    f"expected {witness_suites!r}"
+                )
+            frozen_records = [
+                pocket for pocket in manifest["snapshot"].get("pockets", [])
+                if pocket["suite"] == frozen_suite and pocket["role"] == "frozen"
+            ]
+            if frozen_records:
+                expected_digest = frozen_records[0]["release_sha256"].split(":", 1)[1]
+                if scalars.get("frozen_release_sha256") != expected_digest:
+                    failures.append(
+                        f"protected stage profile coupling: frozen_release_sha256="
+                        f"{scalars.get('frozen_release_sha256')!r}, expected {expected_digest!r}"
+                    )
+
+    bindings = [match.groupdict() for match in SCRIPT_BINDING_ENTRY.finditer(launcher)]
+    if not bindings:
+        failures.append(f"protected stage profile coupling: {REFERENCE_LAUNCHER} has no script_bindings")
+        return failures
+    profile_match = STAGE_PROFILE_LOOP.search(stage)
+    if profile_match is None:
+        failures.append(f"protected stage profile coupling: {PROTECTED_STAGE_SCRIPT} has no profile staging loop")
+    else:
+        try:
+            staged_profiles = shlex.split(profile_match.group("body"), comments=True, posix=True)
+        except ValueError:
+            staged_profiles = []
+        binding_names = [binding["name"] for binding in bindings]
+        if staged_profiles != binding_names:
+            failures.append(
+                f"protected stage profile coupling: staged profiles {staged_profiles!r} "
+                f"do not match launcher bindings {binding_names!r}"
+            )
+
+    identities = {identity["id"]: identity for identity in manifest["identities"]}
+    for binding in bindings:
+        identity_id = f"script:{binding['name']}/postinst"
+        identity = identities.get(identity_id)
+        if identity is None:
+            failures.append(f"protected stage profile coupling: {identity_id} is not a manifest identity")
+            continue
+        expected_digest = "sha256:" + binding["digest"]
+        if identity["digest"] != expected_digest:
+            failures.append(
+                f"protected stage profile coupling: {REFERENCE_LAUNCHER} {binding['name']} digest "
+                f"{expected_digest} disagrees with {identity_id} {identity['digest']}"
+            )
+        if identity["size"] != int(binding["size"]):
+            failures.append(
+                f"protected stage profile coupling: {REFERENCE_LAUNCHER} {binding['name']} size "
+                f"{binding['size']} disagrees with {identity_id} {identity['size']}"
+            )
+        provenance = identity["provenance"]
+        version = provenance.get("version") if isinstance(provenance, dict) else None
+        if version != binding["version"]:
+            failures.append(
+                f"protected stage profile coupling: {REFERENCE_LAUNCHER} {binding['name']} version "
+                f"{binding['version']!r} disagrees with {identity_id} provenance {version!r}"
+            )
+        if identity["architectures"] != ["amd64"]:
+            failures.append(f"protected stage profile coupling: {identity_id} must be amd64-only")
+        if not any(
+            consumer["form"] == "hex" and consumer["path"] == REFERENCE_LAUNCHER
+            for consumer in identity["consumers"]
+        ):
+            failures.append(
+                f"protected stage profile coupling: {identity_id} does not register "
+                f"{REFERENCE_LAUNCHER} as a hex consumer"
+            )
+    return failures
+
+
 def check_manifest(manifest: dict, root: Path, profile: dict | None = None) -> list[str]:
     failures: list[str] = []
     series = manifest["series"]
@@ -1573,6 +1730,7 @@ def check_manifest(manifest: dict, root: Path, profile: dict | None = None) -> l
     for identity in manifest["identities"]:
         failures += consumer_failures(identity, root)
         digests.setdefault(identity["digest"].split(":", 1)[1], identity)
+    failures += protected_stage_profile_coupling_failures(manifest, root)
     excluded = {item["digest"].split(":", 1)[1] for item in manifest["excluded"]}
     fixture_consumers = {
         consumer["path"]
