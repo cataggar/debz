@@ -29,6 +29,15 @@ workload command runs in exactly one job:
 | `build-and-test-workload-native` | `test-workload-native` (native alternatives, snapshot, differential, fixture, conffile, dpkg reference/evidence, SHA-512, trigger queue, lifecycle/trigger/settlement unit and recovery unit tests); pinned `test-native-materialization`, `test-native-conffiles`, `test-native-differential` and `test-native-lifecycle-zig`; `test-native-helper-namespace` |
 | `build-and-test-workload-release` | `test-workload-release` (apt schema, native-only rehearsal and the real-snapshot repin harness); `fuzz`; Debug `test-release`; pinned lifecycle/trigger reference oracles; standalone Zig workspace selectors |
 
+Manual CI dispatches have a boolean `run_full_matrix` input, defaulting to
+`true`. Explicitly setting it to `false` skips all five workload jobs, all six
+native recovery jobs, the `Build and test` aggregators, and `integration-full`.
+Push, pull-request, and scheduled coverage is unchanged. Full-run aggregators
+still require every shard to succeed: failure, cancellation, or an unexpected
+skip cannot pass. An opted-out dispatch intentionally skips the aggregators
+and is **not** evidence that the full matrix passed. Action checks, security
+audit, release checks, fuzzing, and `integration-required` still run.
+
 The security audit enforces this inventory in three ways:
 
 - `build.zig` must bind the aggregate `test` step to exactly the five
@@ -116,6 +125,20 @@ integration tests cover corruption, explicit repair, offline metadata
 requirements, moving repository failure, retained-closure GC, hostile
 tar-shaped cache blobs, relocation, executable-replacement attempts,
 maintainer-script failure, and explicit recovery.
+
+For snapshot-focused validation without repeating the standard matrix:
+
+```sh
+gh workflow run ci.yml --ref main \
+  -f run_full_matrix=false \
+  -f run_native_real_snapshot=true \
+  -f run_protected_reference=true
+```
+
+The snapshot, protected-reference, and ARM64 dpkg oracle lanes remain
+independently selected by their existing inputs. Omitting `run_full_matrix`
+or setting it to `true` retains full manual coverage, including
+`integration-full`.
 
 The manual `ubuntu-real-snapshot` CI job is an opt-in two-row amd64/arm64
 gate selected by the `run_native_real_snapshot` dispatch input. It builds the

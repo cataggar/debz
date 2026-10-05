@@ -2193,6 +2193,43 @@ WORKLOAD_RESULTS = (
     ("BUILD_NATIVE_RESULT", "build-and-test-workload-native"),
     ("BUILD_RELEASE_RESULT", "build-and-test-workload-release"),
 )
+CI_FULL_MATRIX_INPUT = """\
+      run_full_matrix:
+        description: "Run the standard build/test matrix (off for snapshot-only validation)"
+        required: true
+        type: boolean
+        default: true
+"""
+CI_FULL_MATRIX_CONDITION = "github.event_name != 'workflow_dispatch' || inputs.run_full_matrix"
+CI_BUILD_AGGREGATE_CONDITION = "${{ always() && (" + CI_FULL_MATRIX_CONDITION + ") }}"
+CI_FULL_INTEGRATION_CONDITION = (
+    "github.event_name == 'schedule' || "
+    "(github.event_name == 'workflow_dispatch' && inputs.run_full_matrix)"
+)
+
+
+def ci_dispatch_matrix_failures(text: str, jobs: dict[str, str]) -> list[str]:
+    failures: list[str] = []
+    dispatch = re.search(
+        r"(?m)^  workflow_dispatch:\n    inputs:\n((?: {6,}[^\n]*\n)*)", text,
+    )
+    if (
+        dispatch is None or dispatch.group(1).count(CI_FULL_MATRIX_INPUT) != 1
+        or re.findall(r"(?m)^      run_full_matrix:[^\n]*$", text)
+        != ["      run_full_matrix:"]
+    ):
+        failures.append("ci.yml: run_full_matrix must be a required boolean dispatch input defaulting to true")
+    conditions = {
+        **{name: CI_FULL_MATRIX_CONDITION for name in (*WORKLOAD_JOBS, *RECOVERY_ZIG_SHARDS)},
+        "build-and-test": CI_BUILD_AGGREGATE_CONDITION,
+        "integration-full": CI_FULL_INTEGRATION_CONDITION,
+    }
+    for name, condition in conditions.items():
+        if re.findall(r"(?m)^    if:[^\n]*$", jobs.get(name, "")) != [f"    if: {condition}"]:
+            failures.append(f"ci.yml: {name} must retain its exact dispatch matrix condition")
+    if re.search(r"(?m)^    if:", jobs.get("integration-required", "")):
+        failures.append("ci.yml: required integration roots must remain unconditional")
+    return failures
 
 
 def workflow_logical_commands(step: str) -> list[str] | None:
@@ -2272,7 +2309,7 @@ def workload_ci_failures(jobs: dict[str, str], text: str) -> list[str]:
             or body.count("    steps:\n") != 1
             or header.split("    strategy:\n", 1)[-1].split("    env:\n", 1)[0] != WORKLOAD_MATRIX
             or header.split("    env:\n", 1)[-1] != "      OPTIMIZE: ${{ matrix.optimize }}\n"
-            or re.search(r"(?m)^    (?:if|needs|continue-on-error):", body)
+            or re.search(r"(?m)^    (?:needs|continue-on-error):", body)
             or "continue-on-error:" in body
         ):
             failures.append(
@@ -2696,6 +2733,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
         text,
     ))
     failures = []
+    failures.extend(ci_dispatch_matrix_failures(text, jobs))
     failures.extend(workload_ci_failures(jobs, text))
     architectures = (
         "          - os: ubuntu-24.04\n"
@@ -2765,7 +2803,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
             or body.count("    strategy:\n") != 1
             or body.count("    steps:\n") != 1
             or body.split("    strategy:\n", 1)[-1].split("    steps:\n", 1)[0] != strategy
-            or re.search(r"(?m)^    if:|^    continue-on-error:", body)
+            or re.search(r"(?m)^    continue-on-error:", body)
             or "continue-on-error:" in body
         ):
             failures.append(f"ci.yml: {name} must require every reviewed architecture and mode within {timeout_minutes} minutes")
@@ -2842,7 +2880,7 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     if any(line not in gate.splitlines() for line in (
         "    name: Build and test (${{ matrix.name }})",
         "    needs: [build-and-test-workload, build-and-test-workload-production, build-and-test-workload-apt-system, build-and-test-workload-native, build-and-test-workload-release, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]",
-        "    if: ${{ always() }}",
+        f"    if: {CI_BUILD_AGGREGATE_CONDITION}",
         "      fail-fast: false",
         "        name: [linux-x64, linux-arm64]",
         *(f"          {variable}: ${{{{ needs.{job}.result }}}}" for variable, job in WORKLOAD_RESULTS),
