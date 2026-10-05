@@ -2002,7 +2002,7 @@ WORKLOAD_PARTITIONS = {
         "run_native_snapshot_tests", "run_native_differential_zig_tests",
         "run_native_fixture_tests", "run_native_conffile_zig_tests",
         "dpkg_config_reference_tests", "dpkg_alternatives_reference_tests",
-        "dpkg_oracle_evidence_tests", "run_sha512_e2e_tests",
+        "dpkg_oracle_evidence_tests", "signed_proc_compare_tests", "run_sha512_e2e_tests",
         "run_native_trigger_queue_tests", "run_lifecycle_zig_tests",
         "run_trigger_zig_tests", "run_settlement_tests", "run_recovery_unit_tests",
         "run_native_recovery_tests", "run_repository_recovery_unit",

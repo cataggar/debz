@@ -78,7 +78,7 @@ class ZigInstallPolicyTests(unittest.TestCase):
                 changed = self.ci.replace(
                     moved_from, moved_from.replace(policy.GHR_ZIG_INSTALL, "", 1), 1
                 ).replace(moved_to, moved_to + policy.GHR_ZIG_INSTALL, 1)
-                self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 20)
+                self.assertEqual(changed.count(policy.GHR_ZIG_INSTALL), 21)
                 self.assertIn("reviewed CI job inventory", " ".join(self.failures(changed)))
 
     def test_unverified_or_duplicate_install_refuses(self) -> None:

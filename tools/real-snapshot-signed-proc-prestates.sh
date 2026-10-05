@@ -14,12 +14,14 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 # The lock document digest also covers the local keyring path, so bind the
 # authenticated snapshot Release, its signer and the exact archive closure.
-readonly release_sha256=0b2bb35161122b6ef79e8f05f1b14934494db80d7b1d40c46174dc44d95f8ee9
+readonly release_sha256=596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834
+readonly updates_release_sha256=16d93e5e9358047ac2f5d671abcac2bb3f2945532452720cd9a17320c19c4f24
+readonly security_release_sha256=bda7516aa5ed1aa2c8ebcbe36a07276f599559917a9de8fe5de041e99c9a2a10
 readonly release_signer=f6ecb3762474eda9d21b7022871920d1991bc93c
-readonly closure_sha256=7773e7c4473bf7f3e51351d6a7192d693daf74aa1fdbc3704734aca8d66a2b13
+readonly closure_sha256=03fc9d79075819b663127e6702c49ea5c96d81f4a2d847b3886f76e4158a1113
 readonly pinned_dpkg_sha256=0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5
-readonly signed_dpkg='usr/bin/dpkg:322728:755:6587ef9e2ef69b1a0426d69d667bfd7cbcec6c3be5f0560cc4c219f95d65739f'
-readonly setpriv_sha256=9e0d70d26a02c1cb4b984ab6f49a582b7a2c3508b1063ac23adc60073292ae7e
+readonly signed_dpkg='usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517'
+readonly setpriv_sha256=86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993
 
 [[ $# == 2 && $(id -u) == 0 ]] || {
   echo "usage (as root): $0 PINNED_DPKG BINDING_WORKSPACE" >&2
@@ -80,6 +82,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 }
 require_protected_file "$script_path"
 require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
+require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
 require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
 require_protected_path "$repository_root/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$repository_root/.real-snapshot") == 0:0:700 ]] || {
@@ -116,20 +119,24 @@ done
 python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
 
 # The signed proc profiles bind these exact package identities.
-jq -e --arg release "$release_sha256" --arg signer "$release_signer" '
+jq -e --arg release "$release_sha256" --arg updates "$updates_release_sha256" \
+  --arg security "$security_release_sha256" --arg signer "$release_signer" '
   .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
   .version == 3 and .target_architecture == "amd64" and
-  (.repositories | length) == 1 and
-  .repositories[0].release_sha256 == $release and
-  .repositories[0].signer_fingerprints == [$signer] and
+  (.repositories | length) == 3 and
+  all(.repositories[]; .index_identity.primary == "sha256") and
+  ([.repositories[].release_sha256] |
+    index($release) != null and index($updates) != null and index($security) != null) and
+  all(.repositories[].release_sha256; . == $release or . == $updates or . == $security) and
+  ([.repositories[].signer_fingerprints[]] | unique) == [$signer] and
   all(.packages[]; .archive_identity.primary == "sha512" and
     ([.archive_identity.digests[] | select(.algorithm == "sha512")] | length) == 1) and
   ([.packages[] | select(.architecture == "amd64" and (
-    (.name == "systemd" and .version == "261.2-1ubuntu2") or
-    (.name == "udev" and .version == "261.2-1ubuntu2") or
-    (.name == "sudo" and .version == "1.9.17p2-7ubuntu3") or
-    (.name == "sudo-rs" and .version == "0.2.14-1ubuntu2") or
-    (.name == "util-linux" and .version == "2.41.3-3ubuntu2")))] | length) == 5
+    (.name == "systemd" and .version == "259.5-0ubuntu3.4") or
+    (.name == "udev" and .version == "259.5-0ubuntu3.4") or
+    (.name == "sudo" and .version == "1.9.17p2-1ubuntu3.1") or
+    (.name == "sudo-rs" and .version == "0.2.13-0ubuntu1.2") or
+    (.name == "util-linux" and .version == "2.41.3-3ubuntu2.2")))] | length) == 5
 ' "$lock" >/dev/null
 
 install -d -o root -g root -m 0700 "$build" "$build/evidence" "$build/tmp" "$prestates" "$tools"
@@ -189,12 +196,20 @@ done
 printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nrelease_sha256=%s\nclosure_sha256=%s\nbootstrap_archives=%s\n' \
   "$(sha256sum "$pinned" | cut -d' ' -f1)" "$(sha256sum "$lock" | cut -d' ' -f1)" \
   "$release_sha256" "$closure_sha256" "${#bootstrap[@]}" >"$evidence/reference-identity.txt"
+launcher=$tools/reference-launcher
+zig build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+  --cache-dir "$tools/zig-cache" \
+  --global-cache-dir "$tools/zig-global-cache" \
+  -femit-bin="$launcher"
+chmod 0500 "$launcher"
+require_protected_file "$launcher"
 
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   sh -c 'mount -t proc -o nosuid,nodev,noexec proc "$1/proc" && shift && exec "$@"' \
   sh "$root" timeout --signal=TERM --kill-after=30s 20m \
   python3 tools/real-snapshot-reference-order.py \
+    --launcher "$launcher" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prestate "systemd:amd64=half-configured:$prestates/systemd" \
     --prestate "udev:amd64=half-configured:$prestates/udev" \
@@ -205,9 +220,9 @@ dpkg-query --admindir="$root/var/lib/dpkg" \
 rm -rf --one-file-system -- "$root" "$build/tmp"
 
 expected_record=$(printf '%s\t%s\t%s\n' \
-  systemd:amd64 '261.2-1ubuntu2 install ok half-configured' "$prestates/systemd" \
-  udev:amd64 '261.2-1ubuntu2 install ok half-configured' "$prestates/udev" \
-  sudo:amd64 '1.9.17p2-7ubuntu3 install ok unpacked' "$prestates/sudo")
+  systemd:amd64 '259.5-0ubuntu3.4 install ok half-configured' "$prestates/systemd" \
+  udev:amd64 '259.5-0ubuntu3.4 install ok half-configured' "$prestates/udev" \
+  sudo:amd64 '1.9.17p2-1ubuntu3.1 install ok unpacked' "$prestates/sudo")
 [[ $(cat "$prestates/prestates.tsv") == "$expected_record" ]]
 
 require_control() { # root name:size:mode:sha256
@@ -232,12 +247,12 @@ require_prestate() { # package status control
   require_control "$target" "$signed_dpkg"
   [[ ! -e "$target/usr/bin/setpriv" && ! -L "$target/usr/bin/setpriv" ]]
 }
-require_prestate systemd '261.2-1ubuntu2 install ok half-configured' \
-  'var/lib/dpkg/info/systemd.postinst:4942:755:39df51226d6dd8456a388d3315e7d02b446dcec9944515a109933c65c8c1b412'
-require_prestate udev '261.2-1ubuntu2 install ok half-configured' \
-  'var/lib/dpkg/info/udev.postinst:2533:755:861ba57cdb3f94bae94af237b9284b01bceb956ee69bb09d3b54e381567336ee'
-require_prestate sudo '1.9.17p2-7ubuntu3 install ok unpacked' \
-  'var/lib/dpkg/info/sudo.postinst:1927:755:e766407bf70ad03d8006de9f3f8700f7ed22b532d8e299ac88e522e2c80a2cb8'
+require_prestate systemd '259.5-0ubuntu3.4 install ok half-configured' \
+  'var/lib/dpkg/info/systemd.postinst:5037:755:d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d'
+require_prestate udev '259.5-0ubuntu3.4 install ok half-configured' \
+  'var/lib/dpkg/info/udev.postinst:2578:755:b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606'
+require_prestate sudo '1.9.17p2-1ubuntu3.1 install ok unpacked' \
+  'var/lib/dpkg/info/sudo.postinst:1747:755:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383'
 
 # Pinned dpkg writes sudo.list in extraction order, symbolic links last; the
 # signed sudo binding pins the native engine's C-sorted list. Only the order
@@ -250,11 +265,11 @@ chmod 0644 "$list.sorted"
 mv -- "$list.sorted" "$list"
 # The pre-sudo record is sudo-rs's registration before sudo's postinst.
 require_control "$prestates/sudo" \
-  'var/lib/dpkg/info/sudo.list:2376:644:92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f'
+  'var/lib/dpkg/info/sudo.list:2376:644:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8'
 require_control "$prestates/sudo" \
   'var/lib/dpkg/alternatives/sudo:464:644:4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6'
 [[ $(dpkg-query --admindir="$prestates/sudo/var/lib/dpkg" -W \
-  -f='${Version} ${Status}' sudo-rs) == '0.2.14-1ubuntu2 install ok installed' ]]
+  -f='${Version} ${Status}' sudo-rs) == '0.2.13-0ubuntu1.2 install ok installed' ]]
 for link in 'usr/bin/sudoedit:/etc/alternatives/sudoedit' \
   'usr/share/man/man8/sudoedit.8.gz:/etc/alternatives/sudoedit.8.gz'; do
   [[ -L "$prestates/sudo/${link%%:*}" &&
@@ -276,6 +291,7 @@ done
 dpkg-deb --fsys-tarfile "$util_linux" | tar -xO ./usr/bin/setpriv >"$tools/setpriv"
 chmod 0755 "$tools/setpriv"
 [[ $(sha256sum "$tools/setpriv" | cut -d' ' -f1) == "$setpriv_sha256" ]]
+sha256sum "$tools/setpriv" >"$tools/setpriv.sha256"
 
 printf 'SIGNED_SYSTEMD_PRESTATE=%s\nSIGNED_UDEV_PRESTATE=%s\nSIGNED_SUDO_PRESTATE=%s\nREFERENCE_SETPRIV=%s\n' \
   "$prestates/systemd" "$prestates/udev" "$prestates/sudo" "$tools/setpriv" \

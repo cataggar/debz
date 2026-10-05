@@ -468,6 +468,32 @@
       "consumers": [
         {
           "form": "hex",
+          "path": "tools/real-snapshot-signed-proc-prestates.sh"
+        }
+      ],
+      "digest": "sha256:86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993",
+      "id": "file:util-linux/usr/bin/setpriv@amd64",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "util-linux",
+      "path": "usr/bin/setpriv",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:271b4df2ee3ee790cdf1791dfffdaf87280a99a4df0bb0bc82c3d3f325484da98c05475961f8eb73410be9079fea05c2a2f4c94375deab6cdcb864b0ce21e7cc"
+        },
+        "version": "2.41.3-3ubuntu2.2"
+      },
+      "review": "#287",
+      "size": 47576,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
           "path": "src/native_alternatives.zig"
         },
         {

@@ -7,8 +7,11 @@ set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20260923T000000Z
-readonly snapshot_suite=stonking
+readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
+readonly snapshot_suite=resolute
+readonly snapshot_witness_suites=(resolute-updates resolute-security)
+readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
+readonly frozen_release_sha256=596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 
 [[ $# == 2 && $(id -u) == 0 ]] || {
@@ -89,24 +92,38 @@ install -d -o root -g root -m 0700 "$workspace"
 snapshot=$workspace/snapshot
 bindings=$workspace/bindings
 install -d -o root -g root -m 0700 "$snapshot" "$snapshot/root" "$snapshot/cache" \
-  "$snapshot/state" "$snapshot/evidence" "$bindings"
-cat >"$snapshot/ubuntu.sources" <<EOF
+  "$snapshot/state" "$snapshot/evidence" "$snapshot/sources" "$snapshot/config" "$bindings"
+write_source() {
+  local target=$1 suite=$2
+  cat >"$target" <<EOF
 Types: deb
 URIs: $snapshot_uri
-Suites: $snapshot_suite
+Suites: $suite
 Components: main
 Architectures: amd64
 Signed-By: $keyring
 EOF
-printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
-  "$snapshot/ubuntu.sources" "$snapshot_suite" $((31 * 24 * 60 * 60)) >"$snapshot/ubuntu.json"
+}
+write_source "$snapshot/sources/$snapshot_suite.sources" "$snapshot_suite"
+printf '{"source_path":"%s","priority":500,"immutable":true,"freshness":{"mode":"frozen_release_with_witnesses","frozen_release_digest":"sha256:%s","witness_suites":["%s","%s"]}}\n' \
+  "$snapshot/sources/$snapshot_suite.sources" "$frozen_release_sha256" \
+  "${snapshot_witness_suites[0]}" "${snapshot_witness_suites[1]}" \
+  >"$snapshot/config/$snapshot_suite.json"
+for witness in "${snapshot_witness_suites[@]}"; do
+  write_source "$snapshot/sources/$witness.sources" "$witness"
+  printf '{"source_path":"%s","priority":500,"immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
+    "$snapshot/sources/$witness.sources" "$maximum_release_age_seconds" \
+    >"$snapshot/config/$witness.json"
+done
 lock=$snapshot/evidence/ubuntu-minimal.lock.json
 common=(
   --install-root "$snapshot/root"
   --cache-path "$snapshot/cache"
   --state-path "$snapshot/state"
   --architecture amd64
-  --config "$snapshot/ubuntu.json"
+  --config "$snapshot/config/$snapshot_suite.json"
+  --config "$snapshot/config/${snapshot_witness_suites[0]}.json"
+  --config "$snapshot/config/${snapshot_witness_suites[1]}.json"
   --keyring "$keyring"
   --deadline-ms 300000
   --lock-wait-ms 30000
@@ -126,9 +143,9 @@ jq -e '
   .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
   .target_architecture == "amd64" and
   all(.packages[]; .archive_identity.primary == "sha512") and
-  ([.packages[] | select(.name == "udev" and .version == "261.2-1ubuntu2" and
+  ([.packages[] | select(.name == "udev" and .version == "259.5-0ubuntu3.4" and
     .architecture == "amd64")] | length) == 1 and
-  ([.packages[] | select(.name == "sudo" and .version == "1.9.17p2-7ubuntu3" and
+  ([.packages[] | select(.name == "sudo" and .version == "1.9.17p2-1ubuntu3.1" and
     .architecture == "amd64")] | length) == 1
 ' "$lock" >/dev/null
 

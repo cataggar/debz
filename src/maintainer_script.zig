@@ -4987,6 +4987,7 @@ test "maintainer_script.test.production script inherits only narrowed capability
         .launcher = launcher.interface(),
     });
     defer report.deinit();
+    if (try skipIfPrivateNetworkUnavailable(&report)) return;
     try testing.expect(report.succeeded());
     var seen: usize = 0;
     var lines = std.mem.splitScalar(u8, report.stdout, '\n');
