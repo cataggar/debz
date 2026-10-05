@@ -640,6 +640,47 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(any("constant snapshot_alpha_sha256" in failure for failure in failures))
         self.assertTrue(any("disagrees with file:beta/usr/bin/beta" in failure for failure in failures))
 
+    def test_protected_stage_profiles_must_match_manifest_and_launcher(self) -> None:
+        frozen = pocket("stable", "frozen", b"frozen")
+        value = copy.deepcopy(self.manifest)
+        value["series"]["pockets"] = [
+            {"suite": "stable", "role": "frozen"},
+            {"suite": "stable-updates", "role": "witness"},
+            {"suite": "stable-security", "role": "witness"},
+        ]
+        value["snapshot"] = {"timestamp": T0, "status": "probed", "pockets": [frozen]}
+        value["identities"][0]["provenance"] = {"version": "1.0", "archives": {"amd64": sha512(b"1.0")}}
+        value["identities"][0]["consumers"].append({"path": repin.REFERENCE_LAUNCHER, "form": "hex"})
+        (self.root / repin.REFERENCE_LAUNCHER).write_text(
+            'const script_bindings = [_]ScriptBinding{\n'
+            f'    .{{ .name = "alpha", .version = "1.0", .size = {len(SCRIPT)}, '
+            f'.digest = "{sha256(SCRIPT).split(":", 1)[1]}" }},\n'
+            '};\n',
+            encoding="utf-8",
+        )
+        stage = self.root / repin.PROTECTED_STAGE_SCRIPT
+        stage.write_text(
+            f"readonly snapshot_uri={repin.snapshot_uri(value['series'], T0)}\n"
+            "readonly snapshot_suite=stable\n"
+            "readonly snapshot_witness_suites=(stable-updates stable-security)\n"
+            f"readonly frozen_release_sha256={frozen['release_sha256'].split(':', 1)[1]}\n"
+            "for profile in alpha; do\n  :\ndone\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(repin.check_manifest(value, self.root, value["series"]), [])
+
+        stage.write_text(stage.read_text().replace("snapshot_suite=stable", "snapshot_suite=devel"),
+                         encoding="utf-8")
+        self.assertTrue(any("snapshot_suite" in failure for failure in
+                            repin.check_manifest(value, self.root, value["series"])))
+        stage.write_text(stage.read_text().replace("snapshot_suite=devel", "snapshot_suite=stable"),
+                         encoding="utf-8")
+        launcher = self.root / repin.REFERENCE_LAUNCHER
+        launcher.write_text(launcher.read_text().replace(f".size = {len(SCRIPT)}", ".size = 1"),
+                            encoding="utf-8")
+        self.assertTrue(any("alpha size" in failure for failure in
+                            repin.check_manifest(value, self.root, value["series"])))
+
     def test_uri_consumers_are_enforced_and_default_admissions_ignore_versions(self) -> None:
         script = self.root / "tools/real-snapshot-synthetic.sh"
         script.write_text(script.read_text() + f"old=file:///x/{'snapshot.ubuntu.com/ubuntu/20260101T000000Z'}\n")

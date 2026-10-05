@@ -202,6 +202,10 @@ python3 tools/real-snapshot-repin.py check
   quoted digest literals in `src/maintainer_script.zig`,
   `src/native_alternatives.zig` and `src/native_unpack.zig`, plus digest
   literals in `tools/real-snapshot-*.sh`.
+- the protected pinned-dpkg stage's frozen suite, witness suites or frozen
+  Release digest drift from the manifest, or the protected launcher's
+  proc-profile `script_bindings` drift from the manifest identities for the
+  staged `systemd`, `udev` and `sudo` postinsts.
 
 `test/real-snapshot-policy.zig` runs `check` in `zig build security-audit`
 and also verifies that it refuses a manifest with a mutated identity.

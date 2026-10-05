@@ -11,13 +11,15 @@ umask 077
 trap 'echo "protected staging failed at line $LINENO" >&2' ERR
 
 readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
-# This staging step only needs an authenticated runtime closure for the
-# chrooted pinned dpkg, so it uses a devel suite whose Release is republished
-# continuously. It deliberately does not track the pinned snapshot series.
-# resolute is a frozen stable pocket whose Release is dated 2026-04-23 and
-# carries no Valid-Until, so at this snapshot it is 160 days old and the
-# freshness policy below rejects it with ReleaseExpired (#390).
-readonly snapshot_suite=stonking
+# The launcher binds amd64 proc-profile postinsts by exact version, size and
+# digest, so the staged profiles and runtime closure must come from the pinned
+# resolute series. The frozen base pocket never satisfies an age window: bind
+# its exact Release digest and use the fresh updates/security pockets only as
+# witnesses and package overlays, matching the reviewed real-snapshot pin.
+readonly snapshot_suite=resolute
+readonly snapshot_witness_suites=(resolute-updates resolute-security)
+readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
+readonly frozen_release_sha256=596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 # The distribution dpkg's locked dependency closure supplies every runtime
 # library and tar the pinned Debian dpkg and its helpers load in the root.
@@ -115,22 +117,39 @@ install -d -o root -g root -m 0700 "$evidence" "$snapshot" "$snapshot/root" \
   "$snapshot/cache" "$snapshot/state" "$workspace/build" "$workspace/packages"
 
 # Authenticated runtime closure for the chrooted pinned dpkg and its helpers.
-cat >"$snapshot/ubuntu.sources" <<EOF
+source_dir=$snapshot/sources
+config_dir=$snapshot/config
+install -d -o root -g root -m 0700 "$source_dir" "$config_dir"
+write_source() {
+  local target=$1 suite_name=$2
+  cat >"$target" <<EOF
 Types: deb
 URIs: $snapshot_uri
-Suites: $snapshot_suite
+Suites: $suite_name
 Components: main
 Architectures: $architecture
 Signed-By: $keyring
 EOF
-printf '{"source_path":"%s","priority":500,"default_release":"%s","immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
-  "$snapshot/ubuntu.sources" "$snapshot_suite" $((31 * 24 * 60 * 60)) >"$snapshot/ubuntu.json"
+}
+write_source "$source_dir/$snapshot_suite.sources" "$snapshot_suite"
+printf '{"source_path":"%s","priority":500,"immutable":true,"freshness":{"mode":"frozen_release_with_witnesses","frozen_release_digest":"sha256:%s","witness_suites":["%s","%s"]}}\n' \
+  "$source_dir/$snapshot_suite.sources" "$frozen_release_sha256" \
+  "${snapshot_witness_suites[0]}" "${snapshot_witness_suites[1]}" \
+  >"$config_dir/$snapshot_suite.json"
+config_args=(--config "$config_dir/$snapshot_suite.json")
+for witness in "${snapshot_witness_suites[@]}"; do
+  write_source "$source_dir/$witness.sources" "$witness"
+  printf '{"source_path":"%s","priority":500,"immutable":true,"freshness":{"mode":"allow_missing_valid_until_with_max_age_seconds","maximum_release_age_seconds":%s}}\n' \
+    "$source_dir/$witness.sources" "$maximum_release_age_seconds" \
+    >"$config_dir/$witness.json"
+  config_args+=(--config "$config_dir/$witness.json")
+done
 lock=$evidence/runtime.lock.json
 common=(
   --cache-path "$snapshot/cache"
   --state-path "$snapshot/state"
   --architecture "$architecture"
-  --config "$snapshot/ubuntu.json"
+  "${config_args[@]}"
   --keyring "$keyring"
   --deadline-ms 300000
   --lock-wait-ms 30000
@@ -341,11 +360,17 @@ install -d -o root -g root -m 0700 "$workspace/proof"
 {
   printf 'architecture=%s\nsnapshot_uri=%s\nsnapshot_suite=%s\n' \
     "$architecture" "$snapshot_uri" "$snapshot_suite"
+  printf 'snapshot_witness_suites=%s\n' "$(IFS=,; echo "${snapshot_witness_suites[*]}")"
+  printf 'repository_freshness=frozen_release_with_witnesses:%s:witnesses=%s:maximum_witness_age=%s\n' \
+    "$frozen_release_sha256" "$(IFS=,; echo "${snapshot_witness_suites[*]}")" \
+    "$maximum_release_age_seconds"
   printf 'keyring_sha256=%s\nruntime_lock_sha256=%s\n' \
     "$(sha256sum "$keyring" | cut -d' ' -f1)" "$(sha256sum "$lock" | cut -d' ' -f1)"
   printf 'zig_sha256=%s\ndebz_sha256=%s\n' \
     "$(sha256sum "$zig" | cut -d' ' -f1)" "$(sha256sum "$debz" | cut -d' ' -f1)"
   printf 'dpkg_archive_sha256=%s\n' "$(sha256sum "$workspace/build/dpkg.deb" | cut -d' ' -f1)"
+  sha256sum "$source_dir"/*.sources | sed 's#^.*/##; s#^#source_profile_sha256 #'
+  sha256sum "$config_dir"/*.json | sed 's#^.*/##; s#^#repository_profile_sha256 #'
   for path in "$dpkg_prefix/usr/bin/dpkg" "$template/usr/bin/dpkg-deb" \
     "$template/usr/bin/dpkg-split" "$template/usr/bin/tar" "$template/usr/bin/rm" "$template/$loader" \
     "$launcher" "$probe" "$profiles"/*.postinst; do

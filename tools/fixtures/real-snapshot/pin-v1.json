@@ -63,6 +63,10 @@
           "form": "zig_bytes",
           "name": "snapshot_systemd_sha256",
           "path": "src/maintainer_script.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
         }
       ],
       "digest": "sha256:d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d",
@@ -110,6 +114,10 @@
           "form": "zig_bytes",
           "name": "snapshot_udev_sha256",
           "path": "src/maintainer_script.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
         }
       ],
       "digest": "sha256:b7892e975bcce896c4938c2219a244fa03863d5eff37cd2eb66d2b8540f14606",
@@ -165,6 +173,10 @@
           "form": "zig_bytes",
           "name": "snapshot_sudo_sha256",
           "path": "src/maintainer_script.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-launcher.zig"
         }
       ],
       "digest": "sha256:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383",
@@ -2855,6 +2867,7 @@
   "uri_consumers": [
     ".github/workflows/ci.yml",
     "test/real-snapshot-policy.zig",
-    "tools/real-snapshot-acceptance.sh"
+    "tools/real-snapshot-acceptance.sh",
+    "tools/real-snapshot-reference-protected-stage.sh"
   ]
 }
