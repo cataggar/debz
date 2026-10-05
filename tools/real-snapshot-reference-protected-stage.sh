@@ -11,7 +11,13 @@ umask 077
 trap 'echo "protected staging failed at line $LINENO" >&2' ERR
 
 readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
-readonly snapshot_suite=resolute
+# This staging step only needs an authenticated runtime closure for the
+# chrooted pinned dpkg, so it uses a devel suite whose Release is republished
+# continuously. It deliberately does not track the pinned snapshot series.
+# resolute is a frozen stable pocket whose Release is dated 2026-04-23 and
+# carries no Valid-Until, so at this snapshot it is 160 days old and the
+# freshness policy below rejects it with ReleaseExpired (#390).
+readonly snapshot_suite=stonking
 readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
 # The distribution dpkg's locked dependency closure supplies every runtime
 # library and tar the pinned Debian dpkg and its helpers load in the root.
