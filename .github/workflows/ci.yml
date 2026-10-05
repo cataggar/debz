@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      run_full_matrix:
+        description: "Run the standard build/test matrix (off for snapshot-only validation)"
+        required: true
+        type: boolean
+        default: true
       ubuntu_snapshot_uri:
         description: "Pinned immutable Ubuntu snapshot URI"
         required: true
@@ -748,6 +753,7 @@ jobs:
           grep -q '"outcome":"succeeded"' "$workspace/install-summary.json"
 
   build-and-test-workload:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload core (${{ matrix.name }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -856,6 +862,7 @@ jobs:
           test "$REUSED" -eq 0
 
   build-and-test-workload-production:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload production (${{ matrix.name }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -913,6 +920,7 @@ jobs:
             -Dnative-reference-dpkg="$reference_dpkg" -Doptimize="$OPTIMIZE" -j2 --summary all
 
   build-and-test-workload-apt-system:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload apt system (${{ matrix.name }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -996,6 +1004,7 @@ jobs:
           sudo rm -rf /run/debz
 
   build-and-test-workload-native:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload native (${{ matrix.name }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -1058,6 +1067,7 @@ jobs:
           zig build test-native-helper-namespace -Doptimize="$OPTIMIZE" -j2 --summary all
 
   build-and-test-workload-release:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Build and test workload release (${{ matrix.name }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -1142,6 +1152,7 @@ jobs:
           grep -Fxq 'error: PathAlreadyExists' "$PWD/.tmp/zig-existing-workspace.log"
 
   native-recovery-zig-workflows:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Native crash recovery Zig core (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
@@ -1200,6 +1211,7 @@ jobs:
           zig build test-native-root-import -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   native-recovery-zig-repository:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Native crash recovery Zig repository (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
@@ -1247,6 +1259,7 @@ jobs:
           zig build test-native-recovery-zig-repository -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   native-recovery-zig-helper:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Native crash recovery Zig helper, bootstrap, parity and rollback (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
@@ -1300,6 +1313,7 @@ jobs:
           zig build test-native-recovery-zig-rollback-clock -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   native-recovery-zig-family:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Native crash recovery Zig signed FAMILY (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
@@ -1347,6 +1361,7 @@ jobs:
           zig build test-native-recovery-zig-family -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   native-recovery-zig-scenarios:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Native crash recovery Zig scenario matrices (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
@@ -1407,6 +1422,7 @@ jobs:
           zig build test-native-recovery-zig-mutation-boundaries -Dnative-reference-dpkg="$reference_dpkg" -Doptimize=ReleaseSafe -j2 --summary all
 
   native-recovery-zig-diversions:
+    if: github.event_name != 'workflow_dispatch' || inputs.run_full_matrix
     name: Native crash recovery Zig diversion shard (${{ matrix.name }} / ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
@@ -1599,7 +1615,7 @@ jobs:
   build-and-test:
     name: Build and test (${{ matrix.name }})
     needs: [build-and-test-workload, build-and-test-workload-production, build-and-test-workload-apt-system, build-and-test-workload-native, build-and-test-workload-release, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]
-    if: ${{ always() }}
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_full_matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     strategy:
@@ -1862,7 +1878,7 @@ jobs:
           retention-days: 7
 
   integration-full:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_full_matrix)
     name: Full disposable root (${{ matrix.suite }}/${{ matrix.architecture }}/${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45

@@ -422,6 +422,16 @@ test "security: workflow expected failures require bound outcomes, no hidden fai
 }
 
 const workload_needs = "    needs: [build-and-test-workload, build-and-test-workload-production, build-and-test-workload-apt-system, build-and-test-workload-native, build-and-test-workload-release, native-recovery-zig-workflows, native-recovery-zig-repository, native-recovery-zig-helper, native-recovery-zig-family, native-recovery-zig-scenarios, native-recovery-zig-diversions]";
+const full_matrix_input =
+    \\      run_full_matrix:
+    \\        description: "Run the standard build/test matrix (off for snapshot-only validation)"
+    \\        required: true
+    \\        type: boolean
+    \\        default: true
+;
+const full_matrix_condition = "github.event_name != 'workflow_dispatch' || inputs.run_full_matrix";
+const aggregate_condition = "${{ always() && (" ++ full_matrix_condition ++ ") }}";
+const full_integration_condition = "github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_full_matrix)";
 
 const WorkloadJob = struct {
     name: []const u8,
@@ -522,6 +532,106 @@ fn partitionCommand(f: *Fixture, partition: []const u8) ![]const u8 {
     return std.fmt.allocPrint(f.arena.allocator(), "          zig build {s} -Doptimize=\"$OPTIMIZE\" -j2 --summary all\n", .{partition});
 }
 
+test "security: CI dispatch matrix opt-out requires a typed default-true input" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const valid = try f.check("ci-recovery", workflow);
+    defer valid.deinit();
+    try valid.ok();
+    for ([_][]const u8{
+        "",
+        try f.replace(full_matrix_input, "required: true", "required: false"),
+        try f.replace(full_matrix_input, "type: boolean", "type: string"),
+        try f.replace(full_matrix_input, "default: true", "default: false"),
+        try f.replace(full_matrix_input, "        default: true", ""),
+        try std.fmt.allocPrint(f.arena.allocator(), "{s}\n{s}", .{ full_matrix_input, full_matrix_input }),
+    }) |replacement| {
+        const refused = try f.check("ci-recovery", try f.replace(workflow, full_matrix_input, replacement));
+        defer refused.deinit();
+        try refused.failsWith("run_full_matrix must be a required boolean dispatch input defaulting to true");
+    }
+}
+
+test "security: CI dispatch matrix gates preserve non-dispatch coverage on every shard" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const gate = "    if: " ++ full_matrix_condition ++ "\n";
+    const first = std.mem.indexOfScalar(u8, workload_needs, '[') orelse return error.MissingNeeds;
+    var names = std.mem.tokenizeAny(u8, workload_needs[first + 1 ..], ", ]");
+    while (names.next()) |name| {
+        const marker = try std.fmt.allocPrint(f.arena.allocator(), "  {s}:\n", .{name});
+        const start = std.mem.indexOf(u8, workflow, marker) orelse return error.MissingJob;
+        const end = std.mem.indexOfPos(u8, workflow, start + marker.len, "\n    steps:\n") orelse return error.MissingSteps;
+        const header = workflow[start..end];
+        for ([_][]const u8{
+            "",
+            "    if: false\n",
+            "    if: inputs.run_full_matrix\n",
+            "    if: github.event_name == 'pull_request' || inputs.run_full_matrix\n",
+            "    if: github.event_name != 'workflow_dispatch' || inputs.run_native_real_snapshot\n",
+            gate ++ gate,
+        }) |replacement| {
+            const changed = try f.replace(workflow, header, try f.replace(header, gate, replacement));
+            const refused = try f.check("ci-recovery", changed);
+            defer refused.deinit();
+            try refused.failsWith(try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must retain its exact dispatch matrix condition", .{name}));
+        }
+    }
+}
+
+test "security: CI dispatch aggregate and full integration conditions cannot hide omitted work" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    for ([_]struct { name: []const u8, next: []const u8, condition: []const u8, mutations: []const []const u8 }{
+        .{
+            .name = "build-and-test",
+            .next = "\n  security-audit:\n",
+            .condition = aggregate_condition,
+            .mutations = &.{
+                "${{ always() }}",
+                "${{ " ++ full_matrix_condition ++ " }}",
+                "${{ success() && (" ++ full_matrix_condition ++ ") }}",
+                "${{ always() && inputs.run_full_matrix }}",
+            },
+        },
+        .{
+            .name = "integration-full",
+            .next = "\n  ubuntu-real-snapshot:\n",
+            .condition = full_integration_condition,
+            .mutations = &.{
+                "github.event_name == 'workflow_dispatch' && inputs.run_full_matrix",
+                "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'",
+                "github.event_name == 'schedule' && inputs.run_full_matrix",
+                full_matrix_condition,
+            },
+        },
+    }) |selected| {
+        const body = try job(workflow, selected.name, selected.next);
+        const condition = try std.fmt.allocPrint(f.arena.allocator(), "    if: {s}\n", .{selected.condition});
+        const message = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must retain its exact dispatch matrix condition", .{selected.name});
+        for (selected.mutations) |mutation| {
+            const changed = try f.replace(workflow, body, try f.replace(body, condition, try std.fmt.allocPrint(f.arena.allocator(), "    if: {s}\n", .{mutation})));
+            const refused = try f.check("ci-recovery", changed);
+            defer refused.deinit();
+            try refused.failsWith(message);
+        }
+        for ([_][]const u8{ "", try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ condition, condition }) }) |replacement| {
+            const changed = try f.replace(workflow, body, try f.replace(body, condition, replacement));
+            const refused = try f.check("ci-recovery", changed);
+            defer refused.deinit();
+            try refused.failsWith(message);
+        }
+    }
+    const required = try job(workflow, "integration-required", "\n  integration-full:\n");
+    const changed = try f.replace(workflow, required, try f.replace(required, "  integration-required:\n", "  integration-required:\n    if: " ++ full_matrix_condition ++ "\n"));
+    const refused = try f.check("ci-recovery", changed);
+    defer refused.deinit();
+    try refused.failsWith("required integration roots must remain unconditional");
+}
+
 test "security: required CI modes, architecture and aggregate failure propagation refuse mutations" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -560,7 +670,6 @@ test "security: every split build workload job, mode and step fails closed under
             .{ .before = "        include:", .after = "        exclude:" },
             .{ .before = "          - os: ubuntu-24.04-arm\n", .after = "" },
             .{ .before = "      fail-fast: false", .after = "      fail-fast: true" },
-            .{ .before = "\n    steps:\n", .after = "\n    if: false\n    steps:\n" },
             .{ .before = "\n    steps:\n", .after = "\n    continue-on-error: true\n    steps:\n" },
         }) |mutation| {
             const changed = try f.replace(workflow, body, try f.replace(body, mutation.before, mutation.after));
@@ -739,7 +848,7 @@ test "security: required recovery shards keep every mode, selector, setup and ag
     const gate = try job(workflow, "build-and-test", "\n  security-audit:\n");
     for ([_][]const u8{
         workload_needs,
-        "    if: ${{ always() }}",
+        "    if: " ++ aggregate_condition,
         "        name: [linux-x64, linux-arm64]",
         "          BUILD_RESULT: ${{ needs.build-and-test-workload.result }}",
         "          BUILD_PRODUCTION_RESULT: ${{ needs.build-and-test-workload-production.result }}",
@@ -923,11 +1032,11 @@ test "security: aggregate gate rejects failure, cancellation, skip and unknown j
         "RECOVERY_REPOSITORY_RESULT", "RECOVERY_HELPER_RESULT",     "RECOVERY_FAMILY_RESULT",
         "RECOVERY_SCENARIOS_RESULT",  "RECOVERY_DIVERSIONS_RESULT",
     };
-    for (names, 0..) |_, changed| {
+    for (0..names.len + 1) |changed| {
         for (states) |state| {
             var values: [names.len][]const u8 = undefined;
             for (names, 0..) |name, index| {
-                values[index] = try std.fmt.allocPrint(f.arena.allocator(), "{s}={s}", .{ name, if (index == changed) state else "success" });
+                values[index] = try std.fmt.allocPrint(f.arena.allocator(), "{s}={s}", .{ name, if (changed == names.len or index == changed) state else "success" });
             }
             var argv: [names.len + 4][]const u8 = undefined;
             argv[0] = "env";
