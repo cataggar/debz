@@ -2085,7 +2085,7 @@
           "version": "1.9.17p2-1ubuntu3.1"
         }
       ],
-      "digest": "sha256:92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f",
+      "digest": "sha256:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8",
       "id": "prestate:sudo/var/lib/dpkg/info/sudo.list",
       "kind": "prestate",
       "mode": "0644",
@@ -2097,7 +2097,7 @@
         },
         "version": "1.9.17p2-1ubuntu3.1"
       },
-      "review": "#330",
+      "review": "#392",
       "size": 2376,
       "version_bound": false
     },
@@ -2117,7 +2117,7 @@
           "version": "3.14.3-0ubuntu2"
         }
       ],
-      "digest": "sha256:d830caf623e35ec940e8f6d185455faa601a627052b1daffe3e4741b960bb1a3",
+      "digest": "sha256:383196acd094063e8e49dc4511deb7094e264a41d872bb889d21b197a550f628",
       "id": "prestate:python3/var/lib/dpkg/info/python3.list",
       "kind": "prestate",
       "mode": "0644",
@@ -2129,7 +2129,7 @@
         },
         "version": "3.14.3-0ubuntu2"
       },
-      "review": "#330",
+      "review": "#392",
       "size": 918,
       "version_bound": false
     },
@@ -2153,7 +2153,7 @@
           "version": "3.14.3-0ubuntu2"
         }
       ],
-      "digest": "sha256:a0d9c1023aeef88ea89781862449be6b65cf84157b7d894aacd0c536b0940ba8",
+      "digest": "sha256:82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519",
       "id": "prestate:python3-minimal/var/lib/dpkg/info/python3-minimal.list",
       "kind": "prestate",
       "mode": "0644",
@@ -2165,7 +2165,7 @@
         },
         "version": "3.14.3-0ubuntu2"
       },
-      "review": "#330",
+      "review": "#392",
       "size": 781,
       "version_bound": false
     },
@@ -2189,10 +2189,10 @@
           "version": "1.237ubuntu3.1"
         }
       ],
-      "digest": "sha256:fcbd5a4757d10f8e93472331cff45fd91667dad80b16e6e3dffd4a550097c79f",
+      "digest": "sha256:7ce7d005cb9f6144ee42373153611b01a1ab8f867f7174e3c0bf105ca2f7790f",
       "id": "prestate:console-setup-linux/var/lib/dpkg/info/console-setup-linux.list",
       "kind": "prestate",
-      "mode": null,
+      "mode": "0644",
       "package": "console-setup-linux",
       "path": "var/lib/dpkg/info/console-setup-linux.list",
       "provenance": {
@@ -2201,7 +2201,7 @@
         },
         "version": "1.237ubuntu3.1"
       },
-      "review": "#330",
+      "review": "#392",
       "size": 41489,
       "version_bound": false
     },
@@ -2317,10 +2317,10 @@
           "version": "2.88.0-1ubuntu0.1"
         }
       ],
-      "digest": "sha256:7ad0cfea75305b62f9ac8daf97f4304d922a54afb9713b7493aeb285336b9a91",
+      "digest": "sha256:d87291948921b5707a14673f459846076a00d98e671a47b907b1761fab7bbe93",
       "id": "prestate:libglib2.0-0t64/var/lib/dpkg/info/libglib2.0-0t64:amd64.triggers",
       "kind": "prestate",
-      "mode": null,
+      "mode": "0644",
       "package": "libglib2.0-0t64",
       "path": "var/lib/dpkg/info/libglib2.0-0t64:amd64.triggers",
       "provenance": {
@@ -2329,8 +2329,8 @@
         },
         "version": "2.88.0-1ubuntu0.1"
       },
-      "review": "#330",
-      "size": 124,
+      "review": "#392",
+      "size": 171,
       "version_bound": false
     },
     {

@@ -414,7 +414,7 @@ owns **two** existing generic symlinks:
 `/usr/bin/sudoedit -> sudo.ws` and
 `/usr/share/man/man8/sudoedit.8.gz -> sudo.ws.8.gz`. The exact signed
 `sudo.list` (SHA-256
-`92f90d6a92f5c697cce3057db0b0b6ed3d831af950b1b6a2e2704f32410d483f`)
+`39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8`)
 claims both; the proposed `sudo` group, record, selectors, and all other
 generic links are absent.
 
@@ -717,7 +717,7 @@ Its only alternatives-related assignment is the literal
 and the 155-byte `vtrgb.vga` SHA-256 is
 `1018702de86f8c570d097eadda5c2ec807375beb663e3a7afeec2cd1cd3e8f76`.
 The exact root-owned `console-setup-linux.list` (41,489 bytes, SHA-256
-`fcbd5a4757d10f8e93472331cff45fd91667dad80b16e6e3dffd4a550097c79f`)
+`7ce7d005cb9f6144ee42373153611b01a1ab8f867f7174e3c0bf105ca2f7790f`)
 claims both. Before launch, the record, selector, and generic link are absent;
 the installed tool matches the snapshot amd64 digest and executable metadata.
 

@@ -381,6 +381,24 @@ def tar_member(deb: bytes, prefix: str, path: str) -> tuple[bytes, int]:
     raise AssertionError
 
 
+def tar_member_dpkg_list_path(name: str) -> str:
+    if name in ("", "."):
+        return "/."
+    if name.startswith("./"):
+        name = name[2:]
+    if not name.startswith("/"):
+        name = "/" + name
+    return name.rstrip("/") or "/."
+
+
+def dpkg_ownership_list(deb: bytes) -> bytes:
+    lines = []
+    with package_tar(deb, "data.tar") as archive:
+        for member in archive:
+            lines.append(tar_member_dpkg_list_path(member.name))
+    return ("\n".join(lines) + "\n").encode()
+
+
 # Manifest.
 
 
@@ -865,6 +883,26 @@ def observe_identity(identity: dict, arch: str, packages: dict[str, dict], debz:
         for item in identity["derived_from"]:
             derived = packages.get(item["package"])
             observed["derived_versions"][item["package"]] = None if derived is None else derived["version"]
+        if identity["path"] == f"var/lib/dpkg/info/{identity['package']}.list":
+            data = dpkg_ownership_list(debz.archive(entry["lock_package"]))
+            observed.update(
+                digest=tagged("sha256", data),
+                size=len(data),
+                mode="0644",
+            )
+            return observed
+        trigger_paths = {
+            f"var/lib/dpkg/info/{identity['package']}.triggers",
+            f"var/lib/dpkg/info/{identity['package']}:{entry['architecture']}.triggers",
+        }
+        if identity["path"] in trigger_paths:
+            data, mode = tar_member(debz.archive(entry["lock_package"]), "control.tar", "triggers")
+            observed.update(
+                digest=tagged("sha256", data),
+                size=len(data),
+                mode=f"0{mode:03o}",
+            )
+            return observed
         observed.update(digest=None, size=None, mode=None)
         return observed
     deb = debz.archive(entry["lock_package"])
@@ -1099,6 +1137,12 @@ def identity_status(identity: dict, observed: dict[str, dict | None]) -> tuple[s
             ]
             if stale:
                 return "changed", [f"{arch}: derived state depends on changed packages: {', '.join(stale)}"]
+            if value.get("digest") is not None and (
+                value["digest"] != identity["digest"]
+                or value["size"] != identity["size"]
+                or value["mode"] != identity["mode"]
+            ):
+                return "changed", [f"{arch}: derived prestate changed: {identity['digest']} -> {value['digest']}"]
         elif value["digest"] != identity["digest"] or value["size"] != identity["size"] or value["mode"] != identity["mode"]:
             return "changed", [f"{arch}: bound bytes changed: {identity['digest']} -> {value['digest']}"]
         provenance = identity["provenance"]
@@ -1411,7 +1455,7 @@ def record_manifest(
         observed = report["identities"][identity["id"]]
         first = observed[identity["architectures"][0]]
         new = copy.deepcopy(identity)
-        if identity["kind"] != "prestate":
+        if identity["kind"] != "prestate" or first.get("digest") is not None:
             new.update(digest=first["digest"], size=first["size"], mode=first["mode"])
         if series_migration:
             for consumer in new["consumers"]:
