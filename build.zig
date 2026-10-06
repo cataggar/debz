@@ -830,7 +830,7 @@ pub fn build(b: *std.Build) void {
 
     const native_unpack_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{"native_unpack.test."},
+        .filters = &.{b.option([]const u8, "native-unpack-test-filter", "Select focused native unpack unit tests") orelse "native_unpack.test."},
     });
     const run_native_unpack_tests = b.addRunArtifact(native_unpack_tests);
     b.step("test-native-unpack", "Run native unpack and file ownership tests")
@@ -1301,9 +1301,15 @@ pub fn build(b: *std.Build) void {
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{
-            "native_recovery.test.",                                                      "native_provenance.test.",                                                           "native_execution_request.test.",
-            "native_helper.test.",                                                        "native_transaction_result.test.",                                                   "native_install_result.test.",
-            "root_operation_completion.test.store publishes atomically and idempotently", "root_operation_completion.test.store refuses a symbolic link at the document path",
+            "native_phase_telemetry.test.",
+            "native_recovery.test.",
+            "native_provenance.test.",
+            "native_execution_request.test.",
+            "native_helper.test.",
+            "native_transaction_result.test.",
+            "native_install_result.test.",
+            "root_operation_completion.test.store publishes atomically and idempotently",
+            "root_operation_completion.test.store refuses a symbolic link at the document path",
         },
     });
     const run_native_recovery_tests = b.addRunArtifact(native_recovery_tests);
