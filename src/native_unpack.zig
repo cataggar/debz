@@ -122,6 +122,7 @@ const ExecutionState = struct {
     route_settlement: ?ActiveRouteSettlement = null,
     recovery_models: ?[]const archive_application.Model = null,
     recovery_initial_model: ?*const package_database.Model = null,
+    trigger_pending_is_live: bool = false,
 
     fn checkDeadline(self: *ExecutionState) !void {
         try checkRuntimeBounds(self.bounds);
@@ -16604,13 +16605,13 @@ fn deriveDeferredFinalState(
                 record.name,
                 record.architecture,
             );
-            var index = record.triggers_pending.len;
-            while (index != 0) {
-                index -= 1;
+            // f_trigpend prepends the serialized tokens on command import.
+            // This simulation appends noting order, then reverses on write.
+            for (record.triggers_pending) |trigger| {
                 try appendUniqueText(
                     allocator,
                     &entry.values,
-                    record.triggers_pending[index],
+                    trigger,
                 );
             }
         }
@@ -17784,13 +17785,15 @@ fn lifecycleApplyTriggerEvents(
                 record.name,
                 record.architecture,
             );
-            var index = record.triggers_pending.len;
-            while (index != 0) {
-                index -= 1;
+            for (record.triggers_pending, 0..) |_, index| {
+                const position = if (execution.trigger_pending_is_live)
+                    record.triggers_pending.len - index - 1
+                else
+                    index;
                 try appendUniqueText(
                     owned,
                     &entry.values,
-                    record.triggers_pending[index],
+                    record.triggers_pending[position],
                 );
             }
         }
@@ -17858,7 +17861,7 @@ fn lifecycleApplyTriggerEvents(
             .awaited = awaited_values,
         });
     }
-    return lifecycleTriggerDatabase(
+    const result = try lifecycleTriggerDatabase(
         execution,
         allocator,
         root,
@@ -17875,6 +17878,8 @@ fn lifecycleApplyTriggerEvents(
             .pending = if (clear_queue) &.{} else database.model.triggers.pending,
         },
     );
+    if (result.outcome == .applied) execution.trigger_pending_is_live = true;
+    return result;
 }
 
 fn lifecyclePublishDerivedFinalState(
@@ -18178,6 +18183,7 @@ fn nextPendingTriggerHandler(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     architecture: []const u8,
+    pending_is_live: bool,
 ) !?PendingTriggerHandler {
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
@@ -18198,8 +18204,10 @@ fn nextPendingTriggerHandler(
             []const u8,
             record.triggers_pending.len,
         );
+        // Native publication is already in dpkg's in-memory prepend order.
+        // Only a new command's imported status needs f_trigpend's reversal.
         for (record.triggers_pending, 0..) |trigger, index|
-            triggers[record.triggers_pending.len - index - 1] =
+            triggers[if (pending_is_live) index else record.triggers_pending.len - index - 1] =
                 try allocator.dupe(u8, trigger);
         return .{
             .package = .{
@@ -18596,6 +18604,7 @@ fn lifecycleProcessTriggers(
         scratch,
         root,
         program.target_architecture,
+        execution.trigger_pending_is_live,
     )) |handler| {
         if (invocation_count >= maximum_invocations)
             return .{
@@ -18755,6 +18764,7 @@ fn lifecycleProcessTriggers(
             scratch,
             root,
             program.target_architecture,
+            execution.trigger_pending_is_live,
         )) orelse return .{
             .outcome = .applied,
             .detail = "triggers_processed",

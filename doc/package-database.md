@@ -134,14 +134,27 @@ does the imported database, so the snapshot must outlive both.
 
 ## Normalization
 
-Ordering and spelling are preserved wherever dpkg treats them as significant:
-status record order, field order, unknown fields, ownership order, checksum
-order, and trigger order all round-trip byte for byte. Only two documented
-normalizations exist, and both are format-level rather than semantic:
+Import preserves status record order as generation evidence. Publication sorts
+records with dpkg's `pkg_sorter_by_nonambig_name_arch`: bytewise package name,
+then an unqualified native/`all` instance before a qualified foreign instance;
+two qualified instances (including `Multi-Arch: same`) compare architecture
+names bytewise. The writer receives the database's native architecture and
+does not mutate the imported model. Field order, unknown fields, ownership
+order, checksum order, and serialized trigger order remain preserved.
+Two additional format-level normalizations exist:
 continuation lines are republished with dpkg's single leading space, and a
 field with an empty first value line is republished as `Name:` without trailing
-whitespace. Canonical writers exist for every modeled surface, so a healthy
-imported generation re-serializes to identical bytes.
+whitespace. A dpkg-canonical imported generation re-serializes to identical
+bytes; an out-of-order status generation retains its original digest until
+publication, when its sorted bytes produce a new digest.
+
+`test-native-root-import` compares an out-of-order multiarch writer result
+directly with pinned dpkg's rewrite and requires status-byte equality after
+imported-root installation and no-pending commands. The existing lifecycle
+selector's `-Dnative-dpkg-query-only=true` option runs its pinned query cases
+for configured, residual-config, purged, half-configured and trigger-pending
+packages without running unrelated lifecycle fixtures; it requires
+`-Dnative-reference-dpkg`.
 
 ## Generation evidence
 

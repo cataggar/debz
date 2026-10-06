@@ -264,6 +264,15 @@ activation, pending Unincorp queues, known failures, dynamic chains and
 no-progress cycles. It also checks interrupted handler evidence and re-entry
 blocking, malformed queue refusal, unrelated deferred selection changes,
 unauthenticated helper refusal, and diverted/aliased file-trigger routes.
+The one-handler byte-order cases compare raw status and exact, length-framed
+`postinst triggered` argv against pinned dpkg, with multiple explicit and file
+interests. Immediately noted names use dpkg's prepend order; a subsequent
+command reads `Triggers-Pending` by prepending its serialized tokens, reversing
+that order once. Native internal status publications are not new command
+imports. The deferred reinstallation case also tests imported pending names
+coalescing with repeated activations, without moving duplicates. The focused
+`-Dnative-trigger-byte-order-only=true` selector runs these cases in the
+existing native and two-dpkg oracle targets.
 It also runs two **reference-only** guarded, pinned-dpkg cases for a failed
 activating postinst with an unpacked (not configured) listener, once with
 `interest-await` and once with `interest-noawait`. Both assert that the listener
@@ -282,13 +291,15 @@ pending (no `triggers-pending`/`triggers-awaited` package, no pending or
 awaited names, empty `Unincorp`) are not work. That root is `unchanged` with
 `changed=false`, compiles no `process_triggers` program, and leaves status,
 `triggers/` and provenance byte-identical. `test-native-root-import`'s
-`zeroActionTriggers` installs explicit and file interest handlers plus an
+`zeroActionTriggers` installs one explicit/file interest handler plus an
 activating source through native trigger processing. Two zero-action updates
 then leave `var/lib/dpkg` and `var/lib/debz` byte- and mtime-identical. Pinned
 dpkg's `--configure --pending` and `--triggers-only -a` run no script and
-change no `status` or `triggers/` bytes on the reference root; only
-`status-old` is rewritten. It also covers activate-only roots with no
-interested package. An unincorporated activation or a deferred
+change no `status` or `triggers/` bytes on either reference or native clones;
+only `status-old` is rewritten, with persistent locks additionally allowed on
+native clones. Record or field normalization is not accepted as byte equality.
+It also covers activate-only roots with no interested package.
+An unincorporated activation or a deferred
 `Triggers-Pending` still classifies as `execution_required` `process_triggers`,
 and after processing the root is unchanged again.
 

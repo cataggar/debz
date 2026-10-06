@@ -1344,7 +1344,7 @@ fn build(
 
     const packages = try builder.livePackages();
     builder.live_count = packages.len;
-    const status_bytes = try database.writeStatusDocument(builder.arena, packages);
+    const status_bytes = try database.writeStatusDocument(builder.arena, packages, source.model.native_architecture);
     const model = try builder.resultingModel(packages, status_bytes);
     if (try database.validateModel(builder.scratch, model, builder.options.database)) |diagnostic| {
         return .{

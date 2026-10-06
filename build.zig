@@ -1172,6 +1172,8 @@ pub fn build(b: *std.Build) void {
     native_lifecycle_step.dependOn(&lifecycle_zig.step);
     b.step("test-native-lifecycle-zig", "Run Zig-owned lifecycle and diversion acceptance against dpkg")
         .dependOn(&lifecycle_zig.step);
+    if (b.option(bool, "native-dpkg-query-only", "Select pinned dpkg-query status compatibility cases") orelse false)
+        lifecycle_zig.addArg("--dpkg-query-only");
     const root_import_module = b.createModule(.{
         .root_source_file = b.path("test/native_root_import.zig"),
         .target = target,
@@ -1250,6 +1252,10 @@ pub fn build(b: *std.Build) void {
     trigger_oracle_zig.step.dependOn(&run_trigger_zig_tests.step);
     b.step("test-native-triggers-zig-oracle", "Run trigger and settlement reference scenarios in two guarded dpkg roots")
         .dependOn(&trigger_oracle_zig.step);
+    if (b.option(bool, "native-trigger-byte-order-only", "Select exact status and triggered argv byte-order cases") orelse false) {
+        trigger_zig.addArg("--byte-order-only");
+        trigger_oracle_zig.addArg("--byte-order-only");
+    }
     const settlement_oracle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),

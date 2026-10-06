@@ -165,6 +165,7 @@ pub fn main(init: std.process.Init) !void {
     var install_boundaries_only = false;
     var removal_only = false;
     var repository_descriptor_only = false;
+    var dpkg_query_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
@@ -187,6 +188,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--repository-descriptor-only")) {
             if (repository_descriptor_only) return error.DuplicateSelector;
             repository_descriptor_only = true;
+        } else if (std.mem.eql(u8, option, "--dpkg-query-only")) {
+            if (dpkg_query_only) return error.DuplicateSelector;
+            dpkg_query_only = true;
         } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
             driver = option;
         }
@@ -195,7 +199,9 @@ pub fn main(init: std.process.Init) !void {
     if (@as(u8, @intFromBool(diversions_only)) +
         @as(u8, @intFromBool(install_boundaries_only)) +
         @as(u8, @intFromBool(removal_only)) +
-        @as(u8, @intFromBool(repository_descriptor_only)) > 1) return error.InvalidArguments;
+        @as(u8, @intFromBool(repository_descriptor_only)) +
+        @as(u8, @intFromBool(dpkg_query_only)) > 1) return error.InvalidArguments;
+    if (dpkg_query_only and (oracle_only or pinned == null)) return error.PinnedReferenceRequired;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
@@ -203,6 +209,11 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     fixture.oracle_only = oracle_only;
     const selected = driver orelse "";
+    if (dpkg_query_only) {
+        try dpkg_query.run(&fixture, selected, reference.executable, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     if (removal_only) {
         try removal.run(&fixture, selected, reference.executable, reference.architecture);
         try support.assertHostUnchanged(allocator, init.io, reference.before);

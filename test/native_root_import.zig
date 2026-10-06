@@ -2,6 +2,7 @@ const std = @import("std");
 const native_alternatives = @import("debz").native_alternatives;
 const native_provenance = @import("debz").native_provenance;
 const root_fs = @import("debz").root_fs;
+const package_database = @import("debz").package_database;
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const options = @import("native_test_options");
@@ -267,6 +268,7 @@ fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, archi
         .triggers = true,
         .recovery = true,
     }, false);
+    try support.compareStatusBytes(fixture, scenario.reference_root, scenario.native_root);
     const status_after = try rootFile(fixture, scenario.native_root, admin ++ "status");
     defer fixture.allocator.free(status_after);
     if (std.mem.indexOf(u8, status_after, "Package: " ++ keeper ++ "\n") == null or
@@ -571,7 +573,6 @@ fn archNative(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8
 }
 
 const zero_handler = "zero-trigger-handler";
-const zero_file_handler = "zero-file-handler";
 const zero_source = "zero-trigger-source";
 const zero_activator = "zero-trigger-activator";
 const zero_trigger = "debz-zero-trigger";
@@ -592,33 +593,10 @@ fn assertNoPendingTriggers(fixture: *foundation.Fixture, root: []const u8) !void
     if (unincorp.len != 0) return error.ZeroActionFixtureHasPendingTriggers;
 }
 
-/// Status paragraphs as a sorted multiset, so record order is ignored.
-fn sameParagraphs(allocator: std.mem.Allocator, left: []const u8, right: []const u8) !bool {
-    var sides: [2]std.ArrayList([]const u8) = .{ .empty, .empty };
-    defer for (&sides) |*side| side.deinit(allocator);
-    for ([_][]const u8{ left, right }, &sides) |text, *side| {
-        var paragraphs = std.mem.splitSequence(u8, text, "\n\n");
-        while (paragraphs.next()) |paragraph| {
-            const trimmed = std.mem.trim(u8, paragraph, "\n");
-            if (trimmed.len != 0) try side.append(allocator, trimmed);
-        }
-        std.mem.sort([]const u8, side.items, {}, struct {
-            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lessThan);
-    }
-    if (sides[0].items.len != sides[1].items.len) return false;
-    for (sides[0].items, sides[1].items) |a, b| if (!std.mem.eql(u8, a, b)) return false;
-    return true;
-}
-
 /// Which database rewrites pinned dpkg may make while proving it has no
 /// pending work. On its own reference root nothing but `status-old` may
 /// change. On a native root dpkg additionally creates its persistent lock
-/// files and rewrites `status` in its own record order (dpkg sorts records by
-/// name and architecture; native keeps install order), which is allowed only
-/// when the paragraph set is identical.
+/// files. Both roots must retain byte-identical `status`.
 const PendingNoop = enum { reference, native };
 
 /// Pinned dpkg's own pending-work commands on a copy of `source`. With nothing
@@ -658,6 +636,7 @@ fn dpkgPendingNoop(
         defer fixture.allocator.free(after);
         const status_after = try rootFile(fixture, copy, admin ++ "status");
         defer fixture.allocator.free(status_after);
+        if (!std.mem.eql(u8, status_before, status_after)) return error.ReferencePendingChangedStatusBytes;
         const changed = try changedPaths(fixture.allocator, before, after);
         defer fixture.allocator.free(changed);
         for (changed) |path_name| {
@@ -670,9 +649,6 @@ fn dpkgPendingNoop(
                     std.mem.eql(u8, path_name, admin ++ "triggers"))
                 {
                     // Directory entries change only with the created lock files.
-                } else if (std.mem.eql(u8, path_name, admin ++ "status")) {
-                    if (!try sameParagraphs(fixture.allocator, status_before, status_after))
-                        return error.ReferencePendingChangedDatabase;
                 } else return error.ReferencePendingChangedDatabase;
                 continue;
             }
@@ -682,6 +658,44 @@ fn dpkgPendingNoop(
         defer fixture.allocator.free(trace_after);
         if (!std.mem.eql(u8, trace_before, trace_after)) return error.ReferencePendingRanScript;
     }
+}
+
+fn statusWriterOrder(fixture: *foundation.Fixture, dpkg: []const u8, architecture: []const u8) !void {
+    const foreign = if (std.mem.eql(u8, architecture, "amd64")) "arm64" else "amd64";
+    const foreign_arch = if (std.mem.eql(u8, architecture, "amd64")) "arm64\n" else "amd64\n";
+    const root = try fixture.makeRoot("status-writer-order", architecture);
+    defer fixture.allocator.free(root);
+    const arch = try std.fmt.allocPrint(fixture.allocator, "{s}\n{s}\n", .{ architecture, foreign });
+    defer fixture.allocator.free(arch);
+    try fixture.write("status-writer-order/" ++ admin ++ "arch", arch, 0o644);
+    const input =
+        "Package: zz\nStatus: deinstall ok config-files\nArchitecture: all\nVersion: 1\nDescription: last\nX-Order-Note: retained\n continuation\n\n" ++
+        "Package: multi\nStatus: deinstall ok config-files\nArchitecture: arm64\nMulti-Arch: same\nVersion: 1\nDescription: pair\n\n" ++
+        "Package: aa\nStatus: deinstall ok config-files\nArchitecture: all\nVersion: 1\nDescription: first\n\n" ++
+        "Package: multi\nStatus: deinstall ok config-files\nArchitecture: amd64\nMulti-Arch: same\nVersion: 1\nDescription: pair\n\n";
+    var database = switch (try package_database.importSnapshot(fixture.allocator, .{
+        .native_architecture = architecture,
+        .snapshot = .{
+            .status = package_database.regularFile(input),
+            .arch = package_database.regularFile(foreign_arch),
+        },
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.StatusOrderFixtureRejected,
+    };
+    defer database.deinit();
+    const written = try package_database.writeStatusDocument(fixture.allocator, database.model.packages, architecture);
+    defer fixture.allocator.free(written);
+    try fixture.write("status-writer-order/" ++ admin ++ "status", input, 0o644);
+    const root_arg = try std.fmt.allocPrint(fixture.allocator, "--root={s}", .{root});
+    defer fixture.allocator.free(root_arg);
+    if (try support.runExit(fixture, &.{ dpkg, "--force-not-root", "--force-bad-path", root_arg, "--configure", "--pending" }, "status-writer-order/dpkg.log") != 0)
+        return error.StatusOrderReferenceFailed;
+    const oracle = try rootFile(fixture, root, admin ++ "status");
+    defer fixture.allocator.free(oracle);
+    if (!std.mem.eql(u8, written, oracle)) return error.StatusOrderOracleBytesMismatch;
+    try fixture.write("status-writer-order/" ++ support.trace, "", 0o644);
+    try dpkgPendingNoop(fixture, dpkg, root, "status-writer-order-noop", architecture, .reference);
 }
 
 /// A fully configured root whose packages declare trigger interest and
@@ -694,13 +708,9 @@ fn dpkgPendingNoop(
 fn zeroActionTriggers(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, architecture: []const u8) !void {
     const workspace = "packages/zero-action-triggers";
     const handler = try support.makePackage(fixture, architecture, "1", zero_handler, workspace, .{
-        .declarations = "interest-noawait " ++ zero_trigger ++ "\n",
+        .declarations = "interest-noawait " ++ zero_trigger ++ "\ninterest /" ++ zero_files ++ "\n",
     });
     defer fixture.allocator.free(handler);
-    const file_handler = try support.makePackage(fixture, architecture, "1", zero_file_handler, workspace, .{
-        .declarations = "interest /" ++ zero_files ++ "\n",
-    });
-    defer fixture.allocator.free(file_handler);
     const source = try support.makePackage(fixture, architecture, "1", zero_source, workspace, .{
         .declarations = "activate-noawait " ++ zero_trigger ++ "\n",
         .extra_files = &.{.{ .path = zero_files ++ "/" ++ zero_source, .content = "file trigger payload\n" }},
@@ -713,15 +723,16 @@ fn zeroActionTriggers(fixture: *foundation.Fixture, driver: []const u8, dpkg: []
 
     var scenario = try support.Scenario.init(fixture, "zero-action-triggers", driver, dpkg, architecture, false);
     defer scenario.deinit();
-    try scenario.phase(.{ .operation = "install", .archives = &.{ handler, file_handler }, .triggers = true, .recovery = true }, false);
+    try scenario.phase(.{ .operation = "install", .archives = &.{handler}, .triggers = true, .recovery = true }, false);
     try scenario.phase(.{ .operation = "install", .archives = &.{source}, .triggers = true, .recovery = true }, false);
+    try support.compareStatusBytes(fixture, scenario.reference_root, scenario.native_root);
     const trace = try rootFile(fixture, scenario.native_root, support.trace);
     defer fixture.allocator.free(trace);
-    for ([_][]const u8{ zero_handler, zero_file_handler }) |name| {
-        const triggered = try std.fmt.allocPrint(fixture.allocator, "{s}@1:postinst\t{s}\tpostinst\t{s}\t2\t9:triggered\t", .{ name, name, architecture });
-        defer fixture.allocator.free(triggered);
-        if (std.mem.indexOf(u8, trace, triggered) == null) return error.ZeroActionFixtureTriggerNotProcessed;
-    }
+    const names = "/" ++ zero_files ++ " " ++ zero_trigger;
+    const triggered = try std.fmt.allocPrint(fixture.allocator, zero_handler ++ "@1:postinst\t" ++ zero_handler ++
+        "\tpostinst\t{s}\t2\t9:triggered\t{d}:{s}\t", .{ architecture, names.len, names });
+    defer fixture.allocator.free(triggered);
+    if (std.mem.indexOf(u8, trace, triggered) == null) return error.ZeroActionFixtureTriggerNotProcessed;
     for ([_][]const u8{ scenario.reference_root, scenario.native_root }) |root|
         try assertNoPendingTriggers(fixture, root);
     try checkProvenance(fixture, scenario.native_root);
@@ -777,6 +788,7 @@ pub fn main(init: std.process.Init) !void {
     var fixture = try foundation.Fixture.init(allocator, init.io, options.repository);
     defer fixture.deinit();
     errdefer fixture.retain = true;
+    try statusWriterOrder(&fixture, prerequisite.executable, prerequisite.architecture);
     try run(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try archNative(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try zeroActionTriggers(&fixture, driver, prerequisite.executable, prerequisite.architecture);

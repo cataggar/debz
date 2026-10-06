@@ -556,6 +556,22 @@ pub fn compare(fixture: *foundation.Fixture, reference_root: []const u8, candida
     }
 }
 
+pub fn compareStatusBytes(fixture: *foundation.Fixture, reference_root: []const u8, candidate: []const u8) !void {
+    const expected = try statusBytes(fixture, reference_root);
+    defer fixture.allocator.free(expected);
+    const actual = try statusBytes(fixture, candidate);
+    defer fixture.allocator.free(actual);
+    if (!std.mem.eql(u8, expected, actual)) return error.NativeDpkgStatusBytesMismatch;
+}
+
+fn statusBytes(fixture: *foundation.Fixture, root: []const u8) ![]u8 {
+    var guarded = try foundation.guardedRoot(fixture.io, root);
+    guarded.close(fixture.io);
+    const status_path = try path(fixture.allocator, root, "var/lib/dpkg/status");
+    defer fixture.allocator.free(status_path);
+    return read(fixture, status_path, 64 * 1024 * 1024);
+}
+
 const RollbackLink = struct { path: []const u8, original: ?i64 };
 
 fn normalizeRollback(value: *std.json.Value, links: []const RollbackLink, start: i64, end: i64) !void {

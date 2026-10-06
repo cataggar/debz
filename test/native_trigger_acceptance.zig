@@ -197,6 +197,82 @@ fn runTriggeredFailure(fixture: *foundation.Fixture, driver: []const u8, helper:
     }
 }
 
+const immediate_trigger_names = "/usr/share/" ++ source ++ "/data /usr/share/" ++ source ++ " debz-a debz-z";
+const deferred_trigger_names = "debz-z debz-a /usr/share/" ++ source ++ " /usr/share/" ++ source ++ "/data";
+
+fn assertTriggeredArgv(allocator: std.mem.Allocator, recorded: []const u8, arch: []const u8, names: []const u8) !void {
+    const expected = try std.fmt.allocPrint(allocator, receiver ++ "@1:postinst\t" ++ receiver ++
+        "\tpostinst\t{s}\t2\t9:triggered\t{d}:{s}\tpayload=data version 1", .{ arch, names.len, names });
+    defer allocator.free(expected);
+    var invocations: usize = 0;
+    var lines = std.mem.splitScalar(u8, recorded, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, receiver ++ "@1:postinst\t")) continue;
+        if (!std.mem.eql(u8, expected, line)) return error.TriggerArgvBytesMismatch;
+        invocations += 1;
+    }
+    if (invocations != 1) return error.TriggerInvocationCountMismatch;
+}
+
+fn runTriggerByteOrder(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const handler = try support.makePackage(fixture, arch, "1", receiver, "byte-order-packages", .{
+        .declarations = "interest-noawait debz-z\ninterest-noawait debz-a\n" ++
+            "interest-noawait /usr/share/" ++ source ++ "\n" ++
+            "interest-noawait /usr/share/" ++ source ++ "/data\n",
+    });
+    defer fixture.allocator.free(handler);
+    const activating = try support.makePackage(fixture, arch, "1", source, "byte-order-packages", .{
+        .declarations = "activate-noawait debz-z\nactivate-noawait debz-a\n",
+    });
+    defer fixture.allocator.free(activating);
+    const cases = [_]struct { name: []const u8, defer_triggers: bool, reimport: bool }{
+        .{ .name = "trigger-byte-order-immediate", .defer_triggers = false, .reimport = false },
+        .{ .name = "trigger-byte-order-deferred", .defer_triggers = true, .reimport = false },
+        .{ .name = "trigger-byte-order-reimport", .defer_triggers = true, .reimport = true },
+    };
+    for (cases) |input| {
+        const name = input.name;
+        const defer_triggers = input.defer_triggers;
+        var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+        defer case.deinit();
+        try case.seed(handler);
+        try copyNativeHelper(fixture, &case, helper);
+        try case.phase(.{
+            .operation = "install",
+            .archives = &.{activating},
+            .triggers = true,
+            .defer_triggers = defer_triggers,
+        }, false);
+        try support.compareStatusBytes(fixture, case.reference_root, case.native_root);
+        if (defer_triggers) {
+            const status_path = try std.fmt.allocPrint(fixture.allocator, "{s}/reference/var/lib/dpkg/status", .{name});
+            defer fixture.allocator.free(status_path);
+            const status = try support.read(fixture, status_path, 64 * 1024);
+            defer fixture.allocator.free(status);
+            if (std.mem.indexOf(u8, status, "Triggers-Pending: " ++ immediate_trigger_names ++ "\n") == null)
+                return error.TriggerPendingBytesMismatch;
+        }
+        if (input.reimport) {
+            try case.phase(.{
+                .operation = "reinstall",
+                .archives = &.{activating},
+                .triggers = true,
+                .defer_triggers = true,
+            }, false);
+            try support.compareStatusBytes(fixture, case.reference_root, case.native_root);
+        }
+        if (defer_triggers) try case.phase(.{ .operation = "process_triggers", .triggers = true }, false);
+        try support.compareStatusBytes(fixture, case.reference_root, case.native_root);
+        for ([_][]const u8{ "reference", "native" }) |side| {
+            const trace_path = try std.fmt.allocPrint(fixture.allocator, "{s}/{s}/{s}", .{ name, side, support.trace });
+            defer fixture.allocator.free(trace_path);
+            const recorded = try support.read(fixture, trace_path, 64 * 1024);
+            defer fixture.allocator.free(recorded);
+            try assertTriggeredArgv(fixture.allocator, recorded, arch, if (defer_triggers and !input.reimport) deferred_trigger_names else immediate_trigger_names);
+        }
+    }
+}
+
 fn runTriggerLifecycle(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
     const mixed_handler = try support.makePackage(fixture, arch, "1", receiver, "mixed-packages", .{
         .declarations = "interest-await debz-a\ninterest-noawait debz-b\ninterest-await /usr/share/" ++ source ++ "\n",
@@ -1111,6 +1187,7 @@ pub fn main(init: std.process.Init) !void {
     var diversions_only = false;
     var settlement_reference_only = false;
     var removal_only = false;
+    var byte_order_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--native-helper")) {
             if (helper != null) return error.DuplicateHelper;
@@ -1133,12 +1210,17 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--removal-only")) {
             if (removal_only) return error.DuplicateSelector;
             removal_only = true;
+        } else if (std.mem.eql(u8, option, "--byte-order-only")) {
+            if (byte_order_only) return error.DuplicateSelector;
+            byte_order_only = true;
         } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
             driver = option;
         }
     }
     try validateSelection(driver, helper, oracle_only, diversions_only, settlement_reference_only);
     if (removal_only and (diversions_only or settlement_reference_only)) return error.InvalidArguments;
+    if (byte_order_only and (removal_only or diversions_only or settlement_reference_only)) return error.InvalidArguments;
+    if (byte_order_only and pinned == null) return error.PinnedReferenceRequired;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
@@ -1150,6 +1232,11 @@ pub fn main(init: std.process.Init) !void {
     else
         "";
     const native_driver = driver orelse "";
+    if (byte_order_only) {
+        try runTriggerByteOrder(&fixture, native_driver, selected, reference.executable, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     if (removal_only) {
         try removal_cases.run(&fixture, native_driver, selected, reference.executable, reference.architecture, copyNativeHelper);
         try support.assertHostUnchanged(allocator, init.io, reference.before);
@@ -1169,6 +1256,10 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         runTriggerLifecycle(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
+            try support.assertHostUnchanged(allocator, init.io, reference.before);
+            return err;
+        };
+        runTriggerByteOrder(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };
@@ -1223,6 +1314,26 @@ test "standalone settlement selector cannot claim native parity or combine with 
     try std.testing.expectError(error.InvalidReferenceSelection, validateSelection("driver", null, false, false, false));
     try std.testing.expectError(error.InvalidReferenceSelection, validateSelection(null, "helper", true, false, true));
     try std.testing.expectError(error.InvalidReferenceSelection, validateSelection("driver", "helper", true, false, false));
+}
+
+test "trigger byte-order oracle refuses reordered argv and duplicate callbacks" {
+    const allocator = std.testing.allocator;
+    const prefix = receiver ++ "@1:postinst\t" ++ receiver ++ "\tpostinst\tamd64\t2\t9:triggered\t80:";
+    const suffix = "\tpayload=data version 1\n";
+    const trace = prefix ++ immediate_trigger_names ++ suffix;
+    try assertTriggeredArgv(allocator, trace, "amd64", immediate_trigger_names);
+    try std.testing.expectError(error.TriggerArgvBytesMismatch, assertTriggeredArgv(
+        allocator,
+        prefix ++ deferred_trigger_names ++ suffix,
+        "amd64",
+        immediate_trigger_names,
+    ));
+    try std.testing.expectError(error.TriggerInvocationCountMismatch, assertTriggeredArgv(
+        allocator,
+        trace ++ trace,
+        "amd64",
+        immediate_trigger_names,
+    ));
 }
 
 test "trigger helper exclusion cannot hide package status and queue mutations" {
