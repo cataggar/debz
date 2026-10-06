@@ -88,6 +88,15 @@ require_protected_file "$script_path"
 require_protected_file "$repository_root/tools/real-snapshot-reference-order.py"
 require_protected_file "$repository_root/tools/real-snapshot-reference-launcher.zig"
 require_protected_file "$repository_root/tools/prepare-native-dpkg.py"
+# The staged toolchain lives outside the fixed PATH above, so the caller names
+# it and it is verified like every other root-trusted input: it compiles the
+# launcher that runs as root below.
+zig=$(command -v "${DEBZ_ZIG:-zig}") || {
+  echo "the zig toolchain that compiles the launcher was not found: ${DEBZ_ZIG:-zig}" >&2
+  exit 2
+}
+zig=$(realpath -- "$zig")
+require_protected_file "$zig"
 require_protected_path "$repository_root/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$repository_root/.real-snapshot") == 0:0:700 ]] || {
   echo "the fixture directory must be root-owned and mode 0700" >&2
@@ -201,7 +210,7 @@ printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nrelease_sha256=%s\nc
   "$(sha256sum "$pinned" | cut -d' ' -f1)" "$(sha256sum "$lock" | cut -d' ' -f1)" \
   "$release_sha256" "$closure_sha256" "${#bootstrap[@]}" >"$evidence/reference-identity.txt"
 launcher=$tools/reference-launcher
-zig build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+"$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
   --cache-dir "$tools/zig-cache" \
   --global-cache-dir "$tools/zig-global-cache" \
   -femit-bin="$launcher"

@@ -1737,6 +1737,7 @@ jobs:
             tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \
             "$PWD/.real-snapshot/ws"
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C.UTF-8 \
+            DEBZ_ZIG="$PROTECTED/zig/zig" \
             tools/real-snapshot-signed-proc-prestates.sh \
             "$PWD/.real-snapshot/pinned-dpkg/usr/bin/dpkg" "$PWD/.real-snapshot/ws"
       - name: Run pinned dpkg proofs on separate prestate copies
