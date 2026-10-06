@@ -1,4 +1,32 @@
 {
+  "coordinate_consumers": [
+    {
+      "bindings": {
+        "release_sha256": "frozen_release_sha256",
+        "suite": "pinned_suite",
+        "uri": "pinned_uri"
+      },
+      "path": "tools/real-snapshot-acceptance.sh"
+    },
+    {
+      "bindings": {
+        "release_sha256": "frozen_release_sha256",
+        "suite": "snapshot_suite",
+        "uri": "snapshot_uri",
+        "witness_suites": "snapshot_witness_suites"
+      },
+      "path": "tools/real-snapshot-reference-protected-stage.sh"
+    },
+    {
+      "bindings": {
+        "release_sha256": "frozen_release_sha256",
+        "suite": "snapshot_suite",
+        "uri": "snapshot_uri",
+        "witness_suites": "snapshot_witness_suites"
+      },
+      "path": "tools/real-snapshot-signed-proc-bindings.sh"
+    }
+  ],
   "excluded": [
     {
       "digest": "sha256:0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
@@ -937,6 +965,14 @@
         {
           "form": "hex",
           "path": "doc/integration-roots.md"
+        },
+        {
+          "bindings": {
+            "digest_size": "script_dpkg_amd64",
+            "version": "script_dpkg_version"
+          },
+          "form": "shell",
+          "path": "tools/real-snapshot-acceptance.sh"
         }
       ],
       "digest": "sha256:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517",
@@ -971,6 +1007,14 @@
         {
           "form": "hex",
           "path": "doc/integration-roots.md"
+        },
+        {
+          "bindings": {
+            "digest_size": "script_dpkg_arm64",
+            "version": "script_dpkg_version"
+          },
+          "form": "shell",
+          "path": "tools/real-snapshot-acceptance.sh"
         }
       ],
       "digest": "sha256:6c03c9fa2053b5a4e899438c1318ed460f62f01812da7f91f6c35a7e0957692f",
@@ -1001,6 +1045,14 @@
         {
           "form": "hex",
           "path": "doc/integration-roots.md"
+        },
+        {
+          "bindings": {
+            "digest_size": "script_dpkg_divert_amd64",
+            "version": "script_dpkg_version"
+          },
+          "form": "shell",
+          "path": "tools/real-snapshot-acceptance.sh"
         }
       ],
       "digest": "sha256:e975eecfbceda235ecedc2e35addf5cc5abe05de355202780cf8e47b2f6745eb",
@@ -1031,6 +1083,14 @@
         {
           "form": "hex",
           "path": "doc/integration-roots.md"
+        },
+        {
+          "bindings": {
+            "digest_size": "script_dpkg_divert_arm64",
+            "version": "script_dpkg_version"
+          },
+          "form": "shell",
+          "path": "tools/real-snapshot-acceptance.sh"
         }
       ],
       "digest": "sha256:50fd191a3a97a17ff0de4bb921ded2d877e5648e197712e8025631c09d456798",
@@ -1061,6 +1121,14 @@
         {
           "form": "hex",
           "path": "doc/integration-roots.md"
+        },
+        {
+          "bindings": {
+            "digest_size": "script_dpkg_statoverride_amd64",
+            "version": "script_dpkg_version"
+          },
+          "form": "shell",
+          "path": "tools/real-snapshot-acceptance.sh"
         }
       ],
       "digest": "sha256:f8496aa47ff782a4881ebdf9e0a4e4615e81f8c56bc004af51f49954e315ff8c",
@@ -1091,6 +1159,14 @@
         {
           "form": "hex",
           "path": "doc/integration-roots.md"
+        },
+        {
+          "bindings": {
+            "digest_size": "script_dpkg_statoverride_arm64",
+            "version": "script_dpkg_version"
+          },
+          "form": "shell",
+          "path": "tools/real-snapshot-acceptance.sh"
         }
       ],
       "digest": "sha256:b9c47a676498db293c4f674d63af54656d274e68b7598e235ec50f2380dba0f6",
@@ -2032,9 +2108,18 @@
         "amd64",
         "arm64"
       ],
+      "artifact": {
+        "architecture": "all",
+        "filename": "pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb"
+      },
       "consumers": [
         {
-          "form": "hex",
+          "bindings": {
+            "digest": "archive_keyring_deb_sha512",
+            "size": "archive_keyring_deb_size",
+            "url": "archive_keyring_deb_url"
+          },
+          "form": "shell",
           "path": "tools/real-snapshot-reference-protected-ci.sh"
         }
       ],
@@ -2060,9 +2145,19 @@
         "amd64",
         "arm64"
       ],
+      "artifact": {
+        "architecture": "all",
+        "filename": "pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb"
+      },
       "consumers": [
         {
-          "form": "hex",
+          "bindings": {
+            "digest": "archive_keyring_sha256",
+            "member": "archive_keyring_member",
+            "size": "archive_keyring_size",
+            "url": "archive_keyring_deb_url"
+          },
+          "form": "shell",
           "path": "tools/real-snapshot-reference-protected-ci.sh"
         },
         {
@@ -2416,6 +2511,7 @@
       "version_bound": false
     }
   ],
+  "prestate_evidence": "tools/fixtures/real-snapshot/prestate-sources-v1.zip",
   "schema": "io.github.cataggar.debz.real-snapshot-pin.v1",
   "series": {
     "architectures": [

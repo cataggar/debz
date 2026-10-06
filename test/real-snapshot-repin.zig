@@ -764,6 +764,66 @@ test "repin: a frozen Release that differs from the reviewed pin is refused befo
     try std.testing.expect(!h.exists("ws/frozen"));
 }
 
+test "repin: offline source evidence defeats matching stale prestate code and manifest" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const t1 = h.settledDay(2);
+    const ownership = "/usr/share/alpha/data\n";
+    const packages = [_]Package{.{
+        .name = "alpha",
+        .version = "1.0",
+        .files = &.{.{ .name = "./usr/share/alpha/data", .bytes = "alpha\n" }},
+    }};
+    try h.writeSnapshot("prestate", t1, &.{"stable"}, &packages);
+    const profile = try h.writeProfile("synthetic-prestate", "prestate", try h.fingerprint(), bounded);
+    const digest = try sha256Hex(h.arena(), ownership);
+    const identities = try h.print(
+        "[{{\"id\":\"prestate:alpha/var/lib/dpkg/info/alpha.list\",\"kind\":\"prestate\",\"package\":\"alpha\"," ++
+            "\"architectures\":[\"amd64\",\"arm64\"],\"path\":\"var/lib/dpkg/info/alpha.list\"," ++
+            "\"digest\":\"sha256:{s}\",\"size\":{d},\"mode\":\"0644\",\"version_bound\":false," ++
+            "\"derived_from\":[{{\"package\":\"alpha\",\"version\":\"1.0\"}}],\"provenance\":\"pending\"," ++
+            "\"consumers\":[{{\"path\":\"src/native_unpack.zig\",\"form\":\"hex\"}}],\"review\":\"#1\"}}]",
+        .{ digest, ownership.len },
+    );
+    try h.writeManifest("synthetic-prestate", profile, t1, "[]", identities);
+    try h.writeDebz("synthetic-prestate", "");
+    const source = try h.print(
+        "const inputs = .{{.{{ .path = \"var/lib/dpkg/info/alpha.list\", .size = {d}, .mode = 0o644, .sha256 = \"{s}\" }}}};\n",
+        .{ ownership.len, digest },
+    );
+    try h.work.write("tree/src/native_unpack.zig", source);
+    _ = try h.probe("synthetic-prestate", t1, "ws/prestate", 0);
+    const manifest = try h.path("synthetic-prestate.pin.json");
+    const tree = try h.path("tree");
+    _ = try h.repin(&.{
+        "record", "--manifest", manifest, "--report", try h.path("ws/prestate/report.json"), "--root", tree,
+    }, 0);
+    const calls = try h.calls("synthetic-prestate");
+    const check = [_][]const u8{
+        "check", "--manifest", manifest, "--root", tree, "--profile", try h.path("synthetic-prestate.profile.json"),
+    };
+    _ = try h.repin(&check, 0);
+    try std.testing.expect(h.exists("tree/tools/fixtures/real-snapshot/prestate-sources-v1.zip"));
+    const stale = try sha256Hex(h.arena(), "stale historical list\n");
+    _ = try h.run(&.{
+        "python3", "-c",
+        "import json,sys; p=sys.argv[1]; m=json.load(open(p)); m['identities'][0]['digest']='sha256:'+sys.argv[2]; " ++
+            "open(p,'w').write(json.dumps(m))",
+        manifest,  stale,
+    }, 0);
+    try h.work.write("tree/src/native_unpack.zig", try h.print(
+        "const inputs = .{{.{{ .path = \"var/lib/dpkg/info/alpha.list\", .size = {d}, .mode = 0o644, .sha256 = \"{s}\" }}}};\n",
+        .{ ownership.len, stale },
+    ));
+    const refused = try h.repin(&check, 1);
+    try contains(refused.stderr, "independent source evidence");
+    try contains(refused.stderr, "derived bytes disagree");
+    try expectAbsent(refused.stderr, "does not pin");
+    try expectAbsent(refused.stderr, "in-tree pin");
+    try std.testing.expectEqualStrings(calls, try h.calls("synthetic-prestate"));
+}
+
 const two_bounded = "[{\"suite\":\"stable\",\"role\":\"bounded\"},{\"suite\":\"stable-security\",\"role\":\"bounded\"}]";
 
 const architectures = [_][]const u8{ "amd64", "arm64" };

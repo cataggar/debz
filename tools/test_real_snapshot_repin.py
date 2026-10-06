@@ -16,6 +16,8 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -642,6 +644,22 @@ class CheckTests(unittest.TestCase):
         self.assertTrue(any("constant snapshot_alpha_sha256" in failure for failure in failures))
         self.assertTrue(any("disagrees with file:beta/usr/bin/beta" in failure for failure in failures))
 
+    def test_archive_record_size_version_and_architecture_cannot_hide_behind_digest(self) -> None:
+        archive = identity(id="archive:gamma", kind="archive", package="gamma", path=None, mode=None,
+                           digest=sha512(b"gamma"), size=5,
+                           provenance={"version": "1.0", "archives": {"amd64": sha512(b"gamma")}},
+                           consumers=[{"path": "src/native_unpack.zig", "form": "hex"}])
+        value = copy.deepcopy(self.manifest)
+        value["identities"].append(archive)
+        source = ('.{ .package = .{ .name = "gamma", .version = "1.0", .architecture = "amd64" },\n'
+                  f'.size = 5, .sha512 = "{archive["digest"].split(":")[1]}" }},\n')
+        target = self.root / "src/native_unpack.zig"
+        target.write_text(source)
+        self.assertEqual(self.failures(value), [])
+        for old, new in ((".size = 5", ".size = 6"), ('"1.0"', '"0.9"'), ('"amd64"', '"arm64"')):
+            target.write_text(source.replace(old, new))
+            self.assertTrue(any("archive version, size or architecture" in f for f in self.failures(value)))
+
     def test_protected_stage_profiles_must_match_manifest_and_launcher(self) -> None:
         frozen = pocket("stable", "frozen", b"frozen")
         value = copy.deepcopy(self.manifest)
@@ -765,6 +783,292 @@ class PackageTests(unittest.TestCase):
         data = deb({"postinst": (SCRIPT, 0o755)}, {})
         with self.assertRaisesRegex(repin.RepinError, "truncated or duplicate"):
             repin.ar_members(data[:-40])
+
+
+class CoordinateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        (ROOT / ".tmp").mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix="repin-coordinates-", dir=ROOT / ".tmp")
+        self.root = Path(self.temporary.name)
+        self.value = identity(provenance={"version": "1.0", "archives": {"amd64": sha512(b"archive")}},
+                              consumers=[{"path": "pins.sh", "form": "shell", "bindings": {
+                                  "digest": "member_digest", "size": "member_size", "version": "package_version",
+                                  "member": "member_path"}}])
+        self.text = (
+            f"readonly member_digest={sha256(SCRIPT).split(':')[1]}\n"
+            f"readonly member_size={len(SCRIPT)}\n"
+            "readonly package_version=1.0\nreadonly member_path=./postinst\n"
+        )
+        (self.root / "pins.sh").write_text(self.text)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_named_coordinates_reject_stale_literals_even_when_comments_are_correct(self) -> None:
+        repin.validate_identity(self.value, 0)
+        self.assertEqual(repin.consumer_failures(self.value, self.root), [])
+        for old, new, coordinate in (
+            (f"member_size={len(SCRIPT)}", "member_size=1", "size"),
+            ("package_version=1.0", "package_version=0.9", "version"),
+            ("member_path=./postinst", "member_path=./preinst", "member"),
+            ("member_digest=" + sha256(SCRIPT).split(":")[1], "member_digest=" + "0" * 64, "digest"),
+        ):
+            with self.subTest(coordinate=coordinate):
+                (self.root / "pins.sh").write_text(self.text.replace(old, new) + "\n# " + self.text.replace("\n", " "))
+                self.assertTrue(any(f" {coordinate} (" in failure for failure in repin.consumer_failures(self.value, self.root)))
+
+    def test_keyring_url_deb_size_and_member_size_are_typed_consumers(self) -> None:
+        committed = repin.load_json(ROOT / repin.DEFAULT_MANIFEST)
+        archive = next(i for i in committed["identities"] if i["id"] == "archive:ubuntu-keyring")
+        member = next(i for i in committed["identities"] if i["package"] == "ubuntu-keyring" and i["kind"] == "tool_file")
+        relative = next(c["path"] for c in archive["consumers"] if c["form"] == "shell")
+        target = self.root / relative
+        target.parent.mkdir(parents=True)
+        source = (ROOT / relative).read_text()
+        for old, new, coordinate, bound in (
+            ("ubuntu-keyring_2023.11.28.1build1_all.deb", "ubuntu-keyring_2026.08.18_all.deb", "url", archive),
+            ("archive_keyring_deb_size=11228", "archive_keyring_deb_size=12718", "size", archive),
+            ("archive_keyring_size=3607", "archive_keyring_size=2334", "size", member),
+            ("archive_keyring_member=./usr/share/keyrings", "archive_keyring_member=./etc/keyrings", "member", member),
+        ):
+            with self.subTest(coordinate=coordinate, old=old):
+                target.write_text(source.replace(old, new))
+                failures = repin.consumer_failures(bound, self.root, committed)
+                self.assertTrue(any(f" {coordinate} (" in failure for failure in failures), failures)
+        target.write_text(source)
+        self.assertEqual(repin.consumer_failures(archive, self.root, committed), [])
+        moved = copy.deepcopy(archive)
+        moved["provenance"]["version"] = "2026.08.18"
+        with self.assertRaisesRegex(repin.RepinError, "version"):
+            repin.validate_identity(moved, 0)
+
+    def test_duplicate_or_dynamic_assignment_is_not_a_literal_binding(self) -> None:
+        for addition in ("\nreadonly member_size=1\n", "\nreadonly member_size=$(wc -c <postinst)\n"):
+            (self.root / "pins.sh").write_text(self.text + addition)
+            self.assertTrue(any(" size (" in failure for failure in repin.consumer_failures(self.value, self.root)))
+
+    def test_digest_size_tuple_and_explicit_version_binding(self) -> None:
+        self.value["consumers"][0]["bindings"] = {"digest_size": "member", "version": "version"}
+        text = f"readonly member='{sha256(SCRIPT).split(':')[1]} {len(SCRIPT)}'\nreadonly version=1.0\n"
+        (self.root / "pins.sh").write_text(text)
+        self.assertEqual(repin.consumer_failures(self.value, self.root), [])
+        (self.root / "pins.sh").write_text(text.replace(f" {len(SCRIPT)}'", " 1'"))
+        self.assertTrue(any("digest_size" in f for f in repin.consumer_failures(self.value, self.root)))
+
+    def test_generic_snapshot_suite_witness_uri_and_release_bindings(self) -> None:
+        frozen = pocket("stable", "frozen", b"frozen")
+        value = manifest(pockets=[{"suite": "stable", "role": "frozen"}, {"suite": "stable-updates", "role": "witness"}])
+        value["snapshot"]["pockets"] = [frozen]
+        value["coordinate_consumers"] = [{"path": "pins.sh", "bindings": {
+            "suite": "suite", "uri": "uri", "witness_suites": "witnesses", "release_sha256": "release"}}]
+        text = ("readonly suite=stable\nreadonly witnesses=(stable-updates)\n"
+                f"readonly uri={repin.snapshot_uri(value['series'], T0)}\n"
+                f"readonly release={frozen['release_sha256'].split(':')[1]}\n")
+        (self.root / "pins.sh").write_text(text)
+        self.assertEqual(repin.snapshot_coordinate_failures(value, self.root), [])
+        for old, new, coordinate in (
+            ("suite=stable", "suite=wrong", "suite"),
+            ("witnesses=(stable-updates)", "witnesses=(stable-security)", "witness_suites"),
+            (T0, T1, "uri"),
+            (frozen["release_sha256"].split(":")[1], "0" * 64, "release_sha256"),
+        ):
+            with self.subTest(coordinate=coordinate):
+                (self.root / "pins.sh").write_text(text.replace(old, new))
+                self.assertTrue(any(f" {coordinate} (" in f for f in repin.snapshot_coordinate_failures(value, self.root)))
+
+    def test_coordinate_schema_is_strict(self) -> None:
+        for bindings in ({"digest": "x", "unknown": "y"}, {"digest": "x", "size": "x"}, {"digest": "$(true)"}, {"size": "x"}):
+            value = copy.deepcopy(self.value)
+            value["consumers"][0]["bindings"] = bindings
+            with self.subTest(bindings=bindings), self.assertRaises(repin.RepinError):
+                repin.validate_identity(value, 0)
+
+
+class SourceEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        (ROOT / ".tmp").mkdir(exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(prefix="repin-evidence-", dir=ROOT / ".tmp")
+        self.root = Path(self.temporary.name)
+        self.directory = self.root / "probe"
+        self.directory.mkdir()
+        (self.directory / "locks").mkdir()
+        control = b"Package: alpha\nVersion: 1.0\nArchitecture: all\nDescription: synthetic\n"
+        self.archive = deb({"control": (control, 0o644), "triggers": (b"interest /usr/share/alpha\n", 0o644)},
+                           {"usr/share/alpha": (b"alpha\n", 0o644)})
+        self.member = repin.dpkg_ownership_list(self.archive)
+        self.value = manifest([identity(
+            id="prestate:alpha/var/lib/dpkg/info/alpha.list", kind="prestate", path="var/lib/dpkg/info/alpha.list",
+            digest=sha256(self.member), size=len(self.member), mode="0644",
+            derived_from=[{"package": "alpha", "version": "1.0"}],
+            provenance={"version": "1.0", "archives": {"amd64": sha512(self.archive)}},
+        )])
+        self.report = report({}, timestamp=T0)
+        self.report["repository_ids"] = {"amd64": {"stable": "1" * 64}}
+        index = (
+            f"Package: alpha\nVersion: 1.0\nArchitecture: all\nSize: {len(self.archive)}\n"
+            f"SHA512: {sha512(self.archive).split(':')[1]}\nFilename: pool/alpha_1.0_all.deb\n\n"
+        ).encode()
+        cleartext = (f"Suite: stable\nDate: Sun, 26 Sep 2026 23:00:00 UTC\nSHA256:\n"
+                     f" {sha256(index).split(':')[1]} {len(index)} main/binary-amd64/Packages\n").encode()
+        release = (b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n" + cleartext +
+                   b"-----BEGIN PGP SIGNATURE-----\nsynthetic unit fixture\n")
+        self.report["pockets"][0].update(release_sha256=sha256(cleartext), in_release_sha256=sha256(release),
+                                          in_release_sha512=sha512(release))
+        metadata = {"index_file": "indexes/amd64-stable-Packages", "index_path": "main/binary-amd64/Packages",
+                    "release_file": "releases/stable.InRelease"}
+        self.report["artifact_sources"] = {"amd64": {"alpha": metadata}}
+        for relative, content in ((metadata["index_file"], index), (metadata["release_file"], release)):
+            target = self.directory / relative
+            target.parent.mkdir(parents=True)
+            target.write_bytes(content)
+        self.value["snapshot"] = {
+            "timestamp": T0, "status": "probed", "pockets": self.report["pockets"],
+            "admission_deadline": self.report["admission_deadline"], "closures": {},
+        }
+        entry = {
+            "name": "alpha", "version": "1.0", "architecture": "all", "declared_size": len(self.archive),
+            "origin": {"type": "authenticated_repository", "repository_id": "1" * 64, "repository_snapshot_sha256": "2" * 64},
+            "archive_identity": {"primary": "sha512", "digests": [{"algorithm": "sha512", "digest": sha512(self.archive).split(":")[1]}]},
+        }
+        self.lock = {"packages": [entry], "repositories": [{
+            "id": "1" * 64, "snapshot_sha256": "2" * 64,
+            "release_sha256": self.report["pockets"][0]["release_sha256"].split(":")[1], "signer_fingerprints": [SIGNER],
+            "index_identity": {"primary": "sha256", "digests": [{"algorithm": "sha256", "digest": sha256(index).split(":")[1]}]},
+        }]}
+        repin.write_json(self.directory / "report.json", self.report)
+        repin.write_json(self.directory / "locks/amd64.lock.json", self.lock)
+        cas = self.directory / "amd64/cache/packages-v2/objects"
+        cas.mkdir(parents=True)
+        (cas / sha512(self.archive).replace(":", "-")).write_bytes(self.archive)
+        self.value["prestate_evidence"] = "evidence.zip"
+        repin.export_prestate_evidence(self.value, self.report, self.directory, self.root)
+        (self.root / "pins.txt").write_text(sha256(self.member).split(":")[1])
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_retained_bytes_are_rederived_without_network_or_cached_verdict(self) -> None:
+        with patch.object(repin, "fetch", side_effect=AssertionError("offline")), patch.object(repin.Debz, "run", side_effect=AssertionError("offline")):
+            self.assertEqual(repin.check_manifest(self.value, self.root, self.value["series"]), [])
+        # Even a mutually consistent consumer and manifest cannot replace the retained source bytes.
+        changed = copy.deepcopy(self.value)
+        changed["identities"][0]["digest"] = sha256(b"historical stale list\n")
+        (self.root / "pins.txt").write_text(changed["identities"][0]["digest"].split(":")[1])
+        self.assertEqual(repin.consumer_failures(changed["identities"][0], self.root), [])
+        self.assertTrue(any("derived bytes disagree" in f for f in repin.check_manifest(changed, self.root, changed["series"])))
+
+    def test_derived_digest_size_mode_version_and_archive_mutations_fail(self) -> None:
+        for key, wrong in (("digest", sha256(b"stale")), ("size", 1), ("mode", "0755")):
+            changed = copy.deepcopy(self.value)
+            changed["identities"][0][key] = wrong
+            self.assertTrue(any("derived bytes disagree" in f for f in repin.prestate_evidence_failures(changed, self.root)))
+        for mutate in (
+            lambda i: i["provenance"].update(version="0.9"),
+            lambda i: i["provenance"]["archives"].update(amd64=sha512(b"stale")),
+            lambda i: i["derived_from"][0].update(version="0.9"),
+        ):
+            changed = copy.deepcopy(self.value)
+            mutate(changed["identities"][0])
+            self.assertTrue(repin.prestate_evidence_failures(changed, self.root))
+
+    def test_trigger_derivation_reuses_control_member_and_missing_evidence_refuses(self) -> None:
+        changed = copy.deepcopy(self.value)
+        item = changed["identities"][0]
+        member = b"interest /usr/share/alpha\n"
+        item.update(id="prestate:alpha/var/lib/dpkg/info/alpha.triggers", path="var/lib/dpkg/info/alpha.triggers",
+                    digest=sha256(member), size=len(member))
+        self.assertEqual(repin.prestate_evidence_failures(changed, self.root), [])
+        del changed["prestate_evidence"]
+        self.assertTrue(any("no retained" in f for f in repin.prestate_evidence_failures(changed, self.root)))
+
+    def test_artifact_filename_is_grounded_in_original_signed_packages_bytes(self) -> None:
+        changed = copy.deepcopy(self.value)
+        changed["identities"][0]["artifact"] = {"filename": "pool/alpha_1.0_all.deb", "architecture": "all"}
+        changed["identities"][0]["consumers"] = [{"path": "pins.txt", "form": "shell", "bindings": {
+            "digest": "digest", "url": "url", "size": "size", "member": "member"}}]
+        repin.validate_identity(changed["identities"][0], 0)
+        self.assertEqual(repin.prestate_evidence_failures(changed, self.root), [])
+        changed["identities"][0]["artifact"]["filename"] = "wrong-pool/alpha_1.0_all.deb"
+        repin.validate_identity(changed["identities"][0], 0)
+        self.assertTrue(any("artifact filename" in f for f in repin.prestate_evidence_failures(changed, self.root)))
+
+    def test_retained_release_index_and_lock_tampering_or_zip_traversal_refuses(self) -> None:
+        original = (self.root / "evidence.zip").read_bytes()
+        for prefix in ("releases/", "indexes/", "locks/", "../escape"):
+            output = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(original)) as old, zipfile.ZipFile(output, "w") as new:
+                for entry in old.infolist():
+                    content = old.read(entry.filename)
+                    if entry.filename.startswith(prefix):
+                        content += b"x"
+                    new.writestr(entry, content)
+                if prefix == "../escape":
+                    new.writestr(prefix, b"bad")
+            (self.root / "evidence.zip").write_bytes(output.getvalue())
+            with self.subTest(prefix=prefix):
+                self.assertTrue(repin.prestate_evidence_failures(self.value, self.root))
+        (self.root / "evidence.zip").write_bytes(original)
+
+    def test_source_bundle_symlink_is_not_an_offline_checkout_source(self) -> None:
+        path = self.root / "evidence.zip"
+        path.rename(self.root / "original.zip")
+        path.symlink_to(self.root / "original.zip")
+        self.assertTrue(any("unsafe" in f for f in repin.prestate_evidence_failures(self.value, self.root)))
+        with self.assertRaisesRegex(repin.RepinError, "symlink"):
+            repin.export_prestate_evidence(self.value, self.report, self.directory, self.root)
+
+    def test_report_without_retained_signed_metadata_cannot_record_a_cached_success(self) -> None:
+        report = copy.deepcopy(self.report)
+        del report["artifact_sources"]
+        with self.assertRaisesRegex(repin.RepinError, "run a new probe"):
+            repin.export_prestate_evidence(self.value, report, self.directory, self.root)
+
+    def test_source_control_coordinates_and_authenticated_provenance_are_not_manifest_copies(self) -> None:
+        entry = copy.deepcopy(self.lock["packages"][0])
+        entry["version"] = "0.9"
+        with self.assertRaisesRegex(repin.RepinError, "control coordinates"):
+            repin.verify_source_archive(self.archive, entry)
+        for mutate in (
+            lambda lock: lock["packages"][0]["origin"].update(type="local_artifact"),
+            lambda lock: lock["repositories"][0].update(signer_fingerprints=["0" * 40]),
+            lambda lock: lock["repositories"][0].update(release_sha256="0" * 64),
+        ):
+            lock = copy.deepcopy(self.lock)
+            mutate(lock)
+            with self.assertRaises(repin.RepinError):
+                repin.authenticated_source_package(self.report, lock, "alpha", "amd64")
+
+    def test_archive_and_evidence_bounds_and_unsafe_members_fail_closed(self) -> None:
+        data = (self.root / "evidence.zip").read_bytes()
+        with patch.object(repin, "MAXIMUM_EVIDENCE_BYTES", 64):
+            self.assertTrue(any("too large" in f for f in repin.prestate_evidence_failures(self.value, self.root)))
+        with patch.object(repin, "MAXIMUM_TAR_BYTES", 64):
+            with self.assertRaisesRegex(repin.RepinError, "too large"):
+                repin.dpkg_ownership_list(self.archive)
+        for path in ("../escape", "/absolute", "usr/../escape", "usr/bad\nname"):
+            with self.subTest(path=path), self.assertRaises(repin.RepinError):
+                repin.dpkg_ownership_list(deb({}, {path: (b"bad", 0o644)}))
+        source = io.BytesIO(data)
+        output = io.BytesIO()
+        with zipfile.ZipFile(source) as old, zipfile.ZipFile(output, "w") as new:
+            for entry in old.infolist():
+                content = old.read(entry.filename)
+                if entry.filename.startswith("archives/"):
+                    content = content[:-1] + b"!"
+                new.writestr(entry, content)
+        (self.root / "evidence.zip").write_bytes(output.getvalue())
+        self.assertTrue(any("archive" in f for f in repin.prestate_evidence_failures(self.value, self.root)))
+
+    def test_each_real_archive_derived_prestate_mutation_fails_independently(self) -> None:
+        committed = repin.load_json(ROOT / repin.DEFAULT_MANIFEST)
+        covered = [i for i in committed["identities"] if repin.prestate_derivation(i, "amd64")]
+        for item in covered:
+            changed = copy.deepcopy(committed)
+            target = next(i for i in changed["identities"] if i["id"] == item["id"])
+            target["digest"] = sha256(b"stale historical prestate")
+            with self.subTest(identity=item["id"]):
+                failures = repin.prestate_evidence_failures(changed, ROOT)
+                self.assertTrue(any(item["id"] in f and "derived bytes disagree" in f for f in failures), failures)
 
 
 if __name__ == "__main__":
