@@ -165,6 +165,29 @@ class ReferenceLauncherTests(unittest.TestCase):
         with self.assertRaises(OSError):
             ORDER.database_packages(self.root)
 
+    def test_status_read_accepts_valueless_fields(self) -> None:
+        database = self.root / "var/lib/dpkg"
+        database.mkdir(parents=True)
+        status = database / "status"
+        # dpkg writes Conffiles with no value on the field line; the value is
+        # carried entirely by the continuation lines beneath it.
+        status.write_text(
+            "Package: demo\nArchitecture: amd64\nVersion: 1\n"
+            "Status: install ok unpacked\n"
+            "Conffiles:\n /etc/demo.conf 0123456789abcdef\n\n"
+        )
+        self.assertEqual(
+            ORDER.database_packages(self.root),
+            {("demo", "amd64"): ("install ok unpacked", "1")},
+        )
+        for malformed in ("Priority:optional", "Bad Key: x", "Conffiles"):
+            status.write_text(
+                "Package: demo\nArchitecture: amd64\nVersion: 1\n"
+                f"Status: install ok unpacked\n{malformed}\n\n"
+            )
+            with self.assertRaisesRegex(ValueError, "malformed"):
+                ORDER.database_packages(self.root)
+
     def test_launcher_invocation_stays_single_package(self) -> None:
         package = ORDER.Package(
             "demo", "1", "amd64", "a" * 128, 42, self.root / "package.deb",

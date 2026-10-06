@@ -204,9 +204,12 @@ def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
                 if previous is None or previous in ("package", "architecture", "version", "status"):
                     raise ValueError("invalid continuation in reference database identity")
                 continue
-            key, separator, value = line.partition(": ")
+            key, separator, value = line.partition(":")
             if not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", key):
                 raise ValueError("malformed reference database field")
+            if value and not value.startswith(" "):
+                raise ValueError("malformed reference database field")
+            value = value[1:]
             previous = key.lower()
             if previous in fields:
                 raise ValueError(f"duplicate reference database field: {key}")
