@@ -110,6 +110,7 @@ printf '%s' "$full_output" | grep -q 'SECOND=.*"changed":false'
 printf '%s' "$full_output" | grep -q 'HUMAN=repository added: packages-microsoft-prod=1.2-fixture:all; installed=yes; refreshed=yes'
 test -s "$full_root/etc/apt/sources.list.d/microsoft-prod.list"
 test -s "$full_root/usr/share/keyrings/microsoft-prod.gpg"
+test -s "$full_root/var/lib/debz/repository/active-config-v1.json"
 cmp "$source_file" "$full_root/etc/apt/sources.list.d/microsoft-prod.list"
 cmp "$keyring" "$full_root/usr/share/keyrings/microsoft-prod.gpg"
 test "$(grep -c '/config/packages-microsoft-prod.deb' "$request_log")" -eq 1
@@ -126,6 +127,7 @@ no_refresh_root="$workspace/no-refresh-root"
 no_refresh_output=$(run_harness "$no_refresh_root" --no-refresh)
 printf '%s' "$no_refresh_output" | grep -q 'FIRST=.*"refreshed_phase":"skipped"'
 printf '%s' "$no_refresh_output" | grep -q 'FIRST=.*"refreshed":false'
+test -s "$no_refresh_root/var/lib/debz/repository/active-config-v1.json"
 in_release_after=$(grep -c '/repository/dists/debian-stable/InRelease' "$request_log")
 test $((in_release_after - in_release_before)) -eq 2
 test ! -e "$no_refresh_root/etc/apt/sources.list.d/host.list"
@@ -182,5 +184,6 @@ printf '%s' "$mismatch" | grep -q '"id":"acquisition_failed"'
 printf '%s' "$mismatch" | grep -q '"installed":false'
 printf '%s' "$mismatch" | grep -vq 'fixture-query-secret'
 test ! -e "$mismatch_root/etc/apt/sources.list.d/microsoft-prod.list"
+test ! -e "$mismatch_root/var/lib/debz/repository/active-config-v1.json"
 
 printf 'repository-add integration passed\n'

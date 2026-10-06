@@ -13,6 +13,8 @@
     "actions/install/src/subprocess.ts": {"spawn": 2}
   },
   "reviewed_fingerprints": {
+    "src/active_repository_config.zig": "ee851afc418f30d08f33094711080ba21cff223d65e21ac41ddfc0e17288869580435a56050d129d8b3cdc9d9591e59a03994d5d98dee27a3e8ba56253079783",
+    "src/system_product_context.zig": "45b3e0dbaecd4b02d6ae60faf093a1ece0341cc4b2711ec445f39db7b588a7169d01f9037338bfcad4296e9d7a1fce2be0b35810ae232b6d4c055f33a5280968",
     "src/transaction_executor.zig": "eb546e88d64091c900ba097f1066c5a809df4884bb12b8ba469f9b4d3c502b6663a2c5deae7e769bbff010174b927f3a688ae0327d13a3d128b621b3a1f30427",
     "src/exact_lock.zig": "7e71d79d4d6e46daf452815a37445c913cf989e80adbf1c6b8aff0d5ed8b1e15dbcd06990032cbe295af374222bce47be968f37099a980c0222bf3768b57be36",
     "src/transaction_provenance.zig": "97681205e52180826f19f6afbb6058b2acddef25c0ae632424be3ec271090323854aa72859898a1e7f86684f7af8d60594544a36ef5dd06a5d4ff2fc9bcf82d9",
@@ -20,7 +22,7 @@
     "src/target_apt_config.zig": "f53fda429830e5f52b1c984989d93717cce9568090ad63d7cd66d6cd7b0093e1ad2f2b6dc3432595e2ebeccbcaf1392a5477cf7094ed71f76bdff5034edd4dba",
     "src/transaction_engine.zig": "c946ffa8a22569ea04ec1cfc1e42e90010101e0a0a41fbf89acbc684d925d9dd0528ae4db5de86bbe87c1d597f740dffad30d11fddfa34d999fa6a7b0729e5bf",
     "src/production_backend.zig": "176c86abd14f3ff648f14306b4d2f92bf249a2fca3b7caa22c5c833df1d315e114a0bf52ac8fceda6447b733056fc314f446b583537421bcbdd1a721ccba7871",
-    "src/repository_backend.zig": "53cf1621cabd68b8c4bf2cbb629cb46be492469dcb4df54e519aaf94ad86d72f163fa4a4f2f4372faa9ac2238f1d919898b13ba28dd6535ec7dbff318926e63e",
+    "src/repository_backend.zig": "24fa2438e74993f8f7f25c924d4862cea33ddce3d190461498f7b859f804445356e68f3fd718ec846bbbff84d47f521b7c322fad9657fff9607c0c9851db5aaf",
     "src/package_family_backend.zig": "fa52136c268f31875d85facc841271de841e2ac5285c99ea0d367d1e65249db6630019b2ddab431785caab40f77185a1626ce858cae2c11883f8301f469a708e",
     "src/package_cache_workflow.zig": "6ea20d3e9b96806df0422c8d043584f6800517bfc2cfca3c73024b16beb0a8d7a42e6401bd152e6163373b82c441444a05f6d73551464cf92f1df8ac06213eff",
     "src/transaction_result_summary.zig": "75512b49dd61c2f70db8d2372623ac534950e65ac05e15ad525ba586d30a25aae8f00ab331af1e30f9c7e8e6a8eb1ab64f40b7ae094b41c4f50b93fddef7f271",
@@ -57,7 +59,7 @@
     "actions/install/dist/index.js": "dad4adb56fe188e157583ce95be562d1ea31fc9b61ba3b093920de84f266104c4962a00667bc6b887cfdbf6af408dcff755be66ed03f167a08bf5f42af05aafb",
     "tools/prepare-native-dpkg.py": "090c4653ac1fed6dcf013fccf4fa8b857319f8be11aecd4e2d7139631cb937045b677663db8bfceec279964e59b98233e3a88b7e63c439d963328cab179cc723",
     "tools/native-differential.py": "46e715fc4c3210deba0fc4141f85de46adef7edfbcc3c3e25ef0c9d67f4d27e4f383ee504ab5abd07b2406815bfe0afec5a8d1396dda02924a458b19bd6ecccd",
-    "build.zig": "9f183623b146267a4a21f6396218236dd631dd5047cb845ce43bf4a99dcb247dc74daf83c40e36b29d454c3ad47fcd2b3f6e824c5535f694cc84dd3826b3d0b3"
+    "build.zig": "c45c726275bd05446275fa381a9ca2b5b890134c0a0b49d54cc1a893f785147d3a1c887466b6426dd4f2543961416c6e385d9e9e494e5de353500c5d9b497a47"
   },
   "signed_script_exception": {
     "path": "src/maintainer_script.zig",

@@ -105,6 +105,24 @@
   },
   "semantic_allowlist": [
     {
+      "id": "active-root-configuration-schema-controls",
+      "kind": "schema_sha256_field",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "The active pointer binds the existing root identity, its canonical payload checksum, and retained configuration-manifest bytes. These are root-scoped document controls, never package, archive, or index content authority.",
+      "paths": [
+        "schema/active-repository-config-v1.json"
+      ]
+    },
+    {
+      "id": "active-root-configuration-hex-controls",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "This exact schema encodes SHA256 root/document controls and the existing repository operation-id spelling. Current package/archive/index authority remains algorithm-tagged and unchanged.",
+      "paths": [
+        "schema/active-repository-config-v1.json"
+      ]
+    },
+    {
       "id": "typed-identity-raw-widths",
       "kind": "raw_32_byte_field",
       "classification": "typed_identity_internal",

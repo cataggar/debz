@@ -4,6 +4,8 @@ const build_options = @import("debz_build_options");
 
 pub const version = build_options.version;
 pub const product_api = @import("product_api.zig");
+pub const active_repository_config = @import("active_repository_config.zig");
+pub const system_product_context = @import("system_product_context.zig");
 pub const system_profile = @import("system_profile.zig");
 pub const apt_system_api = @import("apt_system_api.zig");
 pub const apt_system_cli = @import("apt_system_cli.zig");

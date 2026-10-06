@@ -439,6 +439,16 @@
   ],
   "compatibility_guard_paths": [
     {
+      "path": "src/active_repository_config.zig",
+      "role": "backend_neutral_root_scoped_configuration_publication_and_exact_revalidation",
+      "cutover": "retain_metadata_boundary_without_package_execution"
+    },
+    {
+      "path": "src/system_product_context.zig",
+      "role": "typed_read_only_active_configuration_context_and_root_owner_refusal",
+      "cutover": "retain_metadata_boundary_without_host_mutation_authority"
+    },
+    {
       "path": "src/legacy_compat.zig",
       "role": "exact_legacy_identity_classifier_and_non_authoritative_evidence",
       "cutover": "retain_historical_classifier_delete_new_execution_disposition"

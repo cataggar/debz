@@ -1897,7 +1897,7 @@ pub fn build(b: *std.Build) void {
 
     const target_apt_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{"target_apt_config.test."},
+        .filters = &.{ "target_apt_config.test.", "system_product_context.test." },
     });
     const run_target_apt_tests = b.addRunArtifact(target_apt_tests);
     b.step("test-target-apt-config", "Run target-root APT configuration import tests")

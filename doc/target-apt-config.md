@@ -65,6 +65,71 @@ keyring, while the original `declared_keyrings` sequence is preserved so
 `Signed-By` declaration. Sources without `Signed-By` receive only the enumerated
 global keyrings, and the manifest marks global-trust compatibility.
 
+## Typed system product context
+
+`debz.system_product_context` consumes only the
+[active record published by a successful repository add](repository-management.md#root-scoped-active-configuration).
+It supplies a typed, allocator-owned configuration view, not a new execution
+permission or an implicit fallback for product API v1:
+
+```zig
+const context = try debz.system_product_context.resolve(allocator, io, .{
+    .root = "/srv/owned-image",
+});
+defer context.deinit();
+try context.validate();
+const snapshot = context.snapshot();
+const defaults = context.options();
+```
+
+The request defaults are root `/`, logical cache `/var/cache/debz` and logical
+state `/var/lib/debz`. `options()` returns the physical paths under the
+selected root, validated native/foreign architectures, noninteractive mode,
+and `keep_existing` conffile policy. `locksPath()` selects `<state>/locks`.
+It does **not** set `assume_yes`, create directories, select a backend, fill
+generic product repository paths, or authorize mutation. Consumers use the
+snapshot's normalized configuration and `runtimeTrust` byte inputs; reopening
+its logical key paths against the process host would violate this boundary.
+
+Architecture comes from target installed-dpkg metadata with **no subprocess
+fallback, including for `/`**. An explicit architecture override must match
+the recorded architecture. Cache/state overrides are canonical logical paths
+inside the selected root; a missing alternate-root pointer never imports a
+host pointer. Root namespace and device/inode checks reject copied active
+records. Reimport rehashes the manifest and every recorded source/keyring,
+replays its finite freshness policy, and compares the complete configuration
+digest. Added or removed eligible inputs, symlink or unsafe-owner/mode/link
+changes, and architecture/configuration drift refuse.
+
+An existing shared root-operation record, deferred owner/review, or native
+execution intent returns `RootOperationRecoveryRequired` **before** source
+import. `validate()` repeats that check and reopens/revalidates the same root
+and active identity; it never adopts, clears or replaces retained work.
+Recovery must use the surface that owns `/var/lib/debz/root-operation-v1.json`
+and its exact recorded evidence. This read-only check is not a root-lock
+reservation: a future mutation consumer still needs the normal root-operation
+lock and exact recovery/receipt protocol.
+
+The host's active **configuration** uses `/` identity for either backend.
+Normalization from a private projection occurs only after validating its
+borrowed `live_root.Projection` authority against the pinned descriptor;
+the observed physical device/inode must still match. `resolveProjected`
+requires that same authority. Ordinary `resolve` rejects the projection
+spelling; no host-root alias or permission is inferred from a path string.
+**Execution/recovery records retain their original exact root namespace**,
+and this configuration view neither reinterprets nor adopts them. A projected
+context must stay within its callback's lifetime; `validate()` rechecks that
+borrowed authority too.
+
+This completes configuration/context preparation only. The short SymCrypt
+install command, durable auto-lock, evidence-bearing product results and
+exact owned retry are not wired to this view yet. In particular, the existing
+exact-lock builder refuses retained installed packages with no authenticated
+origin in the current repository set (`RetainedPackageUnavailable`); resolving
+that healthy-system baseline boundary must not silently drop retained state
+or invent archive/signature authority. The reproduced blocker is tracked in
+[#407](https://github.com/cataggar/debz/issues/407).
+
 ## Architecture and manifest
 
 Callers may provide an explicit native architecture. Otherwise the importer

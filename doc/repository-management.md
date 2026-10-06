@@ -748,9 +748,11 @@ kept in `.zig-cache/live-repository-add-evidence/` for review. A failure can
 reflect the live feed, such as a Release older than 14 days or a replaced
 descriptor, rather than a debz regression.
 
-The profile is not yet applied by the `debz apt` system facade, product API v1,
-or package installation, so those still refuse this feed unless a product API
-`--config` explicitly selects the same bounded freshness for its source.
+The typed `system_product_context` resolver now retains this profile when it
+loads the active repository configuration described below. It is not yet
+consumed by the `debz apt` system facade or product API v1 package execution, so
+those still refuse this feed unless a product API `--config` explicitly selects
+the same bounded freshness for its source.
 Installed packages do not replace the pinned build inputs that zig-symcrypt
 uses.
 
@@ -760,6 +762,50 @@ alone. Product API v1 and every generic product command continue to reject
 host root. An alternate `--root` resolves source files, keyrings, architecture,
 cache, state, locks, and evidence only within that root; it never falls back
 to `/`.
+
+### Root-scoped active configuration
+
+A successful `repo add` also atomically publishes
+`<state>/repository/active-config-v1.json` (default state `/var/lib/debz`).
+Both backends publish it while their original shared root-operation lock is
+still held, after installed source/keyring verification, the historical target
+manifest, and any requested final refresh have succeeded. An interrupted or
+failed add retains its operation evidence and root owner; this pointer does
+not authorize replanning around that owner.
+Completed cleanup replay after caller clearance only revalidates the exact
+already-published pointer and manifest; it cannot create or repair missing
+configuration evidence.
+
+The [v1 pointer schema](../schema/active-repository-config-v1.json) binds the
+existing root-identity namespace **and** the observed target-root device/inode,
+the operation-scoped manifest path, and SHA-256 of its complete canonical
+bytes. The envelope checksum covers the canonical `payload`. The historical
+manifest still binds source/keyring digests, signing fingerprints,
+architecture, normalized configuration and repository IDs, and per-source
+freshness. No historical manifest, exact lock, or receipt is rewritten into a
+new version. The existing `target_manifest` result path remains its historical
+location; the active pointer has the deterministic location above.
+
+Publication uses no-follow root filesystem traversal, a private `0600` staged
+file, fsync, atomic rename, and directory fsync. Existing corrupt, foreign,
+symlinked, multiply linked, or group/other-writable active files refuse rather
+than being silently adopted. Source/keyring and historical manifest reads are
+also no-follow, owner checked, bounded, and rehashed; a new eligible source,
+removed source, changed key or freshness policy, foreign root, or changed
+architecture invalidates the active context. A subsequent successful
+repository add may publish a newly verified configuration set.
+
+`--no-refresh` still publishes the verified local configuration after a
+successful import. **Neither this pointer nor its resolver proves current
+Release freshness.** A consumer must authenticate Release signatures at its
+verification clock, enforce the unchanged bounded policy, and verify index,
+archive and exact-lock identities before executing.
+
+This is the active-configuration/system-context slice of #68, **not completion
+of `sudo debz install symcrypt[-openssl]`**. See
+[the typed context boundary](target-apt-config.md#typed-system-product-context).
+Auto-lock publication, exact recovery-aware retry, evidence-bearing product
+results and the reviewed standalone host-install route remain separate work.
 
 ## Planning and mutation boundary
 

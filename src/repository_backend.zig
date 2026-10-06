@@ -1,4 +1,5 @@
 const std = @import("std");
+const active_repository_config = @import("active_repository_config.zig");
 const absolute_path = @import("absolute_path.zig");
 const archive_application = @import("archive_application.zig");
 const api = @import("repository_api.zig");
@@ -755,6 +756,12 @@ fn completeUnchangedNativeObserved(
     }
     if (observer) |value| try value.hitFn(value.context, .after_complete);
     try publication.validate();
+    var active_snapshot = try nativeRepositorySnapshot(allocator, input);
+    defer active_snapshot.deinit();
+    try active_repository_config.publish(allocator, input.attempt, input.repository.state.path orelse "/var/lib/debz", paths.manifest_logical, active_snapshot.manifest.manifest, .{
+        .context = &publication,
+        .hitFn = NativeCheckpointPublication.activeHit,
+    });
     if (input.attempt.record().state != .completed) {
         try input.attempt.complete(allocator, .abandoned_before_mutation);
         guard.caller_sha256 = input.attempt.record().digest_sha256;
@@ -1179,6 +1186,11 @@ const NativeCheckpointPublication = struct {
         if (self.observer) |observer| try observer.hit(point);
         if (point == .before_rename) try self.validate();
     }
+
+    fn activeHit(raw: *anyopaque, _: root_fs.PublishPoint) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.validate();
+    }
 };
 
 fn nativePackageCheckpointState(
@@ -1551,6 +1563,11 @@ const NativeCompletionPublication = struct {
         if (point == .before_rename) try self.boundary(.before_completion_rename);
         if (point == .after_rename) try self.context.hit(.after_completion_rename);
     }
+
+    fn activeHit(raw: *anyopaque, _: root_fs.PublishPoint) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.validate();
+    }
 };
 
 fn validateNativeCallerRecord(allocator: std.mem.Allocator, attempt: *root_operation.Attempt) !void {
@@ -1679,6 +1696,14 @@ fn finishNativeRepository(
     const discharge = nativeCompletionRequestDigest(input, attempt.attemptId(), current.state, publication.manifest_sha256);
     if (local_document) |document| try validateNativeCompletion(input, document.document, discharge, outcome);
     try completion_publication.boundary(.after_final_state);
+    if (!failed) {
+        var active_snapshot = try nativeRepositorySnapshot(allocator, input.recoveryRequest());
+        defer active_snapshot.deinit();
+        try active_repository_config.publish(allocator, attempt, input.repository.state.path orelse "/var/lib/debz", paths.manifest_logical, active_snapshot.manifest.manifest, .{
+            .context = &completion_publication,
+            .hitFn = NativeCompletionPublication.activeHit,
+        });
+    }
     if (attempt.record().state != .completed) {
         switch (attempt.record().state) {
             .mutating => try attempt.advance(allocator, .{ .state = .verifying, .phase = .verification }),
@@ -4120,6 +4145,21 @@ pub const Backend = struct {
             .post_install,
             .resource_limit_exceeded,
             "complete",
+            @errorName(err),
+        );
+        active_repository_config.publish(
+            allocator,
+            guard.active().?,
+            request.state.path orelse "/var/lib/debz",
+            paths.manifest_logical,
+            after_snapshot.manifest.manifest,
+            null,
+        ) catch |err| return progress.fail(
+            state_store,
+            allocator,
+            .post_install,
+            .target_import_failed,
+            "active-config",
             @errorName(err),
         );
         progress.persist(

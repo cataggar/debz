@@ -56,6 +56,7 @@ GUARD_CUTOVER_ROUTES = {
     ),
 }
 GUARD_PATHS = {
+    "src/active_repository_config.zig", "src/system_product_context.zig",
     "src/legacy_compat.zig", "src/cli_backend_policy.zig",
     "src/native_authorization.zig",
     "src/exact_lock_v2.zig", "src/exact_lock_v3.zig",

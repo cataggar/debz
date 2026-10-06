@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/active-repository-config-v1",
+  "title": "debz root-scoped active repository configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha256"],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "version", "root_identity_sha256", "root_device",
+        "root_inode", "manifest_path", "manifest_sha256"
+      ],
+      "properties": {
+        "schema": { "const": "https://debz.dev/schema/active-repository-config-v1" },
+        "version": { "const": 1 },
+        "root_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "root_device": { "type": "integer", "minimum": 0 },
+        "root_inode": { "type": "integer", "minimum": 0 },
+        "manifest_path": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^/[^\\u0000\\r\\n]+/repository/operations/[a-f0-9]{64}/apt-config-snapshot-v1\\.json$"
+        },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "digest_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

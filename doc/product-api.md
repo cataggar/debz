@@ -31,6 +31,14 @@ the separate versioned `debz.repository_api` surface documented in
 [Repository management API](repository-management.md), preserving every
 product API v1 request, result, schema, exit meaning, and host-root denial.
 
+Repository add now also publishes a root-scoped active configuration. The
+separate read-only [`system_product_context`](target-apt-config.md#typed-system-product-context)
+resolver exposes its verified snapshot and core system path defaults. It
+does not reinterpret empty v1 options, authorize host mutation, or make
+`debz install symcrypt[-openssl]` a working short command. Exact locks,
+confirmation, backend/capability selection, and existing explicit
+plan/review/replay remain unchanged.
+
 The proposed apt-shaped system facade likewise has a separate
 `debz.apt_system_api` contract and trusted profile. It does not add
 multi-package requests, live-root orchestration, configuration inheritance, or
