@@ -34511,6 +34511,24 @@ test "native_unpack.test.derived trigger closure rejects missing reordered and u
     );
     var derived_arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer derived_arena.deinit();
+    tampered = authorization;
+    tampered.trigger_authority.?.allowed_triggers = &.{"debz-a"};
+    try testing.expectError(error.InvalidTriggerActivation, deriveDeferredFinalState(
+        derived_arena.allocator(),
+        tampered,
+        initial_model,
+        &events,
+    ));
+    var unknown_listeners = listeners;
+    unknown_listeners[0].package.name = "unbound-handler";
+    var unknown_handler_events = events;
+    unknown_handler_events[0].listeners = &unknown_listeners;
+    try testing.expectError(error.InvalidTriggerActivation, deriveDeferredFinalState(
+        derived_arena.allocator(),
+        authorization,
+        initial_model,
+        &unknown_handler_events,
+    ));
     const expected = try deriveDeferredFinalState(
         derived_arena.allocator(),
         authorization,
