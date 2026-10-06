@@ -50,10 +50,15 @@ The `version_bound` flag is reserved for reviewed cases where version-keyed
 logic is itself part of the admission; only then must a consumer name the
 provenance version.
 
-The committed manifest starts `pending` at the current pin, `20261001T000000Z`.
-It holds every reviewed identity, but no probe results yet. The tool refuses
-to probe a timestamp less than 24 hours old, so the first `record` runs in the
-first repin after that day has settled.
+The committed manifest is `probed` for `ubuntu-resolute` at
+`20261001T000000Z`: it records the frozen Release, both witnesses, and
+177-package closures on amd64 and arm64. Its admission deadline is
+2026-10-31 20:38:20 UTC; renewal requires a reviewed repin, not a clock
+override. Committed quiet-pocket `refresh_only` bindings remain
+[historical evidence](#historical-evidence-is-not-a-new-probe) until a real
+probe using the new public refresh output proves their identity.
+The tool refuses to probe a timestamp less than 24 hours old and compares
+two fetches of each InRelease before recording the result.
 
 ## Commands
 
