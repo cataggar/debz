@@ -81,7 +81,7 @@ def collect_outcome(evidence: Path, workflow_outcome: str) -> tuple[dict, int]:
         else:
             if (not exit_status(result.get("exit_status")) or
                 type(result.get("changed")) is not bool or
-                not isinstance(result.get("operation"), str) or not result["operation"] or
+                result.get("operation") != STAGES[stage] or
                 not isinstance(result.get("summary"), str) or
                 not isinstance(result.get("diagnostics"), list)):
                 raise ValueError(f"invalid native command result: {stage}.json")

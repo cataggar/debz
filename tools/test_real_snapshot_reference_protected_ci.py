@@ -465,6 +465,20 @@ class NativeOutcomeTests(unittest.TestCase):
                 self.assertEqual(status, 1)
                 self.assertNotEqual(outcome["exit_status"], 0)
 
+    def test_latest_result_operation_must_match_recorded_attempt(self) -> None:
+        for stage, command, wrapper, workflow in (
+            ("create", 0, 1, "failure"),
+            ("injected-failure", 5, 0, "success"),
+        ):
+            with self.subTest(stage=stage):
+                self.attempt(stage, command, self.result("refresh", command), wrapper)
+                outcome, status = collect_outcome(self.evidence, workflow)
+                self.assertEqual(status, 1)
+                self.assertEqual(outcome["operation"], "install" if stage == "create" else "plan")
+                self.assertFalse(outcome["result_available"])
+                self.assertNotEqual(outcome["exit_status"], 0)
+                self.assertEqual(outcome["diagnostics"][-1]["id"], "native_acceptance_evidence_invalid")
+
 
 if __name__ == "__main__":
     unittest.main()
