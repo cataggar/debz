@@ -40,7 +40,26 @@ const Driver = struct {
         errdefer support.allocator.free(workspace);
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const len = try std.Io.Dir.cwd().realPathFile(support.io, ".", &path_buf);
-        const script = try std.fmt.allocPrint(support.allocator, "{s}/tools/real-snapshot-acceptance.sh", .{path_buf[0..len]});
+        const source_script = try std.fmt.allocPrint(support.allocator, "{s}/tools/real-snapshot-acceptance.sh", .{path_buf[0..len]});
+        defer support.allocator.free(source_script);
+        const script_bytes = try std.Io.Dir.cwd().readFileAlloc(support.io, source_script, support.allocator, .limited(support.maximum_file_bytes));
+        defer support.allocator.free(script_bytes);
+        try work.write("tools/real-snapshot-acceptance.sh", script_bytes);
+        const reference_bytes = try std.Io.Dir.cwd().readFileAlloc(support.io, "tools/real-snapshot-reference.sh", support.allocator, .limited(support.maximum_file_bytes));
+        defer support.allocator.free(reference_bytes);
+        try work.write("tools/real-snapshot-reference.sh", reference_bytes);
+        // Offline sequencing fixture only; production trust refusals and
+        // descriptor checks are exercised by the protected-CI Python tests.
+        try work.write("tools/real-snapshot-reference-protected-ci.sh",
+            \\#!/usr/bin/env bash
+            \\[[ $# == 2 && $1 == --check-keyring && -f $2 && ! -L $2 ]] || exit 2
+        ++ "\n");
+        try work.write("tools/real_snapshot_reference_paths.py",
+            \\def protected(path, directory=False):
+            \\    return path.stat()
+        ++ "\n");
+        try work.directory.dir.createDirPath(support.io, ".real-snapshot");
+        const script = try work.path("tools/real-snapshot-acceptance.sh");
         errdefer support.allocator.free(script);
         const fixture_script = try std.fmt.allocPrint(support.allocator, "#!/bin/sh\nprintf called > '{s}/called'\nexit 77\n", .{work.root});
         defer support.allocator.free(fixture_script);
@@ -91,17 +110,14 @@ const Driver = struct {
         errdefer driver.deinit();
         const cwd = try std.process.currentPathAlloc(support.io, support.allocator);
         defer support.allocator.free(cwd);
-        const binary = try std.fmt.allocPrint(support.allocator,
-            "{s}/.zig-cache/issue-214-snapshot-fixture-{s}",
-            .{ cwd, if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug" });
+        const binary = try std.fmt.allocPrint(support.allocator, "{s}/.zig-cache/issue-214-snapshot-fixture-{s}", .{ cwd, if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug" });
         errdefer support.allocator.free(binary);
         if (!fixture_compiled) {
             const binary_arg = try std.fmt.allocPrint(support.allocator, "-femit-bin={s}", .{binary});
             defer support.allocator.free(binary_arg);
             const compiled = try support.runWithTimeout(&.{
-                "zig", "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
-                if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug",
-                binary_arg,
+                "zig",                                                                   "build-exe", "test/real-snapshot-fixture-cli.zig", "-O",
+                if (@import("builtin").mode == .ReleaseSafe) "ReleaseSafe" else "Debug", binary_arg,
             }, .inherit, 120);
             defer compiled.deinit();
             try compiled.ok();
@@ -148,7 +164,7 @@ const Driver = struct {
             \\  fi
             \\fi
             \\exec "$@"
-            ++ "\n");
+        ++ "\n");
         const strace_path = try driver.work.path("strace");
         defer support.allocator.free(strace_path);
         const executable = try support.run(&.{ "chmod", "0700", strace_path });
@@ -182,13 +198,9 @@ const Driver = struct {
         const path = try std.fmt.allocPrint(support.allocator, "PATH={s}:{s}", .{ self.work.root, inherited_path });
         defer support.allocator.free(path);
         return support.runIn(&.{
-            "env", key, calls, name, path, execve, injected, progress_limit, ceiling,
-            if (config.trace) "DEBZ_REAL_SNAPSHOT_TRACE=1" else "DEBZ_REAL_SNAPSHOT_TRACE=0",
-            if (config.no_trace) "SNAPSHOT_TEST_NO_TRACE=1" else "SNAPSHOT_TEST_NO_TRACE=0",
-            if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0",
-            if (config.script_dpkg) "SNAPSHOT_TEST_SCRIPT_DPKG=1" else "SNAPSHOT_TEST_SCRIPT_DPKG=0",
-            if (config.script_tools) "SNAPSHOT_TEST_SCRIPT_TOOLS=1" else "SNAPSHOT_TEST_SCRIPT_TOOLS=0",
-            "bash", self.script, self.executable, uri, "resolute", self.arch, self.workspace,
+            "env",                                                                            key,                                                                             calls,                                                                           name,                                                                                     path,                                                                                        execve, injected,    progress_limit,  ceiling,
+            if (config.trace) "DEBZ_REAL_SNAPSHOT_TRACE=1" else "DEBZ_REAL_SNAPSHOT_TRACE=0", if (config.no_trace) "SNAPSHOT_TEST_NO_TRACE=1" else "SNAPSHOT_TEST_NO_TRACE=0", if (config.execveat) "SNAPSHOT_TEST_EXECVEAT=1" else "SNAPSHOT_TEST_EXECVEAT=0", if (config.script_dpkg) "SNAPSHOT_TEST_SCRIPT_DPKG=1" else "SNAPSHOT_TEST_SCRIPT_DPKG=0", if (config.script_tools) "SNAPSHOT_TEST_SCRIPT_TOOLS=1" else "SNAPSHOT_TEST_SCRIPT_TOOLS=0", "bash", self.script, self.executable, uri,
+            "resolute",                                                                       self.arch,                                                                       self.workspace,
         }, .{ .path = self.work.root });
     }
 };
@@ -230,6 +242,18 @@ test "snapshot: explicit regular keyring rejects missing, relative, directory an
         defer result.deinit();
         try result.failsWith("explicit regular Ubuntu archive keyring");
     }
+}
+
+test "snapshot: production acceptance refuses the unprotected offline trust fixture" {
+    var f = try Driver.init();
+    defer f.deinit();
+    const key = try std.fmt.allocPrint(support.allocator, "DEBZ_REAL_SNAPSHOT_KEYRING={s}", .{f.keyring});
+    defer support.allocator.free(key);
+    const result = try support.run(&.{
+        "env", key, "bash", "tools/real-snapshot-acceptance.sh", "--validate", uri, "resolute", f.arch,
+    });
+    defer result.deinit();
+    try result.failsWith("writable or non-root ancestor");
 }
 
 test "snapshot: existing directory and dangling symlink refuse before fixture CLI or mutation" {
@@ -321,8 +345,8 @@ test "snapshot: offline native creation and zero-action update preserve evidence
             defer support.allocator.free(root);
             try expectArguments(args, &.{
                 "transaction-result", "verify", "--transaction-backend", "native",
-                "--install-root", root, "--lock-input", install_lock,
-                "--architecture", f.arch, "--json",
+                "--install-root",     root,     "--lock-input",          install_lock,
+                "--architecture",     f.arch,   "--json",
             });
         }
         if (std.mem.eql(u8, args[0], "plan") and hasArgument(args, update_lock)) {
@@ -423,22 +447,24 @@ test "snapshot: legacy verification requires state path, native rejects it" {
     const state = try f.work.path(".real-snapshot/fresh/state");
     defer support.allocator.free(state);
     const legacy = try support.run(&.{
-        "env", env_calls, f.executable, "transaction-result", "verify",
-        "--state-path", state, "--lock-input", update_lock, "--architecture", f.arch, "--json",
+        "env",          env_calls, f.executable,   "transaction-result", "verify",
+        "--state-path", state,     "--lock-input", update_lock,          "--architecture",
+        f.arch,         "--json",
     });
     defer legacy.deinit();
     try legacy.ok();
     const legacy_without_state = try support.run(&.{
-        "env", env_calls, f.executable, "transaction-result", "verify",
-        "--lock-input", update_lock, "--architecture", f.arch, "--json",
+        "env",          env_calls,   f.executable,     "transaction-result", "verify",
+        "--lock-input", update_lock, "--architecture", f.arch,               "--json",
     });
     defer legacy_without_state.deinit();
     try testing.expect(legacy_without_state.code != 0);
     try support.contains(legacy_without_state.stderr, "MissingState");
     const native_with_state = try support.run(&.{
-        "env", env_calls, f.executable, "transaction-result", "verify",
-        "--transaction-backend", "native", "--install-root", root, "--state-path", state,
-        "--lock-input", lock, "--architecture", f.arch, "--json",
+        "env",                   env_calls,      f.executable,     "transaction-result", "verify",
+        "--transaction-backend", "native",       "--install-root", root,                 "--state-path",
+        state,                   "--lock-input", lock,             "--architecture",     f.arch,
+        "--json",
     });
     defer native_with_state.deinit();
     try testing.expect(native_with_state.code != 0);
@@ -1755,16 +1781,18 @@ test "snapshot: script dpkg pins are per architecture and bound to the pinned sn
     defer support.allocator.free(workflow);
     const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n") orelse return error.MissingSnapshotJob;
     const job = workflow[start..];
-    try support.contains(job, "sudo tools/real-snapshot-acceptance.sh --audit-exec-trace \\\n");
-    try support.contains(job, "candidate=\"$(realpath zig-out/bin/debz)\"");
-    try support.contains(job, ">\"$evidence/forbidden-exec.txt\"");
-    try support.contains(job, "tee -a \"$GITHUB_STEP_SUMMARY\"");
+    const collector = try source("tools/real-snapshot-protected-native-ci.sh");
+    defer support.allocator.free(collector);
+    try support.contains(collector, "bash tools/real-snapshot-acceptance.sh --audit-exec-trace \\\n");
+    try support.contains(collector, "\"$checkout/zig-out/bin/debz\"");
+    try support.contains(collector, ">\"$evidence/forbidden-exec.txt\"");
+    try support.contains(job, ">>\"$GITHUB_STEP_SUMMARY\"");
     try testing.expect(std.mem.indexOf(u8, workflow, "--audit-exec-trace-fixture") == null);
     try testing.expect(std.mem.indexOf(u8, workflow, "execveat\\(") == null);
     for ([_][]const u8{ "dpkg", "dpkg_divert", "dpkg_statoverride" }) |tool| {
         const counted = try std.fmt.allocPrint(support.allocator, "sed -n 's/^allowed_script_{s}_exec=", .{tool});
         defer support.allocator.free(counted);
-        try support.contains(job, counted);
+        try support.contains(collector, counted);
     }
     // No identity is shared across architectures or tools.
     var seen: [6][]const u8 = undefined;
@@ -1798,15 +1826,11 @@ test "snapshot: reference rejects corrupt cached archive before creating root or
     var packages: std.ArrayList(u8) = .empty;
     defer packages.deinit(support.allocator);
     for ([_][]const u8{ "libc6", "dash", "coreutils", "dpkg" }, 0..) |name, index| {
-        const item = try std.fmt.allocPrint(support.allocator,
-            "{{\"name\":\"{s}\",\"version\":\"1\",\"architecture\":\"{s}\",\"declared_size\":1,\"archive_identity\":{{\"primary\":\"sha512\",\"digests\":[{{\"algorithm\":\"sha512\",\"digest\":\"{s}\"}}]}}}}{s}",
-            .{ name, f.arch, zeros, if (index == 3) "" else "," });
+        const item = try std.fmt.allocPrint(support.allocator, "{{\"name\":\"{s}\",\"version\":\"1\",\"architecture\":\"{s}\",\"declared_size\":1,\"archive_identity\":{{\"primary\":\"sha512\",\"digests\":[{{\"algorithm\":\"sha512\",\"digest\":\"{s}\"}}]}}}}{s}", .{ name, f.arch, zeros, if (index == 3) "" else "," });
         defer support.allocator.free(item);
         try packages.appendSlice(support.allocator, item);
     }
-    const lock_text = try std.fmt.allocPrint(support.allocator,
-        "{{\"schema\":\"https://debz.dev/schema/exact-closure-lock-v3\",\"version\":3,\"target_architecture\":\"{s}\",\"packages\":[{s}]}}\n",
-        .{ f.arch, packages.items });
+    const lock_text = try std.fmt.allocPrint(support.allocator, "{{\"schema\":\"https://debz.dev/schema/exact-closure-lock-v3\",\"version\":3,\"target_architecture\":\"{s}\",\"packages\":[{s}]}}\n", .{ f.arch, packages.items });
     defer support.allocator.free(lock_text);
     try f.work.write(lock_relative, lock_text);
     const reference = try std.fmt.allocPrint(support.allocator, "{s}/tools/real-snapshot-reference.sh", .{
@@ -1817,7 +1841,7 @@ test "snapshot: reference rejects corrupt cached archive before creating root or
     defer support.allocator.free(cache);
     const refused = try support.runIn(&.{
         "bash", reference, f.executable, lock,
-        cache, f.arch, f.workspace,
+        cache,  f.arch,    f.workspace,
     }, .{ .path = f.work.root });
     defer refused.deinit();
     try testing.expect(refused.code != 0);
@@ -1839,19 +1863,25 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
         "- architecture: amd64",
         "- architecture: arm64",
         "real-snapshot-acceptance.sh --validate",
-        "real-snapshot-acceptance.sh \"$PWD/zig-out/bin/debz\"",
-        "real-snapshot-reference.sh \"$REFERENCE_DPKG\"",
-        "real-snapshot-comparator compare",
-        "comparison-unavailable.txt",
-        "if [ -f \"$evidence/reference.snapshot.json\" ]",
-        "[ -f \"$evidence/native.snapshot.json\" ]; then",
-        "one evidence member exceeds 128 MiB",
-        "artifact-summary.txt",
-        "sudo rm -rf \"$work/root\" \"$work/cache\"",
-        "sudo rm -rf \"$work/reference-root\"",
+        "real-snapshot-reference-protected-ci.sh\" --stage-native",
+        "native \"$PROTECTED_TREE\" \"$ARCHITECTURE\" \"$GITHUB_SHA\"",
+        "reference \"$PROTECTED_TREE\" \"$ARCHITECTURE\" \"$GITHUB_SHA\"",
+        "rm -rf --one-file-system -- \"$tree\"",
         "name: ubuntu-real-snapshot-${{ matrix.architecture }}",
         "path: .real-snapshot/${{ matrix.architecture }}/evidence/",
     }) |required| try support.contains(job, required);
+    const collector = try source("tools/real-snapshot-protected-native-ci.sh");
+    defer support.allocator.free(collector);
+    for ([_][]const u8{
+        "real-snapshot-acceptance.sh \"$checkout/zig-out/bin/debz\"",
+        "real-snapshot-reference.sh \"$REFERENCE_DPKG\"",
+        "real-snapshot-comparator compare",
+        "comparison-unavailable.txt",
+        "[[ -f \"$evidence/reference.snapshot.json\" && -f \"$evidence/native.snapshot.json\" ]]",
+        "128 * 1024 * 1024",
+        "512 * 1024 * 1024",
+        "artifact-summary.txt",
+    }) |required| try support.contains(collector, required);
     try testing.expect(std.mem.indexOf(u8, workflow[0..start], "schedule:\n") != null);
 }
 
@@ -1873,20 +1903,22 @@ test "snapshot: manual job budgets cover the reviewed install ceiling and the pi
     const job_minutes = try minutesAfter(job, "\n    timeout-minutes: ");
     const native_minutes = try minutesAfter(job, "- name: Create and replay exact native Ubuntu root\n        timeout-minutes: ");
     const reference_minutes = try minutesAfter(job, "- name: Install exact closure with pinned dpkg reference\n        timeout-minutes: ");
-    const diagnostics_minutes = try minutesAfter(job, "- name: Collect diagnostics and clean staged payloads\n        if: always()\n        timeout-minutes: ");
+    const staging_minutes = try minutesAfter(job, "- name: Stage protected native checkout, toolchain, dpkg and trust root\n        timeout-minutes: ");
+    const diagnostics_minutes = try minutesAfter(job, "- name: Collect bounded protected native diagnostics\n        if: always()\n        timeout-minutes: ");
     const runner = try source("tools/real-snapshot-acceptance.sh");
     defer support.allocator.free(runner);
     const ceiling_minutes = try numberBetween(runner, "readonly maximum_install_ceiling_seconds=$((", " * 60))\n");
-    try testing.expectEqual(@as(u64, 300), job_minutes);
+    try testing.expectEqual(@as(u64, 320), job_minutes);
+    try testing.expectEqual(@as(u64, 20), staging_minutes);
     try testing.expectEqual(@as(u64, 220), native_minutes);
     try testing.expectEqual(@as(u64, 50), reference_minutes);
     try testing.expectEqual(@as(u64, 15), diagnostics_minutes);
     // Refresh, planning, download, verification and the zero-action update
     // need their own budget beyond the install ceiling; the reference keeps
-    // its 40-minute pinned-dpkg limit; setup, build and upload need 15.
+    // its 40-minute pinned-dpkg limit; protected setup and export are separate.
     try testing.expect(native_minutes >= ceiling_minutes + 30);
     try testing.expect(reference_minutes >= 45);
-    try testing.expect(job_minutes >= native_minutes + reference_minutes + diagnostics_minutes + 15);
+    try testing.expect(job_minutes >= staging_minutes + native_minutes + reference_minutes + diagnostics_minutes + 15);
     const reference = try source("tools/real-snapshot-reference.sh");
     defer support.allocator.free(reference);
     try support.contains(reference, "timeout --signal=TERM --kill-after=30s 40m");

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Root-only hosted-CI staging and protected per-operation reference proof (#268).
+# Shared root-only staging/trust bootstrap and small protected proof (#268).
 #
 # The workflow bootstrap clones the reviewed commit, verified by SHA, from a
 # root-owned bare copy into TREE/checkout, where TREE is a new root-owned
@@ -12,10 +12,14 @@
 # negatives on new workspaces, and runs the protected proof on a new empty
 # workspace. Bounded evidence is copied into TREE/upload; nothing outside TREE
 # is written.
+# --stage-native stages the same trusted inputs in a distinct native-ci tree,
+# without running or reusing the small proof. --check-keyring verifies protected
+# member bytes against the same reviewed constants for the acceptance consumer.
 set -euo pipefail
 umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
+unset ZIG_LIB_DIR
 
 readonly zig_version=0.16.0
 readonly zig_release=https://github.com/cataggar/zig/releases/download/v0.16.0
@@ -33,12 +37,32 @@ readonly archive_keyring_member=./usr/share/keyrings/ubuntu-archive-keyring.gpg
 readonly archive_keyring_sha256=80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31
 readonly archive_keyring_size=3607
 
+if [[ ${1:-} == --check-keyring && $# == 2 ]]; then
+  python3 -I - "$(dirname -- "${BASH_SOURCE[0]}")" "$2" \
+    "$archive_keyring_size" "$archive_keyring_sha256" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import verify_keyring
+print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))
+PY
+  exit "$?"
+fi
+
+mode=proof
+if [[ ${1:-} == --stage-native ]]; then
+  mode=native-staging
+  shift
+fi
+readonly mode
 [[ $# == 3 && $(id -u) == 0 && $(id -g) == 0 ]] || {
   echo "usage (as root, from the protected clone): $0 TREE ARCHITECTURE COMMIT" >&2
   exit 2
 }
 tree=$1 architecture=$2 commit=$3
-[[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&
+prefix=ci
+[[ $mode == proof ]] || prefix=native-ci
+[[ $tree =~ ^/srv/debz-protected/$prefix-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&
   $commit =~ ^[0-9a-f]{40}$ ]] || {
   echo "the protected tree, architecture and commit must be the workflow's named values" >&2
   exit 2
@@ -97,8 +121,8 @@ collect() {
     [[ -d $directory && ! -L $directory ]] || continue
     find "$directory" -maxdepth 1 -printf '%M %u:%g %s %P\n' >"$upload/negatives/${directory##*/}.listing"
   done
-  printf 'status=%s\ncommit=%s\narchitecture=%s\nfinished=%s\n' \
-    "$status" "$commit" "$architecture" "$(date -u +%FT%TZ)" >"$upload/result.txt"
+  printf 'status=%s\nmode=%s\ncommit=%s\narchitecture=%s\nfinished=%s\n' \
+    "$status" "$mode" "$commit" "$architecture" "$(date -u +%FT%TZ)" >"$upload/result.txt"
   local bytes
   bytes=$(du -sb "$upload" | cut -f1)
   if ((bytes > 256 * 1024 * 1024)); then
@@ -480,6 +504,13 @@ with tarfile.open(sys.argv[1]) as archive:
     archive.extractall(sys.argv[2], filter="data")
 ' "$downloads/$zig_name.tar.xz" "$tree/zig"
 zig=$tree/zig/$zig_name/zig
+step zig-library-check 0 "" python3 -I - "$checkout/tools" "$zig" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import toolchain
+print(toolchain(Path(sys.argv[2])))
+PY
 zenv=(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C
   "ZIG_GLOBAL_CACHE_DIR=$tree/zig-global" "ZIG_LOCAL_CACHE_DIR=$checkout/.zig-cache")
 step zig-version 0 "$zig_version" "${zenv[@]}" "$zig" version
@@ -498,6 +529,39 @@ step zig-pkg-verify 0 "" python3 -I tools/real-snapshot-reference-tree-check.py 
 step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize=ReleaseSafe -j4
 chmod -R go-w "$tree/zig-global" "$checkout/.zig-cache" "$checkout/zig-out"
 step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+
+stage_native_inputs() {
+  step comparator-build 0 "" "${zenv[@]}" "$zig" build test-real-snapshot-comparator -Doptimize=ReleaseSafe -j2
+  python3 -I - "$checkout/tools" "$architecture" "$tree/reference-dpkg" <<'PY'
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("prepare_native_dpkg", Path(sys.argv[1]) / "prepare-native-dpkg.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+architecture, prefix = sys.argv[2], Path(sys.argv[3])
+url, content = module.download_archive(architecture)
+archive = prefix.parent / "reference-dpkg.deb"
+archive.write_bytes(content)
+module.verify_file(archive, module.PINS[architecture]["archive"])
+module.verify_archive_metadata(archive, architecture)
+subprocess.run(["dpkg-deb", "--extract", str(archive), str(prefix)], check=True, timeout=60)
+module.verify_extracted_bindings(prefix, architecture)
+module.write_receipt(architecture, url, content, prefix)
+module.verify_receipt(prefix / module.RECEIPT, architecture)
+PY
+  install -d -o root -g root -m 0700 "$checkout/.real-snapshot"
+  printf '%s\n' "$zig" "$tree/reference-dpkg/usr/bin/dpkg" "$staged_archive_keyring" \
+    >"$tree/native-inputs.args"
+  step native-tree-staged 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
+}
+if [[ $mode == native-staging ]]; then
+  stage_native_inputs
+  echo "protected native inputs staged; native wrapper and full reference have not executed"
+  exit "$?"
+fi
 
 workspace=$checkout/.real-snapshot/$architecture
 install -d -o root -g root -m 0700 .real-snapshot

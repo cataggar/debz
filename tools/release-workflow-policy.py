@@ -53,7 +53,6 @@ CI_GHR_ZIG_JOBS = (
     "fuzz",
     "integration-required",
     "integration-full",
-    "ubuntu-real-snapshot",
 )
 
 

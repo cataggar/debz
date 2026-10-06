@@ -1934,9 +1934,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot
     name: Native Ubuntu snapshot (${{ matrix.architecture }})
     runs-on: ${{ matrix.runner }}
-    # Step budgets: native wrapper 220 (install ceiling 180), pinned
-    # reference 50 and diagnostics 15, leaving 15 for setup, build and upload.
-    timeout-minutes: 300
+    # Protected setup 20, native wrapper 220 (install ceiling 180), reference
+    # 50 and diagnostics 15, leaving 15 for bounded export/upload/cleanup.
+    timeout-minutes: 320
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -1946,6 +1946,9 @@ jobs:
             runner: ubuntu-24.04
           - architecture: arm64
             runner: ubuntu-24.04-arm
+    env:
+      ARCHITECTURE: ${{ matrix.architecture }}
+      PROTECTED_TREE: /srv/debz-protected/native-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1955,212 +1958,135 @@ jobs:
           SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}
           SNAPSHOT_SUITE: ${{ inputs.ubuntu_snapshot_suite }}
         run: |
-          tools/real-snapshot-acceptance.sh --validate \
+          tools/real-snapshot-acceptance.sh --validate-values \
             "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "${{ matrix.architecture }}"
-      - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@c4be68b52d67d7acd2a7fe6c1e5f126e1754176e # v0.8.1
-        env:
-          GH_TOKEN: ${{ github.token }}
-        with:
-          ghr-version: v0.8.1
-          tools: >-
-            cataggar/zig@v0.16.0
-            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
-      - name: Validate Zig version
-        run: test "$(zig version)" = 0.16.0
       - name: Install test runner prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
+          sudo -n apt-get update
+          sudo -n apt-get install --yes --no-install-recommends \
             dpkg jq liblzma-dev libzstd-dev strace
-      - name: Build native candidate and Zig comparator
+      - name: Stage protected native checkout, toolchain, dpkg and trust root
+        timeout-minutes: 20
         run: |
-          zig build -Doptimize=ReleaseSafe -j2
-          zig build test-real-snapshot-comparator -Doptimize=ReleaseSafe -j2
-      - name: Prepare pinned isolated dpkg oracle
-        id: reference
-        env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          reference_dpkg="$(python3 tools/prepare-native-dpkg.py \
-            --architecture "$ARCHITECTURE")"
-          printf 'dpkg=%s\n' "$reference_dpkg" >>"$GITHUB_OUTPUT"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          bundle="$PWD/.native-protected-$ARCHITECTURE.bundle"
+          git bundle create "$bundle" HEAD
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            bash -euo pipefail -c '
+            tree=$1 architecture=$2 expected=$3 bundle=$4
+            [[ $tree =~ ^/srv/debz-protected/native-ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]
+            [[ ${BASH_REMATCH[1]} == "$architecture" && $expected =~ ^[0-9a-f]{40}$ ]]
+            umask 022
+            [[ -e /srv/debz-protected ]] || mkdir -m 0755 /srv/debz-protected
+            for ancestor in / /srv /srv/debz-protected; do
+              [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]
+              (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))
+            done
+            mkdir -m 0700 -- "$tree"
+            install -o root -g root -m 0600 -- "$bundle" "$tree/debz.bundle"
+            git init --quiet --bare "$tree/bare.git"
+            printf "%s\n" "$expected" >"$tree/bare.git/shallow"
+            git --git-dir="$tree/bare.git" bundle verify "$tree/debz.bundle"
+            git --git-dir="$tree/bare.git" fetch --quiet "$tree/debz.bundle" HEAD:refs/heads/protected
+            test "$(git --git-dir="$tree/bare.git" rev-parse refs/heads/protected)" = "$expected"
+            git --git-dir="$tree/bare.git" symbolic-ref HEAD refs/heads/protected
+            git --git-dir="$tree/bare.git" fsck --full --no-dangling
+            git clone --quiet --no-hardlinks "file://$tree/bare.git" "$tree/checkout"
+            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"
+            exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" --stage-native "$tree" "$architecture" "$expected"
+            ' native-protected-bootstrap "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$bundle"
       - name: Create and replay exact native Ubuntu root
         timeout-minutes: 220
         env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-          REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
           SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}
           SNAPSHOT_SUITE: ${{ inputs.ubuntu_snapshot_suite }}
         run: |
-          sudo --preserve-env=ARCHITECTURE,GITHUB_JOB,GITHUB_RUN_ATTEMPT,GITHUB_RUN_ID,GITHUB_SHA,GITHUB_WORKFLOW,REFERENCE_DPKG,SNAPSHOT_SUITE,SNAPSHOT_URI \
-            env DEBZ_REAL_SNAPSHOT_TRACE=1 \
-            tools/real-snapshot-acceptance.sh "$PWD/zig-out/bin/debz" \
-            "$SNAPSHOT_URI" "$SNAPSHOT_SUITE" "$ARCHITECTURE" \
-            "$PWD/.real-snapshot/$ARCHITECTURE"
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \
+            GITHUB_SHA="$GITHUB_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" GITHUB_JOB="$GITHUB_JOB" \
+            GITHUB_WORKFLOW="$GITHUB_WORKFLOW" \
+            bash "$PROTECTED_TREE/checkout/tools/real-snapshot-protected-native-ci.sh" \
+            native "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$SNAPSHOT_URI" "$SNAPSHOT_SUITE"
       - name: Install exact closure with pinned dpkg reference
         timeout-minutes: 50
-        env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-          REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
         run: |
-          sudo --preserve-env=ARCHITECTURE,REFERENCE_DPKG \
-            tools/real-snapshot-reference.sh "$REFERENCE_DPKG" \
-            "$PWD/.real-snapshot/$ARCHITECTURE/evidence/ubuntu-minimal.lock.json" \
-            "$PWD/.real-snapshot/$ARCHITECTURE/cache" "$ARCHITECTURE" \
-            "$PWD/.real-snapshot/$ARCHITECTURE"
-      - name: Collect diagnostics and clean staged payloads
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \
+            bash "$PROTECTED_TREE/checkout/tools/real-snapshot-protected-native-ci.sh" \
+            reference "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"
+      - name: Collect bounded protected native diagnostics
         if: always()
         timeout-minutes: 15
-        env:
-          ARCHITECTURE: ${{ matrix.architecture }}
-          REFERENCE_DPKG: ${{ steps.reference.outputs.dpkg }}
+        run: |
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \
+            bash "$PROTECTED_TREE/checkout/tools/real-snapshot-protected-native-ci.sh" \
+            collect "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"
+      - name: Copy bounded native evidence
+        if: always()
         run: |
           set -euo pipefail
-          work=".real-snapshot/$ARCHITECTURE"
-          evidence="$work/evidence"
-          manifest="$work/evidence/vendor-state-inventory-v1.json"
-          sudo mkdir -p "$evidence"
-          sudo chown "$USER:$USER" .real-snapshot "$work" "$evidence"
-          if [ -n "$REFERENCE_DPKG" ] && [ -f "$REFERENCE_DPKG" ]; then
-            reference_prefix="$(dirname "$(dirname "$(dirname "$REFERENCE_DPKG")")")"
-            sudo cp "$REFERENCE_DPKG" "$evidence/reference-dpkg"
-            sudo cp "$reference_prefix/reference-receipt-v1.json" \
-              "$evidence/reference-receipt-v1.json"
-            if [ -f "$(dirname "$REFERENCE_DPKG")/dpkg-deb" ]; then
-              sudo cp "$(dirname "$REFERENCE_DPKG")/dpkg-deb" \
-                "$evidence/reference-dpkg-deb"
-            fi
-          fi
-          capture_status=0
-          # The candidate root is 0700 root-owned, so test it as root.
-          if sudo test -d "$work/root/var/lib/dpkg/info"; then
-            sudo python3 tools/capture-vendor-state.py \
-              --reference-root "$PWD/$work/root" \
-              --architecture "$ARCHITECTURE" \
-              --output "$PWD/$manifest" \
-              || capture_status=$?
-            if [ "$capture_status" -eq 0 ]; then
-              sudo chown "$USER:$USER" "$manifest" || capture_status=$?
-            fi
+          output="$PWD/.real-snapshot/$ARCHITECTURE/evidence"
+          mkdir -p "$output"
+          if sudo -n test -d "$PROTECTED_TREE/native-upload"; then
+            read -r bytes _ < <(sudo -n du -sb "$PROTECTED_TREE/native-upload")
+            test "$bytes" -le $((512 * 1024 * 1024))
+            sudo -n tar -C "$PROTECTED_TREE/native-upload" -cf - . >"$PWD/.native-evidence.tar"
+            tar --no-same-owner --no-same-permissions -C "$output" -xf "$PWD/.native-evidence.tar"
           else
-            printf 'captured=false\nreason=no-candidate-dpkg-database\n' |
-              sudo tee "$evidence/vendor-state-capture-skipped.txt" >/dev/null
-          fi
-          differential_status=0
-          sudo zig-out/bin/native-differential capture \
-            --root "$PWD/$work/root" \
-            --exclude dev/null \
-            --output "$PWD/$evidence/native.snapshot.json" \
-            || differential_status=$?
-          if [ -f "$evidence/reference.snapshot.json" ] &&
-             [ -f "$evidence/native.snapshot.json" ]; then
-            sudo zig-out/bin/real-snapshot-comparator compare \
-              "$PWD/$evidence/reference.snapshot.json" \
-              "$PWD/$evidence/native.snapshot.json" \
-              "$PWD/$evidence/comparison-summary-v1.json" \
-              || differential_status=$?
-          else
-            differential_status=1
-            printf 'compared=false\nreference_snapshot_present=%s\nnative_snapshot_present=%s\n' \
-              "$([ -f "$evidence/reference.snapshot.json" ] && echo true || echo false)" \
-              "$([ -f "$evidence/native.snapshot.json" ] && echo true || echo false)" |
-              sudo tee "$evidence/comparison-unavailable.txt" >/dev/null
-          fi
-          if [ -f "$evidence/refresh.json" ]; then
-            sudo jq '{
-              operation,
-              exit_status,
-              changed,
-              summary,
-              diagnostics
-            }' "$evidence/refresh.json" |
-              sudo tee "$evidence/acceptance-outcome-v1.json" >/dev/null
-          fi
-          sudo chown -R "$USER:$USER" "$evidence"
-          # Re-audit every retained trace against the still-present root, even
-          # if the wrapper stopped before its own audit.
-          forbidden_exec_status=0
-          allowed_script_dpkg_exec=0
-          allowed_script_dpkg_divert_exec=0
-          allowed_script_dpkg_statoverride_exec=0
-          candidate="$(realpath zig-out/bin/debz)"
-          : >"$evidence/exec-reaudit.txt"
-          for trace in "$evidence"/*.execve; do
-            [ -f "$trace" ] || continue
-            audit_status=0
-            sudo tools/real-snapshot-acceptance.sh --audit-exec-trace \
-              "$PWD/$trace" "$PWD/$work/root" "$ARCHITECTURE" "$candidate" \
-              >"$evidence/exec-reaudit.part" || audit_status=$?
-            {
-              printf 'trace=%s\naudit_status=%s\n' "${trace##*/}" "$audit_status"
-              cat "$evidence/exec-reaudit.part"
-            } >>"$evidence/exec-reaudit.txt"
-            allowed=$(sed -n 's/^allowed_script_dpkg_exec=\([0-9][0-9]*\)$/\1/p' \
-              "$evidence/exec-reaudit.part")
-            allowed_script_dpkg_exec=$((allowed_script_dpkg_exec + ${allowed:-0}))
-            allowed=$(sed -n 's/^allowed_script_dpkg_divert_exec=\([0-9][0-9]*\)$/\1/p' \
-              "$evidence/exec-reaudit.part")
-            allowed_script_dpkg_divert_exec=$((allowed_script_dpkg_divert_exec + ${allowed:-0}))
-            allowed=$(sed -n 's/^allowed_script_dpkg_statoverride_exec=\([0-9][0-9]*\)$/\1/p' \
-              "$evidence/exec-reaudit.part")
-            allowed_script_dpkg_statoverride_exec=$((allowed_script_dpkg_statoverride_exec + ${allowed:-0}))
-            if [ "$audit_status" -ne 0 ]; then
-              forbidden_exec_status=1
+            printf 'native_evidence=unavailable\nreason=protected-setup-or-export-failed\n' >"$output/collection-failure.txt"
+            if sudo -n test -d "$PROTECTED_TREE/upload"; then
+              mkdir -p "$output/staging"
+              sudo -n tar -C "$PROTECTED_TREE/upload" -cf - . >"$PWD/.native-staging-evidence.tar"
+              tar --no-same-owner --no-same-permissions -C "$output/staging" -xf "$PWD/.native-staging-evidence.tar"
             fi
-          done
-          rm -f "$evidence/exec-reaudit.part"
-          if [ "$forbidden_exec_status" -ne 0 ]; then
-            grep -h '^forbidden_exec' "$evidence/exec-reaudit.txt" \
-              >"$evidence/forbidden-exec.txt" || true
           fi
-          printf '%s exec re-audit: %s allowed read-only script dpkg execs, %s dpkg-divert, %s dpkg-statoverride; forbidden=%s\n' \
-            "$ARCHITECTURE" "$allowed_script_dpkg_exec" "$allowed_script_dpkg_divert_exec" \
-            "$allowed_script_dpkg_statoverride_exec" \
-            "$([ "$forbidden_exec_status" -eq 0 ] && echo false || echo true)" |
-            tee -a "$GITHUB_STEP_SUMMARY"
-          sudo cp -a "$work/state/." "$work/evidence/state/" 2>/dev/null || true
-          sudo cp "$work/root/var/lib/dpkg/status" "$work/evidence/status-final" 2>/dev/null || true
-          sudo cp "$work/root/var/lib/dpkg/diversions" "$work/evidence/diversions-final" 2>/dev/null || true
-          sudo cp "$work/root/var/lib/dpkg/statoverride" "$work/evidence/statoverride-final" 2>/dev/null || true
-          sudo cp "$work/ubuntu.sources" "$work/evidence/" 2>/dev/null || true
-          sudo cp "$work/ubuntu.json" "$work/evidence/" 2>/dev/null || true
-          sudo du -sh "$work" 2>/dev/null \
-            | sudo tee "$work/evidence/disk-usage-final.txt" >/dev/null || true
-          sudo chown -R "$USER:$USER" "$evidence"
-          oversized=$(find "$evidence" -type f -size +128M -print -quit)
-          if [ -n "$oversized" ]; then
-            echo "one evidence member exceeds 128 MiB: $oversized" >&2
-            exit 1
+          if [ -f "$output/exec-reaudit-summary.txt" ]; then
+            cat "$output/exec-reaudit-summary.txt" >>"$GITHUB_STEP_SUMMARY"
           fi
-          read -r bytes _ < <(du -sb "$evidence")
-          test "$bytes" -le $((512 * 1024 * 1024))
-          printf 'artifact=ubuntu-real-snapshot-%s\nbytes_before_index=%s\n' \
-            "$ARCHITECTURE" "$bytes" >"$evidence/artifact-summary.txt"
+      - name: Kill native descendants and remove only the named tree
+        if: always()
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          output="$PWD/.real-snapshot/$ARCHITECTURE/evidence"
+          mkdir -p "$output"
+          status=0
+          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C bash -euo pipefail -c '
+            tree=$1
+            [[ $tree =~ ^/srv/debz-protected/native-ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]
+            [[ -e $tree || -L $tree ]] || exit 0
+            [[ -d $tree && ! -L $tree && $(stat -c %u:%g "$tree") == 0:0 ]]
+            for attempt in 1 2 3 4 5; do
+              victims=()
+              for process in /proc/[0-9]*; do
+                root=$(readlink "$process/root" 2>/dev/null) || continue
+                cwd=$(readlink "$process/cwd" 2>/dev/null) || cwd=
+                case "$root/ $cwd/" in
+                  *"$tree/"*) victims+=("${process#/proc/}") ;;
+                esac
+              done
+              (( ${#victims[@]} )) || break
+              echo "killing named native descendants: ${victims[*]}"
+              kill -KILL "${victims[@]}" 2>/dev/null || true
+              sleep 1
+            done
+            (( ${#victims[@]} == 0 ))
+            if grep -F " $tree" /proc/self/mountinfo; then
+              echo "mounts remain beneath $tree" >&2
+              exit 1
+            fi
+            rm -rf --one-file-system -- "$tree"
+            test ! -e "$tree"
+            ' native-protected-cleanup "$PROTECTED_TREE" >"$output/cleanup-result.txt" 2>&1 || status=$?
+          printf 'cleanup_status=%s\n' "$status" >>"$output/cleanup-result.txt"
           (
-            cd "$evidence"
+            cd "$output"
             find . -type f ! -name SHA256SUMS -print0 \
               | sort -z \
-              | xargs -0 sha256sum >SHA256SUMS
+              | xargs -0 -r sha256sum >SHA256SUMS
           )
-          cleanup_status=0
-          sudo rm -rf "$work/root" "$work/cache" || cleanup_status=$?
-          sudo rm -rf "$work/reference-root" || cleanup_status=$?
-          ownership_status=0
-          sudo chown -R "$USER:$USER" .real-snapshot || ownership_status=$?
-          if [ "$capture_status" -ne 0 ]; then
-            exit "$capture_status"
-          fi
-          if [ "$differential_status" -ne 0 ]; then
-            exit "$differential_status"
-          fi
-          if [ "$forbidden_exec_status" -ne 0 ]; then
-            exit "$forbidden_exec_status"
-          fi
-          if [ "$cleanup_status" -ne 0 ]; then
-            exit "$cleanup_status"
-          fi
-          exit "$ownership_status"
+          exit "$status"
       - name: Upload real acceptance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -2207,7 +2133,7 @@ jobs:
             [[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]
             [[ ${BASH_REMATCH[1]} == "$architecture" && $expected =~ ^[0-9a-f]{40}$ ]]
             umask 022
-            install -d -o root -g root -m 0755 /srv/debz-protected
+            [[ -e /srv/debz-protected ]] || mkdir -m 0755 /srv/debz-protected
             for ancestor in / /srv /srv/debz-protected; do
               [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]
               (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))

@@ -30,6 +30,7 @@ def load(name: str, path: str):
 MINISIGN = load("debz_verify_minisign", "verify-minisign.py")
 TREE = load("debz_reference_tree_check", "real-snapshot-reference-tree-check.py")
 HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protected.py")
+from real_snapshot_reference_paths import toolchain, verify_keyring
 
 ZIG_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
 # The published signature of the pinned x86_64 Zig 0.16.0 archive.
@@ -252,6 +253,99 @@ class ProtectedCiScriptTests(unittest.TestCase):
                                     text=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertNotIn("protected reference CI: commit=", result.stdout)
+
+    def test_acceptance_has_no_ambient_keyring_fallback(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("DEBZ_REAL_SNAPSHOT_KEYRING", None)
+        architecture = "arm64" if os.uname().machine == "aarch64" else "amd64"
+        result = subprocess.run(
+            ["bash", str(TOOLS / "real-snapshot-acceptance.sh"), "--validate",
+             "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z", "resolute", architecture],
+            env=environment, capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("explicit regular Ubuntu archive keyring", result.stderr)
+
+
+class ProtectedInputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-protected-input-", dir=TOOLS.parent / ".zig-cache")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.real_fstat = os.fstat
+
+    def root_owned_fstat(self, fd: int) -> os.stat_result:
+        values = list(self.real_fstat(fd))
+        values[4:6] = [0, 0]
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if not path.is_relative_to(self.root):
+            values[0] &= ~0o022
+        return os.stat_result(values)
+
+    def test_keyring_refuses_unprotected_writable_symlinked_and_wrong_bytes(self) -> None:
+        keyring = self.root / "keyring"
+        payload = b"reviewed fixture bytes"
+        keyring.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
+            verify_keyring(keyring, len(payload), digest)
+        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
+            self.assertEqual(verify_keyring(keyring, len(payload), digest), digest)
+            for size, expected in ((len(payload) + 1, digest), (len(payload), "0" * 64)):
+                with self.subTest(size=size), self.assertRaisesRegex(ValueError, "pin mismatch"):
+                    verify_keyring(keyring, size, expected)
+            keyring.write_bytes(payload[:-1] + b"?")
+            with self.assertRaisesRegex(ValueError, "pin mismatch"):
+                verify_keyring(keyring, len(payload), digest)
+            keyring.write_bytes(payload)
+            keyring.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                verify_keyring(keyring, len(payload), digest)
+            keyring.chmod(0o644)
+            link = self.root / "linked"
+            link.symlink_to(keyring)
+            with self.assertRaises(OSError):
+                verify_keyring(link, len(payload), digest)
+            directory_link = self.root / "linked-dir"
+            directory_link.symlink_to(self.root, target_is_directory=True)
+            with self.assertRaises(OSError):
+                verify_keyring(directory_link / "keyring", len(payload), digest)
+            self.root.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                verify_keyring(keyring, len(payload), digest)
+
+    def test_compiler_binds_protected_library_ancestry_without_resolving_input_links(self) -> None:
+        compiler = self.root / "zig"
+        compiler.write_text("#!/bin/sh\nexit 0\n")
+        compiler.chmod(0o755)
+        library = self.root / "lib"
+        library.mkdir()
+        source = library / "std.zig"
+        source.write_text("fixture")
+        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
+            toolchain(compiler)
+        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
+            self.assertEqual(toolchain(compiler), library)
+            compiler.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                toolchain(compiler)
+            compiler.chmod(0o755)
+            source.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                toolchain(compiler)
+            source.chmod(0o644)
+            (library / "escape").symlink_to(compiler)
+            with self.assertRaisesRegex(ValueError, "symlink escapes"):
+                toolchain(compiler)
+            (library / "escape").unlink()
+            linked = self.root / "linked-zig"
+            linked.symlink_to(compiler)
+            with self.assertRaises(OSError):
+                toolchain(linked)
+            library.rename(self.root / "real-lib")
+            library.symlink_to(self.root / "real-lib", target_is_directory=True)
+            with self.assertRaises(OSError):
+                toolchain(compiler)
 
 
 if __name__ == "__main__":

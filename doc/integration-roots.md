@@ -142,9 +142,22 @@ component `main`, and the explicit Ubuntu archive keyring. The frozen
 reviewed `596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834`
 and fresh same-snapshot `resolute-updates` and `resolute-security` witnesses
 both pass.
-Local runs may explicitly set `DEBZ_REAL_SNAPSHOT_KEYRING` to an absolute,
-regular, non-symlink Ubuntu archive keyring instead of installing trust material
-on the host. The authenticated lock must identify the reviewed Ubuntu 2018
+Both architecture legs now stage the reviewed commit under a **new**
+root-owned mode-0700 `/srv/debz-protected/native-ci-RUN-ATTEMPT-ARCH` tree,
+separate from the small proof's `ci-RUN-ATTEMPT-ARCH` tree. They reuse
+`real-snapshot-reference-protected-ci.sh --stage-native` for the verified Zig
+archive/library tree, package sources, candidate build, pinned Debian dpkg and
+package-derived trust root; this setup mode does **not** run or claim the small
+protected proof. Native and reference execution stay in that protected checkout.
+`DEBZ_REAL_SNAPSHOT_KEYRING` is required, with no hosted-image fallback. Its
+absolute regular, non-symlink path and every ancestor must be root-owned and
+not group/world writable. A no-follow descriptor verifies the consumed member
+against the shared reviewed size/digest: ubuntu-keyring
+`2023.11.28.1build1`, deb size 11228 and member size 3607, SHA-256
+`80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31`.
+Bootstrap verifies the package's reviewed SHA-512 before extraction.
+Local runs must provide the same protected bytes and protected candidate/checkout,
+not merely an arbitrary image keyring. The authenticated lock must identify the reviewed Ubuntu 2018
 archive signer `F6ECB3762474EDA9D21B7022871920D1991BC93C`. Workspaces must be new;
 an existing root is never reused or reset by this script.
 Local candidate installation must run as UID 0: the private helper workspace
@@ -346,12 +359,18 @@ enter the root and skipped that capture. It also keeps the root's final
 `diversions` and `statoverride` databases as `diversions-final` and
 `statoverride-final`.
 
-The manual `ubuntu-real-snapshot` job therefore allows 300 minutes: 220 for
+The manual `ubuntu-real-snapshot` job therefore allows 320 minutes: 20 for
+protected setup, 220 for
 the native wrapper step (the 180-minute install ceiling plus refresh,
 planning, download, verification and the zero-action update), 50 for the
 pinned reference step (its own 40-minute dpkg limit plus staging and
-capture), 15 for diagnostics and cleanup, and the remaining 15 for setup,
-build and upload. Step limits keep a slow native install from consuming the
+capture), 15 for diagnostics, and the remaining 15 for bounded export,
+named descendant/mount-checked cleanup and upload. Evidence members remain
+bounded to 128 MiB and the artifact to 512 MiB, indexed by `SHA256SUMS`, with
+14-day retention. Only exported evidence is copied to the runner; the protected
+checkout, tools and live roots are never chowned to it. Collection and cleanup
+have distinct retained outcomes, and both cleanup and upload run on failure.
+Step limits keep a slow native install from consuming the
 reference or diagnostics budget. The job stays dispatch-only; pull-request
 jobs are unchanged.
 
@@ -674,10 +693,15 @@ these distinct identities and closure ordering are proved, finalization
 refuses rather than silently changing `--pending` behavior. Privileged
 namespace/archive-mount, death/timeout cleanup and
 exact result equivalence still require independently protected small-root
-proof and review before any 175-package comparison. The current CI checkout
-and cleanup are not root-owned protected ancestry; arm64 signed script
-profiles are unproved. Running the manual full-reference step there must
-fail closed until the runner's staging and cleanup contract is redesigned.
+proof and review before any full-closure comparison. The manual full-reference
+step now uses the independent protected native staging tree and explicit absolute
+`DEBZ_ZIG`, not a bare compiler in the fixed `/usr/sbin:/usr/bin:/sbin:/bin`
+PATH. Compiler and library ancestry/bytes stay bound to that protected
+toolchain, with an explicit `--zig-lib-dir` and no ambient `ZIG_LIB_DIR`.
+Arm64 signed script profiles, loader/runtime binding (#263), cycle ordering
+and trigger finalization remain separate gates. Ordinary tests and a green
+small protected proof do not establish that this full reference step executed:
+native completion is still required before it can compile and reach ordering.
 The reference-only
 `dev/null` chroot device is excluded from both bounded captures only when no
 package claims it; no package payload path is excluded.
