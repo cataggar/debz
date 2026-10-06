@@ -22982,6 +22982,7 @@ test "native_unpack.test.snapshot python3 preinst diagnostics identify bindings"
         return error.TestUnexpectedResult;
     var program: native_program.Program = undefined;
     program.artifacts = &.{};
+    program.target_architecture = "amd64";
     clearNativeRecoveryErrorDetail();
     try testing.expectError(
         error.InvalidPython3PreinstControl,
@@ -23162,6 +23163,7 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     }
     var program: native_program.Program = undefined;
     program.artifacts = &artifacts;
+    program.target_architecture = "amd64";
     try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);
     try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);
     try verifySnapshotPython3PreinstPaths(
