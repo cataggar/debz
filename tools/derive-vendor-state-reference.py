@@ -247,6 +247,7 @@ CONTROL_FACT_FIELDS = (
     "referenced_paths",
 )
 LINKED_FACT_FIELDS = ("mode", "uid", "gid", "size", "sha256", "target")
+WRITE_WITNESS_PATHS = ("dev/null",)
 PUBLIC_REFERENCE_ROOTS = frozenset(
     {"bin", "lib", "lib32", "lib64", "libx32", "sbin", "usr"}
 )
@@ -654,6 +655,52 @@ def _validate_linked_entry(
     raise DerivationError(f"{label} has unsupported linked entry kind: {kind!r}")
 
 
+def _validate_write_witness(
+    item: Any, label: str, limits: dict[str, int]
+) -> None:
+    if not isinstance(item, dict):
+        raise DerivationError(f"{label} must be an object")
+    path = item.get("path")
+    if path not in WRITE_WITNESS_PATHS:
+        raise DerivationError(f"{label}.path is not an admitted write witness")
+    kind = item.get("kind")
+    if kind == "absent":
+        _require_keys(item, frozenset({"path", "kind"}), label)
+        return
+    if kind == "regular":
+        _require_keys(
+            item,
+            frozenset({"path", "kind", "mode", "uid", "gid", "size", "sha256"}),
+            label,
+        )
+        _validate_file_metadata(item, label)
+        size = _count(item["size"], f"{label}.size")
+        if size > limits["max_linked_file_bytes"]:
+            raise DerivationError(f"{label} exceeds write-witness file byte limit")
+        _digest(item["sha256"], f"{label}.sha256")
+        return
+    if kind in {
+        "directory",
+        "symlink",
+        "character-device",
+        "block-device",
+        "fifo",
+        "socket",
+        "unknown",
+    }:
+        expected = {"path", "kind", "mode", "uid", "gid"}
+        if "target" in item:
+            expected.add("target")
+        _require_keys(item, frozenset(expected), label)
+        _validate_file_metadata(item, label)
+        if "target" in item and len(_text(item["target"], f"{label}.target").encode("utf-8")) > limits[
+            "max_link_target_bytes"
+        ]:
+            raise DerivationError(f"{label} symlink target exceeds byte limit")
+        return
+    raise DerivationError(f"{label} has unsupported write-witness kind: {kind!r}")
+
+
 def _inventory(document: dict[str, Any]) -> dict[str, Any]:
     controls = document["control_members"]["entries"]
     alternatives = document["alternatives_database"]
@@ -679,21 +726,18 @@ def _inventory(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _validate_manifest(document: dict[str, Any], architecture: str) -> None:
-    _require_keys(
-        document,
-        frozenset(
-            {
-                "schema",
-                "version",
-                "architecture",
-                "limits",
-                "control_members",
-                "alternatives_database",
-                "linked_filesystem",
-            }
-        ),
-        f"{architecture} manifest",
-    )
+    manifest_keys = {
+        "schema",
+        "version",
+        "architecture",
+        "limits",
+        "control_members",
+        "alternatives_database",
+        "linked_filesystem",
+    }
+    if "write_witnesses" in document:
+        manifest_keys.add("write_witnesses")
+    _require_keys(document, frozenset(manifest_keys), f"{architecture} manifest")
     if document["schema"] != CAPTURE_SCHEMA or document["version"] != 1:
         raise DerivationError(f"{architecture} manifest capture schema mismatch")
     if document["architecture"] != architecture:
@@ -769,6 +813,10 @@ def _validate_manifest(document: dict[str, Any], architecture: str) -> None:
     for index, item in enumerate(linked):
         _validate_linked_entry(
             item, f"{architecture}.linked[{index}]", validated_limits
+        )
+    for index, item in enumerate(document.get("write_witnesses", [])):
+        _validate_write_witness(
+            item, f"{architecture}.write_witnesses[{index}]", validated_limits
         )
 
     for label, paths in (

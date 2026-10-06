@@ -169,6 +169,9 @@ class VendorStateCaptureTests(unittest.TestCase):
             linked["usr/bin/editor.real"]["sha256"],
             hashlib.sha256(b"fixture editor\n").hexdigest(),
         )
+        self.assertEqual(
+            first["write_witnesses"], [{"path": "dev/null", "kind": "absent"}]
+        )
         serialized = json.dumps(first)
         self.assertNotIn(str(self.workspace), serialized)
         self.assertNotIn("fixture editor", serialized)
@@ -204,6 +207,30 @@ class VendorStateCaptureTests(unittest.TestCase):
                     self.fixture_root(f"bad-architecture-{len(str(architecture))}"),
                     architecture,  # type: ignore[arg-type]
                 )
+
+    def test_capture_records_dev_null_write_witness(self) -> None:
+        root = self.fixture_root("write-witness")
+        witness = root / "dev/null"
+        witness.parent.mkdir(parents=True)
+        witness.write_bytes(b"")
+        witness.chmod(0o600)
+
+        document = self.capture(root)
+
+        self.assertEqual(
+            document["write_witnesses"],
+            [
+                {
+                    "path": "dev/null",
+                    "kind": "regular",
+                    "mode": "0600",
+                    "uid": os.getuid(),
+                    "gid": os.getgid(),
+                    "size": 0,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                }
+            ],
+        )
 
     def test_pinned_vendor_state_references_are_canonical_bounded_and_private(
         self,

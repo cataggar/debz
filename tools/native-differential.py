@@ -27,6 +27,7 @@ DEFAULT_EXCLUDES = (
     "var/lib/dpkg",
     TRACE_PATH,
 )
+WRITE_WITNESS_PATHS = ("dev/null",)
 LOCK_FILES = frozenset({"lock", "lock-frontend", "triggers/Lock"})
 SCENARIO_OPERATIONS = frozenset(
     {
@@ -224,6 +225,51 @@ def capture_tree(
             entry["hardlink_to"] = hardlink_first.get(entry["path"])
     entries.sort(key=lambda item: os.fsencode(item["path"]))
     return entries
+
+
+def capture_write_witnesses(root: pathlib.Path, limits: Limits) -> list[dict[str, Any]]:
+    root = _validated_root(root)
+    result: list[dict[str, Any]] = []
+    for relative in WRITE_WITNESS_PATHS:
+        path = root / pathlib.PurePosixPath(relative)
+        if not _optional_safe_directory(path.parent):
+            result.append({"path": relative, "kind": "absent"})
+            continue
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            result.append({"path": relative, "kind": "absent"})
+            continue
+        except OSError as error:
+            raise SnapshotError(f"cannot stat write witness {relative}: {error}") from error
+        kind = _kind(metadata.st_mode)
+        entry: dict[str, Any] = {
+            "path": relative,
+            "kind": kind,
+            "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+        }
+        if kind != "directory":
+            entry["mtime_ns"] = metadata.st_mtime_ns
+        if kind == "regular":
+            if metadata.st_size > limits.max_file_bytes:
+                raise SnapshotError(f"write witness exceeds limit: {relative}")
+            entry["size"] = metadata.st_size
+            entry["sha256"] = _sha256_file(path, metadata.st_size)
+            entry["hardlink_to"] = None
+        elif kind == "symlink":
+            target = os.readlink(path)
+            if len(os.fsencode(target)) > limits.max_link_bytes:
+                raise SnapshotError(
+                    f"write witness symlink target exceeds limit: {relative}"
+                )
+            entry["target"] = target
+        elif kind in {"character-device", "block-device"}:
+            entry["device_major"] = os.major(metadata.st_rdev)
+            entry["device_minor"] = os.minor(metadata.st_rdev)
+        result.append(entry)
+    return result
 
 
 def _normalize_relative(value: str) -> str:
@@ -599,6 +645,7 @@ def capture(
         "schema": SCHEMA,
         "version": 1,
         "filesystem": capture_tree(root, limits, excludes),
+        "write_witnesses": capture_write_witnesses(root, limits),
         "dpkg": capture_dpkg(root, limits),
         "trace": capture_trace(root, limits),
     }
@@ -625,6 +672,8 @@ def differences(
             return
         if isinstance(left, dict):
             for key in sorted(set(left) | set(right)):
+                if key == "write_witnesses":
+                    continue
                 child = f"{path}.{key}"
                 if key not in left:
                     result.append(f"{child}: missing from reference")
