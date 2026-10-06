@@ -11,9 +11,14 @@ The [repin runbook](real-snapshot-repin.md#runbook) describes the current flow.
 Both architectures authenticated the migrated snapshot in
 [run 37317412790](https://github.com/cataggar/debz/actions/runs/37317412790)
 at `7657602`, and both protected-reference jobs passed there. Those greens
-predate #398's changed signed-proc fixtures: they do not prove current-head
-protected fixture execution, completed native installation, signed-proc
-replay, or full native/dpkg parity. Those remain separate acceptance gates.
+predate #398's changed signed-proc fixtures. The post-#398 protected-reference
+jobs also executed and passed for
+[amd64](https://github.com/cataggar/debz/actions/runs/37537004982/job/112520469522)
+and [arm64](https://github.com/cataggar/debz/actions/runs/37537004982/job/112520469651)
+in run `37537004982` at `98ec3b3b40b4760e441ea02411ebc145baa89bcf`.
+These are protected-lane proofs at that exact source SHA; completed native
+installation, signed-proc replay and full native/dpkg parity remain separate
+acceptance gates.
 
 The measurements and migration sequence below retain the original design
 baseline; references to stonking describe historical evidence, not today's
