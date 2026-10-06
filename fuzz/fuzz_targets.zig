@@ -1342,23 +1342,23 @@ test "fuzz.new native state corpus decodes and keeps exact SHA256" {
         },
         .{
             .bytes = program_v2_seed,
-            .sha256 = "5ae4bb66711d8721b8dc10f87d12166e3c09210a7206d0998565405901c47d09",
+            .sha256 = "8c2856e50a9f0c2f27964529000258058867ccde010b7054d61971cb57a39525",
         },
         .{
             .bytes = execution_request_v4_seed,
-            .sha256 = "47cc5cfcd043b14f17fc9c0eec1038108dabd59ee9def83b6660567fc83d6677",
+            .sha256 = "ca9ea400759b7eb42c0b00ac9cd77a7b91b8b413cde7b84f0dc526d891aa8b76",
         },
         .{
             .bytes = recovery_intent_v2_seed,
-            .sha256 = "a3783fe1c59ebe6b537a50aa9139a34154f7ba75926924880aacd99bca456c92",
+            .sha256 = "83ed490bf5c247941e97f8a08e74982bacfece8c6f865d0bd747d17b8bc5f332",
         },
         .{
             .bytes = progress_v3_seed,
-            .sha256 = "ab0405f5f5ab53d003f685913548fa7c607e4eead9f17ba7c5becfb44e43415b",
+            .sha256 = "a88cca4b4a49d951ba69151cbcab6e13b4747794c9a7ff5a07065da1515effa6",
         },
         .{
             .bytes = progress_v4_seed,
-            .sha256 = "a853786f98c01fa07dcad415c131c5383df7faee7e2106aa780bda2e9d17865a",
+            .sha256 = "1a0838936bd5410caa3f9b62290e6339a82ee5b1d48912265c9845b9b88c2685",
         },
         .{
             .bytes = native_provenance_v2_seed,

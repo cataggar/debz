@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import contextlib
 import hashlib
 from pathlib import Path
 import re
@@ -136,21 +137,33 @@ def oracle_environment() -> dict[str, str]:
     }
 
 
+@contextlib.contextmanager
+def launcher_stdin():
+    """The launcher refuses a writable stdin, and subprocess.DEVNULL opens
+    /dev/null with O_RDWR."""
+    descriptor = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
 def probe(
     command: list[str], environment: dict[str, str], evidence: Path,
 ) -> tuple[int, bytes]:
     with tempfile.TemporaryDirectory(prefix="reference-probe-", dir=evidence) as temporary:
         output_path = Path(temporary) / "output"
         with output_path.open("x+b") as output, output_path.open("ab") as writer:
-            result = subprocess.run(
-                command,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=writer,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=60,
-            )
+            with launcher_stdin() as null:
+                result = subprocess.run(
+                    command,
+                    env=environment,
+                    stdin=null,
+                    stdout=writer,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    timeout=60,
+                )
             writer.flush()
             if output_path.stat().st_size > MAXIMUM_PROBE_OUTPUT:
                 raise ValueError("reference dpkg dry-run output exceeds limit")
@@ -164,15 +177,16 @@ def apply(
     stderr: Path,
 ) -> None:
     with stdout.open("ab") as output, stderr.open("ab") as errors:
-        subprocess.run(
-            command,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=errors,
-            check=True,
-            timeout=120,
-        )
+        with launcher_stdin() as null:
+            subprocess.run(
+                command,
+                env=environment,
+                stdin=null,
+                stdout=output,
+                stderr=errors,
+                check=True,
+                timeout=120,
+            )
     if stdout.stat().st_size > MAXIMUM_LOG_BYTES or stderr.stat().st_size > MAXIMUM_LOG_BYTES:
         raise ValueError("reference dpkg output exceeds limit")
 
@@ -190,9 +204,12 @@ def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
                 if previous is None or previous in ("package", "architecture", "version", "status"):
                     raise ValueError("invalid continuation in reference database identity")
                 continue
-            key, separator, value = line.partition(": ")
+            key, separator, value = line.partition(":")
             if not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", key):
                 raise ValueError("malformed reference database field")
+            if value and not value.startswith(" "):
+                raise ValueError("malformed reference database field")
+            value = value[1:]
             previous = key.lower()
             if previous in fields:
                 raise ValueError(f"duplicate reference database field: {key}")
@@ -210,11 +227,169 @@ def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
     return records
 
 
+@dataclass(frozen=True)
+class Prestate:
+    selector: str
+    status: str
+    destination: Path
+
+
+PRESTATE = re.compile(
+    r"(?P<selector>[a-z0-9][a-z0-9+.-]*:[a-z0-9][a-z0-9-]*)="
+    r"(?P<status>half-configured|unpacked):(?P<destination>/.+)\Z"
+)
+
+
+def parse_prestate(value: str) -> Prestate:
+    match = PRESTATE.fullmatch(value)
+    if not match:
+        raise argparse.ArgumentTypeError(f"invalid prestate: {value}")
+    return Prestate(
+        match["selector"], match["status"], Path(match["destination"]),
+    )
+
+
+def package_status(root: Path, selector: str, environment: dict[str, str]) -> str:
+    result = subprocess.run(
+        [
+            "dpkg-query", f"--admindir={root / 'var/lib/dpkg'}", "-W",
+            "-f=${Version} ${Status}", selector,
+        ],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+    if len(result.stdout) > 4096 or result.stderr:
+        raise ValueError(f"invalid reference status query: {selector}")
+    return result.stdout.decode("utf-8")
+
+
+def interrupt_postinst(
+    launcher: Path,
+    dpkg: Path,
+    root: Path,
+    architecture: str,
+    package: Package,
+    environment: dict[str, str],
+    stdout: Path,
+    stderr: Path,
+) -> None:
+    """Let dpkg start configuring, but deny execution of the installed postinst."""
+    script = root / "var/lib/dpkg/info" / f"{package.name}.postinst"
+    if script.is_symlink() or not script.is_file():
+        raise ValueError(f"prestate postinst is not a regular file: {package.selector}")
+    before = hashlib.sha256(script.read_bytes()).hexdigest()
+    profile = package.name if package.name in PROFILE_VERSIONS else "none"
+    if profile == "none" or package.version != PROFILE_VERSIONS[profile]:
+        raise ValueError(f"unauthorized interrupted prestate package: {package.selector}")
+    subprocess.run(["mount", "--bind", "--", str(script), str(script)], check=True, timeout=30)
+    try:
+        subprocess.run(
+            ["mount", "-o", "remount,bind,ro,noexec,nosuid,nodev", "--", str(script)],
+            check=True,
+            timeout=30,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="reference-configure-", dir=stdout.parent,
+        ) as temporary:
+            output_path = Path(temporary) / "stdout"
+            errors_path = Path(temporary) / "stderr"
+            with output_path.open("x+b") as output, errors_path.open("x+b") as errors, \
+                    output_path.open("ab") as out_writer, errors_path.open("ab") as err_writer:
+                with launcher_stdin() as null:
+                    result = subprocess.run(
+                        dpkg_command(launcher, dpkg, root, architecture, profile, "configure", package),
+                        env=environment,
+                        stdin=null,
+                        stdout=out_writer,
+                        stderr=err_writer,
+                        check=False,
+                        timeout=120,
+                    )
+                out_writer.flush()
+                err_writer.flush()
+                if (
+                    output_path.stat().st_size > MAXIMUM_PROBE_OUTPUT
+                    or errors_path.stat().st_size > MAXIMUM_PROBE_OUTPUT
+                ):
+                    raise ValueError("interrupted configure output exceeds limit")
+                observed_output, observed_errors = output.read(), errors.read()
+    finally:
+        subprocess.run(["umount", "--", str(script)], check=True, timeout=30)
+    with stdout.open("ab") as out, stderr.open("ab") as err:
+        out.write(observed_output)
+        err.write(observed_errors)
+    if (
+        result.returncode == 0
+        or b"post-installation script" not in observed_errors
+        or b"Permission denied" not in observed_errors
+    ):
+        raise RuntimeError(
+            f"prestate postinst was not denied before execution: {observed_errors[:4096]!r}"
+        )
+    if hashlib.sha256(script.read_bytes()).hexdigest() != before:
+        raise RuntimeError(f"prestate postinst changed: {package.selector}")
+
+
+def capture_prestate(
+    launcher: Path,
+    dpkg: Path,
+    root: Path,
+    architecture: str,
+    package: Package,
+    prestate: Prestate,
+    environment: dict[str, str],
+    stdout: Path,
+    stderr: Path,
+) -> None:
+    destination = prestate.destination
+    if destination.exists() or destination.is_symlink() or not destination.parent.is_dir():
+        raise ValueError(f"prestate destination must be new: {destination}")
+    if prestate.status == "half-configured":
+        interrupt_postinst(launcher, dpkg, root, architecture, package, environment, stdout, stderr)
+    expected = f"{package.version} install ok {prestate.status}"
+    if package_status(root, package.selector, environment) != expected:
+        raise RuntimeError(f"unexpected prestate status for {package.selector}")
+    proc = root / "proc"
+    mounted = proc.is_mount()
+    if mounted:
+        subprocess.run(["umount", "--", str(proc)], check=True, timeout=30)
+    try:
+        if proc.is_mount() or any(proc.iterdir()):
+            raise RuntimeError("prestate proc mountpoint is not empty")
+        subprocess.run(
+            ["cp", "-a", "--one-file-system", "--", str(root), str(destination)],
+            check=True,
+            timeout=600,
+        )
+        destination.chmod(0o700)
+    finally:
+        if mounted:
+            subprocess.run(
+                ["mount", "-t", "proc", "-o", "nosuid,nodev,noexec", "proc", str(proc)],
+                check=True,
+                timeout=30,
+            )
+    with (destination.parent / "prestates.tsv").open("a") as record:
+        record.write(f"{package.selector}\t{expected}\t{destination}\n")
+
+
 def install(
     launcher: Path, dpkg: Path, root: Path, cache: Path, evidence: Path,
-    architecture: str,
+    architecture: str, prestates: tuple[Prestate, ...] = (),
 ) -> None:
     packages = packages_from_manifest(evidence / "reference-archives.tsv", cache)
+    targets = {prestate.selector: prestate for prestate in prestates}
+    if len(targets) != len(prestates):
+        raise ValueError("duplicate prestate selector")
+    destinations = {prestate.destination for prestate in prestates}
+    if len(destinations) != len(prestates):
+        raise ValueError("duplicate prestate destination")
+    selectors = {package.selector for package in packages}
+    if any(selector not in selectors for selector in targets):
+        raise ValueError("prestate package is not in the verified closure")
     pending = packages[:]
     unpacked: list[Package] = []
     configured: set[tuple[str, str]] = set()
@@ -261,6 +436,14 @@ def install(
             profile = package.name if package.name in PROFILE_VERSIONS else "none"
             if profile != "none" and package.version != PROFILE_VERSIONS[profile]:
                 raise ValueError(f"unauthorized reference script version: {package.selector}")
+            prestate = targets.pop(package.selector, None)
+            if prestate is not None:
+                capture_prestate(
+                    launcher, dpkg, root, architecture, package, prestate,
+                    environment, stdout, stderr,
+                )
+                if not targets:
+                    return
             apply(dpkg_command(
                 launcher, dpkg, root, architecture, profile, "configure", package,
             ), environment, stdout, stderr)
@@ -272,6 +455,8 @@ def install(
                 "reference dependency ordering stalled; ambiguous --configure --pending "
                 "is not authorized: " + ", ".join(deferred[:20])
             )
+    if targets:
+        raise RuntimeError("prestate package was never configured")
     if len(configured) != len(packages):
         raise ValueError("reference closure not fully configured")
     raise RuntimeError(
@@ -316,6 +501,11 @@ def main() -> None:
     parser.add_argument("--launcher", type=Path)
     parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument(
+        "--prestate", type=parse_prestate, action="append", default=[],
+        metavar="PACKAGE:ARCH=STATUS:DESTINATION",
+        help="copy the root just before configuring PACKAGE, then stop after the last copy",
+    )
     args = parser.parse_args()
     if not args.root.is_absolute() or not args.cache.is_absolute() or not args.evidence.is_absolute():
         raise ValueError("reference inputs must be absolute paths")
@@ -328,7 +518,10 @@ def main() -> None:
     protected(args.dpkg)
     protected(args.cache, directory=True)
     protected(args.evidence, directory=True)
-    install(args.launcher, args.dpkg, args.root, args.cache, args.evidence, args.architecture)
+    install(
+        args.launcher, args.dpkg, args.root, args.cache, args.evidence,
+        args.architecture, tuple(args.prestate),
+    )
 
 
 if __name__ == "__main__":

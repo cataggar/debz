@@ -797,7 +797,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 43), members);
+    try testing.expectEqual(@as(usize, 44), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));
@@ -1409,13 +1409,13 @@ test "security: apt import and native child-process owners retain explicit bound
     const runner = try f.source("src/maintainer_script.zig");
     try testing.expect(std.mem.indexOf(u8, runner, "std.process.run(") == null);
     for ([_][]const u8{
-        "linux.open(\"/dev/null\"",                            "linux.chroot(\".\")",                        "linux.unshare(linux.CLONE.NEWNS)",
-        "live_root.cloneMountDescriptor(",                     "live_root.setMountAttributes(",              "linux.move_mount(",
-        "const clone_flags = linux.CLONE.NEWNET |",            "linux.CLONE.NEWNS | linux.CLONE.NEWPID",     "fn setupPrivateLoopback() linux.E",
-        "\"private-network-loopback-v1\\x00\"",                "fn sealInheritedDescriptors() linux.E",      "linux.PR.CAPBSET_DROP",
-        "linux.PR.SET_NO_NEW_PRIVS",
-        "linux.PR.SET_PDEATHSIG",                              "linux.syscall2(\n        .capget,",          "linux.syscall2(\n        .capset,",
-        "linux.syscall3(\n        .close_range,",              "@offsetOf(KernelCapabilityHeader, \"pid\")",
+        "linux.open(\"/dev/null\"",                      "linux.chroot(\".\")",                    "linux.unshare(linux.CLONE.NEWNS)",
+        "live_root.cloneMountDescriptor(",               "live_root.setMountAttributes(",          "linux.move_mount(",
+        "const clone_flags = linux.CLONE.NEWNET |",      "linux.CLONE.NEWNS | linux.CLONE.NEWPID", "fn setupPrivateLoopback() linux.E",
+        "\"private-network-loopback-v1\\x00\"",          "fn sealInheritedDescriptors() linux.E",  "linux.PR.CAPBSET_DROP",
+        "linux.PR.SET_NO_NEW_PRIVS",                     "linux.PR.SET_PDEATHSIG",                 "linux.syscall2(\n        .capget,",
+        "linux.syscall2(\n        .capset,",             "linux.SECCOMP.SET_MODE_FILTER",          "restrictScriptPrivileges(null, false)",
+        "restrictScriptPrivileges(failure_stage, true)", "linux.syscall3(\n        .close_range,", "@offsetOf(KernelCapabilityHeader, \"pid\")",
     }) |marker| try support.contains(runner, marker);
     const live = try f.source("src/live_root.zig");
     try testing.expect(std.mem.indexOf(u8, live, "std.process.run(") == null);

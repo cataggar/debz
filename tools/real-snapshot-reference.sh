@@ -129,7 +129,7 @@ while IFS=$'\t' read -r name version package_arch digest size; do
   [[ $(stat -c '%s' "$archive") == "$size" ]]
   printf '%s  %s\n' "$digest" "$archive" | sha512sum --check --status
   case "$name" in
-    libc6|dash|bash|gnu-coreutils|coreutils|coreutils-from-gnu|dpkg|libmd0|libbz2-1.0|liblzma5|libselinux1|libzstd1|zlib1g|libacl1|libattr1|libgmp10|libssl4|libsystemd0|libpcre2-8-0|libgcc-s1|libcrypt1|perl-base|mawk|sed|grep|findutils|tar|gzip|debianutils|debconf)
+    libc6|dash|bash|gnu-coreutils|coreutils|coreutils-from-gnu|dpkg|libmd0|libbz2-1.0|liblzma5|libselinux1|libzstd1|zlib1g|libacl1|libattr1|libgmp10|libssl3t64|libsystemd0|libpcre2-8-0|libgcc-s1|libcrypt1|perl-base|mawk|sed|grep|findutils|tar|gzip|debianutils|debconf)
       bootstrap+=("$archive") ;;
   esac
 done <"$evidence/reference-archives.tsv"

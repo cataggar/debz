@@ -1577,10 +1577,32 @@ def audit_production_sources() -> None:
         '"usr/bin/gnuchmod"',
         '"usr/share/dpkg/sh/dpkg-error.sh"',
         '"d4d4fd7712da692dbb21a10795f7e62046c90b506338768b5a93cf9f1897f528"',
-        "return restrictSnapshotProcPrivileges(failure_stage);",
+        "return restrictScriptPrivileges(failure_stage, true);",
+        "const restricted = restrictScriptPrivileges(null, false);",
+        "childFail(streams.status, .capability_policy, restricted);",
+        "maskScriptCapabilities(&data);",
+        "scriptCapabilityAllowed(capability)",
+        "linux.PR.CAP_AMBIENT",
+        "linux.SECCOMP.SET_MODE_FILTER",
+        "linux.SECCOMP.RET.KILL_PROCESS",
+        "linux.CLONE.NEWNET",
+        "if (count == 64) return .RANGE;",
+        "if (required) return error.SignedProcRootRequired;",
+        "return error.SkipZigTest;",
     ):
         if required not in runner:
             fail(f"reviewed exact-script proc isolation changed: {required}")
+    build = (ROOT / "build.zig").read_text(errors="strict")
+    for required in (
+        '"test-native-signed-proc"',
+        '"DEBZ_REQUIRE_SIGNED_PROC_ROOTS=1"',
+        '"signed-systemd-proc-root"',
+        '"signed-udev-proc-root"',
+        '"signed-sudo-proc-root"',
+        "signed_proc_run.addArtifactArg(signed_proc_tests);",
+    ):
+        if required not in build:
+            fail(f"required signed proc fixture gate changed: {required}")
     alternatives = (ROOT / "src/native_alternatives.zig").read_text(errors="strict")
     unpack = (ROOT / "src/native_unpack.zig").read_text(errors="strict")
     for required in (
@@ -1980,7 +2002,7 @@ WORKLOAD_PARTITIONS = {
         "run_native_snapshot_tests", "run_native_differential_zig_tests",
         "run_native_fixture_tests", "run_native_conffile_zig_tests",
         "dpkg_config_reference_tests", "dpkg_alternatives_reference_tests",
-        "dpkg_oracle_evidence_tests", "run_sha512_e2e_tests",
+        "dpkg_oracle_evidence_tests", "signed_proc_compare_tests", "run_sha512_e2e_tests",
         "run_native_trigger_queue_tests", "run_lifecycle_zig_tests",
         "run_trigger_zig_tests", "run_settlement_tests", "run_recovery_unit_tests",
         "run_native_recovery_tests", "run_repository_recovery_unit",
