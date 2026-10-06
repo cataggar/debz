@@ -3,6 +3,7 @@ const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
 const settlement = @import("native_diversion_settlement.zig");
 const removal_cases = @import("native_trigger_removal.zig");
+const root_import = @import("native_root_import.zig");
 const options = @import("native_test_options");
 const root_fs = @import("debz").root_fs;
 
@@ -201,17 +202,52 @@ const immediate_trigger_names = "/usr/share/" ++ source ++ "/data /usr/share/" +
 const deferred_trigger_names = "debz-z debz-a /usr/share/" ++ source ++ " /usr/share/" ++ source ++ "/data";
 
 fn assertTriggeredArgv(allocator: std.mem.Allocator, recorded: []const u8, arch: []const u8, names: []const u8) !void {
-    const expected = try std.fmt.allocPrint(allocator, receiver ++ "@1:postinst\t" ++ receiver ++
-        "\tpostinst\t{s}\t2\t9:triggered\t{d}:{s}\tpayload=data version 1", .{ arch, names.len, names });
+    return assertPackageTriggeredArgv(allocator, recorded, receiver, arch, names);
+}
+
+fn assertPackageTriggeredArgv(allocator: std.mem.Allocator, recorded: []const u8, package: []const u8, arch: []const u8, names: []const u8) !void {
+    const prefix = try std.fmt.allocPrint(allocator, "{s}@1:postinst\t", .{package});
+    defer allocator.free(prefix);
+    const expected = try std.fmt.allocPrint(allocator, "{s}{s}\tpostinst\t{s}\t2\t9:triggered\t{d}:{s}\tpayload=data version 1", .{
+        prefix, package, arch, names.len, names,
+    });
     defer allocator.free(expected);
     var invocations: usize = 0;
     var lines = std.mem.splitScalar(u8, recorded, '\n');
     while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, receiver ++ "@1:postinst\t")) continue;
+        if (!std.mem.startsWith(u8, line, prefix) or std.mem.indexOf(u8, line, "\t9:triggered") == null) continue;
         if (!std.mem.eql(u8, expected, line)) return error.TriggerArgvBytesMismatch;
         invocations += 1;
     }
     if (invocations != 1) return error.TriggerInvocationCountMismatch;
+}
+
+fn assertDeferredMultiState(case: *support.Scenario, source_name: []const u8) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const status = (try support.readOptionalCaseFile(case, side, "var/lib/dpkg/status")) orelse return error.MissingStatus;
+        defer case.fixture.allocator.free(status);
+        const expected = [_]struct { name: []const u8, state: []const u8, field: []const u8 }{
+            .{ .name = "zero-trigger-handler", .state = "triggers-pending", .field = "Triggers-Pending: debz-zero-trigger" },
+            .{ .name = "zero-file-handler", .state = "triggers-pending", .field = "Triggers-Pending: /usr/share/debz-zero-files" },
+            .{ .name = source_name, .state = "triggers-awaited", .field = "Triggers-Awaited: zero-file-handler" },
+        };
+        for (expected) |package| {
+            const name = try std.fmt.allocPrint(case.fixture.allocator, "Package: {s}\n", .{package.name});
+            defer case.fixture.allocator.free(name);
+            const state = try std.fmt.allocPrint(case.fixture.allocator, "\nStatus: install ok {s}\n", .{package.state});
+            defer case.fixture.allocator.free(state);
+            const field = try std.fmt.allocPrint(case.fixture.allocator, "\n{s}\n", .{package.field});
+            defer case.fixture.allocator.free(field);
+            var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
+            const paragraph = while (paragraphs.next()) |entry| {
+                if (std.mem.startsWith(u8, entry, name)) break entry;
+            } else return error.TriggerPackageMissing;
+            if (std.mem.indexOf(u8, paragraph, state) == null or
+                !std.mem.endsWith(u8, paragraph, field[0 .. field.len - 1]) or
+                std.mem.count(u8, paragraph, "\nTriggers-") != 1)
+                return error.DeferredMultiHandlerStateMismatch;
+        }
+    }
 }
 
 fn runTriggerByteOrder(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
@@ -270,6 +306,159 @@ fn runTriggerByteOrder(fixture: *foundation.Fixture, driver: []const u8, helper:
             defer fixture.allocator.free(recorded);
             try assertTriggeredArgv(fixture.allocator, recorded, arch, if (defer_triggers and !input.reimport) deferred_trigger_names else immediate_trigger_names);
         }
+    }
+}
+
+fn runDeferredMultiHandler(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const explicit_handler = try support.makePackage(fixture, arch, "1", "zero-trigger-handler", "multi-handler-packages", .{
+        .declarations = "interest-noawait debz-zero-trigger\n",
+    });
+    defer fixture.allocator.free(explicit_handler);
+    const file_handler = try support.makePackage(fixture, arch, "1", "zero-file-handler", "multi-handler-packages", .{
+        .declarations = "interest /usr/share/debz-zero-files\n",
+    });
+    defer fixture.allocator.free(file_handler);
+    for ([_][]const u8{ "zero-file-activator", "zero-trigger-source" }) |source_name| {
+        const activating = try support.makePackage(fixture, arch, "1", source_name, "multi-handler-packages", .{
+            .declarations = "activate-noawait debz-zero-trigger\n",
+            .extra_files = &.{.{ .path = "usr/share/debz-zero-files/data", .content = "multi-handler activation\n" }},
+        });
+        defer fixture.allocator.free(activating);
+        for ([_]bool{ false, true }) |recovery| {
+            const name = try std.fmt.allocPrint(fixture.allocator, "deferred-multi-{s}-{s}", .{
+                source_name, if (recovery) "recovery" else "direct",
+            });
+            defer fixture.allocator.free(name);
+            var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+            defer case.deinit();
+            try copyNativeHelper(fixture, &case, helper);
+            try case.phase(.{
+                .operation = "install",
+                .archives = &.{ explicit_handler, file_handler },
+                .triggers = true,
+                .recovery = true,
+            }, false);
+            try case.phase(.{
+                .operation = "install",
+                .archives = &.{activating},
+                .triggers = true,
+                .defer_triggers = true,
+                .recovery = recovery,
+            }, false);
+            try support.compareStatusBytes(fixture, case.reference_root, case.native_root);
+            try assertDeferredMultiState(&case, source_name);
+            // This authority fixture does not claim dpkg's --pending handler
+            // selection order; it compares explicitly ordered reference handlers.
+            try case.phase(.{
+                .operation = "process_triggers",
+                .triggers = true,
+                .recovery = recovery,
+                .reference_trigger_order = &.{
+                    .{ .name = "zero-trigger-handler", .architecture = arch },
+                    .{ .name = "zero-file-handler", .architecture = arch },
+                },
+            }, false);
+            try support.compareStatusBytes(fixture, case.reference_root, case.native_root);
+            for ([_][]const u8{ "reference", "native" }) |side| {
+                const status = (try support.readOptionalCaseFile(&case, side, "var/lib/dpkg/status")) orelse return error.MissingStatus;
+                defer fixture.allocator.free(status);
+                if (std.mem.indexOf(u8, status, "Triggers-") != null) return error.UnsettledMultiHandlerState;
+                if (try support.readOptionalCaseFile(&case, side, "var/lib/dpkg/triggers/Unincorp")) |queue| {
+                    defer fixture.allocator.free(queue);
+                    if (queue.len != 0) return error.UnsettledMultiHandlerQueue;
+                }
+                const recorded = (try support.readOptionalCaseFile(&case, side, support.trace)) orelse return error.MissingTriggerTrace;
+                defer fixture.allocator.free(recorded);
+                try assertPackageTriggeredArgv(fixture.allocator, recorded, "zero-trigger-handler", arch, "debz-zero-trigger");
+                try assertPackageTriggeredArgv(fixture.allocator, recorded, "zero-file-handler", arch, "/usr/share/debz-zero-files");
+            }
+            if (!fixture.oracle_only) {
+                const destination = try std.fmt.allocPrint(fixture.allocator, "{s}/unchanged", .{name});
+                defer fixture.allocator.free(destination);
+                try root_import.expectUnchanged(fixture, driver, case.native_root, arch, destination, "unchanged");
+            }
+        }
+    }
+    if (!fixture.oracle_only)
+        try deferredMultiHandlerRecovery(fixture, driver, helper, dpkg, arch, &.{ explicit_handler, file_handler });
+}
+
+fn deferredMultiHandlerRecovery(fixture: *foundation.Fixture, driver: []const u8, helper: []const u8, dpkg: []const u8, arch: []const u8, handlers: []const []const u8) !void {
+    const source_name = "zero-file-activator";
+    const activating = try support.makePackage(fixture, arch, "1", source_name, "multi-recovery-packages", .{
+        .declarations = "activate-noawait debz-zero-trigger\n",
+        .extra_files = &.{.{ .path = "usr/share/debz-zero-files/data", .content = "multi-handler activation\n" }},
+    });
+    defer fixture.allocator.free(activating);
+    for ([_]bool{ false, true }) |drift| {
+        const name = if (drift) "deferred-multi-recovery-drift" else "deferred-multi-recovery-clean";
+        var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+        defer case.deinit();
+        try copyNativeHelper(fixture, &case, helper);
+        try case.phase(.{ .operation = "install", .archives = handlers, .triggers = true, .recovery = true }, false);
+        const interrupted = try support.path(fixture.allocator, name, "interrupted");
+        defer fixture.allocator.free(interrupted);
+        try fixture.directory(interrupted);
+        const phase: support.Phase = .{
+            .operation = "install",
+            .archives = &.{activating},
+            .triggers = true,
+            .defer_triggers = true,
+            .recovery = true,
+            .crash_at = "after_deferred_trigger_status_publication",
+        };
+        if (try support.reference(fixture, dpkg, case.reference_root, phase, interrupted) != 0)
+            return error.UnexpectedReferenceOutcome;
+        try support.interruptNative(fixture, driver, case.native_root, arch, phase, interrupted);
+        try support.compareStatusBytes(fixture, case.reference_root, case.native_root);
+        try assertDeferredMultiState(&case, source_name);
+        const status_path = try std.fmt.allocPrint(fixture.allocator, "{s}/native/var/lib/dpkg/status", .{name});
+        defer fixture.allocator.free(status_path);
+        if (drift) {
+            const status = try support.read(fixture, status_path, 64 * 1024);
+            defer fixture.allocator.free(status);
+            const original = "Triggers-Pending: debz-zero-trigger";
+            const position = std.mem.indexOf(u8, status, original) orelse return error.MissingTriggerPending;
+            const changed = try std.mem.concat(fixture.allocator, u8, &.{
+                status[0..position], "Triggers-Pending: debz-forged-trigger", status[position + original.len ..],
+            });
+            defer fixture.allocator.free(changed);
+            try support.fixtureFile(fixture, status_path, changed, 0o644);
+        }
+        const before = try support.read(fixture, status_path, 64 * 1024);
+        defer fixture.allocator.free(before);
+        const trace_before = (try support.readOptionalCaseFile(&case, "native", support.trace)) orelse return error.MissingTriggerTrace;
+        defer fixture.allocator.free(trace_before);
+        const recovered = try support.path(fixture.allocator, name, "recovered");
+        defer fixture.allocator.free(recovered);
+        try fixture.directory(recovered);
+        var result = try support.native(fixture, driver, case.native_root, arch, .{
+            .operation = "recover",
+            .triggers = true,
+            .recovery = true,
+        }, recovered);
+        defer result.deinit();
+        if (drift) {
+            if (!std.mem.eql(u8, result.value.outcome, "recovery_required") or
+                !std.mem.eql(u8, result.value.detail, "managed_state_changed"))
+            {
+                return error.RecoveryDriftWasNotRefused;
+            }
+            const active = (try support.readOptionalCaseFile(&case, "native", "var/lib/debz/root-operation-v1.json")) orelse return error.RecoveryDriftLostEvidence;
+            defer fixture.allocator.free(active);
+            if (active.len == 0) return error.RecoveryDriftLostEvidence;
+        } else {
+            if (!std.mem.eql(u8, result.value.outcome, "applied"))
+                return error.MultiHandlerRecoveryDidNotComplete;
+            try support.assertNoActiveEvidence(fixture, case.native_root);
+            try support.compareStatusBytes(fixture, case.reference_root, case.native_root);
+        }
+        const after = try support.read(fixture, status_path, 64 * 1024);
+        defer fixture.allocator.free(after);
+        const trace_after = (try support.readOptionalCaseFile(&case, "native", support.trace)) orelse return error.MissingTriggerTrace;
+        defer fixture.allocator.free(trace_after);
+        if (!std.mem.eql(u8, before, after) or !std.mem.eql(u8, trace_before, trace_after))
+            return error.DeferredRecoveryRewroteStateOrReplayedScript;
     }
 }
 
@@ -1188,6 +1377,7 @@ pub fn main(init: std.process.Init) !void {
     var settlement_reference_only = false;
     var removal_only = false;
     var byte_order_only = false;
+    var multi_handler_only = false;
     while (arguments.next()) |option| {
         if (std.mem.eql(u8, option, "--native-helper")) {
             if (helper != null) return error.DuplicateHelper;
@@ -1213,6 +1403,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--byte-order-only")) {
             if (byte_order_only) return error.DuplicateSelector;
             byte_order_only = true;
+        } else if (std.mem.eql(u8, option, "--multi-handler-only")) {
+            if (multi_handler_only) return error.DuplicateSelector;
+            multi_handler_only = true;
         } else if (std.mem.startsWith(u8, option, "-") or driver != null) return error.InvalidArguments else {
             driver = option;
         }
@@ -1220,7 +1413,8 @@ pub fn main(init: std.process.Init) !void {
     try validateSelection(driver, helper, oracle_only, diversions_only, settlement_reference_only);
     if (removal_only and (diversions_only or settlement_reference_only)) return error.InvalidArguments;
     if (byte_order_only and (removal_only or diversions_only or settlement_reference_only)) return error.InvalidArguments;
-    if (byte_order_only and pinned == null) return error.PinnedReferenceRequired;
+    if (multi_handler_only and (byte_order_only or removal_only or diversions_only or settlement_reference_only)) return error.InvalidArguments;
+    if ((byte_order_only or multi_handler_only) and pinned == null) return error.PinnedReferenceRequired;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     var fixture = try foundation.Fixture.initWorkspace(allocator, init.io, options.repository, workspace);
@@ -1232,6 +1426,12 @@ pub fn main(init: std.process.Init) !void {
     else
         "";
     const native_driver = driver orelse "";
+    if (multi_handler_only) {
+        try runDeferredMultiHandler(&fixture, native_driver, selected, reference.executable, reference.architecture);
+        try runUnwatchedDeclaredActivations(&fixture, native_driver, selected, reference.executable, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     if (byte_order_only) {
         try runTriggerByteOrder(&fixture, native_driver, selected, reference.executable, reference.architecture);
         try support.assertHostUnchanged(allocator, init.io, reference.before);
@@ -1260,6 +1460,10 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         runTriggerByteOrder(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
+            try support.assertHostUnchanged(allocator, init.io, reference.before);
+            return err;
+        };
+        runDeferredMultiHandler(&fixture, native_driver, selected, reference.executable, reference.architecture) catch |err| {
             try support.assertHostUnchanged(allocator, init.io, reference.before);
             return err;
         };

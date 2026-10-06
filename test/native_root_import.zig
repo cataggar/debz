@@ -479,7 +479,7 @@ fn expectZeroAction(
     try support.assertNoActiveEvidence(fixture, root);
 }
 
-fn expectUnchanged(
+pub fn expectUnchanged(
     fixture: *foundation.Fixture,
     driver: []const u8,
     root: []const u8,

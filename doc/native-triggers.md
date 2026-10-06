@@ -170,6 +170,35 @@ extra, or reordered edges and unrelated package identity/version/selection
 changes remain mismatches; derived mode is not permission to accept any
 pending state.
 
+The input base digest must match the caller's exact closure before
+authorization canonicalizes package order. The returned authority rebinds
+that already-validated closure to its canonical order, so adding a source
+before an installed handler in the name order cannot invalidate deferred
+derivation or its persisted recovery authority. A wrong input digest still
+refuses; no handler, activation, or package transition is newly authorized.
+
+`zig build test-native-triggers-zig test-native-triggers-zig-oracle
+-Dnative-trigger-multi-handler-only=true -Dnative-reference-dpkg=/absolute/pinned/dpkg
+-Doptimize=Debug -j2` selects two natively installed handlers: explicit
+no-await interest and awaited file interest. The original source name and a
+source that sorts before a handler run with recovery on/off; the existing
+unwatched-activation case-1 matrix runs alongside them. The fixture
+requires exact pinned-dpkg `--no-triggers` status bytes and pending/awaited
+edges, eventual native `process_triggers` settlement, exact per-handler
+callback argv, and an unchanged zero-action upgrade including database and
+provenance bytes/mtimes. It also interrupts after deferred status publication:
+clean recovery must not replay scripts or rewrite status, and pending-field
+drift must retain recovery evidence with `managed_state_changed`.
+Repeat with `-Doptimize=ReleaseSafe`.
+
+This fixture does **not** establish dpkg's cross-handler `--pending` scheduling
+order. The reference settlement explicitly selects both handlers with
+`--no-triggers --triggers-only zero-trigger-handler zero-file-handler`;
+dpkg processes that selected list in reverse, matching the native fixture's
+file-then-explicit callback order. Traces are compared without reordering or
+normalization. Generic pending-handler scheduling remains a separate
+compatibility question; hosted isolated-runtime acceptance remains required.
+
 ## Private activation helper
 
 The test-only static helper accepts `--await` or `--no-await`, an optional

@@ -356,6 +356,7 @@ pub const Phase = struct {
     operation: []const u8,
     archives: []const []const u8 = &.{},
     reference_groups: ?[]const []const []const u8 = null,
+    reference_trigger_order: ?[]const foundation.PackageIdentity = null,
     packages: []const foundation.PackageIdentity = &.{},
     policy: []const u8 = "keep_existing",
     defer_triggers: bool = false,
@@ -413,6 +414,10 @@ pub fn runExit(fixture: *foundation.Fixture, argv: []const []const u8, log: []co
 }
 
 pub fn reference(fixture: *foundation.Fixture, executable: []const u8, root: []const u8, phase: Phase, destination: []const u8) !u8 {
+    if (phase.reference_trigger_order) |selected| {
+        if (!std.mem.eql(u8, phase.operation, "process_triggers") or selected.len == 0)
+            return error.InvalidReferenceOperation;
+    }
     var guarded = try foundation.guardedRoot(fixture.io, root);
     guarded.close(fixture.io);
     const root_arg = try std.fmt.allocPrint(fixture.allocator, "--root={s}", .{root});
@@ -422,7 +427,8 @@ pub fn reference(fixture: *foundation.Fixture, executable: []const u8, root: []c
     try argv.appendSlice(fixture.allocator, &.{
         executable, "--force-not-root", "--force-bad-path", root_arg,
     });
-    if (!phase.triggers or phase.defer_triggers) try argv.append(fixture.allocator, "--no-triggers");
+    if (!phase.triggers or phase.defer_triggers or phase.reference_trigger_order != null)
+        try argv.append(fixture.allocator, "--no-triggers");
     try argv.append(fixture.allocator, if (std.mem.eql(u8, phase.policy, "keep_existing")) "--force-confold" else if (std.mem.eql(u8, phase.policy, "use_package_version")) "--force-confnew" else return error.InvalidConffilePolicy);
     const operation = phase.operation;
     if (std.mem.eql(u8, operation, "install") or std.mem.eql(u8, operation, "upgrade") or
@@ -435,7 +441,8 @@ pub fn reference(fixture: *foundation.Fixture, executable: []const u8, root: []c
     } else if (std.mem.eql(u8, operation, "process_triggers")) {
         if (!phase.triggers) return error.InvalidReferenceOperation;
         try argv.append(fixture.allocator, "--triggers-only");
-        if (phase.packages.len == 0) try argv.append(fixture.allocator, "--pending") else for (phase.packages) |item| try argv.append(fixture.allocator, item.name);
+        const selected = phase.reference_trigger_order orelse phase.packages;
+        if (selected.len == 0) try argv.append(fixture.allocator, "--pending") else for (selected) |item| try argv.append(fixture.allocator, item.name);
     } else if (std.mem.eql(u8, operation, "configure") or std.mem.eql(u8, operation, "remove") or std.mem.eql(u8, operation, "purge")) {
         if (phase.packages.len == 0) return error.MissingPackage;
         const flag = try std.fmt.allocPrint(fixture.allocator, "--{s}", .{operation});
@@ -470,7 +477,7 @@ pub const Report = struct {
     program_sha256: ?[]const u8 = null,
 };
 
-pub fn native(fixture: *foundation.Fixture, executable: []const u8, root: []const u8, architecture: []const u8, phase: Phase, destination: []const u8) !std.json.Parsed(Report) {
+fn nativeRequest(fixture: *foundation.Fixture, root: []const u8, architecture: []const u8, phase: Phase, destination: []const u8) !void {
     var guarded = try foundation.guardedRoot(fixture.io, root);
     guarded.close(fixture.io);
     const request_relative = try path(fixture.allocator, destination, "native.request.json");
@@ -501,11 +508,35 @@ pub fn native(fixture: *foundation.Fixture, executable: []const u8, root: []cons
     defer fixture.allocator.free(document);
     try fixture.write(request_relative, document, 0o644);
     try fixture.environment.put("DEBZ_NATIVE_LIFECYCLE_REQUEST", request);
+}
+
+pub fn interruptNative(fixture: *foundation.Fixture, executable: []const u8, root: []const u8, architecture: []const u8, phase: Phase, destination: []const u8) !void {
+    if (!phase.recovery or phase.crash_at == null) return error.InvalidCrashSelection;
+    try nativeRequest(fixture, root, architecture, phase, destination);
+    const log = try path(fixture.allocator, destination, "native.log");
+    defer fixture.allocator.free(log);
+    const expected = try std.fmt.allocPrint(fixture.allocator, "{d}", .{@import("debz").native_recovery.crash_exit_code});
+    defer fixture.allocator.free(expected);
+    try fixture.run(&.{
+        "/bin/sh", "-c", "\"$1\"; code=$?; test \"$code\" -eq \"$2\"", "sh", executable, expected,
+    }, log, 120);
+    const report = try path(fixture.allocator, destination, "native.report.json");
+    defer fixture.allocator.free(report);
+    if (read(fixture, report, 64 * 1024)) |bytes| {
+        fixture.allocator.free(bytes);
+        return error.CrashedNativePublishedReport;
+    } else |err| if (err != error.FileNotFound) return err;
+}
+
+pub fn native(fixture: *foundation.Fixture, executable: []const u8, root: []const u8, architecture: []const u8, phase: Phase, destination: []const u8) !std.json.Parsed(Report) {
+    try nativeRequest(fixture, root, architecture, phase, destination);
     const log = try path(fixture.allocator, destination, "native.log");
     defer fixture.allocator.free(log);
     var wrapped = try withUmask(fixture.allocator, phase.caller_umask, &.{executable});
     defer freeUmask(fixture.allocator, phase.caller_umask, &wrapped);
     try fixture.run(wrapped.items, log, 120);
+    const report_relative = try path(fixture.allocator, destination, "native.report.json");
+    defer fixture.allocator.free(report_relative);
     const bytes = try read(fixture, report_relative, 64 * 1024);
     defer fixture.allocator.free(bytes);
     const parsed = try std.json.parseFromSlice(Report, fixture.allocator, bytes, .{

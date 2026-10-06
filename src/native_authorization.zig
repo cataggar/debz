@@ -614,7 +614,11 @@ pub fn create(
             .allowed_triggers = allowed,
             .maximum_invocations = trigger.maximum_invocations,
             .final_mode = trigger.final_mode,
-            .base_final_state_sha256 = trigger.base_final_state_sha256,
+            // The input digest was checked before canonicalizing its closure.
+            .base_final_state_sha256 = if (trigger.final_mode == .derive_from_activations)
+                digestFinalState(final_state)
+            else
+                null,
             .maximum_activations = trigger.maximum_activations,
         };
     }
@@ -2300,6 +2304,43 @@ test "native_authorization.test.derived trigger final mode binds base and bounds
         error.InvalidTriggerAuthority,
         create(std.testing.allocator, input),
     );
+}
+
+test "native_authorization.test.derived trigger base follows canonical closure without accepting a wrong input digest" {
+    var input = testInput();
+    var reversed = test_final_state;
+    std.mem.reverse(FinalPackage, &reversed);
+    input.final_state = &reversed;
+    const input_digest = finalStateDigest(input.final_state);
+    input.trigger_authority = .{
+        .mode = .transaction,
+        .defer_triggers = true,
+        .initial_state_sha256 = @splat(0x43),
+        .handlers = &.{},
+        .callers = &.{},
+        .allowed_triggers = &.{},
+        .maximum_invocations = 8,
+        .final_mode = .derive_from_activations,
+        .base_final_state_sha256 = input_digest,
+        .maximum_activations = 8,
+    };
+    var owned = try create(std.testing.allocator, input);
+    defer owned.deinit();
+    const authorization = owned.authorization;
+    const canonical_digest = finalStateDigest(authorization.final_state);
+    try std.testing.expect(!std.mem.eql(u8, &input_digest, &canonical_digest));
+    try std.testing.expectEqualSlices(u8, &canonical_digest, &authorization.trigger_authority.?.base_final_state_sha256.?);
+    const bytes = try authorization.canonicalJson(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    var decoded = try decode(std.testing.allocator, bytes, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqualSlices(u8, &authorization.digest_sha256, &decoded.authorization.digest_sha256);
+
+    input.trigger_authority.?.base_final_state_sha256 = canonical_digest;
+    try std.testing.expectError(error.InvalidTriggerAuthority, create(std.testing.allocator, input));
+    input.trigger_authority.?.base_final_state_sha256 = input_digest;
+    reversed[0].version = "changed";
+    try std.testing.expectError(error.InvalidTriggerAuthority, create(std.testing.allocator, input));
 }
 
 test "native_authorization.test.rejects contradictory duplicate and unauthorized programs" {
