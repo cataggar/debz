@@ -48,17 +48,22 @@ The `version_bound` flag is reserved for reviewed cases where version-keyed
 logic is itself part of the admission; only then must a consumer name the
 provenance version.
 
-The committed manifest starts `pending` at the current pin, `20261001T000000Z`.
-It holds every reviewed identity, but no probe results yet. The tool refuses
-to probe a timestamp less than 24 hours old, so the first `record` runs in the
-first repin after that day has settled.
+The committed manifest is `probed` for `ubuntu-resolute` at
+`20261001T000000Z`: it records the frozen Release, both witnesses, and
+177-package closures on amd64 and arm64. Its admission deadline is
+2026-10-31 20:38:20 UTC; renewal requires a reviewed repin, not a clock
+override. A quiet pocket's `refresh_only` binding remains subject to the
+[known gap](#known-gap-release-identity-of-a-pocket-outside-a-lock) below.
+The tool refuses to probe a timestamp less
+than 24 hours old and compares two fetches of each InRelease before recording
+the result.
 
 ## Commands
 
 ### `probe`
 
 ```sh
-python3 tools/real-snapshot-repin.py probe --series ubuntu-stonking \
+python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute \
     [--timestamp 20261015T000000Z] --debz zig-out/bin/debz \
     [--manifest PATH] [--workspace DIR] [--accept-frozen-release]
 ```
@@ -215,7 +220,7 @@ and also verifies that it refuses a manifest with a mutated identity.
 1. Build ReleaseSafe `debz` at the current `main`:
    `zig build -Doptimize=ReleaseSafe -j4`.
 2. Probe the newest settled day:
-   `python3 tools/real-snapshot-repin.py probe --series ubuntu-stonking --debz zig-out/bin/debz`.
+   `python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute --debz zig-out/bin/debz`.
    Read `summary.md` and note the new admission deadline.
 3. Run `diff --report .tmp/real-snapshot-repin/<T>/report.json --pr N` for
    every open real-snapshot pull request.
