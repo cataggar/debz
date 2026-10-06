@@ -61,10 +61,10 @@ KINDS = ("script", "tool_file", "archive", "prestate")
 ROLES = ("bounded", "frozen", "witness")
 # How each pocket's fetched Release is tied to what debz authenticated, per
 # architecture. `exact_lock`: an exact lock names the repository with the same
-# cleartext release_sha256. `refresh_only`: debz refresh authenticated the
-# pocket, but it contributes no locked package and debz emits no Release digest
-# for it, so the fetched bytes are recorded without that cross-check (#344).
-BINDINGS = ("exact_lock", "refresh_only")
+# cleartext release_sha256. `refresh_identity`: public refresh evidence binds
+# even a quiet pocket. `refresh_only` is retained ONLY for historical reports
+# made by debz versions that did not expose that evidence.
+BINDINGS = ("exact_lock", "refresh_identity", "refresh_only")
 CONSUMER_FORMS = ("hex", "zig_bytes", "fixture")
 STATUSES = ("unchanged", "provenance-only", "changed", "missing")
 SNAPSHOT_URI = re.compile(r"snapshot\.ubuntu\.com/ubuntu/([0-9]{8}T[0-9]{6}Z)")
@@ -723,19 +723,36 @@ class Debz:
             fail(f"debz {operation} failed for {self.arch} (exit {result.returncode}): {detail[:2000]}")
         return document
 
-    def refresh(self, suites: set[str]) -> dict[str, str]:
-        """Refreshes every pocket and returns suite -> repository id."""
+    def refresh(self, suites: set[str]) -> dict[str, dict]:
+        """Returns every pocket's public authenticated repository evidence."""
         document = self.run("refresh", ["--assume-yes"])
-        repository_ids: dict[str, str] = {}
+        if (document.get("schema") != "io.github.cataggar.debz.command.v1"
+                or type(document.get("api_version")) is not int or document["api_version"] != 1
+                or document.get("operation") != "refresh"
+                or type(document.get("exit_status")) is not int or document["exit_status"] != 0
+                or not isinstance(document.get("items"), list)):
+            fail(f"{self.arch} refresh returned an unsupported command result")
+        repositories: dict[str, dict] = {}
         for item in document["items"]:
-            if item["version"] in suites:
-                detail = item.get("detail") or ""
-                if not detail.startswith("authenticated") or "stale" in detail:
-                    fail(f"{self.arch} refresh did not freshly authenticate {item['version']}: {detail}")
-                repository_ids[item["version"]] = item["package"]
-        if sorted(repository_ids) != sorted(suites):
+            if (not isinstance(item, dict) or not isinstance(item.get("version"), str)
+                    or item["version"] not in suites or item.get("architecture") is not None):
+                fail(f"{self.arch} refresh reported an unexpected pocket")
+            suite = item["version"]
+            if suite in repositories:
+                fail(f"{self.arch} refresh reported {suite} twice")
+            detail = item.get("detail") or ""
+            if not isinstance(detail, str) or not detail.startswith("authenticated") or "stale" in detail:
+                fail(f"{self.arch} refresh did not freshly authenticate {suite}: {detail}")
+            repository_id = item.get("package")
+            if not isinstance(repository_id, str) or not re.fullmatch(r"[0-9a-f]{64}", repository_id):
+                fail(f"{suite} refresh has an invalid repository id")
+            evidence = validate_refresh_repository(item.get("repository"), suite)
+            repositories[suite] = {"id": repository_id, **evidence}
+        if sorted(repositories) != sorted(suites):
             fail(f"{self.arch} refresh did not authenticate every pocket")
-        return repository_ids
+        if len({value["id"] for value in repositories.values()}) != len(repositories):
+            fail(f"{self.arch} refresh reported duplicate repository ids")
+        return repositories
 
     def plan(self, package: str, lock: Path) -> dict:
         self.run("plan", ["--transaction-backend", "native", "--lock-output", str(lock), package])
@@ -848,21 +865,91 @@ def require_sha512(packages: dict[str, dict], arch: str) -> None:
         fail(f"{arch} closure packages without a signed SHA-512 archive identity: {', '.join(missing)}")
 
 
+def validate_refresh_repository(value: object, suite: str) -> dict:
+    exact_keys(value, {"release_digest", "snapshot_digest", "signer_fingerprints", "frozen"}, set(),
+               f"{suite} refresh repository")
+    assert isinstance(value, dict)
+    parse_tagged(value["release_digest"], ("sha256",))
+    parse_tagged(value["snapshot_digest"], ("sha256",))
+    signers = value["signer_fingerprints"]
+    if (not isinstance(signers, list) or not signers
+            or any(not isinstance(s, str) or not re.fullmatch(r"[0-9a-f]{40}", s) for s in signers)
+            or signers != sorted(set(signers))):
+        fail(f"{suite} refresh has invalid signer fingerprints")
+    frozen = value["frozen"]
+    if frozen is not None:
+        exact_keys(frozen, {"release_digest", "admission_deadline_unix", "witnesses"}, set(),
+                   f"{suite} frozen decisions")
+        parse_tagged(frozen["release_digest"], ("sha256",))
+        if type(frozen["admission_deadline_unix"]) is not int:
+            fail(f"{suite} frozen admission deadline must be an integer")
+        if not isinstance(frozen["witnesses"], list) or not 1 <= len(frozen["witnesses"]) <= 4:
+            fail(f"{suite} frozen decisions need one to four witnesses")
+        for witness in frozen["witnesses"]:
+            exact_keys(witness, {"repository_id", "snapshot_digest", "release_date_unix",
+                                "deadline_unix", "primary_fingerprint"}, set(), f"{suite} frozen witness")
+            if (not isinstance(witness["repository_id"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", witness["repository_id"])
+                    or not isinstance(witness["primary_fingerprint"], str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", witness["primary_fingerprint"])
+                    or type(witness["release_date_unix"]) is not int or type(witness["deadline_unix"]) is not int):
+                fail(f"{suite} frozen witness has invalid identity or decisions")
+            parse_tagged(witness["snapshot_digest"], ("sha256",))
+    return value
+
+
 def bind_pockets(
-    pockets: dict[str, dict], locks: list[dict], refresh_ids: dict[str, str], signer: str, arch: str
+    pockets: dict[str, dict], locks: list[dict], repositories: dict[str, dict], signer: str, arch: str
 ) -> set[str]:
-    """Binds fetched Release bytes to the cleartext digests debz locked; returns the bound suites."""
-    by_id = {repository_id: suite for suite, repository_id in refresh_ids.items()}
+    """Binds EVERY fetched pocket to refresh; locks must agree where they contribute."""
+    if set(repositories) != set(pockets):
+        fail(f"{arch} refresh did not authenticate every pocket")
+    for suite, repository in repositories.items():
+        exact_keys(repository, {"id", "release_digest", "snapshot_digest", "signer_fingerprints", "frozen"},
+                   set(), f"{suite} refresh evidence")
+        if not isinstance(repository["id"], str) or not re.fullmatch(r"[0-9a-f]{64}", repository["id"]):
+            fail(f"{suite} refresh has an invalid repository id")
+    by_id = {value["id"]: suite for suite, value in repositories.items()}
+    if len(by_id) != len(repositories):
+        fail(f"{arch} refresh reported duplicate repository ids")
+    for suite, repository in repositories.items():
+        validate_refresh_repository({key: value for key, value in repository.items() if key != "id"}, suite)
+        if repository["signer_fingerprints"] != [signer]:
+            fail(f"{suite} is signed by {repository['signer_fingerprints']}, not the reviewed signer")
+        if repository["release_digest"] != pockets[suite]["release_sha256"]:
+            fail(f"{suite} Release fetched by the probe differs from the Release debz authenticated")
+        frozen = repository["frozen"]
+        if pockets[suite]["role"] != "frozen":
+            if frozen is not None:
+                fail(f"{suite} unexpectedly reports frozen decisions")
+            continue
+        witnesses = sorted((p for p in pockets.values() if p["role"] == "witness"), key=lambda p: p["suite"])
+        if frozen is None or frozen["release_digest"] != pockets[suite]["release_sha256"]:
+            fail(f"{suite} frozen Release differs from the reviewed pin")
+        if [w["repository_id"] for w in frozen["witnesses"]] != [repositories[p["suite"]]["id"] for p in witnesses]:
+            fail(f"{suite} frozen witnesses differ from configured policy order")
+        for decision, pocket in zip(frozen["witnesses"], witnesses):
+            witness = repositories[pocket["suite"]]
+            date = release_time(pocket["date"], "Date")
+            deadline = (release_time(pocket["valid_until"], "Valid-Until") if pocket["valid_until"]
+                        else date + MAXIMUM_RELEASE_AGE_SECONDS)
+            if (decision["snapshot_digest"] != witness["snapshot_digest"]
+                    or decision["primary_fingerprint"] != signer
+                    or decision["release_date_unix"] != date or decision["deadline_unix"] != deadline):
+                fail(f"{suite} frozen witness {pocket['suite']} differs from its authenticated pocket")
+        if frozen["admission_deadline_unix"] != min(w["deadline_unix"] for w in frozen["witnesses"]):
+            fail(f"{suite} frozen admission deadline differs from its witnesses")
     bound: set[str] = set()
     for lock in locks:
         for repository in lock["repositories"]:
             suite = by_id.get(repository["id"])
             if suite is None:
                 fail(f"{arch} lock names a repository that refresh did not report")
-            if repository["signer_fingerprints"] != [signer]:
-                fail(f"{suite} is signed by {repository['signer_fingerprints']}, not the reviewed signer")
-            if lock_digest(repository["release_sha256"]) != pockets[suite]["release_sha256"]:
-                fail(f"{suite} Release fetched by the probe differs from the Release debz authenticated")
+            evidence = repositories[suite]
+            if (repository["signer_fingerprints"] != evidence["signer_fingerprints"]
+                    or lock_digest(repository["release_sha256"]) != evidence["release_digest"]
+                    or lock_digest(repository["snapshot_sha256"]) != evidence["snapshot_digest"]):
+                fail(f"{suite} exact lock differs from its authenticated refresh identity")
             bound.add(suite)
     return bound
 
@@ -976,14 +1063,18 @@ def probe(args: argparse.Namespace, now: int | None = None) -> int:
     closures: dict[str, dict] = {}
     identities: dict[str, dict] = {}
     repository_ids: dict[str, dict[str, str]] = {}
+    repository_evidence: dict[str, dict[str, dict]] = {}
     unavailable: dict[str, dict[str, str]] = {}
     manifest_identities = manifest["identities"] if manifest else []
     for arch in profile["architectures"]:
         configs = write_configs(workspace / "config" / arch, profile, timestamp, arch,
                                 frozen["release_sha256"] if frozen else None)
         debz = Debz(debz_path, workspace, arch, configs, profile["keyring"])
-        refresh_ids = debz.refresh(set(pockets))
+        refreshed = debz.refresh(set(pockets))
+        bind_pockets(pockets, [], refreshed, profile["signer"], arch)
+        refresh_ids = {suite: value["id"] for suite, value in refreshed.items()}
         repository_ids[arch] = refresh_ids
+        repository_evidence[arch] = refreshed
         closure_lock_path = locks_directory / f"{arch}.lock.json"
         closure_lock = debz.plan(profile["request"], closure_lock_path)
         debz.download(profile["request"], closure_lock_path)
@@ -1014,9 +1105,9 @@ def probe(args: argparse.Namespace, now: int | None = None) -> int:
                     lock_entries.setdefault(package["name"], package)
                 for package_name, entry in extra_packages.items():
                     packages.setdefault(package_name, entry)
-        bound = bind_pockets(pockets, locks, refresh_ids, profile["signer"], arch)
+        bound = bind_pockets(pockets, locks, refreshed, profile["signer"], arch)
         for suite, pocket in pockets.items():
-            pocket["binding"][arch] = "exact_lock" if suite in bound else "refresh_only"
+            pocket["binding"][arch] = "exact_lock" if suite in bound else "refresh_identity"
         for name, entry in packages.items():
             entry["lock_package"] = lock_entries[name]
         for identity in manifest_identities:
@@ -1054,6 +1145,7 @@ def probe(args: argparse.Namespace, now: int | None = None) -> int:
         "frozen_release_change": frozen_change,
         "pockets": ordered,
         "repository_ids": repository_ids,
+        "repository_evidence": repository_evidence,
         "admission_deadline": deadline,
         "closures": closures,
         "unavailable": unavailable,
@@ -1108,6 +1200,11 @@ def report_summary(report: dict) -> str:
             "",
             *unbound,
         ]
+    quiet = [f"- `{p['suite']}` on {', '.join(a for a, b in p['binding'].items() if b == 'refresh_identity')}"
+             for p in report["pockets"] if "refresh_identity" in p["binding"].values()]
+    if quiet:
+        lines += ["", "Pockets that contribute no locked package. Their fetched Release is bound to "
+                  "`debz refresh` repository evidence (no fabricated lock contribution):", "", *quiet]
     return "\n".join(lines) + "\n"
 
 
@@ -1119,7 +1216,25 @@ def load_report(path: Path) -> dict:
     if report.get("schema") != REPORT_SCHEMA:
         fail(f"{path} is not a repin probe report")
     validate_profile(report["series"], "report.series")
+    validate_report_pocket_evidence(report)
     return report
+
+
+def validate_report_pocket_evidence(report: dict) -> None:
+    """Never promote historical refresh-only reports without public identity evidence."""
+    if ("repository_evidence" not in report
+            and not any("refresh_identity" in p["binding"].values() for p in report["pockets"])):
+        return
+    evidence = report.get("repository_evidence")
+    if not isinstance(evidence, dict) or set(evidence) != set(report["series"]["architectures"]):
+        fail("report repository evidence must cover every architecture")
+    pockets = {p["suite"]: p for p in report["pockets"]}
+    for arch, repositories in evidence.items():
+        if not isinstance(repositories, dict):
+            fail(f"{arch} report repository evidence must be an object")
+        bind_pockets(pockets, [], repositories, report["series"]["signer"], arch)
+        if report.get("repository_ids", {}).get(arch) != {s: r["id"] for s, r in repositories.items()}:
+            fail(f"{arch} report repository ids differ from authenticated evidence")
 
 
 def identity_status(identity: dict, observed: dict[str, dict | None]) -> tuple[str, list[str]]:
@@ -1399,6 +1514,7 @@ def record_manifest(
     accept_frozen: str | None,
     allow_series_migration: bool = False,
 ) -> dict:
+    validate_report_pocket_evidence(report)
     series_migration = report["series"]["name"] != manifest["series"]["name"]
     if series_migration and not allow_series_migration:
         fail("the report is for a different series")

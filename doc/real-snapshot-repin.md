@@ -89,10 +89,14 @@ The probe refuses, with exit status 2, when any of these checks fails:
    `allow_missing_valid_until_with_max_age_seconds` with the 31-day bound.
    The frozen pocket uses `frozen_release_with_witnesses`, pinned to the
    probed digest.
-5. A lock names a repository that refresh did not report, a signer other than
-   the reviewed signer, or a `release_sha256` other than the bytes the tool
-   fetched. Refresh must also report every pocket as freshly authenticated,
-   not from a stale cache.
+5. Refresh omits a pocket's typed repository evidence, reports a signer other
+   than the reviewed signer, or its tagged Release digest differs from the
+   fetched bytes. This is checked before any planning/download, including for
+   quiet pockets. Frozen decisions must name exactly the configured witnesses
+   in normalized policy order, with their own refresh snapshot digests, signed
+   Dates, calculated deadlines and reviewed primary signer. Each contributing
+   lock must agree with refresh's Release/snapshot/signer identity. Refresh must
+   report fresh authentication, not stale-cache admission.
 6. A closure package, or a package that a manifest identity needs, has no
    signed SHA-512 archive identity.
 7. A second fetch of any `InRelease`, made after all planning and
@@ -105,7 +109,8 @@ The probe refuses, with exit status 2, when any of these checks fails:
 Outputs, under `--workspace` (default `.tmp/real-snapshot-repin/<T>`):
 
 - `report.json` (`io.github.cataggar.debz.real-snapshot-repin-report.v1`):
-  the pockets with their per-architecture `binding`, `debz` repository ids,
+  the pockets with their per-architecture `binding`, `debz` repository ids and
+  full public `repository_evidence` (including frozen witness decisions),
   admission deadline, per-architecture closures (lock, lock digest, closure
   digest, package and pocket counts, packages), packages that could not be
   planned, and the observed value of every manifest identity.
@@ -118,13 +123,14 @@ Each pocket's `binding`, per architecture, is one of:
 - `exact_lock`: an exact lock from the closure plan or from an identity's
   plan names the repository, and its `release_sha256` equals the Release the
   tool fetched.
-- `refresh_only`: the pocket contributes no locked package, for example a
-  quiet `-security` pocket, or one whose fixes all reached `-updates`. `debz
-  refresh` authenticated it, and for a frozen series its witness admission
-  passed, but no `debz` output carries its Release digest (see
-  [Known gap](#known-gap-release-identity-of-a-pocket-outside-a-lock)). The
-  probe reports such a pocket and does not refuse it. `record` keeps the
-  binding in the manifest.
+- `refresh_identity`: the pocket contributes no locked package, for example a
+  quiet `-security` pocket, but its fetched Release is bound to public refresh
+  evidence. Frozen witnesses are bound regardless of lock contribution.
+- `refresh_only`: **historical evidence only**, produced before refresh exposed
+  repository identity. It is never emitted by a new probe. Existing reports and
+  manifests retain this honest limitation rather than being silently promoted.
+  `record` requires complete matching public repository evidence before it will
+  accept `refresh_identity`; a label edit alone is refused.
 
 ### `diff`
 
@@ -253,37 +259,22 @@ admission deadline (about day 21 of the 31-day bound).
   - an unreviewed signer;
   - an unreviewed frozen Release, which is refused before `debz` runs;
   - a pocket whose packages are all shadowed by another pocket, and an empty
-    pocket. Each is reported as `refresh_only` on the architectures where it
+    pocket. Each is reported as `refresh_identity` on the architectures where it
     contributes nothing, without any extra `debz` plan, and `record` keeps
-    that binding.
+    that binding. Contributing Release/snapshot identities match exact locks;
+    frozen witnesses include an empty security pocket on both architectures.
 - `tools/test_real_snapshot_repin.py` unit-tests the tool's pure logic in
   `zig build security-audit`: timestamps, Release parsing, date and deadline
   rules, manifest and binding validation, statuses, `record` refusals and
   renames, pocket binding, and package member extraction.
 
-## Known gap: Release identity of a pocket outside a lock
+## Historical evidence is not a new probe
 
-`debz` already holds every configured pocket's authenticated Release digest
-after refresh: `PublishedRepositoryState.release_digest`, which is also the
-source of an exact lock's `release_sha256`. Two outputs reach the tool, and
-neither carries that digest for every pocket:
-
-- `debz refresh --json` emits, per repository, only the repository id
-  (`package`), the Release suite (`version`) and a detail string. It does not
-  emit the Release digest or the signer fingerprint.
-- An exact lock lists only the repositories that contribute a locked package.
-
-For a frozen series, `debz` also records each witness's repository id,
-snapshot digest, `Date`, deadline and primary fingerprint
-(`FrozenDecisions`/`WitnessDecision`). That record reaches snapshot digest v4
-and `debz`'s cache manifests only. The multi-repository cache manifest also
-lists every pocket's Release digest and signer, but it is a cache file, not
-command output.
-
-So for a `refresh_only` pocket, the tool records the Release bytes it fetched
-twice, but it cannot compare them with the digest `debz` authenticated. The
-tool does not work around this, for example by planning another closure or by
-reading `debz`'s cache files. Closing the gap needs `debz` to emit each
-pocket's tagged Release digest and signer in refresh output, and, for a
-frozen pocket, its witness decisions. The tool can then bind every pocket to
-that output and drop `refresh_only`. This is tracked in #344.
+Older committed evidence may still contain `refresh_only`, including the
+resolute arm64 security pocket. The implementation fixes future observations;
+it does not retroactively authenticate those fetched bytes. Replacing such a
+binding requires a reviewed report from the new binary's public refresh
+evidence, using the existing repin procedure. Do not fabricate a contributing
+package, inspect private metadata-cache manifests as a substitute, or describe
+an offline manifest `check` as a new live probe. Live native/protected acceptance
+gates remain separate from these synthetic, network-free tests.

@@ -17,6 +17,8 @@ import tarfile
 import tempfile
 import unittest
 
+import jsonschema
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("debz_real_snapshot_repin", ROOT / "tools/real-snapshot-repin.py")
@@ -133,6 +135,28 @@ def report(identities: dict, pockets=None, timestamp=T1, closure=None) -> dict:
         },
         "identities": identities,
     }
+
+
+def refresh_evidence(pockets: dict[str, dict]) -> dict[str, dict]:
+    values = {
+        suite: {"id": str(index + 1) * 64, "release_digest": p["release_sha256"],
+                "snapshot_digest": sha256(suite.encode()), "signer_fingerprints": [SIGNER], "frozen": None}
+        for index, (suite, p) in enumerate(pockets.items())
+    }
+    for suite, p in pockets.items():
+        if p["role"] == "frozen":
+            witnesses = [
+                {"repository_id": values[name]["id"], "snapshot_digest": values[name]["snapshot_digest"],
+                 "release_date_unix": repin.release_time(w["date"], "Date"),
+                 "deadline_unix": repin.release_time(w["date"], "Date") + repin.MAXIMUM_RELEASE_AGE_SECONDS,
+                 "primary_fingerprint": SIGNER}
+                for name, w in sorted(pockets.items()) if w["role"] == "witness"
+            ]
+            values[suite]["frozen"] = {
+                "release_digest": p["release_sha256"],
+                "admission_deadline_unix": min(w["deadline_unix"] for w in witnesses), "witnesses": witnesses,
+            }
+    return values
 
 
 def deb(control: dict[str, tuple[bytes, int]], data: dict[str, tuple[bytes, int]], compress=True) -> bytes:
@@ -521,7 +545,7 @@ class RecordTests(unittest.TestCase):
         third = repin.record_manifest(second, point_release, diff, {}, "#332")
         self.assertEqual(third["snapshot"]["pockets"][0]["review"], "#332")
 
-    def test_quiet_witness_is_recorded_as_refresh_only_and_bindings_are_validated(self) -> None:
+    def test_historical_refresh_only_is_preserved_not_promoted_without_evidence(self) -> None:
         roles = [{"suite": "r", "role": "frozen"}, {"suite": "r-security", "role": "witness"}]
         value = manifest(pockets=roles)
         probe = report(
@@ -538,6 +562,25 @@ class RecordTests(unittest.TestCase):
             mutated["snapshot"]["pockets"][1]["binding"] = binding
             with self.subTest(binding=binding), self.assertRaisesRegex(repin.RepinError, "binding must give"):
                 repin.validate_manifest(mutated)
+        forged = copy.deepcopy(probe)
+        forged["pockets"][1]["binding"]["amd64"] = "refresh_identity"
+        with self.assertRaisesRegex(repin.RepinError, "evidence must cover"):
+            repin.record_manifest(value, forged, self.diff(value, forged), {}, "#330")
+
+    def test_quiet_witness_identity_is_recorded_only_with_complete_refresh_evidence(self) -> None:
+        pockets = [pocket("r", "frozen", b"frozen"),
+                   pocket("r-security", "witness", b"security", "refresh_identity")]
+        probe = report({"script:alpha/postinst": {"amd64": observed()}}, pockets=pockets)
+        repositories = refresh_evidence({p["suite"]: p for p in pockets})
+        probe["repository_evidence"] = {"amd64": repositories}
+        probe["repository_ids"] = {"amd64": {s: r["id"] for s, r in repositories.items()}}
+        value = manifest(pockets=probe["series"]["pockets"])
+        recorded = repin.record_manifest(value, probe, self.diff(value, probe), {}, "#330")
+        self.assertEqual(recorded["snapshot"]["pockets"][1]["binding"], {"amd64": "refresh_identity"})
+        mutated = copy.deepcopy(probe)
+        mutated["repository_evidence"]["amd64"]["r-security"]["release_digest"] = sha256(b"wrong")
+        with self.assertRaisesRegex(repin.RepinError, "Release fetched by the probe differs"):
+            repin.record_manifest(value, mutated, self.diff(value, mutated), {}, "#330")
 
     def test_closure_diff_and_pr_scan(self) -> None:
         value = manifest()
@@ -707,34 +750,108 @@ class CheckTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
-    def test_bind_pockets_returns_only_pockets_a_lock_names(self) -> None:
+    def test_bind_pockets_binds_every_pocket_even_without_lock_contribution(self) -> None:
         pockets = {
             "r": pocket("r", "frozen", b"frozen"),
             "r-updates": pocket("r-updates", "witness", b"updates"),
             "r-security": pocket("r-security", "witness", b"security"),
         }
-        ids = {"r": "1" * 64, "r-updates": "2" * 64, "r-security": "3" * 64}
+        refreshed = refresh_evidence(pockets)
 
         def repository(suite: str, release: bytes, signer: str = SIGNER) -> dict:
             return {
-                "id": ids[suite],
+                "id": refreshed[suite]["id"],
                 "release_sha256": hashlib.sha256(release).hexdigest(),
+                "snapshot_sha256": refreshed[suite]["snapshot_digest"].removeprefix("sha256:"),
                 "signer_fingerprints": [signer],
             }
 
         closure = {"repositories": [repository("r", b"frozen"), repository("r-updates", b"updates")]}
-        self.assertEqual(repin.bind_pockets(pockets, [closure], ids, SIGNER, "amd64"), {"r", "r-updates"})
+        self.assertEqual(repin.bind_pockets(pockets, [], refreshed, SIGNER, "arm64"), set())
+        self.assertEqual(repin.bind_pockets(pockets, [closure], refreshed, SIGNER, "amd64"), {"r", "r-updates"})
         bind = {"repositories": [repository("r-security", b"security")]}
         self.assertEqual(
-            repin.bind_pockets(pockets, [closure, bind], ids, SIGNER, "amd64"), {"r", "r-updates", "r-security"}
+            repin.bind_pockets(pockets, [closure, bind], refreshed, SIGNER, "amd64"), {"r", "r-updates", "r-security"}
         )
         for lock, message in (
-            ({"repositories": [repository("r-security", b"other")]}, "r-security Release fetched by the probe differs"),
-            ({"repositories": [repository("r-security", b"security", "0" * 40)]}, "not the reviewed signer"),
+            ({"repositories": [repository("r-security", b"other")]}, "exact lock differs"),
+            ({"repositories": [repository("r-security", b"security", "0" * 40)]}, "exact lock differs"),
+            ({"repositories": [dict(repository("r-security", b"security"), snapshot_sha256="9" * 64)]}, "exact lock differs"),
             ({"repositories": [dict(repository("r", b"frozen"), id="4" * 64)]}, "refresh did not report"),
         ):
             with self.subTest(message=message), self.assertRaisesRegex(repin.RepinError, message):
-                repin.bind_pockets(pockets, [lock], ids, SIGNER, "amd64")
+                repin.bind_pockets(pockets, [lock], refreshed, SIGNER, "amd64")
+        for field, value in (
+            ("release_digest", sha256(b"other")),
+            ("signer_fingerprints", ["0" * 40]),
+            ("snapshot_digest", sha512(b"other")),
+            ("frozen", {}),
+        ):
+            mutated = copy.deepcopy(refreshed)
+            mutated["r-security"][field] = value
+            with self.subTest(field=field), self.assertRaises(repin.RepinError):
+                repin.bind_pockets(pockets, [closure], mutated, SIGNER, "arm64")
+        for field, value in (
+            ("snapshot_digest", sha256(b"other")),
+            ("repository_id", "4" * 64),
+            ("primary_fingerprint", "0" * 40),
+            ("release_date_unix", 1),
+            ("deadline_unix", 1),
+        ):
+            mutated = copy.deepcopy(refreshed)
+            mutated["r"]["frozen"]["witnesses"][0][field] = value
+            with self.subTest(witness_field=field), self.assertRaises(repin.RepinError):
+                repin.bind_pockets(pockets, [], mutated, SIGNER, "arm64")
+
+    def test_refresh_requires_strict_public_evidence_and_every_unique_pocket(self) -> None:
+        pockets = {"r": pocket("r")}
+        repositories = refresh_evidence(pockets)
+        item = {"package": repositories["r"]["id"], "version": "r", "architecture": None,
+                "detail": "authenticated", "repository": {k: v for k, v in repositories["r"].items() if k != "id"}}
+        document = {"schema": "io.github.cataggar.debz.command.v1", "api_version": 1,
+                    "operation": "refresh", "exit_status": 0, "items": [item]}
+        debz = object.__new__(repin.Debz)
+        debz.arch = "arm64"
+        debz.run = lambda operation, extra: document
+        self.assertEqual(debz.refresh({"r"}), repositories)
+        mutations = [
+            dict(document, api_version=2), dict(document, api_version=True),
+            dict(document, operation="plan"), dict(document, items=[]),
+            dict(document, items=[item, item]),
+            dict(document, items=[{k: v for k, v in item.items() if k != "repository"}]),
+            dict(document, items=[dict(item, repository=dict(item["repository"], private_cache="not evidence"))]),
+            dict(document, items=[dict(item, detail="authenticated stale cache")]),
+        ]
+        for changed in mutations:
+            debz.run = lambda operation, extra: changed
+            with self.subTest(document=changed), self.assertRaises(repin.RepinError):
+                debz.refresh({"r"})
+
+    def test_command_schema_enforces_refresh_only_typed_repository_evidence(self) -> None:
+        schema = json.loads((ROOT / "schema/command-result-v1.json").read_text())
+        jsonschema.Draft202012Validator.check_schema(schema)
+        validator = jsonschema.Draft202012Validator(schema)
+        pockets = {"r": pocket("r", "frozen"), "r-security": pocket("r-security", "witness")}
+        repository = refresh_evidence(pockets)["r"]
+        repository = {k: v for k, v in repository.items() if k != "id"}
+        document = {"schema": "io.github.cataggar.debz.command.v1", "api_version": 1,
+                    "operation": "refresh", "exit_status": 0, "changed": True, "summary": "authenticated",
+                    "items": [{"package": "1" * 64, "version": "r", "architecture": None,
+                               "detail": "authenticated", "repository": repository}], "diagnostics": []}
+        validator.validate(document)
+        for operation in ("plan", "install", "list-installed"):
+            with self.subTest(operation=operation), self.assertRaises(jsonschema.ValidationError):
+                validator.validate(dict(document, operation=operation))
+        for field, value in (("release_digest", sha512(b"release")), ("snapshot_digest", "1" * 64),
+                             ("signer_fingerprints", ["A" * 40]), ("unknown", True)):
+            changed = copy.deepcopy(document)
+            changed["items"][0]["repository"][field] = value
+            with self.subTest(field=field), self.assertRaises(jsonschema.ValidationError):
+                validator.validate(changed)
+        changed = copy.deepcopy(document)
+        changed["items"][0]["repository"]["frozen"]["witnesses"][0]["deadline_unix"] = True
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(changed)
 
     def test_members_are_read_from_compressed_and_plain_tars(self) -> None:
         for compress in (True, False):
