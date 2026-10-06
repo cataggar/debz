@@ -273,12 +273,27 @@ imports. The deferred reinstallation case also tests imported pending names
 coalescing with repeated activations, without moving duplicates. The focused
 `-Dnative-trigger-byte-order-only=true` selector runs these cases in the
 existing native and two-dpkg oracle targets.
-It also runs two **reference-only** guarded, pinned-dpkg cases for a failed
-activating postinst with an unpacked (not configured) listener, once with
-`interest-await` and once with `interest-noawait`. Both assert that the listener
-stays unpacked with no pending work, the source stays half-configured without
-an awaited edge, and `Unincorp` stays empty after the helper returns. These
-cases do **not** compare native execution: the native program compiler currently
+
+Recovery restores the live/imported pending-name distinction from the
+authenticated completed incorporation phase, not from queue or activation-log
+contents. An uninterested activation can leave both empty after incorporation
+has already normalized imported pending names. Replaying that phase must keep
+the original triggered argv so the recorded ordinal and outcome are reused
+without rerunning the handler. Queue clearing without event application does
+not establish live pending order.
+`zig build test-native-recovery-helper-zig -j2
+-Dnative-trigger-recovery-order-only=true -Dnative-reference-dpkg=/absolute/path/to/dpkg`
+runs genuine `after_trigger_outcome` crash/recovery cases with one imported
+handler, with and without an uninterested queue entry. They require exact
+pinned-dpkg argv and final status bytes, unchanged retained outcome bytes and
+action identity, and no duplicate callback on recovery or terminal replay.
+
+The full trigger suite also runs two **reference-only** guarded, pinned-dpkg
+cases for a failed activating postinst with an unpacked (not configured)
+listener, once with `interest-await` and once with `interest-noawait`. Both
+assert that the listener stays unpacked with no pending work, the source stays
+half-configured without an awaited edge, and `Unincorp` stays empty after the
+helper returns. These cases do **not** compare native execution: the native program compiler currently
 refuses this unconfigured-listener program. Separate Zig tests for both await
 variants assert `program_compile_rejected`, unchanged full private-root
 snapshots, and no active authority. That fail-closed behavior must not be

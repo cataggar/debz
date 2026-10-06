@@ -18028,8 +18028,13 @@ fn lifecycleIncorporateTriggerQueue(
         // Account for its completed database phase before assigning the
         // derived status publication a new recovery action identity.
         if (execution.recovery) |runtime| {
-            if (runtime.recovering)
-                _ = try consumeRecoveredDatabasePhase(execution);
+            if (runtime.recovering) {
+                const incorporated = try consumeRecoveredDatabasePhase(execution);
+                // The authenticated completed incorporation also normalized
+                // imported pending names even without activation-log events.
+                if (incorporated and apply_events)
+                    execution.trigger_pending_is_live = true;
+            }
         }
         return .{ .outcome = .applied, .detail = "trigger_queue_empty" };
     }

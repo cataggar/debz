@@ -1445,6 +1445,8 @@ pub fn build(b: *std.Build) void {
     recovery_helper.addArtifactArg(recovery_helper_executable);
     recovery_helper.addArtifactArg(native_lifecycle_tests);
     if (native_script_failure_only or native_core_only) recovery_helper.addArg("--script-failure-only");
+    if (b.option(bool, "native-trigger-recovery-order-only", "Select imported pending trigger order crash/replay cases") orelse false)
+        recovery_helper.addArg("--trigger-pending-order-only");
     b.step("test-native-recovery-helper-zig", "Run Zig-owned real-process crash and helper acceptance")
         .dependOn(&recovery_helper.step);
 

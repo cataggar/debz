@@ -2012,6 +2012,130 @@ fn knownScriptFailures(fixture: *foundation.Fixture, driver: []const u8, dpkg: [
         try knownFailure(fixture, driver, dpkg, arch, boundary);
 }
 
+fn pendingTriggerOrderOutcome(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    unwatched_queue: bool,
+) !void {
+    const name = if (unwatched_queue) "pending-trigger-unwatched-queue-outcome" else "pending-trigger-imported-outcome";
+    const handler_name = "debz-recovery-pending";
+    var scenario = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer scenario.deinit();
+    const handler = try support.makePackage(fixture, arch, "1", handler_name, try support.path(fixture.allocator, name, "handler"), .{
+        .declarations = "interest-noawait debz-a\ninterest-noawait debz-b\n",
+        .scripts = .{ .only_postinst = true },
+    });
+    try scenario.seed(handler);
+    for ([_][]const u8{ scenario.reference_root, scenario.native_root }) |root| {
+        const original = try bytes(fixture, root, "var/lib/dpkg/status", 64 * 1024);
+        const pending = try std.mem.replaceOwned(u8, fixture.allocator, original, "Status: install ok installed", "Status: install ok triggers-pending");
+        const status = try std.mem.replaceOwned(u8, fixture.allocator, pending, "\n\n", "\nTriggers-Pending: debz-a debz-b\n\n");
+        try fixture.write(try relative(fixture, root, "var/lib/dpkg/status"), status, 0o644);
+        if (unwatched_queue)
+            try fixture.write(try relative(fixture, root, "var/lib/dpkg/triggers/Unincorp"), "debz-unwatched -\n", 0o644);
+    }
+    const reference_run = try support.path(fixture.allocator, name, "reference-process");
+    try fixture.directory(reference_run);
+    if (try support.reference(fixture, dpkg, scenario.reference_root, .{
+        .operation = "process_triggers",
+        .triggers = true,
+    }, reference_run) != 0) return error.UnexpectedReferenceTriggerExit;
+    if (try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "crash"), .{
+        .operation = "process_triggers",
+        .crash_at = "after_trigger_outcome",
+        .caller_owned = false,
+        .isolated_helper = false,
+        .trigger_execution = true,
+    }) != null) return error.CrashProducedCompletionReport;
+    const trace = try bytes(fixture, scenario.native_root, support.trace, 64 * 1024);
+    const expected_trace = try std.fmt.allocPrint(fixture.allocator, handler_name ++ "@1:postinst\t" ++ handler_name ++
+        "\tpostinst\t{s}\t2\t9:triggered\t13:debz-b debz-a\tpayload=data version 1\n", .{arch});
+    try same(trace, expected_trace);
+    try same(try bytes(fixture, scenario.reference_root, support.trace, 64 * 1024), trace);
+    try same(try bytes(fixture, scenario.native_root, "var/lib/dpkg/triggers/Unincorp", 64 * 1024), "");
+    if (unwatched_queue) {
+        var events = try document(fixture, scenario.native_root, debz.native_recovery.trigger_events_path);
+        defer events.deinit();
+        const log = try field(events.value, "events");
+        if (log != .array or log.array.items.len != 0) return error.ExpectedEmptyTriggerActivationLog;
+        const status = try bytes(fixture, scenario.native_root, "var/lib/dpkg/status", 64 * 1024);
+        if (std.mem.indexOf(u8, status, "Triggers-Pending: debz-b debz-a\n") == null)
+            return error.PendingTriggerNormalizationNotPublished;
+    }
+    var root_dir = try foundation.guardedRoot(fixture.io, scenario.native_root);
+    defer root_dir.close(fixture.io);
+    const root: debz.root_fs.Root = .init(fixture.io, root_dir);
+    var progress = try debz.native_recovery.readProgress(fixture.allocator, root);
+    defer progress.deinit();
+    var action: ?debz.native_recovery.Action = null;
+    for (progress.document.records) |record| {
+        if (record.action.kind != .trigger or record.stage != .outcome) continue;
+        if (action != null or record.result != .exited) return error.DuplicateTriggerOutcome;
+        action = record.action;
+    }
+    const original_action = action orelse return error.MissingTriggerOutcome;
+    if (original_action.ordinal != 0) return error.UnexpectedTriggerOrdinal;
+    var outcome = (try debz.native_recovery.readScriptOutcome(fixture.allocator, root, original_action)) orelse
+        return error.MissingTriggerOutcome;
+    defer outcome.deinit();
+    if (outcome.outcome.arguments.len != 2 or outcome.outcome.exit_code != 0)
+        return error.InvalidTriggerOutcome;
+    try same(outcome.outcome.arguments[0], "triggered");
+    try same(outcome.outcome.arguments[1], "debz-b debz-a");
+    var outcome_path_buffer: [128]u8 = undefined;
+    const outcome_path = try debz.native_recovery.scriptOutcomePath(original_action, &outcome_path_buffer);
+    const outcome_bytes = try bytes(fixture, scenario.native_root, outcome_path, 64 * 1024);
+    var recovered = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "recovery"), .{
+        .operation = "recover",
+        .caller_owned = false,
+        .isolated_helper = false,
+        .trigger_execution = true,
+    }), "applied", null);
+    defer recovered.deinit();
+    try same(try bytes(fixture, scenario.native_root, support.trace, 64 * 1024), trace);
+    try missing(fixture, scenario.native_root, "var/lib/debz/native-lifecycle-script-v1.json");
+    try missing(fixture, scenario.native_root, operation_path);
+    try missing(fixture, scenario.native_root, intent_path);
+    const proof_bytes = try bytes(fixture, scenario.native_root, provenance_path, 16 * 1024 * 1024);
+    var proof = try debz.native_provenance.decode(fixture.allocator, proof_bytes);
+    defer proof.deinit();
+    if (proof.document.outcome != .succeeded) return error.WrongRecoveryOutcome;
+    try same(&proof.document.execution_intent_sha256, &outcome.outcome.intent_sha256);
+    try debz.native_provenance.verifyEvidence(fixture.allocator, root, proof.document);
+    var retained_outcomes: usize = 0;
+    for (proof.document.evidence_files) |file| {
+        if (file.kind != .script_outcome) continue;
+        retained_outcomes += 1;
+        if (!std.meta.eql(file.action orelse return error.MissingTriggerOutcomeAction, .{
+            .kind = original_action.kind,
+            .program_step = original_action.program_step,
+            .substep = original_action.substep,
+            .ordinal = original_action.ordinal,
+        }))
+            return error.TriggerOutcomeOrdinalChanged;
+        try same(try bytes(fixture, scenario.native_root, file.path, 64 * 1024), outcome_bytes);
+        try same(&file.sha256, &sha256(outcome_bytes));
+        try same(&(file.document_sha256 orelse return error.MissingTriggerOutcomeDigest), &outcome.outcome.digest_sha256);
+    }
+    if (retained_outcomes != 1) return error.DuplicateTriggerOutcome;
+    const comparison = try support.path(fixture.allocator, name, "comparison");
+    try fixture.directory(comparison);
+    try support.compare(fixture, scenario.reference_root, scenario.native_root, comparison, true);
+    try support.compareStatusBytes(fixture, scenario.reference_root, scenario.native_root);
+    var repeated = try expectReport(try invoke(fixture, driver, scenario.native_root, arch, try support.path(fixture.allocator, name, "repeat"), .{
+        .operation = "recover",
+        .caller_owned = false,
+        .isolated_helper = false,
+        .trigger_execution = true,
+    }), "applied", null);
+    defer repeated.deinit();
+    try same(try bytes(fixture, scenario.native_root, support.trace, 64 * 1024), trace);
+    try same(try bytes(fixture, scenario.native_root, provenance_path, 16 * 1024 * 1024), proof_bytes);
+    std.debug.print("{s}: exit 86, exact pinned-dpkg argv and original ordinal/outcome reused without a second callback\n", .{name});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var args = init.minimal.args.iterate();
@@ -2019,6 +2143,7 @@ pub fn main(init: std.process.Init) !void {
     const driver = args.next() orelse return error.MissingNativeDriver;
     var pinned: ?[]const u8 = null;
     var script_failure_only = false;
+    var trigger_pending_order_only = false;
     while (args.next()) |argument| {
         if (std.mem.eql(u8, argument, "--reference-dpkg")) {
             if (pinned != null) return error.DuplicateReference;
@@ -2026,8 +2151,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, argument, "--script-failure-only")) {
             if (script_failure_only) return error.DuplicateSelector;
             script_failure_only = true;
+        } else if (std.mem.eql(u8, argument, "--trigger-pending-order-only")) {
+            if (trigger_pending_order_only) return error.DuplicateSelector;
+            trigger_pending_order_only = true;
         } else return error.InvalidArguments;
     }
+    if (script_failure_only and trigger_pending_order_only) return error.InvalidArguments;
+    if (trigger_pending_order_only and pinned == null) return error.PinnedReferenceRequired;
     const reference = try support.prerequisites(init, allocator, pinned);
     defer allocator.free(reference.architecture);
     try namespaceGate(allocator, init.io);
@@ -2036,6 +2166,12 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after helper failure: {s}\n", .{@errorName(err)});
+    if (trigger_pending_order_only) {
+        for ([_]bool{ false, true }) |queued|
+            try pendingTriggerOrderOutcome(&fixture, driver, reference.executable, reference.architecture, queued);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     if (script_failure_only) {
         try knownScriptFailures(&fixture, driver, reference.executable, reference.architecture);
         try support.assertHostUnchanged(allocator, init.io, reference.before);
@@ -2089,6 +2225,8 @@ pub fn main(init: std.process.Init) !void {
     try blockedUnknown(&fixture, driver, reference.executable, reference.architecture, true);
     try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, false);
     try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, true);
+    for ([_]bool{ false, true }) |queued|
+        try pendingTriggerOrderOutcome(&fixture, driver, reference.executable, reference.architecture, queued);
     try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, false);
     try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, true);
     for ([_]Corruption{ .intent, .progress, .artifact, .managed_root, .completed_phase }) |which|
