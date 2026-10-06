@@ -14,9 +14,11 @@ The tool never authenticates repository metadata itself:
   native --lock-output` and `download --lock-input`) in a fresh workspace with
   no host APT configuration.
 - The tool fetches each pocket's `InRelease` itself only to record its bytes.
-  It then binds those bytes to the cleartext `release_sha256` that `debz`
-  wrote into an exact lock after authenticating the Release. A pocket that
-  `debz` did not authenticate in some lock is refused.
+  It binds every pocket's cleartext Release digest to `debz refresh` public
+  repository evidence, including quiet pockets absent from any lock. Frozen
+  witness decisions must agree with their own refresh items, and contributing
+  exact locks must agree with refresh's Release/snapshot/signer identity.
+  Missing or mismatched public evidence is refused before planning/download.
 - Package members are read only from CAS objects that `debz download`
   verified. The tool hashes each object again against the lock's SHA-512
   archive identity and declared size before opening it.
