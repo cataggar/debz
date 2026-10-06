@@ -2524,6 +2524,122 @@
       "review": "#393",
       "size": 25808,
       "version_bound": false
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-python3-reference.sh"
+        },
+        {
+          "form": "hex",
+          "path": "tools/security-audit.py"
+        },
+        {
+          "form": "fixture",
+          "path": "src/fixtures/ubuntu-resolute-python3-minimal.postinst"
+        }
+      ],
+      "digest": "sha256:be10656c9edf975f5dfe48fe5819172e905e14dcd4ff372af5d8b45b26168edd",
+      "id": "script:python3-minimal/postinst",
+      "kind": "script",
+      "mode": "0755",
+      "package": "python3-minimal",
+      "path": "postinst",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#393",
+      "size": 117,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-python3-reference.sh"
+        },
+        {
+          "form": "hex",
+          "path": "tools/security-audit.py"
+        }
+      ],
+      "digest": "sha256:a94b6fd8fb7f801f564da4dbb3e2d646b54713b58349d725c650885a5a0c6ccc",
+      "id": "file:python3-minimal/usr/bin/py3compile",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "python3-minimal",
+      "path": "usr/bin/py3compile",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#393",
+      "size": 13312,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "amd64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-python3-reference.sh"
+        },
+        {
+          "form": "hex",
+          "path": "tools/security-audit.py"
+        }
+      ],
+      "derived_from": [
+        {
+          "package": "python3-minimal",
+          "version": "3.14.3-0ubuntu2"
+        },
+        {
+          "package": "python3",
+          "version": "3.14.3-0ubuntu2"
+        }
+      ],
+      "digest": "sha256:e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e",
+      "id": "prestate:python3-minimal/postinst-dev-null",
+      "kind": "prestate",
+      "mode": "0644",
+      "package": "python3-minimal",
+      "path": "dev/null",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#393",
+      "size": 20,
+      "version_bound": false
     }
   ],
   "schema": "io.github.cataggar.debz.real-snapshot-pin.v1",

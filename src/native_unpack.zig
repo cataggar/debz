@@ -22585,12 +22585,7 @@ fn verifySnapshotPython3PreinstInputs(
         root,
         program.target_architecture,
     );
-    try verifySnapshotPython3NullFile(
-        allocator,
-        root,
-        0,
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    );
+    try verifySnapshotPython3NullInput(allocator, root, program);
 }
 
 const SnapshotPython3PreinstBinding = struct {
@@ -23100,6 +23095,227 @@ fn verifySnapshotPython3NullFile(
     }, error.InvalidPython3PreinstControl);
 }
 
+const snapshot_python3_minimal_postinst = SignedDebconfControlFile{
+    .path = "var/lib/dpkg/info/python3-minimal.postinst",
+    .size = 117,
+    .mode = 0o755,
+    .sha256 = "be10656c9edf975f5dfe48fe5819172e905e14dcd4ff372af5d8b45b26168edd",
+};
+const snapshot_python3_minimal_null_sources = [_]SignedDebconfControlFile{
+    snapshot_python3_minimal_postinst,
+    .{
+        .path = "usr/bin/py3compile",
+        .size = 13312,
+        .mode = 0o755,
+        .sha256 = "a94b6fd8fb7f801f564da4dbb3e2d646b54713b58349d725c650885a5a0c6ccc",
+    },
+};
+const snapshot_python3_minimal_null_input = SignedDebconfControlFile{
+    .path = "dev/null",
+    .size = 20,
+    .mode = 0o644,
+    .sha256 = "e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e",
+};
+
+fn verifySnapshotPython3NullInputBinding(
+    entry: root_fs.Entry,
+    digest: [32]u8,
+    architecture: []const u8,
+) !bool {
+    if (entry.size == snapshot_python3_minimal_null_input.size) {
+        if (!std.mem.eql(u8, architecture, "amd64"))
+            return invalidPython3Preinst(
+                "reason=null_prestate_architecture_unbound path=dev/null field=target_architecture expected=amd64 observed={s}",
+                .{architecture},
+            );
+        try verifySignedDebconfControlFileBinding(
+            entry,
+            digest,
+            snapshot_python3_minimal_null_input,
+            error.InvalidPython3PreinstControl,
+        );
+        return true;
+    }
+    if (entry.mode != 0o600 and entry.mode != 0o644)
+        return invalidPython3Preinst(
+            "reason=null_file_mode_mismatch path=dev/null field=mode expected=0o600-or-0o644 observed=0o{o}",
+            .{entry.mode},
+        );
+    try verifySignedDebconfControlFileBinding(entry, digest, .{
+        .path = "dev/null",
+        .size = 0,
+        .mode = @intCast(entry.mode),
+        .sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    }, error.InvalidPython3PreinstControl);
+    return false;
+}
+
+fn verifySnapshotPython3NullInput(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    program: *const native_program.Program,
+) !void {
+    var pinned = root.pinRegularFile(try root_fs.Path.init("dev/null")) catch |err|
+        return python3PreinstError(
+            err,
+            "reason=null_file_open_failed path=dev/null field=kind expected=regular observed={s}",
+            .{@errorName(err)},
+        );
+    defer pinned.close();
+    const observed = try pinned.observeStableAlloc(allocator, 1024 * 1024);
+    defer allocator.free(observed.bytes);
+    var digest: [32]u8 = undefined;
+    Sha256.hash(observed.bytes, &digest, .{});
+    if (try verifySnapshotPython3NullInputBinding(
+        observed.entry,
+        digest,
+        program.target_architecture,
+    )) {
+        try verifySnapshotPython3PreinstArtifacts(program.artifacts, "amd64");
+        for (snapshot_python3_minimal_null_sources) |binding| try verifySignedDebconfControlFile(
+            allocator,
+            root,
+            binding,
+            error.InvalidPython3PreinstControl,
+        );
+    }
+}
+
+test "native_unpack.test.python3 null input admits only empty or exact amd64 minimal callback witness" {
+    const witness = "/usr/bin/py3compile\n";
+    var digest: [32]u8 = undefined;
+    Sha256.hash(witness, &digest, .{});
+    const entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = witness.len,
+        .mode = 0o644,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try testing.expect(try verifySnapshotPython3NullInputBinding(entry, digest, "amd64"));
+    for ([_][]const u8{ "arm64", "all", "riscv64" }) |architecture|
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3NullInputBinding(entry, digest, architecture),
+        );
+    for ([_]struct {
+        mode: u32 = 0o644,
+        uid: u32 = 0,
+        gid: u32 = 0,
+        link_count: u64 = 1,
+        kind: std.Io.File.Kind = .file,
+        size: u64 = witness.len,
+        modeled: bool = true,
+    }{
+        .{ .mode = 0o600 },
+        .{ .mode = 0o640 },
+        .{ .mode = 0o666 },
+        .{ .uid = 1 },
+        .{ .gid = 1 },
+        .{ .link_count = 2 },
+        .{ .kind = .sym_link },
+        .{ .size = witness.len - 1 },
+        .{ .size = witness.len + 1 },
+        .{ .modeled = false },
+    }) |mutation| {
+        var changed = entry;
+        changed.mode = mutation.mode;
+        changed.uid = mutation.uid;
+        changed.gid = mutation.gid;
+        changed.link_count = mutation.link_count;
+        changed.kind = mutation.kind;
+        changed.size = mutation.size;
+        changed.modeled = mutation.modeled;
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3NullInputBinding(changed, digest, "amd64"),
+        );
+    }
+    var wrong_digest: [32]u8 = undefined;
+    Sha256.hash("/usr/bin/py3compile ", &wrong_digest, .{});
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullInputBinding(entry, wrong_digest, "amd64"),
+    );
+    var empty = entry;
+    empty.size = 0;
+    var empty_digest: [32]u8 = undefined;
+    Sha256.hash("", &empty_digest, .{});
+    for ([_]u32{ 0o600, 0o644 }) |mode| {
+        empty.mode = mode;
+        try testing.expect(!(try verifySnapshotPython3NullInputBinding(empty, empty_digest, "amd64")));
+    }
+    empty.mode = 0o666;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullInputBinding(empty, empty_digest, "amd64"),
+    );
+    var after = entry;
+    after.size = 96;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullInputBinding(
+            after,
+            parseHex(32, "3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc").?,
+            "amd64",
+        ),
+    );
+}
+
+test "native_unpack.test.python3 minimal callback source refuses stale semantic controls" {
+    const script = @embedFile("fixtures/ubuntu-resolute-python3-minimal.postinst");
+    var digest: [32]u8 = undefined;
+    Sha256.hash(script, &digest, .{});
+    var entry: root_fs.Entry = .{
+        .kind = .file,
+        .size = script.len,
+        .mode = 0o755,
+        .uid = 0,
+        .gid = 0,
+        .device = 1,
+        .inode = 2,
+        .link_count = 1,
+        .modified_nanoseconds = 0,
+        .modeled = true,
+    };
+    try verifySignedDebconfControlFileBinding(
+        entry,
+        digest,
+        snapshot_python3_minimal_postinst,
+        error.InvalidPython3PreinstControl,
+    );
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    const offset = std.mem.indexOf(u8, changed, "which").?;
+    @memcpy(changed[offset .. offset + 5], "false");
+    Sha256.hash(changed, &digest, .{});
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySignedDebconfControlFileBinding(
+            entry,
+            digest,
+            snapshot_python3_minimal_postinst,
+            error.InvalidPython3PreinstControl,
+        ),
+    );
+    Sha256.hash(script, &digest, .{});
+    entry.mode = 0o644;
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySignedDebconfControlFileBinding(
+            entry,
+            digest,
+            snapshot_python3_minimal_postinst,
+            error.InvalidPython3PreinstControl,
+        ),
+    );
+}
+
 fn verifySnapshotPython3NullOutput(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
@@ -23120,6 +23336,10 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
         return error.TestUnexpectedResult;
     const after_0644_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_0644") orelse
         return error.TestUnexpectedResult;
+    const before_py3compile_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_PY3COMPILE") orelse
+        return error.TestUnexpectedResult;
+    const after_py3compile_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_PY3COMPILE") orelse
+        return error.TestUnexpectedResult;
     var before = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_path));
     defer before.close();
     var after = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_path));
@@ -23128,6 +23348,10 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     defer before_0644.close();
     var after_0644 = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_0644_path));
     defer after_0644.close();
+    var before_py3compile = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(before_py3compile_path));
+    defer before_py3compile.close();
+    var after_py3compile = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(after_py3compile_path));
+    defer after_py3compile.close();
     const identities = [_]struct {
         package: native_program.PackageIdentity,
         size: u64,
@@ -23166,6 +23390,7 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     program.target_architecture = "amd64";
     try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);
     try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);
+    try verifySnapshotPython3PreinstInputs(testing.allocator, before_py3compile.root, &program);
     try verifySnapshotPython3PreinstPaths(
         testing.allocator,
         before.root,
@@ -23182,6 +23407,11 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     );
     try verifySnapshotPython3NullOutput(testing.allocator, after.root);
     try verifySnapshotPython3NullOutput(testing.allocator, after_0644.root);
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullOutput(testing.allocator, before_py3compile.root),
+    );
+    try verifySnapshotPython3NullOutput(testing.allocator, after_py3compile.root);
 
     program.artifacts = artifacts[0..1];
     try testing.expectError(
@@ -23222,6 +23452,10 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
         "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_0640",
         "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_ROOT",
         "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_SCRIPT",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_HASH",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_MODE",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_POSTINST",
+        "DEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_COMPILER",
     }) |name| {
         const path = std.c.getenv(name) orelse
             return error.TestUnexpectedResult;

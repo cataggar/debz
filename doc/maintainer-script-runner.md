@@ -629,7 +629,7 @@ authorize any new network connectivity on this evidence.
 
 ## Exact signed python3 preinst inert alternatives call
 
-The separate new-package `python3:amd64` `3.14.7-3`
+The separate new-package `python3:amd64` `3.14.3-0ubuntu2`
 `preinst ["install"]` (signed SHA-256
 `115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f`)
 does not receive proc, mount, or general shell authority. The exact
@@ -638,8 +638,8 @@ and python3-minimal archives, their dpkg ownership lists, the
 `/usr/bin/python3 -> python3.14` link, signed `dash` and GNU `rm` bytes,
 their aliases, the snapshot-pinned alternatives tool, and the root-owned
 mode-0700 fixture root. `/proc` must be empty, `/usr/sbin` tool shadows
-and the HTML cleanup target absent, and `/dev/null` must be a root-owned,
-mode-0600 or mode-0644, empty regular file. Both modes were separately
+and the HTML cleanup target absent. The original `/dev/null` input is a
+root-owned, mode-0600 or mode-0644, empty regular file. Both modes were separately
 proved against pinned dpkg 1.22.22 and the signed script in protected
 disposable roots; 0640 and 0666 refuse. Other tool, root, alias,
 script, argument, package, or architecture identities refuse before launch.
@@ -657,6 +657,45 @@ A different exit or redirected witness cannot be converted into success;
 post-launch proof failure requires durable recovery. The managed checkpoint
 includes that one changed file. This does not admit `--auto` with an
 absolute name elsewhere or the signed script's upgrade branch.
+
+### Exact amd64 Python minimal callback input
+
+The input verifier also recognizes one **amd64-only** observed-before
+transition: a root-owned, single-link, regular mode-0644 `/dev/null`
+containing exactly the 20 bytes `/usr/bin/py3compile\n`, SHA-256
+`e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e`.
+The exact authenticated Python archives above remain required. In addition,
+the installed 117-byte `python3-minimal.postinst` and 13,312-byte
+`usr/bin/py3compile` must match their signed archive members, including
+mode-0755, root ownership and single-link metadata. Their script/tool
+identities and the separate behavioral prestate are registered with amd64
+archive/version provenance in the real-snapshot pin manifest.
+
+This transition is grounded in native run `37537004982`: its checksum-verified
+vendor inventory records regular-file kind, mode 0644, root ownership,
+size 20 and that digest, and its callback
+trace records `python3-minimal.postinst configure`, `which py3compile`, then
+`py3compile` immediately before Python preinst refuses the 20-byte input.
+The signed minimal postinst contains `which py3compile >/dev/null 2>&1`;
+the literal line independently hashes to the inventory witness. The original
+root bytes and an open/write trace were not retained, so this is not a claim
+of exclusive writer attribution or independent protected replay.
+
+No production repair, pre-truncation, arbitrary nonempty input, arm64
+behavioral authority, or output relaxation is introduced. Wrong content,
+size, mode, owner, link/type, architecture or stale source controls refuse.
+The unchanged signed Python preinst performs its own redirection and must
+still leave the exact 96-byte output witness above.
+
+`tools/real-snapshot-python3-reference.sh` retains its original empty-input
+proof and additionally prepares separate protected roots by running the
+unmodified signed minimal postinst, then compares the Python preinst outcome
+with pinned dpkg and prepares wrong-content/mode/source negatives. Its new
+`DEBZ_REQUIRE_SIGNED_PYTHON3_*PY3COMPILE*` and minimal-source coordinates
+are mandatory when the existing protected Zig root test is enabled.
+This extended positive replay remains a privileged/hosted acceptance gate;
+an unprivileged test pass does not prove it. Full #393/#262 closure and
+character-device `/dev/null` parity remain separate.
 
 ### Resolute arm64 Python input-binding prerequisite (#393)
 

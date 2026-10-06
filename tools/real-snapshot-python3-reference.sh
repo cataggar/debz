@@ -55,15 +55,28 @@ lock=$(realpath -- "$3")
 archive=$(realpath -- "$4")
 script_root=$(realpath -m -- "$5")
 dpkg_root=$(realpath -m -- "$6")
+py3compile_before="${script_root}-py3compile-before"
+py3compile_after="${script_root}-py3compile-after"
+py3compile_dpkg="${dpkg_root}-py3compile"
+py3compile_bad_hash="${script_root}-py3compile-bad-hash"
+py3compile_bad_mode="${script_root}-py3compile-bad-mode"
+py3compile_bad_postinst="${script_root}-py3compile-bad-postinst"
+py3compile_bad_compiler="${script_root}-py3compile-bad-compiler"
 for file in "$pinned" "$lock" "$archive"; do require_protected_file "$file"; done
 require_protected_path "$source_root"
 [[ $(stat -c '%u:%g:%a' "$source_root") == 0:0:700 ]]
-for path in "$pinned" "$source_root" "$lock" "$archive" "$script_root" "$dpkg_root"; do
+for path in "$pinned" "$source_root" "$lock" "$archive" "$script_root" "$dpkg_root" \
+  "$py3compile_before" "$py3compile_after" "$py3compile_dpkg" \
+  "$py3compile_bad_hash" "$py3compile_bad_mode" \
+  "$py3compile_bad_postinst" "$py3compile_bad_compiler"; do
   case "$path" in "$checkout"/.real-snapshot/*) ;; *) exit 2 ;; esac
 done
 [[ "$source_root" != "$script_root" && "$source_root" != "$dpkg_root" &&
    "$script_root" != "$dpkg_root" ]]
-for path in "$script_root" "$dpkg_root"; do
+for path in "$script_root" "$dpkg_root" \
+  "$py3compile_before" "$py3compile_after" "$py3compile_dpkg" \
+  "$py3compile_bad_hash" "$py3compile_bad_mode" \
+  "$py3compile_bad_postinst" "$py3compile_bad_compiler"; do
   require_protected_path "$(dirname -- "$path")"
   [[ ! -e "$path" && ! -L "$path" ]]
   case "$path" in "$source_root"/*) exit 2 ;; esac
@@ -78,7 +91,9 @@ digest=616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2
 [[ $(stat -c '%s' "$archive") == 22938 ]]
 [[ $(sha512sum "$archive" | cut -d' ' -f1) == "$digest" ]]
 require_protected_file "$source_root/var/lib/dpkg/info/python3.preinst"
+require_protected_file "$source_root/var/lib/dpkg/info/python3-minimal.postinst"
 require_protected_file "$source_root/var/lib/dpkg/info/python3-minimal.list"
+require_protected_file "$source_root/usr/bin/py3compile"
 require_protected_file "$source_root/usr/bin/update-alternatives"
 [[ $(sha256sum "$source_root/usr/bin/update-alternatives" | cut -d' ' -f1) == \
   023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45 ]]
@@ -91,10 +106,24 @@ require_protected_file "$source_root/usr/bin/update-alternatives"
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/var/lib/dpkg/info/python3.preinst") == 0:0:755:856:1 ]]
 [[ $(sha256sum "$source_root/var/lib/dpkg/info/python3.preinst" | cut -d' ' -f1) == \
   115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f ]]
+[[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/var/lib/dpkg/info/python3-minimal.postinst") == 0:0:755:117:1 ]]
+[[ $(sha256sum "$source_root/var/lib/dpkg/info/python3-minimal.postinst" | cut -d' ' -f1) == \
+  be10656c9edf975f5dfe48fe5819172e905e14dcd4ff372af5d8b45b26168edd ]]
+[[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/usr/bin/py3compile") == 0:0:755:13312:1 ]]
+[[ $(sha256sum "$source_root/usr/bin/py3compile" | cut -d' ' -f1) == \
+  a94b6fd8fb7f801f564da4dbb3e2d646b54713b58349d725c650885a5a0c6ccc ]]
+[[ $(jq -r '.packages[] | select(.name == "python3-minimal" and .version == "3.14.3-0ubuntu2" and .architecture == "amd64") | .archive_identity.digests[] | select(.algorithm == "sha512") | .digest' "$lock") == \
+  e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5 ]]
+[[ $(jq -r '.packages[] | select(.name == "python3-minimal" and .version == "3.14.3-0ubuntu2" and .architecture == "amd64") | .declared_size' "$lock") == 25808 ]]
 cmp "$source_root/var/lib/dpkg/info/python3.preinst" \
   "$checkout/src/fixtures/ubuntu-resolute-python3.preinst"
+require_protected_file "$checkout/src/fixtures/ubuntu-resolute-python3-minimal.postinst"
+cmp "$source_root/var/lib/dpkg/info/python3-minimal.postinst" \
+  "$checkout/src/fixtures/ubuntu-resolute-python3-minimal.postinst"
 [[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
   -f='${Version} ${Status}' python3) == '3.14.3-0ubuntu2 install ok unpacked' ]]
+[[ $(dpkg-query --admindir="$source_root/var/lib/dpkg" -W \
+  -f='${Version} ${Status}' python3-minimal) == '3.14.3-0ubuntu2 install ok installed' ]]
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/dev/null") == 0:0:600:0:1 ||
    $(stat -c '%u:%g:%a:%s:%h' "$source_root/dev/null") == 0:0:644:0:1 ]]
 [[ -d "$source_root/proc" && ! -L "$source_root/proc" &&
@@ -163,4 +192,85 @@ cmp "$script_root/dev/null" "$dpkg_root/dev/null"
 [[ $(stat -c '%u:%g:%a:%s' "$script_root/dev/null") == \
    "$(stat -c '%u:%g:%a:%s' "$dpkg_root/dev/null")" ]]
 [[ ! -e "$script_root/proc/sys" && ! -e "$dpkg_root/proc/sys" ]]
+
+# Generate the 20-byte prestate by running its signed producer, not by seeding bytes.
+cp -a --reflink=auto -- "$source_root" "$py3compile_before"
+require_protected_path "$py3compile_before"
+chmod 0644 "$py3compile_before/dev/null"
+timeout --signal=TERM --kill-after=5s 120s \
+  unshare --mount --pid --fork --kill-child=SIGKILL --propagation private -- \
+  chroot "$py3compile_before" /bin/sh -c '
+    set -eu
+    test "$$" -eq 1
+    test -z "$(find /proc -mindepth 1 -print -quit)"
+    exec setpriv --bounding-set=-sys_admin --no-new-privs \
+      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      /bin/sh /var/lib/dpkg/info/python3-minimal.postinst configure ""
+  '
+[[ $(stat -c '%u:%g:%a:%s:%h' "$py3compile_before/dev/null") == 0:0:644:20:1 ]]
+[[ $(sha256sum "$py3compile_before/dev/null" | cut -d' ' -f1) == \
+  e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e ]]
+[[ $(alternatives_fingerprint "$py3compile_before") == "$before" ]]
+cp -a --reflink=auto -- "$py3compile_before" "$py3compile_after"
+cp -a --reflink=auto -- "$py3compile_before" "$py3compile_dpkg"
+for path in "$py3compile_after" "$py3compile_dpkg"; do require_protected_path "$path"; done
+timeout --signal=TERM --kill-after=5s 120s \
+  unshare --mount --pid --fork --kill-child=SIGKILL --propagation private -- \
+  chroot "$py3compile_after" /bin/sh -c '
+    set -eu
+    test "$$" -eq 1
+    test -z "$(find /proc -mindepth 1 -print -quit)"
+    exec setpriv --bounding-set=-sys_admin --no-new-privs \
+      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+      DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+      /bin/sh /var/lib/dpkg/info/python3.preinst install
+  '
+install -o root -g root -m0755 "$pinned" "$py3compile_dpkg/usr/local/sbin/dpkg"
+require_protected_path "$py3compile_dpkg/var/lib/dpkg"
+[[ ! -e "$py3compile_dpkg/var/lib/dpkg/python3-probe.deb" &&
+   ! -L "$py3compile_dpkg/var/lib/dpkg/python3-probe.deb" ]]
+install -o root -g root -m0644 "$archive" "$py3compile_dpkg/var/lib/dpkg/python3-probe.deb"
+timeout --signal=TERM --kill-after=5s 120s \
+  unshare --mount --pid --fork --kill-child=SIGKILL --propagation private -- \
+  chroot "$py3compile_dpkg" /bin/sh -c '
+    set -eu
+    test "$$" -eq 1
+    test -z "$(find /proc -mindepth 1 -print -quit)"
+    exec setpriv --bounding-set=-sys_admin --no-new-privs /bin/sh -ec '\''
+      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+        DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+        /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
+        --force-depends --no-triggers --purge python3
+      env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
+        DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
+        /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
+        --force-confold --no-triggers --unpack /var/lib/dpkg/python3-probe.deb
+    '\'' sh
+  '
+[[ $(stat -c '%u:%g:%a:%s:%h' "$py3compile_after/dev/null") == 0:0:644:96:1 ]]
+[[ $(sha256sum "$py3compile_after/dev/null" | cut -d' ' -f1) == \
+  3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc ]]
+cmp "$py3compile_after/dev/null" "$py3compile_dpkg/dev/null"
+[[ $(stat -c '%u:%g:%a:%s:%h' "$py3compile_dpkg/dev/null") == 0:0:644:96:1 ]]
+[[ $(dpkg-query --admindir="$py3compile_dpkg/var/lib/dpkg" -W \
+  -f='${Version} ${Status}' python3) == '3.14.3-0ubuntu2 install ok unpacked' ]]
+[[ $(alternatives_fingerprint "$py3compile_after") == "$before" &&
+   $(alternatives_fingerprint "$py3compile_dpkg") == "$before" ]]
+for path in "$py3compile_after" "$py3compile_dpkg"; do
+  [[ -d "$path/proc" && ! -L "$path/proc" &&
+     -z $(find "$path/proc" -mindepth 1 -print -quit) ]]
+done
+for path in "$py3compile_bad_hash" "$py3compile_bad_mode" \
+  "$py3compile_bad_postinst" "$py3compile_bad_compiler"; do
+  cp -a --reflink=auto -- "$py3compile_before" "$path"
+  require_protected_path "$path"
+done
+printf '/usr/bin/py3compile ' > "$py3compile_bad_hash/dev/null"
+chmod 0600 "$py3compile_bad_mode/dev/null"
+sed -i 's/which/false/' "$py3compile_bad_postinst/var/lib/dpkg/info/python3-minimal.postinst"
+printf 'stale compiler\n' > "$py3compile_bad_compiler/usr/bin/py3compile"
+printf 'DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_PY3COMPILE=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_PY3COMPILE=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_HASH=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_MODE=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_POSTINST=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_COMPILER=%s\n' \
+  "$py3compile_before" "$py3compile_after" "$py3compile_bad_hash" \
+  "$py3compile_bad_mode" "$py3compile_bad_postinst" "$py3compile_bad_compiler"
 printf 'signed_python3_preinst=115f972bfeb85d083537b4d7fc59261979c6a2511d85b84407c7d7da38c9a85f\npinned_dpkg=1.22.22\nsigned_archive_sha512=%s\nscript_exit=0\ndpkg_unpack_exit=0\npreinst_args=install\nalternatives_fingerprint=%s\nnull_bytes=96\nnull_sha256=3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc\n' "$digest" "$before"

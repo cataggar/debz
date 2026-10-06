@@ -1629,7 +1629,22 @@ def audit_production_sources() -> None:
         "verifySnapshotPython3PreinstInputs(allocator, root, program)",
         "verifySnapshotPython3NullOutput(allocator, root)",
         "observed.entry.mode != 0o600 and observed.entry.mode != 0o644",
-        'root,\n        0,\n        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"',
+        "verifySnapshotPython3NullInput(allocator, root, program)",
+        'if (!std.mem.eql(u8, architecture, "amd64"))',
+        'try verifySnapshotPython3PreinstArtifacts(program.artifacts, "amd64");',
+        "for (snapshot_python3_minimal_null_sources) |binding| try verifySignedDebconfControlFile(",
+        'const snapshot_python3_minimal_null_input = SignedDebconfControlFile{\n'
+        '    .path = "dev/null",\n    .size = 20,\n    .mode = 0o644,\n'
+        '    .sha256 = "e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e",',
+        'const snapshot_python3_minimal_postinst = SignedDebconfControlFile{\n'
+        '    .path = "var/lib/dpkg/info/python3-minimal.postinst",\n'
+        '    .size = 117,\n    .mode = 0o755,\n'
+        '    .sha256 = "be10656c9edf975f5dfe48fe5819172e905e14dcd4ff372af5d8b45b26168edd",',
+        '        .path = "usr/bin/py3compile",\n        .size = 13312,\n'
+        '        .mode = 0o755,\n'
+        '        .sha256 = "a94b6fd8fb7f801f564da4dbb3e2d646b54713b58349d725c650885a5a0c6ccc",',
+        '        .size = 0,\n        .mode = @intCast(entry.mode),\n'
+        '        .sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",',
         'root,\n        96,\n        "3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc"',
         '"usr/sbin/rm"',
     ):
