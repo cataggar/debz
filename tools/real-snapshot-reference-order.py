@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import contextlib
 import hashlib
 from pathlib import Path
 import re
@@ -136,21 +137,33 @@ def oracle_environment() -> dict[str, str]:
     }
 
 
+@contextlib.contextmanager
+def launcher_stdin():
+    """The launcher refuses a writable stdin, and subprocess.DEVNULL opens
+    /dev/null with O_RDWR."""
+    descriptor = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
 def probe(
     command: list[str], environment: dict[str, str], evidence: Path,
 ) -> tuple[int, bytes]:
     with tempfile.TemporaryDirectory(prefix="reference-probe-", dir=evidence) as temporary:
         output_path = Path(temporary) / "output"
         with output_path.open("x+b") as output, output_path.open("ab") as writer:
-            result = subprocess.run(
-                command,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=writer,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=60,
-            )
+            with launcher_stdin() as null:
+                result = subprocess.run(
+                    command,
+                    env=environment,
+                    stdin=null,
+                    stdout=writer,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    timeout=60,
+                )
             writer.flush()
             if output_path.stat().st_size > MAXIMUM_PROBE_OUTPUT:
                 raise ValueError("reference dpkg dry-run output exceeds limit")
@@ -164,15 +177,16 @@ def apply(
     stderr: Path,
 ) -> None:
     with stdout.open("ab") as output, stderr.open("ab") as errors:
-        subprocess.run(
-            command,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=output,
-            stderr=errors,
-            check=True,
-            timeout=120,
-        )
+        with launcher_stdin() as null:
+            subprocess.run(
+                command,
+                env=environment,
+                stdin=null,
+                stdout=output,
+                stderr=errors,
+                check=True,
+                timeout=120,
+            )
     if stdout.stat().st_size > MAXIMUM_LOG_BYTES or stderr.stat().st_size > MAXIMUM_LOG_BYTES:
         raise ValueError("reference dpkg output exceeds limit")
 
@@ -274,21 +288,31 @@ def interrupt_postinst(
             check=True,
             timeout=30,
         )
-        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-            result = subprocess.run(
-                dpkg_command(launcher, dpkg, root, architecture, profile, "configure", package),
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=errors,
-                check=False,
-                timeout=120,
-            )
-            if output.tell() > MAXIMUM_PROBE_OUTPUT or errors.tell() > MAXIMUM_PROBE_OUTPUT:
-                raise ValueError("interrupted configure output exceeds limit")
-            output.seek(0)
-            errors.seek(0)
-            observed_output, observed_errors = output.read(), errors.read()
+        with tempfile.TemporaryDirectory(
+            prefix="reference-configure-", dir=stdout.parent,
+        ) as temporary:
+            output_path = Path(temporary) / "stdout"
+            errors_path = Path(temporary) / "stderr"
+            with output_path.open("x+b") as output, errors_path.open("x+b") as errors, \
+                    output_path.open("ab") as out_writer, errors_path.open("ab") as err_writer:
+                with launcher_stdin() as null:
+                    result = subprocess.run(
+                        dpkg_command(launcher, dpkg, root, architecture, profile, "configure", package),
+                        env=environment,
+                        stdin=null,
+                        stdout=out_writer,
+                        stderr=err_writer,
+                        check=False,
+                        timeout=120,
+                    )
+                out_writer.flush()
+                err_writer.flush()
+                if (
+                    output_path.stat().st_size > MAXIMUM_PROBE_OUTPUT
+                    or errors_path.stat().st_size > MAXIMUM_PROBE_OUTPUT
+                ):
+                    raise ValueError("interrupted configure output exceeds limit")
+                observed_output, observed_errors = output.read(), errors.read()
     finally:
         subprocess.run(["umount", "--", str(script)], check=True, timeout=30)
     with stdout.open("ab") as out, stderr.open("ab") as err:

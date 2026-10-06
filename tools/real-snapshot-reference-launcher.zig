@@ -1369,6 +1369,27 @@ test "reference standard streams refuse directory-backed stdin and readable host
     try std.testing.expect(!allowedStandardStream(1, output, 1 | append));
 }
 
+test "reference stdin refuses the read-write /dev/null that subprocess.DEVNULL opens" {
+    // CPython opens os.devnull with O_RDWR for subprocess.DEVNULL, so callers
+    // that pass it hand the launcher a writable stdin.
+    const read_write = linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read_write));
+    defer _ = linux.close(@intCast(read_write));
+    const writable = try metadata(@intCast(read_write));
+    try std.testing.expectEqual(@as(u32, 0o020000), writable.mode & 0o170000);
+    try std.testing.expectEqual(@as(u32, 1), writable.rdev_major);
+    try std.testing.expectEqual(@as(u32, 3), writable.rdev_minor);
+    try std.testing.expectError(
+        error.InvalidStandardStream,
+        verifyStandardStream(0, @intCast(read_write)),
+    );
+
+    const read_only = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(read_only));
+    defer _ = linux.close(@intCast(read_only));
+    try verifyStandardStream(0, @intCast(read_only));
+}
+
 test "reference proc profile is bound to the installed dpkg status version" {
     try std.testing.expectEqualStrings("systemd", script_bindings[0].name);
     try std.testing.expectEqualStrings("259.5-0ubuntu3.4", script_bindings[0].version);
