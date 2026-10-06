@@ -18,7 +18,11 @@ readonly release_sha256=596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01
 readonly updates_release_sha256=16d93e5e9358047ac2f5d671abcac2bb3f2945532452720cd9a17320c19c4f24
 readonly security_release_sha256=bda7516aa5ed1aa2c8ebcbe36a07276f599559917a9de8fe5de041e99c9a2a10
 readonly release_signer=f6ecb3762474eda9d21b7022871920d1991bc93c
-readonly closure_sha256=03fc9d79075819b663127e6702c49ea5c96d81f4a2d847b3886f76e4158a1113
+# Digest of the sorted reference-archives TSV built below, which is a
+# different scheme from the algorithm-tagged
+# snapshot.closures.amd64.digest that tools/fixtures/real-snapshot/pin-v1.json
+# records for the same closure. Do not copy one into the other.
+readonly closure_sha256=5223cb19af6f686faa591eb6575b6d585a830473d98550df52ef958fd152f9f2
 readonly pinned_dpkg_sha256=0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5
 readonly signed_dpkg='usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517'
 readonly setpriv_sha256=86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993
@@ -167,7 +171,7 @@ while IFS=$'\t' read -r name version package_arch digest size; do
   [[ $(stat -c '%s' "$archive") == "$size" ]]
   printf '%s  %s\n' "$digest" "$archive" | sha512sum --check --status
   case "$name" in
-    libc6|dash|bash|gnu-coreutils|coreutils|coreutils-from-gnu|dpkg|libmd0|libbz2-1.0|liblzma5|libselinux1|libzstd1|zlib1g|libacl1|libattr1|libgmp10|libssl4|libsystemd0|libpcre2-8-0|libgcc-s1|libcrypt1|perl-base|mawk|sed|grep|findutils|tar|gzip|debianutils|debconf)
+    libc6|dash|bash|gnu-coreutils|coreutils|coreutils-from-gnu|dpkg|libmd0|libbz2-1.0|liblzma5|libselinux1|libzstd1|zlib1g|libacl1|libattr1|libgmp10|libssl3t64|libsystemd0|libpcre2-8-0|libgcc-s1|libcrypt1|perl-base|mawk|sed|grep|findutils|tar|gzip|debianutils|debconf)
       bootstrap+=("$archive") ;;
     util-linux) util_linux=$archive ;;
   esac

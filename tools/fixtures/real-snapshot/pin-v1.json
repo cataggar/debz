@@ -31,6 +31,10 @@
     {
       "digest": "sha256:ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
       "reason": "Zig 0.16.0 aarch64-linux release archive pinned by protected CI; external tool release, not snapshot bytes"
+    },
+    {
+      "digest": "sha256:5223cb19af6f686faa591eb6575b6d585a830473d98550df52ef958fd152f9f2",
+      "reason": "SHA-256 of the sorted reference-archives TSV that tools/real-snapshot-signed-proc-prestates.sh rebuilds from the locked amd64 closure; a derived digest over the closure already bound by snapshot.closures.amd64.digest, not snapshot bytes"
     }
   ],
   "identities": [
