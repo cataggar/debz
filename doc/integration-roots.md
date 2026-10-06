@@ -643,6 +643,49 @@ signed-lock bindings of dpkg's in-root dynamic loader and runtime libraries
 remain unverified;
 no privileged reference run is authorized on this delta.
 
+The **amd64 base-cycle exception (#401)** is a separate `break_base_cycle`
+operation with the `libgcc_cycle` profile, not ordinary configure authority.
+At genuine scheduler no-progress it rehashes the four exact signed resolute
+archives and reads their control members (the exact lock has no dependency
+fields). The reviewed SCC is `libc6 2.43-2ubuntu2.4 ↔ libgcc-s1
+16-20260322-1ubuntu1`; both must be unpacked. Its only external dependencies,
+`gcc-16-base 16-20260322-1ubuntu1` and `libc-gconv-modules-extra
+2.43-2ubuntu2.4`, must already be installed. All four have no Pre-Depends.
+Changed identities, graphs, versions, trigger state, unincorporated activations,
+database updates or outside dependencies refuse before the operation.
+
+The deterministic breaker is **libgcc-s1**, whose signed control archive
+contains **no maintainer scripts**. The launcher independently rehashes all
+four pinned archives, rechecks the installed hard-dependency graph and states
+inside the protected chroot, requires both qualified and unqualified script
+paths absent, and binds the installed `activate-noawait ldconfig` metadata.
+It adds only `--force-depends` to the existing common dpkg flags and
+`--no-triggers --configure libgcc-s1:amd64`. No `--force-all`,
+`--force-depends-version`, arbitrary selector, pending batch, proc mount or
+callback is authorized. The expected transition is only libgcc-s1
+unpacked → installed; all other status fields and trigger-database bytes must
+be unchanged. Normal unforced scheduling then resumes, preserving the signed
+systemd/udev half-configured and sudo unpacked capture semantics. A second
+stall refuses; neither bootstrap status registration nor trigger clearing is
+performed.
+
+The restored `signed-proc-protected-replay` job runs both Debug and ReleaseSafe,
+with the historical protected staging, non-skipped signed systemd/udev/sudo
+proofs and native replays, comparison, refusal mutations and bounded evidence.
+Before the full prestate install, a fresh **four-package** fixture reproduces
+both single-configure refusals and compares this callback-free transition with
+protected real pinned `dpkg --no-triggers --configure --pending`. Its only
+possible libc6 postinst is byte-checked and made read-only/noexec **before**
+launch; the real pending scheduler configures libgcc-s1 and attempts libc6,
+whose callback is denied. The candidate leaves libc6 unpacked while the
+interrupted baseline records it half-configured. This deliberately bounded
+schedule comparison is **not full callback or command-scheduling parity**.
+The job retains graph/status/trigger before/after evidence, both argv/output
+histories and a launcher injected-callback refusal. Hosted success is required
+before #401 closure; local unit tests and an archive rehash are not that proof.
+The authenticated runtime and individually authorized final triggered-handler
+contracts remain separate follow-ups.
+
 This is **not yet an executable full parity gate**: the closed launcher
 refuses `--configure --pending`, `--triggers-only --pending` and **also**
 single-package trigger actions. A disposable unprivileged dpkg 1.22.22
@@ -666,7 +709,7 @@ listener's **triggered** script bytes to the exact authenticated archive,
 verify the pinned installed script, status/trigger queue and version again
 in the launcher before exec, establish that no other script is invoked, and
 compare per-listener ordering and state with pinned dpkg. The current
-launcher has only `configure`/`probe_configure` and an exact
+launcher's normal configure path has an exact
 `["configure", ""]` proc profile for systemd/udev/sudo, not a `triggered`
 profile for any of them. The Python command builder refuses all trigger
 verbs, including attempts to reuse those configure-only profiles. Until

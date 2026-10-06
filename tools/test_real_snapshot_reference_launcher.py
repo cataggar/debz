@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 from unittest import mock
 
@@ -302,6 +305,181 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertEqual(sorted(output.splitlines()), [b"stderr witness", b"stdout witness"])
         self.assertEqual(list(evidence.iterdir()), [])
+
+    def cycle_fixture(self) -> tuple[tuple, dict, dict]:
+        packages = tuple(ORDER.Package(name, version, "amd64", digest, size,
+                                        self.root / f"{name}.deb")
+                         for name, version, size, digest, _ in ORDER.BASE_CYCLE)
+        records, controls = {}, {}
+        for index, package in enumerate(packages):
+            fields = {"package": package.name, "architecture": "amd64",
+                      "version": package.version, "depends": ORDER.BASE_CYCLE[index][4]}
+            records[(package.name, "amd64")] = {
+                **fields, "status": "install ok unpacked" if index < 2 else "install ok installed",
+            }
+            data = io.BytesIO()
+            with tarfile.open(fileobj=data, mode="w") as archive:
+                entries = {"./control": "".join(
+                    f"{key}: {value}\n" for key, value in fields.items()
+                ).encode()}
+                if index == 1:
+                    entries.update({".": b"", "./md5sums": b"", "./shlibs": b"",
+                                    "./symbols": b"", "./triggers": ORDER.LIBGCC_TRIGGERS})
+                for name, content in entries.items():
+                    member = tarfile.TarInfo(name)
+                    member.size = len(content)
+                    archive.addfile(member, io.BytesIO(content))
+            controls[str(package.archive)] = data.getvalue()
+        info = self.root / "var/lib/dpkg/info"
+        info.mkdir(parents=True)
+        (self.root / "var/lib/dpkg/triggers").mkdir()
+        (self.root / "var/lib/dpkg/updates").mkdir()
+        (self.root / "var/lib/dpkg/status").write_bytes(b"synthetic unit fixture only\n")
+        (info / "libgcc-s1:amd64.triggers").write_bytes(ORDER.LIBGCC_TRIGGERS)
+        return packages, records, controls
+
+    def test_cycle_operation_requires_exact_four_archives_and_dedicated_profile(self) -> None:
+        cycle, _, _ = self.cycle_fixture()
+        command = ORDER.dpkg_command(self.root / "launcher", self.root / "dpkg",
+                                     self.root, "amd64", ORDER.BASE_CYCLE_PROFILE,
+                                     "break_base_cycle", cycle[1], cycle)
+        self.assertEqual(command[3:7],
+                         ["amd64", "libgcc_cycle", "break_base_cycle", "libgcc-s1:amd64"])
+        self.assertEqual(command[7:], [str(p.archive) for p in cycle])
+        for architecture, profile, selected, archives in (
+            ("arm64", "libgcc_cycle", cycle[1], cycle),
+            ("amd64", "none", cycle[1], cycle),
+            ("amd64", "libgcc_cycle", cycle[0], cycle),
+            ("amd64", "libgcc_cycle", cycle[1], cycle[:2]),
+        ):
+            with self.subTest(architecture=architecture, profile=profile, selected=selected.name):
+                with self.assertRaises(ORDER.CycleRefusal):
+                    ORDER.dpkg_command(self.root / "launcher", self.root / "dpkg",
+                                       self.root, architecture, profile, "break_base_cycle",
+                                       selected, archives)
+        with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleIdentityChanged"):
+            ORDER.base_cycle_packages([*cycle[:-1]], "amd64")
+
+    def test_signed_cycle_graph_and_callback_mutations_refuse_before_apply(self) -> None:
+        cycle, records, controls = self.cycle_fixture()
+        def run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, controls[command[2]], b"")
+        with (mock.patch.object(ORDER, "verify_archive"),
+              mock.patch.object(ORDER, "database_fields", return_value=records),
+              mock.patch.object(ORDER.subprocess, "run", side_effect=run),
+              mock.patch.object(ORDER, "apply") as applied):
+            self.assertEqual(ORDER.verify_base_cycle(self.root, cycle)["callbacks"], [])
+            for name, field, changed, reason in (
+                ("libc6", "depends", "another-package", "CycleControlChanged"),
+                ("libgcc-s1", "pre-depends", "libc6", "CycleControlChanged"),
+                ("gcc-16-base", "status", "install ok unpacked", "CycleOutsideDependency"),
+                ("libgcc-s1", "status", "install ok triggers-pending", "CycleStateChanged"),
+                ("libgcc-s1", "triggers-pending", "ldconfig", "CycleCallbackChanged"),
+            ):
+                record = records[(name, "amd64")]
+                saved = dict(record)
+                record[field] = changed
+                with self.subTest(name=name, field=field):
+                    with self.assertRaisesRegex(ORDER.CycleRefusal, reason):
+                        ORDER.break_base_cycle(self.root / "launcher", self.root / "dpkg",
+                                               self.root, self.root, "amd64", list(cycle),
+                                               {}, self.root / "out", self.root / "err")
+                record.clear()
+                record.update(saved)
+            for name in ("libgcc-s1.postinst", "libgcc-s1:amd64.postinst"):
+                path = self.root / "var/lib/dpkg/info" / name
+                path.symlink_to("/does-not-exist")
+                with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                    ORDER.verify_base_cycle(self.root, cycle)
+                path.unlink()
+            triggers = self.root / "var/lib/dpkg/info/libgcc-s1:amd64.triggers"
+            triggers.write_bytes(b"activate-noawait another-handler\n")
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                ORDER.verify_base_cycle(self.root, cycle)
+            triggers.write_bytes(ORDER.LIBGCC_TRIGGERS)
+            updates = self.root / "var/lib/dpkg/updates/0000"
+            updates.write_text("unincorporated state\n")
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleStateChanged"):
+                ORDER.verify_base_cycle(self.root, cycle)
+            updates.unlink()
+            unincorp = self.root / "var/lib/dpkg/triggers/Unincorp"
+            unincorp.write_text("ldconfig libc-bin\n")
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                ORDER.verify_base_cycle(self.root, cycle)
+            applied.assert_not_called()
+
+    def test_cycle_transition_requires_exact_progress_not_only_successful_exit(self) -> None:
+        cycle, records, _ = self.cycle_fixture()
+        before = {"records": records, "callbacks": [], "graph": {}, "trigger_database": {}}
+        after = {key: dict(value) for key, value in records.items()}
+        after[("libgcc-s1", "amd64")]["status"] = "install ok installed"
+        with (mock.patch.object(ORDER, "verify_base_cycle", return_value=before),
+              mock.patch.object(ORDER, "database_fields", return_value=after),
+              mock.patch.object(ORDER, "apply") as applied):
+            selected = ORDER.break_base_cycle(self.root / "launcher", self.root / "dpkg",
+                                              self.root, self.root, "amd64", list(cycle),
+                                              {}, self.root / "out", self.root / "err")
+            self.assertEqual(selected, cycle[1])
+            self.assertEqual(applied.call_args.args[0][5], "break_base_cycle")
+            evidence = json.loads((self.root / "base-cycle-after.json").read_text())
+            self.assertEqual(evidence["callbacks"], [])
+            after[("libc6", "amd64")]["status"] = "install ok installed"
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
+                ORDER.break_base_cycle(self.root / "launcher", self.root / "dpkg",
+                                       self.root, self.root, "amd64", list(cycle),
+                                       {}, self.root / "out", self.root / "err")
+
+    def test_second_stall_never_reuses_cycle_authority(self) -> None:
+        cycle, _, _ = self.cycle_fixture()
+        def probe(command, *_):
+            return (0, b"") if command[5] == "probe_unpack" else (1, b"dependency problems")
+        with (mock.patch.object(ORDER, "packages_from_manifest", return_value=list(cycle)),
+              mock.patch.object(ORDER, "probe", side_effect=probe),
+              mock.patch.object(ORDER, "verify_archive"),
+              mock.patch.object(ORDER, "apply"),
+              mock.patch.object(ORDER, "break_base_cycle", return_value=cycle[1]) as breaker):
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
+                ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                              self.root / "cache", self.root, "amd64")
+        breaker.assert_called_once()
+
+    def test_cycle_break_retries_normal_schedule_without_configuring_prestate_target(self) -> None:
+        cycle, _, _ = self.cycle_fixture()
+        target = ORDER.Package("systemd", ORDER.PROFILE_VERSIONS["systemd"], "amd64",
+                               "a" * 128, 42, self.root / "systemd.deb")
+        broken = False
+        def dependency_probe(command, *_):
+            if not broken and (
+                command[5] == "probe_configure" and command[6] in ("libc6:amd64", "libgcc-s1:amd64")
+                or command[5] == "probe_unpack" and command[6] == "systemd:amd64"
+            ):
+                return 1, (b"pre-dependency problem" if command[5] == "probe_unpack"
+                           and command[6] == "systemd:amd64" else b"dependency problems")
+            return 0, b""
+        def breaker(*_):
+            nonlocal broken
+            broken = True
+            return cycle[1]
+        def state(_):
+            return {(p.name, p.architecture): ("install ok unpacked", p.version)
+                    for p in (*cycle, target)}
+        with (mock.patch.object(ORDER, "packages_from_manifest", return_value=[*cycle, target]),
+              mock.patch.object(ORDER, "probe", side_effect=dependency_probe),
+              mock.patch.object(ORDER, "verify_archive"),
+              mock.patch.object(ORDER, "database_packages", side_effect=state),
+              mock.patch.object(ORDER, "break_base_cycle", side_effect=breaker) as break_cycle,
+              mock.patch.object(ORDER, "apply") as applied,
+              mock.patch.object(ORDER, "capture_prestate") as captured):
+            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                          self.root / "cache", self.root, "amd64",
+                          (ORDER.Prestate(target.selector, "half-configured", self.root / "saved"),))
+        break_cycle.assert_called_once()
+        captured.assert_called_once()
+        configurations = [call.args[0][6] for call in applied.call_args_list
+                          if call.args[0][5] == "configure"]
+        self.assertIn("libc6:amd64", configurations)
+        self.assertNotIn("libgcc-s1:amd64", configurations)
+        self.assertNotIn("systemd:amd64", configurations)
 
 
 if __name__ == "__main__":

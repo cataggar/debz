@@ -69,8 +69,8 @@ const environment: [*:null]const ?[*:0]const u8 = &.{
     null,
 };
 
-const Profile = enum { none, systemd, udev, sudo };
-const Verb = enum { probe_unpack, unpack, probe_configure, configure };
+const Profile = enum { none, systemd, udev, sudo, libgcc_cycle };
+const Verb = enum { probe_unpack, unpack, probe_configure, configure, break_base_cycle };
 const ScriptBinding = struct {
     name: []const u8,
     version: []const u8,
@@ -86,6 +86,51 @@ const dpkg_digests = [_][]const u8{
     "0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5",
     "d8878dcd8949b2d18359b98082e18b2c3bb77f4cbe14e7a90f58b3fad2670e79",
 };
+const CycleBinding = struct {
+    name: []const u8,
+    version: []const u8,
+    depends: []const u8,
+    archive_size: usize,
+    archive_sha512: []const u8,
+};
+const base_cycle = [_]CycleBinding{
+    .{ .name = "libc6", .version = "2.43-2ubuntu2.4", .depends = "libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)", .archive_size = 2104056, .archive_sha512 = "e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696" },
+    .{ .name = "libgcc-s1", .version = "16-20260322-1ubuntu1", .depends = "gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)", .archive_size = 80312, .archive_sha512 = "a34e93f253ca90bd331c5eee563be6ebcc14dbf08147e82b9479f972fe566c83263b644e348757af1853f8663cb8ca2349e2c013e4a0ca0e3ea3d631297576b2" },
+    .{ .name = "gcc-16-base", .version = "16-20260322-1ubuntu1", .depends = "", .archive_size = 38296, .archive_sha512 = "0767f731e71e709736596d52dbe181245a8ca181cdadbac6226aad5aa7151d8ce5149ad28625facc61d8882e76fc387af5336dc289126a0bf830b9e599b3922c" },
+    .{ .name = "libc-gconv-modules-extra", .version = "2.43-2ubuntu2.4", .depends = "", .archive_size = 1362202, .archive_sha512 = "c385f1ca4f8054e59f977a38819e31d6f2429909ce0a88c734c874ce163851dfa7e565dded6c65c3feb3bc8cf074498b45a4c2226bb8e17a2bc8b95027a29692" },
+};
+const libc6_breaks = "base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)";
+const cycle_graph_keys = [_][]const u8{
+    "Depends",    "Pre-Depends", "Breaks",    "Conflicts",        "Provides",         "Replaces",
+    "Multi-Arch", "Protected",   "Essential", "Triggers-Pending", "Triggers-Awaited", "Config-Version",
+};
+
+fn cycleGraphField(index: usize, key: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(key, "Depends")) return base_cycle[index].depends;
+    if (std.ascii.eqlIgnoreCase(key, "Breaks")) return switch (index) {
+        0 => libc6_breaks,
+        2 => "gnat (<< 7)",
+        3 => "libc6 (<< 2.42-1)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Replaces")) return switch (index) {
+        0 => "libc6-amd64",
+        1 => "libgcc1 (<< 1:10)",
+        3 => "libc6 (<< 2.42-1)",
+        else => "",
+    };
+    if (std.ascii.eqlIgnoreCase(key, "Provides")) return if (index == 1) "libgcc1 (= 1:16-20260322-1ubuntu1)" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return if (index < 2) "same" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Protected")) return if (index == 1) "yes" else "";
+    return "";
+}
+
+fn scriptBinding(profile: Profile) ?ScriptBinding {
+    return switch (profile) {
+        .systemd, .udev, .sudo => script_bindings[@intFromEnum(profile) - 1],
+        .none, .libgcc_cycle => null,
+    };
+}
 
 const Pinned = struct { fd: i32, metadata: linux.Statx };
 const Options = struct {
@@ -98,6 +143,7 @@ const Options = struct {
     archive: ?[:0]const u8 = null,
     archive_sha512: ?[]const u8 = null,
     archive_size: ?usize = null,
+    cycle_archives: ?[base_cycle.len][:0]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -122,9 +168,17 @@ pub fn main(init: std.process.Init) !void {
     const profile = std.meta.stringToEnum(Profile, profile_name) orelse return error.InvalidArguments;
     const verb = std.meta.stringToEnum(Verb, verb_name) orelse return error.InvalidArguments;
     const selector = args.next();
-    const archive = args.next();
-    const digest = args.next();
-    const size_text = args.next();
+    var cycle_archives: ?[base_cycle.len][:0]const u8 = null;
+    if (verb == .break_base_cycle) {
+        var paths: [base_cycle.len][:0]const u8 = undefined;
+        for (&paths) |*path| {
+            path.* = try init.arena.allocator().dupeZ(u8, args.next() orelse return error.InvalidArguments);
+        }
+        cycle_archives = paths;
+    }
+    const archive = if (cycle_archives == null) args.next() else null;
+    const digest = if (cycle_archives == null) args.next() else null;
+    const size_text = if (cycle_archives == null) args.next() else null;
     if (args.next() != null) return error.InvalidArguments;
     const options: Options = .{
         .root = try init.arena.allocator().dupeZ(u8, root),
@@ -136,6 +190,7 @@ pub fn main(init: std.process.Init) !void {
         .archive = if (archive) |value| try init.arena.allocator().dupeZ(u8, value) else null,
         .archive_sha512 = digest,
         .archive_size = if (size_text) |value| try std.fmt.parseInt(usize, value, 10) else null,
+        .cycle_archives = cycle_archives,
     };
     try validateOptions(options);
     const status = try run(init.arena.allocator(), options);
@@ -163,21 +218,30 @@ fn validateOptions(options: Options) !void {
     else
         return error.UnsupportedArchitecture;
     const unpacking = options.verb == .unpack or options.verb == .probe_unpack;
-    const configuring = options.verb == .configure or options.verb == .probe_configure;
+    const configuring = options.verb == .configure or options.verb == .probe_configure or options.verb == .break_base_cycle;
     if (unpacking != (options.archive != null) or
         unpacking != (options.archive_sha512 != null) or
         unpacking != (options.archive_size != null) or
         (unpacking or configuring) != (options.selector != null))
         return error.InvalidArguments;
+    if ((options.verb == .break_base_cycle) != (options.cycle_archives != null))
+        return error.InvalidArguments;
+    if (options.cycle_archives) |paths| {
+        for (paths) |path| if (!validAbsolute(path)) return error.InvalidArguments;
+        if (options.profile != .libgcc_cycle or architecture_index != 0 or
+            !std.mem.eql(u8, options.selector.?, "libgcc-s1:amd64"))
+            return error.InvalidCycleProfile;
+    } else if (options.profile == .libgcc_cycle) {
+        return error.InvalidCycleProfile;
+    }
     if (options.selector) |selector| {
         if (selector.len == 0 or selector.len > 120 or
             std.mem.indexOfAny(u8, selector, "/ \t\n\x00") != null or selector[0] == '-')
             return error.InvalidArguments;
     }
-    if (options.profile != .none) {
+    if (scriptBinding(options.profile)) |binding| {
         if (options.verb != .configure or architecture_index != 0)
             return error.InvalidProfile;
-        const binding = script_bindings[@intFromEnum(options.profile) - 1];
         const selector_name = options.selector.?;
         if (selector_name.len != binding.name.len + ":amd64".len or
             !std.mem.startsWith(u8, selector_name, binding.name) or
@@ -345,9 +409,11 @@ fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
                 continue;
             }
             identity_field = false;
-            const separator = std.mem.indexOf(u8, line, ": ") orelse return false;
+            const separator = std.mem.indexOfScalar(u8, line, ':') orelse return false;
             const key = line[0..separator];
-            const value = line[separator + 2 ..];
+            const rest = line[separator + 1 ..];
+            if (rest.len > 0 and rest[0] != ' ') return false;
+            const value = if (rest.len == 0) rest else rest[1..];
             if (std.ascii.eqlIgnoreCase(key, "Package")) {
                 if (name != null) return false;
                 name = value;
@@ -377,8 +443,7 @@ fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
     return matched;
 }
 
-fn verifyInstalledBinding(binding: ScriptBinding) !void {
-    const path: [:0]const u8 = "/var/lib/dpkg/status";
+fn readInstalledFile(path: [:0]const u8, maximum: usize) ![]u8 {
     try protectedAncestors(path);
     const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true };
     const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)), .resolve = resolve_no_symlinks };
@@ -393,20 +458,29 @@ fn verifyInstalledBinding(binding: ScriptBinding) !void {
     const before = try metadata(fd);
     if (before.uid != 0 or before.gid != 0 or
         (before.mode & 0o170000) != 0o100000 or (before.mode & 0o022) != 0 or
-        before.nlink != 1 or before.size > 4 * 1024 * 1024)
+        before.nlink != 1 or before.size > maximum)
         return error.InvalidInstalledBinding;
     const size: usize = @intCast(before.size);
-    const bytes = try std.heap.page_allocator.alloc(u8, size + 1);
-    defer std.heap.page_allocator.free(bytes);
+    const bytes = try std.heap.page_allocator.alloc(u8, size);
+    errdefer std.heap.page_allocator.free(bytes);
     var count: usize = 0;
     while (count < bytes.len) {
         const got = try checked(linux.read(fd, bytes[count..].ptr, bytes.len - count));
         if (got == 0) break;
         count += got;
     }
-    if (count != size or !same(before, try metadata(fd)) or
-        !bindingStatusMatches(bytes[0..count], binding))
-        return error.InvalidInstalledBinding;
+    if (count != size or !same(before, try metadata(fd))) return error.InvalidInstalledBinding;
+    return bytes[0..count];
+}
+
+fn readInstalledStatus() ![]u8 {
+    return readInstalledFile("/var/lib/dpkg/status", 4 * 1024 * 1024);
+}
+
+fn verifyInstalledBinding(binding: ScriptBinding) !void {
+    const bytes = try readInstalledStatus();
+    defer std.heap.page_allocator.free(bytes);
+    if (!bindingStatusMatches(bytes, binding)) return error.InvalidInstalledBinding;
     const script_path = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}.postinst",
@@ -422,6 +496,110 @@ fn verifyInstalledBinding(binding: ScriptBinding) !void {
         binding.size,
     );
     _ = linux.close(script.fd);
+}
+
+fn cycleStatusMatches(status: []const u8) bool {
+    var matched = [_]bool{false} ** base_cycle.len;
+    var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
+    while (paragraphs.next()) |paragraph| {
+        if (paragraph.len == 0) continue;
+        var fields: [128]struct { key: []const u8, value: []const u8 } = undefined;
+        var count: usize = 0;
+        var lines = std.mem.splitScalar(u8, paragraph, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (line[0] == ' ' or line[0] == '\t') {
+                if (count == 0) return false;
+                const key = fields[count - 1].key;
+                for ([_][]const u8{ "Package", "Architecture", "Version", "Status" } ++ cycle_graph_keys) |identity| {
+                    if (std.ascii.eqlIgnoreCase(key, identity)) return false;
+                }
+                continue;
+            }
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+            const rest = line[colon + 1 ..];
+            if (rest.len != 0 and rest[0] != ' ') return false;
+            if (count == fields.len) return false;
+            const key = line[0..colon];
+            for (fields[0..count]) |field| {
+                if (std.ascii.eqlIgnoreCase(field.key, key)) return false;
+            }
+            fields[count] = .{ .key = key, .value = if (rest.len == 0) rest else rest[1..] };
+            count += 1;
+        }
+        var name: []const u8 = "";
+        for (fields[0..count]) |field| {
+            if (std.ascii.eqlIgnoreCase(field.key, "Package")) name = field.value;
+        }
+        for (base_cycle, 0..) |binding, index| {
+            if (!std.mem.eql(u8, name, binding.name)) continue;
+            if (matched[index]) return false;
+            matched[index] = true;
+            var architecture: []const u8 = "";
+            var version: []const u8 = "";
+            var state: []const u8 = "";
+            var depends: []const u8 = "";
+            var graph_seen = [_]bool{false} ** cycle_graph_keys.len;
+            for (fields[0..count]) |field| {
+                if (std.ascii.eqlIgnoreCase(field.key, "Architecture")) architecture = field.value;
+                if (std.ascii.eqlIgnoreCase(field.key, "Version")) version = field.value;
+                if (std.ascii.eqlIgnoreCase(field.key, "Status")) state = field.value;
+                if (std.ascii.eqlIgnoreCase(field.key, "Depends")) depends = field.value;
+                for (cycle_graph_keys, 0..) |key, graph_index| {
+                    if (!std.ascii.eqlIgnoreCase(field.key, key)) continue;
+                    graph_seen[graph_index] = true;
+                    if (!std.mem.eql(u8, field.value, cycleGraphField(index, key))) return false;
+                }
+            }
+            for (cycle_graph_keys, graph_seen) |key, seen| {
+                if (!seen and cycleGraphField(index, key).len != 0) return false;
+            }
+            if (!std.mem.eql(u8, architecture, "amd64") or !std.mem.eql(u8, version, binding.version) or
+                !std.mem.eql(u8, depends, binding.depends) or !std.mem.eql(u8, state, if (index < 2)
+                "install ok unpacked"
+            else
+                "install ok installed")) return false;
+        }
+    }
+    return std.mem.allEqual(bool, &matched, true);
+}
+
+fn verifyBaseCycle() !void {
+    const bytes = try readInstalledStatus();
+    defer std.heap.page_allocator.free(bytes);
+    if (!cycleStatusMatches(bytes)) return error.CycleStateOrGraphChanged;
+    protectedAncestors("/var/lib/dpkg/updates/.cycle-check") catch return error.CycleStateChanged;
+    emptyDirectory("/var/lib/dpkg/updates") catch return error.CycleStateChanged;
+    const unincorp_path: [:0]const u8 = "/var/lib/dpkg/triggers/Unincorp";
+    try protectedAncestors(unincorp_path);
+    const unincorp = linux.open(unincorp_path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    if (linux.errno(unincorp) == .SUCCESS) {
+        _ = linux.close(@intCast(unincorp));
+        const pending = readInstalledFile(unincorp_path, 0) catch return error.CycleCallbackChanged;
+        std.heap.page_allocator.free(pending);
+    } else if (linux.errno(unincorp) != .NOENT) return error.CycleCallbackChanged;
+    const triggers = readInstalledFile("/var/lib/dpkg/info/libgcc-s1:amd64.triggers", 1024) catch return error.CycleCallbackChanged;
+    defer std.heap.page_allocator.free(triggers);
+    if (!std.mem.eql(u8, triggers, "# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"))
+        return error.CycleCallbackChanged;
+    const unqualified = linux.open("/var/lib/dpkg/info/libgcc-s1.triggers", .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+    if (linux.errno(unqualified) == .SUCCESS) {
+        _ = linux.close(@intCast(unqualified));
+        return error.CycleCallbackChanged;
+    }
+    if (linux.errno(unqualified) != .NOENT) return error.CycleCallbackChanged;
+    inline for (.{ "libgcc-s1", "libgcc-s1:amd64" }) |name| {
+        inline for (.{ "preinst", "postinst", "prerm", "postrm", "config" }) |script| {
+            const path = "/var/lib/dpkg/info/" ++ name ++ "." ++ script;
+            try protectedAncestors(path);
+            const present = linux.open(path, .{ .PATH = true, .CLOEXEC = true, .NOFOLLOW = true }, 0);
+            if (linux.errno(present) == .SUCCESS) {
+                _ = linux.close(@intCast(present));
+                return error.CycleCallbackChanged;
+            }
+            if (linux.errno(present) != .NOENT) return error.CycleCallbackChanged;
+        }
+    }
 }
 
 fn protectedRoot(root: [:0]const u8) !Pinned {
@@ -541,7 +719,7 @@ fn mountArchive(child: Child) linux.E {
 }
 
 fn mountProc(child: Child) linux.E {
-    if (child.options.profile == .none) return .SUCCESS;
+    if (child.options.profile == .none or child.options.profile == .libgcc_cycle) return .SUCCESS;
     const proc = openPinned("/proc", true) catch return .STALE;
     defer _ = linux.close(proc.fd);
     if (!same(proc.metadata, child.proc_mountpoint.metadata)) return .STALE;
@@ -878,10 +1056,15 @@ fn childMain(input: Child) noreturn {
     must(linux.chroot("."), status, 4);
     must(linux.chdir("/"), status, 4);
     _ = linux.close(root.fd);
-    if (child.options.profile != .none) {
-        verifyInstalledBinding(script_bindings[@intFromEnum(child.options.profile) - 1]) catch
+    if (scriptBinding(child.options.profile)) |binding| {
+        verifyInstalledBinding(binding) catch
             fail(status, 10, .STALE);
     }
+    if (child.options.verb == .break_base_cycle)
+        verifyBaseCycle() catch |err| {
+            std.log.err("reference cycle operation refused: {s}", .{@errorName(err)});
+            fail(status, 11, .STALE);
+        };
     const archive_setup = mountArchive(child);
     if (archive_setup != .SUCCESS) fail(status, 5, archive_setup);
     const proc_setup = mountProc(child);
@@ -900,6 +1083,7 @@ fn childMain(input: Child) noreturn {
         .unpack => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--unpack", archive_target, null },
         .probe_configure => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--no-act", "--configure", selector, null },
         .configure => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", selector, null },
+        .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
     };
     must(linux.syscall5(
         .execveat,
@@ -988,6 +1172,18 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
     defer {
         if (archive) |value| _ = linux.close(value.fd);
     }
+    if (options.cycle_archives) |paths| {
+        for (paths, base_cycle) |path, binding| {
+            const source = openVerified(
+                path,
+                std.crypto.hash.sha2.Sha512,
+                binding.archive_sha512,
+                binding.archive_size,
+                binding.archive_size,
+            ) catch return error.CycleIdentityChanged;
+            _ = linux.close(source.fd);
+        }
+    }
     const root_proc = try std.fmt.allocPrintSentinel(allocator, "{s}/proc", .{options.root}, 0);
     const proc = try openPinned(root_proc, true);
     defer _ = linux.close(proc.fd);
@@ -1003,8 +1199,7 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
         target.metadata.mode != 0o100600 or target.metadata.size != 0 or
         target.metadata.nlink != 1 or target.metadata.dev_major != root.metadata.dev_major or
         target.metadata.dev_minor != root.metadata.dev_minor) return error.InvalidArchiveMountpoint;
-    if (options.profile != .none) {
-        const binding = script_bindings[@intFromEnum(options.profile) - 1];
+    if (scriptBinding(options.profile)) |binding| {
         const script_path = try std.fmt.allocPrintSentinel(
             allocator,
             "{s}/var/lib/dpkg/info/{s}.postinst",
@@ -1069,6 +1264,83 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
     }
     if (!linux.W.IFEXITED(status)) return error.ReferenceProcessSignaled;
     return linux.W.EXITSTATUS(status);
+}
+
+fn cycleStatusFixture(allocator: std.mem.Allocator) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    for (base_cycle, 0..) |binding, index| {
+        const identity = try std.fmt.allocPrint(allocator, "Package: {s}\nArchitecture: amd64\nVersion: {s}\nStatus: {s}\n", .{ binding.name, binding.version, if (index < 2) "install ok unpacked" else "install ok installed" });
+        defer allocator.free(identity);
+        try output.appendSlice(allocator, identity);
+        for (cycle_graph_keys) |key| {
+            const value = cycleGraphField(index, key);
+            if (value.len == 0) continue;
+            const field = try std.fmt.allocPrint(allocator, "{s}: {s}\n", .{ key, value });
+            defer allocator.free(field);
+            try output.appendSlice(allocator, field);
+        }
+        try output.appendSlice(allocator, "Conffiles:\n /etc/fixture abcdef\n\n");
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+test "reference cycle authority refuses changed graph, pre-depends, triggers and outside state" {
+    const allocator = std.testing.allocator;
+    const status = try cycleStatusFixture(allocator);
+    defer allocator.free(status);
+    try std.testing.expect(cycleStatusMatches(status));
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "Depends: libgcc-s1,", .after = "Depends: unknown-package," },
+        .{ .before = "Depends: gcc-16-base", .after = "Pre-Depends: libc6\nDepends: gcc-16-base" },
+        .{ .before = "Status: install ok installed", .after = "Status: install ok unpacked" },
+        .{ .before = "Status: install ok unpacked", .after = "Status: install ok triggers-pending" },
+        .{ .before = "Protected: yes", .after = "Protected: no" },
+        .{ .before = "Protected: yes", .after = "Triggers-Pending: ldconfig\nProtected: yes" },
+        .{ .before = "Protected: yes", .after = "Config-Version: previous\nProtected: yes" },
+        .{ .before = "Architecture: amd64", .after = "Architecture: arm64" },
+        .{ .before = "Version: 16-20260322-1ubuntu1", .after = "Version: 16-20260322-1ubuntu2" },
+        .{ .before = "Package: libgcc-s1", .after = "Package: libgcc-s1\npackage: libgcc-s1" },
+        .{ .before = "Depends: gcc-16-base", .after = "Depends: gcc-16-base\n continued" },
+    }) |mutation| {
+        const changed = try std.mem.replaceOwned(u8, allocator, status, mutation.before, mutation.after);
+        defer allocator.free(changed);
+        try std.testing.expect(!cycleStatusMatches(changed));
+    }
+    const missing = std.mem.indexOf(u8, status, "Package: gcc-16-base").?;
+    try std.testing.expect(!cycleStatusMatches(status[0..missing]));
+}
+
+test "reference cycle operation is not generic configure or a proc profile" {
+    const options: Options = .{
+        .root = "/protected/root",
+        .dpkg = "/protected/dpkg",
+        .architecture = "amd64",
+        .profile = .libgcc_cycle,
+        .verb = .break_base_cycle,
+        .selector = "libgcc-s1:amd64",
+        .cycle_archives = .{ "/protected/libc6", "/protected/libgcc", "/protected/gcc-base", "/protected/gconv" },
+    };
+    try validateOptions(options);
+    try std.testing.expect(scriptBinding(options.profile) == null);
+    var changed = options;
+    changed.verb = .configure;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.profile = .none;
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.architecture = "arm64";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.selector = "libc6:amd64";
+    try std.testing.expectError(error.InvalidCycleProfile, validateOptions(changed));
+    changed = options;
+    changed.cycle_archives = null;
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
+    changed = options;
+    changed.archive = "/protected/extra";
+    try std.testing.expectError(error.InvalidArguments, validateOptions(changed));
 }
 
 test "reference capability transition fails closed without root authority" {
@@ -1419,6 +1691,12 @@ test "reference proc profile is bound to the installed dpkg status version" {
         "Package: systemd\nVersion: 259.5-0ubuntu3.4\nArchitecture: amd64\n" ++
         "Status: install ok unpacked\n\n";
     try std.testing.expect(bindingStatusMatches(valid, binding));
+    try std.testing.expect(bindingStatusMatches(valid ++
+        "Package: conffile-owner\nVersion: 1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\nConffiles:\n /etc/fixture abcdef\n\n", binding));
+    try std.testing.expect(!bindingStatusMatches(valid ++
+        "Package: conffile-owner\nVersion: 1\nArchitecture: amd64\n" ++
+        "Status: install ok installed\nConffiles:missing-space\n\n", binding));
     try std.testing.expect(!bindingStatusMatches(
         "Package: systemd\nVersion: 259.5-0ubuntu3.5\nArchitecture: amd64\n" ++
             "Status: install ok unpacked\n\n",

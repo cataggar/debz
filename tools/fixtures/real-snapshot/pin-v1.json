@@ -39,6 +39,86 @@
   ],
   "identities": [
     {
+      "architectures": ["amd64"],
+      "consumers": [
+        {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
+        {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
+      ],
+      "digest": "sha512:e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696",
+      "id": "archive:libc6",
+      "kind": "archive",
+      "mode": null,
+      "package": "libc6",
+      "path": null,
+      "provenance": {
+        "archives": {"amd64": "sha512:e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696"},
+        "version": "2.43-2ubuntu2.4"
+      },
+      "review": "#401",
+      "size": 2104056,
+      "version_bound": true
+    },
+    {
+      "architectures": ["amd64"],
+      "consumers": [
+        {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
+        {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
+      ],
+      "digest": "sha512:a34e93f253ca90bd331c5eee563be6ebcc14dbf08147e82b9479f972fe566c83263b644e348757af1853f8663cb8ca2349e2c013e4a0ca0e3ea3d631297576b2",
+      "id": "archive:libgcc-s1",
+      "kind": "archive",
+      "mode": null,
+      "package": "libgcc-s1",
+      "path": null,
+      "provenance": {
+        "archives": {"amd64": "sha512:a34e93f253ca90bd331c5eee563be6ebcc14dbf08147e82b9479f972fe566c83263b644e348757af1853f8663cb8ca2349e2c013e4a0ca0e3ea3d631297576b2"},
+        "version": "16-20260322-1ubuntu1"
+      },
+      "review": "#401",
+      "size": 80312,
+      "version_bound": true
+    },
+    {
+      "architectures": ["amd64"],
+      "consumers": [
+        {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
+        {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
+      ],
+      "digest": "sha512:0767f731e71e709736596d52dbe181245a8ca181cdadbac6226aad5aa7151d8ce5149ad28625facc61d8882e76fc387af5336dc289126a0bf830b9e599b3922c",
+      "id": "archive:gcc-16-base",
+      "kind": "archive",
+      "mode": null,
+      "package": "gcc-16-base",
+      "path": null,
+      "provenance": {
+        "archives": {"amd64": "sha512:0767f731e71e709736596d52dbe181245a8ca181cdadbac6226aad5aa7151d8ce5149ad28625facc61d8882e76fc387af5336dc289126a0bf830b9e599b3922c"},
+        "version": "16-20260322-1ubuntu1"
+      },
+      "review": "#401",
+      "size": 38296,
+      "version_bound": true
+    },
+    {
+      "architectures": ["amd64"],
+      "consumers": [
+        {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
+        {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
+      ],
+      "digest": "sha512:c385f1ca4f8054e59f977a38819e31d6f2429909ce0a88c734c874ce163851dfa7e565dded6c65c3feb3bc8cf074498b45a4c2226bb8e17a2bc8b95027a29692",
+      "id": "archive:libc-gconv-modules-extra",
+      "kind": "archive",
+      "mode": null,
+      "package": "libc-gconv-modules-extra",
+      "path": null,
+      "provenance": {
+        "archives": {"amd64": "sha512:c385f1ca4f8054e59f977a38819e31d6f2429909ce0a88c734c874ce163851dfa7e565dded6c65c3feb3bc8cf074498b45a4c2226bb8e17a2bc8b95027a29692"},
+        "version": "2.43-2ubuntu2.4"
+      },
+      "review": "#401",
+      "size": 1362202,
+      "version_bound": true
+    },
+    {
       "architectures": [
         "amd64"
       ],
