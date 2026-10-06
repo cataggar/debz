@@ -162,6 +162,7 @@ pub fn main(init: std.process.Init) !void {
     var workspace: ?[]const u8 = null;
     var oracle_only = false;
     var diversions_only = false;
+    var statoverrides_only = false;
     var install_boundaries_only = false;
     var removal_only = false;
     var repository_descriptor_only = false;
@@ -178,6 +179,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, option, "--diversions-only")) {
             if (diversions_only) return error.DuplicateSelector;
             diversions_only = true;
+        } else if (std.mem.eql(u8, option, "--statoverrides-only")) {
+            if (statoverrides_only) return error.DuplicateSelector;
+            statoverrides_only = true;
         } else if (std.mem.eql(u8, option, "--install-boundaries-only")) {
             if (install_boundaries_only) return error.DuplicateSelector;
             install_boundaries_only = true;
@@ -193,6 +197,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try validateSelection(driver, oracle_only);
     if (@as(u8, @intFromBool(diversions_only)) +
+        @as(u8, @intFromBool(statoverrides_only)) +
         @as(u8, @intFromBool(install_boundaries_only)) +
         @as(u8, @intFromBool(removal_only)) +
         @as(u8, @intFromBool(repository_descriptor_only)) > 1) return error.InvalidArguments;
@@ -203,6 +208,11 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     fixture.oracle_only = oracle_only;
     const selected = driver orelse "";
+    if (statoverrides_only) {
+        try statoverride.run(&fixture, selected, reference.executable, reference.architecture);
+        try support.assertHostUnchanged(allocator, init.io, reference.before);
+        return;
+    }
     if (removal_only) {
         try removal.run(&fixture, selected, reference.executable, reference.architecture);
         try support.assertHostUnchanged(allocator, init.io, reference.before);

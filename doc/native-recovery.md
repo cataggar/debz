@@ -65,8 +65,8 @@ This uses the existing versioned execution-progress, script-outcome,
 managed-state, root-mutation, completion, and provenance documents; no wire
 schema is widened, and older evidence retains its original meaning.
 
-Statoverride resolution is frozen for the original invocation. Alongside the
-original override database, recovery stores the exact account-file bytes and
+Recovery freezes the original pre-script statoverride resolution. Alongside
+the original override database, it stores the exact account-file bytes and
 modes actually required for named identities. These use bounded database-kind
 blobs keyed `statoverride-passwd` and `statoverride-group`, with exact logical
 paths `etc/passwd` and `etc/group`; they are not dpkg database-generation
@@ -76,7 +76,20 @@ current account files. Numeric-only records require no identity blobs.
 Managed observations separately track current override/account state across
 known script outcomes, so legitimate script changes can resume using the
 original resolution while subsequent external drift still blocks mutation.
-An initially empty override set also stays empty throughout recovery.
+As in normal execution, successful non-preinst outcomes refresh the override
+database for later phases. Their checkpoints include the database and the
+root-local account inputs used by the refreshed records. Only override records
+created or changed at that boundary add their live targets to managed state;
+unchanged administrator overrides do not add targets. Dpkg's incidental rewrite
+of a numeric identity into an equivalent account name is not a target change.
+The observation binds the actual no-follow kind, bytes and mode/uid/gid after genuine
+`dpkg-statoverride --update`, not an assumed copy of the record's metadata.
+Merged-/usr spellings are observed at their physical alias destination.
+Recovery refuses later target drift before continuing. Settled verification
+reuses the managed-payload checks, retaining the existing administrator
+conffile exemptions. Dpkg's `statoverride-old` and `diversions-old` remain
+scratch backups, compared byte-for-byte in the genuine-tool oracles rather
+than added to the lock or closure formats.
 
 Diversion inputs remain genuine database-generation blobs. Managed checkpoints
 also observe the live diversion database, including initial absence, and the
@@ -922,7 +935,7 @@ status before completion, drift refusal without package mutation, exact
 reference-root parity, retained scripted-trigger receipt count, and immutable
 recovery repeats. This target is included in the complete aggregate in both modes on both CI
 architectures.
-`zig build test-native-recovery-zig-statoverride` runs all 17 named
+`zig build test-native-recovery-zig-statoverride` runs 24
 statoverride crash/recovery variants in fresh guarded roots, including
 install, upgrade, remove and purge, failed postinst, script-replaced account
 and override files, a newly created override database, and six independent
@@ -930,6 +943,14 @@ identity, stored-blob and owner drifts. The Zig runner checks exact persisted
 account/group bytes, archive-evicted core recovery, unchanged helper inode and
 bytes, pinned-dpkg filesystem/database/script parity or refusal without
 package mutation, terminal completion, and immutable repeated receipts.
+The five genuine chrony-shaped additions cover created and changed records at
+`after_script_outcome`, archive-evicted recovery, exact `statoverride` and
+`statoverride-old` bytes, untracked administrator override edits, and mode,
+owner and content drift refusals. Script-created targets are present in both
+the checkpoint and retained settled snapshot; the shared settled verifier
+accepts their captured state and refuses later metadata drift. Fixture scripts
+set deterministic regular-file timestamps before observation rather than
+normalizing differences in captured roots.
 Both optimization modes are required on both CI architectures; this target
 alone was never sufficient to retire either Python recovery gate.
 `zig build test-native-recovery-zig-literal` runs all five literal-backslash
