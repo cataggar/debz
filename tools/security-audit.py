@@ -1998,6 +1998,7 @@ WORKLOAD_PARTITIONS = {
         "run_apt_system_orchestrator_tests", "run_required_orchestrator_security_tests",
     )),
     "workload_native": ("test-workload-native", (
+        "run_native_program_corpus_tests",
         "run_native_alternatives_tests", "run_native_alternatives_oracle_tests",
         "run_native_snapshot_tests", "run_native_differential_zig_tests",
         "run_native_fixture_tests", "run_native_conffile_zig_tests",

@@ -767,7 +767,12 @@ pub fn build(b: *std.Build) void {
     const run_native_program_tests = b.addRunArtifact(native_program_tests);
     const native_program_corpus_tests = b.addTest(.{
         .root_module = fuzz_tests.root_module,
-        .filters = &.{"fuzz.corpus native transaction program seeds stay canonical"},
+        .filters = &.{
+            "fuzz.corpus ",
+            "fuzz.new native state corpus",
+            "fuzz.the mutation progress corpus",
+            "fuzz.the mutation journal corpus",
+        },
     });
     const run_native_program_corpus_tests = b.addRunArtifact(native_program_corpus_tests);
     const native_program_step = b.step(
@@ -776,6 +781,7 @@ pub fn build(b: *std.Build) void {
     );
     native_program_step.dependOn(&run_native_program_tests.step);
     native_program_step.dependOn(&run_native_program_corpus_tests.step);
+    workload_native.dependOn(&run_native_program_corpus_tests.step);
 
     const root_operation_tests = b.addTest(.{
         .root_module = debz,
