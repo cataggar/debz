@@ -2299,11 +2299,13 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-protected-native-ci.sh", &.{
         "  export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}\n",
+        "    exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\" \\\n",
         "    exec bash tools/real-snapshot-reference.sh \"$REFERENCE_DPKG\" \\\n",
         "            if total > 512 * 1024 * 1024:\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-acceptance.sh", &.{
         "    --check-keyring \"$keyring\" >/dev/null\n",
+        "python3 -I - \"$repository_root/tools\" \"$repository_root\" \"$debz\" <<'PY'\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference.sh", &.{
         "\"$zig\" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \\\n",

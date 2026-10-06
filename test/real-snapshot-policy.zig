@@ -56,6 +56,8 @@ const Driver = struct {
         ++ "\n");
         try work.write("tools/real_snapshot_reference_paths.py",
             \\def protected(path, directory=False):
+            \\    if not path.is_absolute():
+            \\        raise ValueError(f"reference path is not absolute: {path}")
             \\    return path.stat()
         ++ "\n");
         try work.directory.dir.createDirPath(support.io, ".real-snapshot");
@@ -362,6 +364,20 @@ test "snapshot: offline native creation and zero-action update preserve evidence
     try testing.expectEqual(@as(usize, 1), verifications);
     try testing.expectEqual(@as(usize, 1), update_plans);
     try testing.expectEqual(@as(usize, 2), mutating);
+}
+
+test "snapshot: relative native caller uses absolute protected source paths before create" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const relative_script = try support.allocator.dupe(u8, "tools/real-snapshot-acceptance.sh");
+    support.allocator.free(f.script);
+    f.script = relative_script;
+    const result = try f.offline(.{});
+    defer result.deinit();
+    try result.ok();
+    const continuation = try f.work.read(".real-snapshot/fresh/evidence/update-zero-actions.txt");
+    defer support.allocator.free(continuation);
+    try testing.expectEqualStrings("changed=false\nstatus_unchanged=true\nprovenance_unchanged=true\n", continuation);
 }
 
 fn expectArguments(actual: []const []const u8, expected: []const []const u8) !void {
@@ -1873,7 +1889,7 @@ test "snapshot: manual two-architecture CI workflow retains opt-in, artifact bou
     const collector = try source("tools/real-snapshot-protected-native-ci.sh");
     defer support.allocator.free(collector);
     for ([_][]const u8{
-        "real-snapshot-acceptance.sh \"$checkout/zig-out/bin/debz\"",
+        "exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\"",
         "real-snapshot-reference.sh \"$REFERENCE_DPKG\"",
         "real-snapshot-comparator compare",
         "comparison-unavailable.txt",

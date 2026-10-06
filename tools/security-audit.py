@@ -2672,7 +2672,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "protected(Path(sys.argv[2]))",
         '[[ ${#inputs[@]} == 3 ]]',
         "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
-        'exec bash tools/real-snapshot-acceptance.sh "$checkout/zig-out/bin/debz"',
+        'exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz"',
         'exec bash tools/real-snapshot-reference.sh "$REFERENCE_DPKG"',
         'timeout --signal=TERM --kill-after=30s 5m python3 tools/capture-vendor-state.py',
         'if [[ -d "$work/root/var/lib/dpkg/info" ]]; then',
@@ -2685,6 +2685,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real-snapshot-acceptance.sh": (
         "readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}",
         '--check-keyring "$keyring" >/dev/null',
+        'python3 -I - "$repository_root/tools" "$repository_root" "$debz"',
         'protected(repository, directory=True)',
         'protected(repository / ".real-snapshot", directory=True)',
     ),

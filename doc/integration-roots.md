@@ -149,6 +149,9 @@ separate from the small proof's `ci-RUN-ATTEMPT-ARCH` tree. They reuse
 archive/library tree, package sources, candidate build, pinned Debian dpkg and
 package-derived trust root; this setup mode does **not** run or claim the small
 protected proof. Native and reference execution stay in that protected checkout.
+The native dispatcher invokes acceptance by its absolute checkout path; source
+metadata guards derive absolute tool paths from the protected repository root,
+including when acceptance is invoked through a relative `tools/` entry point.
 `DEBZ_REAL_SNAPSHOT_KEYRING` is required, with no hosted-image fallback. Its
 absolute regular, non-symlink path and every ancestor must be root-owned and
 not group/world writable. A no-follow descriptor verifies the consumed member

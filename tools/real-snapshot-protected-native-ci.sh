@@ -54,7 +54,7 @@ case "$operation" in
   native)
     [[ $# == 6 ]]
     export DEBZ_REAL_SNAPSHOT_TRACE=1
-    exec bash tools/real-snapshot-acceptance.sh "$checkout/zig-out/bin/debz" \
+    exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz" \
       "$5" "$6" "$architecture" "$work"
     ;;
   reference)

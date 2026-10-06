@@ -624,7 +624,7 @@ install_ceiling_seconds=$(install_bound \
 readonly install_progress_limit_seconds install_ceiling_seconds
 [[ -x "$debz" ]]
 case "$workspace" in "$repository_root"/.real-snapshot/*) ;; *) echo "unsafe workspace" >&2; exit 2 ;; esac
-python3 -I - "$(dirname -- "${BASH_SOURCE[0]}")" "$repository_root" "$debz" <<'PY'
+python3 -I - "$repository_root/tools" "$repository_root" "$debz" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
