@@ -17,6 +17,8 @@ pub const SnapshotLimits = struct {
     max_trace_bytes: usize = 16 * 1024 * 1024,
 };
 
+const write_witness_paths = [_][]const u8{"dev/null"};
+
 pub const Fixture = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -594,6 +596,7 @@ const Snapshot = struct {
     schema: []const u8 = "https://debz.dev/test/native-transaction-snapshot-v1",
     version: u32 = 1,
     filesystem: []const FilesystemEntry,
+    write_witnesses: []const FilesystemEntry,
     dpkg: Dpkg,
     trace: []const []const u8,
 };
@@ -849,6 +852,15 @@ fn captureXattrs(allocator: std.mem.Allocator, absolute: []const u8) ![]const At
     return attributes.items;
 }
 
+fn pathExcluded(path: []const u8, excludes: []const []const u8) bool {
+    for (excludes) |prefix| {
+        if (std.mem.eql(u8, path, prefix) or
+            (std.mem.startsWith(u8, path, prefix) and path.len > prefix.len and path[prefix.len] == '/'))
+            return true;
+    }
+    return false;
+}
+
 fn captureFilesystem(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -865,16 +877,7 @@ fn captureFilesystem(
     var total_bytes: u64 = 0;
     while (try walker.next(io)) |child| {
         const path = child.path;
-        var excluded = false;
-        for (excludes) |prefix| {
-            if (std.mem.eql(u8, path, prefix) or
-                (std.mem.startsWith(u8, path, prefix) and path.len > prefix.len and path[prefix.len] == '/'))
-            {
-                excluded = true;
-                break;
-            }
-        }
-        if (excluded) {
+        if (pathExcluded(path, excludes)) {
             if (child.kind == .directory) walker.leave(io);
             continue;
         }
@@ -967,6 +970,100 @@ fn captureFilesystem(
         if (group.count > 1) entry.hardlink_to = group.first;
     }
     std.mem.sort(FilesystemEntry, entries.items, {}, lessPath);
+    return entries.items;
+}
+
+fn captureWriteWitnesses(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_dir: std.Io.Dir,
+    absolute: []const u8,
+    limits: SnapshotLimits,
+    excludes: []const []const u8,
+) ![]const FilesystemEntry {
+    const root: root_fs.Root = .init(io, root_dir);
+    var entries: std.ArrayList(FilesystemEntry) = .empty;
+    var total_bytes: u64 = 0;
+    for (write_witness_paths) |relative| {
+        if (pathExcluded(relative, excludes)) continue;
+        const path = try root_fs.Path.init(relative);
+        const metadata = try root.entryIfExists(path) orelse {
+            try entries.append(allocator, .{
+                .path = try allocator.dupe(u8, relative),
+                .kind = "absent",
+                .mode = 0,
+                .uid = 0,
+                .gid = 0,
+            });
+            continue;
+        };
+        if (!metadata.modeled) return error.UnsupportedFilesystemMetadata;
+        const owned_relative = try allocator.dupe(u8, relative);
+        const full = try std.fs.path.join(allocator, &.{ absolute, owned_relative });
+        const item: FilesystemEntry = .{
+            .path = owned_relative,
+            .kind = switch (metadata.kind) {
+                .file => "regular",
+                .directory => "directory",
+                .sym_link => "symlink",
+                .character_device => "character-device",
+                .block_device => "block-device",
+                .named_pipe => "fifo",
+                .unix_domain_socket => "socket",
+                else => "unknown",
+            },
+            .mode = metadata.mode,
+            .uid = metadata.uid,
+            .gid = metadata.gid,
+            .mtime_ns = if (metadata.kind == .directory) null else metadata.modified_nanoseconds,
+            .size = if (metadata.kind == .file) metadata.size else null,
+            .xattrs = try captureXattrs(allocator, full),
+        };
+        var appended = item;
+        if (metadata.kind == .file) {
+            if (metadata.size > limits.max_file_bytes) return error.FilesystemFileLimit;
+            total_bytes += metadata.size;
+            if (total_bytes > limits.max_total_regular_bytes) return error.FilesystemFileLimit;
+            var file = try root.openRegularFile(path);
+            defer file.close(io);
+            const opened = try file.stat(io);
+            if (opened.size != metadata.size or opened.inode != metadata.inode)
+                return error.FilesystemChanged;
+            var reader = file.reader(io, &.{});
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            var buffer: [64 * 1024]u8 = undefined;
+            var read: u64 = 0;
+            while (true) {
+                const count = reader.interface.readSliceShort(&buffer) catch return reader.err.?;
+                if (count == 0) break;
+                read += count;
+                if (read > metadata.size) return error.FilesystemChanged;
+                hash.update(buffer[0..count]);
+            }
+            if (read != metadata.size or (try file.stat(io)).size != read)
+                return error.FilesystemChanged;
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            appended.sha256 = std.fmt.bytesToHex(digest, .lower);
+        } else if (metadata.kind == .sym_link) {
+            var buffer: [4096]u8 = undefined;
+            appended.target = try allocator.dupe(u8, try root.readSymbolicLink(
+                path,
+                &buffer,
+            ));
+        } else if (metadata.kind == .character_device or metadata.kind == .block_device) {
+            const linux = std.os.linux;
+            const path_z = try allocator.dupeZ(u8, relative);
+            var info: linux.Statx = undefined;
+            if (linux.errno(linux.statx(root_dir.handle, path_z, linux.AT.SYMLINK_NOFOLLOW, .{
+                .TYPE = true,
+                .MODE = true,
+            }, &info)) != .SUCCESS) return error.UnsupportedFilesystemEntry;
+            appended.device_major = info.rdev_major;
+            appended.device_minor = info.rdev_minor;
+        }
+        try entries.append(allocator, appended);
+    }
     return entries.items;
 }
 
@@ -1174,6 +1271,7 @@ fn captureImage(
     }
     const image: Snapshot = .{
         .filesystem = try captureFilesystem(a, io, dir, absolute, limits, excludes),
+        .write_witnesses = try captureWriteWitnesses(a, io, dir, absolute, limits, excludes),
         .dpkg = try captureDpkg(a, io, root, limits),
         .trace = trace.items,
     };

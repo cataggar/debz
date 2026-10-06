@@ -212,6 +212,21 @@ fn convertEntries(a: Allocator, source: Value, filesystem: bool, unknown_file: b
     return result;
 }
 
+fn convertWriteWitnesses(a: Allocator, source: Value) !Value {
+    if (source != .array) return error.InvalidSnapshot;
+    var result = array(a);
+    for (source.array.items) |entry| {
+        const kind = try string(try field(entry, "kind"));
+        if (std.mem.eql(u8, kind, "absent")) {
+            var witness = object(a);
+            try put(a, &witness, "path", try field(entry, "path"));
+            try put(a, &witness, "kind", text("absent"));
+            try append(a, &result, witness);
+        } else try append(a, &result, try convertEntry(a, entry, true, false));
+    }
+    return result;
+}
+
 pub fn convertImage(a: Allocator, source: Value) !Value {
     const dpkg = try field(source, "dpkg");
     var database = object(a);
@@ -225,6 +240,7 @@ pub fn convertImage(a: Allocator, source: Value) !Value {
     try put(a, &result, "schema", text(schema));
     try put(a, &result, "version", .{ .integer = 1 });
     try put(a, &result, "filesystem", try convertEntries(a, try field(source, "filesystem"), true, false));
+    try put(a, &result, "write_witnesses", try convertWriteWitnesses(a, try field(source, "write_witnesses")));
     try put(a, &result, "dpkg", database);
     try put(a, &result, "trace", try field(source, "trace"));
     return result;
@@ -274,6 +290,7 @@ fn showDifference(left: Value, right: Value, path: []const u8, remaining: *usize
                 }
             }.less);
             for (keys.items) |key| {
+                if (std.mem.eql(u8, key, "write_witnesses")) continue;
                 const child = try std.fmt.allocPrint(a, "{s}.{s}", .{ path, key });
                 if (left.object.get(key)) |l| {
                     if (right.object.get(key)) |r| {
@@ -337,12 +354,14 @@ fn compareWithReport(a: Allocator, reference: Value, candidate: Value, maximum: 
 }
 
 fn validateSnapshot(value: Value) !void {
-    if (value != .object or value.object.count() != 5 or
+    if (value != .object or value.object.count() != 6 or
         !std.mem.eql(u8, try string(try field(value, "schema")), schema))
         return error.UnsupportedSnapshot;
     const version = try field(value, "version");
     if (version != .integer or version.integer != 1) return error.UnsupportedSnapshot;
-    if ((try field(value, "filesystem")) != .array or (try field(value, "trace")) != .array)
+    if ((try field(value, "filesystem")) != .array or
+        (try field(value, "write_witnesses")) != .array or
+        (try field(value, "trace")) != .array)
         return error.InvalidSnapshot;
     const database = try field(value, "dpkg");
     if (database != .object or database.object.count() != 10 or (try field(database, "present")) != .bool)
@@ -523,7 +542,7 @@ test "snapshot CLI rejects malformed inputs and supports corpus validation" {
     defer unsupported.deinit();
     try std.testing.expectError(error.UnsupportedSnapshot, compare(a, unsupported.value, unsupported.value, 3));
     var incomplete = try std.json.parseFromSlice(Value, a,
-        \\{"schema":"https://debz.dev/test/native-transaction-snapshot-v1","version":1,"filesystem":[],"trace":[],"dpkg":{}}
+        \\{"schema":"https://debz.dev/test/native-transaction-snapshot-v1","version":1,"filesystem":[],"write_witnesses":[],"trace":[],"dpkg":{}}
     , .{});
     defer incomplete.deinit();
     try std.testing.expectError(error.InvalidSnapshot, compare(a, incomplete.value, incomplete.value, 3));

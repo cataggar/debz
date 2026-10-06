@@ -58,6 +58,7 @@ SENSITIVE_PATHS = (
 PUBLIC_REFERENCE_ROOTS = frozenset(
     {"bin", "lib", "lib32", "lib64", "libx32", "sbin", "usr"}
 )
+WRITE_WITNESS_PATHS = ("dev/null",)
 MAX_JSON_INTEGER = (1 << 53) - 1
 MAX_DOCUMENT_PATH_BYTES = 4096
 ABSOLUTE_PATH = re.compile(r"(?:^|[\s:=])(/[^\s\x00]+)", re.MULTILINE)
@@ -1069,6 +1070,64 @@ def _capture_linked_filesystem(
             os.close(alternatives_descriptor)
 
 
+def _capture_write_witness(
+    root_descriptor: int,
+    relative: str,
+    limits: Limits,
+) -> dict[str, Any]:
+    parent, name = relative.rsplit("/", 1)
+    directory = _open_directory_at(root_descriptor, parent, required=False)
+    if directory is None:
+        return {"path": relative, "kind": "absent"}
+    try:
+        try:
+            metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"path": relative, "kind": "absent"}
+        except OSError as error:
+            raise CaptureError(f"cannot stat write witness {relative}: {error}") from error
+        kind = _kind(metadata.st_mode)
+        if kind == "regular":
+            digest, _ = _read_regular_at(
+                directory,
+                name,
+                relative,
+                metadata,
+                maximum=limits.max_linked_file_bytes,
+                budget={"witness_bytes": 0},
+                budget_key="witness_bytes",
+                total_maximum=limits.max_linked_file_bytes,
+                retain=False,
+            )
+            return {
+                "path": relative,
+                "kind": "regular",
+                **_metadata(metadata),
+                "size": metadata.st_size,
+                "sha256": digest,
+            }
+        entry: dict[str, Any] = {
+            "path": relative,
+            "kind": kind,
+            **_metadata(metadata),
+        }
+        if kind == "symlink":
+            entry["target"] = _readlink_stable(directory, name, relative, metadata)
+        return entry
+    finally:
+        os.close(directory)
+
+
+def _capture_write_witnesses(
+    root_descriptor: int,
+    limits: Limits,
+) -> list[dict[str, Any]]:
+    return [
+        _capture_write_witness(root_descriptor, path, limits)
+        for path in WRITE_WITNESS_PATHS
+    ]
+
+
 def _validate_limits(limits: Limits) -> None:
     if not isinstance(limits, Limits):
         raise CaptureError("limits must use the Limits schema")
@@ -1102,6 +1161,7 @@ def capture(
         requested, linked_entries = _capture_linked_filesystem(
             root_descriptor, references, limits, policy
         )
+        write_witnesses = _capture_write_witnesses(root_descriptor, limits)
         _require_unchanged_directory(
             root_descriptor, root_metadata, "reference root"
         )
@@ -1126,6 +1186,7 @@ def capture(
             "requested_paths": requested,
             "entries": linked_entries,
         },
+        "write_witnesses": write_witnesses,
     }
 
 

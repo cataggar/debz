@@ -114,6 +114,11 @@
           "items": { "$ref": "#/$defs/linkedEntry" }
         }
       }
+    },
+    "write_witnesses": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/writeWitness" }
     }
   },
   "$defs": {
@@ -336,6 +341,76 @@
               "maxLength": 4096,
               "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
             }
+          }
+        }
+      ]
+    },
+    "writeWitness": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "kind"],
+          "properties": {
+            "path": { "const": "dev/null" },
+            "kind": { "const": "absent" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "kind",
+            "mode",
+            "uid",
+            "gid",
+            "size",
+            "sha256"
+          ],
+          "properties": {
+            "path": { "const": "dev/null" },
+            "kind": { "const": "regular" },
+            "mode": { "$ref": "#/$defs/mode" },
+            "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "size": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "sha256": { "$ref": "#/$defs/digest" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "kind", "mode", "uid", "gid"],
+          "properties": {
+            "path": { "const": "dev/null" },
+            "kind": {
+              "enum": [
+                "directory",
+                "symlink",
+                "character-device",
+                "block-device",
+                "fifo",
+                "socket",
+                "unknown"
+              ]
+            },
+            "mode": { "$ref": "#/$defs/mode" },
+            "uid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "gid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "target": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            }
+          },
+          "dependentRequired": {
+            "target": ["path", "kind", "mode", "uid", "gid"]
           }
         }
       ]

@@ -123,11 +123,12 @@ fn validateSnapshot(value: std.json.Value) !Counts {
         .object => |object| object,
         else => return error.InvalidSnapshot,
     };
-    if (root.count() != 5 or
+    if (root.count() != 6 or
         !stringEquals(root.get("schema"), schema) or
         !integerEquals(root.get("version"), 1))
         return error.InvalidSnapshot;
     const filesystem = try arrayLength(root.get("filesystem"));
+    _ = try arrayLength(root.get("write_witnesses"));
     if (filesystem == 0) return error.InvalidSnapshot;
     const dpkg = switch (root.get("dpkg") orelse return error.InvalidSnapshot) {
         .object => |object| object,
@@ -323,7 +324,7 @@ fn validDigest(value: std.json.Value) bool {
 
 fn fixture(comptime status: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr"}}],"dpkg":{{"present":true,"status":[{{"package":"{s}"}}],"status_old":[],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr"}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"{s}"}}],"status_old":[],"info":[],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
     ,
         .{ schema, status },
     );
@@ -331,7 +332,7 @@ fn fixture(comptime status: []const u8) []const u8 {
 
 fn regularFixture(comptime info: []const u8) []const u8 {
     return std.fmt.comptimePrint(
-        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"etc/machine-id","kind":"regular","mode":"0444","mtime_ns":1,"size":33,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],"dpkg":{{"present":true,"status":[{{"package":"installed"}}],"status_old":[],"info":[{s}],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"etc/machine-id","kind":"regular","mode":"0444","mtime_ns":1,"size":33,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"installed"}}],"status_old":[],"info":[{s}],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
     , .{ schema, info });
 }
 
@@ -407,7 +408,7 @@ test "real snapshot comparison refuses to normalize package-owned files" {
 
 test "real snapshot comparison ignores symlink timestamps, not symlink targets" {
     const image = std.fmt.comptimePrint(
-        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr/bin/link","kind":"symlink","target":"payload","mtime_ns":1}}],"dpkg":{{"present":true,"status":[{{"package":"installed"}}],"status_old":[],"info":[{{"path":"var/lib/dpkg/info/demo.list","kind":"path-list","lines":["/usr/bin/link"]}}],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
+        \\{{"schema":"{s}","version":1,"filesystem":[{{"path":"usr/bin/link","kind":"symlink","target":"payload","mtime_ns":1}}],"write_witnesses":[{{"path":"dev/null","kind":"absent"}}],"dpkg":{{"present":true,"status":[{{"package":"installed"}}],"status_old":[],"info":[{{"path":"var/lib/dpkg/info/demo.list","kind":"path-list","lines":["/usr/bin/link"]}}],"triggers":[],"updates":[],"alternatives":[],"parts":[],"staging":[],"files":[]}},"trace":[]}}
     , .{schema});
     var left = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, image, .{});
     defer left.deinit();

@@ -24,7 +24,8 @@ const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const exact_lock_v3 = @import("exact_lock_v3.zig");
 const legacy_compat = @import("legacy_compat.zig");
-const native_runtime = @import("native_unpack.zig").Runtime;
+const native_unpack = @import("native_unpack.zig");
+const native_runtime = native_unpack.Runtime;
 const native_recovery = @import("native_recovery.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_transaction_result = @import("native_transaction_result.zig");
@@ -1053,13 +1054,15 @@ pub const Backend = struct {
             guard.preserve_pre_mutation = true;
             return success(request.operation, false, "root operation ownership reserved", &.{});
         }
+        native_unpack.clearNativeRecoveryErrorDetail();
+        defer native_unpack.clearNativeRecoveryErrorDetail();
         const result = self.withRepositoriesGuarded(allocator, request, workflow, &guard) catch |err| failure: {
             const attempt = guard.active().?;
             if (!try native_runtime.canAbandon(allocator, attempt)) {
                 var blocked = blockedRecovery(request.operation, try std.fmt.allocPrint(
                     allocator,
                     "native execution requires recovery: {s}",
-                    .{@errorName(err)},
+                    .{native_unpack.nativeRecoveryErrorDetail(err)},
                 ));
                 blocked.changed = attempt.record().mutation_started;
                 break :failure blocked;

@@ -18993,8 +18993,10 @@ fn verifySnapshotPython3PreinstPaths(
     candidate: []const u8,
     installed: []const u8,
 ) !void {
-    _ = snapshotPython3PreinstCandidate(candidate, installed) orelse
-        return error.InvalidPython3PreinstControl;
+    _ = snapshotPython3PreinstCandidate(candidate, installed) orelse return invalidPython3Preinst(
+        "reason=script_path_mismatch field=candidate expected={s}|{s}/python3.preinst observed_candidate={s} observed_installed={s}",
+        .{ installed, lifecycle_tmp_ci, candidate, installed },
+    );
     for ([_][]const u8{ candidate, installed }) |path|
         try verifySignedDebconfControlFile(allocator, root, .{
             .path = path,
@@ -20848,6 +20850,90 @@ const SignedSnapshotControlError =
         InvalidAlternativesScriptAuthority,
     };
 
+threadlocal var native_recovery_error_detail_buffer: [4096]u8 = undefined;
+threadlocal var native_recovery_error_detail_len: usize = 0;
+threadlocal var native_recovery_error_detail_name: ?[]const u8 = null;
+
+pub fn clearNativeRecoveryErrorDetail() void {
+    native_recovery_error_detail_len = 0;
+    native_recovery_error_detail_name = null;
+}
+
+pub fn nativeRecoveryErrorDetail(err: anyerror) []const u8 {
+    const name = native_recovery_error_detail_name orelse return @errorName(err);
+    if (!std.mem.eql(u8, name, @errorName(err))) return @errorName(err);
+    return native_recovery_error_detail_buffer[0..native_recovery_error_detail_len];
+}
+
+fn setNativeRecoveryErrorDetail(
+    err: anyerror,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    const detail = std.fmt.bufPrint(
+        &native_recovery_error_detail_buffer,
+        "{s}: python3_preinst " ++ fmt,
+        .{@errorName(err)} ++ args,
+    ) catch std.fmt.bufPrint(
+        &native_recovery_error_detail_buffer,
+        "{s}: python3_preinst reason=diagnostic_truncated",
+        .{@errorName(err)},
+    ) catch unreachable;
+    native_recovery_error_detail_len = detail.len;
+    native_recovery_error_detail_name = @errorName(err);
+}
+
+fn invalidPython3Preinst(
+    comptime fmt: []const u8,
+    args: anytype,
+) error{InvalidPython3PreinstControl} {
+    setNativeRecoveryErrorDetail(error.InvalidPython3PreinstControl, fmt, args);
+    return error.InvalidPython3PreinstControl;
+}
+
+fn python3PreinstError(
+    err: anyerror,
+    comptime fmt: []const u8,
+    args: anytype,
+) anyerror {
+    setNativeRecoveryErrorDetail(err, fmt, args);
+    return err;
+}
+
+fn invalidSignedSnapshotControl(
+    invalid: SignedSnapshotControlError,
+    comptime fmt: []const u8,
+    args: anytype,
+) SignedSnapshotControlError {
+    if (invalid == error.InvalidPython3PreinstControl)
+        setNativeRecoveryErrorDetail(invalid, fmt, args);
+    return invalid;
+}
+
+fn entryKindName(entry: root_fs.Entry) []const u8 {
+    return @tagName(entry.kind);
+}
+
+fn verifyModeledEntry(
+    entry: root_fs.Entry,
+    path: []const u8,
+    expected_kind: std.Io.File.Kind,
+    invalid: SignedSnapshotControlError,
+) !void {
+    if (!entry.modeled)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=entry_metadata_mismatch path={s} field=modeled expected=true observed=false",
+            .{path},
+        );
+    if (entry.kind != expected_kind)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=entry_metadata_mismatch path={s} field=kind expected={s} observed={s}",
+            .{ path, @tagName(expected_kind), entryKindName(entry) },
+        );
+}
+
 fn verifyAuthenticatedSnapshotArtifact(
     artifacts: []const native_program.ProgramArtifact,
     package: native_program.PackageIdentity,
@@ -20865,23 +20951,73 @@ fn verifyAuthenticatedSnapshotArtifact(
             !std.mem.eql(u8, artifact.package.architecture, package.architecture))
             continue;
         const identity = artifact.identity() orelse
-            return invalid;
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_identity_missing package={s} architecture={s} field=archive_identity expected=sha512 observed=absent",
+                .{ package.name, package.architecture },
+            );
         const digest = identity.digests.sha512 orelse
-            return invalid;
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_digest_missing package={s} architecture={s} field=sha512 expected={s} observed=absent",
+                .{ package.name, package.architecture, sha512 },
+            );
         const origin = artifact.origin_v2 orelse
-            return invalid;
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_origin_missing package={s} architecture={s} field=origin_v2 expected=authenticated_repository observed=absent",
+                .{ package.name, package.architecture },
+            );
         const authenticated = switch (origin) {
             .authenticated_repository => true,
             else => false,
         };
-        if (found or !std.mem.eql(u8, artifact.package.version, package.version) or
-            artifact.size != expected_size or identity.primary != .sha512 or
-            !std.crypto.timing_safe.eql([64]u8, digest, expected) or
-            !authenticated)
-            return invalid;
+        if (found)
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_duplicate package={s} architecture={s} field=count expected=1 observed=duplicate",
+                .{ package.name, package.architecture },
+            );
+        if (!std.mem.eql(u8, artifact.package.version, package.version))
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_identity_mismatch package={s} architecture={s} field=version expected={s} observed={s}",
+                .{ package.name, package.architecture, package.version, artifact.package.version },
+            );
+        if (artifact.size != expected_size)
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_identity_mismatch package={s} architecture={s} field=size expected={d} observed={d}",
+                .{ package.name, package.architecture, expected_size, artifact.size },
+            );
+        if (identity.primary != .sha512)
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_identity_mismatch package={s} architecture={s} field=primary_digest expected=sha512 observed={s}",
+                .{ package.name, package.architecture, @tagName(identity.primary) },
+            );
+        if (!std.crypto.timing_safe.eql([64]u8, digest, expected)) {
+            const observed = std.fmt.bytesToHex(digest, .lower);
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_identity_mismatch package={s} architecture={s} field=sha512 expected={s} observed={s}",
+                .{ package.name, package.architecture, sha512, &observed },
+            );
+        }
+        if (!authenticated)
+            return invalidSignedSnapshotControl(
+                invalid,
+                "reason=artifact_identity_mismatch package={s} architecture={s} field=origin_v2 expected=authenticated_repository observed={s}",
+                .{ package.name, package.architecture, @tagName(origin) },
+            );
         found = true;
     }
-    if (!found) return invalid;
+    if (!found)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=artifact_missing package={s} architecture={s} field=package expected={s}:{s}:{s} observed=absent",
+            .{ package.name, package.architecture, package.name, package.version, package.architecture },
+        );
 }
 
 fn verifySnapshotConsoleSetupArtifact(
@@ -20943,14 +21079,74 @@ fn verifySignedDebconfControlFile(
     binding: SignedDebconfControlFile,
     invalid: SignedSnapshotControlError,
 ) !void {
-    var pinned = try root.pinRegularFile(try root_fs.Path.init(binding.path));
+    var pinned = root.pinRegularFile(try root_fs.Path.init(binding.path)) catch |err| {
+        if (invalid == error.InvalidPython3PreinstControl)
+            return python3PreinstError(
+                err,
+                "reason=control_file_open_failed path={s} field=kind expected=regular observed={s}",
+                .{ binding.path, @errorName(err) },
+            );
+        return err;
+    };
     defer pinned.close();
     const observed = try pinned.observeStableAlloc(allocator, 1024 * 1024);
     defer allocator.free(observed.bytes);
     var digest: [32]u8 = undefined;
     Sha256.hash(observed.bytes, &digest, .{});
-    if (!matchesSignedDebconfControlFile(observed.entry, digest, binding))
-        return invalid;
+    try verifySignedDebconfControlFileBinding(observed.entry, digest, binding, invalid);
+}
+
+fn verifySignedDebconfControlFileBinding(
+    entry: root_fs.Entry,
+    digest: [32]u8,
+    binding: SignedDebconfControlFile,
+    invalid: SignedSnapshotControlError,
+) !void {
+    const expected = parseHex(32, binding.sha256) orelse
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=control_file_mismatch path={s} field=sha256 expected={s} observed=invalid_expected_digest",
+            .{ binding.path, binding.sha256 },
+        );
+    try verifyModeledEntry(entry, binding.path, .file, invalid);
+    if (entry.mode != binding.mode)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=control_file_mismatch path={s} field=mode expected=0o{o} observed=0o{o}",
+            .{ binding.path, binding.mode, entry.mode },
+        );
+    if (entry.uid != 0)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=control_file_mismatch path={s} field=uid expected=0 observed={d}",
+            .{ binding.path, entry.uid },
+        );
+    if (entry.gid != 0)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=control_file_mismatch path={s} field=gid expected=0 observed={d}",
+            .{ binding.path, entry.gid },
+        );
+    if (entry.link_count != 1)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=control_file_mismatch path={s} field=link_count expected=1 observed={d}",
+            .{ binding.path, entry.link_count },
+        );
+    if (entry.size != binding.size)
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=control_file_mismatch path={s} field=size expected={d} observed={d}",
+            .{ binding.path, binding.size, entry.size },
+        );
+    if (!std.crypto.timing_safe.eql([32]u8, digest, expected)) {
+        const observed = std.fmt.bytesToHex(digest, .lower);
+        return invalidSignedSnapshotControl(
+            invalid,
+            "reason=control_file_mismatch path={s} field=sha256 expected={s} observed={s}",
+            .{ binding.path, binding.sha256, &observed },
+        );
+    }
 }
 
 fn verifyConsoleSetupControlFile(
@@ -22206,13 +22402,17 @@ fn verifySnapshotPython3PreinstInputs(
 ) !void {
     const linux = std.os.linux;
     var root_stat: linux.Statx = undefined;
-    if (linux.errno(linux.statx(
+    const statx_errno = linux.errno(linux.statx(
         root.dir.handle,
         "",
         linux.AT.EMPTY_PATH,
         .BASIC_STATS,
         &root_stat,
-    )) != .SUCCESS) return error.InvalidPython3PreinstControl;
+    ));
+    if (statx_errno != .SUCCESS) return invalidPython3Preinst(
+        "reason=root_statx_failed path=. field=statx expected=SUCCESS observed={s}",
+        .{@tagName(statx_errno)},
+    );
     const required: linux.STATX = .{
         .TYPE = true,
         .MODE = true,
@@ -22220,33 +22420,86 @@ fn verifySnapshotPython3PreinstInputs(
         .GID = true,
     };
     const bits: u32 = @bitCast(required);
-    if (@as(u32, @bitCast(root_stat.mask)) & bits != bits or
-        root_stat.uid != 0 or root_stat.gid != 0 or
-        root_stat.mode != 0o40700)
-        return error.InvalidPython3PreinstControl;
+    const observed_bits: u32 = @bitCast(root_stat.mask);
+    if (observed_bits & bits != bits)
+        return invalidPython3Preinst(
+            "reason=root_metadata_mismatch path=. field=statx_mask expected=0x{x} observed=0x{x}",
+            .{ bits, observed_bits },
+        );
+    if (root_stat.uid != 0)
+        return invalidPython3Preinst(
+            "reason=root_metadata_mismatch path=. field=uid expected=0 observed={d}",
+            .{root_stat.uid},
+        );
+    if (root_stat.gid != 0)
+        return invalidPython3Preinst(
+            "reason=root_metadata_mismatch path=. field=gid expected=0 observed={d}",
+            .{root_stat.gid},
+        );
+    if (root_stat.mode != 0o40700)
+        return invalidPython3Preinst(
+            "reason=root_metadata_mismatch path=. field=mode expected=0o40700 observed=0o{o}",
+            .{root_stat.mode},
+        );
 
     for ([_]struct { path: []const u8, empty: bool = false }{
         .{ .path = "dev" },
         .{ .path = "proc", .empty = true },
         .{ .path = "usr/share/doc/python3" },
     }) |binding| {
-        var directory = try root.pinDirectory(try root_fs.Path.init(binding.path));
+        var directory = root.pinDirectory(try root_fs.Path.init(binding.path)) catch |err|
+            return python3PreinstError(
+                err,
+                "reason=directory_open_failed path={s} field=kind expected=directory observed={s}",
+                .{ binding.path, @errorName(err) },
+            );
         defer directory.close();
         const entry = (try directory.metadata()).entry;
-        if (!entry.modeled or entry.kind != .directory or
-            entry.mode != 0o755 or entry.uid != 0 or entry.gid != 0)
-            return error.InvalidPython3PreinstControl;
+        try verifyModeledEntry(
+            entry,
+            binding.path,
+            .directory,
+            error.InvalidPython3PreinstControl,
+        );
+        if (entry.mode != 0o755)
+            return invalidPython3Preinst(
+                "reason=directory_metadata_mismatch path={s} field=mode expected=0o755 observed=0o{o}",
+                .{ binding.path, entry.mode },
+            );
+        if (entry.uid != 0)
+            return invalidPython3Preinst(
+                "reason=directory_metadata_mismatch path={s} field=uid expected=0 observed={d}",
+                .{ binding.path, entry.uid },
+            );
+        if (entry.gid != 0)
+            return invalidPython3Preinst(
+                "reason=directory_metadata_mismatch path={s} field=gid expected=0 observed={d}",
+                .{ binding.path, entry.gid },
+            );
         if (binding.empty) {
-            var contents = try directory.observeAlloc(allocator, 0, 0);
+            var contents = directory.observeAlloc(allocator, 0, 0) catch |err| switch (err) {
+                error.DirectoryTooLarge => return python3PreinstError(
+                    err,
+                    "reason=directory_not_empty path={s} field=entries expected=empty observed=non_empty",
+                    .{binding.path},
+                ),
+                else => return err,
+            };
             contents.deinit();
         }
     }
     if (try root.entryIfExists(
         try root_fs.Path.init("usr/share/doc/python3/html"),
-    ) != null) return error.InvalidPython3PreinstControl;
+    )) |entry| return invalidPython3Preinst(
+        "reason=unexpected_entry path=usr/share/doc/python3/html field=presence expected=absent observed={s}",
+        .{entryKindName(entry)},
+    );
     for ([_][]const u8{ "usr/sbin/update-alternatives", "usr/sbin/rm" }) |shadow| {
-        if (try root.entryIfExists(try root_fs.Path.init(shadow)) != null)
-            return error.InvalidPython3PreinstControl;
+        if (try root.entryIfExists(try root_fs.Path.init(shadow))) |entry|
+            return invalidPython3Preinst(
+                "reason=unexpected_shadow_path path={s} field=presence expected=absent observed={s}",
+                .{ shadow, entryKindName(entry) },
+            );
     }
     for ([_]struct { path: []const u8, target: []const u8 }{
         .{ .path = "bin", .target = "usr/bin" },
@@ -22255,16 +22508,50 @@ fn verifySnapshotPython3PreinstInputs(
         .{ .path = "usr/bin/rm", .target = "gnurm" },
         .{ .path = "usr/bin/python3", .target = "python3.14" },
     }) |binding| {
-        var link = try root.pinSymbolicLink(try root_fs.Path.init(binding.path));
+        var link = root.pinSymbolicLink(try root_fs.Path.init(binding.path)) catch |err|
+            return python3PreinstError(
+                err,
+                "reason=symlink_open_failed path={s} field=kind expected=sym_link observed={s}",
+                .{ binding.path, @errorName(err) },
+            );
         defer link.close();
         var buffer: [64]u8 = undefined;
         const observed = try link.observe(&buffer);
-        if (!observed.entry.modeled or observed.entry.uid != 0 or
-            observed.entry.gid != 0 or observed.entry.mode != 0o777 or
-            observed.entry.link_count != 1 or
-            observed.entry.size != binding.target.len or
-            !std.mem.eql(u8, observed.target, binding.target))
-            return error.InvalidPython3PreinstControl;
+        if (!observed.entry.modeled)
+            return invalidPython3Preinst(
+                "reason=symlink_metadata_mismatch path={s} field=modeled expected=true observed=false",
+                .{binding.path},
+            );
+        if (observed.entry.uid != 0)
+            return invalidPython3Preinst(
+                "reason=symlink_metadata_mismatch path={s} field=uid expected=0 observed={d}",
+                .{ binding.path, observed.entry.uid },
+            );
+        if (observed.entry.gid != 0)
+            return invalidPython3Preinst(
+                "reason=symlink_metadata_mismatch path={s} field=gid expected=0 observed={d}",
+                .{ binding.path, observed.entry.gid },
+            );
+        if (observed.entry.mode != 0o777)
+            return invalidPython3Preinst(
+                "reason=symlink_metadata_mismatch path={s} field=mode expected=0o777 observed=0o{o}",
+                .{ binding.path, observed.entry.mode },
+            );
+        if (observed.entry.link_count != 1)
+            return invalidPython3Preinst(
+                "reason=symlink_metadata_mismatch path={s} field=link_count expected=1 observed={d}",
+                .{ binding.path, observed.entry.link_count },
+            );
+        if (observed.entry.size != binding.target.len)
+            return invalidPython3Preinst(
+                "reason=symlink_metadata_mismatch path={s} field=size expected={d} observed={d}",
+                .{ binding.path, binding.target.len, observed.entry.size },
+            );
+        if (!std.mem.eql(u8, observed.target, binding.target))
+            return invalidPython3Preinst(
+                "reason=symlink_target_mismatch path={s} field=target expected={s} observed={s}",
+                .{ binding.path, binding.target, observed.target },
+            );
     }
     try verifySnapshotPython3PreinstArtifacts(program.artifacts);
     for ([_]SignedDebconfControlFile{
@@ -22407,26 +22694,161 @@ test "native_unpack.test.snapshot authenticated artifacts bind resolute provenan
     );
 }
 
+test "native_unpack.test.snapshot python3 preinst diagnostics identify bindings" {
+    const Helper = struct {
+        fn artifact(
+            package: native_program.PackageIdentity,
+            size: u64,
+            sha512: []const u8,
+        ) !native_program.ProgramArtifact {
+            const digest = (try content_digest.Value.parse(.sha512, sha512)).sha512;
+            return .{
+                .index = 0,
+                .package = package,
+                .archive_identity = content_digest.JsonIdentity.init(
+                    try content_digest.Identity.init(.{ .sha512 = digest }, .sha512),
+                ),
+                .size = size,
+                .application_sha256 = @splat('0'),
+                .origin_v2 = .{ .authenticated_repository = .{
+                    .repository_id = @splat('0'),
+                    .repository_snapshot_sha256 = @splat('0'),
+                } },
+            };
+        }
+
+        fn expectDetail(err: anyerror, needles: []const []const u8) !void {
+            const detail = nativeRecoveryErrorDetail(err);
+            for (needles) |needle| try testing.expect(std.mem.indexOf(
+                u8,
+                detail,
+                needle,
+            ) != null);
+        }
+    };
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    if (builtin.os.tag == .linux and
+        std.os.linux.errno(std.os.linux.fchmod(tmp.dir.handle, 0o755)) != .SUCCESS)
+        return error.TestUnexpectedResult;
+    var program: native_program.Program = undefined;
+    program.artifacts = &.{};
+    clearNativeRecoveryErrorDetail();
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3PreinstInputs(
+            testing.allocator,
+            .init(testing.io, tmp.dir),
+            &program,
+        ),
+    );
+    try Helper.expectDetail(error.InvalidPython3PreinstControl, &.{
+        "InvalidPython3PreinstControl: python3_preinst",
+        "reason=root_metadata_mismatch path=.",
+        "field=",
+        "expected=",
+        "observed=",
+    });
+
+    const python3 = try Helper.artifact(
+        .{ .name = "python3", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+        22939,
+        "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
+    );
+    const python3_minimal = try Helper.artifact(
+        .{ .name = "python3-minimal", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+        25808,
+        "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
+    );
+    clearNativeRecoveryErrorDetail();
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3PreinstArtifacts(&.{ python3, python3_minimal }),
+    );
+    try Helper.expectDetail(error.InvalidPython3PreinstControl, &.{
+        "reason=artifact_identity_mismatch",
+        "package=python3",
+        "field=size",
+        "expected=22938",
+        "observed=22939",
+    });
+
+    var null_tmp = testing.tmpDir(.{ .iterate = true });
+    defer null_tmp.cleanup();
+    const null_root: root_fs.Root = .init(testing.io, null_tmp.dir);
+    const dev_path = try root_fs.Path.init("dev");
+    const null_path = try root_fs.Path.init("dev/null");
+    try null_root.ensureDirectory(dev_path, root_fs.default_directory_permissions);
+    try null_root.publishFile(null_path, "", .{});
+    try null_root.applyMetadata(null_path, .{ .mode = 0o640 });
+    clearNativeRecoveryErrorDetail();
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullFile(
+            testing.allocator,
+            null_root,
+            0,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+    );
+    try Helper.expectDetail(error.InvalidPython3PreinstControl, &.{
+        "reason=null_file_mode_mismatch",
+        "path=dev/null",
+        "field=mode",
+        "expected=0o600-or-0o644",
+        "observed=0o640",
+    });
+
+    try null_root.publishFile(null_path, "x", .{ .overwrite = .replace });
+    try null_root.applyMetadata(null_path, .{ .mode = 0o644 });
+    clearNativeRecoveryErrorDetail();
+    try testing.expectError(
+        error.InvalidPython3PreinstControl,
+        verifySnapshotPython3NullFile(
+            testing.allocator,
+            null_root,
+            0,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+    );
+    try Helper.expectDetail(error.InvalidPython3PreinstControl, &.{
+        "reason=control_file_mismatch",
+        "path=dev/null",
+        "field=uid",
+        "expected=0",
+        "observed=",
+    });
+}
+
 fn verifySnapshotPython3NullFile(
     allocator: std.mem.Allocator,
     root: root_fs.Root,
     size: u64,
     sha256: []const u8,
 ) !void {
-    var pinned = try root.pinRegularFile(try root_fs.Path.init("dev/null"));
+    var pinned = root.pinRegularFile(try root_fs.Path.init("dev/null")) catch |err|
+        return python3PreinstError(
+            err,
+            "reason=null_file_open_failed path=dev/null field=kind expected=regular observed={s}",
+            .{@errorName(err)},
+        );
     defer pinned.close();
     const observed = try pinned.observeStableAlloc(allocator, 1024 * 1024);
     defer allocator.free(observed.bytes);
     if (observed.entry.mode != 0o600 and observed.entry.mode != 0o644)
-        return error.InvalidPython3PreinstControl;
+        return invalidPython3Preinst(
+            "reason=null_file_mode_mismatch path=dev/null field=mode expected=0o600-or-0o644 observed=0o{o}",
+            .{observed.entry.mode},
+        );
     var digest: [32]u8 = undefined;
     Sha256.hash(observed.bytes, &digest, .{});
-    if (!matchesSignedDebconfControlFile(observed.entry, digest, .{
+    try verifySignedDebconfControlFileBinding(observed.entry, digest, .{
         .path = "dev/null",
         .size = size,
         .mode = @intCast(observed.entry.mode),
         .sha256 = sha256,
-    })) return error.InvalidPython3PreinstControl;
+    }, error.InvalidPython3PreinstControl);
 }
 
 fn verifySnapshotPython3NullOutput(
@@ -28458,6 +28880,7 @@ pub const Runtime = struct {
         request: Runtime.Request,
         crash_at: ?native_recovery.CrashPoint,
     ) !Report {
+        clearNativeRecoveryErrorDetail();
         const root = try validateAttempt(request.attempt);
         var bounds: RuntimeBounds = .{ .deadline = request.deadline };
         bounds.check() catch return deadlineReport(allocator, request.attempt);
@@ -28519,6 +28942,7 @@ pub const Runtime = struct {
         crash_at: ?native_recovery.CrashPoint,
         external_mechanics: ExternalMechanics,
     ) !Report {
+        clearNativeRecoveryErrorDetail();
         const root = try validateAttempt(attempt);
         var bounds: RuntimeBounds = .{ .deadline = deadline };
         bounds.check() catch return deadlineReport(allocator, attempt);

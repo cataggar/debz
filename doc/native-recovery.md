@@ -1184,8 +1184,8 @@ awake ceiling; failed roots and bounded logs are retained for diagnosis.
 Successful cases check helper source/probe progress, package-owned target
 bytes, absent non-fixture dpkg binaries, original successful provenance,
 immutable replay, cleanup and attempt-bound completion, then compare actual
-filesystem, dpkg database and trace snapshots with the pinned reference
-before and after acknowledgment. Refusals check the exact
+filesystem, write-witness, dpkg database and trace snapshots with the pinned
+reference before and after acknowledgment. Refusals check the exact
 `recovery_required` detail twice, stable original intent/request bytes,
 absence of completion and unchanged package-state snapshots. The ambient
 source test plants bytes of the **compiled native trigger-helper**, not the

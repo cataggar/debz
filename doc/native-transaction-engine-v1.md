@@ -266,6 +266,8 @@ from identical fixture bytes. The semantic comparator records:
 - complete normalized status and status-old paragraphs;
 - normalized ownership lists, md5sums, trigger files, architecture,
   diversions, statoverride, update fragments, and remaining info files;
+- explicit write-witness entries such as `dev/null` when they are excluded
+  from package-tree equivalence but still prove script-visible state;
 - exact maintainer-script and trigger traces;
 - process outcome and typed package-state result.
 
