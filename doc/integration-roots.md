@@ -373,6 +373,34 @@ bounded to 128 MiB and the artifact to 512 MiB, indexed by `SHA256SUMS`, with
 14-day retention. Only exported evidence is copied to the runner; the protected
 checkout, tools and live roots are never chowned to it. Collection and cleanup
 have distinct retained outcomes, and both cleanup and upload run on failure.
+`acceptance-outcome-v1.json` uses the latest attempted native command recorded
+in `native-stage-v1.json`, not a successful earlier `refresh.json`. The marker
+is written before command launch and records its exit before trace auditing;
+the EXIT trap separately records `native-wrapper-exit-status.txt`. The
+collector combines these with `steps.native.outcome`. Its original
+`operation`, `exit_status`, `changed`, `summary` and `diagnostics` fields remain;
+`exit_status` now reports the native acceptance failure/completion rather than
+the refresh command alone. Additional stage, workflow, wrapper, command and
+result fields distinguish a failed postcondition or trace audit from the
+command's JSON exit. Verification receipts have their own JSON shape; their
+command exit is retained without inventing a JSON `exit_status`. The deliberately
+refused invalid-lock probe is a successful
+acceptance outcome only after both wrapper and workflow completion, while its
+nonzero command/result exits stay explicit. Missing, empty, corrupt or unsafe
+latest results produce explicit evidence errors and a nonzero `outcome_status`
+in `collection-result.txt`; they never fall back to refresh. `changed: null`
+means the latest result could not establish whether that command changed state.
+
+The separate `/dev/null` diagnostic surface is
+`vendor-state-inventory-v1.json.write_witnesses`: its observed kind, mode, UID/GID,
+size and SHA-256, alongside any control-file mismatch in `create.json` (stderr
+may be empty). Native and reference differential captures explicitly exclude
+`dev/null`, so an empty native `write_witnesses` array is expected for that
+exclusion and is not evidence of an untouched null path. An absent reference
+still yields `comparison-unavailable.txt` and a failed collection, not parity.
+These observations do not identify the writer or authorize truncating/resetting
+root bytes; the native control-file guard is unchanged.
+
 Step limits keep a slow native install from consuming the
 reference or diagnostics budget. The job stays dispatch-only; pull-request
 jobs are unchanged.

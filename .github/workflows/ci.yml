@@ -1998,6 +1998,7 @@ jobs:
             exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" --stage-native "$tree" "$architecture" "$expected"
             ' native-protected-bootstrap "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$bundle"
       - name: Create and replay exact native Ubuntu root
+        id: native
         timeout-minutes: 220
         env:
           SNAPSHOT_URI: ${{ inputs.ubuntu_snapshot_uri }}
@@ -2018,8 +2019,11 @@ jobs:
       - name: Collect bounded protected native diagnostics
         if: always()
         timeout-minutes: 15
+        env:
+          NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}
         run: |
           sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \
+            NATIVE_STEP_OUTCOME="$NATIVE_STEP_OUTCOME" \
             bash "$PROTECTED_TREE/checkout/tools/real-snapshot-protected-native-ci.sh" \
             collect "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"
       - name: Copy bounded native evidence

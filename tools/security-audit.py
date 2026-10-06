@@ -2481,6 +2481,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-acceptance.sh",
     "tools/real-snapshot-reference.sh",
     "tools/real_snapshot_reference_paths.py",
+    "tools/real_snapshot_outcome.py",
 )
 PROTECTED_REFERENCE_INPUT = (
     '      run_protected_reference:\n'
@@ -2670,6 +2671,7 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
         "unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR",
         "protected(Path(sys.argv[2]))",
+        '"tools/real_snapshot_outcome.py",',
         '[[ ${#inputs[@]} == 3 ]]',
         "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
         'exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz"',
@@ -2680,7 +2682,9 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "not stat.S_ISREG(meta.st_mode) or meta.st_size > 128 * 1024 * 1024",
         "total > 512 * 1024 * 1024",
         "os.open(name, flags | os.O_NOFOLLOW)",
-        '(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && copy_status == 0 ))',
+        'python3 -I tools/real_snapshot_outcome.py "$evidence" "${NATIVE_STEP_OUTCOME:-unavailable}" \\',
+        '>"$evidence/acceptance-outcome-v1.json" || outcome_status=$?',
+        '(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && outcome_status == 0 && copy_status == 0 ))',
     ),
     "tools/real-snapshot-acceptance.sh": (
         "readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}",
@@ -2688,6 +2692,19 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'python3 -I - "$repository_root/tools" "$repository_root" "$debz"',
         'protected(repository, directory=True)',
         'protected(repository / ".real-snapshot", directory=True)',
+        'local wrapper_status=$?',
+        'printf \'%s\\n\' "$wrapper_status" >"$evidence/native-wrapper-exit-status.txt"',
+        'printf \'{"stage":"%s","command_exit_status":null}\\n\' "$name" >"$evidence/native-stage-v1.json"',
+        'printf \'{"stage":"%s","command_exit_status":%s}\\n\' "$name" "$status" >"$evidence/native-stage-v1.json"',
+    ),
+    "tools/real_snapshot_outcome.py": (
+        'read_root_file(evidence, "native-stage-v1.json", 4096)',
+        'read_root_file(evidence, f"{stage}.json", 128 * 1024 * 1024)',
+        'read_root_file(evidence, "native-wrapper-exit-status.txt", 32)',
+        'if workflow_outcome == "success":',
+        'if wrapper_status != 0 or not expected_refusal:',
+        'if command_status is None:',
+        '"id": f"native_acceptance_evidence_{kind}"',
     ),
     "tools/real-snapshot-reference.sh": (
         "unset ZIG_LIB_DIR",
@@ -2770,11 +2787,13 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         '            git --git-dir="$tree/bare.git" fsck --full --no-dangling\n',
         '            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"\n',
         '            exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" --stage-native "$tree" "$architecture" "$expected"\n',
-        "      - name: Create and replay exact native Ubuntu root\n        timeout-minutes: 220\n",
+        "      - name: Create and replay exact native Ubuntu root\n        id: native\n        timeout-minutes: 220\n",
         '            native "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$SNAPSHOT_URI" "$SNAPSHOT_SUITE"\n',
         "      - name: Install exact closure with pinned dpkg reference\n        timeout-minutes: 50\n        run: |\n",
         '            reference "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"\n',
-        "      - name: Collect bounded protected native diagnostics\n        if: always()\n        timeout-minutes: 15\n",
+        "      - name: Collect bounded protected native diagnostics\n        if: always()\n        timeout-minutes: 15\n"
+        "        env:\n          NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}\n",
+        '            NATIVE_STEP_OUTCOME="$NATIVE_STEP_OUTCOME" \\\n',
         '            collect "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"\n',
         "      - name: Copy bounded native evidence\n        if: always()\n",
         '            sudo -n tar -C "$PROTECTED_TREE/native-upload" -cf - . >"$PWD/.native-evidence.tar"\n',

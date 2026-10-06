@@ -28,6 +28,7 @@ for relative in ("tools/real-snapshot-protected-native-ci.sh",
                  "tools/real-snapshot-reference.sh",
                  "tools/capture-vendor-state.py",
                  "tools/real_snapshot_reference_paths.py",
+                 "tools/real_snapshot_outcome.py",
                  "zig-out/bin/debz", "zig-out/bin/native-differential",
                  "zig-out/bin/real-snapshot-comparator"):
     protected(checkout / relative)
@@ -69,7 +70,7 @@ case "$operation" in
 esac
 
 install -d -o root -g root -m 0700 "$evidence" "$upload"
-capture_status=0 differential_status=0 forbidden_exec_status=0 copy_status=0
+capture_status=0 differential_status=0 forbidden_exec_status=0 outcome_status=0 copy_status=0
 if [[ -d "$work/root/var/lib/dpkg/info" ]]; then
   timeout --signal=TERM --kill-after=30s 5m python3 tools/capture-vendor-state.py \
     --reference-root "$work/root" --architecture "$architecture" \
@@ -90,10 +91,8 @@ else
     "$([[ -f "$evidence/native.snapshot.json" ]] && echo true || echo false)" \
     >"$evidence/comparison-unavailable.txt"
 fi
-if [[ -f "$evidence/refresh.json" ]]; then
-  jq '{operation,exit_status,changed,summary,diagnostics}' "$evidence/refresh.json" \
-    >"$evidence/acceptance-outcome-v1.json" || copy_status=$?
-fi
+python3 -I tools/real_snapshot_outcome.py "$evidence" "${NATIVE_STEP_OUTCOME:-unavailable}" \
+  >"$evidence/acceptance-outcome-v1.json" || outcome_status=$?
 
 allowed_script_dpkg_exec=0 allowed_script_dpkg_divert_exec=0 allowed_script_dpkg_statoverride_exec=0
 : >"$evidence/exec-reaudit.txt"
@@ -141,9 +140,9 @@ copy_optional "$tree/reference-dpkg/reference-receipt-v1.json" "$evidence/refere
 copy_optional "$tree/evidence" "$evidence/staging"
 copy_optional "$tree/native-inputs.args" "$evidence/native-inputs.args"
 du -sh "$work" >"$evidence/disk-usage-final.txt" || copy_status=$?
-printf 'commit=%s\narchitecture=%s\ncapture_status=%s\ndifferential_status=%s\nexec_audit_status=%s\ncopy_status=%s\n' \
+printf 'commit=%s\narchitecture=%s\ncapture_status=%s\ndifferential_status=%s\nexec_audit_status=%s\noutcome_status=%s\ncopy_status=%s\n' \
   "$commit" "$architecture" "$capture_status" "$differential_status" \
-  "$forbidden_exec_status" "$copy_status" >"$evidence/collection-result.txt"
+  "$forbidden_exec_status" "$outcome_status" "$copy_status" >"$evidence/collection-result.txt"
 
 # Export only bounded regular evidence, never transfer ownership of the
 # protected checkout, tools or live roots to the runner.
@@ -188,4 +187,4 @@ finally:
             lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(target)}")
     (target / "SHA256SUMS").write_text("\n".join(lines) + "\n")
 PY
-(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && copy_status == 0 ))
+(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && outcome_status == 0 && copy_status == 0 ))

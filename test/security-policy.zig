@@ -2302,10 +2302,27 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "    exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\" \\\n",
         "    exec bash tools/real-snapshot-reference.sh \"$REFERENCE_DPKG\" \\\n",
         "            if total > 512 * 1024 * 1024:\n",
+        "                 \"tools/real_snapshot_outcome.py\",\n",
+        "python3 -I tools/real_snapshot_outcome.py \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
+        "  >\"$evidence/acceptance-outcome-v1.json\" || outcome_status=$?\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-acceptance.sh", &.{
         "    --check-keyring \"$keyring\" >/dev/null\n",
         "python3 -I - \"$repository_root/tools\" \"$repository_root\" \"$debz\" <<'PY'\n",
+        "  printf '%s\\n' \"$wrapper_status\" >\"$evidence/native-wrapper-exit-status.txt\"\n",
+        "  printf '{\"stage\":\"%s\",\"command_exit_status\":null}\\n' \"$name\" >\"$evidence/native-stage-v1.json\"\n",
+        "  printf '{\"stage\":\"%s\",\"command_exit_status\":%s}\\n' \"$name\" \"$status\" >\"$evidence/native-stage-v1.json\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_outcome.py", &.{
+        "        marker = json.loads(read_root_file(evidence, \"native-stage-v1.json\", 4096))\n",
+        "        result = json.loads(read_root_file(evidence, f\"{stage}.json\", 128 * 1024 * 1024))\n",
+        "            if wrapper_status != 0 or not expected_refusal:\n",
+        "        if command_status is None:\n",
+    });
+    try nativeMutationsIn(&f, "protected-reference", ".github/workflows/ci.yml", "  ubuntu-real-snapshot:", "  protected-reference:", &.{
+        "        id: native\n",
+        "          NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}\n",
+        "            NATIVE_STEP_OUTCOME=\"$NATIVE_STEP_OUTCOME\" \\\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference.sh", &.{
         "\"$zig\" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \\\n",

@@ -655,6 +655,8 @@ mkdir -p "$root" "$cache" "$state" "$evidence" "$source_dir" "$config_dir"
 printf 'install_root_exists=true\ndpkg_database_present=false\nhelper_placeholder_present=false\npackage_state_present=false\n' \
   >"$evidence/fresh-root-before.txt"
 capture_root_layout() {
+  local wrapper_status=$?
+  printf '%s\n' "$wrapper_status" >"$evidence/native-wrapper-exit-status.txt"
   {
     for path in bin sbin lib lib64 bin/sh usr/bin/sh usr/bin/dpkg usr/bin/dpkg-deb \
       usr/bin/dpkg-trigger; do
@@ -839,6 +841,7 @@ run_candidate() {
   local audit_status=0
   local command
   shift 2
+  printf '{"stage":"%s","command_exit_status":null}\n' "$name" >"$evidence/native-stage-v1.json"
   if [[ "$duration" == progress ]]; then
     # The watchdog stops the install at its ceiling; timeout's own limit is a backstop.
     command=(timeout --signal=TERM --kill-after=30s "$((install_ceiling_seconds + 30))s")
@@ -859,6 +862,7 @@ run_candidate() {
   else
     "${command[@]}" >"$evidence/$name.json" 2>"$evidence/$name.stderr" || status=$?
   fi
+  printf '{"stage":"%s","command_exit_status":%s}\n' "$name" "$status" >"$evidence/native-stage-v1.json"
   if [[ ${DEBZ_REAL_SNAPSHOT_TRACE:-0} == 1 ]]; then
     [[ -s "$evidence/$name.execve" ]] || {
       echo "candidate execution trace missing for $name" >&2

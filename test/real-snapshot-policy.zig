@@ -378,6 +378,35 @@ test "snapshot: relative native caller uses absolute protected source paths befo
     const continuation = try f.work.read(".real-snapshot/fresh/evidence/update-zero-actions.txt");
     defer support.allocator.free(continuation);
     try testing.expectEqualStrings("changed=false\nstatus_unchanged=true\nprovenance_unchanged=true\n", continuation);
+    const outcome = try nativeOutcome(&f, "success");
+    defer outcome.deinit();
+    try testing.expectEqualStrings("injected-failure", outcome.value.object.get("stage").?.string);
+    try testing.expectEqual(@as(i64, 0), outcome.value.object.get("exit_status").?.integer);
+    try testing.expectEqual(@as(i64, 5), outcome.value.object.get("command_exit_status").?.integer);
+    try testing.expect(outcome.value.object.get("expected_refusal").?.bool);
+}
+
+fn nativeOutcome(f: *Driver, workflow: []const u8) !std.json.Parsed(std.json.Value) {
+    const evidence = try f.work.path(".real-snapshot/fresh/evidence");
+    defer support.allocator.free(evidence);
+    const result = try support.run(&.{ "python3", "-I", "tools/real_snapshot_outcome.py", evidence, workflow });
+    defer result.deinit();
+    try result.ok();
+    return std.json.parseFromSlice(std.json.Value, support.allocator, result.stdout, .{ .allocate = .alloc_always });
+}
+
+test "snapshot: failed native create reports its attempted stage rather than refresh" {
+    var f = try Driver.initOffline();
+    defer f.deinit();
+    const result = try f.offline(.{ .name = "failed-create" });
+    defer result.deinit();
+    try testing.expectEqual(@as(u8, 8), result.code);
+    const outcome = try nativeOutcome(&f, "failure");
+    defer outcome.deinit();
+    try testing.expectEqualStrings("create", outcome.value.object.get("stage").?.string);
+    try testing.expectEqualStrings("install", outcome.value.object.get("operation").?.string);
+    try testing.expectEqual(@as(i64, 8), outcome.value.object.get("wrapper_exit_status").?.integer);
+    try testing.expectEqual(@as(i64, 8), outcome.value.object.get("exit_status").?.integer);
 }
 
 fn expectArguments(actual: []const []const u8, expected: []const []const u8) !void {
@@ -441,6 +470,11 @@ test "snapshot: native verification refusal preserves installed evidence and sto
         try support.contains(status, "Status: install ok installed");
         try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/update.json"));
         try testing.expectError(error.FileNotFound, f.work.read(".real-snapshot/fresh/evidence/update-zero-actions.txt"));
+        const outcome = try nativeOutcome(&f, "failure");
+        defer outcome.deinit();
+        try testing.expectEqualStrings("create-summary", outcome.value.object.get("stage").?.string);
+        try testing.expectEqual(@as(i64, scenario.exit_code), outcome.value.object.get("exit_status").?.integer);
+        try testing.expectEqual(@as(i64, scenario.exit_code), outcome.value.object.get("wrapper_exit_status").?.integer);
     }
 }
 
@@ -1917,7 +1951,7 @@ test "snapshot: manual job budgets cover the reviewed install ceiling and the pi
     const start = std.mem.indexOf(u8, workflow, "  ubuntu-real-snapshot:\n") orelse return error.MissingSnapshotJob;
     const job = workflow[start..];
     const job_minutes = try minutesAfter(job, "\n    timeout-minutes: ");
-    const native_minutes = try minutesAfter(job, "- name: Create and replay exact native Ubuntu root\n        timeout-minutes: ");
+    const native_minutes = try minutesAfter(job, "- name: Create and replay exact native Ubuntu root\n        id: native\n        timeout-minutes: ");
     const reference_minutes = try minutesAfter(job, "- name: Install exact closure with pinned dpkg reference\n        timeout-minutes: ");
     const staging_minutes = try minutesAfter(job, "- name: Stage protected native checkout, toolchain, dpkg and trust root\n        timeout-minutes: ");
     const diagnostics_minutes = try minutesAfter(job, "- name: Collect bounded protected native diagnostics\n        if: always()\n        timeout-minutes: ");
