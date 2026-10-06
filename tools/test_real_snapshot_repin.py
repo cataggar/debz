@@ -1023,6 +1023,40 @@ class SourceEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(repin.RepinError, "run a new probe"):
             repin.export_prestate_evidence(self.value, report, self.directory, self.root)
 
+    def test_source_report_reads_and_lock_directory_are_bounded_before_parsing(self) -> None:
+        with patch.object(repin, "MAXIMUM_RELEASE_BYTES", 32):
+            with self.assertRaisesRegex(repin.RepinError, "JSON document is too large"):
+                repin.load_json(self.directory / "report.json")
+            with self.assertRaisesRegex(repin.RepinError, "report.json is too large"):
+                repin.export_prestate_evidence(self.value, self.report, self.directory, self.root)
+        (self.directory / "locks/extra.lock.json").write_bytes(b"must not be parsed")
+        with patch.object(repin, "MAXIMUM_EVIDENCE_FILES", 1):
+            with self.assertRaisesRegex(repin.RepinError, "entry bound"):
+                repin.export_prestate_evidence(self.value, self.report, self.directory, self.root)
+
+    def test_source_reader_refuses_oversize_and_symlink_metadata(self) -> None:
+        path = self.directory / "oversize"
+        path.write_bytes(b"x" * 33)
+        with self.assertRaisesRegex(repin.RepinError, "too large"):
+            repin.read_source_file(path, self.directory, 32, "retained source")
+        link = self.directory / "linked"
+        link.symlink_to(path)
+        with self.assertRaisesRegex(repin.RepinError, "unsafe"):
+            repin.read_source_file(link, self.directory, 64, "retained source")
+
+    def test_offline_source_metadata_reads_are_bounded_before_parsing(self) -> None:
+        repin.export_prestate_evidence(self.value, self.report, self.directory, self.root)
+        with patch.object(repin, "MAXIMUM_RELEASE_BYTES", 32):
+            failures = repin.prestate_evidence_failures(self.value, self.root)
+            self.assertIn("source evidence member evidence.json is too large", "\n".join(failures))
+
+    def test_aggregate_evidence_budget_caps_the_archive_read(self) -> None:
+        lock = next((self.directory / "locks").glob("*.lock.json"))
+        limit = (self.directory / "report.json").stat().st_size + lock.stat().st_size + len(self.archive) - 1
+        with patch.object(repin, "MAXIMUM_EVIDENCE_BYTES", limit):
+            with self.assertRaisesRegex(repin.RepinError, "source archive .* is too large"):
+                repin.export_prestate_evidence(self.value, self.report, self.directory, self.root)
+
     def test_source_control_coordinates_and_authenticated_provenance_are_not_manifest_copies(self) -> None:
         entry = copy.deepcopy(self.lock["packages"][0])
         entry["version"] = "0.9"

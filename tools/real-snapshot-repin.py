@@ -530,7 +530,10 @@ def derive_prestate(identity: dict, arch: str, deb: bytes) -> tuple[bytes, int] 
 def load_json(path: Path) -> dict:
     try:
         with path.open("rb") as stream:
-            document = json.load(stream)
+            data = stream.read(MAXIMUM_RELEASE_BYTES + 1)
+        if len(data) > MAXIMUM_RELEASE_BYTES:
+            fail(f"{path} JSON document is too large")
+        document = json.loads(data)
     except (OSError, ValueError) as error:
         fail(f"cannot read {path}: {error}")
     if not isinstance(document, dict):
@@ -1888,52 +1891,108 @@ def verify_source_metadata(report: dict, lock: dict, source: dict, entry: dict, 
     return source_index_package(index, source["index_path"], entry)
 
 
+def read_source_file(path: Path, root: Path, limit: int, where: str) -> bytes:
+    if (not path.resolve().is_relative_to(root.resolve()) or not path.is_file() or path.is_symlink()):
+        fail(f"{where} is missing or unsafe")
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+    except OSError as error:
+        fail(f"cannot read {where}: {error}")
+    if len(data) > limit:
+        fail(f"{where} is too large")
+    return data
+
+
+def source_lock_paths(directory: Path) -> list[Path]:
+    path = directory / "locks"
+    if not path.resolve().is_relative_to(directory.resolve()) or not path.is_dir() or path.is_symlink():
+        fail("probe source lock directory is unsafe")
+    paths = []
+    try:
+        with os.scandir(path) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAXIMUM_EVIDENCE_FILES:
+                    fail("probe source lock directory exceeds its entry bound")
+                if entry.name.endswith(".lock.json"):
+                    paths.append(Path(entry.path))
+    except OSError as error:
+        fail(f"cannot read probe source lock directory: {error}")
+    return sorted(paths)
+
+
 def export_prestate_evidence(manifest: dict, report: dict, directory: Path, root: Path) -> None:
     """Retain actual verified CAS objects and original probe locks, not derived hashes."""
-    files = {"report.json": (directory / "report.json").read_bytes()}
+    files = {}
+
+    def remaining_bytes() -> int:
+        return MAXIMUM_EVIDENCE_BYTES - sum(map(len, files.values()))
+
+    def remember(name: str, data: bytes) -> None:
+        if name not in files:
+            if len(files) >= MAXIMUM_EVIDENCE_FILES or len(data) > remaining_bytes():
+                fail("source evidence exceeds its file or byte bound")
+            files[name] = data
+
+    def retain(relative: str, limit: int) -> bytes:
+        validate_relative_path(relative, "probe source metadata path")
+        if relative not in files:
+            data = read_source_file(directory / relative, directory, min(limit, remaining_bytes()),
+                                    f"probe source {relative}")
+            remember(relative, data)
+        return files[relative]
+
+    retain("report.json", MAXIMUM_RELEASE_BYTES)
+    lock_paths = source_lock_paths(directory)
     sources = []
     wanted = sorted({(arch, identity["package"]) for identity in source_evidence_identities(manifest)
                      for arch in identity["architectures"]})
     for arch, name in wanted:
         selected = None
-        for path in sorted((directory / "locks").glob(f"{arch}*.lock.json")):
-            lock = load_json(path)
+        for path in lock_paths:
+            if not path.name.startswith(arch):
+                continue
+            lock_name = "locks/" + path.name
+            lock_bytes = files.get(lock_name)
+            if lock_bytes is None:
+                lock_bytes = read_source_file(path, directory, min(MAXIMUM_RELEASE_BYTES, remaining_bytes()),
+                                              f"probe source lock {path.name}")
+            try:
+                lock = json.loads(lock_bytes)
+            except ValueError as error:
+                fail(f"probe source lock {path.name} is invalid JSON: {error}")
+            if not isinstance(lock, dict):
+                fail(f"probe source lock {path.name} must be an object")
             if any(entry["name"] == name for entry in lock["packages"]):
-                selected = path, lock, authenticated_source_package(report, lock, name, arch)
+                selected = path, lock_bytes, lock, authenticated_source_package(report, lock, name, arch)
                 break
         if selected is None:
             fail(f"probe has no authenticated source lock for {name} on {arch}")
-        path, lock, entry = selected
+        path, lock_bytes, lock, entry = selected
         digest = source_archive_digest(entry)
         archive_name = "archives/" + digest.replace(":", "-") + ".deb"
         source = directory / arch / "cache/packages-v2/objects" / digest.replace(":", "-")
-        if not source.is_file() or source.is_symlink() or source.stat().st_size > MAXIMUM_EVIDENCE_BYTES:
-            fail(f"probe has no bounded source archive for {name} on {arch}")
-        data = source.read_bytes()
-        verify_source_archive(data, entry)
         lock_name = "locks/" + path.name
-        if path.is_symlink() or path.stat().st_size > MAXIMUM_EVIDENCE_BYTES:
-            fail(f"probe source lock for {name} is unsafe or too large")
-        files[lock_name] = path.read_bytes()
-        files[archive_name] = data
+        remember(lock_name, lock_bytes)
+        data = files.get(archive_name)
+        if data is None:
+            data = read_source_file(source, directory, remaining_bytes(), f"probe source archive for {name} on {arch}")
+        verify_source_archive(data, entry)
+        remember(archive_name, data)
         metadata = report.get("artifact_sources", {}).get(arch, {}).get(name)
         if not isinstance(metadata, dict):
             fail(f"probe has no independently retained signed source metadata for {name} on {arch}; run a new probe")
+        exact_keys(metadata, {"index_file", "index_path", "release_file"}, set(), "probe source metadata")
         sources.append({
             "package": name, "architecture": arch, "archive_file": archive_name,
             "lock_file": lock_name, "lock_sha256": tagged("sha256", files[lock_name]),
             **metadata,
         })
         for relative in (sources[-1]["index_file"], sources[-1]["release_file"]):
-            validate_relative_path(relative, "probe source metadata path")
-            path = directory / relative
-            if (not path.resolve().is_relative_to(directory.resolve()) or not path.is_file()
-                    or path.is_symlink() or path.stat().st_size > MAXIMUM_RELEASE_BYTES):
-                fail(f"probe source metadata for {name} is missing, unsafe or too large")
-            files[relative] = path.read_bytes()
-    files["evidence.json"] = canonical_json({
+            retain(relative, MAXIMUM_RELEASE_BYTES)
+    remember("evidence.json", canonical_json({
         "schema": EVIDENCE_SCHEMA, "report_sha256": tagged("sha256", files["report.json"]), "sources": sources,
-    }).encode()
+    }).encode())
     if len(files) > MAXIMUM_EVIDENCE_FILES or sum(map(len, files.values())) > MAXIMUM_EVIDENCE_BYTES:
         fail("source evidence exceeds its file or byte bound")
     path = root / manifest["prestate_evidence"]
@@ -1970,15 +2029,27 @@ def check_prestate_evidence(manifest: dict, data: bytes) -> list[str]:
                     or mode & 0o170000 not in (0, 0o100000)):
                 fail(f"source evidence ZIP has an unsafe member {entry.filename}")
 
+        def read_member(name: str, limit: int | None = None) -> bytes:
+            if limit is None:
+                limit = MAXIMUM_RELEASE_BYTES
+            entry = archive.getinfo(name)
+            if entry.file_size > limit:
+                fail(f"source evidence member {name} is too large")
+            with archive.open(entry) as stream:
+                value = stream.read(limit + 1)
+            if len(value) > limit or len(value) != entry.file_size:
+                fail(f"source evidence member {name} is too large or truncated")
+            return value
+
         def read_json(name: str) -> dict:
-            value = json.loads(archive.read(name))
+            value = json.loads(read_member(name))
             if not isinstance(value, dict):
                 fail(f"source evidence {name} must be an object")
             return value
 
         index = read_json("evidence.json")
         exact_keys(index, {"schema", "report_sha256", "sources"}, set(), "source evidence")
-        if index["schema"] != EVIDENCE_SCHEMA or tagged("sha256", archive.read("report.json")) != index["report_sha256"]:
+        if index["schema"] != EVIDENCE_SCHEMA or tagged("sha256", read_member("report.json")) != index["report_sha256"]:
             fail("source evidence has an unsupported schema or changed probe report")
         report = read_json("report.json")
         if (report["schema"] != REPORT_SCHEMA or report["series"] != manifest["series"]
@@ -2002,15 +2073,15 @@ def check_prestate_evidence(manifest: dict, data: bytes) -> list[str]:
             if key in sources:
                 fail("source evidence has duplicate package/architecture coordinates")
             parse_tagged(source["lock_sha256"], ("sha256",))
-            lock_bytes = archive.read(source["lock_file"])
+            lock_bytes = read_member(source["lock_file"])
             if tagged("sha256", lock_bytes) != source["lock_sha256"]:
                 fail("source evidence lock bytes changed")
             lock = json.loads(lock_bytes)
             entry = authenticated_source_package(report, lock, source["package"], source["architecture"])
-            archive_bytes = archive.read(source["archive_file"])
+            archive_bytes = read_member(source["archive_file"], MAXIMUM_EVIDENCE_BYTES)
             verify_source_archive(archive_bytes, entry)
-            fields = verify_source_metadata(report, lock, source, entry, archive.read(source["release_file"]),
-                                            archive.read(source["index_file"]))
+            fields = verify_source_metadata(report, lock, source, entry, read_member(source["release_file"]),
+                                            read_member(source["index_file"]))
             sources[key] = entry, archive_bytes, fields
             used.update((source["lock_file"], source["archive_file"], source["release_file"], source["index_file"]))
         if used != {entry.filename for entry in entries}:
@@ -2066,7 +2137,8 @@ def prestate_evidence_failures(manifest: dict, root: Path) -> list[str]:
             or path.stat().st_size > MAXIMUM_EVIDENCE_BYTES):
         return [f"independent source evidence {relative} is missing, unsafe or too large"]
     try:
-        return check_prestate_evidence(manifest, path.read_bytes())
+        data = read_source_file(path, root, MAXIMUM_EVIDENCE_BYTES, f"independent source evidence {relative}")
+        return check_prestate_evidence(manifest, data)
     except (RepinError, zipfile.BadZipFile, KeyError, ValueError, TypeError, OSError, EOFError) as error:
         return [f"independent source evidence {relative}: {error}"]
 

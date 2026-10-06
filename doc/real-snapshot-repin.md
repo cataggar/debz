@@ -260,6 +260,9 @@ offline re-verification of OpenPGP signatures or a new live probe.
 The ZIP is read without filesystem extraction. Limits are 64 MiB aggregate
 evidence, 256 ZIP entries, 128 MiB decompressed tar and 100,000 tar entries;
 duplicate/unsafe paths and unsupported ZIP entry types fail closed.
+JSON, lock and source-metadata inputs are limited to 16 MiB before parsing.
+Every source-file/ZIP-member read is capped, export enforces the remaining
+aggregate budget before reading, and candidate lock enumeration is bounded.
 Package tar parsing uses the standard library. Zstd-compressed packages use
 Python 3.14's `compression.zstd`, or the existing bounded `zstd` fallback.
 
