@@ -203,9 +203,18 @@ ln -s usr/sbin "$root/sbin"
 ln -s usr/lib "$root/lib"
 ln -s usr/lib64 "$root/lib64"
 : >"$root/var/lib/dpkg/status"
+# The launcher binds each archive onto this mountpoint and requires it to
+# already exist as an empty root-owned 0600 file, as in
+# tools/real-snapshot-reference.sh.
+: >"$root/.debz-reference-archive"
+chmod 0600 "$root/.debz-reference-archive"
 for archive in "${bootstrap[@]}"; do
   dpkg-deb --extract "$archive" "$root"
 done
+# Every archive carries ./ with mode 0755, so extraction widens the root that
+# the launcher requires to be exactly 0700. Same remedy as
+# tools/real-snapshot-reference.sh.
+chmod 0700 "$root"
 printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nrelease_sha256=%s\nclosure_sha256=%s\nbootstrap_archives=%s\n' \
   "$(sha256sum "$pinned" | cut -d' ' -f1)" "$(sha256sum "$lock" | cut -d' ' -f1)" \
   "$release_sha256" "$closure_sha256" "${#bootstrap[@]}" >"$evidence/reference-identity.txt"
@@ -219,8 +228,7 @@ require_protected_file "$launcher"
 
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
-  sh -c 'mount -t proc -o nosuid,nodev,noexec proc "$1/proc" && shift && exec "$@"' \
-  sh "$root" timeout --signal=TERM --kill-after=30s 20m \
+  timeout --signal=TERM --kill-after=30s 20m \
   python3 tools/real-snapshot-reference-order.py \
     --launcher "$launcher" --architecture amd64 \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
