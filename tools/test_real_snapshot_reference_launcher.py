@@ -307,15 +307,17 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.assertEqual(list(evidence.iterdir()), [])
 
     def cycle_fixture(self) -> tuple[tuple, dict, dict]:
-        packages = tuple(ORDER.Package(name, version, "amd64", digest, size,
-                                        self.root / f"{name}.deb")
-                         for name, version, size, digest, _ in ORDER.BASE_CYCLE)
+        fixture = json.loads((TOOLS / "fixtures/real-snapshot/base-cycle-controls-v1.json").read_text())
+        packages = []
         records, controls = {}, {}
-        for index, package in enumerate(packages):
-            fields = {"package": package.name, "architecture": "amd64",
-                      "version": package.version, "depends": ORDER.BASE_CYCLE[index][4]}
+        for index, entry in enumerate(fixture["packages"]):
+            fields, = ORDER.control_fields(entry["control"].encode())
+            package = ORDER.Package(fields["package"], fields["version"], fields["architecture"],
+                                    entry["archive_sha512"], entry["archive_size"],
+                                    self.root / f'{fields["package"]}.deb')
+            packages.append(package)
             records[(package.name, "amd64")] = {
-                **fields, "status": "install ok unpacked" if index < 2 else "install ok installed",
+                **fields, "status": entry["status"],
             }
             data = io.BytesIO()
             with tarfile.open(fileobj=data, mode="w") as archive:
@@ -336,7 +338,7 @@ class ReferenceLauncherTests(unittest.TestCase):
         (self.root / "var/lib/dpkg/updates").mkdir()
         (self.root / "var/lib/dpkg/status").write_bytes(b"synthetic unit fixture only\n")
         (info / "libgcc-s1:amd64.triggers").write_bytes(ORDER.LIBGCC_TRIGGERS)
-        return packages, records, controls
+        return tuple(packages), records, controls
 
     def test_cycle_operation_requires_exact_four_archives_and_dedicated_profile(self) -> None:
         cycle, _, _ = self.cycle_fixture()
@@ -373,6 +375,8 @@ class ReferenceLauncherTests(unittest.TestCase):
                 ("libc6", "depends", "another-package", "CycleControlChanged"),
                 ("libgcc-s1", "pre-depends", "libc6", "CycleControlChanged"),
                 ("gcc-16-base", "status", "install ok unpacked", "CycleOutsideDependency"),
+                ("gcc-16-base", "multi-arch", "foreign", "CycleControlChanged"),
+                ("libc-gconv-modules-extra", "multi-arch", "", "CycleControlChanged"),
                 ("libgcc-s1", "status", "install ok triggers-pending", "CycleStateChanged"),
                 ("libgcc-s1", "triggers-pending", "ldconfig", "CycleCallbackChanged"),
             ):

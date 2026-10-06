@@ -120,7 +120,7 @@ fn cycleGraphField(index: usize, key: []const u8) []const u8 {
         else => "",
     };
     if (std.ascii.eqlIgnoreCase(key, "Provides")) return if (index == 1) "libgcc1 (= 1:16-20260322-1ubuntu1)" else "";
-    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return if (index < 2) "same" else "";
+    if (std.ascii.eqlIgnoreCase(key, "Multi-Arch")) return "same";
     if (std.ascii.eqlIgnoreCase(key, "Protected")) return if (index == 1) "yes" else "";
     return "";
 }
@@ -1267,19 +1267,17 @@ fn run(allocator: std.mem.Allocator, options: Options) !u8 {
 }
 
 fn cycleStatusFixture(allocator: std.mem.Allocator) ![]u8 {
+    const fixture = try std.json.parseFromSlice(struct {
+        packages: []const struct { control: []const u8, status: []const u8 },
+    }, allocator, @embedFile("fixtures/real-snapshot/base-cycle-controls-v1.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(allocator);
-    for (base_cycle, 0..) |binding, index| {
-        const identity = try std.fmt.allocPrint(allocator, "Package: {s}\nArchitecture: amd64\nVersion: {s}\nStatus: {s}\n", .{ binding.name, binding.version, if (index < 2) "install ok unpacked" else "install ok installed" });
-        defer allocator.free(identity);
-        try output.appendSlice(allocator, identity);
-        for (cycle_graph_keys) |key| {
-            const value = cycleGraphField(index, key);
-            if (value.len == 0) continue;
-            const field = try std.fmt.allocPrint(allocator, "{s}: {s}\n", .{ key, value });
-            defer allocator.free(field);
-            try output.appendSlice(allocator, field);
-        }
+    for (fixture.value.packages) |package| {
+        try output.appendSlice(allocator, package.control);
+        const state = try std.fmt.allocPrint(allocator, "Status: {s}\n", .{package.status});
+        defer allocator.free(state);
+        try output.appendSlice(allocator, state);
         try output.appendSlice(allocator, "Conffiles:\n /etc/fixture abcdef\n\n");
     }
     return output.toOwnedSlice(allocator);
@@ -1299,6 +1297,8 @@ test "reference cycle authority refuses changed graph, pre-depends, triggers and
         .{ .before = "Protected: yes", .after = "Triggers-Pending: ldconfig\nProtected: yes" },
         .{ .before = "Protected: yes", .after = "Config-Version: previous\nProtected: yes" },
         .{ .before = "Architecture: amd64", .after = "Architecture: arm64" },
+        .{ .before = "Multi-Arch: same", .after = "Multi-Arch: foreign" },
+        .{ .before = "Multi-Arch: same\n", .after = "" },
         .{ .before = "Version: 16-20260322-1ubuntu1", .after = "Version: 16-20260322-1ubuntu2" },
         .{ .before = "Package: libgcc-s1", .after = "Package: libgcc-s1\npackage: libgcc-s1" },
         .{ .before = "Depends: gcc-16-base", .after = "Depends: gcc-16-base\n continued" },

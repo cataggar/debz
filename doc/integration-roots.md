@@ -650,7 +650,8 @@ archives and reads their control members (the exact lock has no dependency
 fields). The reviewed SCC is `libc6 2.43-2ubuntu2.4 ↔ libgcc-s1
 16-20260322-1ubuntu1`; both must be unpacked. Its only external dependencies,
 `gcc-16-base 16-20260322-1ubuntu1` and `libc-gconv-modules-extra
-2.43-2ubuntu2.4`, must already be installed. All four have no Pre-Depends.
+2.43-2ubuntu2.4`, must already be installed. All four have no Pre-Depends and
+declare `Multi-Arch: same`, including both already-installed external members.
 Changed identities, graphs, versions, trigger state, unincorporated activations,
 database updates or outside dependencies refuse before the operation.
 

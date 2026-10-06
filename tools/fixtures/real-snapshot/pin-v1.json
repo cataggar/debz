@@ -41,6 +41,7 @@
     {
       "architectures": ["amd64"],
       "consumers": [
+        {"form": "hex", "path": "tools/fixtures/real-snapshot/base-cycle-controls-v1.json"},
         {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
         {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
       ],
@@ -61,6 +62,7 @@
     {
       "architectures": ["amd64"],
       "consumers": [
+        {"form": "hex", "path": "tools/fixtures/real-snapshot/base-cycle-controls-v1.json"},
         {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
         {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
       ],
@@ -81,6 +83,7 @@
     {
       "architectures": ["amd64"],
       "consumers": [
+        {"form": "hex", "path": "tools/fixtures/real-snapshot/base-cycle-controls-v1.json"},
         {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
         {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
       ],
@@ -101,6 +104,7 @@
     {
       "architectures": ["amd64"],
       "consumers": [
+        {"form": "hex", "path": "tools/fixtures/real-snapshot/base-cycle-controls-v1.json"},
         {"form": "hex", "path": "tools/real-snapshot-reference-order.py"},
         {"form": "hex", "path": "tools/real-snapshot-reference-launcher.zig"}
       ],
