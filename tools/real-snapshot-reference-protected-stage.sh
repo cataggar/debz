@@ -20,7 +20,7 @@ readonly snapshot_suite=resolute
 readonly snapshot_witness_suites=(resolute-updates resolute-security)
 readonly maximum_release_age_seconds=$((31 * 24 * 60 * 60))
 readonly frozen_release_sha256=596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834
-readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-/usr/share/keyrings/ubuntu-archive-keyring.gpg}
+readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}
 # The distribution dpkg's locked dependency closure supplies every runtime
 # library and tar the pinned Debian dpkg and its helpers load in the root.
 readonly closure_root=dpkg
@@ -76,7 +76,7 @@ script_path=$(realpath -- "${BASH_SOURCE[0]}")
 }
 for input in tools/real-snapshot-reference-protected-stage.sh \
   tools/real-snapshot-reference-launcher.zig tools/real-snapshot-reference-escape-probe.zig \
-  tools/prepare-native-dpkg.py; do
+  tools/prepare-native-dpkg.py tools/real_snapshot_reference_paths.py; do
   require_protected_file "$repository_root/$input"
 done
 require_protected_path "$repository_root/.real-snapshot"
@@ -84,11 +84,18 @@ require_protected_path "$repository_root/.real-snapshot"
   echo "the staging directory must be root-owned and mode 0700" >&2
   exit 2
 }
-zig=$(realpath -- "$1")
+zig=$1
 debz=$(realpath -- "$2")
 workspace=$(realpath -m -- "$3")
 require_protected_file "$zig"
 require_protected_path "$(dirname -- "$zig")/lib"
+python3 -I - "$repository_root/tools" "$zig" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import toolchain
+print(toolchain(Path(sys.argv[2])))
+PY
 require_protected_file "$debz"
 require_protected_file "$keyring"
 [[ -x "$zig" && -x "$debz" ]]
@@ -108,6 +115,7 @@ case "$(uname -m)" in
 esac
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
+unset ZIG_LIB_DIR
 export PYTHONNOUSERSITE=1 LC_ALL=C SOURCE_DATE_EPOCH=0
 
 install -d -o root -g root -m 0700 "$workspace"
@@ -302,10 +310,12 @@ fi
 launcher=$workspace/launcher
 probe=$workspace/escape-probe
 "$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/build/zig-cache" \
   --global-cache-dir "$workspace/build/zig-global-cache" \
   -femit-bin="$launcher"
 "$zig" build-exe tools/real-snapshot-reference-escape-probe.zig -O ReleaseSafe -fstrip \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/build/zig-cache" \
   --global-cache-dir "$workspace/build/zig-global-cache" \
   -femit-bin="$probe"

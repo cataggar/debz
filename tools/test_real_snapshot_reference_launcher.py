@@ -75,6 +75,39 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.assertIn("non-root or writable reference path", result.stderr)
         self.assertFalse(workspace.exists())
 
+    def test_reference_compiler_stanza_uses_explicit_absolute_tool_and_library_without_path_widening(self) -> None:
+        compiler_directory = self.root / "staged toolchain"
+        compiler_directory.mkdir()
+        compiler = compiler_directory / "zig"
+        compiler.write_text(
+            "#!/usr/bin/python3\nimport json, os, sys\n"
+            "with open(os.environ['COMPILER_LOG'], 'w') as output:\n"
+            "    json.dump(sys.argv, output)\n"
+        )
+        compiler.chmod(0o755)
+        source = (TOOLS / "real-snapshot-reference.sh").read_text()
+        resolve = next(line for line in source.splitlines() if line.startswith("zig=${DEBZ_ZIG:"))
+        start = source.index('"$zig" build-exe ')
+        command = source[start:source.index('chmod 0500 "$launcher"', start)]
+        log = self.root / "compiler.json"
+        environment = {
+            "DEBZ_ZIG": str(compiler), "COMPILER_LOG": str(log),
+            "ZIG_LIB_DIR": "/untrusted/library",
+        }
+        result = subprocess.run(
+            ["/usr/bin/bash", "-euo", "pipefail", "-c",
+             'export PATH=/usr/sbin:/usr/bin:/sbin:/bin\nunset ZIG_LIB_DIR\n'
+             + resolve + '\nworkspace=$1\nlauncher=$workspace/launcher\n' + command,
+             "reference-compiler-fixture", str(self.root)],
+            env=environment, cwd=ROOT, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = json.loads(log.read_text())
+        self.assertEqual(arguments[0], str(compiler))
+        self.assertEqual(arguments[1:3], ["build-exe", "tools/real-snapshot-reference-launcher.zig"])
+        self.assertEqual(arguments[arguments.index("--zig-lib-dir") + 1], str(compiler_directory / "lib"))
+        self.assertIn(f"-femit-bin={self.root}/launcher", arguments)
+
     def test_protected_proof_target_refuses_shared_checkout_without_fixture_skips(self) -> None:
         result = subprocess.run(
             [sys.executable, str(TOOLS / "test_real_snapshot_reference_protected.py"),

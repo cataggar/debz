@@ -2347,6 +2347,44 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
         "step negative-swapped-keyring refused '\"summary\":\"WrongSigningKey\"' swapped_keyring_stage\n",
         "    echo \"negative-$name launched before refusing\" >&2\n",
         "step proof 0 \"executed without skips\" timeout --signal=TERM --kill-after=60s 45m \\\n",
+        "  mode=native-staging\n",
+        "print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))\n",
+        "module.verify_extracted_bindings(prefix, architecture)\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-protected-native-ci.sh", &.{
+        "  export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}\n",
+        "    exec bash \"$checkout/tools/real-snapshot-acceptance.sh\" \"$checkout/zig-out/bin/debz\" \\\n",
+        "    exec bash tools/real-snapshot-reference.sh \"$REFERENCE_DPKG\" \\\n",
+        "            if total > 512 * 1024 * 1024:\n",
+        "                 \"tools/real_snapshot_outcome.py\",\n",
+        "python3 -I tools/real_snapshot_outcome.py \"$evidence\" \"${NATIVE_STEP_OUTCOME:-unavailable}\" \\\n",
+        "  >\"$evidence/acceptance-outcome-v1.json\" || outcome_status=$?\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-acceptance.sh", &.{
+        "    --check-keyring \"$keyring\" >/dev/null\n",
+        "python3 -I - \"$repository_root/tools\" \"$repository_root\" \"$debz\" <<'PY'\n",
+        "  printf '%s\\n' \"$wrapper_status\" >\"$evidence/native-wrapper-exit-status.txt\"\n",
+        "  printf '{\"stage\":\"%s\",\"command_exit_status\":null}\\n' \"$name\" >\"$evidence/native-stage-v1.json\"\n",
+        "  printf '{\"stage\":\"%s\",\"command_exit_status\":%s}\\n' \"$name\" \"$status\" >\"$evidence/native-stage-v1.json\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_outcome.py", &.{
+        "        marker = json.loads(read_root_file(evidence, \"native-stage-v1.json\", 4096))\n",
+        "        result = json.loads(read_root_file(evidence, f\"{stage}.json\", 128 * 1024 * 1024))\n",
+        "            if wrapper_status != 0 or not expected_refusal:\n",
+        "        if command_status is None:\n",
+    });
+    try nativeMutationsIn(&f, "protected-reference", ".github/workflows/ci.yml", "  ubuntu-real-snapshot:", "  protected-reference:", &.{
+        "        id: native\n",
+        "          NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}\n",
+        "            NATIVE_STEP_OUTCOME=\"$NATIVE_STEP_OUTCOME\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference.sh", &.{
+        "\"$zig\" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \\\n",
+        "  --zig-lib-dir \"$(dirname -- \"$zig\")/lib\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_reference_paths.py", &.{
+        "        if meta.st_size != size or len(payload) != size or actual != digest:\n",
+        "                if not target.is_relative_to(library):\n",
     });
     try nativeMutations(&f, "protected-reference", "build.zig", &.{"        \"--profile-scripts\",\n"});
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{

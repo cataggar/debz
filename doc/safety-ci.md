@@ -83,12 +83,27 @@ The published four-job recovery graph uses 14 verified Zig installations;
 this prepared three-job graph requires exactly 13 in both security and
 release workflow policy audits.
 
-Every CI and release build obtains Zig 0.16.0 from `cataggar/zig` through the
-commit-pinned `ghr` v0.8.1 install action, verifies the release with its pinned
-minisign key and GitHub attestations, and checks `zig version` before use. The
+Ordinary CI and release builds obtain Zig 0.16.0 from `cataggar/zig` through the
+commit-pinned `ghr` v0.8.1 install action, verify the release with its pinned
+minisign key and GitHub attestations, and check `zig version` before use. The
 action cache contains only the exact installed tool and `ghr` transaction state;
 it does not restore Zig's local or global build caches, preserving the previous
 no-build-cache policy.
+
+The dispatch-only native snapshot job instead shares the small protected
+proof's root-owned bootstrap: the same size/SHA-256/minisign-pinned Zig and
+verified library tree, package-derived Ubuntu keyring and pinned dpkg. It
+stages a new `native-ci-RUN-ATTEMPT-ARCH` tree on each architecture; the small
+proof retains a distinct `ci-RUN-ATTEMPT-ARCH` tree. No proof workspace is
+reused. The native wrapper requires protected reviewed keyring bytes, without
+an ambient image fallback; the full reference wrapper invokes the explicit
+absolute protected `DEBZ_ZIG` with its protected `lib`, without extending its
+fixed PATH. The 20 ordinary ghr-install jobs include the separate signed proc
+replay, but not the protected native snapshot job; both protected consumers are
+checked separately. Bounded diagnostics/export and named descendant cleanup
+run on failure, without returning ownership of protected inputs to the runner.
+Successful setup or small-proof results do not claim full wrapper/parity
+completion; hosted native success must reach the reference step.
 
 The CI workflow has a top-level concurrency group keyed by the workflow name,
 event name, and either the pull request number, the pushed ref, or the unique

@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -30,6 +31,8 @@ def load(name: str, path: str):
 MINISIGN = load("debz_verify_minisign", "verify-minisign.py")
 TREE = load("debz_reference_tree_check", "real-snapshot-reference-tree-check.py")
 HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protected.py")
+from real_snapshot_reference_paths import toolchain, verify_keyring
+from real_snapshot_outcome import collect_outcome
 
 ZIG_KEY = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"
 # The published signature of the pinned x86_64 Zig 0.16.0 archive.
@@ -252,6 +255,229 @@ class ProtectedCiScriptTests(unittest.TestCase):
                                     text=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertNotIn("protected reference CI: commit=", result.stdout)
+
+    def test_acceptance_has_no_ambient_keyring_fallback(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("DEBZ_REAL_SNAPSHOT_KEYRING", None)
+        architecture = "arm64" if os.uname().machine == "aarch64" else "amd64"
+        result = subprocess.run(
+            ["bash", str(TOOLS / "real-snapshot-acceptance.sh"), "--validate",
+             "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z", "resolute", architecture],
+            env=environment, capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("explicit regular Ubuntu archive keyring", result.stderr)
+
+
+class ProtectedInputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="debz-protected-input-", dir=TOOLS.parent / ".zig-cache")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.real_fstat = os.fstat
+
+    def root_owned_fstat(self, fd: int) -> os.stat_result:
+        values = list(self.real_fstat(fd))
+        values[4:6] = [0, 0]
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if not path.is_relative_to(self.root):
+            values[0] &= ~0o022
+        return os.stat_result(values)
+
+    def test_keyring_refuses_unprotected_writable_symlinked_and_wrong_bytes(self) -> None:
+        keyring = self.root / "keyring"
+        payload = b"reviewed fixture bytes"
+        keyring.write_bytes(payload)
+        digest = hashlib.sha256(payload).hexdigest()
+        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
+            verify_keyring(keyring, len(payload), digest)
+        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
+            self.assertEqual(verify_keyring(keyring, len(payload), digest), digest)
+            for size, expected in ((len(payload) + 1, digest), (len(payload), "0" * 64)):
+                with self.subTest(size=size), self.assertRaisesRegex(ValueError, "pin mismatch"):
+                    verify_keyring(keyring, size, expected)
+            keyring.write_bytes(payload[:-1] + b"?")
+            with self.assertRaisesRegex(ValueError, "pin mismatch"):
+                verify_keyring(keyring, len(payload), digest)
+            keyring.write_bytes(payload)
+            keyring.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                verify_keyring(keyring, len(payload), digest)
+            keyring.chmod(0o644)
+            link = self.root / "linked"
+            link.symlink_to(keyring)
+            with self.assertRaises(OSError):
+                verify_keyring(link, len(payload), digest)
+            directory_link = self.root / "linked-dir"
+            directory_link.symlink_to(self.root, target_is_directory=True)
+            with self.assertRaises(OSError):
+                verify_keyring(directory_link / "keyring", len(payload), digest)
+            self.root.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                verify_keyring(keyring, len(payload), digest)
+
+    def test_compiler_binds_protected_library_ancestry_without_resolving_input_links(self) -> None:
+        compiler = self.root / "zig"
+        compiler.write_text("#!/bin/sh\nexit 0\n")
+        compiler.chmod(0o755)
+        library = self.root / "lib"
+        library.mkdir()
+        source = library / "std.zig"
+        source.write_text("fixture")
+        with self.assertRaisesRegex(ValueError, "non-root ancestor"):
+            toolchain(compiler)
+        with mock.patch.object(os, "fstat", side_effect=self.root_owned_fstat):
+            self.assertEqual(toolchain(compiler), library)
+            compiler.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                toolchain(compiler)
+            compiler.chmod(0o755)
+            source.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                toolchain(compiler)
+            source.chmod(0o644)
+            (library / "escape").symlink_to(compiler)
+            with self.assertRaisesRegex(ValueError, "symlink escapes"):
+                toolchain(compiler)
+            (library / "escape").unlink()
+            linked = self.root / "linked-zig"
+            linked.symlink_to(compiler)
+            with self.assertRaises(OSError):
+                toolchain(linked)
+            library.rename(self.root / "real-lib")
+            library.symlink_to(self.root / "real-lib", target_is_directory=True)
+            with self.assertRaises(OSError):
+                toolchain(compiler)
+
+
+class NativeOutcomeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        cache = TOOLS.parent / ".zig-cache"
+        cache.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(prefix="debz-native-outcome-", dir=cache)
+        self.addCleanup(temporary.cleanup)
+        self.evidence = Path(temporary.name)
+        self.refresh = self.result("refresh", 0, changed=True)
+        self.write_json("refresh.json", self.refresh)
+
+    @staticmethod
+    def result(operation: str, status: int, *, changed: bool = False) -> dict:
+        return {"operation": operation, "exit_status": status, "changed": changed,
+                "summary": f"{operation} result", "diagnostics": []}
+
+    def write_json(self, name: str, value: object) -> None:
+        (self.evidence / name).write_text(json.dumps(value))
+
+    def attempt(self, stage: str, status: int | None, result: dict,
+                wrapper_status: int | None) -> None:
+        self.write_json("native-stage-v1.json", {"stage": stage, "command_exit_status": status})
+        self.write_json(f"{stage}.json", result)
+        receipt = self.evidence / "native-wrapper-exit-status.txt"
+        if wrapper_status is None:
+            receipt.unlink(missing_ok=True)
+        else:
+            receipt.write_text(f"{wrapper_status}\n")
+
+    def test_failed_create_preserves_install_diagnostic_not_successful_refresh(self) -> None:
+        result = self.result("install", 8, changed=True)
+        result["diagnostics"] = [{"id": "native_backend_unavailable",
+                                  "message": "python3_preinst reason=control_file_mismatch "
+                                  "path=dev/null field=size expected=0 observed=20"}]
+        self.attempt("create", 8, result, 8)
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 0)
+        self.assertEqual((outcome["operation"], outcome["stage"], outcome["exit_status"]),
+                         ("install", "create", 8))
+        self.assertTrue(outcome["changed"])
+        self.assertEqual(outcome["diagnostics"][0], result["diagnostics"][0])
+        self.assertEqual(outcome["workflow_step_outcome"], "failure")
+
+    def test_later_failure_and_post_command_failure_keep_latest_attempt(self) -> None:
+        for stage, result, command, wrapper in (
+            ("update", self.result("upgrade-all", 8), 8, 8),
+            ("create-summary", {"backend": "native", "outcome": "failed"}, 7, 7),
+            ("update", self.result("upgrade-all", 0), 0, 90),
+            ("update", self.result("upgrade-all", 0), 0, 0),
+        ):
+            with self.subTest(stage=stage, command=command, wrapper=wrapper):
+                self.attempt(stage, command, result, wrapper)
+                outcome, status = collect_outcome(self.evidence, "failure")
+                self.assertEqual(status, 0)
+                self.assertEqual(outcome["stage"], stage)
+                self.assertEqual(outcome["command_exit_status"], command)
+                self.assertEqual(outcome["wrapper_exit_status"], wrapper)
+                self.assertEqual(outcome["exit_status"], wrapper or 1)
+                self.assertNotEqual(outcome["operation"], "refresh")
+                if stage == "create-summary":
+                    self.assertIsNone(outcome["result_exit_status"])
+
+    def test_missing_empty_corrupt_and_unsafe_latest_result_never_fall_back(self) -> None:
+        self.attempt("update", 1, self.result("upgrade-all", 1), 1)
+        path = self.evidence / "update.json"
+        for data in (None, b"", b"{broken", b"null", b"[]", b"{}",
+                     b'{"operation":"upgrade-all","exit_status":false,"changed":false,'
+                     b'"summary":"bad","diagnostics":[]}'):
+            with self.subTest(data=data):
+                path.unlink(missing_ok=True)
+                if data is not None:
+                    path.write_bytes(data)
+                outcome, status = collect_outcome(self.evidence, "failure")
+                self.assertEqual(status, 1)
+                self.assertEqual(outcome["stage"], "update")
+                self.assertEqual(outcome["operation"], "upgrade-all")
+                self.assertFalse(outcome["result_available"])
+                self.assertNotEqual(outcome["exit_status"], 0)
+                self.assertTrue(outcome["diagnostics"][-1]["id"].startswith("native_acceptance_evidence_"))
+        path.unlink()
+        path.symlink_to(self.evidence / "refresh.json")
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 1)
+        self.assertFalse(outcome["result_available"])
+
+    def test_unrecorded_attempt_exit_and_missing_marker_are_explicitly_unavailable(self) -> None:
+        self.attempt("create", None, self.result("install", 0), None)
+        outcome, status = collect_outcome(self.evidence, "cancelled")
+        self.assertEqual(status, 1)
+        self.assertEqual(outcome["stage"], "create")
+        self.assertIsNone(outcome["command_exit_status"])
+        self.assertEqual(outcome["diagnostics"][-1]["id"], "native_acceptance_evidence_unavailable")
+        (self.evidence / "native-stage-v1.json").unlink()
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 1)
+        self.assertIsNone(outcome["stage"])
+        self.assertNotEqual(outcome["operation"], "refresh")
+
+    def test_expected_negative_control_is_not_wrapper_success_without_completion(self) -> None:
+        self.attempt("injected-failure", 5, self.result("plan", 5), 0)
+        outcome, status = collect_outcome(self.evidence, "success")
+        self.assertEqual(status, 0)
+        self.assertEqual((outcome["exit_status"], outcome["command_exit_status"],
+                          outcome["result_exit_status"]), (0, 5, 5))
+        self.assertTrue(outcome["expected_refusal"])
+        self.attempt("injected-failure", 5, self.result("plan", 5), 1)
+        outcome, status = collect_outcome(self.evidence, "failure")
+        self.assertEqual(status, 0)
+        self.assertEqual(outcome["exit_status"], 1)
+        self.assertTrue(outcome["expected_refusal"])
+        for workflow in ("success", "skipped", "unavailable"):
+            with self.subTest(workflow=workflow):
+                outcome, status = collect_outcome(self.evidence, workflow)
+                self.assertEqual(status, 1)
+                self.assertNotEqual(outcome["exit_status"], 0)
+
+    def test_latest_result_operation_must_match_recorded_attempt(self) -> None:
+        for stage, command, wrapper, workflow in (
+            ("create", 0, 1, "failure"),
+            ("injected-failure", 5, 0, "success"),
+        ):
+            with self.subTest(stage=stage):
+                self.attempt(stage, command, self.result("refresh", command), wrapper)
+                outcome, status = collect_outcome(self.evidence, workflow)
+                self.assertEqual(status, 1)
+                self.assertEqual(outcome["operation"], "install" if stage == "create" else "plan")
+                self.assertFalse(outcome["result_available"])
+                self.assertNotEqual(outcome["exit_status"], 0)
+                self.assertEqual(outcome["diagnostics"][-1]["id"], "native_acceptance_evidence_invalid")
 
 
 if __name__ == "__main__":

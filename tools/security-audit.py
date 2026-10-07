@@ -2492,6 +2492,11 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-reference-escape-probe.zig",
     "tools/verify-minisign.py",
     "tools/real-snapshot-reference-tree-check.py",
+    "tools/real-snapshot-protected-native-ci.sh",
+    "tools/real-snapshot-acceptance.sh",
+    "tools/real-snapshot-reference.sh",
+    "tools/real_snapshot_reference_paths.py",
+    "tools/real_snapshot_outcome.py",
 )
 PROTECTED_REFERENCE_INPUT = (
     '      run_protected_reference:\n'
@@ -2542,7 +2547,7 @@ PROTECTED_REFERENCE_BOOTSTRAP = (
     '            [[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ ]]\n'
     '            [[ ${BASH_REMATCH[1]} == "$architecture" && $expected =~ ^[0-9a-f]{40}$ ]]\n'
     '            umask 022\n'
-    '            install -d -o root -g root -m 0755 /srv/debz-protected\n'
+    '            [[ -e /srv/debz-protected ]] || mkdir -m 0755 /srv/debz-protected\n'
     '            for ancestor in / /srv /srv/debz-protected; do\n'
     '              [[ -d $ancestor && ! -L $ancestor && $(stat -c %u:%g "$ancestor") == 0:0 ]]\n'
     '              (( ($(stat -c 0%a "$ancestor") & 022) == 0 ))\n'
@@ -2622,6 +2627,14 @@ PROTECTED_REFERENCE_CLEANUP = (
 
 PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "set -euo pipefail",
+    'if [[ ${1:-} == --check-keyring && $# == 2 ]]; then',
+    'print(verify_keyring(Path(sys.argv[2]), int(sys.argv[3]), sys.argv[4]))',
+    'if [[ ${1:-} == --stage-native ]]; then',
+    "  mode=native-staging\n",
+    '[[ $mode == proof ]] || prefix=native-ci',
+    'if [[ $mode == native-staging ]]; then\n  stage_native_inputs\n',
+    'module.verify_extracted_bindings(prefix, architecture)',
+    'print(toolchain(Path(sys.argv[2])))',
     "readonly zig_public_key=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     "readonly archive_keyring_deb_url=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z/pool/main/u/ubuntu-keyring/ubuntu-keyring_2023.11.28.1build1_all.deb",
     "readonly archive_keyring_deb_sha512=80446b4521a3cc100d797a7ed03532f4358c028f1c0c110e00cfc6e1db3b2795e2f98f92a4077baea0cee3c82b292f9eeb20f7f1dc06ce28b6b46e661b1fad35",
@@ -2631,7 +2644,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "readonly archive_keyring_size=3607",
     "    zig_sha256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00\n    zig_size=55478392\n",
     "    zig_sha256=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17\n    zig_size=51211944\n",
-    '[[ $tree =~ ^/srv/debz-protected/ci-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&',
+    '[[ $tree =~ ^/srv/debz-protected/$prefix-[0-9]+-[0-9]+-(amd64|arm64)$ && ${BASH_REMATCH[1]} == "$architecture" &&',
     '[[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-reference-protected-ci.sh" ]] || {',
     'test "$(git -C "$checkout" rev-parse HEAD)" = "$commit"',
     "trap collect EXIT",
@@ -2669,6 +2682,61 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "[[ ${#proof_arguments[@]} == 13 ]]",
 )
 PROTECTED_REFERENCE_SOURCE_TOKENS = {
+    "tools/real-snapshot-protected-native-ci.sh": (
+        "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
+        "unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR",
+        "protected(Path(sys.argv[2]))",
+        '"tools/real_snapshot_outcome.py",',
+        '[[ ${#inputs[@]} == 3 ]]',
+        "export DEBZ_ZIG=${inputs[0]} REFERENCE_DPKG=${inputs[1]} DEBZ_REAL_SNAPSHOT_KEYRING=${inputs[2]}",
+        'exec bash "$checkout/tools/real-snapshot-acceptance.sh" "$checkout/zig-out/bin/debz"',
+        'exec bash tools/real-snapshot-reference.sh "$REFERENCE_DPKG"',
+        'timeout --signal=TERM --kill-after=30s 5m python3 tools/capture-vendor-state.py',
+        'if [[ -d "$work/root/var/lib/dpkg/info" ]]; then',
+        'reference_snapshot_present=%s\\nnative_snapshot_present=%s',
+        "not stat.S_ISREG(meta.st_mode) or meta.st_size > 128 * 1024 * 1024",
+        "total > 512 * 1024 * 1024",
+        "os.open(name, flags | os.O_NOFOLLOW)",
+        'python3 -I tools/real_snapshot_outcome.py "$evidence" "${NATIVE_STEP_OUTCOME:-unavailable}" \\',
+        '>"$evidence/acceptance-outcome-v1.json" || outcome_status=$?',
+        '(( capture_status == 0 && differential_status == 0 && forbidden_exec_status == 0 && outcome_status == 0 && copy_status == 0 ))',
+    ),
+    "tools/real-snapshot-acceptance.sh": (
+        "readonly keyring=${DEBZ_REAL_SNAPSHOT_KEYRING:-}",
+        '--check-keyring "$keyring" >/dev/null',
+        'python3 -I - "$repository_root/tools" "$repository_root" "$debz"',
+        'protected(repository, directory=True)',
+        'protected(repository / ".real-snapshot", directory=True)',
+        'local wrapper_status=$?',
+        'printf \'%s\\n\' "$wrapper_status" >"$evidence/native-wrapper-exit-status.txt"',
+        'printf \'{"stage":"%s","command_exit_status":null}\\n\' "$name" >"$evidence/native-stage-v1.json"',
+        'printf \'{"stage":"%s","command_exit_status":%s}\\n\' "$name" "$status" >"$evidence/native-stage-v1.json"',
+    ),
+    "tools/real_snapshot_outcome.py": (
+        'read_root_file(evidence, "native-stage-v1.json", 4096)',
+        'read_root_file(evidence, f"{stage}.json", 128 * 1024 * 1024)',
+        'read_root_file(evidence, "native-wrapper-exit-status.txt", 32)',
+        'if workflow_outcome == "success":',
+        'if wrapper_status != 0 or not expected_refusal:',
+        'if command_status is None:',
+        '"id": f"native_acceptance_evidence_{kind}"',
+    ),
+    "tools/real-snapshot-reference.sh": (
+        "unset ZIG_LIB_DIR",
+        'zig=${DEBZ_ZIG:-$(command -v zig || true)}',
+        "toolchain(Path(sys.argv[6]))",
+        '"$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc',
+        '--zig-lib-dir "$(dirname -- "$zig")/lib"',
+    ),
+    "tools/real_snapshot_reference_paths.py": (
+        "def open_protected(",
+        "def verify_keyring(",
+        "fd = open_protected(path)",
+        "meta.st_size != size or len(payload) != size or actual != digest",
+        "def toolchain(",
+        "protected(library, directory=True)",
+        "if not target.is_relative_to(library):",
+    ),
     "build.zig": (
         '        "--profile-scripts",\n'
         '        b.option([]const u8, "reference-protected-profile-scripts", ',
@@ -2719,6 +2787,43 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,
     ))
+    native_job = jobs.get("ubuntu-real-snapshot", "")
+    for token in (
+        "    if: github.event_name == 'workflow_dispatch' && inputs.run_native_real_snapshot\n",
+        "    timeout-minutes: 320\n",
+        "      max-parallel: 1\n",
+        "          - architecture: amd64\n            runner: ubuntu-24.04\n",
+        "          - architecture: arm64\n            runner: ubuntu-24.04-arm\n",
+        "      PROTECTED_TREE: /srv/debz-protected/native-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.architecture }}\n",
+        '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n          test -z "$(git status --porcelain)"\n',
+        '          sudo -n env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LC_ALL=C \\\n'
+        '            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \\\n',
+        '            mkdir -m 0700 -- "$tree"\n',
+        '            git --git-dir="$tree/bare.git" fsck --full --no-dangling\n',
+        '            test "$(git -C "$tree/checkout" rev-parse HEAD)" = "$expected"\n',
+        '            exec bash "$tree/checkout/tools/real-snapshot-reference-protected-ci.sh" --stage-native "$tree" "$architecture" "$expected"\n',
+        "      - name: Create and replay exact native Ubuntu root\n        id: native\n        timeout-minutes: 220\n",
+        '            native "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA" "$SNAPSHOT_URI" "$SNAPSHOT_SUITE"\n',
+        "      - name: Install exact closure with pinned dpkg reference\n        timeout-minutes: 50\n        run: |\n",
+        '            reference "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"\n',
+        "      - name: Collect bounded protected native diagnostics\n        if: always()\n        timeout-minutes: 15\n"
+        "        env:\n          NATIVE_STEP_OUTCOME: ${{ steps.native.outcome }}\n",
+        '            NATIVE_STEP_OUTCOME="$NATIVE_STEP_OUTCOME" \\\n',
+        '            collect "$PROTECTED_TREE" "$ARCHITECTURE" "$GITHUB_SHA"\n',
+        "      - name: Copy bounded native evidence\n        if: always()\n",
+        '            sudo -n tar -C "$PROTECTED_TREE/native-upload" -cf - . >"$PWD/.native-evidence.tar"\n',
+        "      - name: Kill native descendants and remove only the named tree\n        if: always()\n        timeout-minutes: 3\n",
+        '              kill -KILL "${victims[@]}" 2>/dev/null || true\n',
+        '            rm -rf --one-file-system -- "$tree"\n',
+        "      - name: Upload real acceptance evidence\n        if: always()\n",
+        "          path: .real-snapshot/${{ matrix.architecture }}/evidence/\n",
+        "          if-no-files-found: error\n          retention-days: 14\n",
+    ):
+        if native_job.count(token) != 1:
+            failures.append(f"native snapshot CI lost protected wiring: {token.strip()}")
+    if ("continue-on-error" in native_job or "cataggar/ghr" in native_job
+        or "chown" in native_job or re.search(r"\bsudo (?!-n )", native_job)):
+        failures.append("native snapshot CI must retain protected tools and failures without ownership transfer")
     job = jobs.get("protected-reference")
     on = ci.partition("\nconcurrency:\n")[0]
     if (
@@ -2753,7 +2858,7 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             failures.append(f"protected reference CI script lost {token.strip()}")
     if re.search(r"(?m)^\s*exit 0\b|\|\|\s*true\b|SkipTest|--skip", script) or script.count(
         'python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"'
-    ) != 4:
+    ) != 5:
         failures.append("protected reference CI script must not skip and must check the tree at every stage")
     for path, tokens in PROTECTED_REFERENCE_SOURCE_TOKENS.items():
         for token in tokens:
@@ -4273,7 +4378,7 @@ def audit_ci_pins() -> None:
                 fail(failure)
             for failure in signed_proc_ci_failures(text):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 21, "release.yml": 1}.get(workflow.name)
+        expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -5230,7 +5335,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 21)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 20)
     elif kind == "ghr-release":
         failures = ghr_zig_workflow_failures(text, "release.yml", 1)
     elif kind == "workflow-failure":
