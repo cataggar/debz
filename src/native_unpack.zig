@@ -123,6 +123,7 @@ const ExecutionState = struct {
     recovery_models: ?[]const archive_application.Model = null,
     recovery_initial_model: ?*const package_database.Model = null,
     trigger_pending_is_live: bool = false,
+    trigger_normalization_phase: bool = false,
 
     fn checkDeadline(self: *ExecutionState) !void {
         try checkRuntimeBounds(self.bounds);
@@ -194,6 +195,53 @@ fn consumeRecoveredDatabasePhase(execution: *ExecutionState) !bool {
     if (!try recoveredActionApplied(&next)) return false;
     execution.phase_ordinal = next.phase_ordinal;
     return true;
+}
+
+fn triggerNormalizationPhaseEvidence(intent_sha256: native_recovery.Digest, action: native_recovery.Action) native_recovery.Digest {
+    var hash = Sha256.init(.{});
+    hash.update("debz-native-trigger-normalization-phase-v1\x00");
+    hashText(&hash, &intent_sha256);
+    hashText(&hash, @tagName(action.kind));
+    hashNumber(&hash, action.program_step);
+    hashNumber(&hash, action.substep);
+    hashNumber(&hash, action.ordinal);
+    return native_recovery.hexDigest(hash.finalResult());
+}
+
+fn recoveredTriggerNormalization(runtime: *native_recovery.Runtime, action: native_recovery.Action) !bool {
+    var progress = try native_recovery.readProgress(runtime.allocator, runtime.root);
+    defer progress.deinit();
+    return completedTriggerNormalization(runtime, progress.document, action);
+}
+
+fn completedTriggerNormalization(runtime: *native_recovery.Runtime, progress: native_recovery.ProgressDocument, action: native_recovery.Action) !bool {
+    if (!std.mem.eql(u8, &progress.intent_sha256, &runtime.intent_sha256))
+        return error.InvalidRecoveryProgress;
+    const completed = native_recovery.latest(progress, action) orelse return false;
+    if (action.kind != .database or completed.stage != .completed or
+        (completed.result != .applied and completed.result != .succeeded and completed.result != .recovered))
+        return false;
+    var index = progress.records.len;
+    while (index != 0) {
+        index -= 1;
+        const record = progress.records[index];
+        if (!std.meta.eql(record.action, action) or record.stage != .prepared) continue;
+        const purpose = record.evidence_sha256 orelse return false;
+        const expected = triggerNormalizationPhaseEvidence(runtime.intent_sha256, action);
+        if (!std.mem.eql(u8, &purpose, &expected)) return false;
+        // A purpose-bearing preparation is not proof that publication happened.
+        // Require its successful completion to bind the actual managed checkpoint.
+        const checkpoint = (try native_recovery.managedCheckpointDigestForAction(
+            runtime.allocator,
+            runtime.root,
+            runtime.intent_sha256,
+            action,
+        )) orelse return error.InvalidRecoveryProgress;
+        const evidence = completed.evidence_sha256 orelse return error.InvalidRecoveryProgress;
+        if (!std.mem.eql(u8, &evidence, &checkpoint)) return error.InvalidRecoveryProgress;
+        return true;
+    }
+    return false;
 }
 
 fn beginNativeProgramStep(
@@ -12170,7 +12218,10 @@ fn executePhaseMaterialization(
     };
     if (execution.recovery) |runtime| {
         if (execution.action) |action| {
-            try runtime.append(action, .prepared, .none, null);
+            try runtime.append(action, .prepared, .none, if (execution.trigger_normalization_phase)
+                triggerNormalizationPhaseEvidence(runtime.intent_sha256, action)
+            else
+                null);
             if (request.observed_paths.len != 0)
                 _ = try native_recovery.updateManagedState(
                     allocator,
@@ -17861,6 +17912,10 @@ fn lifecycleApplyTriggerEvents(
             .awaited = awaited_values,
         });
     }
+    const action = nativeAction(.database, execution.program_step, execution.phase_ordinal, 0);
+    const previous_normalization_phase = execution.trigger_normalization_phase;
+    execution.trigger_normalization_phase = true;
+    defer execution.trigger_normalization_phase = previous_normalization_phase;
     const result = try lifecycleTriggerDatabase(
         execution,
         allocator,
@@ -17878,7 +17933,13 @@ fn lifecycleApplyTriggerEvents(
             .pending = if (clear_queue) &.{} else database.model.triggers.pending,
         },
     );
-    if (result.outcome == .applied) execution.trigger_pending_is_live = true;
+    if (result.outcome == .applied) {
+        const normalized = if (execution.recovery) |runtime|
+            try recoveredTriggerNormalization(runtime, action)
+        else
+            true;
+        if (normalized) execution.trigger_pending_is_live = true;
+    }
     return result;
 }
 
@@ -18029,10 +18090,9 @@ fn lifecycleIncorporateTriggerQueue(
         // derived status publication a new recovery action identity.
         if (execution.recovery) |runtime| {
             if (runtime.recovering) {
+                const action = nativeAction(.database, execution.program_step, execution.phase_ordinal, 0);
                 const incorporated = try consumeRecoveredDatabasePhase(execution);
-                // The authenticated completed incorporation also normalized
-                // imported pending names even without activation-log events.
-                if (incorporated and apply_events)
+                if (incorporated and apply_events and try recoveredTriggerNormalization(runtime, action))
                     execution.trigger_pending_is_live = true;
             }
         }
@@ -18381,10 +18441,14 @@ fn resumeTriggerDatabasePhases(execution: *ExecutionState, allocator: std.mem.Al
             record.action.program_step == execution.program_step and
             record.stage == .completed and
             (record.result == .applied or record.result == .succeeded or record.result == .recovered))
+        {
             execution.phase_ordinal = @max(
                 execution.phase_ordinal,
                 try std.math.add(u16, record.action.substep, 1),
             );
+            if (try completedTriggerNormalization(runtime, progress.document, record.action))
+                execution.trigger_pending_is_live = true;
+        }
     }
 }
 
@@ -38366,6 +38430,79 @@ test "native_unpack.test.conffile generated path rejects archive collision" {
         .interoperability = .isolated_root,
         .conffiles = .unpack,
     }), .duplicate_archive_path);
+}
+
+test "native_unpack.test.trigger normalization replay requires purpose and completed checkpoint" {
+    for ([_]enum { prepared_only, no_checkpoint, wrong_checkpoint, generic, normalized, later_normalized, wrong_action }{
+        .prepared_only, .no_checkpoint, .wrong_checkpoint, .generic, .normalized, .later_normalized, .wrong_action,
+    }) |selected| {
+        var temporary = testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const root = root_fs.Root.init(testing.io, temporary.dir);
+        for ([_][]const u8{ "var", "var/lib", "var/lib/dpkg", root_operation.namespace_path }) |path|
+            try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+        const status = try root_fs.Path.init("var/lib/dpkg/status");
+        try root.publishFile(status, "Triggers-Pending: debz-a debz-b\n", .{});
+        var runtime: native_recovery.Runtime = .{
+            .allocator = testing.allocator,
+            .root = root,
+            .intent_sha256 = @splat('a'),
+            .recovering = true,
+        };
+        try native_recovery.initializeProgress(testing.allocator, root, runtime.intent_sha256);
+        try native_recovery.initializeManagedState(testing.allocator, root, runtime.intent_sha256);
+        if (selected == .later_normalized) {
+            const generic = nativeAction(.database, 7, 0, 0);
+            try runtime.append(generic, .prepared, .none, null);
+            const checkpoint = try native_recovery.updateManagedState(
+                testing.allocator,
+                root,
+                runtime.intent_sha256,
+                generic,
+                &.{status.text},
+                false,
+            );
+            try runtime.append(generic, .completed, .applied, checkpoint);
+        }
+        const action = nativeAction(.database, 7, if (selected == .later_normalized) 1 else 0, 0);
+        const purpose_action = if (selected == .wrong_action) nativeAction(.database, 8, 0, 0) else action;
+        try runtime.append(action, .prepared, .none, if (selected == .generic)
+            null
+        else
+            triggerNormalizationPhaseEvidence(runtime.intent_sha256, purpose_action));
+        if (selected == .prepared_only) {
+            try testing.expect(!try recoveredTriggerNormalization(&runtime, action));
+            continue;
+        }
+        const checkpoint = if (selected == .no_checkpoint)
+            @as(native_recovery.Digest, @splat('0'))
+        else block: {
+            if (selected != .generic)
+                try root.publishFile(status, "Triggers-Pending: debz-b debz-a\n", .{ .overwrite = .replace });
+            break :block try native_recovery.updateManagedState(
+                testing.allocator,
+                root,
+                runtime.intent_sha256,
+                action,
+                &.{status.text},
+                false,
+            );
+        };
+        try runtime.append(action, .completed, .applied, if (selected == .wrong_checkpoint)
+            @as(native_recovery.Digest, @splat('0'))
+        else
+            checkpoint);
+        if (selected == .no_checkpoint or selected == .wrong_checkpoint) {
+            try testing.expectError(error.InvalidRecoveryProgress, recoveredTriggerNormalization(&runtime, action));
+        } else {
+            const normalized = selected == .normalized or selected == .later_normalized;
+            try testing.expectEqual(normalized, try recoveredTriggerNormalization(&runtime, action));
+            var execution: ExecutionState = .{ .recovery = &runtime, .program_step = 7 };
+            try resumeTriggerDatabasePhases(&execution, testing.allocator, root);
+            try testing.expectEqual(normalized, execution.trigger_pending_is_live);
+            try testing.expectEqual(@as(u16, if (selected == .later_normalized) 2 else 1), execution.phase_ordinal);
+        }
+    }
 }
 
 test "native_unpack.test.conffile phase digest binds mutation steps" {

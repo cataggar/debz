@@ -274,19 +274,30 @@ coalescing with repeated activations, without moving duplicates. The focused
 `-Dnative-trigger-byte-order-only=true` selector runs these cases in the
 existing native and two-dpkg oracle targets.
 
-Recovery restores the live/imported pending-name distinction from the
-authenticated completed incorporation phase, not from queue or activation-log
-contents. An uninterested activation can leave both empty after incorporation
-has already normalized imported pending names. Replaying that phase must keep
-the original triggered argv so the recorded ordinal and outcome are reused
-without rerunning the handler. Queue clearing without event application does
-not establish live pending order.
+Recovery restores the live/imported pending-name distinction only from an
+authenticated normalization publication, not a generic completed database
+phase or queue/log contents. Normalization binds an intent/action-specific
+purpose digest in the existing preparation record's `evidence_sha256`.
+Replay requires that preparation **and** successful completion bound to the
+retained managed checkpoint; a preparation alone cannot establish live order.
+The journal schemas, fields and stages are unchanged. Existing generic/null
+preparations remain readable and are not promoted to normalization evidence.
+An uninterested activation can leave the queue and activation log empty after
+normalization. Replaying that publication must keep the original triggered
+argv so the recorded ordinal and outcome are reused without rerunning the
+handler. Queue clearing without event application and scriptless-handler
+completion do not establish live pending order.
 `zig build test-native-recovery-helper-zig -j2
 -Dnative-trigger-recovery-order-only=true -Dnative-reference-dpkg=/absolute/path/to/dpkg`
 runs genuine `after_trigger_outcome` crash/recovery cases with one imported
-handler, with and without an uninterested queue entry. They require exact
+handler, with and without an uninterested queue entry, and a scripted handler
+after a scriptless handler's non-normalizing completion. They require exact
 pinned-dpkg argv and final status bytes, unchanged retained outcome bytes and
 action identity, and no duplicate callback on recovery or terminal replay.
+Unit cases reject an unfinished preparation, missing/mismatched checkpoint and
+purpose bound to another action, while retaining generic v1 record semantics.
+They also restore a later authenticated normalization after generic phase 0;
+restoration is not restricted to the first completed database phase.
 
 The full trigger suite also runs two **reference-only** guarded, pinned-dpkg
 cases for a failed activating postinst with an unpacked (not configured)

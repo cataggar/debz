@@ -2012,17 +2012,31 @@ fn knownScriptFailures(fixture: *foundation.Fixture, driver: []const u8, dpkg: [
         try knownFailure(fixture, driver, dpkg, arch, boundary);
 }
 
+const PendingTriggerOrderCase = enum { imported, unwatched_queue, scriptless_first };
+
 fn pendingTriggerOrderOutcome(
     fixture: *foundation.Fixture,
     driver: []const u8,
     dpkg: []const u8,
     arch: []const u8,
-    unwatched_queue: bool,
+    selected: PendingTriggerOrderCase,
 ) !void {
-    const name = if (unwatched_queue) "pending-trigger-unwatched-queue-outcome" else "pending-trigger-imported-outcome";
+    const name = switch (selected) {
+        .imported => "pending-trigger-imported-outcome",
+        .unwatched_queue => "pending-trigger-unwatched-queue-outcome",
+        .scriptless_first => "pending-trigger-scriptless-first-outcome",
+    };
     const handler_name = "debz-recovery-pending";
     var scenario = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
     defer scenario.deinit();
+    if (selected == .scriptless_first) {
+        const scriptless = try support.makePackage(fixture, arch, "1", "debz-recovery-a", try support.path(fixture.allocator, name, "scriptless"), .{
+            .declarations = "interest-noawait debz-a\ninterest-noawait debz-b\n",
+            .postinst = false,
+            .scripts = .{ .only_postinst = true },
+        });
+        try scenario.seed(scriptless);
+    }
     const handler = try support.makePackage(fixture, arch, "1", handler_name, try support.path(fixture.allocator, name, "handler"), .{
         .declarations = "interest-noawait debz-a\ninterest-noawait debz-b\n",
         .scripts = .{ .only_postinst = true },
@@ -2033,7 +2047,7 @@ fn pendingTriggerOrderOutcome(
         const pending = try std.mem.replaceOwned(u8, fixture.allocator, original, "Status: install ok installed", "Status: install ok triggers-pending");
         const status = try std.mem.replaceOwned(u8, fixture.allocator, pending, "\n\n", "\nTriggers-Pending: debz-a debz-b\n\n");
         try fixture.write(try relative(fixture, root, "var/lib/dpkg/status"), status, 0o644);
-        if (unwatched_queue)
+        if (selected == .unwatched_queue)
             try fixture.write(try relative(fixture, root, "var/lib/dpkg/triggers/Unincorp"), "debz-unwatched -\n", 0o644);
     }
     const reference_run = try support.path(fixture.allocator, name, "reference-process");
@@ -2055,7 +2069,7 @@ fn pendingTriggerOrderOutcome(
     try same(trace, expected_trace);
     try same(try bytes(fixture, scenario.reference_root, support.trace, 64 * 1024), trace);
     try same(try bytes(fixture, scenario.native_root, "var/lib/dpkg/triggers/Unincorp", 64 * 1024), "");
-    if (unwatched_queue) {
+    if (selected == .unwatched_queue) {
         var events = try document(fixture, scenario.native_root, debz.native_recovery.trigger_events_path);
         defer events.deinit();
         const log = try field(events.value, "events");
@@ -2077,6 +2091,29 @@ fn pendingTriggerOrderOutcome(
     }
     const original_action = action orelse return error.MissingTriggerOutcome;
     if (original_action.ordinal != 0) return error.UnexpectedTriggerOrdinal;
+    if (selected == .scriptless_first) {
+        const status = try bytes(fixture, scenario.native_root, "var/lib/dpkg/status", 64 * 1024);
+        if (std.mem.indexOf(u8, status, "Triggers-Pending: debz-a debz-b\n") == null or
+            std.mem.indexOf(u8, status, "Triggers-Pending: debz-b debz-a\n") != null)
+            return error.ScriptlessCompletionNormalizedOtherPendingNames;
+        const phase: debz.native_recovery.Action = .{
+            .kind = .database,
+            .program_step = original_action.program_step,
+            .substep = 0,
+            .ordinal = 0,
+        };
+        const completed = debz.native_recovery.latest(progress.document, phase) orelse
+            return error.MissingScriptlessCompletion;
+        if (completed.stage != .completed or completed.result != .applied)
+            return error.MissingScriptlessCompletion;
+        const checkpoint = (try debz.native_recovery.managedCheckpointDigestForAction(
+            fixture.allocator,
+            root,
+            progress.document.intent_sha256,
+            phase,
+        )) orelse return error.MissingScriptlessCompletion;
+        try same(&(completed.evidence_sha256 orelse return error.MissingScriptlessCompletion), &checkpoint);
+    }
     var outcome = (try debz.native_recovery.readScriptOutcome(fixture.allocator, root, original_action)) orelse
         return error.MissingTriggerOutcome;
     defer outcome.deinit();
@@ -2167,8 +2204,8 @@ pub fn main(init: std.process.Init) !void {
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after helper failure: {s}\n", .{@errorName(err)});
     if (trigger_pending_order_only) {
-        for ([_]bool{ false, true }) |queued|
-            try pendingTriggerOrderOutcome(&fixture, driver, reference.executable, reference.architecture, queued);
+        for ([_]PendingTriggerOrderCase{ .imported, .unwatched_queue, .scriptless_first }) |selected|
+            try pendingTriggerOrderOutcome(&fixture, driver, reference.executable, reference.architecture, selected);
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return;
     }
@@ -2225,8 +2262,8 @@ pub fn main(init: std.process.Init) !void {
     try blockedUnknown(&fixture, driver, reference.executable, reference.architecture, true);
     try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, false);
     try triggerOutcome(&fixture, driver, reference.executable, reference.architecture, true);
-    for ([_]bool{ false, true }) |queued|
-        try pendingTriggerOrderOutcome(&fixture, driver, reference.executable, reference.architecture, queued);
+    for ([_]PendingTriggerOrderCase{ .imported, .unwatched_queue, .scriptless_first }) |selected|
+        try pendingTriggerOrderOutcome(&fixture, driver, reference.executable, reference.architecture, selected);
     try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, false);
     try noInterestOutcome(&fixture, driver, reference.executable, reference.architecture, true);
     for ([_]Corruption{ .intent, .progress, .artifact, .managed_root, .completed_phase }) |which|
