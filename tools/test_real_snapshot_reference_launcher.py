@@ -20,6 +20,7 @@ from unittest import mock
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 from real_snapshot_reference_paths import open_absolute, protected, read_root_file
+import real_snapshot_less_fixtures as LESS_FIXTURES
 
 ROOT = TOOLS.parent
 SPEC = importlib.util.spec_from_file_location(
@@ -36,6 +37,69 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="debz-reference-negative-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    def test_less_negative_writes_refuse_leaf_aliases_without_touching_outside_bytes(self) -> None:
+        outside = self.root / "outside"
+        outside.write_bytes(b"must remain intact\n")
+        for relative, create in (("usr/bin/update-alternatives", False), ("etc/ld.so.cache", True)):
+            with self.subTest(relative=relative):
+                target = self.root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(outside)
+                with self.assertRaises(OSError):
+                    if create:
+                        LESS_FIXTURES.create_exclusive(self.root, relative, b"bad cache\n", 0o644)
+                    else:
+                        LESS_FIXTURES.overwrite_regular(self.root, relative, b"bad tool\n")
+                self.assertEqual(outside.read_bytes(), b"must remain intact\n")
+
+    def test_less_negative_writes_refuse_redirected_parent_components(self) -> None:
+        outside = self.root / "outside"
+        (outside / "bin").mkdir(parents=True)
+        tool = outside / "bin/update-alternatives"
+        tool.write_bytes(b"outside tool\n")
+        cache = outside / "ld.so.cache"
+        cache.write_bytes(b"outside cache\n")
+        fixture = self.root / "fixture"
+        fixture.mkdir()
+        (fixture / "usr").symlink_to(outside)
+        (fixture / "etc").symlink_to(outside)
+        with self.assertRaises(OSError):
+            LESS_FIXTURES.overwrite_regular(fixture, "usr/bin/update-alternatives", b"bad tool\n")
+        with self.assertRaises(OSError):
+            LESS_FIXTURES.create_exclusive(fixture, "etc/ld.so.cache", b"bad cache\n", 0o644)
+        self.assertEqual(tool.read_bytes(), b"outside tool\n")
+        self.assertEqual(cache.read_bytes(), b"outside cache\n")
+
+    def test_less_negative_file_type_and_hardlinks_refuse_before_truncation(self) -> None:
+        directory = self.root / "usr/bin"
+        directory.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.write_bytes(b"must not truncate\n")
+        target = directory / "update-alternatives"
+        os.link(outside, target)
+        with mock.patch.object(LESS_FIXTURES.os, "ftruncate", wraps=os.ftruncate) as truncate:
+            with self.assertRaises(ValueError):
+                LESS_FIXTURES.overwrite_regular(self.root, "usr/bin/update-alternatives", b"bad tool\n")
+            truncate.assert_not_called()
+            self.assertEqual(outside.read_bytes(), b"must not truncate\n")
+            target.unlink()
+            os.mkfifo(target)
+            with self.assertRaises(ValueError):
+                LESS_FIXTURES.overwrite_regular(self.root, "usr/bin/update-alternatives", b"bad tool\n")
+            truncate.assert_not_called()
+
+    def test_less_safe_fixture_writes_preserve_regular_and_exclusive_contract(self) -> None:
+        tool = self.root / "usr/bin/update-alternatives"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(b"original tool with longer contents\n")
+        (self.root / "etc").mkdir()
+        LESS_FIXTURES.overwrite_regular(self.root, "usr/bin/update-alternatives", b"bad tool\n")
+        self.assertEqual(tool.read_bytes(), b"bad tool\n")
+        LESS_FIXTURES.create_exclusive(self.root, "etc/ld.so.cache", b"bad cache\n", 0o644)
+        with self.assertRaises(FileExistsError):
+            LESS_FIXTURES.create_exclusive(self.root, "etc/ld.so.cache", b"replacement\n", 0o644)
+        self.assertEqual((self.root / "etc/ld.so.cache").read_bytes(), b"bad cache\n")
 
     def test_no_follow_database_rejects_symlinked_ancestors(self) -> None:
         (self.root / "var/lib").mkdir(parents=True)
