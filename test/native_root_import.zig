@@ -4,6 +4,7 @@ const native_provenance = @import("debz").native_provenance;
 const root_fs = @import("debz").root_fs;
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
+const dpkg_query = @import("native_dpkg_query.zig");
 const options = @import("native_test_options");
 
 const keeper = "import-keeper";
@@ -286,14 +287,19 @@ fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, archi
     const invalid_status = try std.mem.replaceOwned(u8, fixture.allocator, status_before, "Status: install ok installed", "Status: install ok mystery");
     defer fixture.allocator.free(invalid_status);
     try fixture.write("corrupt-import/" ++ admin ++ "status", invalid_status, 0o644);
+    try dpkg_query.observeRefusedImport(fixture, dpkg, architecture, corrupt, "corrupt-import", null);
     try refusal(fixture, driver, corrupt, architecture, archive, "corrupt-import", "invalid_state");
 
     const repeated = try std.mem.concat(fixture.allocator, u8, &.{ status_before, status_before });
     defer fixture.allocator.free(repeated);
     try fixture.write("ambiguous-import/" ++ admin ++ "status", repeated, 0o644);
+    try dpkg_query.observeRefusedImport(fixture, dpkg, architecture, ambiguous, "ambiguous-import", null);
     try refusal(fixture, driver, ambiguous, architecture, archive, "ambiguous-import", "repeated_identity");
 
     try fixture.write("unsupported-import/" ++ admin ++ "future-feature", "unknown metadata\n", 0o644);
+    const imported_show = try std.fmt.allocPrint(fixture.allocator, keeper ++ " 1 {s} install ok installed\n", .{architecture});
+    defer fixture.allocator.free(imported_show);
+    try dpkg_query.observeRefusedImport(fixture, dpkg, architecture, unsupported, "unsupported-import", imported_show);
     try refusal(fixture, driver, unsupported, architecture, archive, "unsupported-import", "UnsupportedDatabaseEntry");
 
     try fixture.write("unsafe-import/" ++ admin ++ "status", status_before, 0o666);
@@ -777,6 +783,7 @@ pub fn main(init: std.process.Init) !void {
     var fixture = try foundation.Fixture.init(allocator, init.io, options.repository);
     defer fixture.deinit();
     errdefer fixture.retain = true;
+    try dpkg_query.runImported(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try run(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try archNative(&fixture, driver, prerequisite.executable, prerequisite.architecture);
     try zeroActionTriggers(&fixture, driver, prerequisite.executable, prerequisite.architecture);
