@@ -154,6 +154,13 @@ target-native evidence therefore requires an explicit override instead of a
 dpkg subprocess. Root-adapter checks, malformed-input refusals, and allocation
 errors are preserved. The ordinary `snapshot` fallback contract is unchanged.
 
+`zig build test-target-apt-config -j2` discovers both the importer and
+`system_product_context` modules explicitly. Its context cases cover deeply
+read-only borrowed facts, allocation-failure ownership, retained work, root
+identity, immutable-generation drift, and independence from the public
+operation manifest. Use `-Doptimize=ReleaseSafe` to repeat the same cases;
+compile filters alone do not discover Zig's lazy module imports.
+
 Callers may attach an explicit freshness policy to a discovered source path.
 The default requires signed `Valid-Until`; the only alternative allows a
 missing field for a nonzero, bounded maximum Release age. Unknown, duplicate,

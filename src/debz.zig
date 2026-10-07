@@ -644,6 +644,7 @@ test {
     _ = repository_refresh;
     _ = repository_policy;
     _ = target_apt_config;
+    _ = system_product_context;
     _ = reviewed_repository_profile;
     _ = signed_release_envelope;
     _ = openpgp_verifier;

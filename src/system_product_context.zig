@@ -215,12 +215,12 @@ const Fixture = struct {
     fn init(architecture: []const u8, state: []const u8) !Fixture {
         const allocator = std.testing.allocator;
         var random: [16]u8 = undefined;
-        std.crypto.random.bytes(&random);
+        try std.Io.randomSecure(std.testing.io, &random);
         const name = std.fmt.bytesToHex(random, .lower);
         const relative = try std.fmt.allocPrint(allocator, ".zig-cache/system-context-{s}", .{name});
         errdefer allocator.free(relative);
         try std.Io.Dir.cwd().createDirPath(std.testing.io, ".zig-cache");
-        try std.Io.Dir.cwd().createDir(std.testing.io, relative, .{});
+        try std.Io.Dir.cwd().createDir(std.testing.io, relative, .fromMode(0o700));
         errdefer std.Io.Dir.cwd().deleteTree(std.testing.io, relative) catch {};
         var dir = try std.Io.Dir.cwd().openDir(std.testing.io, relative, .{ .follow_symlinks = false });
         defer dir.close(std.testing.io);
@@ -279,7 +279,7 @@ const Fixture = struct {
             .policy_sha256 = @splat(2),
             .target_architecture = snapshot.manifest.manifest.native_architecture,
         });
-        defer attempt.deinit();
+        defer attempt.release();
         try active.publish(allocator, &attempt, self.state, self.manifest_path, snapshot.manifest.manifest, observer);
         try attempt.complete(allocator, .abandoned_before_mutation);
         try attempt.clear();
@@ -430,12 +430,32 @@ test "system_product_context refuses source key manifest and active-pointer drif
     try fixture.root.root.publishFile(try root_fs.Path.init(Fixture.keyring_path), &@import("fixtures/openpgp.zig").keyring, .{ .permissions = .fromMode(0o664) });
     try std.testing.expectError(error.UnsafeActiveConfigFile, context.validate());
     try fixture.root.root.publishFile(try root_fs.Path.init(Fixture.keyring_path), &@import("fixtures/openpgp.zig").keyring, .{});
-    const manifest = try root_fs.Path.fromAbsolute(fixture.manifest_path);
+    const manifest = try root_fs.Path.fromAbsolute(context.manifestPath());
     try fixture.root.root.publishFile(manifest, "truncated", .{ .permissions = .fromMode(0o600) });
     try std.testing.expectError(error.ActiveManifestChanged, context.validate());
     const active_path = try root_fs.Path.fromAbsolute(context.activePath());
     try fixture.root.root.publishFile(active_path, "{\"unexpected\":true}", .{ .permissions = .fromMode(0o600) });
     try std.testing.expectError(error.InvalidActiveConfig, context.validate());
+}
+
+test "system_product_context public operation manifest changes preserve immutable generation" {
+    var fixture = try Fixture.init("amd64", "/var/lib/debz");
+    defer fixture.deinit();
+    try fixture.activate();
+    const context = try resolve(std.testing.allocator, std.testing.io, .{ .root = fixture.path });
+    defer context.deinit();
+    const path = try root_fs.Path.fromAbsolute(context.manifestPath());
+    const before = try fixture.root.root.readFileAlloc(std.testing.allocator, path, target.maximum_document_bytes);
+    defer std.testing.allocator.free(before);
+    try fixture.root.root.publishFile(try root_fs.Path.fromAbsolute(fixture.manifest_path), "truncated public operation manifest", .{ .permissions = .fromMode(0o600) });
+    try context.validate();
+    const reopened = try resolve(std.testing.allocator, std.testing.io, .{ .root = fixture.path });
+    defer reopened.deinit();
+    try reopened.validate();
+    try std.testing.expectEqualStrings(context.manifestPath(), reopened.manifestPath());
+    const after = try fixture.root.root.readFileAlloc(std.testing.allocator, path, target.maximum_document_bytes);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
 }
 
 test "system_product_context refuses copied configuration and unrecorded target sources" {
@@ -450,7 +470,7 @@ test "system_product_context refuses copied configuration and unrecorded target 
     defer std.testing.allocator.free(bytes);
     try second.root.root.publishFile(path, bytes, .{ .permissions = .fromMode(0o600) });
     try std.testing.expectError(error.ForeignActiveRoot, resolve(std.testing.allocator, std.testing.io, .{ .root = second.path }));
-    try first.root.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/extra.list"), Fixture.source_bytes, .{});
+    try first.root.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/extra.list"), "deb [signed-by=/usr/share/keyrings/vendor.gpg] https://extra.vendor.invalid/ubuntu noble main\n", .{});
     try std.testing.expectError(error.ActiveConfigurationChanged, resolve(std.testing.allocator, std.testing.io, .{ .root = first.path }));
 }
 
