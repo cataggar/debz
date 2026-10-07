@@ -19392,6 +19392,29 @@ test "native_unpack.test.signed python3 preinst is inert only for exact install 
         @splat('0'),
         args,
     ));
+    var arm64_package = package;
+    arm64_package.architecture = "arm64";
+    try testing.expect(!snapshotPython3PreinstIsBound(
+        "arm64",
+        arm64_package,
+        .preinst,
+        .new_package,
+        .script,
+        digest,
+        args,
+    ));
+    try testing.expectError(
+        error.InvalidAlternativesScriptAuthority,
+        snapshotPython3PreinstIsInert(
+            script,
+            "arm64",
+            arm64_package,
+            .preinst,
+            .new_package,
+            args,
+            .script,
+        ),
+    );
     for ([_]struct {
         architecture: []const u8 = "amd64",
         package: native_program.PackageIdentity = package,
@@ -22565,18 +22588,14 @@ fn verifySnapshotPython3PreinstInputs(
                 .{ binding.path, binding.target, observed.target },
             );
     }
-    try verifySnapshotPython3PreinstArtifacts(program.artifacts);
-    for ([_]SignedDebconfControlFile{
-        .{ .path = "var/lib/dpkg/info/python3.preinst", .size = 856, .mode = 0o755, .sha256 = snapshot_python3_preinst_sha256 },
-        .{ .path = "var/lib/dpkg/info/python3.list", .size = 918, .mode = 0o644, .sha256 = "383196acd094063e8e49dc4511deb7094e264a41d872bb889d21b197a550f628" },
-        .{ .path = "var/lib/dpkg/info/python3-minimal.list", .size = 781, .mode = 0o644, .sha256 = "82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519" },
-        .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
-        .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6" },
-    }) |binding| try verifySignedDebconfControlFile(
+    try verifySnapshotPython3PreinstArtifacts(
+        program.artifacts,
+        program.target_architecture,
+    );
+    try verifySnapshotPython3PreinstControlFiles(
         allocator,
         root,
-        binding,
-        error.InvalidPython3PreinstControl,
+        program.target_architecture,
     );
     try verifySnapshotPython3NullFile(
         allocator,
@@ -22586,31 +22605,260 @@ fn verifySnapshotPython3PreinstInputs(
     );
 }
 
-fn verifySnapshotPython3PreinstArtifacts(
-    artifacts: []const native_program.ProgramArtifact,
-) !void {
-    for ([_]struct {
-        package: native_program.PackageIdentity,
+const SnapshotPython3PreinstBinding = struct {
+    architecture: []const u8,
+    artifacts: [2]struct {
+        name: []const u8,
         size: u64,
         sha512: []const u8,
-    }{
-        .{
-            .package = .{ .name = "python3", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
-            .size = 22938,
-            .sha512 = "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
+    },
+    tools: [2]SignedDebconfControlFile,
+};
+
+const snapshot_python3_preinst_bindings = [_]SnapshotPython3PreinstBinding{
+    .{
+        .architecture = "amd64",
+        .artifacts = .{
+            .{
+                .name = "python3",
+                .size = 22938,
+                .sha512 = "616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
+            },
+            .{
+                .name = "python3-minimal",
+                .size = 25808,
+                .sha512 = "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
+            },
         },
-        .{
-            .package = .{ .name = "python3-minimal", .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
-            .size = 25808,
-            .sha512 = "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
+        .tools = .{
+            .{ .path = "usr/bin/dash", .size = 129856, .mode = 0o755, .sha256 = "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917" },
+            .{ .path = "usr/bin/gnurm", .size = 64096, .mode = 0o755, .sha256 = "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6" },
         },
-    }) |binding| try verifyAuthenticatedSnapshotArtifact(
+    },
+    .{
+        .architecture = "arm64",
+        .artifacts = .{
+            .{
+                .name = "python3",
+                .size = 22938,
+                .sha512 = "bad3bb3efc461da27a358059071544b865f05a387c2f3ae88f181fbe25965541b3dead5704092ff22a1bde61f70a452462c8f3537b16358dede22ccbab165f2d",
+            },
+            .{
+                .name = "python3-minimal",
+                .size = 25808,
+                .sha512 = "a6cd021e0907b3f9c5eb1ca7777450bd1dc89d9cad2714c3239850a78d1e2d6953c28672cf0c76cbf40d5665881b91b5eafeec9e3f4f1fe348a24129a1c4ade2",
+            },
+        },
+        .tools = .{
+            .{ .path = "usr/bin/dash", .size = 133864, .mode = 0o755, .sha256 = "87630eb41654f7888e28fa5ef3ed0a351682e939d382b9239a24a8aefe84aeb9" },
+            .{ .path = "usr/bin/gnurm", .size = 68224, .mode = 0o755, .sha256 = "d4887172b8395e1eabcefa9320a861489b80496e23bb1f3e62ca8f1d250332d8" },
+        },
+    },
+};
+
+fn snapshotPython3PreinstBinding(
+    architecture: []const u8,
+) !*const SnapshotPython3PreinstBinding {
+    for (&snapshot_python3_preinst_bindings) |*binding| {
+        if (std.mem.eql(u8, architecture, binding.architecture)) return binding;
+    }
+    return invalidPython3Preinst(
+        "reason=architecture_unbound field=target_architecture expected=amd64|arm64 observed={s}",
+        .{architecture},
+    );
+}
+
+const snapshot_python3_preinst_controls = [_]SignedDebconfControlFile{
+    .{ .path = "var/lib/dpkg/info/python3.preinst", .size = 856, .mode = 0o755, .sha256 = snapshot_python3_preinst_sha256 },
+    .{ .path = "var/lib/dpkg/info/python3.list", .size = 918, .mode = 0o644, .sha256 = "383196acd094063e8e49dc4511deb7094e264a41d872bb889d21b197a550f628" },
+    .{ .path = "var/lib/dpkg/info/python3-minimal.list", .size = 781, .mode = 0o644, .sha256 = "82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519" },
+};
+
+fn verifySnapshotPython3PreinstControlFiles(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    architecture: []const u8,
+) !void {
+    const selected = try snapshotPython3PreinstBinding(architecture);
+    for (snapshot_python3_preinst_controls) |binding| try verifySignedDebconfControlFile(
+        allocator,
+        root,
+        binding,
+        error.InvalidPython3PreinstControl,
+    );
+    for (selected.tools) |binding| try verifySignedDebconfControlFile(
+        allocator,
+        root,
+        binding,
+        error.InvalidPython3PreinstControl,
+    );
+}
+
+fn verifySnapshotPython3PreinstArtifacts(
+    artifacts: []const native_program.ProgramArtifact,
+    architecture: []const u8,
+) !void {
+    const selected = try snapshotPython3PreinstBinding(architecture);
+    for (selected.artifacts) |binding| try verifyAuthenticatedSnapshotArtifact(
         artifacts,
-        binding.package,
+        .{ .name = binding.name, .version = "3.14.3-0ubuntu2", .architecture = selected.architecture },
         binding.size,
         binding.sha512,
         error.InvalidPython3PreinstControl,
     );
+}
+
+test "native_unpack.test.snapshot python3 artifacts reject cross architecture and unauthenticated mutations" {
+    for (snapshot_python3_preinst_bindings) |selected| {
+        var artifacts: [2]native_program.ProgramArtifact = undefined;
+        for (selected.artifacts, &artifacts, 0..) |binding, *artifact, index| {
+            artifact.* = .{
+                .index = @intCast(index),
+                .package = .{ .name = binding.name, .version = "3.14.3-0ubuntu2", .architecture = selected.architecture },
+                .archive_identity = content_digest.JsonIdentity.init(
+                    try content_digest.Identity.init(
+                        .{ .sha512 = (try content_digest.Value.parse(.sha512, binding.sha512)).sha512 },
+                        .sha512,
+                    ),
+                ),
+                .size = binding.size,
+                .application_sha256 = @splat('0'),
+                .origin_v2 = .{ .authenticated_repository = .{
+                    .repository_id = @splat('0'),
+                    .repository_snapshot_sha256 = @splat('0'),
+                } },
+            };
+        }
+        try verifySnapshotPython3PreinstArtifacts(&artifacts, selected.architecture);
+        const other = if (std.mem.eql(u8, selected.architecture, "amd64")) "arm64" else "amd64";
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3PreinstArtifacts(&artifacts, other),
+        );
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3PreinstArtifacts(&artifacts, "riscv64"),
+        );
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3PreinstArtifacts(artifacts[0..1], selected.architecture),
+        );
+        try testing.expectError(
+            error.InvalidPython3PreinstControl,
+            verifySnapshotPython3PreinstArtifacts(&.{ artifacts[0], artifacts[0], artifacts[1] }, selected.architecture),
+        );
+        for (0..artifacts.len) |index| {
+            const original = artifacts[index];
+            artifacts[index].package.architecture = other;
+            try testing.expectError(
+                error.InvalidPython3PreinstControl,
+                verifySnapshotPython3PreinstArtifacts(&artifacts, selected.architecture),
+            );
+            artifacts[index] = original;
+            artifacts[index].package.version = "3.14.3-0ubuntu3";
+            try testing.expectError(
+                error.InvalidPython3PreinstControl,
+                verifySnapshotPython3PreinstArtifacts(&artifacts, selected.architecture),
+            );
+            artifacts[index] = original;
+            artifacts[index].size += 1;
+            try testing.expectError(
+                error.InvalidPython3PreinstControl,
+                verifySnapshotPython3PreinstArtifacts(&artifacts, selected.architecture),
+            );
+            artifacts[index] = original;
+            var digest = original.identity().?.digests.sha512.?;
+            digest[0] ^= 1;
+            artifacts[index].archive_identity = content_digest.JsonIdentity.init(
+                try content_digest.Identity.init(.{ .sha512 = digest }, .sha512),
+            );
+            try testing.expectError(
+                error.InvalidPython3PreinstControl,
+                verifySnapshotPython3PreinstArtifacts(&artifacts, selected.architecture),
+            );
+            artifacts[index] = original;
+            artifacts[index].origin_v2 = null;
+            try testing.expectError(
+                error.InvalidPython3PreinstControl,
+                verifySnapshotPython3PreinstArtifacts(&artifacts, selected.architecture),
+            );
+            artifacts[index] = original;
+            artifacts[index].package.architecture = other;
+            try testing.expectError(
+                error.InvalidPython3PreinstControl,
+                verifySnapshotPython3PreinstArtifacts(&artifacts, other),
+            );
+            artifacts[index] = original;
+        }
+    }
+}
+
+test "native_unpack.test.snapshot python3 controls reject foreign tools and semantic prestate changes" {
+    const amd64 = try snapshotPython3PreinstBinding("amd64");
+    const arm64 = try snapshotPython3PreinstBinding("arm64");
+    for (amd64.tools, arm64.tools) |amd64_tool, arm64_tool| {
+        const amd64_digest = parseHex(32, amd64_tool.sha256).?;
+        const arm64_digest = parseHex(32, arm64_tool.sha256).?;
+        var entry: root_fs.Entry = .{
+            .kind = .file,
+            .size = arm64_tool.size,
+            .mode = arm64_tool.mode,
+            .uid = 0,
+            .gid = 0,
+            .device = 1,
+            .inode = 2,
+            .link_count = 1,
+            .modified_nanoseconds = 0,
+            .modeled = true,
+        };
+        try testing.expect(matchesSignedDebconfControlFile(entry, arm64_digest, arm64_tool));
+        try testing.expect(!matchesSignedDebconfControlFile(entry, amd64_digest, arm64_tool));
+        try testing.expect(!matchesSignedDebconfControlFile(entry, arm64_digest, amd64_tool));
+        entry.size = amd64_tool.size;
+        try testing.expect(matchesSignedDebconfControlFile(entry, amd64_digest, amd64_tool));
+        try testing.expect(!matchesSignedDebconfControlFile(entry, amd64_digest, arm64_tool));
+    }
+    for (snapshot_python3_preinst_controls) |binding| {
+        const digest = parseHex(32, binding.sha256).?;
+        var entry: root_fs.Entry = .{
+            .kind = .file,
+            .size = binding.size,
+            .mode = binding.mode,
+            .uid = 0,
+            .gid = 0,
+            .device = 1,
+            .inode = 2,
+            .link_count = 1,
+            .modified_nanoseconds = 0,
+            .modeled = true,
+        };
+        try testing.expect(matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.mode = 0o666;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.mode = binding.mode;
+        entry.link_count = 2;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.link_count = 1;
+        entry.size += 1;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, digest, binding));
+        entry.size = binding.size;
+        var changed_digest = digest;
+        changed_digest[0] ^= 1;
+        try testing.expect(!matchesSignedDebconfControlFile(entry, changed_digest, binding));
+    }
+    const script = @embedFile("fixtures/ubuntu-resolute-python3.preinst");
+    const offset = std.mem.indexOf(u8, script, "rm -rf").?;
+    const changed = try testing.allocator.dupe(u8, script);
+    defer testing.allocator.free(changed);
+    @memcpy(changed[offset .. offset + 2], "id");
+    try testing.expect(!native_alternatives.matchesSnapshotPython3Preinst(changed));
+    var changed_digest: [32]u8 = undefined;
+    Sha256.hash(changed, &changed_digest, .{});
+    try testing.expect(!std.crypto.timing_safe.eql(
+        [32]u8,
+        parseHex(32, snapshot_python3_preinst_controls[0].sha256).?,
+        changed_digest,
+    ));
 }
 
 test "native_unpack.test.snapshot authenticated artifacts bind resolute provenance" {
@@ -22680,7 +22928,7 @@ test "native_unpack.test.snapshot authenticated artifacts bind resolute provenan
         25808,
         "e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
     );
-    try verifySnapshotPython3PreinstArtifacts(&.{ python3, python3_minimal });
+    try verifySnapshotPython3PreinstArtifacts(&.{ python3, python3_minimal }, "amd64");
 
     var changed = chrony;
     changed.package.version = "4.8-2ubuntu2";
@@ -22702,7 +22950,7 @@ test "native_unpack.test.snapshot authenticated artifacts bind resolute provenan
     changed.size += 1;
     try testing.expectError(
         error.InvalidPython3PreinstControl,
-        verifySnapshotPython3PreinstArtifacts(&.{ python3, changed }),
+        verifySnapshotPython3PreinstArtifacts(&.{ python3, changed }, "amd64"),
     );
 }
 
@@ -22746,6 +22994,7 @@ test "native_unpack.test.snapshot python3 preinst diagnostics identify bindings"
         return error.TestUnexpectedResult;
     var program: native_program.Program = undefined;
     program.artifacts = &.{};
+    program.target_architecture = "amd64";
     clearNativeRecoveryErrorDetail();
     try testing.expectError(
         error.InvalidPython3PreinstControl,
@@ -22776,7 +23025,7 @@ test "native_unpack.test.snapshot python3 preinst diagnostics identify bindings"
     clearNativeRecoveryErrorDetail();
     try testing.expectError(
         error.InvalidPython3PreinstControl,
-        verifySnapshotPython3PreinstArtifacts(&.{ python3, python3_minimal }),
+        verifySnapshotPython3PreinstArtifacts(&.{ python3, python3_minimal }, "amd64"),
     );
     try Helper.expectDetail(error.InvalidPython3PreinstControl, &.{
         "reason=artifact_identity_mismatch",
@@ -22926,6 +23175,7 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
     }
     var program: native_program.Program = undefined;
     program.artifacts = &artifacts;
+    program.target_architecture = "amd64";
     try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);
     try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);
     try verifySnapshotPython3PreinstPaths(
