@@ -1848,6 +1848,8 @@ jobs:
                 prestate-build/evidence/base-cycle-proof/candidate.stderr \
                 prestate-build/evidence/base-cycle-proof/pending.stdout \
                 prestate-build/evidence/base-cycle-proof/pending.stderr \
+                prestate-build/evidence/base-cycle-proof/pending-result.json \
+                prestate-build/evidence/base-cycle-proof/pending-status.json \
                 prestate-build/evidence/base-cycle-proof/callback-refusal.log \
                 compare/systemd.json compare/udev.json compare/sudo.json \
                 proofs/systemd/var/log/dpkg.log proofs/udev/var/log/dpkg.log \

@@ -26,6 +26,7 @@ readonly closure_sha256=5223cb19af6f686faa591eb6575b6d585a830473d98550df52ef958f
 readonly pinned_dpkg_sha256=0a20f6015fbb7c011571f3ed227a138b12ce282e46b7fdfc239558bc5a7bc9e5
 readonly signed_dpkg='usr/bin/dpkg:322728:755:972003a11f3ae0f5b2556dce1d2c2721fb5119818b9bbef1124293024fdb6517'
 readonly setpriv_sha256=86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993
+readonly setpriv_runtime_sha256=60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f
 
 [[ $# == 2 && $(id -u) == 0 ]] || {
   echo "usage (as root): $0 PINNED_DPKG BINDING_WORKSPACE" >&2
@@ -149,7 +150,8 @@ jq -e --arg release "$release_sha256" --arg updates "$updates_release_sha256" \
     (.name == "udev" and .version == "259.5-0ubuntu3.4") or
     (.name == "sudo" and .version == "1.9.17p2-1ubuntu3.1") or
     (.name == "sudo-rs" and .version == "0.2.13-0ubuntu1.2") or
-    (.name == "util-linux" and .version == "2.41.3-3ubuntu2.2")))] | length) == 5
+    (.name == "util-linux" and .version == "2.41.3-3ubuntu2.2") or
+    (.name == "libcap-ng0" and .version == "0.8.5-4build5")))] | length) == 6
 ' "$lock" >/dev/null
 
 install -d -o root -g root -m 0700 "$build" "$build/evidence" "$build/tmp" "$prestates" "$tools"
@@ -167,6 +169,7 @@ jq -r '
 
 bootstrap=()
 util_linux=
+libcap_ng=
 while IFS=$'\t' read -r name version package_arch digest size; do
   [[ "$name" =~ ^[a-z0-9][a-z0-9+.-]*$ &&
      "$version" != *$'\t'* && "$version" != *$'\n'* &&
@@ -183,9 +186,10 @@ while IFS=$'\t' read -r name version package_arch digest size; do
     libc6|dash|bash|gnu-coreutils|coreutils|coreutils-from-gnu|dpkg|libmd0|libbz2-1.0|liblzma5|libselinux1|libzstd1|zlib1g|libacl1|libattr1|libgmp10|libssl3t64|libsystemd0|libpcre2-8-0|libgcc-s1|libcrypt1|perl-base|mawk|sed|grep|findutils|tar|gzip|debianutils|debconf)
       bootstrap+=("$archive") ;;
     util-linux) util_linux=$archive ;;
+    libcap-ng0) libcap_ng=$archive ;;
   esac
 done <"$evidence/reference-archives.tsv"
-(( ${#bootstrap[@]} == 30 )) && [[ -n "$util_linux" ]] || {
+(( ${#bootstrap[@]} == 30 )) && [[ -n "$util_linux" && -n "$libcap_ng" ]] || {
   echo "prestate bootstrap tool closure is incomplete" >&2
   exit 1
 }
@@ -232,6 +236,13 @@ dpkg-deb --fsys-tarfile "$util_linux" | tar -xO ./usr/bin/setpriv >"$tools/setpr
 chmod 0755 "$tools/setpriv"
 [[ $(sha256sum "$tools/setpriv" | cut -d' ' -f1) == "$setpriv_sha256" ]]
 sha256sum "$tools/setpriv" >"$tools/setpriv.sha256"
+# setpriv needs libcap-ng.so.0, absent from the unchanged 30-archive bootstrap.
+dpkg-deb --fsys-tarfile "$libcap_ng" |
+  tar -xO ./usr/lib/x86_64-linux-gnu/libcap-ng.so.0.0.0 >"$tools/libcap-ng.so.0.0.0"
+chmod 0644 "$tools/libcap-ng.so.0.0.0"
+require_protected_file "$tools/libcap-ng.so.0.0.0"
+[[ $(stat -c '%s' "$tools/libcap-ng.so.0.0.0") == 26928 &&
+   $(sha256sum "$tools/libcap-ng.so.0.0.0" | cut -d' ' -f1) == "$setpriv_runtime_sha256" ]]
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 5m \
