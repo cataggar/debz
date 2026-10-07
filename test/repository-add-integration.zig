@@ -151,7 +151,12 @@ pub fn main(init: std.process.Init) !void {
     });
     defer context.deinit();
     try context.validate();
-    try expect(std.mem.eql(u8, context.manifestPath(), first.paths.target_manifest.?));
+    const active_manifest_bytes = try context.snapshot().manifest.canonicalJson(allocator);
+    defer allocator.free(active_manifest_bytes);
+    const generation = try debz.active_repository_config.generationPath(allocator, "/var/lib/debz", active_manifest_bytes);
+    defer allocator.free(generation);
+    try expect(std.mem.eql(u8, context.manifestPath(), generation));
+    try expect(!std.mem.eql(u8, context.manifestPath(), first.paths.target_manifest.?));
     try expect(context.snapshot().configuration.repositories.len == 2);
     try expect(context.options().source_paths.len == 0);
     const calls_after_first = simulated_dpkg.calls;

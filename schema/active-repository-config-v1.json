@@ -22,7 +22,7 @@
         "manifest_path": {
           "type": "string",
           "maxLength": 4096,
-          "pattern": "^/[^\\u0000\\r\\n]+/repository/operations/[a-f0-9]{64}/apt-config-snapshot-v1\\.json$"
+          "pattern": "^/[^\\u0000\\r\\n]+/repository/(operations|generations)/[a-f0-9]{64}/apt-config-snapshot-v1\\.json$"
         },
         "manifest_sha256": { "$ref": "#/$defs/sha256" }
       }

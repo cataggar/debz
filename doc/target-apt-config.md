@@ -87,8 +87,13 @@ state `/var/lib/debz`. `options()` returns the physical paths under the
 selected root, validated native/foreign architectures, noninteractive mode,
 and `keep_existing` conffile policy. `locksPath()` selects `<state>/locks`.
 It does **not** set `assume_yes`, create directories, select a backend, fill
-generic product repository paths, or authorize mutation. Consumers use the
-snapshot's normalized configuration and `runtimeTrust` byte inputs; reopening
+generic product repository paths, or authorize mutation. `snapshot()` returns
+non-owning, deeply read-only facts, including `[]const NormalizedRepository`;
+it exposes neither mutable configuration storage nor owning arenas. Detached
+value copies cannot change the retained context. Consumers obtain verifier
+inputs with `context.runtimeTrust(allocator, repository.id)`, which resolves
+only retained repository identities, rather than accepting caller-edited
+repository facts. Reopening
 its logical key paths against the process host would violate this boundary.
 
 Architecture comes from target installed-dpkg metadata with **no subprocess

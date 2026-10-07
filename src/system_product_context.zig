@@ -5,6 +5,21 @@ const live_root = @import("live_root.zig");
 const root_fs = @import("root_fs.zig");
 const root_operation = @import("root_operation.zig");
 const target = @import("target_apt_config.zig");
+const repository_policy = @import("repository_policy.zig");
+const source = @import("source.zig");
+const openpgp = @import("openpgp_verifier.zig");
+
+pub const SnapshotFacts = struct {
+    configuration: struct {
+        repositories: []const repository_policy.NormalizedRepository,
+        canonical_deb822: []const u8,
+        identity: source.RepositoryId,
+    },
+    manifest: target.Manifest,
+    source_materials: []const target.SourceMaterial,
+    keyring_materials: []const target.KeyringMaterial,
+    verifier_limits: openpgp.Limits,
+};
 
 pub const Request = struct {
     root: []const u8 = "/",
@@ -30,8 +45,28 @@ pub const Context = opaque {
         allocator.destroy(value);
     }
 
-    pub fn snapshot(self: *const Context) *const target.Snapshot {
-        return &self.data().loaded.snapshot;
+    pub fn snapshot(self: *const Context) SnapshotFacts {
+        const loaded = &self.data().loaded.snapshot;
+        return .{
+            .configuration = .{
+                .repositories = loaded.configuration.repositories,
+                .canonical_deb822 = loaded.configuration.canonical_deb822,
+                .identity = loaded.configuration.identity,
+            },
+            .manifest = loaded.manifest.manifest,
+            .source_materials = loaded.source_materials,
+            .keyring_materials = loaded.keyring_materials,
+            .verifier_limits = loaded.verifier_limits,
+        };
+    }
+
+    pub fn runtimeTrust(self: *const Context, allocator: std.mem.Allocator, id: source.RepositoryId) !target.RuntimeTrust {
+        const loaded = &self.data().loaded.snapshot;
+        for (loaded.configuration.repositories) |repository| {
+            if (std.mem.eql(u8, repository.id.slice(), id.slice()))
+                return loaded.runtimeTrust(allocator, repository);
+        }
+        return error.UnknownActiveRepository;
     }
 
     pub fn options(self: *const Context) api.CommonOptions {
@@ -63,7 +98,7 @@ pub const Context = opaque {
         try refuseActiveWork(reopened.root);
         var loaded = try active.load(value.allocator, reopened.root, value.configuration_root, value.request.state_path, value.request.architecture);
         defer loaded.deinit();
-        if (!std.mem.eql(u8, &loaded.snapshot.manifest.manifest.digest_sha256, &self.snapshot().manifest.manifest.digest_sha256) or
+        if (!std.mem.eql(u8, &loaded.snapshot.manifest.manifest.digest_sha256, &value.loaded.snapshot.manifest.manifest.digest_sha256) or
             !std.mem.eql(u8, loaded.pointer.value.digest_sha256, value.loaded.pointer.value.digest_sha256))
             return error.ActiveConfigurationChanged;
     }
@@ -286,14 +321,51 @@ test "system_product_context typed defaults preserve target trust on amd64 and a
         try std.testing.expectError(error.FileNotFound, fixture.root.root.openDirectory(try root_fs.Path.init("var/cache/debz")));
         try std.testing.expect(context.options().noninteractive and context.options().conffile == .keep_existing);
         try std.testing.expect(!context.options().assume_yes and context.options().source_paths.len == 0);
-        try std.testing.expectEqualStrings(fixture.manifest_path, context.manifestPath());
+        const manifest_bytes = try context.snapshot().manifest.canonicalJson(std.testing.allocator);
+        defer std.testing.allocator.free(manifest_bytes);
+        const generation = try active.generationPath(std.testing.allocator, fixture.state, manifest_bytes);
+        defer std.testing.allocator.free(generation);
+        try std.testing.expectEqualStrings(generation, context.manifestPath());
         const repository = context.snapshot().configuration.repositories[0];
         try std.testing.expectEqual(@as(u64, 14 * 24 * 60 * 60), repository.freshness.allow_missing_valid_until_with_max_age_seconds);
-        var trust = try context.snapshot().runtimeTrust(std.testing.allocator, repository);
+        var trust = try context.runtimeTrust(std.testing.allocator, repository.id);
         defer trust.deinit();
         try std.testing.expectEqualStrings("/usr/share/keyrings/vendor.gpg", trust.declared_keyrings[0]);
         try std.testing.expectEqualSlices(u8, &@import("fixtures/openpgp.zig").keyring, trust.keyrings[0].bytes);
     }
+}
+
+fn requireDeepReadonly(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .pointer => |pointer| {
+            if (!pointer.is_const) @compileError("system context exposes mutable owned facts");
+            requireDeepReadonly(pointer.child);
+        },
+        .@"struct" => |structure| inline for (structure.fields) |field| requireDeepReadonly(field.type),
+        .@"union" => |structure| inline for (structure.fields) |field| requireDeepReadonly(field.type),
+        .optional => |optional| requireDeepReadonly(optional.child),
+        .array => |array| requireDeepReadonly(array.child),
+        else => {},
+    }
+}
+
+test "system_product_context exposes only deep readonly borrowed facts and detached copies" {
+    var fixture = try Fixture.init("amd64", "/var/lib/debz");
+    defer fixture.deinit();
+    try fixture.activate();
+    const context = try resolve(std.testing.allocator, std.testing.io, .{ .root = fixture.path });
+    defer context.deinit();
+    comptime requireDeepReadonly(@TypeOf(context.snapshot()));
+    comptime requireDeepReadonly(@TypeOf(context.options()));
+    var detached = context.snapshot().configuration.repositories[0];
+    detached.uri = "https://untrusted.invalid/";
+    detached.freshness = .require_valid_until;
+    var manifest = context.snapshot().manifest;
+    manifest.digest_sha256[0] ^= 1;
+    try context.validate();
+    try std.testing.expect(!std.mem.eql(u8, detached.uri, context.snapshot().configuration.repositories[0].uri));
+    try std.testing.expectEqual(@as(u64, 14 * 24 * 60 * 60), context.snapshot().configuration.repositories[0].freshness.allow_missing_valid_until_with_max_age_seconds);
+    try std.testing.expect(!std.mem.eql(u8, &manifest.digest_sha256, &context.snapshot().manifest.digest_sha256));
 }
 
 test "system_product_context allocation failures retain the published configuration" {

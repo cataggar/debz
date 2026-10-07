@@ -30,14 +30,18 @@ pub fn logicalPath(allocator: std.mem.Allocator, state_path: []const u8) ![]u8 {
 
 fn manifestPath(allocator: std.mem.Allocator, state_path: []const u8, path: []const u8) !root_fs.Path {
     const parsed = try root_fs.Path.fromAbsolute(path);
-    const prefix = try std.fmt.allocPrint(allocator, "{s}/repository/operations/", .{state_path});
-    defer allocator.free(prefix);
     const suffix = "/apt-config-snapshot-v1.json";
-    if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, suffix) or
-        path.len != prefix.len + 64 + suffix.len)
-        return error.InvalidActiveManifestPath;
-    _ = try parseDigest(path[prefix.len..][0..64]);
-    return parsed;
+    for ([_][]const u8{ "operations", "generations" }) |directory| {
+        const prefix = try std.fmt.allocPrint(allocator, "{s}/repository/{s}/", .{ state_path, directory });
+        defer allocator.free(prefix);
+        if (std.mem.startsWith(u8, path, prefix) and std.mem.endsWith(u8, path, suffix) and
+            path.len == prefix.len + 64 + suffix.len)
+        {
+            _ = try parseDigest(path[prefix.len..][0..64]);
+            return parsed;
+        }
+    }
+    return error.InvalidActiveManifestPath;
 }
 
 fn parseDigest(text: []const u8) ![32]u8 {
@@ -65,6 +69,71 @@ fn encode(allocator: std.mem.Allocator, payload: Payload) ![]u8 {
         .payload = payload,
         .digest_sha256 = &hex,
     }, .{});
+}
+
+pub fn generationPath(allocator: std.mem.Allocator, state_path: []const u8, bytes: []const u8) ![]u8 {
+    _ = try root_fs.Path.fromAbsolute(state_path);
+    return std.fmt.allocPrint(allocator, "{s}/repository/generations/{s}/apt-config-snapshot-v1.json", .{ state_path, std.fmt.bytesToHex(digest(bytes), .lower) });
+}
+
+fn retainGeneration(allocator: std.mem.Allocator, root: root_fs.Root, state_path: []const u8, bytes: []const u8) ![]u8 {
+    const logical = try generationPath(allocator, state_path, bytes);
+    errdefer allocator.free(logical);
+    const path = try root_fs.Path.fromAbsolute(logical);
+    try root.createDirectoryPath(path.parent().?, .fromMode(0o700));
+    if (try root.entryIfExists(path) == null)
+        try root.publishFile(path, bytes, .{ .permissions = .fromMode(0o600), .overwrite = .fail_if_exists, .durable = true });
+    var pin = try pinOwnedFile(root, path);
+    defer pin.close();
+    const observed = try pin.observeStableAlloc(allocator, target.maximum_document_bytes);
+    defer allocator.free(observed.bytes);
+    if (!std.mem.eql(u8, observed.bytes, bytes)) return error.ActiveManifestChanged;
+    var parent = path.parent();
+    while (parent) |directory| {
+        try root.syncDirectory(directory);
+        parent = directory.parent();
+    }
+    try root.syncRoot();
+    return logical;
+}
+
+/// Earlier v1 pointers may reference the public operation path. Never rewrite
+/// their bound bytes while those pointers remain active.
+pub fn validateManifestReplacement(
+    allocator: std.mem.Allocator,
+    attempt: *root_operation.Attempt,
+    state_path: []const u8,
+    retained_path: []const u8,
+    manifest: target.Manifest,
+) !void {
+    if (!attempt.locked()) return error.RootOperationLockLost;
+    switch (attempt.record().operation) {
+        .repository_bootstrap => |operation| if (operation != .add) return error.InvalidActiveOwner,
+        else => return error.InvalidActiveOwner,
+    }
+    try attempt.coordinator.validateProjection();
+    var current = try attempt.coordinator.store().read(allocator) orelse return error.InvalidActiveOwner;
+    defer current.deinit();
+    if (!std.mem.eql(u8, &current.record.digest_sha256, &attempt.record().digest_sha256))
+        return error.InvalidActiveOwner;
+    const root = attempt.coordinator.root;
+    const logical = try logicalPath(allocator, state_path);
+    defer allocator.free(logical);
+    const path = try root_fs.Path.fromAbsolute(logical);
+    if (try root.entryIfExists(path) == null) return;
+    const namespace = if (attempt.coordinator.root_projection != null) "/" else attempt.record().install_root;
+    var pointer = try readPointer(allocator, root, namespace, path);
+    defer pointer.deinit();
+    if (!std.mem.eql(u8, pointer.value.payload.manifest_path, retained_path)) return;
+    var pin = try pinOwnedFile(root, try manifestPath(allocator, state_path, retained_path));
+    defer pin.close();
+    const retained = try pin.observeStableAlloc(allocator, target.maximum_document_bytes);
+    defer allocator.free(retained.bytes);
+    const expected_digest = try parseDigest(pointer.value.payload.manifest_sha256);
+    if (!std.mem.eql(u8, &digest(retained.bytes), &expected_digest)) return error.ActiveManifestChanged;
+    const proposed = try manifest.canonicalJson(allocator);
+    defer allocator.free(proposed);
+    if (!std.mem.eql(u8, retained.bytes, proposed)) return error.ActiveManifestReplacementUnsupported;
 }
 
 fn validateRoot(root: root_fs.Root, root_path: []const u8, payload: Payload) !void {
@@ -174,8 +243,11 @@ pub fn publish(
         defer prior.deinit();
         const expected = try manifest.canonicalJson(allocator);
         defer allocator.free(expected);
+        const generation = try generationPath(allocator, state_path, expected);
+        defer allocator.free(generation);
         const retained = try parseDigest(prior.pointer.value.payload.manifest_sha256);
-        if (!std.mem.eql(u8, prior.retainedManifestPath(), retained_manifest_path) or
+        if ((!std.mem.eql(u8, prior.retainedManifestPath(), retained_manifest_path) and
+            !std.mem.eql(u8, prior.retainedManifestPath(), generation)) or
             !std.mem.eql(u8, &retained, &digest(expected)))
             return error.ActiveManifestChanged;
         try attempt.coordinator.validateProjection();
@@ -194,6 +266,8 @@ pub fn publish(
     if (!std.mem.eql(u8, observed.bytes, expected)) return error.ActiveManifestChanged;
     var imported = try importMatching(allocator, root, root_path, manifest, manifest.native_architecture);
     defer imported.deinit();
+    const generation = try retainGeneration(allocator, root, state_path, observed.bytes);
+    defer allocator.free(generation);
     const identity = try root.rootEntry();
     if (!identity.modeled) return error.ActiveRootIdentityUnavailable;
     // Configuration is backend-neutral. Only a genuine projection can name
@@ -206,7 +280,7 @@ pub fn publish(
         .root_identity_sha256 = &root_hex,
         .root_device = identity.device,
         .root_inode = identity.inode,
-        .manifest_path = retained_manifest_path,
+        .manifest_path = generation,
         .manifest_sha256 = &manifest_hex,
     });
     defer allocator.free(bytes);
@@ -308,6 +382,11 @@ pub fn load(
     defer allocator.free(observed.bytes);
     const expected = try parseDigest(payload.manifest_sha256);
     if (!std.mem.eql(u8, &digest(observed.bytes), &expected)) return error.ActiveManifestChanged;
+    if (std.mem.eql(u8, std.fs.path.basename(path.parent().?.parent().?.text), "generations")) {
+        const generation = try generationPath(allocator, state_path, observed.bytes);
+        defer allocator.free(generation);
+        if (!std.mem.eql(u8, payload.manifest_path, generation)) return error.InvalidActiveManifestPath;
+    }
     var manifest = try target.decodeManifest(allocator, observed.bytes, target.maximum_document_bytes);
     defer manifest.deinit();
     var snapshot = try importMatching(allocator, root, root_path, manifest.manifest, architecture_override);

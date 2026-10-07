@@ -778,13 +778,22 @@ configuration evidence.
 
 The [v1 pointer schema](../schema/active-repository-config-v1.json) binds the
 existing root-identity namespace **and** the observed target-root device/inode,
-the operation-scoped manifest path, and SHA-256 of its complete canonical
-bytes. The envelope checksum covers the canonical `payload`. The historical
+an immutable configuration-generation manifest path, and SHA-256 of its
+complete canonical bytes. Before switching the pointer, publication durably
+retains those bytes at
+`<state>/repository/generations/<full-manifest-sha256>/apt-config-snapshot-v1.json`.
+Existing generation files must be owned and byte-identical; publication never
+overwrites or repairs them. Repeating the same operation can update its public
+result manifest without invalidating the old active generation if pointer
+publication fails. The envelope checksum covers the canonical `payload`. The historical
 manifest still binds source/keyring digests, signing fingerprints,
 architecture, normalized configuration and repository IDs, and per-source
 freshness. No historical manifest, exact lock, or receipt is rewritten into a
 new version. The existing `target_manifest` result path remains its historical
-location; the active pointer has the deterministic location above.
+location; the active pointer has the deterministic location above. Earlier v1
+operation-path pointers remain readable, but changing their still-active
+referenced file refuses with `ActiveManifestReplacementUnsupported` before
+that file is rewritten; there is no implicit migration or repair.
 
 Publication uses no-follow root filesystem traversal, a private `0600` staged
 file, fsync, atomic rename, and directory fsync. Existing corrupt, foreign,
@@ -794,6 +803,14 @@ also no-follow, owner checked, bounded, and rehashed; a new eligible source,
 removed source, changed key or freshness policy, foreign root, or changed
 architecture invalidates the active context. A subsequent successful
 repository add may publish a newly verified configuration set.
+
+Native historical success also verifies the current active configuration
+under the held root-operation lock. Missing, corrupt, unsafe or root-foreign
+active evidence refuses without publication or repair. A valid later
+configuration generation may retain the requested source/key facts and their
+original freshness policies without matching the entire historical
+configuration generation. Historical completion, receipt, descriptor and
+package-final-state verification remain mandatory.
 
 `--no-refresh` still publishes the verified local configuration after a
 successful import. **Neither this pointer nor its resolver proves current

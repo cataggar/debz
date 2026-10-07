@@ -466,7 +466,7 @@ fn readNativeRepositoryHistoryObserved(
         .deadline = input.deadline,
         .reviewed_profiles = input.reviewed_profiles,
     };
-    var manifest = if (failed) null else try NativeRepositoryManifest.read(allocator, input, original.descriptor, stored, paths);
+    var manifest = if (failed) null else try NativeRepositoryManifest.readHistorical(allocator, input, original.descriptor, stored, paths);
     defer if (manifest) |*value| value.deinit();
     const manifest_sha256 = if (manifest) |value| value.sha256 else null;
     if (!std.mem.eql(u8, &outer.discharge.request_sha256, &nativeCompletionRequestDigest(receipt_input, outer.attempt_id, stored, manifest_sha256)))
@@ -487,9 +487,19 @@ fn readNativeRepositoryHistoryObserved(
         .pins = .{ &original.state_file, &original.plan_file, &original.lock_file },
         .observer = null,
         .manifest_file = if (manifest) |*value| &value.file else null,
-        .manifest_sha256 = manifest_sha256,
+        // Historical discharge binds the old manifest; current configuration
+        // is independently verified above and again after package checks.
+        .manifest_sha256 = null,
     };
     try bindings.validate();
+    if (manifest) |*value| {
+        if (value.active) |*configuration| {
+            var current = try active_repository_config.load(allocator, root, if (input.attempt.coordinator.root_projection != null) "/" else input.repository.root, input.repository.state.path orelse "/var/lib/debz", input.attempt.record().target_architecture);
+            defer current.deinit();
+            if (!std.mem.eql(u8, configuration.pointer.value.digest_sha256, current.pointer.value.digest_sha256))
+                return error.ActiveConfigurationChanged;
+        }
+    }
     for ([_]*root_fs.PinnedRegularFile{ &local_completion, &shared_completion, &local_receipt, &shared_receipt }) |pin|
         _ = try pin.metadata();
     try native_transaction_result.validateRepositoryHistoryCaller(allocator, input.attempt);
@@ -1449,8 +1459,10 @@ fn importNativeDescriptorMaterial(
 const NativeRepositoryManifest = struct {
     file: root_fs.PinnedRegularFile,
     sha256: [32]u8,
+    active: ?active_repository_config.Loaded = null,
 
     fn deinit(self: *@This()) void {
+        if (self.active) |*configuration| configuration.deinit();
         self.file.close();
         self.* = undefined;
     }
@@ -1477,7 +1489,69 @@ const NativeRepositoryManifest = struct {
         if (!std.mem.eql(u8, bytes, observed.bytes)) return error.ImportedDigestMismatch;
         return .{ .file = pin, .sha256 = snapshot.manifest.manifest.digest_sha256 };
     }
+
+    fn readHistorical(
+        allocator: std.mem.Allocator,
+        input: NativeRecoveryRequest,
+        descriptor: api.DescriptorIdentity,
+        state: state_module.State,
+        paths: ResolvedPaths,
+    ) !@This() {
+        try input.validate();
+        const root = input.attempt.coordinator.root;
+        var filesystem: target_apt_config.ProductionFileSystem = .{ .io = root.io, .root = root.dir, .host_root = false };
+        try verifyInstalledDescriptor(allocator, filesystem.interface(), descriptor, state.managed_files);
+        var pin = try root.pinRegularFile(try root_fs.Path.init(paths.manifest_logical[1..]));
+        errdefer pin.close();
+        const observed = try pin.observeStableAlloc(allocator, target_apt_config.maximum_document_bytes);
+        defer allocator.free(observed.bytes);
+        var historical = try target_apt_config.decodeManifest(allocator, observed.bytes, target_apt_config.maximum_document_bytes);
+        defer historical.deinit();
+        const configuration_root = if (input.attempt.coordinator.root_projection != null) "/" else input.repository.root;
+        var current = try loadHistoricalActiveConfiguration(allocator, root, configuration_root, input.repository.state.path orelse "/var/lib/debz", input.attempt.record().target_architecture, historical.manifest, state.managed_files);
+        errdefer current.deinit();
+        if (RootOperationGuard.checkArchitecture(input.attempt.record(), .{
+            .native = current.snapshot.manifest.manifest.native_architecture,
+            .foreign = current.snapshot.manifest.manifest.foreign_architectures,
+        }) != null) return error.RepositoryArchitectureMismatch;
+        _ = try pin.metadata();
+        try input.validate();
+        return .{ .file = pin, .sha256 = historical.manifest.digest_sha256, .active = current };
+    }
 };
+
+fn loadHistoricalActiveConfiguration(
+    allocator: std.mem.Allocator,
+    root: root_fs.Root,
+    root_path: []const u8,
+    state_path: []const u8,
+    architecture: []const u8,
+    historical: target_apt_config.Manifest,
+    managed: []const state_module.FileEvidence,
+) !active_repository_config.Loaded {
+    var current = try active_repository_config.load(allocator, root, root_path, state_path, architecture);
+    errdefer current.deinit();
+    try verifyImportedMaterial(current.snapshot, managed);
+    for (managed) |file| {
+        const source_record: ?target_apt_config.SourceRecord = for (historical.sources) |record| {
+            if (std.mem.eql(u8, file.logical_path, record.logical_path)) break record;
+        } else null;
+        if (source_record) |record| {
+            const active_record = for (current.snapshot.manifest.manifest.sources) |candidate| {
+                if (std.mem.eql(u8, record.logical_path, candidate.logical_path)) break candidate;
+            } else return error.ImportedDigestMismatch;
+            if (!std.mem.eql(u8, &record.sha256, &file.sha256)) return error.ImportedDigestMismatch;
+            if (!repository_refresh.expiryPoliciesEqual(record.freshness, active_record.freshness))
+                return error.ImportedFreshnessMismatch;
+        } else {
+            const record = for (historical.keyrings) |candidate| {
+                if (std.mem.eql(u8, file.logical_path, candidate.logical_path)) break candidate;
+            } else return error.ImportedDigestMismatch;
+            if (!std.mem.eql(u8, &record.sha256, &file.sha256)) return error.ImportedDigestMismatch;
+        }
+    }
+    return current;
+}
 
 const NativeCompletionPoint = enum {
     after_final_state,
@@ -2087,6 +2161,7 @@ pub const Backend = struct {
     acquisition_dependencies: ?repository_acquisition.Dependencies = null,
     now_unix: ?i64 = null,
     state_write_hooks: state_module.WriteHooks = .{},
+    active_config_publication_observer: ?root_fs.PublishObserver = null,
     /// Reviewed exceptions for signed feeds without `Valid-Until`. Only exact
     /// source, key and architecture matches receive the bounded policy.
     reviewed_repository_profiles: []const reviewed_repository_profile.Profile = reviewed_repository_profile.production_profiles,
@@ -3996,6 +4071,8 @@ pub const Backend = struct {
             "manifest",
             @errorName(err),
         );
+        active_repository_config.validateManifestReplacement(allocator, guard.active().?, request.state.path orelse "/var/lib/debz", paths.manifest_logical, after_snapshot.manifest.manifest) catch |err|
+            return progress.fail(state_store, allocator, .post_install, .target_import_failed, "manifest", @errorName(err));
         manifest_store.writeAtomic(allocator, after_snapshot.manifest.manifest) catch |err|
             return progress.fail(
                 state_store,
@@ -4153,7 +4230,7 @@ pub const Backend = struct {
             request.state.path orelse "/var/lib/debz",
             paths.manifest_logical,
             after_snapshot.manifest.manifest,
-            null,
+            self.active_config_publication_observer,
         ) catch |err| return progress.fail(
             state_store,
             allocator,
@@ -9565,6 +9642,31 @@ fn testNativeHistoryRefusals(input: NativeRecoveryRequest, dependencies: NativeI
     try root.rename(saved, active_path, .fail_if_exists);
     var history = try readNativeRepositoryHistory(allocator, input);
     defer history.deinit();
+    const configuration_path = try root_fs.Path.init("var/lib/debz/repository/active-config-v1.json");
+    var configuration = try active_repository_config.load(allocator, root, "/", "/var/lib/debz", input.attempt.record().target_architecture);
+    defer configuration.deinit();
+    try root.rename(configuration_path, saved, .fail_if_exists);
+    try std.testing.expectError(error.FileNotFound, resumeNativeRepository(allocator, input, dependencies));
+    try std.testing.expect(try root.entryIfExists(configuration_path) == null);
+    try root.publishFile(configuration_path, "{}", .{});
+    try std.testing.expectError(error.InvalidActiveConfig, resumeNativeRepository(allocator, input, dependencies));
+    try root.removeFile(configuration_path);
+    try root.createSymbolicLink(configuration_path, "/fixture/history-saved-input");
+    try std.testing.expectError(error.UnsafeActiveConfigFile, resumeNativeRepository(allocator, input, dependencies));
+    try root.removeFile(configuration_path);
+    var foreign = configuration.pointer.value.payload;
+    foreign.root_inode ^= 1;
+    const foreign_bytes = try repositoryTestActivePointer(allocator, foreign);
+    defer allocator.free(foreign_bytes);
+    try root.publishFile(configuration_path, foreign_bytes, .{});
+    try std.testing.expectError(error.ForeignActiveRoot, resumeNativeRepository(allocator, input, dependencies));
+    try root.removeFile(configuration_path);
+    const original_configuration = try root.readFileAlloc(allocator, saved, active_repository_config.maximum_document_bytes);
+    defer allocator.free(original_configuration);
+    try root.publishFile(configuration_path, original_configuration, .{ .permissions = .fromMode(0o666) });
+    try std.testing.expectError(error.UnsafeActiveConfigFile, resumeNativeRepository(allocator, input, dependencies));
+    try root.removeFile(configuration_path);
+    try root.rename(saved, configuration_path, .fail_if_exists);
     const local_completion = try root_fs.Path.init(local_text[1..]);
     const shared_completion = try root_fs.Path.init(root_operation_completion.document_path);
     const saved_shared = try root_fs.Path.init("fixture/history-saved-shared");
@@ -9694,7 +9796,7 @@ fn testNativeHistoryRefusals(input: NativeRecoveryRequest, dependencies: NativeI
         const path = try root_fs.Path.init(text);
         try root.rename(path, saved, .fail_if_exists);
         try root.publishFile(path, "changed history input", .{});
-        try std.testing.expectError(if (index == 2) error.ImportedDigestMismatch else error.ManagedFileMismatch, readNativeRepositoryHistory(allocator, input));
+        try std.testing.expectError(if (index == 2) error.SyntaxError else error.ManagedFileMismatch, readNativeRepositoryHistory(allocator, input));
         try root.removeFile(path);
         try root.rename(saved, path, .fail_if_exists);
     }
@@ -9750,6 +9852,26 @@ fn testNativeHistoryRefusals(input: NativeRecoveryRequest, dependencies: NativeI
         try std.testing.expectEqual(snapshot.sha256, sha256(bytes));
     }
     try std.testing.expectEqual(caller, input.attempt.record().digest_sha256);
+    try root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/retained-history.backup"), "excluded APT entry\n", .{});
+    var later = try nativeRepositorySnapshot(allocator, input);
+    defer later.deinit();
+    const later_bytes = try later.manifest.manifest.canonicalJson(allocator);
+    defer allocator.free(later_bytes);
+    const later_path = try active_repository_config.generationPath(allocator, "/var/lib/debz", later_bytes);
+    defer allocator.free(later_path);
+    const retained_later = try root_fs.Path.fromAbsolute(later_path);
+    try root.createDirectoryPath(retained_later.parent().?, .fromMode(0o700));
+    try root.publishFile(retained_later, later_bytes, .{ .permissions = .fromMode(0o600), .overwrite = .fail_if_exists, .durable = true });
+    try active_repository_config.publish(allocator, input.attempt, "/var/lib/debz", later_path, later.manifest.manifest, null);
+    var resumed_later = try resumeNativeRepository(allocator, input, dependencies);
+    defer resumed_later.deinit();
+    try std.testing.expect(resumed_later == .historical);
+}
+
+fn repositoryTestActivePointer(allocator: std.mem.Allocator, payload: anytype) ![]u8 {
+    const canonical = try std.json.Stringify.valueAlloc(allocator, payload, .{});
+    defer allocator.free(canonical);
+    return std.json.Stringify.valueAlloc(allocator, .{ .payload = payload, .digest_sha256 = @as([]const u8, &native_recovery.hexDigest(sha256(canonical))) }, .{});
 }
 
 fn testProjectedNativeResume(case: RepositoryExecutionCase, projection: *const live_root.Projection, pass: usize) !void {
@@ -13453,6 +13575,120 @@ test "repository backend completes and idempotently resumes every production pha
         result.diagnostics[0].id,
     );
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "repository repeated operation retains immutable active generation when pointer publication fails" {
+    const allocator = std.testing.allocator;
+    const descriptor = @embedFile("fixtures/packages-microsoft-prod_1.1_all.deb");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try stageRepositoryTestRoot(directory.dir);
+    const root_path = try repositoryTestRoot(allocator, directory.dir);
+    defer allocator.free(root_path);
+    var acquisition: RepositoryTestAcquisition = .{ .descriptor = descriptor };
+    var executor: RepositoryTestExecutor = .{ .io = std.testing.io, .directory = directory.dir };
+    var backend: Backend = .{ .io = std.testing.io, .executor = executor.interface(), .acquisition_dependencies = acquisition.dependencies(), .now_unix = @import("fixtures/openpgp.zig").created + 30 };
+    const request: api.Request = .{ .root = root_path, .descriptor_url = "file:///descriptor.deb", .expected_sha256 = sha256(descriptor), .architecture = "amd64" };
+    var first = try api.execute(allocator, request, backend.interface());
+    defer first.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, first.exit_status);
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, root_path);
+    defer root.close();
+    var prior = try active_repository_config.load(allocator, root.root, root_path, "/var/lib/debz", "amd64");
+    defer prior.deinit();
+    const old_manifest_path = try root_fs.Path.fromAbsolute(prior.retainedManifestPath());
+    const old_manifest = try root.root.readFileAlloc(allocator, old_manifest_path, target_apt_config.maximum_document_bytes);
+    defer allocator.free(old_manifest);
+    const active_path = try root_fs.Path.init("var/lib/debz/repository/active-config-v1.json");
+    const old_pointer = try root.root.readFileAlloc(allocator, active_path, active_repository_config.maximum_document_bytes);
+    defer allocator.free(old_pointer);
+    // This changes the full manifest but neither repository identity nor the operation directory.
+    try root.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/ignored.backup"), "excluded APT entry\n", .{});
+    const Failure = struct {
+        hit: bool = false,
+        fn observe(raw: *anyopaque, point: root_fs.PublishPoint) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (point == .before_rename) {
+                self.hit = true;
+                return error.InjectedActivePointerFailure;
+            }
+        }
+    };
+    var failure: Failure = .{};
+    backend.active_config_publication_observer = .{ .context = &failure, .hitFn = Failure.observe };
+    var refused = try api.execute(allocator, request, backend.interface());
+    defer refused.deinit();
+    try std.testing.expectEqual(api.ExitStatus.post_install, refused.exit_status);
+    try std.testing.expectEqual(api.DiagnosticId.target_import_failed, refused.diagnostics[0].id);
+    try std.testing.expect(failure.hit);
+    try std.testing.expectEqualStrings(first.paths.operation_state.?, refused.paths.operation_state.?);
+    const retained_manifest = try root.root.readFileAlloc(allocator, old_manifest_path, target_apt_config.maximum_document_bytes);
+    defer allocator.free(retained_manifest);
+    try std.testing.expectEqualSlices(u8, old_manifest, retained_manifest);
+    const retained_pointer = try root.root.readFileAlloc(allocator, active_path, active_repository_config.maximum_document_bytes);
+    defer allocator.free(retained_pointer);
+    try std.testing.expectEqualSlices(u8, old_pointer, retained_pointer);
+    try root.root.removeFile(try root_fs.Path.init("etc/apt/sources.list.d/ignored.backup"));
+    var restored = try active_repository_config.load(allocator, root.root, root_path, "/var/lib/debz", "amd64");
+    defer restored.deinit();
+    try std.testing.expectEqualStrings(prior.retainedManifestPath(), restored.retainedManifestPath());
+    backend.active_config_publication_observer = null;
+    try root.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/ignored.backup"), "excluded APT entry\n", .{});
+    var retried = try api.execute(allocator, request, backend.interface());
+    defer retried.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, retried.exit_status);
+    var changed = try active_repository_config.load(allocator, root.root, root_path, "/var/lib/debz", "amd64");
+    defer changed.deinit();
+    try std.testing.expect(!std.mem.eql(u8, prior.retainedManifestPath(), changed.retainedManifestPath()));
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    const state_bytes = try root.root.readFileAlloc(allocator, try root_fs.Path.fromAbsolute(first.paths.operation_state.?), state_module.maximum_document_bytes);
+    defer allocator.free(state_bytes);
+    var state = try state_module.decode(allocator, state_bytes, state_module.maximum_document_bytes);
+    defer state.deinit();
+    var historical = try loadHistoricalActiveConfiguration(allocator, root.root, root_path, "/var/lib/debz", "amd64", prior.snapshot.manifest.manifest, state.state.managed_files);
+    defer historical.deinit();
+    try std.testing.expectEqual(changed.snapshot.manifest.manifest.digest_sha256, historical.snapshot.manifest.manifest.digest_sha256);
+    const saved = try root_fs.Path.init("var/lib/debz/repository/saved-active-config");
+    try root.root.rename(active_path, saved, .fail_if_exists);
+    try std.testing.expectError(error.FileNotFound, loadHistoricalActiveConfiguration(allocator, root.root, root_path, "/var/lib/debz", "amd64", prior.snapshot.manifest.manifest, state.state.managed_files));
+    try std.testing.expect(try root.root.entryIfExists(active_path) == null);
+    try root.root.publishFile(active_path, "{}", .{});
+    try std.testing.expectError(error.InvalidActiveConfig, loadHistoricalActiveConfiguration(allocator, root.root, root_path, "/var/lib/debz", "amd64", prior.snapshot.manifest.manifest, state.state.managed_files));
+    try root.root.removeFile(active_path);
+    try root.root.createSymbolicLink(active_path, "saved-active-config");
+    try std.testing.expectError(error.UnsafeActiveConfigFile, loadHistoricalActiveConfiguration(allocator, root.root, root_path, "/var/lib/debz", "amd64", prior.snapshot.manifest.manifest, state.state.managed_files));
+    try root.root.removeFile(active_path);
+    var foreign = changed.pointer.value.payload;
+    foreign.root_inode ^= 1;
+    const foreign_bytes = try repositoryTestActivePointer(allocator, foreign);
+    defer allocator.free(foreign_bytes);
+    try root.root.publishFile(active_path, foreign_bytes, .{});
+    try std.testing.expectError(error.ForeignActiveRoot, loadHistoricalActiveConfiguration(allocator, root.root, root_path, "/var/lib/debz", "amd64", prior.snapshot.manifest.manifest, state.state.managed_files));
+    try root.root.removeFile(active_path);
+    try root.root.rename(saved, active_path, .fail_if_exists);
+    var old_format = changed.pointer.value.payload;
+    old_format.manifest_path = first.paths.target_manifest.?;
+    const old_format_bytes = try repositoryTestActivePointer(allocator, old_format);
+    defer allocator.free(old_format_bytes);
+    try root.root.publishFile(active_path, old_format_bytes, .{});
+    var compatible = try active_repository_config.load(allocator, root.root, root_path, "/var/lib/debz", "amd64");
+    defer compatible.deinit();
+    const public_path = try root_fs.Path.fromAbsolute(first.paths.target_manifest.?);
+    const public_before = try root.root.readFileAlloc(allocator, public_path, target_apt_config.maximum_document_bytes);
+    defer allocator.free(public_before);
+    try root.root.publishFile(try root_fs.Path.init("etc/apt/sources.list.d/legacy.backup"), "excluded legacy entry\n", .{});
+    var old_refused = try api.execute(allocator, request, backend.interface());
+    defer old_refused.deinit();
+    try std.testing.expectEqual(api.ExitStatus.post_install, old_refused.exit_status);
+    try std.testing.expectEqual(api.DiagnosticId.target_import_failed, old_refused.diagnostics[0].id);
+    try std.testing.expectEqualStrings("ActiveManifestReplacementUnsupported", old_refused.diagnostics[0].message);
+    const public_after = try root.root.readFileAlloc(allocator, public_path, target_apt_config.maximum_document_bytes);
+    defer allocator.free(public_after);
+    try std.testing.expectEqualSlices(u8, public_before, public_after);
+    try root.root.removeFile(try root_fs.Path.init("etc/apt/sources.list.d/legacy.backup"));
+    var old_retried = try api.execute(allocator, request, backend.interface());
+    defer old_retried.deinit();
+    try std.testing.expectEqual(api.ExitStatus.success, old_retried.exit_status);
 }
 
 test "repository backend holds bounded target locks for idempotent verification" {
