@@ -200,9 +200,27 @@ pub const Result = struct {
     native_download: ?NativeBaselineDownload = null,
 
     pub fn canonicalJson(self: Result, allocator: std.mem.Allocator) ![]u8 {
+        if (self.native_download != null) try self.requireDocumentBudget();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        const writer = &output.writer;
+        try self.writeCanonical(&output.writer);
+        return output.toOwnedSlice();
+    }
+
+    pub fn encodedDocumentSize(self: Result) !usize {
+        var buffer: [4096]u8 = undefined;
+        var output: std.Io.Writer.Discarding = .init(&buffer);
+        try self.writeCanonical(&output.writer);
+        return std.math.cast(usize, output.fullCount()) orelse error.DocumentTooLarge;
+    }
+
+    pub fn requireDocumentBudget(self: Result) !void {
+        if (self.items.len > maximum_result_items or
+            try self.encodedDocumentSize() > maximum_result_document_bytes)
+            return error.DocumentTooLarge;
+    }
+
+    fn writeCanonical(self: Result, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"schema\":\"");
         try writer.writeAll(if (self.native_download != null) "io.github.cataggar.debz.command.v2" else json_schema);
         try writer.writeAll("\",\"api_version\":");
@@ -243,7 +261,6 @@ pub const Result = struct {
             try std.json.Stringify.value(evidence, .{}, writer);
         }
         try writer.writeAll("}\n");
-        return output.toOwnedSlice();
     }
 };
 

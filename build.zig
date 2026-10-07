@@ -788,6 +788,26 @@ pub fn build(b: *std.Build) void {
     });
     b.step("test-native-baseline", "Run genuine signed native installed-baseline workflows in owned roots")
         .dependOn(&b.addRunArtifact(native_baseline_tests).step);
+    const product_result_module = b.createModule(.{
+        .root_source_file = b.path("src/product_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    product_result_module.addOptions("debz_build_options", build_options);
+    product_result_module.addIncludePath(libsolv_dependency.path("src"));
+    product_result_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    product_result_module.addIncludePath(zstd_dependency.path("lib"));
+    product_result_module.addCMacro("LZMA_API_STATIC", "1");
+    product_result_module.linkLibrary(libsolv);
+    product_result_module.linkLibrary(liblzma);
+    product_result_module.linkLibrary(zstd);
+    const product_result_tests = b.addTest(.{
+        .root_module = product_result_module,
+        .filters = &.{ "product_api.test.", "canonical result JSON", "command JSON", "facade" },
+    });
+    b.step("test-product-results", "Run product command result encoding, decoding, and historical byte contracts")
+        .dependOn(&b.addRunArtifact(product_result_tests).step);
     workload_native.dependOn(&run_native_program_corpus_tests.step);
 
     const root_operation_tests = b.addTest(.{

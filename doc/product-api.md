@@ -378,6 +378,25 @@ results/fingerprints use API v6 and root/component-specific cache keys; export
 uses archive format v4. Active owned work and drift refuse before cache
 preparation/publication. Completed execution generations are not implicitly
 adopted by these read-only entrypoints. Legacy/default behavior is unchanged.
+
+Command.v2 shares the existing **4 MiB (4,194,304 encoded bytes)** and
+**4,096 result items** limits with the command decoder and subprocess transport.
+Before any repository-cache creation/refresh, lock-output publication, or
+archive acquisition, download counts a complete canonical admission envelope:
+all original baseline facts, headers, escaped strings, newline, the entire
+locked archive closure and captured installed-database item candidates, the
+longest solver action label, and a legal download/reuse partition with maximum
+decimal width. This deliberately reserves both candidate sets rather than
+predicting a solver result or future CAS hits; it can refuse a near-limit request
+whose eventual result would be smaller. The count uses the same writer as actual
+serialization, without allocating another serialized baseline document. An
+over-budget request returns the ordinary `planning_failed` / `DocumentTooLarge`
+diagnostic before that work; it never truncates facts or changes result items.
+Actual v2 encoding also enforces the same budget. The component observation
+limit of 100,000 files does **not** promise that every such component fits this
+command-result byte budget. Cache format v6 and archive format v4 retain their
+own existing bounds.
+
 - [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 
 Their successful outputs include the canonical lock digest, CLI-owned

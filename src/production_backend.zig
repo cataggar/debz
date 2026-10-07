@@ -1138,6 +1138,20 @@ pub const Backend = struct {
                     };
                     download_baseline.requireDestination(request.options.cache_path) catch |err|
                         return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                    var admission_installed = try self.loadInstalled(allocator, request);
+                    defer admission_installed.deinit();
+                    if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
+                    requireNativeDownloadAdmission(
+                        allocator,
+                        request.operation,
+                        download_lock.?.nativeLock().?,
+                        download_baseline.contract.?,
+                        admission_installed.database.packages,
+                    ) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        if (err != error.DocumentTooLarge) return err;
+                        return api.failure(request.operation, .planning, .planning_failed, native_download_budget_message);
+                    };
                 }
             }
         }
@@ -1571,13 +1585,14 @@ pub const Backend = struct {
                 defer prepared.deinit();
                 if (self.planning_sync) |sync| try sync.hit();
                 if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
-                var result = try planResultChanged(allocator, request.operation, plan.*, false, "exact signed archives verified; installed baseline retained without execution");
+                var result = try planResultChanged(allocator, request.operation, plan.*, false, native_download_summary);
                 result.native_download = .{
                     .baseline_noop = try download_baseline.contract.?.clone(allocator),
                     .downloaded_count = prepared.downloaded_count,
                     .reused_count = prepared.reused_count,
                 };
                 result.api_version = 2;
+                try result.requireDocumentBudget();
                 return result;
             }
         }
@@ -6239,6 +6254,81 @@ fn planResult(allocator: std.mem.Allocator, operation: api.Operation, plan: solv
     return planResultChanged(allocator, operation, plan, false, "transaction plan produced");
 }
 
+const native_download_summary = "exact signed archives verified; installed baseline retained without execution";
+const native_download_budget_message = "DocumentTooLarge: complete native baseline download admission exceeds the shared 4194304-byte or 4096-item command result budget; no repository cache, lock output, or archive download was published";
+
+const NativeDownloadCounterSplit = struct { downloaded: usize, reused: usize };
+
+fn maximumDownloadCounterSplit(count: usize) NativeDownloadCounterSplit {
+    var result: NativeDownloadCounterSplit = .{ .downloaded = 0, .reused = count };
+    var digits = decimalDigits(count) + 1;
+    var downloaded: usize = 0;
+    while (downloaded < count) : (downloaded += 1) {
+        const candidate = decimalDigits(downloaded) + decimalDigits(count - downloaded);
+        if (candidate > digits) {
+            digits = candidate;
+            result = .{ .downloaded = downloaded, .reused = count - downloaded };
+        }
+    }
+    return result;
+}
+
+fn decimalDigits(number: usize) usize {
+    var value = number;
+    var digits: usize = 1;
+    while (value >= 10) : (value /= 10) digits += 1;
+    return digits;
+}
+
+fn requireNativeDownloadAdmission(
+    allocator: std.mem.Allocator,
+    operation: api.Operation,
+    lock: *const exact_lock_v3.Lock,
+    contract: @import("native_baseline_contract.zig").Contract,
+    installed: []const dpkg_status.Package,
+) !void {
+    // Non-removal actions must come from this exact archive closure; removal
+    // actions can only name the captured installed database. Reserve both
+    // complete sets before refreshing metadata rather than predicting a solve.
+    const count = std.math.add(usize, lock.packages.len, installed.len) catch return error.DocumentTooLarge;
+    if (count > api.maximum_result_items) return error.DocumentTooLarge;
+    const items = try allocator.alloc(api.Item, count);
+    defer allocator.free(items);
+    comptime var longest_action: []const u8 = "";
+    inline for (std.meta.fields(solver.ActionKind)) |field| {
+        if (field.name.len > longest_action.len) longest_action = field.name;
+    }
+    for (lock.packages, 0..) |package, index| items[index] = .{
+        .package = package.name,
+        .version = package.version,
+        .architecture = package.architecture,
+        .detail = longest_action,
+    };
+    for (installed, lock.packages.len..) |package, index| items[index] = .{
+        .package = package.name.value,
+        .version = package.version.spelling.value,
+        .architecture = package.architecture.value,
+        .detail = longest_action,
+    };
+    // Counts always partition the complete archive closure. Select a legal
+    // partition with maximum decimal width, independent of later CAS hits.
+    const split = maximumDownloadCounterSplit(lock.packages.len);
+    const admission: api.Result = .{
+        .api_version = 2,
+        .operation = operation,
+        .exit_status = .success,
+        .changed = false,
+        .summary = native_download_summary,
+        .items = items,
+        .native_download = .{
+            .baseline_noop = contract,
+            .downloaded_count = split.downloaded,
+            .reused_count = split.reused,
+        },
+    };
+    try admission.requireDocumentBudget();
+}
+
 fn planResultChanged(
     allocator: std.mem.Allocator,
     operation: api.Operation,
@@ -8564,6 +8654,114 @@ fn planBaselineCache(allocator: std.mem.Allocator, backend: *Backend, fixture: *
         .selectors = if (empty) &.{} else &.{ .{ .name = "alpha" }, .{ .name = "beta" } },
         .options = options,
     }));
+}
+
+test "production native baseline command full escaped encoding exact boundary and counter partitions" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try nativeBaselineFixture(allocator, &directory);
+    defer fixture.deinit();
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+    try planBaselineCache(allocator, &backend, &fixture, false);
+    var fingerprint = try backend.packageCacheFingerprint(allocator, baselineCacheRequest(&fixture), "1.2.3");
+    defer fingerprint.deinit();
+    var result: api.Result = .{
+        .api_version = 2,
+        .operation = .download,
+        .exit_status = .success,
+        .summary = "x",
+        .items = &.{.{ .package = "alpha", .version = "1.0", .architecture = "amd64", .detail = "escaped \"\\\n" }},
+        .native_download = .{ .baseline_noop = fingerprint.baseline.?.value, .downloaded_count = 1, .reused_count = 1 },
+    };
+    const remaining = api.maximum_result_document_bytes - try result.encodedDocumentSize();
+    const summary = try allocator.alloc(u8, remaining + 2);
+    @memset(summary, 's');
+    result.summary = summary[0 .. remaining + 1];
+    try result.requireDocumentBudget();
+    const bytes = try result.canonicalJson(allocator);
+    try std.testing.expectEqual(api.maximum_result_document_bytes, bytes.len);
+    var decoded = try api.decodeResult(allocator, bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings(result.items[0].detail.?, decoded.result.items[0].detail.?);
+    try std.testing.expectEqualStrings(result.native_download.?.baseline_noop.planning_lock_json, decoded.result.native_download.?.baseline_noop.planning_lock_json);
+    result.summary = summary;
+    try std.testing.expectEqual(api.maximum_result_document_bytes + 1, try result.encodedDocumentSize());
+    try std.testing.expectError(error.DocumentTooLarge, result.requireDocumentBudget());
+    try std.testing.expectError(error.DocumentTooLarge, result.canonicalJson(allocator));
+    const oversized = try allocator.alloc(u8, bytes.len + 1);
+    @memcpy(oversized[0..bytes.len], bytes);
+    oversized[bytes.len] = '\n';
+    try std.testing.expectError(error.DocumentTooLarge, api.decodeResult(allocator, oversized));
+
+    for ([_]usize{ 0, 1, 9, 10, 19, 20, 99, 100, 199, 200, 999, 1000 }) |count| {
+        const split = maximumDownloadCounterSplit(count);
+        result.summary = "x";
+        result.native_download.?.downloaded_count = split.downloaded;
+        result.native_download.?.reused_count = split.reused;
+        const maximum_bytes = try result.encodedDocumentSize();
+        for (0..count + 1) |downloaded| {
+            result.native_download.?.downloaded_count = downloaded;
+            result.native_download.?.reused_count = count - downloaded;
+            try std.testing.expect(try result.encodedDocumentSize() <= maximum_bytes);
+        }
+    }
+}
+
+test "production native baseline command 12000 genuine payload facts refuse before cache lock output and acquisition" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try nativeBaselineFixture(allocator, &directory);
+    defer fixture.deinit();
+    var list: std.Io.Writer.Allocating = .init(allocator);
+    defer list.deinit();
+    try list.writer.writeAll("/usr/share\n/usr/share/private-baseline\n");
+    for (0..12000) |index| {
+        const path = try std.fmt.allocPrint(allocator, "usr/share/private-baseline-fact-{d:0>5}", .{index});
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = try std.fmt.allocPrint(allocator, "root/{s}", .{path}), .data = "retained private payload\n" });
+        try list.writer.print("/{s}\n", .{path});
+    }
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = list.written() });
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+    try planBaselineCache(allocator, &backend, &fixture, false);
+    var fingerprint = try backend.packageCacheFingerprint(allocator, baselineCacheRequest(&fixture), "1.2.3");
+    defer fingerprint.deinit();
+    try std.testing.expectEqual(@as(usize, 12002), fingerprint.baseline.?.value.component.components[0].payload.len);
+    const complete: api.Result = .{
+        .api_version = 2,
+        .operation = .download,
+        .exit_status = .success,
+        .summary = native_download_summary,
+        .native_download = .{ .baseline_noop = fingerprint.baseline.?.value, .downloaded_count = 2, .reused_count = 0 },
+    };
+    const complete_bytes = try complete.encodedDocumentSize();
+    std.debug.print("12000 genuine retained files: complete command.v2 = {d} bytes; budget = {d}\n", .{ complete_bytes, api.maximum_result_document_bytes });
+    try std.testing.expect(complete_bytes > api.maximum_result_document_bytes);
+    try std.testing.expectError(error.DocumentTooLarge, complete.canonicalJson(allocator));
+    try directory.dir.deleteTree(std.testing.io, "cache");
+    try directory.dir.deleteFile(std.testing.io, "repo/pool/alpha_1.0_amd64.deb");
+    try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+    var options = fixture.options();
+    options.lock_input_path = fixture.lock_path;
+    options.lock_output_path = fixture.second_lock_path;
+    const refused = try backend.executeWorkflow(allocator, .{
+        .operation = .install,
+        .mode = .download_only,
+        .selectors = &.{ .{ .name = "alpha" }, .{ .name = "beta" } },
+        .options = options,
+    });
+    try std.testing.expectEqual(api.ExitStatus.planning, refused.exit_status);
+    try std.testing.expectEqual(api.ErrorId.planning_failed, refused.diagnostics[0].id);
+    try std.testing.expectEqualStrings(native_download_budget_message, refused.diagnostics[0].message);
+    try std.testing.expect(!refused.changed and refused.native_download == null);
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.second_lock_path), .{}));
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{}));
 }
 
 test "production native baseline cache signed miss hit export restore download and empty archive provenance" {
