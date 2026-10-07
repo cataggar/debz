@@ -1,4 +1,6 @@
 const std = @import("std");
+const installed_baseline = @import("installed_baseline.zig");
+const exact_lock_v4 = @import("exact_lock_v4.zig");
 const content_digest = @import("content_digest.zig");
 const api = @import("product_api.zig");
 const deb_payload = @import("deb_payload.zig");
@@ -1291,10 +1293,22 @@ pub const Backend = struct {
         else
             null;
         defer if (lock) |*value| value.deinit();
+        var baseline_proof: ?*installed_baseline.Verified = null;
+        defer if (baseline_proof) |value| value.deinit();
+        if (lock) |*value| if (value.baselineEvidence()) |evidence| {
+            if (request.options.status_path != null)
+                return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline requires the selected root's actual package database");
+            baseline_proof = installed_baseline.verify(allocator, self.io, request.options.install_root, request.options.architecture, installed.source, evidence) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "installed baseline prestate refused: {s}", .{@errorName(err)})),
+            };
+            if (mode != .plan_only)
+                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: v4 baseline authority is planning-only; archive-only execution/recovery cannot consume retained local state");
+        };
         const legacy_lock = if (lock) |*value| value.legacyLock() else null;
-        const native_lock = if (lock) |*value| value.nativeLock() else null;
-        if (native_lock) |value| admitNativeLock(
-            value,
+        const native_lock = if (lock) |*value| value.planningLockV3() else null;
+        if (native_lock != null and self.transaction_backend == .native) admitNativeLock(
+            native_lock.?,
             configuration.repositories,
             self.native_archive_digest_policy,
         ) catch |err| return api.failure(
@@ -1337,6 +1351,7 @@ pub const Backend = struct {
             },
             .exact_lock = legacy_lock,
             .exact_lock_v3 = native_lock,
+            .installed_baseline = baseline_proof,
             .output_schema_version = switch (self.transaction_backend) {
                 .legacy_dpkg => .v2,
                 .native => .v4,
@@ -1360,7 +1375,10 @@ pub const Backend = struct {
         defer if (generated_lock) |*value| value.deinit();
         if (request.options.lock_output_path) |path| {
             if (lock) |*value| {
-                try value.write(allocator, self.io, path);
+                value.write(allocator, self.io, path) catch |err| switch (err) {
+                    error.InstalledBaselineOutputOverlapsDatabase => return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline lock output must remain outside its bound package database"),
+                    else => return err,
+                };
             } else {
                 generated_lock = resolveProductLock(
                     self.transaction_backend,
@@ -1371,6 +1389,8 @@ pub const Backend = struct {
                     plan.*,
                     semantic_request_digest,
                     solver_policy_digest,
+                    self.io,
+                    installed.source,
                 ) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -1411,7 +1431,19 @@ pub const Backend = struct {
                         nativeLockAdmissionMessage(err),
                     );
                 }
-                try generated_lock.?.write(allocator, self.io, path);
+                if (generated_lock.?.baselineEvidence()) |evidence| {
+                    if (mode != .plan_only)
+                        return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: v4 baseline lock resolution is planning-only");
+                    const proof = installed_baseline.verify(allocator, self.io, request.options.install_root, request.options.architecture, installed.source, evidence) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "installed baseline prestate refused before publication: {s}", .{@errorName(err)})),
+                    };
+                    proof.deinit();
+                }
+                generated_lock.?.write(allocator, self.io, path) catch |err| switch (err) {
+                    error.InstalledBaselineOutputOverlapsDatabase => return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline lock output must remain outside its bound package database"),
+                    else => return err,
+                };
             }
         }
         if (mode == .plan_only) return planResult(allocator, request.operation, plan.*);
@@ -3306,8 +3338,18 @@ pub const Backend = struct {
             bound_ids.items,
             archives,
         );
-        generated.deinit();
-        generated.* = .{ .native = bound };
+        if (generated.* == .installed_baseline) {
+            defer {
+                var release = bound;
+                release.deinit();
+            }
+            const rebound = try exact_lock_v4.rebindArchives(allocator, &generated.installed_baseline, bound.lock);
+            generated.deinit();
+            generated.* = .{ .installed_baseline = rebound };
+        } else {
+            generated.deinit();
+            generated.* = .{ .native = bound };
+        }
     }
 
     fn loadRepositoryDocuments(
@@ -4593,8 +4635,7 @@ fn configuredFreshness(
             break :blk .require_valid_until;
         },
         .allow_missing_valid_until_with_max_age_seconds => .{
-            .allow_missing_valid_until_with_max_age_seconds =
-                freshness.maximum_release_age_seconds orelse
+            .allow_missing_valid_until_with_max_age_seconds = freshness.maximum_release_age_seconds orelse
                 return error.InvalidRepositoryConfig,
         },
         .frozen_release_with_witnesses => blk: {
@@ -5201,9 +5242,10 @@ fn openRegularFileAbsoluteNoFollow(io: std.Io, path: []const u8) !std.Io.File {
     return file;
 }
 
-const ProductLock = union(transaction_engine.Kind) {
+const ProductLock = union(enum) {
     legacy_dpkg: exact_lock.OwnedLock,
     native: exact_lock_v3.OwnedLock,
+    installed_baseline: exact_lock_v4.OwnedLock,
 
     fn deinit(self: *ProductLock) void {
         switch (self.*) {
@@ -5215,7 +5257,7 @@ const ProductLock = union(transaction_engine.Kind) {
     fn legacyLock(self: *const ProductLock) ?*const exact_lock.Lock {
         return switch (self.*) {
             .legacy_dpkg => |*owned| &owned.lock,
-            .native => null,
+            else => null,
         };
     }
 
@@ -5223,17 +5265,34 @@ const ProductLock = union(transaction_engine.Kind) {
         return switch (self.*) {
             .native => |*owned| &owned.lock,
             .legacy_dpkg => null,
+            .installed_baseline => |*owned| if (owned.backend() == .native) &owned.archive_lock.lock else null,
+        };
+    }
+
+    fn planningLockV3(self: *const ProductLock) ?*const exact_lock_v3.Lock {
+        return switch (self.*) {
+            .installed_baseline => |*owned| &owned.archive_lock.lock,
+            else => self.nativeLock(),
+        };
+    }
+
+    fn baselineEvidence(self: *const ProductLock) ?installed_baseline.Evidence {
+        return switch (self.*) {
+            .installed_baseline => |*owned| owned.evidence(),
+            else => null,
         };
     }
 
     fn requestDigest(self: ProductLock) [32]u8 {
         return switch (self) {
+            .installed_baseline => |owned| owned.archive_lock.lock.request_sha256,
             inline else => |owned| owned.lock.request_sha256,
         };
     }
 
     fn policyDigest(self: ProductLock) [32]u8 {
         return switch (self) {
+            .installed_baseline => |owned| owned.archive_lock.lock.policy_sha256,
             inline else => |owned| owned.lock.policy_sha256,
         };
     }
@@ -5255,6 +5314,19 @@ const ProductLock = union(transaction_engine.Kind) {
                 );
             },
             .native => |owned| try writeLockVersion(exact_lock_v3, allocator, io, path, owned.lock),
+            .installed_baseline => |*owned| {
+                const database_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg", .{std.mem.trimEnd(u8, owned.evidence().root_path, "/")});
+                defer allocator.free(database_path);
+                if (std.mem.eql(u8, path, database_path) or
+                    (std.mem.startsWith(u8, path, database_path) and path.len > database_path.len and path[database_path.len] == '/'))
+                    return error.InstalledBaselineOutputOverlapsDatabase;
+                const bytes = try owned.canonicalJson(allocator);
+                defer allocator.free(bytes);
+                const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
+                var directory = try root_fs.openAbsoluteRoot(io, parent);
+                defer directory.close();
+                try directory.root.publishFile(try root_fs.Path.init(std.fs.path.basename(path)), bytes, .{ .permissions = .fromMode(0o600), .durable = true });
+            },
         }
     }
 };
@@ -5284,6 +5356,14 @@ fn readProductLock(
     path: []const u8,
     backend: transaction_engine.Kind,
 ) !ProductLock {
+    const probe = try readFile(allocator, io, path, exact_lock_v4.maximum_document_bytes);
+    defer allocator.free(probe);
+    if (try exact_lock_v4.hasSchema(allocator, probe)) {
+        var result = try exact_lock_v4.decode(allocator, probe);
+        errdefer result.deinit();
+        if (result.backend() != backend) return error.UnsupportedSchema;
+        return .{ .installed_baseline = result };
+    }
     switch (backend) {
         .legacy_dpkg => return .{ .legacy_dpkg = try readLock(allocator, io, path) },
         .native => {
@@ -5337,7 +5417,31 @@ fn resolveProductLock(
     plan: solver.Plan,
     semantic_request_digest: [32]u8,
     solver_policy_digest: [32]u8,
+    io: std.Io,
+    status_bytes: []const u8,
 ) !ProductLock {
+    var baseline_packages: std.ArrayList(installed_baseline.Package) = .empty;
+    defer baseline_packages.deinit(allocator);
+    for (installed) |package| {
+        if (!package.status.isFullyInstalled() or planChangesIdentity(plan.actions, package.name.value, package.architecture.value))
+            continue;
+        if (findRetainedOrigin(refreshed.universe.repositories, package.name.value, package.version.spelling.value, package.architecture.value) != null)
+            continue;
+        try baseline_packages.append(allocator, .{
+            .name = package.name.value,
+            .version = package.version.spelling.value,
+            .architecture = package.architecture.value,
+            .selection = package.status.want,
+        });
+    }
+    if (baseline_packages.items.len != 0) {
+        if (request.options.status_path != null) return error.InstalledBaselineStatusOverrideUnsupported;
+        const verified = try installed_baseline.capture(allocator, io, request.options.install_root, request.options.architecture, status_bytes, baseline_packages.items);
+        defer verified.deinit();
+        var archive_lock = try lockFromPlan(exact_lock_v3, allocator, request, refreshed, installed, plan, semantic_request_digest, solver_policy_digest, verified);
+        defer archive_lock.deinit();
+        return .{ .installed_baseline = try exact_lock_v4.create(allocator, backend, archive_lock.lock, verified) };
+    }
     switch (backend) {
         inline else => |kind| {
             const Lock = if (kind == .native) exact_lock_v3 else exact_lock;
@@ -5350,6 +5454,7 @@ fn resolveProductLock(
                 plan,
                 semantic_request_digest,
                 solver_policy_digest,
+                null,
             ));
         },
     }
@@ -5364,6 +5469,7 @@ fn lockFromPlan(
     plan: solver.Plan,
     semantic_request_digest: [32]u8,
     solver_policy_digest: [32]u8,
+    baseline_proof: ?*const installed_baseline.Verified,
 ) !Lock.OwnedLock {
     const ResolvedPackage = struct {
         name: []const u8,
@@ -5412,6 +5518,8 @@ fn lockFromPlan(
     for (installed) |package| {
         if (!package.status.isFullyInstalled() or
             planChangesIdentity(plan.actions, package.name.value, package.architecture.value))
+            continue;
+        if (baseline_proof) |proof| if (proof.find(package.name.value, package.architecture.value) != null)
             continue;
         const origin = findRetainedOrigin(
             refreshed.universe.repositories,
@@ -8013,6 +8121,111 @@ test "production native-only rehearsal refuses new legacy locks and results befo
     try std.testing.expectEqualStrings("original\n", sentinel);
 }
 
+const installed_only_status =
+    "Package: private-baseline\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
+
+test "production installed-only baseline joins a complete signed archive lock and remains non-executable" {
+    for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |kind| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
+        defer fixture.deinit();
+        try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
+        var process: TestProcess = .{ .io = std.testing.io, .dir = directory.dir };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .now_unix = 1_788_796_860, .process_runner = process.interface(), .native_archive_digest_policy = .published_digests };
+        const selectors = [_]solver.PackageSelector{ .{ .name = "beta" }, .{ .name = "alpha" } };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const planned = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        try std.testing.expectEqual(@as(usize, 3), planned.items.len);
+        var lock = try readProductLock(allocator, std.testing.io, fixture.lock_path, kind);
+        defer lock.deinit();
+        try std.testing.expect(lock == .installed_baseline);
+        try std.testing.expectEqualStrings("private-baseline", lock.baselineEvidence().?.packages[0].name);
+        try std.testing.expectEqual(@as(usize, 1), lock.baselineEvidence().?.packages.len);
+        try std.testing.expectEqual(@as(usize, 3), lock.planningLockV3().?.packages.len);
+        try std.testing.expect(lock.planningLockV3().?.repositories[0].signer_fingerprints.len != 0);
+        try std.testing.expect(lock.planningLockV3().?.findIdentity("private-baseline", "amd64") == null);
+        try std.testing.expectError(error.InstalledBaselineExecutionUnsupported, lock.installed_baseline.requireExecutionAuthority());
+        const canonical = try lock.installed_baseline.canonicalJson(allocator);
+        var decoded = try exact_lock_v4.decode(allocator, canonical);
+        defer decoded.deinit();
+        try std.testing.expectEqualStrings(canonical, try decoded.canonicalJson(allocator));
+        options.lock_output_path = fixture.second_lock_path;
+        options.lock_input_path = fixture.lock_path;
+        const replayed = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ExitStatus.success, replayed.exit_status);
+        try std.testing.expectEqual(@as(usize, 3), replayed.items.len);
+        options.lock_output_path = null;
+        options.assume_yes = true;
+        options.conffile = .keep_existing;
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .execute, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, "InstalledBaselineExecutionUnsupported") != null);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+        const unchanged = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(4096));
+        try std.testing.expectEqualStrings(installed_only_status, unchanged);
+        options.lock_output_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/invalid-lock.json", .{fixture.install_root});
+        const overlapping_output = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, overlapping_output.diagnostics[0].id);
+        try std.testing.expectError(error.FileNotFound, directory.dir.statFile(std.testing.io, "root/var/lib/dpkg/invalid-lock.json", .{}));
+        options.lock_input_path = null;
+        options.lock_output_path = fixture.second_lock_path;
+        const needs_archive = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &.{.{ .name = "private-baseline", .version = "2.0" }}, .options = options });
+        try std.testing.expectEqual(api.ExitStatus.planning, needs_archive.exit_status);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+    }
+}
+
+test "production installed baseline refuses changed status metadata info metadata and missing prestate" {
+    for ([_]enum { status_metadata, version, selection, info_metadata, missing_status, foreign_root, pending_updates }{ .status_metadata, .version, .selection, .info_metadata, .missing_status, .foreign_root, .pending_updates }) |mutation| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
+        defer fixture.deinit();
+        try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
+        var process: TestProcess = .{ .io = std.testing.io, .dir = directory.dir };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860, .process_runner = process.interface(), .native_archive_digest_policy = .published_digests };
+        const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const planned = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        switch (mutation) {
+            .status_metadata => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = "Package: private-baseline\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\nDescription: changed metadata only\n\n" }),
+            .version => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = "Package: private-baseline\nStatus: install ok installed\nVersion: 2.0\nArchitecture: amd64\n\n" }),
+            .selection => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = "Package: private-baseline\nStatus: hold ok installed\nVersion: 1.0\nArchitecture: amd64\n\n" }),
+            .info_metadata => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/changed\n" }),
+            .missing_status => try directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/status"),
+            .foreign_root => {
+                try directory.dir.createDirPath(std.testing.io, "other/var/lib/dpkg");
+                try directory.dir.writeFile(std.testing.io, .{ .sub_path = "other/var/lib/dpkg/status", .data = installed_only_status });
+                options.install_root = try std.fmt.allocPrint(allocator, "{s}/other", .{std.fs.path.dirname(fixture.install_root).?});
+            },
+            .pending_updates => {
+                try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/updates");
+                try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/updates/0000", .data = installed_only_status });
+            },
+        }
+        options.lock_output_path = fixture.second_lock_path;
+        options.lock_input_path = fixture.lock_path;
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, "installed baseline prestate refused") != null);
+        try std.testing.expectEqual(@as(usize, 0), process.calls);
+        try std.testing.expectError(error.FileNotFound, directory.dir.statFile(std.testing.io, "single-lock.json", .{}));
+    }
+}
+
 fn expectLegacyCapabilitySidecar(
     allocator: std.mem.Allocator,
     artifact_path: []const u8,
@@ -8150,6 +8363,7 @@ fn testWorkflowLockPlanning(kind: transaction_engine.Kind) !void {
     var requested: usize = 0;
     var dependencies: usize = 0;
     switch (lock) {
+        .installed_baseline => return error.UnexpectedInstalledBaseline,
         inline else => |owned| {
             try std.testing.expectEqual(@as(usize, 3), owned.lock.packages.len);
             for (owned.lock.packages) |package| switch (package.retention) {
@@ -11138,7 +11352,11 @@ test "production exact lock retains and validates the installed baseline without
             .lock_output_path = lock_path,
         },
     }, backend.interface());
-    try std.testing.expectEqual(api.ExitStatus.planning, drift.exit_status);
+    try std.testing.expectEqual(api.ExitStatus.success, drift.exit_status);
+    var changed_baseline = try readProductLock(arena.allocator(), std.testing.io, lock_path, .legacy_dpkg);
+    defer changed_baseline.deinit();
+    try std.testing.expectEqualStrings("1.0-2", changed_baseline.baselineEvidence().?.packages[0].version);
+    try std.testing.expectEqual(@as(usize, 0), changed_baseline.planningLockV3().?.packages.len);
 
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "root/var/lib/dpkg/status",
@@ -11163,7 +11381,10 @@ test "production exact lock retains and validates the installed baseline without
             .lock_output_path = lock_path,
         },
     }, backend.interface());
-    try std.testing.expectEqual(api.ExitStatus.planning, missing.exit_status);
+    try std.testing.expectEqual(api.ExitStatus.success, missing.exit_status);
+    var installed_only = try readProductLock(arena.allocator(), std.testing.io, lock_path, .legacy_dpkg);
+    defer installed_only.deinit();
+    try std.testing.expectEqualStrings("baseline-only", installed_only.baselineEvidence().?.packages[0].name);
 }
 
 test "production backend mutation uses injected process runner" {

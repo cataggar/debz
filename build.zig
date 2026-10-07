@@ -2179,6 +2179,7 @@ fn installReleaseFiles(
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
         "exact-closure-lock-v3.json",
+        "exact-closure-lock-v4.json",
         "legacy-capability-evidence-v1.json",
         "legacy-compatibility-policy-v1.json",
         "native-execution-intent-v1.json",

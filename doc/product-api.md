@@ -39,6 +39,15 @@ does not reinterpret empty v1 options, authorize host mutation, or make
 confirmation, backend/capability selection, and existing explicit
 plan/review/replay remain unchanged.
 
+Explicit product `plan --lock-output` can now preserve a healthy
+installed-only exact package absent from signed repository metadata. Such
+plans emit the root-bound, **planning-only v4 baseline envelope** described in
+[Exact closure locks](exact-locks-and-provenance.md#installed-only-baseline-planning-only-v4).
+Exact plan replay verifies the actual complete database prestate; changed or
+missing metadata refuses. This does not make the resulting lock executable:
+install, download, and recovery refuse v4 rather than treating database facts
+as archive authority. Existing archive-only v1/v3 plans retain their formats.
+
 The proposed apt-shaped system facade likewise has a separate
 `debz.apt_system_api` contract and trusted profile. It does not add
 multi-package requests, live-root orchestration, configuration inheritance, or

@@ -55,6 +55,47 @@ identity. Local origins bind a typed artifact ID plus the complete archive and
 pinned content identities; v2/v3 plan serialization remains byte-for-byte
 unchanged.
 
+## Installed-only baseline: planning-only v4
+
+Product planning can retain a healthy installed package whose exact version
+and architecture are absent from authenticated repositories. Instead of
+inventing an archive origin or dropping the retained fact, it emits
+`exact-closure-lock-v4`. This is an explicitly **planning-only** envelope:
+
+- `archive_lock_json` contains the exact canonical v3 JSON string. Its signed
+  repository/index identities, freshness admission, archive digests, backend
+  request/policy bindings, and complete archive closure remain mandatory.
+- `installed_baseline` is separate `installed_database_noop_v1` authority.
+  It binds the exact selected root path, device/inode/ownership/mode, native architecture,
+  complete `var/lib/dpkg` prestate identity, and sorted retained package
+  name/version/architecture/selection tuples. Only healthy `install` or `hold`
+  records qualify. The actual root database is required; `--status` projections
+  cannot supply this authority.
+- Database observations use pinned no-follow descriptors and include file
+  bytes, inode/ownership/mode/time metadata, and directory membership.
+  Symlinks, hard-linked files, unsafe ownership/write permissions, unfinished
+  `updates`, unstable observations, and bounded-work excess refuse.
+- Replay verifies the actual root and database before solving. It locks these
+  packages to their installed identities and rejects any action touching
+  them. Changed/missing prestate, another root, or different architecture
+  fails closed. A new explicit plan can capture a new healthy baseline;
+  replay cannot refresh or replace the old evidence.
+  Lock output must be outside the bound database tree so publication cannot
+  invalidate its own retained prestate.
+
+The envelope checksum detects document substitution; it is **not** a
+repository signature, an archive digest, or proof of installed payload bytes.
+Baseline tuples cannot authorize fetching/installing an archive, reinstall,
+remove, reconfigure, or a new package. Archive/baseline identities cannot
+overlap. V1/v2/v3 decoding and canonical bytes are unchanged.
+
+Execution, download execution, and recovery currently reject v4 with
+`lock_verification_failed` / `InstalledBaselineExecutionUnsupported`. They do
+not flatten it to an archive-only lock or replan around it. Versioned native
+preparation, final-state, receipt, and recovery contracts must represent this
+authority before execution can safely accept it. This bounded planning
+slice does not complete the simple SymCrypt install/auto-lock workflow.
+
 **Signed SHA256 with a derived SHA512.** Some signed archives, including
 Debian stable, publish only SHA256 in both
 Release and Packages. For those repositories debz accepts the signed SHA256
