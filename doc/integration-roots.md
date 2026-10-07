@@ -731,6 +731,13 @@ launch; the real pending scheduler configures libgcc-s1 and attempts libc6,
 whose callback is denied. The candidate leaves libc6 unpacked while the
 interrupted baseline records it half-configured. This deliberately bounded
 schedule comparison is **not full callback or command-scheduling parity**.
+Only that pending-oracle copy receives the exact signed amd64 libcap-ng0
+`0.8.5-4build5` library needed by signed setpriv. Its member size, mode and
+SHA-256 are checked before launch; it is not registered in dpkg, added to the
+30-archive bootstrap, or staged into the candidate or target prestates.
+The oracle retains bounded stdout/stderr, exact argv/exit status, runtime
+identity and database observations **before** classifying a refusal. Loader
+or setup failures still refuse; they are never accepted as callback denial.
 The job retains graph/status/trigger before/after evidence, both argv/output
 histories and a launcher injected-callback refusal. Hosted success is required
 before #401 closure; local unit tests and an archive rehash are not that proof.

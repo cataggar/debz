@@ -559,6 +559,10 @@
         {
           "form": "hex",
           "path": "tools/real-snapshot-signed-proc-prestates.sh"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-reference-order.py"
         }
       ],
       "digest": "sha256:86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993",
@@ -576,6 +580,28 @@
       "review": "#287",
       "size": 47576,
       "version_bound": false
+    },
+    {
+      "architectures": ["amd64"],
+      "consumers": [
+        {"form": "hex", "path": "tools/real-snapshot-signed-proc-prestates.sh"},
+        {"form": "hex", "path": "tools/real-snapshot-reference-order.py"}
+      ],
+      "digest": "sha256:60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f",
+      "id": "file:libcap-ng0/usr/lib/x86_64-linux-gnu/libcap-ng.so.0.0.0@amd64",
+      "kind": "tool_file",
+      "mode": "0644",
+      "package": "libcap-ng0",
+      "path": "usr/lib/x86_64-linux-gnu/libcap-ng.so.0.0.0",
+      "provenance": {
+        "archives": {
+          "amd64": "sha512:03c954cbe1d9f8cf590664fb8dfc0d39ca3fa5219f23697272034e96b483eccec0fb91248ecba0a047cc5077755e01df86a07f2cf044059c7e816793b48b3fab"
+        },
+        "version": "0.8.5-4build5"
+      },
+      "review": "#401",
+      "size": 26928,
+      "version_bound": true
     },
     {
       "architectures": [

@@ -412,6 +412,43 @@ def break_base_cycle(
     return cycle[1]
 
 
+def stage_pending_runtime(baseline: Path, setpriv: Path) -> dict:
+    """Stage setpriv's signed library only in the unregistered pending oracle."""
+    source = setpriv.with_name("libcap-ng.so.0.0.0")
+    try:
+        meta = protected(source)
+        if meta.st_size != 26928 or meta.st_mode & 0o7777 != 0o644:
+            raise ValueError("signed library metadata")
+        data = read_root_file(source.parent, source.name, 26928)
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != "60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f":
+            raise ValueError("signed library bytes")
+        relative = "usr/lib/x86_64-linux-gnu/libcap-ng.so.0"
+        target = baseline / relative
+        protected(target.parent, directory=True)
+        with target.open("xb") as output:
+            output.write(data)
+        target.chmod(0o644)
+    except (OSError, ValueError) as error:
+        raise CycleRefusal(f"CycleProofRuntimeChanged: setpriv libcap-ng: {error}") from error
+    return {"source": str(source), "target": relative, "sha256": digest,
+            "size": len(data), "mode": "0644"}
+
+
+def record_pending_result(proof: Path, command: list[str], result: subprocess.CompletedProcess,
+                          runtime: dict) -> None:
+    # Refused loader/setup/callback attempts must retain their own bounded evidence.
+    (proof / "pending.stdout").write_bytes(result.stdout[:MAXIMUM_PROBE_OUTPUT])
+    (proof / "pending.stderr").write_bytes(result.stderr[:MAXIMUM_PROBE_OUTPUT])
+    (proof / "pending-result.json").write_text(json.dumps({
+        "schema": "io.github.cataggar.debz.base-cycle-pending-result.v1",
+        "argv": command, "returncode": result.returncode, "setpriv_runtime": runtime,
+        "stdout_bytes": len(result.stdout), "stderr_bytes": len(result.stderr),
+        "output_truncated": (len(result.stdout) > MAXIMUM_PROBE_OUTPUT
+                             or len(result.stderr) > MAXIMUM_PROBE_OUTPUT),
+    }, sort_keys=True) + "\n")
+
+
 def prove_base_cycle(
     launcher: Path, dpkg: Path, root: Path, cache: Path, evidence: Path, setpriv: Path,
 ) -> None:
@@ -486,6 +523,8 @@ def prove_base_cycle(
     shutil.copyfile(dpkg, baseline / "usr/bin/dpkg")
     shutil.copyfile(setpriv, baseline / "usr/bin/setpriv")
     (baseline / "usr/bin/setpriv").chmod(0o755)
+    runtime = stage_pending_runtime(baseline, setpriv)
+    before_pending = list(database_fields(baseline).values())
     subprocess.run(["mount", "--bind", "--", str(script), str(script)], check=True, timeout=30)
     try:
         subprocess.run(["mount", "-o", "remount,bind,ro,noexec,nosuid,nodev", "--", str(script)],
@@ -501,16 +540,19 @@ def prove_base_cycle(
         ]
         result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
                                 capture_output=True, check=False, timeout=120)
+        record_pending_result(proof, command, result, runtime)
     finally:
         subprocess.run(["umount", "--", str(script)], check=True, timeout=30)
+    (proof / "pending-status.json").write_text(json.dumps({
+        "before": before_pending, "after": list(database_fields(baseline).values()),
+        "trigger_database": trigger_database(baseline),
+    }, sort_keys=True) + "\n")
     if (len(result.stdout) > MAXIMUM_PROBE_OUTPUT or len(result.stderr) > MAXIMUM_PROBE_OUTPUT
         or result.returncode == 0 or b"Permission denied" not in result.stderr
         or b"post-installation script" not in result.stderr):
         raise CycleRefusal("CycleProofCallbackChanged: libc6 callback was not denied")
     if read_root_file(baseline, str(script.relative_to(baseline)), MAXIMUM_PROBE_OUTPUT) != signed_bytes:
         raise CycleRefusal("CycleProofCallbackChanged: denied libc6 postinst changed")
-    (proof / "pending.stdout").write_bytes(result.stdout)
-    (proof / "pending.stderr").write_bytes(result.stderr)
     observed = database_packages(baseline)
     wanted = database_packages(candidate)
     expected = dict(wanted)
@@ -525,6 +567,7 @@ def prove_base_cycle(
         "candidate_trigger_database": trigger_database(candidate),
         "pending_trigger_database": trigger_database(baseline),
         "pending_argv": command,
+        "pending_setpriv_runtime": runtime,
         "difference": "pending attempts libc6 configure; single breaker leaves libc6 unpacked",
         "parity_claim": False,
     }, sort_keys=True) + "\n")

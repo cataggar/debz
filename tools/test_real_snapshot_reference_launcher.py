@@ -373,6 +373,157 @@ class ReferenceLauncherTests(unittest.TestCase):
         (info / "libgcc-s1:amd64.triggers").write_bytes(ORDER.LIBGCC_TRIGGERS)
         return tuple(packages), records, controls
 
+    def pending_oracle_fixture(self, stderr: bytes, *, returncode: int = 1,
+                               configured: bool = True) -> Path:
+        cycle, records, _ = self.cycle_fixture()
+        image, evidence, tools = (self.root / name for name in ("image", "evidence", "tools"))
+        image.mkdir()
+        evidence.mkdir()
+        tools.mkdir()
+        shutil.copytree(self.root / "var", image / "var")
+        (image / "usr/bin").mkdir(parents=True)
+        (image / "usr/lib/x86_64-linux-gnu").mkdir(parents=True)
+        postinst = b"#!/bin/sh\nexit 0\n"
+        (image / "var/lib/dpkg/info/libc6:amd64.postinst").write_bytes(postinst)
+        dpkg, setpriv = tools / "dpkg", tools / "setpriv"
+        dpkg.write_bytes(b"unit dpkg")
+        setpriv.write_bytes(b"unit signed setpriv")
+        library = b"unit signed libcap-ng".ljust(26928, b"\0")
+        source = tools / "libcap-ng.so.0.0.0"
+        source.write_bytes(library)
+        source.chmod(0o644)
+        real_sha256 = hashlib.sha256
+
+        def identity(data: bytes):
+            approved = {
+                library: "60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f",
+                b"unit signed setpriv":
+                    "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993",
+            }
+            return mock.Mock(hexdigest=lambda: approved[data]) if data in approved else real_sha256(data)
+
+        overrides = {}
+
+        def fields(path: Path) -> dict:
+            return {key: {**record, "status": overrides.get((path.name, key), record["status"])}
+                    for key, record in records.items()}
+
+        def packages(path: Path) -> dict:
+            return {} if path == image else {
+                key: (record["status"], record["version"]) for key, record in fields(path).items()
+            }
+
+        def breaker(*args) -> None:
+            overrides[("candidate", ("libgcc-s1", "amd64"))] = "install ok installed"
+
+        def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+            if command[0] == "cp":
+                shutil.copytree(command[-2], command[-1])
+            elif command[0] == "rm":
+                shutil.rmtree(command[-1])
+            elif command[0] == "unshare":
+                baseline = Path(command[command.index("chroot") + 1])
+                relative = "usr/lib/x86_64-linux-gnu/libcap-ng.so.0"
+                self.assertEqual(command[-3:], ["--no-triggers", "--configure", "--pending"])
+                if configured:
+                    self.assertEqual((baseline / relative).read_bytes(), library)
+                    self.assertFalse((image / relative).exists())
+                    self.assertFalse((baseline.parent / "candidate" / relative).exists())
+                    overrides[("pending", ("libgcc-s1", "amd64"))] = "install ok installed"
+                    overrides[("pending", ("libc6", "amd64"))] = "install ok half-configured"
+                return subprocess.CompletedProcess(command, returncode, b"pending stdout witness", stderr)
+            else:
+                self.assertIn(command[0], ("mount", "umount"))
+            return subprocess.CompletedProcess(command, 0)
+
+        control = io.BytesIO()
+        with tarfile.open(fileobj=control, mode="w") as archive:
+            member = tarfile.TarInfo("./postinst")
+            member.size = len(postinst)
+            archive.addfile(member, io.BytesIO(postinst))
+        with (
+            mock.patch.object(ORDER.os, "uname", return_value=mock.Mock(machine="x86_64")),
+            mock.patch.object(ORDER, "protected", side_effect=lambda path, **kw: path.stat()),
+            mock.patch.object(ORDER, "packages_from_manifest", return_value=list(cycle)),
+            mock.patch.object(ORDER, "database_fields", side_effect=fields),
+            mock.patch.object(ORDER, "database_packages", side_effect=packages),
+            mock.patch.object(ORDER, "verify_archive"),
+            mock.patch.object(ORDER, "verify_base_cycle"),
+            mock.patch.object(ORDER, "apply"),
+            mock.patch.object(ORDER, "break_base_cycle", side_effect=breaker),
+            mock.patch.object(ORDER, "probe", side_effect=[
+                (1, b"dependency problems"), (1, b"dependency problems"), (1, b"stage 11"),
+            ]),
+            mock.patch.object(ORDER.hashlib, "sha256", side_effect=identity),
+            mock.patch.object(ORDER.subprocess, "check_output", return_value=control.getvalue()),
+            mock.patch.object(ORDER.subprocess, "run", side_effect=run),
+        ):
+            ORDER.prove_base_cycle(tools / "launcher", dpkg, image, tools, evidence, setpriv)
+        return evidence / "base-cycle-proof"
+
+    def test_pending_oracle_stages_helper_runtime_without_registering_or_widening_candidate(self) -> None:
+        proof = self.pending_oracle_fixture(b"post-installation script: Permission denied")
+        comparison = json.loads((proof / "comparison.json").read_text())
+        self.assertEqual(len(comparison["pending"]), 4)
+        self.assertFalse(comparison["parity_claim"])
+        self.assertEqual(comparison["callbacks_executed"], [])
+        self.assertEqual(comparison["pending_setpriv_runtime"]["size"], 26928)
+
+    def test_pending_loader_refusal_retains_evidence_but_never_counts_as_callback_denial(self) -> None:
+        stderr = (b"setpriv: error while loading shared libraries: libcap-ng.so.0: "
+                  b"cannot open shared object file: No such file or directory\n")
+        with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleProofCallbackChanged"):
+            self.pending_oracle_fixture(stderr, returncode=127, configured=False)
+        proof = self.root / "evidence/base-cycle-proof"
+        self.assertEqual((proof / "pending.stderr").read_bytes(), stderr)
+        self.assertEqual((proof / "pending.stdout").read_bytes(), b"pending stdout witness")
+        result = json.loads((proof / "pending-result.json").read_text())
+        self.assertEqual(result["returncode"], 127)
+        self.assertFalse(result["output_truncated"])
+        status = json.loads((proof / "pending-status.json").read_text())
+        self.assertEqual(status["before"], status["after"])
+        self.assertFalse((proof / "comparison.json").exists())
+
+    def test_pending_oversized_output_is_retained_bounded_and_still_refuses(self) -> None:
+        stderr = b"post-installation script: Permission denied\n" + b"x" * ORDER.MAXIMUM_PROBE_OUTPUT
+        with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleProofCallbackChanged"):
+            self.pending_oracle_fixture(stderr)
+        proof = self.root / "evidence/base-cycle-proof"
+        self.assertEqual((proof / "pending.stderr").read_bytes(), stderr[:ORDER.MAXIMUM_PROBE_OUTPUT])
+        result = json.loads((proof / "pending-result.json").read_text())
+        self.assertTrue(result["output_truncated"])
+        self.assertEqual(result["stderr_bytes"], len(stderr))
+        self.assertFalse((proof / "comparison.json").exists())
+
+    def test_pending_runtime_rejects_changed_source_metadata_and_existing_target(self) -> None:
+        (self.root / "usr/lib/x86_64-linux-gnu").mkdir(parents=True)
+        setpriv = self.root / "setpriv"
+        library = self.root / "libcap-ng.so.0.0.0"
+        target = self.root / "usr/lib/x86_64-linux-gnu/libcap-ng.so.0"
+        approved = b"unit signed library".ljust(26928, b"\0")
+        real_sha256 = hashlib.sha256
+
+        def identity(data: bytes):
+            return (mock.Mock(hexdigest=lambda:
+                    "60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f")
+                    if data == approved else real_sha256(data))
+
+        with (mock.patch.object(ORDER, "protected", side_effect=lambda path, **kw: path.stat()),
+              mock.patch.object(ORDER.hashlib, "sha256", side_effect=identity)):
+            for mutation in ("missing", "changed", "writable", "setgid", "existing-target"):
+                with self.subTest(mutation=mutation):
+                    if mutation != "missing":
+                        library.write_bytes(b"x" * 26928 if mutation == "changed" else approved)
+                        library.chmod({"writable": 0o666, "setgid": 0o2644}.get(mutation, 0o644))
+                    if mutation == "existing-target":
+                        target.write_bytes(b"unbound existing runtime")
+                    with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleProofRuntimeChanged"):
+                        ORDER.stage_pending_runtime(self.root, setpriv)
+                    if mutation == "existing-target":
+                        self.assertEqual(target.read_bytes(), b"unbound existing runtime")
+                    else:
+                        self.assertFalse(target.exists())
+
     def test_cycle_operation_requires_exact_four_archives_and_dedicated_profile(self) -> None:
         cycle, _, _ = self.cycle_fixture()
         command = ORDER.dpkg_command(self.root / "launcher", self.root / "dpkg",
