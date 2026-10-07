@@ -24930,6 +24930,11 @@ test "native_unpack.test.protected signed arm64 less source is validated before 
     var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
     defer root.close();
     try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_PROOF")) |proof_path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed arm64 less source guard executed without skips\n");
+    }
 }
 
 test "native_unpack.test.protected signed arm64 less inert input and replay roots are exact" {
@@ -24996,6 +25001,11 @@ test "native_unpack.test.protected signed arm64 less inert input and replay root
             &artifacts,
             "arm64",
         ));
+    }
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_REPLAY_PROOF")) |proof_path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\n");
     }
 }
 

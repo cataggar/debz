@@ -9,6 +9,11 @@
 set -euo pipefail
 umask 077
 trap 'echo "protected staging failed at line $LINENO" >&2' ERR
+purpose=proof
+if [[ ${1:-} == --arm64-less-source ]]; then
+  purpose=arm64-less
+  shift
+fi
 
 readonly snapshot_uri=https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
 # The launcher binds amd64 proc-profile postinsts by exact version, size and
@@ -113,6 +118,11 @@ case "$(uname -m)" in
   aarch64) architecture=arm64 loader=usr/lib/ld-linux-aarch64.so.1 ;;
   *) echo "unsupported native reference architecture" >&2; exit 2 ;;
 esac
+closure_args=("$closure_root")
+if [[ $purpose == arm64-less ]]; then
+  [[ $architecture == arm64 ]]
+  closure_args+=(less dash util-linux)
+fi
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
 unset ZIG_LIB_DIR
@@ -180,8 +190,8 @@ authenticated_lock() {
   ' "$1" >/dev/null
 }
 debz_step refresh refresh "$snapshot/root" --assume-yes
-debz_step plan plan "$snapshot/root" --transaction-backend native --lock-output "$lock" "$closure_root"
-debz_step download download "$snapshot/root" --transaction-backend native --lock-input "$lock" "$closure_root"
+debz_step plan plan "$snapshot/root" --transaction-backend native --lock-output "$lock" "${closure_args[@]}"
+debz_step download download "$snapshot/root" --transaction-backend native --lock-input "$lock" "${closure_args[@]}"
 authenticated_lock "$lock"
 
 template=$workspace/template
@@ -275,6 +285,10 @@ chmod 0700 "$template"
 if [[ -n $(find "$template" \( ! -user 0 -o ! -group 0 \) -print -quit) ]]; then
   echo "the template must contain only root-owned entries" >&2
   exit 1
+fi
+if [[ $purpose == arm64-less ]]; then
+  echo "fresh authenticated arm64 less runtime template staged; no replay claimed"
+  exit 0
 fi
 
 # The launcher binds its proc profiles to the signed amd64 systemd, udev and

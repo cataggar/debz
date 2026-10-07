@@ -2553,6 +2553,10 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-signed-proc-prestates.sh",
     "src/native_unpack.zig",
     "src/native_alternatives.zig",
+    "tools/real-snapshot-less-protected-stage.sh",
+    "tools/real-snapshot-less-reference.sh",
+    "tools/real_snapshot_less_stage.py",
+    "tools/real_snapshot_less_fixtures.py",
 )
 PROTECTED_REFERENCE_INPUT = (
     '      run_protected_reference:\n'
@@ -2739,6 +2743,43 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "[[ ${#proof_arguments[@]} == 13 ]]",
 )
 PROTECTED_REFERENCE_SOURCE_TOKENS = {
+    "tools/real-snapshot-less-protected-stage.sh": (
+        '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
+        '"$workspace" == "$checkout/.real-snapshot/less-arm64"',
+        'toolchain(Path(sys.argv[3]))',
+        '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
+        'bash tools/real-snapshot-reference-protected-stage.sh --arm64-less-source',
+        'python3 -B -I tools/real_snapshot_less_stage.py prepare',
+        'python3 -B -I tools/real_snapshot_less_stage.py seal',
+        '--force-depends --no-triggers --unpack /var/lib/dpkg/producer-less.deb',
+        'bash tools/real-snapshot-less-reference.sh',
+        'bytes <= 8 * 1024 * 1024 * 1024',
+    ),
+    "tools/real_snapshot_less_stage.py": (
+        'def alias(root: Path, relative: str, target: str) -> None:\n    with parent_descriptor(root, relative) as (parent, name):',
+        'os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW',
+        'entry["origin"]["type"] != "authenticated_repository"',
+        'raise ValueError("source archive differs from exact production authority")',
+        'for package in SOURCE_ARTIFACTS:\n        archive(lock, cache, package)',
+        'f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8',
+        'c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e',
+        '824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5',
+        '865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7',
+        'regular_descriptor(root, "var/lib/dpkg/info/less.list")',
+        'overwrite_regular(root, "var/lib/dpkg/info/less.list", content)',
+        'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", script, 0o755)',
+        'resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))',
+    ),
+    "tools/real-snapshot-less-reference.sh": (
+        '\ncheck_source_inputs\n',
+        'mutate_negative_roots([Path(root) for root in sys.argv[1:]])',
+        'stage_dpkg_reference(*(Path(path) for path in sys.argv[1:]))',
+    ),
+    "tools/real_snapshot_less_fixtures.py": (
+        'parent_fd = open_beneath(root_fd, parent, directory=True)',
+        'regular_metadata(descriptor)\n    os.ftruncate(descriptor, 0)',
+        'os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC',
+    ),
     "tools/real-snapshot-protected-native-ci.sh": (
         "export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C HOME=/root",
         "unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH ZIG_LIB_DIR",
@@ -2896,6 +2937,51 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
 def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     """The protected reference job stages only reviewed, root-owned inputs and cannot skip."""
     failures: list[str] = []
+    arm_ci = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
+    arm_start = 'elif [[ $architecture == arm64 ]]; then\n  less_workspace='
+    arm_body = arm_ci.partition(arm_start)[2].partition('\n# The protected proof on the staged new empty workspace')[0]
+    for token in (
+        '$checkout/.real-snapshot/less-arm64',
+        'step arm64-less-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m',
+        'bash tools/real-snapshot-less-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$less_workspace"',
+        'step arm64-less-guards 0 "" timeout --signal=TERM --kill-after=60s 10m',
+        '"$zig" build test-real-snapshot-arm64-less-protected',
+        '"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate"',
+        '"$less_workspace/evidence/less-source-proof.txt"',
+        '"$less_workspace/evidence/less-replay-proof.txt"',
+        'grep -F " $less_workspace" /proc/self/mountinfo',
+        'rm -rf --one-file-system -- "$less_workspace"',
+    ):
+        if token not in arm_body:
+            failures.append(f"protected arm64 less activation lost {token}")
+    if "|| true" in arm_body or "SkipZigTest" in arm_body:
+        failures.append("protected arm64 less activation must not skip or swallow errors")
+    arm_build = texts.get("build.zig", "")
+    for token in (
+        'b.step("test-real-snapshot-arm64-less-protected",',
+        'run_arm64_less_tests.has_side_effects = true;',
+        '"Required protected ARM less proof coordinate") orelse ""',
+        'setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT", value)',
+    ):
+        if token not in arm_build:
+            failures.append(f"protected arm64 less build lost {token}")
+    for name, calls in (
+        ("source is validated before fixture mutation", (
+            'try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");',
+            'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_PROOF',
+        )),
+        ("inert input and replay roots are exact", (
+            'prepareAlternativesScriptBoundary(',
+            'try testing.expectEqualDeep(before.record, after.record);',
+            'try testing.expectError(error.InvalidAlternativesScriptAuthority, verifySnapshotLessArm64Inputs(',
+            'DEBZ_REQUIRE_SIGNED_ARM64_LESS_REPLAY_PROOF',
+        )),
+    ):
+        text = texts.get("src/native_unpack.zig", "")
+        body = text.partition(f'test "native_unpack.test.protected signed arm64 less {name}" {{')[2].partition('\n}\n')[0]
+        for token in (*calls, '.exclusive = true', 'try proof.writeStreamingAll('):
+            if token not in body:
+                failures.append(f"protected arm64 less test body lost {token}")
     python_ci = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
     python_start = 'if [[ $architecture == amd64 ]]; then\n  python3_workspace='
     python_end = '\n# The protected proof on the staged new empty workspace'

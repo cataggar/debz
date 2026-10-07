@@ -188,9 +188,14 @@ records the `zig-pkg` modes, and runs seven fail-closed negatives before the
 proof. Its amd64 leg additionally stages a separate signed Python pre-configure
 source and runs the empty0600/0644 and strict20/96 replay, then requires exclusive
 receipts from both activated Zig root validators. The 140-minute job budget
-includes bounded Python staging/replay (40) and Zig verification (10), without
-activating ARM397 or changing reference configure semantics. These are dispatch
-gates, not proof inferred from skipped ordinary PR jobs.
+includes bounded Python staging/replay (40) and Zig verification (10). Its
+arm64 leg separately stages a fresh signed less source using the reviewed
+no-follow helper, then requires both actual source/replay verifier receipts
+with all eight root coordinates (30-minute staging/replay, 10-minute required
+Zig verification). The AMD Python 20/96 gate remains AMD-only; neither branch
+changes reference configure semantics or broadens proc/alternatives authority.
+These are dispatch gates, not proof inferred from skipped ordinary PR jobs;
+genuinely protected positive replay still requires retained hosted evidence.
 Bounded evidence is always uploaded, and the tree is always removed.
 `tools/security-audit.py` and `test/security-policy.zig` keep the job opt-in,
 `sudo -n`-only and unskippable; see "Hosted protected reference job" in

@@ -121,6 +121,12 @@ collect() {
     find "$checkout/.real-snapshot/python3-amd64/evidence" -maxdepth 1 -type f \
       -size -16777217c -exec install -m 0644 -t "$upload/python3" {} +
   fi
+  if [[ -d $checkout/.real-snapshot/less-arm64/evidence &&
+        ! -L $checkout/.real-snapshot/less-arm64/evidence ]]; then
+    install -d -o root -g root -m 0755 "$upload/arm64-less"
+    find "$checkout/.real-snapshot/less-arm64/evidence" -maxdepth 1 -type f \
+      -size -16777217c -exec install -m 0644 -t "$upload/arm64-less" {} +
+  fi
   for source in snapshot/evidence prestate-build/evidence; do
     local python3_evidence=$checkout/.real-snapshot/python3-amd64/$source
     [[ -d $python3_evidence && ! -L $python3_evidence ]] || continue
@@ -678,6 +684,33 @@ PY
     exit 1
   fi
   rm -rf --one-file-system -- "$python3_workspace"
+elif [[ $architecture == arm64 ]]; then
+  less_workspace=$checkout/.real-snapshot/less-arm64
+  step arm64-less-stage 0 "eight replay roots staged" timeout --signal=TERM --kill-after=60s 30m \
+    "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
+    bash tools/real-snapshot-less-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" "$less_workspace"
+  step arm64-less-guards 0 "" timeout --signal=TERM --kill-after=60s 10m \
+    "${zenv[@]}" "$zig" build test-real-snapshot-arm64-less-protected \
+    "-Darm64-less-reference-root=$less_workspace/source" \
+    "-Darm64-less-reference-script-after=$less_workspace/script-after" \
+    "-Darm64-less-reference-dpkg-after=$less_workspace/dpkg-after" \
+    "-Darm64-less-reference-bad-script=$less_workspace/script-after-bad-script" \
+    "-Darm64-less-reference-bad-mode=$less_workspace/script-after-bad-mode" \
+    "-Darm64-less-reference-bad-tool=$less_workspace/script-after-bad-tool" \
+    "-Darm64-less-reference-bad-alias=$less_workspace/script-after-bad-alias" \
+    "-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate" \
+    "-Darm64-less-reference-source-proof=$less_workspace/evidence/less-source-proof.txt" \
+    "-Darm64-less-reference-replay-proof=$less_workspace/evidence/less-replay-proof.txt" \
+    -Doptimize=ReleaseSafe -j2 --summary all
+  grep -Fx "signed arm64 less source guard executed without skips" "$less_workspace/evidence/less-source-proof.txt"
+  grep -Fx "signed arm64 less eight replay roots executed without skips" "$less_workspace/evidence/less-replay-proof.txt"
+  find "$less_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
+    -exec install -m 0644 -t "$evidence" {} +
+  if grep -F " $less_workspace" /proc/self/mountinfo; then
+    echo "mounts remain beneath the ARM less replay workspace" >&2
+    exit 1
+  fi
+  rm -rf --one-file-system -- "$less_workspace"
 fi
 
 # The protected proof on the staged new empty workspace, bounded by a timeout

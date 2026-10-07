@@ -777,7 +777,34 @@ the lane. The regular-file fixture conversion never resets a native root.
 
 This wiring is local implementation, not evidence of a passing hosted replay.
 The protected job remains skipped on ordinary PR runs and requires the parent's
-explicit dispatch after capacity release. ARM397 replay is not activated.
+explicit dispatch after local review/capacity release. The Python 20-byte
+activation remains amd64-only; ARM Python is not admitted.
+
+The companion arm64 `protected-reference` branch now activates the reviewed
+`tools/real-snapshot-less-reference.sh` safety correction. Its independent
+`.real-snapshot/less-arm64` workspace reuses the existing protected runtime
+stager and reviewed keyring/compiler, not a mutated proof root. An opt-in
+source-only staging mode adds the signed less/dash/util-linux closure without
+changing the default proof or any reference configure semantics. The exact
+production less/dash/dpkg/libc6 archives are checked before source mutation
+or callback execution. Pinned dpkg genuinely unpacks the exact signed less
+archive; status/control bytes are not fabricated. Descriptor-rooted no-follow,
+exclusive setup supplies the signed runtime and staged control; the observed
+ownership list is normalized only if its exact existing path-set digest matches.
+
+The helper retains its production source guard before clones/negatives and
+uses only the reviewed no-follow fixture writes. The caller then explicitly
+runs `test-real-snapshot-arm64-less-protected -Doptimize=ReleaseSafe -j2` with
+all eight root coordinates: source, script/dpkg after-roots and five bad
+script/mode/tool/alias/prestate roots. Both actual source and replay verifier
+bodies must write exclusive receipts after their assertions. Missing options
+override ambient inputs with empty values and fail instead of returning early.
+Source/replay and required verification are bounded to 30/10 minutes; bounded
+failure evidence and named-workspace/mount checks remain in the protected lane.
+
+This is activation wiring, not a claim of positive hosted execution, native
+installation, wider alternatives/proc authority or full reference completion.
+The parent owns the explicit dispatch and retained evidence review.
 
 ### Resolute arm64 Python input-binding prerequisite (#393)
 

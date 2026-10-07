@@ -21,6 +21,7 @@ TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 from real_snapshot_reference_paths import open_absolute, protected, read_root_file
 import real_snapshot_less_fixtures as LESS_FIXTURES
+import real_snapshot_less_stage as LESS_STAGE
 
 ROOT = TOOLS.parent
 SPEC = importlib.util.spec_from_file_location(
@@ -37,6 +38,47 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="debz-reference-negative-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    def test_less_source_setup_directories_refuse_aliases_and_handle_private_umask(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.root / "usr").mkdir()
+        (self.root / "usr/local").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            LESS_STAGE.directory(self.root, "usr/local")
+        self.assertEqual(list(outside.iterdir()), [])
+        (self.root / "usr/local").unlink()
+        previous = os.umask(0o077)
+        try:
+            LESS_STAGE.directory(self.root, "usr/local")
+        finally:
+            os.umask(previous)
+        self.assertEqual((self.root / "usr/local").stat().st_mode & 0o777, 0o755)
+
+    def test_less_source_setup_refuses_unreviewed_archive_before_opening_cache(self) -> None:
+        version, size, digest = LESS_STAGE.SOURCE_ARTIFACTS["less"]
+        entry = {"name": "less", "architecture": "arm64", "version": version,
+                 "declared_size": size, "origin": {"type": "authenticated_repository"},
+                 "archive_identity": {"primary": "sha512", "digests": [
+                     {"algorithm": "sha512", "digest": digest}]}}
+        for field, changed in (("version", "other"), ("declared_size", size + 1)):
+            with self.subTest(field=field):
+                wrong = dict(entry); wrong[field] = changed
+                with mock.patch.object(LESS_STAGE, "protected") as opened:
+                    with self.assertRaisesRegex(ValueError, "exact production authority"):
+                        LESS_STAGE.archive({"packages": [wrong]}, self.root, "less")
+                    opened.assert_not_called()
+
+    def test_less_source_capture_is_exclusive_without_following_an_existing_alias(self) -> None:
+        outside = self.root / "outside"
+        outside.write_bytes(b"must stay intact")
+        archive = self.root / "archive"
+        (self.root / "archive.less-source.tar").symlink_to(outside)
+        with mock.patch.object(LESS_STAGE.subprocess, "run") as executed:
+            with self.assertRaises(FileExistsError):
+                LESS_STAGE.member(archive, "usr/bin/dash")
+            executed.assert_not_called()
+        self.assertEqual(outside.read_bytes(), b"must stay intact")
 
     def test_less_negative_writes_refuse_leaf_aliases_without_touching_outside_bytes(self) -> None:
         outside = self.root / "outside"

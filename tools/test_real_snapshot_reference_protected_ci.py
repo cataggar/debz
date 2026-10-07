@@ -247,6 +247,32 @@ class ProfileStagingTests(unittest.TestCase):
 
 
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_arm_less_receipts_require_real_source_and_replay_assertions(self) -> None:
+        audit = load("debz_arm_less_activation_policy", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, token in (
+            ("src/native_unpack.zig", '    try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");\n'),
+            ("src/native_unpack.zig", '        try testing.expectEqualDeep(before.record, after.record);\n'),
+            ("src/native_unpack.zig", '        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\\n");\n'),
+            ("tools/real-snapshot-reference-protected-ci.sh", '"$zig" build test-real-snapshot-arm64-less-protected'),
+            ("tools/real_snapshot_less_stage.py", '    for package in SOURCE_ARTIFACTS:\n        archive(lock, cache, package)\n'),
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, texts[path])
+                changed = dict(texts)
+                changed[path] = texts[path].replace(token, "", 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
+
+    def test_arm_less_activation_refuses_unprivileged_or_incomplete_staging(self) -> None:
+        script = TOOLS / "real-snapshot-less-protected-stage.sh"
+        for arguments in ((), ("/usr/bin/zig", "/usr/bin/debz",
+                               str(TOOLS.parent / ".real-snapshot/less-arm64"))):
+            result = subprocess.run(["bash", str(script), *arguments], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("replay roots staged", result.stdout)
+
     def test_python_input_receipt_requires_actual_strict_root_assertions(self) -> None:
         audit = load("debz_python_activation_policy", "security-audit.py")
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}

@@ -875,6 +875,34 @@ pub fn build(b: *std.Build) void {
     }
     const python3_reference_step = b.step("test-real-snapshot-python3-protected", "Require the protected signed Python root and alternatives proof without skips");
     python3_reference_step.dependOn(&run_python3_reference_tests.step);
+    const arm64_less_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "native_unpack.test.protected signed arm64 less source is validated before fixture mutation",
+            "native_unpack.test.protected signed arm64 less inert input and replay roots are exact",
+        },
+    });
+    const run_arm64_less_tests = b.addRunArtifact(arm64_less_tests);
+    run_arm64_less_tests.has_side_effects = true;
+    for ([_]struct { option: []const u8, environment: []const u8 }{
+        .{ .option = "root", .environment = "PREINST_ROOT" },
+        .{ .option = "script-after", .environment = "SCRIPT_AFTER" },
+        .{ .option = "dpkg-after", .environment = "DPKG_AFTER" },
+        .{ .option = "bad-script", .environment = "BAD_SCRIPT_ROOT" },
+        .{ .option = "bad-mode", .environment = "BAD_MODE_ROOT" },
+        .{ .option = "bad-tool", .environment = "BAD_TOOL_ROOT" },
+        .{ .option = "bad-alias", .environment = "BAD_ALIAS_ROOT" },
+        .{ .option = "bad-prestate", .environment = "BAD_PRESTATE_ROOT" },
+        .{ .option = "source-proof", .environment = "SOURCE_PROOF" },
+        .{ .option = "replay-proof", .environment = "REPLAY_PROOF" },
+    }) |coordinate| {
+        const value = b.option([]const u8, b.fmt("arm64-less-reference-{s}", .{coordinate.option}), "Required protected ARM less proof coordinate") orelse "";
+        run_arm64_less_tests.setEnvironmentVariable(b.fmt("DEBZ_REQUIRE_SIGNED_ARM64_LESS_{s}", .{coordinate.environment}), value);
+        if (std.mem.eql(u8, coordinate.option, "root"))
+            run_arm64_less_tests.setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT", value);
+    }
+    b.step("test-real-snapshot-arm64-less-protected", "Require the exact signed ARM less source and replay root guards without skips")
+        .dependOn(&run_arm64_less_tests.step);
 
     const native_alternatives_test_module = b.createModule(.{
         .root_source_file = b.path("src/native_alternatives.zig"),

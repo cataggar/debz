@@ -2322,6 +2322,19 @@ test "security: retired lifecycle fixtures stay import-only and all consumers re
 test "security: protected reference CI stays opt-in, root-staged, bounded and unskippable" {
     var f = try Fixture.init();
     defer f.deinit();
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-ci.sh", &.{
+        "    \"${zenv[@]}\" \"$zig\" build test-real-snapshot-arm64-less-protected \\\n",
+        "    \"-Darm64-less-reference-bad-prestate=$less_workspace/script-after-bad-prestate\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-protected-stage.sh", &.{
+        "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",
+        "python3 -B -I tools/real_snapshot_less_stage.py prepare \"$source\" \"$lock\" \"$cache\" \"$pinned\"\n",
+        "  bash tools/real-snapshot-less-reference.sh \"$pinned\" \"$source\" \"$lock\" \"$cache/sha512-$digest\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_less_stage.py", &.{
+        "    for package in SOURCE_ARTIFACTS:\n        archive(lock, cache, package)\n",
+        "        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,\n",
+    });
     try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{
         "      run_protected_reference:\n",
         "  schedule:\n    - cron: \"23 3 * * 1\"\n",
