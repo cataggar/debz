@@ -89,7 +89,7 @@ Baseline tuples cannot authorize fetching/installing an archive, reinstall,
 remove, reconfigure, or a new package. Archive/baseline identities cannot
 overlap. V1/v2/v3 decoding and canonical bytes are unchanged.
 
-Execution, download execution, and recovery currently reject v4 with
+Execution, download execution, recovery, and package-cache fingerprint/prepare currently reject v4 with
 `lock_verification_failed` / `InstalledBaselineExecutionUnsupported`. They do
 not flatten it to an archive-only lock or replan around it. Versioned native
 preparation, final-state, receipt, and recovery contracts must represent this

@@ -450,6 +450,7 @@ pub const Backend = struct {
         };
         defer lock.deinit();
         return switch (lock) {
+            .installed_baseline => error.InstalledBaselineExecutionUnsupported,
             inline else => |owned, kind| {
                 const createFingerprint = if (kind == .native)
                     package_cache_workflow.createTaggedFingerprint
@@ -492,6 +493,7 @@ pub const Backend = struct {
             else => return error.InvalidExactLock,
         };
         defer owned_lock.deinit();
+        if (owned_lock == .installed_baseline) return error.InstalledBaselineExecutionUnsupported;
         const lock = if (kind == .native) owned_lock.native.lock else owned_lock.legacy_dpkg.lock;
         if (kind == .native and lock.repositories.len != 0)
             try package_cache_workflow.validateRequest(request, true);
@@ -8152,6 +8154,19 @@ test "production installed-only baseline joins a complete signed archive lock an
         try std.testing.expect(lock.planningLockV3().?.repositories[0].signer_fingerprints.len != 0);
         try std.testing.expect(lock.planningLockV3().?.findIdentity("private-baseline", "amd64") == null);
         try std.testing.expectError(error.InstalledBaselineExecutionUnsupported, lock.installed_baseline.requireExecutionAuthority());
+        try std.testing.expectError(error.InstalledBaselineExecutionUnsupported, backend.packageCacheFingerprint(allocator, .{
+            .lock_input_path = fixture.lock_path,
+            .cache_root = options.cache_path,
+            .architecture = options.architecture,
+        }, "baseline-fixture"));
+        try std.testing.expectError(error.InstalledBaselineExecutionUnsupported, backend.packageCachePrepare(allocator, .{
+            .lock_input_path = fixture.lock_path,
+            .cache_root = options.cache_path,
+            .architecture = options.architecture,
+            .source_paths = options.source_paths,
+            .config_paths = options.config_paths,
+            .keyring_paths = options.keyring_paths,
+        }, "baseline-fixture"));
         const canonical = try lock.installed_baseline.canonicalJson(allocator);
         var decoded = try exact_lock_v4.decode(allocator, canonical);
         defer decoded.deinit();
