@@ -28622,6 +28622,201 @@ fn productionLifecycleRequest(
     };
 }
 
+const BaselineOwnershipIndex = struct {
+    const RetainedFile = @import("installed_baseline_component.zig").File;
+    const RetainedEntry = struct {
+        file: *const RetainedFile,
+        incompatible: bool = false,
+    };
+
+    entries: []RetainedEntry,
+    allocation: []RetainedEntry,
+    allocator: std.mem.Allocator,
+    work: usize,
+
+    fn init(allocator: std.mem.Allocator, components: []const @import("installed_baseline_component.zig").Component) !BaselineOwnershipIndex {
+        var count: usize = 0;
+        for (components) |component| {
+            count = std.math.add(usize, count, component.payload.len) catch return error.InstalledBaselineComponentLimit;
+            if (count > @import("installed_baseline_component.zig").maximum_files)
+                return error.InstalledBaselineComponentLimit;
+        }
+        const entries = try allocator.alloc(RetainedEntry, count);
+        errdefer allocator.free(entries);
+        var offset: usize = 0;
+        for (components) |component| for (component.payload) |*file| {
+            entries[offset] = .{ .file = file };
+            offset += 1;
+        };
+        std.mem.sort(RetainedEntry, entries, {}, struct {
+            fn less(_: void, left: RetainedEntry, right: RetainedEntry) bool {
+                return std.mem.lessThan(u8, left.file.path, right.file.path);
+            }
+        }.less);
+        var unique: usize = 0;
+        for (entries) |entry| {
+            if (unique != 0 and std.mem.eql(u8, entries[unique - 1].file.path, entry.file.path)) {
+                const previous = &entries[unique - 1];
+                const left = previous.file;
+                const right = entry.file;
+                previous.incompatible = previous.incompatible or
+                    left.kind != .directory or right.kind != .directory or
+                    (left.mode & 0o7777) != (right.mode & 0o7777) or left.uid != right.uid or left.gid != right.gid;
+            } else {
+                entries[unique] = entry;
+                unique += 1;
+            }
+        }
+        return .{ .entries = entries[0..unique], .allocation = entries, .allocator = allocator, .work = count };
+    }
+
+    fn deinit(self: *BaselineOwnershipIndex) void {
+        self.allocator.free(self.allocation);
+    }
+
+    fn charge(self: *BaselineOwnershipIndex) !void {
+        self.work = std.math.add(usize, self.work, 1) catch return error.LimitExceeded;
+        if (self.work > (Limits{}).max_work) return error.LimitExceeded;
+    }
+
+    fn requireCompatible(self: *BaselineOwnershipIndex, files: []const archive_application.File) !void {
+        for (files) |file| {
+            try self.charge();
+            var low: usize = 0;
+            var high = self.entries.len;
+            while (low < high) {
+                try self.charge();
+                const middle = low + (high - low) / 2;
+                const entry = self.entries[middle];
+                switch (std.mem.order(u8, entry.file.path, file.path)) {
+                    .lt => low = middle + 1,
+                    .gt => high = middle,
+                    .eq => {
+                        const retained = entry.file;
+                        if (entry.incompatible or retained.kind != .directory or file.kind != .directory or
+                            retained.mode & 0o7777 != file.mode or retained.uid != file.uid or retained.gid != file.gid)
+                            return error.InstalledBaselineOwnershipConflict;
+                        break;
+                    },
+                }
+            }
+        }
+    }
+};
+
+const BaselineOwnershipTest = struct {
+    fn retained(path: []const u8, kind: @FieldType(BaselineOwnershipIndex.RetainedFile, "kind")) BaselineOwnershipIndex.RetainedFile {
+        return .{ .path = path, .kind = kind, .device = 1, .inode = 1, .uid = 0, .gid = 0, .mode = 0o755 };
+    }
+
+    fn component(payload: []const BaselineOwnershipIndex.RetainedFile) @import("installed_baseline_component.zig").Component {
+        return .{
+            .package = .{ .name = "private-baseline", .version = "1.0", .architecture = "amd64", .selection = .install },
+            .status_fields_sha512 = @splat('0'),
+            .info_stem = "private-baseline",
+            .controls = &.{},
+            .payload = payload,
+        };
+    }
+
+    fn archive(path: []const u8, kind: archive_application.FileKind) archive_application.File {
+        return .{
+            .path = path,
+            .kind = kind,
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+            .owner_name = null,
+            .group_name = null,
+            .mtime = 0,
+            .size = 0,
+            .content = null,
+            .sha256 = null,
+            .md5 = null,
+            .link_target = null,
+            .link_literal = null,
+            .conffile = false,
+            .entry_index = 0,
+        };
+    }
+};
+
+test "native_unpack.test.baseline indexed ownership rejects overlap and preserves shared directory metadata" {
+    const fixture = BaselineOwnershipTest;
+    const payload = [_]BaselineOwnershipIndex.RetainedFile{
+        fixture.retained("usr/share/shared", .directory),
+        fixture.retained("usr/share/private", .regular),
+        fixture.retained("usr/share/link", .symlink),
+    };
+    const components = [_]@import("installed_baseline_component.zig").Component{fixture.component(&payload)};
+    var index = try BaselineOwnershipIndex.init(testing.allocator, &components);
+    defer index.deinit();
+    try index.requireCompatible(&.{ fixture.archive("usr/share/new", .regular), fixture.archive("usr/share/shared", .directory) });
+    for ([_][]const u8{ "usr/share/private", "usr/share/link" }) |path|
+        try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{fixture.archive(path, .regular)}));
+    var shared = fixture.archive("usr/share/shared", .directory);
+    shared.kind = .regular;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+    shared.kind = .directory;
+    shared.mode = 0o700;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+    shared.mode = 0o755;
+    shared.uid = 1;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+    shared.uid = 0;
+    shared.gid = 1;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+}
+
+test "native_unpack.test.baseline indexed ownership retains every duplicate owner's restrictions" {
+    const fixture = BaselineOwnershipTest;
+    for ([_]enum { matching, mode, uid, gid, kind }{ .matching, .mode, .uid, .gid, .kind }) |scenario| {
+        const first = [_]BaselineOwnershipIndex.RetainedFile{fixture.retained("shared", .directory)};
+        var second = first;
+        switch (scenario) {
+            .matching => {},
+            .mode => second[0].mode = 0o700,
+            .uid => second[0].uid = 1,
+            .gid => second[0].gid = 1,
+            .kind => second[0].kind = .regular,
+        }
+        const components = [_]@import("installed_baseline_component.zig").Component{ fixture.component(&first), fixture.component(&second) };
+        var index = try BaselineOwnershipIndex.init(testing.allocator, &components);
+        defer index.deinit();
+        try index.requireCompatible(&.{fixture.archive("new", .regular)});
+        if (scenario == .matching)
+            try index.requireCompatible(&.{fixture.archive("shared", .directory)})
+        else
+            try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{fixture.archive("shared", .directory)}));
+    }
+}
+
+test "native_unpack.test.baseline ownership 100k by 250k scan is indexed and cumulatively work bounded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = BaselineOwnershipTest;
+    const payload = try allocator.alloc(BaselineOwnershipIndex.RetainedFile, 100_000);
+    for (payload, 0..) |*file, number|
+        file.* = fixture.retained(try std.fmt.allocPrint(allocator, "retained/{d:0>6}", .{number}), .regular);
+    const components = [_]@import("installed_baseline_component.zig").Component{fixture.component(payload)};
+    var index = try BaselineOwnershipIndex.init(allocator, &components);
+    defer index.deinit();
+    for (0..250_000) |number| {
+        var buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, "incoming/{d:0>6}", .{number});
+        try index.requireCompatible(&.{fixture.archive(path, .regular)});
+    }
+    try testing.expect(index.work <= payload.len + 250_000 * 19);
+    const missing = fixture.archive("incoming/more", .regular);
+    while (index.work < (Limits{}).max_work - 19)
+        try index.requireCompatible(&.{missing});
+    const more = [_]archive_application.File{missing} ** 19;
+    try testing.expectError(error.LimitExceeded, index.requireCompatible(&more));
+    const too_many = [_]@import("installed_baseline_component.zig").Component{ fixture.component(payload), fixture.component(payload[0..1]) };
+    try testing.expectError(error.InstalledBaselineComponentLimit, BaselineOwnershipIndex.init(allocator, &too_many));
+}
+
 /// Experimental caller-owned runtime. Product/CLI backend selection remains
 /// separate; this interface never accepts fixture requests or alternate helpers.
 pub const Runtime = struct {
@@ -28832,6 +29027,11 @@ pub const Runtime = struct {
             request.archives.len,
         );
         var total_bytes: u64 = 0;
+        var baseline_ownership: ?BaselineOwnershipIndex = if (baseline) |contract|
+            try BaselineOwnershipIndex.init(temporary, contract.component.components)
+        else
+            null;
+        defer if (baseline_ownership) |*index| index.deinit();
         for (request.archives, 0..) |bytes, index| {
             total_bytes = std.math.add(u64, total_bytes, bytes.len) catch
                 return error.LimitExceeded;
@@ -28851,17 +29051,10 @@ pub const Runtime = struct {
                 return error.ArchiveEvidenceMismatch;
             if (!supportedArchiveMetadata(model))
                 return error.UnsupportedNativeArchive;
-            if (baseline) |contract| {
+            if (baseline != null) {
                 if (model.scripts.len != 0 or model.triggers.len != 0)
                     return error.InstalledBaselineCallbacksUnsupported;
-                for (contract.component.components) |component| for (component.payload) |retained| {
-                    for (model.files) |file| {
-                        if (std.mem.eql(u8, retained.path, file.path) and
-                            (retained.kind != .directory or file.kind != .directory or
-                                retained.mode & 0o7777 != file.mode or retained.uid != file.uid or retained.gid != file.gid))
-                            return error.InstalledBaselineOwnershipConflict;
-                    }
-                };
+                try baseline_ownership.?.requireCompatible(model.files);
             }
             origins[index] = locked.origin;
             identities[index] = locked.archive_identity;

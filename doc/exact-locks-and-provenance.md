@@ -136,6 +136,10 @@ authenticated **new installs**, with no baseline ownership conflicts or
 directory-metadata changes, no callbacks (including debconf `config`), and no
 pending/declared/unincorporated trigger work. Other cases refuse rather than
 fall back to another backend or broaden authorization.
+Preparation indexes retained payload paths once, with bounded sorted lookup
+and cumulative archive-comparison work capped by the existing native work
+limit. Shared-directory mode and uid/gid must match every retained owner;
+all other exact-path overlaps refuse.
 
 Request v4, intent v2, non-bootstrap progress v3 and provenance v2 carry the exact
 authorization-v3/program-v3/lock-v4 tuple. The final-state kind is
