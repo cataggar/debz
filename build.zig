@@ -784,7 +784,12 @@ pub fn build(b: *std.Build) void {
     native_program_step.dependOn(&run_native_program_corpus_tests.step);
     const native_baseline_tests = b.addTest(.{
         .root_module = production_backend_tests.root_module,
-        .filters = &.{ "production native baseline", "production workflow external native fixture" },
+        .filters = &.{
+            "production native baseline",
+            "production workflow external native fixture",
+            "production workflow signed SHA256 archive binding is a per-repository native opt-in",
+            "production package family native resolution binds an opted-in signed SHA256 repository",
+        },
     });
     b.step("test-native-baseline", "Run genuine signed native installed-baseline workflows in owned roots")
         .dependOn(&b.addRunArtifact(native_baseline_tests).step);

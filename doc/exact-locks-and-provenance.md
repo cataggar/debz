@@ -217,13 +217,20 @@ hashes both exclusion files in full; this observation cannot supply v4 or no-op
 authority. Signed-only resolution retains database, owned-state and output
 containment checks without opening the unreadable exclusion for its bytes.
 
-Fresh v4 download with `signed_sha256_derived_sha512` currently refuses with
-`InstalledBaselineImplicitBindingUnsupported` before persistent cache, lock
-output or archive acquisition. The existing derivation helper acquires archives
-before it constructs the final lock; this path needs a separately bounded
-pre-acquisition admission contract. Supply an already bound exact v4 lock for
-that repository policy. No fake derived digest or weaker native digest policy
-is used. Other commands and signed-only results retain command.v1.
+Fresh v4 download with explicit `signed_sha256_derived_sha512` opt-in reserves
+the complete command envelope before archive acquisition or persistent cache
+and lock publication. Accounting-only headroom counts the shared canonical
+writer's binding/provenance fragments with both nested JSON-string escapes,
+128 non-escaping hexadecimal positions per derived SHA512, and maximum decimal
+width for the two rebound digest arrays. It contains no dummy identity or lock.
+Only genuine archives matching the signed SHA256, declared size and original
+authenticated source coordinates produce the derived values. Original guarded
+Root facts are reverified at CAS staging, before actual lock rebind and before
+metadata/lock publication; no later baseline adoption occurs. Tagged preparation
+then consumes those verified CAS objects through the existing path, so its
+download/reuse counters describe that preparation phase. Explicit-v4 policy,
+schemas and budgets are unchanged. Other commands and signed-only results retain
+command.v1.
 Legacy v4 execution/download/cache still refuse; legacy remains the default.
 This native slice does
 not complete backend-neutral execution, SymCrypt short commands, durable

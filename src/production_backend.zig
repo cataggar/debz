@@ -1147,6 +1147,7 @@ pub const Backend = struct {
                         download_lock.?.nativeLock().?,
                         download_baseline.contract.?,
                         admission_installed.database.packages,
+                        0,
                     ) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         if (err != error.DocumentTooLarge) return err;
@@ -1522,28 +1523,31 @@ pub const Backend = struct {
                     if (generated_lock.?.baselineEvidence() != null) {
                         download_baseline.bindFresh(&generated_lock.?.installed_baseline) catch |err|
                             return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                        const deriving = try configuredDerivedRepositoryIds(allocator, generated_lock.?.nativeLock().?, configuration.repositories);
+                        defer allocator.free(deriving);
+                        const reservation = exact_lock_v3.reserveDerivedSha512(generated_lock.?.nativeLock().?.*, deriving) catch |err| {
+                            if (err == error.OutOfMemory) return err;
+                            return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "signed SHA256 pre-acquisition admission refused: {s}", .{@errorName(err)}));
+                        };
+                        const growth = if (deriving.len == 0) 0 else std.math.add(usize, reservation.command_growth_bytes, reboundDigestEncodingGrowth(download_baseline.contract.?)) catch
+                            return api.failure(request.operation, .planning, .planning_failed, native_download_budget_message);
                         requireNativeDownloadAdmission(
                             allocator,
                             request.operation,
                             generated_lock.?.nativeLock().?,
                             download_baseline.contract.?,
                             planning_records,
+                            growth,
                         ) catch |err| {
                             if (err == error.OutOfMemory) return err;
                             if (err != error.DocumentTooLarge) return err;
                             return api.failure(request.operation, .planning, .planning_failed, native_download_budget_message);
                         };
-                        // Derivation acquires archives before producing the final
-                        // lock. It needs its own pre-acquisition encoded admission.
-                        for (generated_lock.?.nativeLock().?.repositories) |repository| {
-                            const configured = findNormalized(configuration.repositories, .{ .bytes = repository.id }) orelse return error.MissingRepository;
-                            if (configured.archive_binding == .signed_sha256_derived_sha512)
-                                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineImplicitBindingUnsupported: fresh native baseline download cannot derive archive identities before complete command admission; supply an exact v4 lock");
-                        }
-                        admitNativeLock(
+                        admitNativeLockBeforeDerivation(
                             generated_lock.?.nativeLock().?,
                             configuration.repositories,
                             self.native_archive_digest_policy,
+                            deriving,
                         ) catch |err|
                             return api.failure(request.operation, .planning, .lock_verification_failed, nativeLockAdmissionMessage(err));
                     }
@@ -1551,9 +1555,6 @@ pub const Backend = struct {
                     download_baseline.requireOutputOutsideDatabase(root_fs.Root.init(self.io, cache_root.?)) catch |err|
                         return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
                     if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
-                    var destination = try metadata_cache.Cache.initFromDir(self.io, cache_root.?, .{});
-                    defer destination.deinit();
-                    try metadata.commitDeferred(&destination);
                 }
                 if (generated_lock.?.nativeLock() != null) {
                     self.bindConfiguredArchiveIdentities(
@@ -1565,14 +1566,19 @@ pub const Backend = struct {
                         cache_root.?,
                         acquisition.dependencies(),
                         credentials,
+                        if (fresh_download) &download_baseline else null,
                     ) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => return api.failure(
-                            request.operation,
-                            .download,
-                            .download_failed,
-                            try std.fmt.allocPrint(allocator, "signed SHA256 archive binding refused: {s}", .{@errorName(err)}),
-                        ),
+                        else => {
+                            if (download_baseline.publication_error) |failure| if (failure == err)
+                                return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                            return api.failure(
+                                request.operation,
+                                .download,
+                                .download_failed,
+                                try std.fmt.allocPrint(allocator, "signed SHA256 archive binding refused: {s}", .{@errorName(err)}),
+                            );
+                        },
                     };
                     admitNativeLock(
                         generated_lock.?.nativeLock().?,
@@ -1584,6 +1590,21 @@ pub const Backend = struct {
                         .planning_failed,
                         nativeLockAdmissionMessage(err),
                     );
+                }
+                if (fresh_download) {
+                    if (generated_lock.?.baselineEvidence() != null) {
+                        download_baseline.bindFresh(&generated_lock.?.installed_baseline) catch |err|
+                            return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                        requireNativeDownloadAdmission(allocator, request.operation, generated_lock.?.nativeLock().?, download_baseline.contract.?, planning_records, 0) catch |err| {
+                            if (err == error.OutOfMemory) return err;
+                            if (err != error.DocumentTooLarge) return err;
+                            return api.failure(request.operation, .planning, .planning_failed, native_download_budget_message);
+                        };
+                    }
+                    if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
+                    var destination = try metadata_cache.Cache.initFromDir(self.io, cache_root.?, .{});
+                    defer destination.deinit();
+                    try metadata.commitDeferred(&destination);
                 }
             }
             const output = if (lock) |*value| value else &generated_lock.?;
@@ -3508,17 +3529,12 @@ pub const Backend = struct {
         cache_root: std.Io.Dir,
         dependencies: repository_acquisition.Dependencies,
         credentials: repository_acquisition.CredentialsProvider,
+        baseline_guard: ?*NativeBaselineCacheGuard,
     ) !void {
         const unbound = generated.nativeLock() orelse return;
-        var bound_ids: std.ArrayList([64]u8) = .empty;
-        defer bound_ids.deinit(allocator);
-        for (unbound.repositories) |repository| {
-            const normalized = findNormalized(configured, .{ .bytes = repository.id }) orelse
-                return error.MissingRepository;
-            if (normalized.archive_binding == .signed_sha256_derived_sha512)
-                try bound_ids.append(allocator, repository.id);
-        }
-        if (bound_ids.items.len == 0) return;
+        const bound_ids = try configuredDerivedRepositoryIds(allocator, unbound, configured);
+        defer allocator.free(bound_ids);
+        if (bound_ids.len == 0) return;
 
         var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
             .maximum_object_bytes = 1024 * 1024 * 1024,
@@ -3538,7 +3554,7 @@ pub const Backend = struct {
                 .authenticated_repository => |value| value,
                 .local_artifact => continue,
             };
-            if (!containsRepositoryId(bound_ids.items, origin.repository_id)) continue;
+            if (!containsRepositoryId(bound_ids, origin.repository_id)) continue;
             const id: source.RepositoryId = .{ .bytes = origin.repository_id };
             const repository_input = findRepositoryInput(universe, id) orelse return error.MissingRepository;
             const normalized = findNormalized(configured, id) orelse return error.MissingRepository;
@@ -3563,6 +3579,7 @@ pub const Backend = struct {
                         .retry = productionRetryPolicy(),
                         .proxy = try proxyPolicy(request.options.proxy),
                         .credentials = credentials,
+                        .publish_hooks = if (baseline_guard) |guard| .{ .context = guard, .stagedFn = NativeBaselineCacheGuard.archivePublicationCheck } else .{},
                     },
                     .exact_lock_v3_package = package,
                 },
@@ -3573,7 +3590,7 @@ pub const Backend = struct {
         const bound = try exact_lock_v3.bindSignedSha256Repositories(
             allocator,
             unbound.*,
-            bound_ids.items,
+            bound_ids,
             archives,
         );
         if (generated.* == .installed_baseline) {
@@ -3582,6 +3599,15 @@ pub const Backend = struct {
                 release.deinit();
             }
             const rebound = try exact_lock_v4.rebindArchives(allocator, &generated.installed_baseline, bound.lock);
+            errdefer {
+                var release = rebound;
+                release.deinit();
+            }
+            if (baseline_guard) |guard| {
+                try NativeBaselineCacheGuard.archivePublicationCheck(guard);
+                guard.contract = null;
+                guard.lock = null;
+            }
             generated.deinit();
             generated.* = .{ .installed_baseline = rebound };
         } else {
@@ -5600,6 +5626,7 @@ const NativeBaselineCacheGuard = struct {
     contract: ?@import("native_baseline_contract.zig").Contract = null,
     component: ?@import("installed_baseline_component.zig").Manifest = null,
     capture_error: ?anyerror = null,
+    publication_error: ?anyerror = null,
     fresh: bool = false,
 
     fn captureFresh(self: *NativeBaselineCacheGuard, allocator: std.mem.Allocator, io: std.Io, root_path: []const u8, architecture: []const u8, wait_ms: u64) !void {
@@ -5842,6 +5869,14 @@ const NativeBaselineCacheGuard = struct {
 
     fn observe(context: *anyopaque, point: root_fs.PublishPoint) !void {
         if (point == .before_rename) try (@as(*NativeBaselineCacheGuard, @ptrCast(@alignCast(context)))).verify();
+    }
+
+    fn archivePublicationCheck(context: ?*anyopaque) !void {
+        const self: *NativeBaselineCacheGuard = @ptrCast(@alignCast(context orelse return error.InvalidInstalledBaseline));
+        self.verify() catch |err| {
+            self.publication_error = err;
+            return err;
+        };
     }
 
     fn deinit(self: *NativeBaselineCacheGuard) void {
@@ -6542,6 +6577,7 @@ fn requireNativeDownloadAdmission(
     lock: *const exact_lock_v3.Lock,
     contract: @import("native_baseline_contract.zig").Contract,
     installed: []const dpkg_status.Package,
+    additional_encoded_bytes: usize,
 ) !void {
     // Non-removal actions must come from this exact archive closure; removal
     // actions can only name the captured installed database. Reserve both
@@ -6582,7 +6618,18 @@ fn requireNativeDownloadAdmission(
             .reused_count = split.reused,
         },
     };
-    try admission.requireDocumentBudget();
+    try admission.requireReservedDocumentBudget(additional_encoded_bytes);
+}
+
+fn reboundDigestEncodingGrowth(contract: @import("native_baseline_contract.zig").Contract) usize {
+    var growth: usize = 0;
+    // These actual digest arrays change on rebind; reserve three decimal
+    // digits per byte without inventing any digest values.
+    for ([_][32]u8{ contract.planning_lock_sha256, contract.archive_lock_sha256 }) |digest|
+        for (digest) |byte| {
+            growth += 3 - decimalDigits(byte);
+        };
+    return growth;
 }
 
 fn planResultChanged(
@@ -7702,6 +7749,40 @@ fn admitNativeLock(
     try lock.requireArchiveDigestPolicy(policy);
 }
 
+fn configuredDerivedRepositoryIds(
+    allocator: std.mem.Allocator,
+    lock: *const exact_lock_v3.Lock,
+    configured: []const repository_policy.NormalizedRepository,
+) ![]const [64]u8 {
+    var ids: std.ArrayList([64]u8) = .empty;
+    errdefer ids.deinit(allocator);
+    for (lock.repositories) |repository| {
+        const normalized = findNormalized(configured, .{ .bytes = repository.id }) orelse return error.MissingRepository;
+        if (normalized.archive_binding == .signed_sha256_derived_sha512)
+            try ids.append(allocator, repository.id);
+    }
+    return ids.toOwnedSlice(allocator);
+}
+
+fn admitNativeLockBeforeDerivation(
+    lock: *const exact_lock_v3.Lock,
+    repositories: []const repository_policy.NormalizedRepository,
+    policy: exact_lock_v3.ArchiveDigestPolicy,
+    deriving: []const [64]u8,
+) error{ ArchiveBindingMismatch, Sha512IdentityRequired }!void {
+    for (lock.repositories) |repository| {
+        if (containsRepositoryId(deriving, repository.id)) continue;
+        const configured = findNormalized(repositories, .{ .bytes = repository.id }) orelse continue;
+        if (configured.archive_binding != repository.archive_binding) return error.ArchiveBindingMismatch;
+    }
+    if (policy == .published_digests) return;
+    for (lock.packages) |package| {
+        if (lock.archiveAuthentication(package) != .signed_sha256_only) continue;
+        const origin = package.origin.authenticated_repository;
+        if (!containsRepositoryId(deriving, origin.repository_id)) return error.Sha512IdentityRequired;
+    }
+}
+
 fn nativeLockAdmissionMessage(err: error{ ArchiveBindingMismatch, Sha512IdentityRequired }) []const u8 {
     return switch (err) {
         error.ArchiveBindingMismatch => "exact lock archive binding does not match the configured repository archive_binding",
@@ -7710,8 +7791,7 @@ fn nativeLockAdmissionMessage(err: error{ ArchiveBindingMismatch, Sha512Identity
 }
 
 fn containsRepositoryId(ids: []const [64]u8, id: [64]u8) bool {
-    for (ids) |candidate| if (std.mem.eql(u8, &candidate, &id)) return true;
-    return false;
+    return exact_lock_v3.containsSortedRepositoryId(ids, id);
 }
 
 /// Finds the authenticated record that a freshly resolved lock package was
@@ -9020,6 +9100,17 @@ test "production native baseline command 12000 genuine payload facts refuse befo
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.second_lock_path), .{}));
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{}));
     }
+    const deriving_repository = try SignedSha256Repository.init(allocator);
+    try configureNativeDerivedFixture(allocator, &directory, deriving_repository);
+    try directory.dir.deleteFile(std.testing.io, "repo/" ++ SignedSha256Repository.package_path);
+    backend.now_unix = SignedSha256Repository.now_unix;
+    var deriving_options = fixture.options();
+    deriving_options.lock_output_path = fixture.second_lock_path;
+    const deriving_refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "demo" }}, .options = deriving_options });
+    try std.testing.expectEqualStrings(native_download_budget_message, deriving_refused.diagnostics[0].message);
+    try std.testing.expectEqual(api.ErrorId.planning_failed, deriving_refused.diagnostics[0].id);
+    try expectNoFile(&directory, "cache");
+    try expectNoFile(&directory, std.fs.path.basename(fixture.second_lock_path));
 }
 
 test "production native baseline cache signed miss hit export restore download and empty archive provenance" {
@@ -9791,7 +9882,163 @@ test "production native baseline unreadable exclusions retain drift owned-state 
     }
 }
 
-test "production native baseline fresh derived identity refuses before persistent cache lock output or archive acquisition" {
+fn nativeDerivedFixture(allocator: std.mem.Allocator, directory: *std.testing.TmpDir, repository: SignedSha256Repository) !ProductionWorkflowFixture {
+    var fixture = try nativeBaselineFixture(allocator, directory);
+    errdefer fixture.deinit();
+    try configureNativeDerivedFixture(allocator, directory, repository);
+    return fixture;
+}
+
+fn configureNativeDerivedFixture(allocator: std.mem.Allocator, directory: *std.testing.TmpDir, repository: SignedSha256Repository) !void {
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/dists/stable/InRelease", .data = repository.in_release });
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/dists/stable/main/binary-amd64/Packages", .data = repository.packages });
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "keyring.gpg", .data = repository.keyring });
+    const original = try directory.dir.readFileAlloc(std.testing.io, "sources.list", allocator, .limited(64 * 1024));
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "sources.list",
+        .data = try std.mem.replaceOwned(u8, allocator, original, "arch=amd64", "arch=amd64 debz-archive-binding=signed_sha256_derived_sha512"),
+    });
+    try directory.dir.createDirPath(std.testing.io, "repo/pool/main/d/demo");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/" ++ SignedSha256Repository.package_path, .data = repository.archive });
+}
+
+test "production native baseline fresh derived SHA512 verifies signed SHA256 and reuses actual cache" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const repository = try SignedSha256Repository.init(allocator);
+    var fixture = try nativeDerivedFixture(allocator, &directory, repository);
+    defer fixture.deinit();
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = SignedSha256Repository.now_unix };
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const request: WorkflowRequest = .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "demo" }}, .options = options };
+    const result = try backend.executeWorkflow(allocator, request);
+    try expectBaselineWorkflowSuccess(result);
+    try std.testing.expectEqual(@as(u32, 2), result.api_version);
+    const bytes = try result.canonicalJson(allocator);
+    var decoded = try api.decodeResult(allocator, bytes);
+    defer decoded.deinit();
+    var bound = try readProductLock(allocator, std.testing.io, fixture.lock_path, .native);
+    defer bound.deinit();
+    try std.testing.expect(bound == .installed_baseline);
+    const archives = bound.nativeLock().?;
+    try std.testing.expectEqual(@as(usize, 1), archives.packages.len);
+    try std.testing.expect(archives.findIdentity("private-baseline", "amd64") == null);
+    const package = archives.packages[0];
+    try std.testing.expectEqual(content_digest.Algorithm.sha256, package.archive_identity.primary);
+    try std.testing.expect(package.archive_identity.digests.sha512 == null);
+    try std.testing.expectEqual(content_digest.Value.of(.sha256, repository.archive).sha256, package.archive_identity.digests.sha256.?);
+    try std.testing.expectEqual(content_digest.Value.of(.sha512, repository.archive).sha512, package.derived_sha512.?);
+    const origin = package.origin.authenticated_repository;
+    const locked_repository = archives.findRepository(origin.repository_id).?;
+    try std.testing.expectEqual(locked_repository.snapshot_sha256, origin.repository_snapshot_sha256);
+    try std.testing.expect(locked_repository.signer_fingerprints.len != 0);
+    try std.testing.expectEqual(exact_lock_v3.ArchiveBinding.signed_sha256_derived_sha512, locked_repository.archive_binding);
+    try archives.requireArchiveDigestPolicy(.sha512_identity_required);
+
+    const proof = try installed_baseline.verify(allocator, std.testing.io, fixture.install_root, "amd64", installed_only_status, bound.installed_baseline.evidence());
+    defer proof.deinit();
+    var unbound_repository = locked_repository;
+    unbound_repository.archive_binding = .published_digests;
+    var unbound_package = package;
+    unbound_package.derived_sha512 = null;
+    var unbound_archives = try exact_lock_v3.create(allocator, .{
+        .target_architecture = archives.target_architecture,
+        .request_sha256 = archives.request_sha256,
+        .policy_sha256 = archives.policy_sha256,
+        .repositories = &.{unbound_repository},
+        .local_artifacts = &.{},
+        .packages = &.{unbound_package},
+        .verified_origins = true,
+    });
+    defer unbound_archives.deinit();
+    var unbound = try exact_lock_v4.create(allocator, .native, unbound_archives.lock, proof);
+    defer unbound.deinit();
+    var original = result;
+    original.native_download.?.baseline_noop.planning_lock_json = try unbound.canonicalJson(allocator);
+    std.crypto.hash.sha2.Sha256.hash(original.native_download.?.baseline_noop.planning_lock_json, &original.native_download.?.baseline_noop.planning_lock_sha256, .{});
+    original.native_download.?.baseline_noop.archive_lock_sha256 = unbound_archives.lock.digest_sha256;
+    try original.native_download.?.baseline_noop.validate(allocator, &unbound_archives.lock);
+    const reservation = try exact_lock_v3.reserveDerivedSha512(unbound_archives.lock, &.{locked_repository.id});
+    const unbound_json = try unbound_archives.lock.canonicalJson(allocator);
+    const bound_json = try archives.canonicalJson(allocator);
+    const unbound_string = try std.json.Stringify.valueAlloc(allocator, unbound_json, .{});
+    const bound_string = try std.json.Stringify.valueAlloc(allocator, bound_json, .{});
+    const twice_unbound = try std.json.Stringify.valueAlloc(allocator, unbound_string, .{});
+    const twice_bound = try std.json.Stringify.valueAlloc(allocator, bound_string, .{});
+    try std.testing.expectEqual(twice_bound.len - twice_unbound.len, reservation.command_growth_bytes);
+    const headroom = reservation.command_growth_bytes + reboundDigestEncodingGrowth(original.native_download.?.baseline_noop);
+    try std.testing.expect(try result.encodedDocumentSize() <= try original.encodedDocumentSize() + headroom);
+    const padding = try allocator.alloc(u8, api.maximum_result_document_bytes - try original.encodedDocumentSize() - headroom + original.summary.len + 1);
+    @memset(padding, 's');
+    original.summary = padding[0 .. padding.len - 1];
+    try original.requireReservedDocumentBudget(headroom);
+    original.summary = padding;
+    try std.testing.expectError(error.DocumentTooLarge, original.requireReservedDocumentBudget(headroom));
+
+    var cache_dir = try openAbsoluteDirectory(std.testing.io, fixture.cache_path);
+    defer cache_dir.close(std.testing.io);
+    var cache = try package_acquisition.Cache.initFromDir(std.testing.io, cache_dir, .{ .maximum_object_bytes = 1024 * 1024 });
+    defer cache.deinit();
+    const cached = try cache.lookup(allocator, package.archive_identity, package.declared_size, .verify_all_supported);
+    defer allocator.free(cached);
+    try std.testing.expectEqualStrings(repository.archive, cached);
+    try directory.dir.deleteFile(std.testing.io, "repo/" ++ SignedSha256Repository.package_path);
+    var replay = request;
+    replay.options.offline = true;
+    replay.options.lock_output_path = fixture.second_lock_path;
+    const reused = try backend.executeWorkflow(allocator, replay);
+    try expectBaselineWorkflowSuccess(reused);
+    try std.testing.expectEqualStrings(result.native_download.?.baseline_noop.planning_lock_json, reused.native_download.?.baseline_noop.planning_lock_json);
+    try std.testing.expectEqual(@as(usize, 1), reused.native_download.?.reused_count);
+    var prepared = try backend.packageCachePrepare(allocator, baselineCacheRequest(&fixture), "1.2.3");
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), prepared.reused_count);
+    try std.testing.expectEqualStrings(installed_only_status, try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024)));
+    try expectNoFile(&directory, "root/" ++ native_recovery.intent_path);
+}
+
+test "production native baseline fresh derived SHA512 refuses authentic source mismatch without lock publication" {
+    var repository_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer repository_arena.deinit();
+    const repository = try SignedSha256Repository.init(repository_arena.allocator());
+    for ([_]bool{ false, true }) |index_mismatch| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeDerivedFixture(allocator, &directory, repository);
+        defer fixture.deinit();
+        const corrupt = try allocator.dupe(u8, if (index_mismatch) repository.packages else repository.archive);
+        corrupt[corrupt.len - 1] ^= 1;
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = if (index_mismatch) "repo/dists/stable/main/binary-amd64/Packages" else "repo/" ++ SignedSha256Repository.package_path,
+            .data = corrupt,
+        });
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = SignedSha256Repository.now_unix };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "demo" }}, .options = options });
+        try std.testing.expect(refused.exit_status != .success and !refused.changed and refused.native_download == null);
+        if (!index_mismatch) {
+            try std.testing.expectEqual(api.ErrorId.download_failed, refused.diagnostics[0].id);
+            try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, "DigestMismatch") != null);
+            var cache_dir = try openAbsoluteDirectory(std.testing.io, fixture.cache_path);
+            defer cache_dir.close(std.testing.io);
+            var cache = try package_acquisition.Cache.initFromDir(std.testing.io, cache_dir, .{ .maximum_object_bytes = 1024 * 1024 });
+            defer cache.deinit();
+            try std.testing.expectError(error.CacheMiss, cache.lookup(allocator, content_digest.Identity.init(.{ .sha256 = content_digest.Value.of(.sha256, repository.archive).sha256 }, .sha256) catch unreachable, repository.archive.len, .verify_all_supported));
+        } else try expectNoFile(&directory, "cache");
+        try expectNoFile(&directory, std.fs.path.basename(fixture.lock_path));
+        try expectNoFile(&directory, "root/" ++ native_recovery.intent_path);
+    }
+}
+
+test "production native baseline fresh derived binding rejects already published SHA512 before persistent work" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -9811,7 +10058,7 @@ test "production native baseline fresh derived identity refuses before persisten
     options.lock_output_path = fixture.lock_path;
     const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{ .{ .name = "alpha" }, .{ .name = "beta" } }, .options = options });
     try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
-    try std.testing.expect(std.mem.startsWith(u8, refused.diagnostics[0].message, "InstalledBaselineImplicitBindingUnsupported:"));
+    try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, "ArchiveBindingMismatch") != null);
     try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
     try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
 }

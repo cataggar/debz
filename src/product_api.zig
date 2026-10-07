@@ -215,8 +215,13 @@ pub const Result = struct {
     }
 
     pub fn requireDocumentBudget(self: Result) !void {
+        try self.requireReservedDocumentBudget(0);
+    }
+
+    /// Pure encoding headroom, never inserted into the serialized result.
+    pub fn requireReservedDocumentBudget(self: Result, additional_bytes: usize) !void {
         if (self.items.len > maximum_result_items or
-            try self.encodedDocumentSize() > maximum_result_document_bytes)
+            (std.math.add(usize, try self.encodedDocumentSize(), additional_bytes) catch return error.DocumentTooLarge) > maximum_result_document_bytes)
             return error.DocumentTooLarge;
     }
 
