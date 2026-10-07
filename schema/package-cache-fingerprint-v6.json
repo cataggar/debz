@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/package-cache-fingerprint-v6.json",
+  "title": "debz native installed-baseline package-cache fingerprint v6",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "api_version", "capability", "lock_schema", "lock_schema_version", "lock_digest", "target_architecture", "abi", "debz_version", "cas_layout", "archive_format", "payload_policy", "origin_mode", "acceptance_policy_digest", "fingerprint", "baseline_noop", "primary_key", "restore_prefix", "cache_root", "cache_path", "maximum_archive_bytes"],
+  "properties": {
+    "schema": {"const": "io.github.cataggar.debz.package-cache-fingerprint.v6"},
+    "api_version": {"const": 6},
+    "capability": {"const": "package-cache-v6"},
+    "lock_schema": {"const": "https://debz.dev/schema/exact-closure-lock-v4"},
+    "lock_schema_version": {"const": 4},
+    "lock_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "target_architecture": {"type": "string", "minLength": 1, "maxLength": 64},
+    "abi": {"const": "debian-package-archive-v1"},
+    "debz_version": {"type": "string", "minLength": 1},
+    "cas_layout": {"const": "packages-v2"},
+    "archive_format": {"const": "debz-package-cache-archive-v4"},
+    "payload_policy": {"const": "deb-payload-default-limits-v1"},
+    "origin_mode": {"const": "exact-lock-v4-native-installed-component-noop"},
+    "acceptance_policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "baseline_noop": {"$ref": "https://debz.dev/schema/native-installed-baseline-noop-v1"},
+    "primary_key": {"type": "string", "pattern": "^debz-package-cas-v6-[A-Za-z0-9-]+-[0-9a-f]{64}-exact$"},
+    "restore_prefix": {"type": "string", "pattern": "^debz-package-cas-v6-[A-Za-z0-9-]+-[0-9a-f]{64}-$"},
+    "cache_root": {"type": "string", "pattern": "^/"},
+    "cache_path": {"type": "string", "pattern": "/packages-v2/objects$"},
+    "maximum_archive_bytes": {"type": "integer", "minimum": 1}
+  }
+}

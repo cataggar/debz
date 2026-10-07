@@ -41,12 +41,13 @@ plan/review/replay remain unchanged.
 
 Explicit product `plan --lock-output` can now preserve a healthy
 installed-only exact package absent from signed repository metadata. Such
-plans emit the root-bound, **planning-only v4 baseline envelope** described in
-[Exact closure locks](exact-locks-and-provenance.md#installed-only-baseline-planning-only-v4).
+plans emit the root-bound **v4 baseline envelope** described in
+[Exact closure locks](exact-locks-and-provenance.md#installed-only-baseline-v4-planning-and-native-no-op-execution).
 Exact plan replay verifies the actual complete database prestate; changed or
-missing metadata refuses. This does not make the resulting lock executable:
-install, download, and recovery refuse v4 rather than treating database facts
-as archive authority. Existing archive-only v1/v3 plans retain their formats.
+missing metadata refuses. Local facts never become archive authority. Explicit
+native selection supports bounded retained-baseline no-op execution/recovery
+and read-only download/cache preparation; legacy v4 execution/download/cache
+still refuse. Existing archive-only v1/v3 plans retain their formats.
 
 The proposed apt-shaped system facade likewise has a separate
 `debz.apt_system_api` contract and trusted profile. It does not add
@@ -362,11 +363,21 @@ Package-cache JSON schemas are:
 - [`package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
 - [`package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
 - [`package-cache-fingerprint-v5.json`](../schema/package-cache-fingerprint-v5.json)
+- [`package-cache-fingerprint-v6.json`](../schema/package-cache-fingerprint-v6.json)
 - [`package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
 - [`package-cache-result-v2.json`](../schema/package-cache-result-v2.json)
 - [`package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
 - [`package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
 - [`package-cache-result-v5.json`](../schema/package-cache-result-v5.json)
+- [`package-cache-result-v6.json`](../schema/package-cache-result-v6.json)
+
+Native v4 download uses [`command-result-v2.json`](../schema/command-result-v2.json)
+with the complete baseline no-op contract and exact signed archive counts.
+It cannot run callbacks or fetch the private baseline. Native v4 package-cache
+results/fingerprints use API v6 and root/component-specific cache keys; export
+uses archive format v4. Active owned work and drift refuse before cache
+preparation/publication. Completed execution generations are not implicitly
+adopted by these read-only entrypoints. Legacy/default behavior is unchanged.
 - [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 
 Their successful outputs include the canonical lock digest, CLI-owned

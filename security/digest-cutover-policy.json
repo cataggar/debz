@@ -105,6 +105,16 @@
   },
   "semantic_allowlist": [
     {
+      "id": "native-baseline-cache-publication-hex-controls",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "These two exact v6 schemas encode the full v4 planning-document checksum, acceptance-policy checksum and root/component-specific cache publication fingerprint/key. They never encode package/archive/repository content identity or substitute for signed algorithm-tagged archive authority.",
+      "paths": [
+        "schema/package-cache-fingerprint-v6.json",
+        "schema/package-cache-result-v6.json"
+      ]
+    },
+    {
       "id": "native-baseline-document-controls",
       "kind": "raw_32_byte_field",
       "classification": "fixed_control_and_versioned_compatibility",

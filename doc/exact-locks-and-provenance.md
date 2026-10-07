@@ -157,9 +157,35 @@ the original attempt. It neither requires replacement repository/archive
 locations nor replans around missing ones. Baseline or unknown trigger drift
 after a crash refuses acknowledgment and retains the active intent/ownership.
 
-Legacy execution, download execution and package-cache fingerprint/prepare
-still reject v4 with `InstalledBaselineExecutionUnsupported`; their contracts
-have not been implemented. Legacy remains the default. This native slice does
+Native v4 download and package-cache fingerprint/prepare retain the complete
+envelope and component contract, but acquire only the genuine nested signed
+v3 archive closure. Cache API v6 fingerprints/results include `baseline_noop`;
+the fingerprint and restore prefix bind its root, full prestate and immutable
+component facts. Opaque cache archive v4 carries the canonical complete contract
+before the ordinary algorithm-tagged archive records. A foreign or changed
+binding is rejected before CAS import; the baseline is never an archive record.
+Verified immutable signed CAS objects remain reusable independently.
+
+These read-only workflows hold existing root-operation and dpkg exclusion
+locks without creating/adopting an intent. Active work or orphan checkpoints,
+missing/changed baseline metadata, unsafe callbacks and unknown trigger work
+refuse. Actual prestate and component facts are checked before archive work and
+before prepared/download publication; archive export is staged, durably synced,
+and checked again immediately before atomic rename. The original whole-database
+prestate remains required: these workflows do **not** use completed-execution
+receipts to adopt a later database generation. A new explicit healthy plan is
+needed for that generation; interrupted owned execution must be recovered,
+not replanned. Empty signed closures publish an explicit baseline no-op proof
+with zero archive counts, never synthetic digests or repository authority.
+
+Native baseline download publishes command.v2 with typed
+[`native-baseline-download-v1`](../schema/native-baseline-download-v1.json)
+evidence and does not execute packages. It requires an existing exact v4 input
+lock. Fresh download-time v4 generation remains refused before archive binding
+and lock publication: it needs a separate pre-refresh root exclusion contract
+and belongs to the later durable auto-lock stage. Other commands retain command.v1.
+Legacy v4 execution/download/cache still refuse; legacy remains the default.
+This native slice does
 not complete backend-neutral execution, SymCrypt short commands, durable
 auto-lock orchestration, or supported Noble amd64/arm64 live acceptance.
 

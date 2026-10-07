@@ -197,15 +197,16 @@ pub const Result = struct {
     native_completion: ?NativeCompletionEvidence = null,
     // Typed consumers read who owns a refused held attempt; command.v1 omits it.
     recovery_owner: ?RecoveryOwner = null,
+    native_download: ?NativeBaselineDownload = null,
 
     pub fn canonicalJson(self: Result, allocator: std.mem.Allocator) ![]u8 {
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
         const writer = &output.writer;
         try writer.writeAll("{\"schema\":\"");
-        try writer.writeAll(json_schema);
+        try writer.writeAll(if (self.native_download != null) "io.github.cataggar.debz.command.v2" else json_schema);
         try writer.writeAll("\",\"api_version\":");
-        try writer.print("{d}", .{self.api_version});
+        try writer.print("{d}", .{if (self.native_download != null) @as(u32, 2) else self.api_version});
         try writer.writeAll(",\"operation\":");
         try writeJsonString(writer, self.operation.spelling());
         try writer.writeAll(",\"exit_status\":");
@@ -236,9 +237,23 @@ pub const Result = struct {
             try writeJsonString(writer, diagnostic.message);
             try writer.writeByte('}');
         }
-        try writer.writeAll("]}\n");
+        try writer.writeByte(']');
+        if (self.native_download) |evidence| {
+            try writer.writeAll(",\"native_download\":");
+            try std.json.Stringify.value(evidence, .{}, writer);
+        }
+        try writer.writeAll("}\n");
         return output.toOwnedSlice();
     }
+};
+
+pub const NativeBaselineDownload = struct {
+    schema: []const u8 = "https://debz.dev/schema/native-baseline-download-v1",
+    version: u32 = 1,
+    outcome: enum { archives_verified_without_execution } = .archives_verified_without_execution,
+    baseline_noop: @import("native_baseline_contract.zig").Contract,
+    downloaded_count: usize,
+    reused_count: usize,
 };
 
 pub const OwnedResult = struct {
@@ -274,6 +289,7 @@ const WireResult = struct {
     summary: []const u8,
     items: []const WireItem,
     diagnostics: []const WireDiagnostic,
+    native_download: ?NativeBaselineDownload = null,
 };
 
 /// Decodes the canonical bounded result transported out of the private
@@ -289,8 +305,9 @@ pub fn decodeResult(
         .ignore_unknown_fields = false,
     }) catch return error.InvalidDocument;
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.schema, json_schema) or
-        parsed.value.api_version != api_version)
+    const baseline_download = std.mem.eql(u8, parsed.value.schema, "io.github.cataggar.debz.command.v2") and parsed.value.api_version == 2;
+    if (!((std.mem.eql(u8, parsed.value.schema, json_schema) and parsed.value.api_version == api_version and parsed.value.native_download == null) or
+        (baseline_download and parsed.value.native_download != null)))
         return error.UnsupportedSchema;
     if (parsed.value.items.len > maximum_result_items or
         parsed.value.diagnostics.len > 1)
@@ -305,6 +322,16 @@ pub fn decodeResult(
     arena.* = .init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
+    if (parsed.value.native_download) |evidence| {
+        if (!std.mem.eql(u8, evidence.schema, "https://debz.dev/schema/native-baseline-download-v1") or evidence.version != 1 or
+            operation != .download or exit_status != .success or parsed.value.changed or parsed.value.diagnostics.len != 0)
+            return error.InvalidDocument;
+        try evidence.baseline_noop.validate(owned, null);
+        var baseline_lock = try @import("exact_lock_v4.zig").decode(owned, evidence.baseline_noop.planning_lock_json);
+        defer baseline_lock.deinit();
+        const count = std.math.add(usize, evidence.downloaded_count, evidence.reused_count) catch return error.InvalidDocument;
+        if (count != baseline_lock.archive_lock.lock.packages.len) return error.InvalidDocument;
+    }
     const items = try owned.alloc(Item, parsed.value.items.len);
     for (parsed.value.items, 0..) |item, index| {
         items[index] = .{
@@ -329,6 +356,7 @@ pub fn decodeResult(
     }
     var result: OwnedResult = .{
         .result = .{
+            .api_version = parsed.value.api_version,
             .operation = operation,
             .exit_status = exit_status,
             .changed = parsed.value.changed,
@@ -340,6 +368,11 @@ pub fn decodeResult(
         .arena = arena,
         .backing_allocator = allocator,
     };
+    if (parsed.value.native_download) |evidence| {
+        var value = evidence;
+        value.baseline_noop = try evidence.baseline_noop.clone(owned);
+        result.result.native_download = value;
+    }
     const canonical = try result.result.canonicalJson(allocator);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, source))
