@@ -1156,7 +1156,7 @@ pub const Backend = struct {
             } else if (request.options.status_path == null) {
                 download_baseline.captureFresh(allocator, self.io, request.options.install_root, request.options.architecture, request.options.lock_wait_ms) catch |err|
                     return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
-                if (download_baseline.proof != null) {
+                if (download_baseline.fresh) {
                     download_baseline.requireDestination(request.options.cache_path) catch |err|
                         return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
                     if (request.options.lock_output_path) |path|
@@ -1271,7 +1271,7 @@ pub const Backend = struct {
         else
             try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
         defer if (cache_root) |directory| directory.close(self.io);
-        if (download_baseline.proof) |proof| if (cache_root) |directory| proof.requireOutputOutsideDatabase(root_fs.Root.init(self.io, directory)) catch |err|
+        if (cache_root) |directory| download_baseline.requireOutputOutsideDatabase(root_fs.Root.init(self.io, directory)) catch |err|
             return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
         if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
         var metadata = if (fresh_download)
@@ -1548,7 +1548,7 @@ pub const Backend = struct {
                             return api.failure(request.operation, .planning, .lock_verification_failed, nativeLockAdmissionMessage(err));
                     }
                     if (cache_root == null) cache_root = try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
-                    if (download_baseline.proof) |proof| proof.requireOutputOutsideDatabase(root_fs.Root.init(self.io, cache_root.?)) catch |err|
+                    download_baseline.requireOutputOutsideDatabase(root_fs.Root.init(self.io, cache_root.?)) catch |err|
                         return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
                     if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
                     var destination = try metadata_cache.Cache.initFromDir(self.io, cache_root.?, .{});
@@ -5507,13 +5507,31 @@ const BaselinePublicationLocks = struct {
         if (!std.mem.eql(u8, publication.root_path, evidence.root_path) or
             !std.mem.eql(u8, publication.architecture, evidence.native_architecture))
             return error.InstalledBaselineRootMismatch;
-        self.root = try root_fs.openAbsoluteRoot(self.io, publication.root_path);
-        const root = self.root.?.root;
-        const entry = try root.rootEntry();
+        const entry = try self.openRoot(publication.root_path);
         if (!entry.modeled or entry.device != evidence.root_device or entry.inode != evidence.root_inode or
             entry.uid != evidence.root_uid or entry.gid != evidence.root_gid or entry.mode != evidence.root_mode)
             return error.InstalledBaselineChanged;
+        try self.acquirePaths(publication);
+    }
+
+    fn acquireObserved(self: *BaselinePublicationLocks, publication: BaselinePublication, observed_root: root_fs.Root) !void {
+        const expected = try observed_root.rootEntry();
+        const entry = try self.openRoot(publication.root_path);
+        if (!entry.modeled or entry.device != expected.device or entry.inode != expected.inode or
+            entry.uid != expected.uid or entry.gid != expected.gid or entry.mode != expected.mode)
+            return error.InstalledBaselineChanged;
+        try self.acquirePaths(publication);
+    }
+
+    fn openRoot(self: *BaselinePublicationLocks, path: []const u8) !root_fs.Entry {
+        self.root = try root_fs.openAbsoluteRoot(self.io, path);
         self.backend = .{ .allocator = self.allocator, .io = self.io };
+        return self.root.?.root.rootEntry();
+    }
+
+    fn acquirePaths(self: *BaselinePublicationLocks, publication: BaselinePublication) !void {
+        const root = self.root.?.root;
+        const entry = try root.rootEntry();
         var namespace: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(publication.root_path, &namespace, .{});
         const paths = [_][]const u8{ root_operation.lock_path, "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" };
@@ -5578,6 +5596,7 @@ const NativeBaselineCacheGuard = struct {
     arena: ?std.heap.ArenaAllocator = null,
     lock: ?*const exact_lock_v4.OwnedLock = null,
     proof: ?*installed_baseline.Verified = null,
+    unavailable_prestate: ?*installed_baseline.UnavailableDownloadPrestate = null,
     contract: ?@import("native_baseline_contract.zig").Contract = null,
     component: ?@import("installed_baseline_component.zig").Manifest = null,
     capture_error: ?anyerror = null,
@@ -5612,9 +5631,27 @@ const NativeBaselineCacheGuard = struct {
             });
         }
         if (packages.items.len == 0) return;
-        self.proof = try installed_baseline.capture(owned, io, root_path, architecture, status, packages.items);
         self.fresh = true;
         self.locks = .{ .allocator = allocator, .io = io };
+        switch (try installed_baseline.captureDownloadPrestate(owned, io, root_path, architecture, status, packages.items)) {
+            .verified => |proof| self.proof = proof,
+            .unavailable => |prestate| {
+                self.unavailable_prestate = prestate;
+                self.capture_error = prestate.refusal();
+                self.locks.?.acquireObserved(.{
+                    .root_path = root_path,
+                    .architecture = architecture,
+                    .status_bytes = status,
+                    .wait_ms = wait_ms,
+                }, root.root) catch |err| switch (err) {
+                    error.InstalledBaselinePublicationLockUnavailable, error.LockUnavailable => {},
+                    else => return err,
+                };
+                self.locks.?.releaseHeld();
+                try self.verify();
+                return;
+            },
+        }
         self.locks.?.acquire(.{
             .root_path = root_path,
             .architecture = architecture,
@@ -5742,7 +5779,7 @@ const NativeBaselineCacheGuard = struct {
     }
 
     fn verify(self: *NativeBaselineCacheGuard) !void {
-        if (self.proof == null) return;
+        if (self.proof == null and self.unavailable_prestate == null) return;
         var temporary: std.heap.ArenaAllocator = .init(self.locks.?.allocator);
         defer temporary.deinit();
         const owned = temporary.allocator();
@@ -5752,8 +5789,12 @@ const NativeBaselineCacheGuard = struct {
             if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
                 return error.RecoveryRequired;
         };
-        const evidence = self.proof.?.evidence();
         const status = try root.readFileAlloc(owned, try root_fs.Path.init("var/lib/dpkg/status"), 64 * 1024 * 1024);
+        if (self.unavailable_prestate) |prestate| {
+            try prestate.verify(owned, root, status);
+            return;
+        }
+        const evidence = self.proof.?.evidence();
         const actual = try installed_baseline.verify(owned, root.io, evidence.root_path, evidence.native_architecture, status, evidence);
         defer actual.deinit();
         if (self.component) |component| {
@@ -5789,9 +5830,14 @@ const NativeBaselineCacheGuard = struct {
                 else => return err,
             };
             defer destination.close();
-            try self.proof.?.requireOutputOutsideDatabase(destination.root);
+            try self.requireOutputOutsideDatabase(destination.root);
             return;
         }
+    }
+
+    fn requireOutputOutsideDatabase(self: *NativeBaselineCacheGuard, directory: root_fs.Root) !void {
+        if (self.proof) |proof| try proof.requireOutputOutsideDatabase(directory);
+        if (self.unavailable_prestate) |prestate| try prestate.requireOutputOutsideDatabase(directory);
     }
 
     fn observe(context: *anyopaque, point: root_fs.PublishPoint) !void {
@@ -5800,6 +5846,7 @@ const NativeBaselineCacheGuard = struct {
 
     fn deinit(self: *NativeBaselineCacheGuard) void {
         if (self.proof) |proof| proof.deinit();
+        if (self.unavailable_prestate) |prestate| prestate.deinit();
         if (self.locks) |*locks| locks.deinit();
         if (self.arena) |*arena| arena.deinit();
     }
@@ -9485,7 +9532,7 @@ test "production native baseline fresh download retains signed-only native v3 be
     try std.testing.expectEqualStrings(status, try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024)));
 }
 
-test "production native baseline fresh signed-only download needs neither missing nor nonwritable baseline locks" {
+test "production native baseline fresh signed-only download needs neither missing nor inaccessible baseline locks" {
     const Late = struct {
         directory: std.Io.Dir,
         repair: bool,
@@ -9513,8 +9560,9 @@ test "production native baseline fresh signed-only download needs neither missin
             backend.interface().release(token);
         }
     };
-    for ([_]enum { missing, nonwritable, late_repair }{ .missing, .nonwritable, .late_repair }) |scenario| {
-        if (scenario == .nonwritable and (@import("builtin").os.tag != .linux or std.os.linux.getuid() == 0))
+    for ([_]enum { missing, nonwritable, unreadable_lock, unreadable_frontend, late_repair }{ .missing, .nonwritable, .unreadable_lock, .unreadable_frontend, .late_repair }) |scenario| {
+        const inaccessible = scenario == .nonwritable or scenario == .unreadable_lock or scenario == .unreadable_frontend;
+        if (inaccessible and (@import("builtin").os.tag != .linux or std.os.linux.getuid() == 0))
             continue;
         for ([_]bool{ false, true }) |needs_baseline| {
             var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -9535,15 +9583,27 @@ test "production native baseline fresh signed-only download needs neither missin
             } else {
                 var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
                 defer root.close();
-                for ([_][]const u8{ "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path|
-                    try root.root.applyMetadata(try root_fs.Path.init(path), .{ .mode = 0o444 });
+                for ([_][]const u8{ "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path| {
+                    const unreadable = (scenario == .unreadable_lock and std.mem.eql(u8, path, "var/lib/dpkg/lock")) or
+                        (scenario == .unreadable_frontend and std.mem.eql(u8, path, "var/lib/dpkg/lock-frontend"));
+                    try root.root.applyMetadata(try root_fs.Path.init(path), .{ .mode = if (unreadable) 0 else 0o444 });
+                    if (unreadable) try std.testing.expectError(error.AccessDenied, directory.dir.openFile(std.testing.io, try std.fmt.allocPrint(allocator, "root/{s}", .{path}), .{ .mode = .read_only }));
+                }
                 try std.testing.expectError(error.AccessDenied, directory.dir.openFile(std.testing.io, "root/var/lib/dpkg/lock-frontend", .{ .mode = .read_write }));
                 try std.testing.expectError(error.AccessDenied, directory.dir.openFile(std.testing.io, "root/var/lib/dpkg/lock", .{ .mode = .read_write }));
+                if (scenario != .nonwritable) try std.testing.expectError(error.AccessDenied, installed_baseline.capture(
+                    allocator,
+                    std.testing.io,
+                    fixture.install_root,
+                    "amd64",
+                    status,
+                    &.{.{ .name = if (needs_baseline) "private-baseline" else "alpha", .version = "1.0", .architecture = "amd64", .selection = .install }},
+                ));
             }
             if (needs_baseline) try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
             var injected: Late = .{ .directory = directory.dir, .repair = scenario == .late_repair };
             var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
-            if (scenario == .late_repair or scenario == .nonwritable)
+            if (scenario == .late_repair or inaccessible)
                 backend.planning_sync = .{ .context = &injected, .hitFn = Late.hit };
             var options = fixture.options();
             options.lock_output_path = fixture.lock_path;
@@ -9553,7 +9613,7 @@ test "production native baseline fresh signed-only download needs neither missin
                     if (scenario == .nonwritable) api.ErrorId.root_operation_conflict else api.ErrorId.lock_verification_failed,
                     result.diagnostics[0].id,
                 );
-                if (scenario != .nonwritable) try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "InstalledBaselinePublicationLockUnavailable") != null);
+                if (scenario != .nonwritable) try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, if (inaccessible) "AccessDenied" else "InstalledBaselinePublicationLockUnavailable") != null);
                 try std.testing.expect(!result.changed and result.native_download == null);
                 try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
                 try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
@@ -9576,11 +9636,14 @@ test "production native baseline fresh signed-only download needs neither missin
             if (scenario == .missing) for ([_][]const u8{ root_operation.lock_path, "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path| {
                 try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, try std.fmt.allocPrint(allocator, "root/{s}", .{path}), .{}));
             };
-            if (scenario == .nonwritable) {
+            if (inaccessible) {
                 var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
                 defer root.close();
-                for ([_][]const u8{ "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path|
-                    try std.testing.expectEqual(@as(u32, 0o444), (try root.root.entry(try root_fs.Path.init(path))).mode & 0o777);
+                for ([_][]const u8{ "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path| {
+                    const unreadable = (scenario == .unreadable_lock and std.mem.eql(u8, path, "var/lib/dpkg/lock")) or
+                        (scenario == .unreadable_frontend and std.mem.eql(u8, path, "var/lib/dpkg/lock-frontend"));
+                    try std.testing.expectEqual(@as(u32, if (unreadable) 0 else 0o444), (try root.root.entry(try root_fs.Path.init(path))).mode & 0o777);
+                }
             }
             if (scenario != .missing) try std.testing.expectEqual(@as(usize, 1), injected.calls);
             try std.testing.expectEqualStrings(status, try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024)));
@@ -9635,6 +9698,96 @@ test "production native baseline fresh lock refusal cannot bypass signed-only dr
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
         try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ root_operation.lock_path, .{}));
         if (intent) try directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{});
+    }
+}
+
+test "production native baseline unreadable exclusions retain drift owned-state and database containment guards" {
+    if (@import("builtin").os.tag != .linux or std.os.linux.getuid() == 0) return error.SkipZigTest;
+    const Scenario = enum { other_file, status, intent, mode_restore, permission_repair, destination, unsafe_lock, busy_lock };
+    const Drift = struct {
+        root: root_fs.Root,
+        scenario: Scenario,
+        calls: usize = 0,
+        fn hit(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            switch (self.scenario) {
+                .status => try self.root.publishFile(try root_fs.Path.init("var/lib/dpkg/status"), "Package: alpha\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n\n", .{}),
+                .intent => {
+                    try self.root.createDirectoryPath(try root_fs.Path.init(comptime std.fs.path.dirname(native_recovery.intent_path).?), root_fs.default_directory_permissions);
+                    try self.root.publishFile(try root_fs.Path.init(native_recovery.intent_path), "{}\n", .{});
+                },
+                .mode_restore, .permission_repair => {
+                    const path = try root_fs.Path.init("var/lib/dpkg/lock");
+                    const original = try self.root.entry(path);
+                    try self.root.applyMetadata(path, .{ .mode = 0o644 });
+                    if (self.scenario == .mode_restore) {
+                        try self.root.applyMetadata(path, .{ .mode = 0 });
+                        try std.testing.expect(std.meta.eql(original, try self.root.entry(path)));
+                    }
+                },
+                else => return error.UnexpectedPlanningCallback,
+            }
+        }
+    };
+    for ([_]Scenario{ .other_file, .status, .intent, .mode_restore, .permission_repair, .destination, .unsafe_lock, .busy_lock }) |scenario| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "root/var/lib/dpkg/status",
+            .data = if (scenario == .permission_repair) installed_only_status else "Package: alpha\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n",
+        });
+        var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+        defer root.close();
+        try root.root.applyMetadata(try root_fs.Path.init("var/lib/dpkg/lock"), .{ .mode = 0 });
+        if (scenario == .unsafe_lock)
+            try root.root.applyMetadata(try root_fs.Path.init(root_operation.lock_path), .{ .mode = 0o666 });
+        var held_backend: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+        const held: ?root_operation.LockToken = if (scenario == .busy_lock) try held_backend.interface().acquire(.{
+            .rank = .root_operation,
+            .root = root.root,
+            .identity = .{ .install_root_sha256 = @splat(0), .inode = (try root.root.rootEntry()).inode },
+            .path = root_operation.lock_path,
+            .wait_ms = 0,
+            .cancellation = transaction_executor.Cancellation.never(),
+            .create_if_missing = false,
+        }) else null;
+        defer if (held) |token| held_backend.interface().release(token);
+        if (scenario == .other_file) {
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/unreadable", .data = "not an exclusion\n" });
+            try root.root.applyMetadata(try root_fs.Path.init("var/lib/dpkg/info/unreadable"), .{ .mode = 0 });
+        }
+        try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+        var injected: Drift = .{ .root = root.root, .scenario = scenario };
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+        const callback = scenario == .status or scenario == .intent or scenario == .mode_restore or scenario == .permission_repair;
+        if (callback)
+            backend.planning_sync = .{ .context = &injected, .hitFn = Drift.hit };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        options.lock_wait_ms = 0;
+        if (scenario == .destination) options.cache_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/refused-cache", .{fixture.install_root});
+        const result = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "beta" }}, .options = options });
+        try std.testing.expectEqual(if (scenario == .busy_lock) api.ErrorId.root_operation_conflict else api.ErrorId.lock_verification_failed, result.diagnostics[0].id);
+        try std.testing.expect(!result.changed and result.native_download == null);
+        try std.testing.expectEqual(@as(usize, if (callback) 1 else 0), injected.calls);
+        try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, switch (scenario) {
+            .other_file => "AccessDenied",
+            .intent => "RecoveryRequired",
+            .destination => "InstalledBaselineOutputOverlapsDatabase",
+            .unsafe_lock => "UnsafeInstalledBaseline",
+            .busy_lock => "another debz operation",
+            else => "InstalledBaselineChanged",
+        }) != null);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/dpkg/info/refused-cache", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
+        if (scenario == .intent) try directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{});
     }
 }
 

@@ -208,6 +208,14 @@ If the signed resolution needs no installed-only baseline, historical archive-on
 v3 download proceeds without creating or requiring those locks. Partial baseline
 lock acquisitions are released before resolution. Other lock failures, unsafe
 metadata, Root drift and owned-work checks are not relaxed.
+An unreadable dpkg `lock` or `lock-frontend` is a separate opaque, read-only
+observation, not a baseline proof: its no-follow identity, mode, size and change
+time remain bound, while every other database file still requires a stable
+full read. The original permission refusal prevents v4 generation, even if the
+caller later restores access. Strict v4 capture/verification still reads and
+hashes both exclusion files in full; this observation cannot supply v4 or no-op
+authority. Signed-only resolution retains database, owned-state and output
+containment checks without opening the unreadable exclusion for its bytes.
 
 Fresh v4 download with `signed_sha256_derived_sha512` currently refuses with
 `InstalledBaselineImplicitBindingUnsupported` before persistent cache, lock

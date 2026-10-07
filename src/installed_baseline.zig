@@ -52,19 +52,48 @@ pub const Verified = opaque {
 
     pub fn deinit(self: *Verified) void {
         const value: *Data = @ptrCast(@alignCast(self));
-        const allocator = value.allocator;
-        value.arena.deinit();
-        allocator.destroy(value);
+        value.deinit();
     }
 
     pub fn requireOutputOutsideDatabase(self: *const Verified, directory: root_fs.Root) !void {
-        const actual = try directory.rootEntry();
-        if (!actual.modeled or !actual.isDirectory()) return error.UnsafeInstalledBaseline;
-        for (self.data().directories) |bound| {
-            if (bound.device == actual.device and bound.inode == actual.inode)
-                return error.InstalledBaselineOutputOverlapsDatabase;
-        }
+        try self.data().requireOutputOutsideDatabase(directory);
     }
+};
+
+/// Read-only drift observation with unavailable exclusion bytes, never no-op authority.
+pub const UnavailableDownloadPrestate = opaque {
+    fn data(self: *const UnavailableDownloadPrestate) *const Data {
+        return @ptrCast(@alignCast(self));
+    }
+
+    pub fn refusal(self: *const UnavailableDownloadPrestate) anyerror {
+        return self.data().read_refusal.?;
+    }
+
+    pub fn verify(self: *const UnavailableDownloadPrestate, allocator: std.mem.Allocator, root: root_fs.Root, status_bytes: []const u8) !void {
+        const evidence = self.data().value;
+        const entry = try root.rootEntry();
+        if (entry.device != evidence.root_device or entry.inode != evidence.root_inode or
+            entry.uid != evidence.root_uid or entry.gid != evidence.root_gid or entry.mode != evidence.root_mode)
+            return error.InstalledBaselineChanged;
+        const actual = try make(allocator, root.io, evidence.root_path, evidence.native_architecture, status_bytes, evidence.packages, true);
+        defer actual.deinit();
+        try requireSamePrestate(actual.value, evidence);
+    }
+
+    pub fn requireOutputOutsideDatabase(self: *const UnavailableDownloadPrestate, directory: root_fs.Root) !void {
+        try self.data().requireOutputOutsideDatabase(directory);
+    }
+
+    pub fn deinit(self: *UnavailableDownloadPrestate) void {
+        const value: *Data = @ptrCast(@alignCast(self));
+        value.deinit();
+    }
+};
+
+pub const DownloadPrestate = union(enum) {
+    verified: *Verified,
+    unavailable: *UnavailableDownloadPrestate,
 };
 
 const DirectoryIdentity = struct { device: u64, inode: u64 };
@@ -74,6 +103,22 @@ const Data = struct {
     arena: std.heap.ArenaAllocator,
     value: Evidence,
     directories: []const DirectoryIdentity,
+    read_refusal: ?anyerror,
+
+    fn deinit(self: *Data) void {
+        const allocator = self.allocator;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+
+    fn requireOutputOutsideDatabase(self: *const Data, directory: root_fs.Root) !void {
+        const actual = try directory.rootEntry();
+        if (!actual.modeled or !actual.isDirectory()) return error.UnsafeInstalledBaseline;
+        for (self.directories) |bound| {
+            if (bound.device == actual.device and bound.inode == actual.inode)
+                return error.InstalledBaselineOutputOverlapsDatabase;
+        }
+    }
 };
 
 const Tree = struct {
@@ -85,6 +130,8 @@ const Tree = struct {
     metadata_bytes: usize = 0,
     status_bytes: ?[]const u8 = null,
     directories: std.ArrayList(DirectoryIdentity) = .empty,
+    allow_unreadable_exclusions: bool = false,
+    read_refusal: ?anyerror = null,
 
     fn charge(self: *Tree, bytes: usize) !void {
         self.metadata_bytes = std.math.add(usize, self.metadata_bytes, bytes) catch
@@ -123,7 +170,26 @@ fn captureTree(tree: *Tree, root: root_fs.Root, path: []const u8, depth: usize) 
     if (entry.isRegularFile()) {
         tree.files += 1;
         if (tree.files > 100_000) return error.InstalledBaselineLimitExceeded;
-        var pin = try root.pinRegularFile(resolved);
+        var pin = root.pinRegularFile(resolved) catch |err| switch (err) {
+            error.AccessDenied, error.PermissionDenied => {
+                if (!tree.allow_unreadable_exclusions or
+                    (!std.mem.eql(u8, path, "var/lib/dpkg/lock") and
+                        !std.mem.eql(u8, path, "var/lib/dpkg/lock-frontend")))
+                    return err;
+                const observed = try root.observeEntry(resolved);
+                try requireOwned(root, observed.entry);
+                if (!observed.entry.isRegularFile()) return error.UnsafeInstalledBaseline;
+                if (observed.entry.size > 64 * 1024 * 1024) return error.InstalledBaselineLimitExceeded;
+                tree.bytes = std.math.add(usize, tree.bytes, @intCast(observed.entry.size)) catch
+                    return error.InstalledBaselineLimitExceeded;
+                if (tree.bytes > 256 * 1024 * 1024) return error.InstalledBaselineLimitExceeded;
+                tree.read_refusal = tree.read_refusal orelse err;
+                tree.hash.update("unreadable publication exclusion\x00");
+                try hashEntry(tree, path, observed.entry, observed.change_nanoseconds, null);
+                return;
+            },
+            else => return err,
+        };
         defer pin.close();
         try requireOwned(root, (try pin.metadata()).entry);
         const observed = try pin.observeStableAlloc(tree.allocator, 64 * 1024 * 1024);
@@ -159,12 +225,12 @@ fn captureTree(tree: *Tree, root: root_fs.Root, path: []const u8, depth: usize) 
     _ = try pin.metadata();
 }
 
-fn captureIdentity(allocator: std.mem.Allocator, root: root_fs.Root) !struct { bytes: []const u8, digest: [64]u8, directories: []const DirectoryIdentity } {
-    var tree: Tree = .{ .allocator = allocator };
+fn captureIdentity(allocator: std.mem.Allocator, root: root_fs.Root, allow_unreadable_exclusions: bool) !struct { bytes: []const u8, digest: [64]u8, directories: []const DirectoryIdentity, read_refusal: ?anyerror } {
+    var tree: Tree = .{ .allocator = allocator, .allow_unreadable_exclusions = allow_unreadable_exclusions };
     tree.hash.update("debz installed database no-op prestate v1\x00");
     try captureTree(&tree, root, "var/lib/dpkg", 0);
     const bytes = tree.status_bytes orelse return error.InstalledBaselineStatusMissing;
-    return .{ .bytes = bytes, .digest = tree.hash.finalResult(), .directories = try tree.directories.toOwnedSlice(allocator) };
+    return .{ .bytes = bytes, .digest = tree.hash.finalResult(), .directories = try tree.directories.toOwnedSlice(allocator), .read_refusal = tree.read_refusal };
 }
 
 fn make(
@@ -174,7 +240,8 @@ fn make(
     architecture: []const u8,
     expected_status: ?[]const u8,
     packages: []const Package,
-) !*Verified {
+    allow_unreadable_exclusions: bool,
+) !*Data {
     if (packages.len == 0 or packages.len > 100_000) return error.InvalidInstalledBaseline;
     var root = try root_fs.openAbsoluteRoot(io, root_path);
     defer root.close();
@@ -183,13 +250,13 @@ fn make(
     var arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    const first = try captureIdentity(owned, root.root);
+    const first = try captureIdentity(owned, root.root, allow_unreadable_exclusions);
     if (expected_status) |expected| {
         if (!std.mem.eql(u8, first.bytes, expected)) return error.InstalledBaselineChanged;
     }
     var check_arena: std.heap.ArenaAllocator = .init(allocator);
     defer check_arena.deinit();
-    const second = try captureIdentity(check_arena.allocator(), root.root);
+    const second = try captureIdentity(check_arena.allocator(), root.root, allow_unreadable_exclusions);
     if (!std.mem.eql(u8, &first.digest, &second.digest)) return error.InstalledBaselineChanged;
     var database = switch (try status.parseBorrowed(owned, first.bytes, .{})) {
         .database => |value| value,
@@ -238,8 +305,8 @@ fn make(
         .packages = saved,
     };
     const data = try allocator.create(Data);
-    data.* = .{ .allocator = allocator, .arena = arena, .value = value, .directories = first.directories };
-    return @ptrCast(data);
+    data.* = .{ .allocator = allocator, .arena = arena, .value = value, .directories = first.directories, .read_refusal = first.read_refusal };
+    return data;
 }
 
 pub fn lessThan(_: void, left: Package, right: Package) bool {
@@ -255,7 +322,27 @@ pub fn capture(
     expected_status: []const u8,
     packages: []const Package,
 ) !*Verified {
-    return make(allocator, io, root_path, architecture, expected_status, packages);
+    return @ptrCast(try make(allocator, io, root_path, architecture, expected_status, packages, false));
+}
+
+pub fn captureDownloadPrestate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    architecture: []const u8,
+    expected_status: []const u8,
+    packages: []const Package,
+) !DownloadPrestate {
+    const data = try make(allocator, io, root_path, architecture, expected_status, packages, true);
+    if (data.read_refusal != null) return .{ .unavailable = @ptrCast(data) };
+    return .{ .verified = @ptrCast(data) };
+}
+
+fn requireSamePrestate(actual: Evidence, evidence: Evidence) !void {
+    if (actual.root_device != evidence.root_device or actual.root_inode != evidence.root_inode or
+        actual.root_uid != evidence.root_uid or actual.root_gid != evidence.root_gid or actual.root_mode != evidence.root_mode or
+        !std.mem.eql(u8, actual.database_identity.value, evidence.database_identity.value))
+        return error.InstalledBaselineChanged;
 }
 
 pub fn verify(
@@ -269,12 +356,9 @@ pub fn verify(
     if (!std.mem.eql(u8, root_path, evidence.root_path) or
         !std.mem.eql(u8, architecture, evidence.native_architecture))
         return error.InstalledBaselineRootMismatch;
-    const result = try make(allocator, io, root_path, architecture, expected_status, evidence.packages);
+    const result: *Verified = @ptrCast(try make(allocator, io, root_path, architecture, expected_status, evidence.packages, false));
     errdefer result.deinit();
     const actual = result.evidence();
-    if (actual.root_device != evidence.root_device or actual.root_inode != evidence.root_inode or
-        actual.root_uid != evidence.root_uid or actual.root_gid != evidence.root_gid or actual.root_mode != evidence.root_mode or
-        !std.mem.eql(u8, actual.database_identity.value, evidence.database_identity.value))
-        return error.InstalledBaselineChanged;
+    try requireSamePrestate(actual, evidence);
     return result;
 }
