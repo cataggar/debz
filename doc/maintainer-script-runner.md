@@ -627,6 +627,53 @@ be investigated and decided **for both** engines in #278. Do not infer host
 network isolation from this gate, silently adjust one signed proc view, or
 authorize any new network connectivity on this evidence.
 
+## Exact arm64 less preinst inert alternatives branch (#393)
+
+The first arm64 alternatives refusal in native run `37537004982` is the
+signed `less:arm64` `668-1build1` new-package preinst with exactly
+`["install"]`, not the last traced libreadline diversion. The retained
+bootstrap insertion order, preserved by database publication, has a
+59-package configured prefix before the `ncurses-bin` Pre-Depends barrier.
+Then ncurses-bin has no scripts, libreadline's preinst is observed, and
+libncurses has no scripts before less. The compiler emits less's preinst
+before its unpack. Its installed and staged 292-byte scripts match the
+authenticated archive and existing signed fixture exactly.
+
+Only that inert arm64 callback is admitted. The original amd64 behavior
+is unchanged; arm64 less postinst, upgrade/abort arguments, other versions,
+foreign architectures and unknown scripts still refuse. The install branch
+performs no alternatives operation: every observed group remains immutable,
+including an existing pager. No proc or debconf authority is added.
+
+Arm64 admission additionally requires exact authenticated archive identities
+for less `668-1build1`, dash `0.5.12-12ubuntu3`, dpkg `1.23.7ubuntu1` and
+libc6 `2.43-2ubuntu2.4`. Installed/staged preinst bytes, the signed-derived
+583-byte ownership list, 133,864-byte dash, 68,032-byte snapshot alternatives
+tool, 201,872-byte loader and 1,788,240-byte libc are bound by content,
+size, mode, root ownership and single-link metadata. Files remain frozen
+through the alternatives boundary. The exact merged-/usr, shell and loader
+aliases are checked before and after execution, as are the root-owned
+mode-0700 root, empty mode-0755 proc directory, and absent loader
+cache/preload/hwcaps and alternatives shadow paths. An unexplained change
+after launch requires durable recovery, never repair or conversion to success.
+
+These identities were independently extracted/derived from the original
+authenticated arm64 lock/CAS and cross-checked against checksum-verified
+retained root inventory. The identical preinst digest is not a transfer of
+amd64 runtime behavior; the arm64 tools, archives and loader/libc are
+independently bound in the repin manifest.
+
+The protected positive replay remains **blocked pending privileged arm64
+execution**. General CI and an unactivated optional test are not proof.
+`tools/real-snapshot-less-reference.sh` accepts seven explicit arguments:
+the verified pinned arm64 dpkg, protected prestate root, signed lock,
+signed less archive, two new disposable root paths, and protected Zig.
+It supplies all eight protected test coordinates and actually invokes the
+activated ReleaseSafe Zig test, before execution and again after unmodified
+script/pinned-dpkg replay and strict negative fixtures. It must be invoked
+explicitly from a root-owned protected checkout; no workflow dispatch or
+automatic CI proof is implied. Full #393/#262 closure remains separate.
+
 ## Exact signed python3 preinst inert alternatives call
 
 The separate new-package `python3:amd64` `3.14.3-0ubuntu2`

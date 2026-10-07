@@ -1662,6 +1662,39 @@ def audit_production_sources() -> None:
     ):
         if required not in unpack:
             fail(f"reviewed automatic file-trigger self-interest boundary changed: {required}")
+    for required in (
+        'const arm64 = std.mem.eql(u8, architecture, "arm64") and\n'
+        '        std.mem.eql(u8, package.architecture, "arm64");',
+        "if ((!amd64 and !arm64) or",
+        "const snapshot_less_arm64_artifacts = [_]struct {",
+        "const snapshot_less_arm64_controls = [_]SignedDebconfControlFile{",
+        'if (action_kind != .script or !std.mem.eql(u8, program.target_architecture, "arm64"))',
+        "try verifySnapshotLessArm64Inputs(allocator, root, program.artifacts, program.target_architecture);",
+        "try bindSnapshotLessArm64ImmutableInputs(&script);",
+        'stat.uid != 0 or stat.gid != 0 or stat.mode != 0o40700)',
+        '"etc/ld.so.preload",\n    "etc/ld.so.cache",',
+        "var contents = try proc.observeAlloc(allocator, 0, 0);",
+        "entry.mode != 0o777 or entry.uid != 0 or entry.gid != 0 or",
+        "try attempt.requireRecovery(allocator, .script);",
+    ):
+        if required not in unpack:
+            fail(f"reviewed exact arm64 less inert boundary changed: {required}")
+    less_reference = (ROOT / "tools/real-snapshot-less-reference.sh").read_text(errors="strict")
+    for required in (
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT="$source_root"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SCRIPT_AFTER="$script_root"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_DPKG_AFTER="$dpkg_root"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_SCRIPT_ROOT="$bad_script"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_MODE_ROOT="$bad_mode"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_TOOL_ROOT="$bad_tool"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_ALIAS_ROOT="$bad_alias"',
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_BAD_PRESTATE_ROOT="$bad_prestate"',
+        '"$zig" build test-native-unpack -Doptimize=ReleaseSafe -j2 --summary all',
+        "unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private --",
+        "/bin/sh /var/lib/debz-lifecycle-scripts/less.preinst install",
+    ):
+        if required not in less_reference:
+            fail(f"protected arm64 less activated proof wiring changed: {required}")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")
