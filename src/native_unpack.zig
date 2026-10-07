@@ -23515,6 +23515,38 @@ fn verifySnapshotPython3NullOutput(
     );
 }
 
+test "native_unpack.test.protected signed python3 source is validated before fixture mutation" {
+    const path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_ROOT") orelse return;
+    const selected = try snapshotPython3PreinstBinding("amd64");
+    var artifacts: [2]native_program.ProgramArtifact = undefined;
+    for (selected.artifacts, &artifacts, 0..) |binding, *artifact, index| {
+        artifact.* = .{
+            .index = @intCast(index),
+            .package = .{ .name = binding.name, .version = "3.14.3-0ubuntu2", .architecture = "amd64" },
+            .archive_identity = content_digest.JsonIdentity.init(try content_digest.Identity.init(
+                .{ .sha512 = (try content_digest.Value.parse(.sha512, binding.sha512)).sha512 },
+                .sha512,
+            )),
+            .size = binding.size,
+            .application_sha256 = @splat('0'),
+            .origin_v2 = .{ .authenticated_repository = .{
+                .repository_id = @splat('0'),
+                .repository_snapshot_sha256 = @splat('0'),
+            } },
+        };
+    }
+    var program = std.mem.zeroes(native_program.Program);
+    program.target_architecture = "amd64";
+    program.artifacts = &artifacts;
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+    defer root.close();
+    try verifySnapshotPython3PreinstInputs(testing.allocator, root.root, &program);
+    const proof_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_PROOF") orelse return error.TestUnexpectedResult;
+    var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(proof_path), .{ .exclusive = true });
+    defer proof.close(testing.io);
+    try proof.writeStreamingAll(testing.io, "signed Python source guard executed before fixture mutation\n");
+}
+
 test "native_unpack.test.protected signed python3 inputs and redirected tool witness are exact" {
     const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT") orelse return;
     const after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER") orelse

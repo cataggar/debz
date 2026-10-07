@@ -187,7 +187,11 @@ from a root-owned bare repository into a new mode-0700 tree under
 records the `zig-pkg` modes, and runs seven fail-closed negatives before the
 proof. Its amd64 leg additionally stages a separate signed Python pre-configure
 source and runs the empty0600/0644 and strict20/96 replay, then requires exclusive
-receipts from both activated Zig root validators. The 140-minute job budget
+receipts from both activated Zig root validators and the actual pre-mutation
+Python source verifier. Shared staging produces and verifies the pinned archive's complete
+dpkg tool receipt on both architectures; Python setup/mutation/capture writes
+reuse the reviewed descriptor-rooted no-follow fixture primitives.
+The 140-minute job budget
 includes bounded Python staging/replay (40) and Zig verification (10). Its
 arm64 leg separately stages a fresh signed less source using the reviewed
 no-follow helper, then requires both actual source/replay verifier receipts

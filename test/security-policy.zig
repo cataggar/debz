@@ -2371,13 +2371,25 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-protected-stage.sh", &.{
         "toolchain(Path(sys.argv[3]))\n",
-        "protected(root / \"dev\", directory=True)\n",
-        "protected(root / \"proc\", directory=True)\n",
+        "fixture empty \"$before\"\n",
+        "fixture mode \"$before_0644\" 0644\n",
         "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",
         "bash tools/real-snapshot-signed-proc-prestates.sh --python3 \"$pinned\" \"$workspace\"\n",
         "    bash tools/real-snapshot-python3-reference.sh \"$pinned\" \"$input\" \"$lock\" \"$archive\" \\\n",
         "  \"-Dpython3-reference-root-py3compile=$after-py3compile-before\" \\\n",
         "  \"-Dpython3-reference-bad-minimal-compiler=$after-py3compile-bad-compiler\" \\\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-reference-protected-stage.sh", &.{
+        "module.receipt_from_extracted_archive(\n",
+        "  --architecture \"$architecture\" --verify-only \"$dpkg_prefix/usr/bin/dpkg\"\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real_snapshot_python_fixtures.py", &.{
+        "    create_exclusive(shadow, \"usr/sbin/update-alternatives\", b\"shadow\\n\", 0o644)\n",
+    });
+    try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-reference.sh", &.{
+        "fixture preflight \"$source_root\"\n",
+        "fixture dpkg \"$dpkg_root\" \"$pinned\" \"$archive\"\n",
+        "fixture strict \"$py3compile_bad_hash\" \"$py3compile_bad_mode\" \\\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-python3-reference.sh", &.{
         "require_protected_file \"$source_root/dev/null\"\n",

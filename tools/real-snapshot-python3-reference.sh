@@ -2,6 +2,7 @@
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset ZIG_LIB_DIR
 
 [[ $# == 6 && $(id -u) == 0 ]] || {
   echo "usage (as root): $0 PINNED_DPKG PROTECTED_SOURCE_ROOT SIGNED_LOCK SIGNED_ARCHIVE NEW_SCRIPT_COPY NEW_DPKG_COPY" >&2
@@ -45,9 +46,29 @@ checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-python3-reference.sh" ]]
 require_protected_file "$checkout/tools/real-snapshot-python3-reference.sh"
 require_protected_file "$checkout/tools/prepare-native-dpkg.py"
+require_protected_file "$checkout/tools/real_snapshot_python_fixtures.py"
+require_protected_file "$checkout/tools/real_snapshot_less_fixtures.py"
+require_protected_file "$checkout/tools/real_snapshot_reference_paths.py"
 require_protected_file "$checkout/src/fixtures/ubuntu-resolute-python3.preinst"
 require_protected_path "$checkout/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$checkout/.real-snapshot") == 0:0:700 ]]
+zig=${DEBZ_ZIG:-}
+[[ "$zig" == /* ]]
+python3 -B -I - "$checkout/tools" "$zig" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import toolchain
+toolchain(Path(sys.argv[2]))
+PY
+fixture() {
+  python3 -B -I - "$checkout/tools" "$@" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_python_fixtures import dispatch
+dispatch(sys.argv[2:])
+PY
+}
 
 pinned=$(realpath -- "$1")
 source_root=$(realpath -- "$2")
@@ -130,6 +151,13 @@ cmp "$source_root/var/lib/dpkg/info/python3-minimal.postinst" \
 [[ -d "$source_root/proc" && ! -L "$source_root/proc" &&
    -z $(find "$source_root/proc" -mindepth 1 -print -quit) ]]
 [[ ! -e "$source_root/usr/share/doc/python3/html" ]]
+fixture preflight "$source_root"
+source_proof="$script_root-source-proof.txt"
+env "TMPDIR=$checkout/.zig-cache" "$zig" build test-real-snapshot-python3-source-protected \
+  "-Dpython3-source-root=$source_root" "-Dpython3-source-proof=$source_proof" \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
+  -Doptimize=ReleaseSafe -j2 --summary all
+grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"
 
 alternatives_fingerprint() {
   local root=$1
@@ -165,10 +193,7 @@ timeout --signal=TERM --kill-after=5s 120s \
   3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc ]]
 [[ $(stat -c '%s' "$script_root/dev/null") == 96 ]]
 
-[[ -d "$dpkg_root/tmp" && ! -L "$dpkg_root/tmp" ]]
-[[ -d "$dpkg_root/usr/local/sbin" && ! -L "$dpkg_root/usr/local/sbin" ]]
-install -o root -g root -m0755 "$pinned" "$dpkg_root/usr/local/sbin/dpkg"
-install -o root -g root -m0644 "$archive" "$dpkg_root/tmp/python3.deb"
+fixture dpkg "$dpkg_root" "$pinned" "$archive"
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --pid --fork --kill-child=SIGKILL --propagation private -- \
   chroot "$dpkg_root" /bin/sh -c '
@@ -183,7 +208,7 @@ timeout --signal=TERM --kill-after=5s 120s \
       env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/ LC_ALL=C \
         DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
         /usr/local/sbin/dpkg --root=/ --force-not-root --force-bad-path \
-        --force-confold --no-triggers --unpack /tmp/python3.deb
+        --force-confold --no-triggers --unpack /var/lib/dpkg/python3-probe.deb
     '\'' sh
   '
 [[ $(dpkg-query --admindir="$dpkg_root/var/lib/dpkg" -W \
@@ -197,7 +222,7 @@ cmp "$script_root/dev/null" "$dpkg_root/dev/null"
 # Generate the 20-byte prestate by running its signed producer, not by seeding bytes.
 cp -a --reflink=auto -- "$source_root" "$py3compile_before"
 require_protected_path "$py3compile_before"
-chmod 0644 "$py3compile_before/dev/null"
+fixture mode "$py3compile_before" 0644
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --pid --fork --kill-child=SIGKILL --propagation private -- \
   chroot "$py3compile_before" /bin/sh -c '
@@ -227,11 +252,7 @@ timeout --signal=TERM --kill-after=5s 120s \
       DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
       /bin/sh /var/lib/dpkg/info/python3.preinst install
   '
-install -o root -g root -m0755 "$pinned" "$py3compile_dpkg/usr/local/sbin/dpkg"
-require_protected_path "$py3compile_dpkg/var/lib/dpkg"
-[[ ! -e "$py3compile_dpkg/var/lib/dpkg/python3-probe.deb" &&
-   ! -L "$py3compile_dpkg/var/lib/dpkg/python3-probe.deb" ]]
-install -o root -g root -m0644 "$archive" "$py3compile_dpkg/var/lib/dpkg/python3-probe.deb"
+fixture dpkg "$py3compile_dpkg" "$pinned" "$archive"
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --pid --fork --kill-child=SIGKILL --propagation private -- \
   chroot "$py3compile_dpkg" /bin/sh -c '
@@ -267,10 +288,8 @@ for path in "$py3compile_bad_hash" "$py3compile_bad_mode" \
   cp -a --reflink=auto -- "$py3compile_before" "$path"
   require_protected_path "$path"
 done
-printf '/usr/bin/py3compile ' > "$py3compile_bad_hash/dev/null"
-chmod 0600 "$py3compile_bad_mode/dev/null"
-sed -i 's/which/false/' "$py3compile_bad_postinst/var/lib/dpkg/info/python3-minimal.postinst"
-printf 'stale compiler\n' > "$py3compile_bad_compiler/usr/bin/py3compile"
+fixture strict "$py3compile_bad_hash" "$py3compile_bad_mode" \
+  "$py3compile_bad_postinst" "$py3compile_bad_compiler"
 printf 'DEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_ROOT_PY3COMPILE=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_PREINST_AFTER_PY3COMPILE=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_HASH=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_NULL_PY3COMPILE_MODE=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_POSTINST=%s\nDEBZ_REQUIRE_SIGNED_PYTHON3_BAD_MINIMAL_COMPILER=%s\n' \
   "$py3compile_before" "$py3compile_after" "$py3compile_bad_hash" \
   "$py3compile_bad_mode" "$py3compile_bad_postinst" "$py3compile_bad_compiler"

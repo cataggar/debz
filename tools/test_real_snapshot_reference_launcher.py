@@ -22,6 +22,7 @@ sys.path.insert(0, str(TOOLS))
 from real_snapshot_reference_paths import open_absolute, protected, read_root_file
 import real_snapshot_less_fixtures as LESS_FIXTURES
 import real_snapshot_less_stage as LESS_STAGE
+import real_snapshot_python_fixtures as PYTHON_FIXTURES
 
 ROOT = TOOLS.parent
 SPEC = importlib.util.spec_from_file_location(
@@ -38,6 +39,105 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="debz-reference-negative-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    def test_python_dpkg_staging_refuses_parent_and_leaf_aliases(self) -> None:
+        pinned, archive = self.root / "pinned", self.root / "archive"
+        pinned.write_bytes(b"pinned bytes")
+        archive.write_bytes(b"archive bytes")
+        for alias in ("usr", "usr/local", "usr/local/sbin", "usr/local/sbin/dpkg",
+                      "var/lib/dpkg/python3-probe.deb"):
+            with self.subTest(alias=alias):
+                root = self.root / alias.replace("/", "-")
+                (root / "usr").mkdir(parents=True)
+                (root / "var/lib/dpkg").mkdir(parents=True)
+                outside = self.root / (root.name + "-outside")
+                outside.mkdir()
+                witness = outside / "witness"
+                witness.write_bytes(b"outside must survive")
+                target = root / alias
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_dir():
+                    target.rmdir()
+                target.symlink_to(outside if alias != "usr/local/sbin/dpkg" and
+                                  alias != "var/lib/dpkg/python3-probe.deb" else witness)
+                with mock.patch.object(LESS_FIXTURES, "protected"), self.assertRaises((OSError, ValueError)):
+                    PYTHON_FIXTURES.dispatch(["dpkg", str(root), str(pinned), str(archive)])
+                self.assertEqual(witness.read_bytes(), b"outside must survive")
+                self.assertEqual(sorted(path.name for path in outside.iterdir()), ["witness"])
+
+    def test_python_shadow_negative_refuses_copied_leaf_alias(self) -> None:
+        roots = [self.root / f"negative-{index}" for index in range(8)]
+        (roots[0] / "usr/share/doc/python3").mkdir(parents=True)
+        (roots[1] / "usr/bin").mkdir(parents=True)
+        (roots[1] / "usr/bin/python3").symlink_to("python3.14")
+        (roots[2] / "usr/sbin").mkdir(parents=True)
+        outside = self.root / "outside-shadow"
+        outside.write_bytes(b"preserved outside shadow")
+        (roots[2] / "usr/sbin/update-alternatives").symlink_to(outside)
+        with self.assertRaises(FileExistsError):
+            PYTHON_FIXTURES.basic_negatives(roots)
+        self.assertEqual(outside.read_bytes(), b"preserved outside shadow")
+
+    def test_python_mutators_refuse_hardlink_and_nonregular_before_changes(self) -> None:
+        outside = self.root / "outside-null"
+        outside.write_bytes(b"untouched")
+        outside.chmod(0o644)
+        for kind in ("hardlink", "fifo", "directory", "alias", "parent-alias"):
+            with self.subTest(kind=kind):
+                root = self.root / kind
+                (root / "dev").mkdir(parents=True)
+                leaf = root / "dev/null"
+                if kind == "hardlink":
+                    os.link(outside, leaf)
+                elif kind == "fifo":
+                    os.mkfifo(leaf)
+                elif kind == "directory":
+                    leaf.mkdir()
+                elif kind == "alias":
+                    leaf.symlink_to(outside)
+                else:
+                    (root / "dev").rmdir()
+                    (root / "dev").symlink_to(self.root)
+                with mock.patch.object(LESS_FIXTURES.os, "ftruncate") as truncate, \
+                        mock.patch.object(LESS_FIXTURES.os, "fchmod") as chmod:
+                    for mutate in (
+                        lambda: PYTHON_FIXTURES.strict_negatives([root] * 4),
+                        lambda: PYTHON_FIXTURES.dispatch(["mode", str(root), "0600"]),
+                    ):
+                        with self.assertRaises((ValueError, OSError)):
+                            mutate()
+                    truncate.assert_not_called()
+                    chmod.assert_not_called()
+                self.assertEqual(outside.read_bytes(), b"untouched")
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o644)
+
+    def test_python_staging_and_capture_create_exclusive_files(self) -> None:
+        root = self.root / "safe"
+        (root / "usr").mkdir(parents=True)
+        (root / "var/lib/dpkg").mkdir(parents=True)
+        pinned, archive = self.root / "pinned", self.root / "archive"
+        pinned.write_bytes(b"pinned bytes")
+        archive.write_bytes(b"archive bytes")
+        with mock.patch.object(LESS_FIXTURES, "protected"):
+            PYTHON_FIXTURES.dispatch(["dpkg", str(root), str(pinned), str(archive)])
+            with self.assertRaises(FileExistsError):
+                PYTHON_FIXTURES.dispatch(["dpkg", str(root), str(pinned), str(archive)])
+        self.assertEqual((root / "usr/local/sbin/dpkg").read_bytes(), b"pinned bytes")
+        self.assertEqual((root / "var/lib/dpkg/python3-probe.deb").read_bytes(), b"archive bytes")
+        command = ["capture", str(root), "stdout", "stderr",
+                   sys.executable, "-B", "-c", "print('captured')"]
+        with self.assertRaises(SystemExit) as result:
+            PYTHON_FIXTURES.dispatch(command)
+        self.assertEqual(result.exception.code, 0)
+        self.assertEqual((root / "stdout").read_bytes(), b"captured\n")
+        with self.assertRaises(FileExistsError):
+            PYTHON_FIXTURES.dispatch(command)
+        with self.assertRaisesRegex(ValueError, "capture exceeds"):
+            PYTHON_FIXTURES.dispatch([
+                "capture", str(root), "oversized", "oversized-stderr",
+                sys.executable, "-B", "-c", "import sys; sys.stdout.buffer.write(b'x' * (17 * 1024 * 1024))",
+            ])
+        self.assertEqual((root / "oversized").stat().st_size, 16 * 1024 * 1024)
 
     def test_less_source_setup_directories_refuse_aliases_and_handle_private_umask(self) -> None:
         outside = self.root / "outside"

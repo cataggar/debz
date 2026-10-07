@@ -1,4 +1,4 @@
-"""No-follow mutations for disposable signed-less reference fixtures."""
+"""Shared no-follow writes for disposable signed reference fixtures."""
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ from real_snapshot_reference_paths import open_absolute, open_beneath, protected
 @contextmanager
 def parent_descriptor(root: Path, relative: str):
     parent, separator, name = relative.rpartition("/")
-    if not separator or name in ("", ".", ".."):
+    if name in ("", ".", "..") or relative.startswith("/"):
         raise ValueError("invalid fixture mutation path")
     root_fd = open_absolute(root, directory=True)
     try:
-        parent_fd = open_beneath(root_fd, parent, directory=True)
+        parent_fd = open_beneath(root_fd, parent, directory=True) if separator else os.dup(root_fd)
         try:
             yield parent_fd, name
         finally:
@@ -76,6 +76,73 @@ def create_exclusive(root: Path, relative: str, contents: bytes, mode: int) -> N
             os.close(descriptor)
 
 
+def read_regular(root: Path, relative: str, maximum: int = 8 * 1024 * 1024) -> bytes:
+    with regular_descriptor(root, relative) as descriptor:
+        metadata = regular_metadata(descriptor)
+        if metadata.st_size > maximum:
+            raise ValueError("fixture source exceeds its byte limit")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            content = stream.read(maximum + 1)
+        if len(content) != metadata.st_size:
+            raise ValueError("fixture source bytes changed")
+        return content
+
+
+def chmod_regular(root: Path, relative: str, mode: int) -> None:
+    with regular_descriptor(root, relative) as descriptor:
+        os.fchmod(descriptor, mode)
+
+
+def directory(root: Path, relative: str, mode: int = 0o755, *, exclusive: bool = False) -> None:
+    with parent_descriptor(root, relative) as (parent, name):
+        created = False
+        try:
+            os.mkdir(name, mode, dir_fd=parent)
+            created = True
+        except FileExistsError:
+            if exclusive:
+                raise
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                             dir_fd=parent)
+        try:
+            metadata = os.fstat(descriptor)
+            if metadata.st_uid != os.geteuid() or metadata.st_gid != os.getegid():
+                raise ValueError("unsafe fixture directory owner")
+            if created:
+                os.fchmod(descriptor, mode)
+            elif stat.S_IMODE(metadata.st_mode) != mode:
+                raise ValueError("unsafe existing fixture directory mode")
+        finally:
+            os.close(descriptor)
+
+
+def replace_symlink(root: Path, relative: str, expected: str, target: str) -> None:
+    with parent_descriptor(root, relative) as (parent, name):
+        metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISLNK(metadata.st_mode) or metadata.st_nlink != 1 or
+                metadata.st_uid != os.geteuid() or metadata.st_gid != os.getegid() or
+                os.readlink(name, dir_fd=parent) != expected):
+            raise ValueError("unexpected fixture alias")
+        os.unlink(name, dir_fd=parent)
+        os.symlink(target, name, dir_fd=parent)
+
+
+def copy_exclusive(root: Path, relative: str, source: Path, mode: int) -> None:
+    protected(source)
+    descriptor = open_absolute(source)
+    try:
+        metadata = regular_metadata(descriptor)
+        if metadata.st_size > 8 * 1024 * 1024:
+            raise ValueError("fixture staging source exceeds its byte limit")
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
+            contents = stream.read(metadata.st_size + 1)
+        if len(contents) != metadata.st_size:
+            raise ValueError("protected fixture source changed")
+    finally:
+        os.close(descriptor)
+    create_exclusive(root, relative, contents, mode)
+
+
 def mutate_negative_roots(roots: list[Path]) -> None:
     if len(roots) != 5:
         raise ValueError("five distinct negative roots are required")
@@ -103,39 +170,13 @@ def mutate_negative_roots(roots: list[Path]) -> None:
     create_exclusive(bad_prestate, "etc/ld.so.cache", b"unbound loader cache\n", 0o644)
 
 
-def stage_dpkg_reference(root: Path, pinned: Path, archive: Path) -> None:
+def stage_dpkg_reference(root: Path, pinned: Path, archive: Path, *,
+                         archive_relative: str = "var/lib/dpkg/less-probe.deb") -> None:
     protected(root, directory=True)
-    root_fd = open_absolute(root, directory=True)
-    try:
-        current = open_beneath(root_fd, "usr", directory=True)
-        try:
-            for name in ("local", "sbin"):
-                try:
-                    os.mkdir(name, 0o755, dir_fd=current)
-                except FileExistsError:
-                    pass
-                following = os.open(
-                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    dir_fd=current,
-                )
-                os.close(current)
-                current = following
-        finally:
-            os.close(current)
-    finally:
-        os.close(root_fd)
+    directory(root, "usr/local")
+    directory(root, "usr/local/sbin")
     for source, relative, mode in (
         (pinned, "usr/local/sbin/dpkg", 0o755),
-        (archive, "var/lib/dpkg/less-probe.deb", 0o644),
+        (archive, archive_relative, 0o644),
     ):
-        protected(source)
-        descriptor = open_absolute(source)
-        try:
-            metadata = regular_metadata(descriptor)
-            with os.fdopen(os.dup(descriptor), "rb") as stream:
-                contents = stream.read(metadata.st_size + 1)
-            if len(contents) != metadata.st_size:
-                raise ValueError("protected fixture source changed")
-        finally:
-            os.close(descriptor)
-        create_exclusive(root, relative, contents, mode)
+        copy_exclusive(root, relative, source, mode)

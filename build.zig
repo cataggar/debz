@@ -875,6 +875,16 @@ pub fn build(b: *std.Build) void {
     }
     const python3_reference_step = b.step("test-real-snapshot-python3-protected", "Require the protected signed Python root and alternatives proof without skips");
     python3_reference_step.dependOn(&run_python3_reference_tests.step);
+    const python3_source_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{"native_unpack.test.protected signed python3 source is validated before fixture mutation"},
+    });
+    const run_python3_source_tests = b.addRunArtifact(python3_source_tests);
+    run_python3_source_tests.has_side_effects = true;
+    run_python3_source_tests.setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_ROOT", b.option([]const u8, "python3-source-root", "Required protected Python source") orelse "");
+    run_python3_source_tests.setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_PROOF", b.option([]const u8, "python3-source-proof", "Exclusive pre-mutation Python source proof") orelse "");
+    b.step("test-real-snapshot-python3-source-protected", "Require the exact protected Python source before fixture mutation")
+        .dependOn(&run_python3_source_tests.step);
     const arm64_less_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{

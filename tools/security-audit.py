@@ -2557,6 +2557,8 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-less-reference.sh",
     "tools/real_snapshot_less_stage.py",
     "tools/real_snapshot_less_fixtures.py",
+    "tools/real_snapshot_python_fixtures.py",
+    "tools/prepare-native-dpkg.py",
 )
 PROTECTED_REFERENCE_INPUT = (
     '      run_protected_reference:\n'
@@ -2743,6 +2745,9 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     "[[ ${#proof_arguments[@]} == 13 ]]",
 )
 PROTECTED_REFERENCE_SOURCE_TOKENS = {
+    "tools/prepare-native-dpkg.py": (
+        'with path.open("x", encoding="utf-8") as output:',
+    ),
     "tools/real-snapshot-less-protected-stage.sh": (
         '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == aarch64',
         '"$workspace" == "$checkout/.real-snapshot/less-arm64"',
@@ -2826,10 +2831,11 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
         'bash tools/real-snapshot-signed-proc-bindings.sh "$debz" "$workspace"',
         'bash tools/real-snapshot-signed-proc-prestates.sh --python3 "$pinned" "$workspace"',
-        'protected(root / "dev", directory=True)',
-        'protected(root / "proc", directory=True)',
-        'not stat.S_ISCHR(meta.st_mode) or meta.st_rdev != os.makedev(1, 3)',
-        'os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW',
+        'fixture empty "$before"',
+        'fixture mode "$before_0644" 0644',
+        'fixture capture "$workspace" "evidence/replay-$mode.txt" "evidence/replay-$mode.stderr"',
+        'fixture basic "$workspace/bad-html" "$workspace/bad-link" "$workspace/bad-shadow"',
+        'create_exclusive(root, "evidence/python3-reference.args", content, 0o600)',
         'for mode in 0600 0644; do',
         'bash tools/real-snapshot-python3-reference.sh "$pinned" "$input" "$lock" "$archive"',
         '"-Dpython3-reference-root-py3compile=$after-py3compile-before"',
@@ -2840,6 +2846,16 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'bytes <= 16 * 1024 * 1024 * 1024',
     ),
     "tools/real-snapshot-python3-reference.sh": (
+        'unset ZIG_LIB_DIR',
+        '--zig-lib-dir "$(dirname -- "$zig")/lib"',
+        'fixture preflight "$source_root"',
+        '"$zig" build test-real-snapshot-python3-source-protected',
+        '"-Dpython3-source-root=$source_root" "-Dpython3-source-proof=$source_proof"',
+        'grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"',
+        'fixture dpkg "$dpkg_root" "$pinned" "$archive"',
+        'fixture dpkg "$py3compile_dpkg" "$pinned" "$archive"',
+        'fixture mode "$py3compile_before" 0644',
+        'fixture strict "$py3compile_bad_hash" "$py3compile_bad_mode"',
         'require_protected_file "$source_root/dev/null"',
         '0:0:600:0:1',
         '0:0:644:0:1',
@@ -2848,6 +2864,15 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e',
         '[[ $(sha256sum "$py3compile_after/dev/null" | cut -d\' \' -f1) == \\\n'
         '  3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc ]]',
+    ),
+    "tools/real_snapshot_python_fixtures.py": (
+        'maximum = 16 * 1024 * 1024',
+        'raise ValueError("Python reference capture exceeds its byte limit")',
+        'not stat.S_ISCHR(metadata.st_mode) or metadata.st_rdev != os.makedev(1, 3)',
+        'create_exclusive(root, "dev/null", b"", 0o600)',
+        'create_exclusive(shadow, "usr/sbin/update-alternatives", b"shadow\\n", 0o644)',
+        'stage_dpkg_reference(*roots, archive_relative="var/lib/dpkg/python3-probe.deb")',
+        'with regular_descriptor(postinst, "var/lib/dpkg/info/python3-minimal.postinst") as descriptor:',
     ),
     "tools/real-snapshot-signed-proc-prestates.sh": (
         'if [[ ${1:-} == --python3 ]]; then',
@@ -2880,6 +2905,10 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "if not target.is_relative_to(library):",
     ),
     "build.zig": (
+        'b.step("test-real-snapshot-python3-source-protected",',
+        'run_python3_source_tests.has_side_effects = true;',
+        'run_python3_source_tests.setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_ROOT", b.option([]const u8, "python3-source-root", "Required protected Python source") orelse "");',
+        'run_python3_source_tests.setEnvironmentVariable("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_PROOF", b.option([]const u8, "python3-source-proof", "Exclusive pre-mutation Python source proof") orelse "");',
         'b.step("test-real-snapshot-python3-protected",',
         'run_python3_reference_tests.has_side_effects = true;',
         'run_python3_alternatives_tests.has_side_effects = true;',
@@ -2897,6 +2926,8 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'b.step("test-real-snapshot-reference-protected", ',
     ),
     "tools/real-snapshot-reference-protected-stage.sh": (
+        'module.receipt_from_extracted_archive(\n    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])',
+        '--architecture "$architecture" --verify-only "$dpkg_prefix/usr/bin/dpkg"',
         "  for profile in systemd udev sudo; do\n",
         """  printf -- '-Dreference-protected-profile-scripts=%s\\n' "$profiles"\n""",
         "staging path is not root-owned and protected: $current (uid:gid:mode=$metadata; expected 0:0 with no group/world write bits)",
@@ -3007,6 +3038,13 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         failures.append("protected Python activation must not skip, swallow errors or activate ARM397")
     for path, name, tokens in (
         ("src/native_unpack.zig",
+         "native_unpack.test.protected signed python3 source is validated before fixture mutation", (
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, root.root, &program);",
+             'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_SOURCE_PROOF")',
+             ".exclusive = true",
+             "try proof.writeStreamingAll(",
+         )),
+        ("src/native_unpack.zig",
          "native_unpack.test.protected signed python3 inputs and redirected tool witness are exact", (
              "try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);",
              "try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);",
@@ -3033,6 +3071,25 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
         for token in tokens:
             if token not in body:
                 failures.append(f"{path}: protected Python test body lost {token}")
+    python_reference = texts.get("tools/real-snapshot-python3-reference.sh", "")
+    guard = 'grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"'
+    if (guard not in python_reference or
+            python_reference.index(guard) > python_reference.index("cp -a --reflink=auto")):
+        failures.append("protected Python source guard must execute before copies/mutations")
+    fixtures = texts.get("tools/real_snapshot_less_fixtures.py", "")
+    if "os.O_TRUNC" in fixtures:
+        failures.append("shared reference mutations must inspect the descriptor before truncation")
+    producer = texts.get("tools/prepare-native-dpkg.py", "").partition(
+        "def receipt_from_extracted_archive("
+    )[2].partition("\ndef ")[0]
+    for token in ("verify_file(archive, PINS[architecture][\"archive\"])",
+                  "verify_archive_metadata(archive, architecture)",
+                  "verify_extracted_bindings(prefix, architecture)", "write_receipt(",
+                  "verify_receipt(prefix / RECEIPT, architecture)",
+                  "metadata.st_nlink != 1 or metadata.st_mode & 0o022",
+                  "path.resolve(strict=True) != path"):
+        if token not in producer:
+            failures.append(f"protected extracted reference receipt producer lost {token}")
     ci = texts.get(".github/workflows/ci.yml", "")
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,

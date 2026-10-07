@@ -55,9 +55,9 @@
     "src/root_operation_completion.zig": "a3cfec539eeefd69f7adc15e8972972aab3f4ef991be1517a6018ae89fd307926f1096d1af735ce4e25dc30a06ebc31129fb901d5c2342429b04dee4a88a35b9",
     "actions/download/dist/index.js": "23229ca48d984f02d6555316df68c337ea9d587c38f1745e40eb56dc686e9a9ecb081e2e2fd75d87bc0a8c099cd09d84be97ad7602200996b8c67286ddde3ed0",
     "actions/install/dist/index.js": "dad4adb56fe188e157583ce95be562d1ea31fc9b61ba3b093920de84f266104c4962a00667bc6b887cfdbf6af408dcff755be66ed03f167a08bf5f42af05aafb",
-    "tools/prepare-native-dpkg.py": "090c4653ac1fed6dcf013fccf4fa8b857319f8be11aecd4e2d7139631cb937045b677663db8bfceec279964e59b98233e3a88b7e63c439d963328cab179cc723",
+    "tools/prepare-native-dpkg.py": "360217c53c2f16caab6073b5edeb6a09b351d20c8ebf6a3d853162fb080c4d53676b037cc9093387c7762009feb818fbac6f2a4bf11597e624c81fa9ae7d6c0b",
     "tools/native-differential.py": "46e715fc4c3210deba0fc4141f85de46adef7edfbcc3c3e25ef0c9d67f4d27e4f383ee504ab5abd07b2406815bfe0afec5a8d1396dda02924a458b19bd6ecccd",
-    "build.zig": "9f183623b146267a4a21f6396218236dd631dd5047cb845ce43bf4a99dcb247dc74daf83c40e36b29d454c3ad47fcd2b3f6e824c5535f694cc84dd3826b3d0b3"
+    "build.zig": "dc10b4263b8ebf5385b25578422cee800844b1ac3978dd6d158fcdec2a9229aa7749fe895bf782837cd4652bbd90ce97517399ea0448ca66cdb22622a6061443"
   },
   "signed_script_exception": {
     "path": "src/maintainer_script.zig",

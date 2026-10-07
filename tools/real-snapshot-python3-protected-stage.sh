@@ -26,6 +26,8 @@ for relative in ("tools/real-snapshot-python3-protected-stage.sh",
                  "tools/real-snapshot-signed-proc-bindings.sh",
                  "tools/real-snapshot-signed-proc-prestates.sh",
                  "tools/real-snapshot-reference-order.py",
+                 "tools/real_snapshot_python_fixtures.py",
+                 "tools/real_snapshot_less_fixtures.py",
                  "tools/real_snapshot_reference_paths.py"):
     protected(checkout / relative)
 protected(checkout / ".real-snapshot", directory=True)
@@ -36,6 +38,14 @@ PY
 bash "$checkout/tools/real-snapshot-reference-protected-ci.sh" \
   --check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING" >/dev/null
 export DEBZ_ZIG=$zig PYTHONDONTWRITEBYTECODE=1
+fixture() {
+  python3 -B -I - "$checkout/tools" "$@" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_python_fixtures import dispatch
+dispatch(sys.argv[2:])
+PY
+}
 
 # Reuse the authenticated full closure and its existing pinned-dpkg scheduler;
 # capture before Python configure, without changing configure semantics.
@@ -43,7 +53,7 @@ bash tools/real-snapshot-signed-proc-bindings.sh "$debz" "$workspace"
 bash tools/real-snapshot-signed-proc-prestates.sh --python3 "$pinned" "$workspace"
 source=$workspace/prestates/python3
 evidence=$workspace/evidence
-install -d -o root -g root -m 0700 "$evidence"
+fixture directory "$workspace" evidence
 read -r bytes _ < <(du -sb "$source")
 (( bytes <= 512 * 1024 * 1024 ))
 
@@ -56,50 +66,9 @@ before_0644=$workspace/empty-0644
 copy_root "$source" "$before"
 # This is a new disposable fixture, not a native-root repair. Never follow
 # the captured root's null/proc aliases while preparing its empty sink.
-python3 -B -I - "$checkout/tools" "$before" <<'PY'
-import os
-from pathlib import Path
-import stat
-import sys
-sys.path.insert(0, sys.argv[1])
-from real_snapshot_reference_paths import open_protected, protected
-root = Path(sys.argv[2])
-protected(root, directory=True)
-protected(root / "dev", directory=True)
-protected(root / "proc", directory=True)
-null = root / "dev/null"
-meta = null.lstat()
-if not stat.S_ISCHR(meta.st_mode) or meta.st_rdev != os.makedev(1, 3):
-    raise ValueError("fresh captured source must have the reference null device")
-if any((root / "proc").iterdir()):
-    raise ValueError("captured source proc must be empty")
-null.unlink()
-fd = os.open(null, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-os.close(fd)
-# Pinned dpkg lists use extraction order; the native binding uses C-sorted
-# paths. Verify the exact path-set digest after normalization, not new paths.
-for name, size, digest in (
-    ("python3", 918, "383196acd094063e8e49dc4511deb7094e264a41d872bb889d21b197a550f628"),
-    ("python3-minimal", 781, "82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519"),
-):
-    import hashlib
-    path = root / f"var/lib/dpkg/info/{name}.list"
-    fd = open_protected(path)
-    with os.fdopen(fd, "rb") as member:
-        meta = os.fstat(member.fileno())
-        if meta.st_size != size or meta.st_nlink != 1:
-            raise ValueError(f"Python list metadata changed: {name}")
-        content = b"".join(sorted(member.readlines()))
-    if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
-        raise ValueError(f"signed Python list path set changed: {name}")
-    temporary = path.with_suffix(".list.sorted")
-    with temporary.open("xb") as member:
-        member.write(content)
-    temporary.chmod(0o644)
-    temporary.replace(path)
-PY
+fixture empty "$before"
 copy_root "$before" "$before_0644"
-chmod 0644 "$before_0644/dev/null"
+fixture mode "$before_0644" 0644
 lock=$workspace/snapshot/evidence/ubuntu-minimal.lock.json
 archive_digest=$(jq -er '.packages[] | select(.name == "python3" and .architecture == "amd64") |
   .archive_identity.digests[] | select(.algorithm == "sha512") | .digest' "$lock")
@@ -109,22 +78,17 @@ after_0644=$workspace/after-0644
 for mode in 0600 0644; do
   input=$before output=$after
   [[ $mode == 0600 ]] || { input=$before_0644; output=$after_0644; }
-  timeout --signal=TERM --kill-after=30s 10m \
+  fixture capture "$workspace" "evidence/replay-$mode.txt" "evidence/replay-$mode.stderr" \
+    timeout --signal=TERM --kill-after=30s 10m \
     bash tools/real-snapshot-python3-reference.sh "$pinned" "$input" "$lock" "$archive" \
-    "$output" "$workspace/dpkg-$mode" >"$evidence/replay-$mode.txt" 2>"$evidence/replay-$mode.stderr"
+    "$output" "$workspace/dpkg-$mode"
 done
 for name in html link shadow null null-0640 root script proc; do
   copy_root "$before" "$workspace/bad-$name"
 done
-mkdir "$workspace/bad-html/usr/share/doc/python3/html"
-rm -- "$workspace/bad-link/usr/bin/python3"
-ln -s python3.invalid "$workspace/bad-link/usr/bin/python3"
-printf 'shadow\n' >"$workspace/bad-shadow/usr/sbin/update-alternatives"
-chmod 0666 "$workspace/bad-null/dev/null"
-chmod 0640 "$workspace/bad-null-0640/dev/null"
-chmod 0755 "$workspace/bad-root"
-printf 'stale script\n' >"$workspace/bad-script/var/lib/dpkg/info/python3.preinst"
-printf 'unexpected\n' >"$workspace/bad-proc/proc/unexpected"
+fixture basic "$workspace/bad-html" "$workspace/bad-link" "$workspace/bad-shadow" \
+  "$workspace/bad-null" "$workspace/bad-null-0640" "$workspace/bad-root" \
+  "$workspace/bad-script" "$workspace/bad-proc"
 
 printf '%s\n' \
   "-Dpython3-reference-root=$before" \
@@ -147,7 +111,19 @@ printf '%s\n' \
   "-Dpython3-reference-bad-minimal-compiler=$after-py3compile-bad-compiler" \
   "-Dpython3-reference-inputs-proof=$evidence/inputs-proof.txt" \
   "-Dpython3-reference-alternatives-proof=$evidence/alternatives-proof.txt" \
-  >"$evidence/python3-reference.args"
+  | python3 -B -I -c '
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import protected
+from real_snapshot_less_fixtures import create_exclusive
+root = Path(sys.argv[2])
+protected(root, directory=True)
+content = sys.stdin.buffer.read(16385)
+if len(content) > 16384:
+    raise ValueError("Python arguments exceed bound")
+create_exclusive(root, "evidence/python3-reference.args", content, 0o600)
+' "$checkout/tools" "$workspace"
 read -r bytes _ < <(du -sb "$workspace")
 (( bytes <= 16 * 1024 * 1024 * 1024 ))
 echo "Python source and all 18 root coordinates staged; Zig verification has not executed"

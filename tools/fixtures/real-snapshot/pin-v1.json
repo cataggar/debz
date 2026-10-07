@@ -2269,7 +2269,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-python3-protected-stage.sh"
+          "path": "tools/real_snapshot_python_fixtures.py"
         }
       ],
       "derived_from": [
@@ -2307,7 +2307,7 @@
         },
         {
           "form": "hex",
-          "path": "tools/real-snapshot-python3-protected-stage.sh"
+          "path": "tools/real_snapshot_python_fixtures.py"
         },
         {
           "form": "hex",
@@ -2677,6 +2677,10 @@
         {
           "form": "fixture",
           "path": "src/fixtures/ubuntu-resolute-python3-minimal.postinst"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real_snapshot_python_fixtures.py"
         }
       ],
       "digest": "sha256:be10656c9edf975f5dfe48fe5819172e905e14dcd4ff372af5d8b45b26168edd",

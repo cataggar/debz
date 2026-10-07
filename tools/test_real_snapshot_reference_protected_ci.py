@@ -31,6 +31,7 @@ def load(name: str, path: str):
 MINISIGN = load("debz_verify_minisign", "verify-minisign.py")
 TREE = load("debz_reference_tree_check", "real-snapshot-reference-tree-check.py")
 HARNESS = load("debz_reference_protected", "test_real_snapshot_reference_protected.py")
+DPKG = load("debz_reference_receipt", "prepare-native-dpkg.py")
 from real_snapshot_reference_paths import toolchain, verify_keyring
 from real_snapshot_outcome import collect_outcome
 
@@ -246,7 +247,104 @@ class ProfileStagingTests(unittest.TestCase):
         self.assertEqual(set(HARNESS.PROFILE_VIEW_CHECKS), set(HARNESS.ORDER.PROFILE_VERSIONS))
 
 
+class ExtractedReferenceReceiptTests(unittest.TestCase):
+    def test_archive_receipt_producer_and_verify_only_both_architectures(self) -> None:
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                package, prefix, archive = base / "package", base / "prefix", base / "dpkg.deb"
+                (package / "DEBIAN").mkdir(parents=True)
+                (package / "DEBIAN/control").write_text(
+                    f"Package: dpkg\nVersion: {DPKG.VERSION}\nArchitecture: {architecture}\n"
+                    "Maintainer: Fixture <fixture@example.invalid>\nDescription: Receipt fixture\n"
+                )
+                (package / "usr/bin").mkdir(parents=True)
+                pins = {}
+                for name, key in (("dpkg", "executable"), ("dpkg-query", "dpkg_query"),
+                                  ("update-alternatives", "update_alternatives")):
+                    executable = package / "usr/bin" / name
+                    executable.write_text(f"#!/bin/sh\necho 'Debian dpkg version {DPKG.VERSION}'\n")
+                    executable.chmod(0o755)
+                    pins[key] = hashlib.sha256(executable.read_bytes()).hexdigest()
+                subprocess.run(["dpkg-deb", "--build", str(package), str(archive)],
+                               stdout=subprocess.DEVNULL, check=True)
+                subprocess.run(["dpkg-deb", "--extract", str(archive), str(prefix)], check=True)
+                pins["archive"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+                receipt = prefix / DPKG.RECEIPT
+                with mock.patch.dict(DPKG.PINS, {architecture: pins}):
+                    DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    DPKG.verify_receipt(receipt, architecture)
+                    with mock.patch.object(sys, "argv", [
+                        "prepare-native-dpkg.py", "--architecture", architecture,
+                        "--verify-only", str(prefix / "usr/bin/dpkg"),
+                    ]):
+                        self.assertEqual(DPKG.main(), 0)
+                    with self.assertRaises(FileExistsError):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    receipt.unlink()
+                    with self.assertRaises(RuntimeError):
+                        DPKG.verify_receipt(receipt, architecture)
+                    DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    receipt.write_text("{}\n")
+                    with self.assertRaises(RuntimeError):
+                        DPKG.verify_receipt(receipt, architecture)
+                    receipt.unlink()
+                    query = prefix / "usr/bin/dpkg-query"
+                    query.chmod(0o777)
+                    with self.assertRaisesRegex(RuntimeError, "protected regular"):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    query.chmod(0o755)
+                    os.link(query, prefix / "hardlink")
+                    with self.assertRaisesRegex(RuntimeError, "protected regular"):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    (prefix / "hardlink").unlink()
+                    (prefix / "usr/bin").rename(prefix / "usr/aliased-bin")
+                    (prefix / "usr/bin").symlink_to("aliased-bin")
+                    with self.assertRaisesRegex(RuntimeError, "protected regular"):
+                        DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    (prefix / "usr/bin").unlink()
+                    (prefix / "usr/aliased-bin").rename(prefix / "usr/bin")
+                    for name in ("dpkg-query", "update-alternatives"):
+                        tool = prefix / "usr/bin" / name
+                        original = tool.read_bytes()
+                        tool.write_bytes(b"corrupted binding")
+                        with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
+                            DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                        self.assertFalse(receipt.exists())
+                        tool.write_bytes(original)
+                    DPKG.receipt_from_extracted_archive(architecture, archive, prefix)
+                    (prefix / "usr/bin/dpkg-query").write_bytes(b"corrupted after receipt")
+                    with self.assertRaises(RuntimeError):
+                        DPKG.verify_receipt(receipt, architecture)
+
+
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_receipt_and_python_premutation_guards_cannot_be_removed(self) -> None:
+        audit = load("debz_receipt_python_guards", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, token in (
+            ("tools/prepare-native-dpkg.py", "    verify_extracted_bindings(prefix, architecture)\n"),
+            ("tools/prepare-native-dpkg.py", "    verify_archive_metadata(archive, architecture)\n"),
+            ("tools/real-snapshot-reference-protected-stage.sh", "module.receipt_from_extracted_archive(\n"),
+            ("tools/real-snapshot-python3-reference.sh", 'fixture preflight "$source_root"\n'),
+            ("tools/real_snapshot_python_fixtures.py",
+             '    create_exclusive(shadow, "usr/sbin/update-alternatives", b"shadow\\n", 0o644)\n'),
+            ("src/native_unpack.zig",
+             "    try verifySnapshotPython3PreinstInputs(testing.allocator, root.root, &program);\n"),
+        ):
+            with self.subTest(path=path, token=token):
+                changed = dict(texts)
+                self.assertIn(token, changed[path])
+                changed[path] = changed[path].replace(token, "", 1)
+                self.assertTrue(audit.protected_reference_ci_failures(changed))
+        changed = dict(texts)
+        path = "tools/real-snapshot-python3-reference.sh"
+        token = 'grep -Fx "signed Python source guard executed before fixture mutation" "$source_proof"\n'
+        changed[path] = changed[path].replace(token, "", 1) + "\n" + token
+        self.assertIn("protected Python source guard must execute before copies/mutations",
+                      audit.protected_reference_ci_failures(changed))
+
     def test_arm_less_receipts_require_real_source_and_replay_assertions(self) -> None:
         audit = load("debz_arm_less_activation_policy", "security-audit.py")
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}

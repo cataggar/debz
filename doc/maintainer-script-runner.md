@@ -765,6 +765,18 @@ full reference completion. New disposable copies supply the original empty
 the original minimal callback and proves the unchanged 96-byte output against
 both the script and pinned dpkg.
 
+Shared protected staging generates the existing pinned dpkg identity receipt
+from the authenticated archive only after checking its metadata and all three
+extracted tool bindings; both architectures retain the unchanged mandatory
+`--verify-only` receipt check. Before cloning or mutating Python fixtures, the
+helper rejects setup-parent aliases and executes the actual signed source
+verifier through `test-real-snapshot-python3-source-protected`, checking its
+exclusive receipt. Fixture copies, truncations, chmods, alias replacements
+and captures use the shared descriptor-rooted no-follow primitives. Existing
+file mutations require owned single-link regular descriptors before truncation;
+staging and shadow negatives require exclusive fresh leaves. This changes no
+signed callback, root authority or native `/dev/null` guard.
+
 All six positive before/after roots and twelve negative roots are mandatory
 coordinates for `zig build test-real-snapshot-python3-protected`. The target
 forces its environment even when options are missing, so the optional unit

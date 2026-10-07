@@ -268,7 +268,7 @@ PY
 install -d -o root -g root -m 0755 "$dpkg_prefix"
 dpkg-deb --extract "$workspace/build/dpkg.deb" "$dpkg_prefix"
 python3 -I - "$repository_root/tools/prepare-native-dpkg.py" "$architecture" \
-  "$dpkg_prefix/usr/bin/dpkg" <<'PY'
+  "$dpkg_prefix/usr/bin/dpkg" "$workspace/build/dpkg.deb" <<'PY'
 import importlib.util
 import pathlib
 import sys
@@ -277,7 +277,11 @@ spec = importlib.util.spec_from_file_location("prepare_native_dpkg", sys.argv[1]
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module.verify_file(pathlib.Path(sys.argv[3]), module.PINS[sys.argv[2]]["executable"])
+module.receipt_from_extracted_archive(
+    sys.argv[2], pathlib.Path(sys.argv[4]), pathlib.Path(sys.argv[3]).parents[2])
 PY
+python3 -B "$repository_root/tools/prepare-native-dpkg.py" \
+  --architecture "$architecture" --verify-only "$dpkg_prefix/usr/bin/dpkg"
 for helper in dpkg-deb dpkg-split; do
   install -o root -g root -m 0755 "$dpkg_prefix/usr/bin/$helper" "$template/usr/bin/$helper"
 done
