@@ -200,6 +200,14 @@ acquisition. Potential-component observation remains conservative: an ineligible
 potential component cannot become v4 authority; a signed-only solve still uses
 v3 without claiming component authority. Owned work, orphan evidence and changed
 captured facts refuse, rather than being recaptured as a new baseline.
+Missing or caller-nonwritable baseline exclusions are retained as an unavailable
+authority refusal while authenticated resolution remains non-publishing. A solve
+requiring v4 returns that refusal before any later baseline capture or persistent
+work; it never repairs/reacquires the exclusions or recaptures around them.
+If the signed resolution needs no installed-only baseline, historical archive-only
+v3 download proceeds without creating or requiring those locks. Partial baseline
+lock acquisitions are released before resolution. Other lock failures, unsafe
+metadata, Root drift and owned-work checks are not relaxed.
 
 Fresh v4 download with `signed_sha256_derived_sha512` currently refuses with
 `InstalledBaselineImplicitBindingUnsupported` before persistent cache, lock

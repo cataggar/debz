@@ -1499,15 +1499,20 @@ pub const Backend = struct {
                     solver_policy_digest,
                     self.io,
                     installed.source,
+                    download_baseline.capture_error,
                 ) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        else => return api.failure(
-                            request.operation,
-                            .planning,
-                            .planning_failed,
-                            try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
-                        ),
+                        else => {
+                            if (download_baseline.capture_error) |refusal| if (refusal == err)
+                                return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                            return api.failure(
+                                request.operation,
+                                .planning,
+                                .planning_failed,
+                                try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
+                            );
+                        },
                     };
                 if (self.transaction_backend == .native and mode == .download_only and
                     generated_lock.?.baselineEvidence() != null and !fresh_download)
@@ -5532,12 +5537,19 @@ const BaselinePublicationLocks = struct {
         }
     }
 
-    fn deinit(self: *BaselinePublicationLocks) void {
+    fn releaseHeld(self: *BaselinePublicationLocks) void {
         var index = self.held.len;
         while (index != 0) {
             index -= 1;
-            if (self.held[index]) |token| self.backend.interface().release(token);
+            if (self.held[index]) |token| {
+                self.backend.interface().release(token);
+                self.held[index] = null;
+            }
         }
+    }
+
+    fn deinit(self: *BaselinePublicationLocks) void {
+        self.releaseHeld();
         if (self.root) |*root| root.close();
     }
 };
@@ -5603,12 +5615,20 @@ const NativeBaselineCacheGuard = struct {
         self.proof = try installed_baseline.capture(owned, io, root_path, architecture, status, packages.items);
         self.fresh = true;
         self.locks = .{ .allocator = allocator, .io = io };
-        try self.locks.?.acquire(.{
+        self.locks.?.acquire(.{
             .root_path = root_path,
             .architecture = architecture,
             .status_bytes = status,
             .wait_ms = wait_ms,
-        }, self.proof.?.evidence());
+        }, self.proof.?.evidence()) catch |err| switch (err) {
+            error.InstalledBaselinePublicationLockUnavailable, error.LockUnavailable => {
+                self.locks.?.releaseHeld();
+                self.capture_error = err;
+                try self.verify();
+                return;
+            },
+            else => return err,
+        };
         try self.verify();
         self.component = @import("installed_baseline_component.zig").capture(
             owned,
@@ -6007,6 +6027,7 @@ fn resolveProductLock(
     solver_policy_digest: [32]u8,
     io: std.Io,
     status_bytes: []const u8,
+    baseline_capture_error: ?anyerror,
 ) !ProductLock {
     var baseline_packages: std.ArrayList(installed_baseline.Package) = .empty;
     defer baseline_packages.deinit(allocator);
@@ -6023,6 +6044,7 @@ fn resolveProductLock(
         });
     }
     if (baseline_packages.items.len != 0) {
+        if (baseline_capture_error) |err| return err;
         if (request.options.status_path != null) return error.InstalledBaselineStatusOverrideUnsupported;
         const verified = try installed_baseline.capture(allocator, io, request.options.install_root, request.options.architecture, status_bytes, baseline_packages.items);
         defer verified.deinit();
@@ -9461,6 +9483,159 @@ test "production native baseline fresh download retains signed-only native v3 be
     defer lock.deinit();
     try std.testing.expect(lock == .native);
     try std.testing.expectEqualStrings(status, try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024)));
+}
+
+test "production native baseline fresh signed-only download needs neither missing nor nonwritable baseline locks" {
+    const Late = struct {
+        directory: std.Io.Dir,
+        repair: bool,
+        calls: usize = 0,
+        fn hit(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            if (self.repair) {
+                try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/" ++ root_operation.lock_path, .data = "" });
+                return;
+            }
+            var directory = try self.directory.openDir(std.testing.io, "root", .{});
+            defer directory.close(std.testing.io);
+            const root = root_fs.Root.init(std.testing.io, directory);
+            var backend: root_operation.SystemLockBackend = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+            const token = try backend.interface().acquire(.{
+                .rank = .root_operation,
+                .root = root,
+                .identity = .{ .install_root_sha256 = @splat(0), .inode = (try root.rootEntry()).inode },
+                .path = root_operation.lock_path,
+                .wait_ms = 0,
+                .cancellation = transaction_executor.Cancellation.never(),
+                .create_if_missing = false,
+            });
+            backend.interface().release(token);
+        }
+    };
+    for ([_]enum { missing, nonwritable, late_repair }{ .missing, .nonwritable, .late_repair }) |scenario| {
+        if (scenario == .nonwritable and (@import("builtin").os.tag != .linux or std.os.linux.getuid() == 0))
+            continue;
+        for ([_]bool{ false, true }) |needs_baseline| {
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            var fixture = try nativeBaselineFixture(allocator, &directory);
+            defer fixture.deinit();
+            const status = if (needs_baseline) installed_only_status else "Package: alpha\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = status });
+            if (scenario == .missing or scenario == .late_repair) {
+                try directory.dir.deleteFile(std.testing.io, "root/" ++ root_operation.lock_path);
+                if (scenario == .missing) {
+                    try directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/lock-frontend");
+                    try directory.dir.deleteFile(std.testing.io, "root/var/lib/dpkg/lock");
+                }
+            } else {
+                var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+                defer root.close();
+                for ([_][]const u8{ "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path|
+                    try root.root.applyMetadata(try root_fs.Path.init(path), .{ .mode = 0o444 });
+                try std.testing.expectError(error.AccessDenied, directory.dir.openFile(std.testing.io, "root/var/lib/dpkg/lock-frontend", .{ .mode = .read_write }));
+                try std.testing.expectError(error.AccessDenied, directory.dir.openFile(std.testing.io, "root/var/lib/dpkg/lock", .{ .mode = .read_write }));
+            }
+            if (needs_baseline) try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+            var injected: Late = .{ .directory = directory.dir, .repair = scenario == .late_repair };
+            var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+            if (scenario == .late_repair or scenario == .nonwritable)
+                backend.planning_sync = .{ .context = &injected, .hitFn = Late.hit };
+            var options = fixture.options();
+            options.lock_output_path = fixture.lock_path;
+            const result = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "beta" }}, .options = options });
+            if (needs_baseline) {
+                try std.testing.expectEqual(
+                    if (scenario == .nonwritable) api.ErrorId.root_operation_conflict else api.ErrorId.lock_verification_failed,
+                    result.diagnostics[0].id,
+                );
+                if (scenario != .nonwritable) try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "InstalledBaselinePublicationLockUnavailable") != null);
+                try std.testing.expect(!result.changed and result.native_download == null);
+                try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+                try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
+            } else {
+                try expectBaselineWorkflowSuccess(result);
+                try std.testing.expectEqual(@as(u32, 1), result.api_version);
+                try std.testing.expect(!result.changed and result.native_download == null);
+                var lock = try readProductLock(allocator, std.testing.io, fixture.lock_path, .native);
+                defer lock.deinit();
+                try std.testing.expect(lock == .native);
+                var cache_root = try openAbsoluteDirectory(std.testing.io, fixture.cache_path);
+                defer cache_root.close(std.testing.io);
+                var cache = try package_acquisition.Cache.initFromDir(std.testing.io, cache_root, .{ .maximum_object_bytes = 1024 * 1024 });
+                defer cache.deinit();
+                const beta = lock.nativeLock().?.findPackage("beta", "1.0", "amd64").?;
+                const cached = try cache.lookup(allocator, beta.archive_identity, beta.declared_size, .verify_all_supported);
+                defer allocator.free(cached);
+                try std.testing.expectEqualStrings(@embedFile("fixtures/native_baseline/beta.deb"), cached);
+            }
+            if (scenario == .missing) for ([_][]const u8{ root_operation.lock_path, "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path| {
+                try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, try std.fmt.allocPrint(allocator, "root/{s}", .{path}), .{}));
+            };
+            if (scenario == .nonwritable) {
+                var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+                defer root.close();
+                for ([_][]const u8{ "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" }) |path|
+                    try std.testing.expectEqual(@as(u32, 0o444), (try root.root.entry(try root_fs.Path.init(path))).mode & 0o777);
+            }
+            if (scenario != .missing) try std.testing.expectEqual(@as(usize, 1), injected.calls);
+            try std.testing.expectEqualStrings(status, try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024)));
+            try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{}));
+        }
+    }
+}
+
+test "production native baseline fresh lock refusal cannot bypass signed-only drift or owned intent checks" {
+    const Drift = struct {
+        directory: std.Io.Dir,
+        intent: bool,
+        fn hit(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.intent) {
+                try self.directory.createDirPath(std.testing.io, "root/" ++ comptime std.fs.path.dirname(native_recovery.intent_path).?);
+                try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/" ++ native_recovery.intent_path, .data = "{}\n" });
+            } else {
+                try self.directory.writeFile(std.testing.io, .{
+                    .sub_path = "root/var/lib/dpkg/status",
+                    .data = "Package: alpha\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n\n",
+                });
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |intent| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        try directory.dir.writeFile(std.testing.io, .{
+            .sub_path = "root/var/lib/dpkg/status",
+            .data = "Package: alpha\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n",
+        });
+        try directory.dir.deleteFile(std.testing.io, "root/" ++ root_operation.lock_path);
+        try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+        var injected: Drift = .{ .directory = directory.dir, .intent = intent };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .transaction_backend = .native,
+            .now_unix = 1_788_796_860,
+            .planning_sync = .{ .context = &injected, .hitFn = Drift.hit },
+        };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "beta" }}, .options = options });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ root_operation.lock_path, .{}));
+        if (intent) try directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{});
+    }
 }
 
 test "production native baseline fresh derived identity refuses before persistent cache lock output or archive acquisition" {
