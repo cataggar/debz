@@ -761,6 +761,7 @@ pub fn build(b: *std.Build) void {
             "native_authorization.test.",
             "native_program.test.",
             "native_preparation.test.",
+            "installed_baseline_component.test.",
             "transaction_engine.test.",
         },
     });
@@ -781,6 +782,12 @@ pub fn build(b: *std.Build) void {
     );
     native_program_step.dependOn(&run_native_program_tests.step);
     native_program_step.dependOn(&run_native_program_corpus_tests.step);
+    const native_baseline_tests = b.addTest(.{
+        .root_module = production_backend_tests.root_module,
+        .filters = &.{ "production native baseline", "production workflow external native fixture" },
+    });
+    b.step("test-native-baseline", "Run genuine signed native installed-baseline workflows in owned roots")
+        .dependOn(&b.addRunArtifact(native_baseline_tests).step);
     workload_native.dependOn(&run_native_program_corpus_tests.step);
 
     const root_operation_tests = b.addTest(.{
@@ -2166,6 +2173,7 @@ fn installReleaseFiles(
         "zvmi-package-family.md",
     };
     const schemas = [_][]const u8{
+        "active-repository-config-v1.json",
         "apt-config-snapshot-v1.json",
         "apt-config-snapshot-v2.json",
         "apt-system-cli-diagnostic-v1.json",
@@ -2180,6 +2188,7 @@ fn installReleaseFiles(
         "exact-closure-lock-v2.json",
         "exact-closure-lock-v3.json",
         "exact-closure-lock-v4.json",
+        "installed-baseline-component-v1.json",
         "legacy-capability-evidence-v1.json",
         "legacy-compatibility-policy-v1.json",
         "native-execution-intent-v1.json",
@@ -2192,6 +2201,7 @@ fn installReleaseFiles(
         "native-execution-request-v2.json",
         "native-execution-request-v3.json",
         "native-execution-request-v4.json",
+        "native-installed-baseline-noop-v1.json",
         "native-managed-state-v1.json",
         "native-repository-unchanged-v1.json",
         "native-diversion-cache-v1.json",
@@ -2200,8 +2210,10 @@ fn installReleaseFiles(
         "native-script-outcome-v1.json",
         "native-transaction-authorization-v1.json",
         "native-transaction-authorization-v2.json",
+        "native-transaction-authorization-v3.json",
         "native-transaction-program-v1.json",
         "native-transaction-program-v2.json",
+        "native-transaction-program-v3.json",
         "native-transaction-provenance-v1.json",
         "native-transaction-provenance-v2.json",
         "native-trigger-events-v1.json",

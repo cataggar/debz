@@ -243,6 +243,7 @@ pub const Backend = struct {
     /// (#261). There is deliberately no CLI override; repositories that publish
     /// only signed SHA256 opt into a derived SHA-512 binding per repository.
     native_archive_digest_policy: exact_lock_v3.ArchiveDigestPolicy = .sha512_identity_required,
+    native_test_mechanics: if (@import("builtin").is_test) native_runtime.ExternalMechanics else void = if (@import("builtin").is_test) .{} else {},
 
     pub fn interface(self: *Backend) api.Backend {
         return .{ .context = self, .executeFn = executeOpaque };
@@ -1304,10 +1305,17 @@ pub const Backend = struct {
                 return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline requires the selected root's actual package database");
             baseline_proof = installed_baseline.verify(allocator, self.io, request.options.install_root, request.options.architecture, installed.source, evidence) catch |err| switch (err) {
                 error.OutOfMemory => return err,
+                error.InstalledBaselineChanged => if (self.transaction_backend == .native and mode == .execute and guard.active() != null)
+                    native_runtime.verifyRetainedBaseline(allocator, guard.active().?, &value.installed_baseline, installed.source, null) catch |completion_error| switch (completion_error) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "installed baseline completed prestate refused: {s}", .{@errorName(completion_error)})),
+                    }
+                else
+                    return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline prestate refused: InstalledBaselineChanged"),
                 else => return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "installed baseline prestate refused: {s}", .{@errorName(err)})),
             };
-            if (mode != .plan_only)
-                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: v4 baseline authority is planning-only; archive-only execution/recovery cannot consume retained local state");
+            if (mode != .plan_only and !(self.transaction_backend == .native and mode == .execute))
+                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: this entrypoint cannot consume v4 retained local state; typed native no-op execution is required");
         };
         const legacy_lock = if (lock) |*value| value.legacyLock() else null;
         const native_lock = if (lock) |*value| value.planningLockV3() else null;
@@ -1433,8 +1441,8 @@ pub const Backend = struct {
                 }
             }
             const output = if (lock) |*value| value else &generated_lock.?;
-            if (output.baselineEvidence() != null and mode != .plan_only)
-                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: v4 baseline lock resolution is planning-only");
+            if (output.baselineEvidence() != null and mode != .plan_only and !(self.transaction_backend == .native and mode == .execute))
+                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: this entrypoint cannot resolve executable v4 baseline authority");
             output.write(allocator, self.io, path, .{
                 .root_path = request.options.install_root,
                 .architecture = request.options.architecture,
@@ -1457,7 +1465,11 @@ pub const Backend = struct {
         // means a resumed attempt can prove which plan it was reserved for.
         if (try guard.preflight(allocator, request.operation, .{
             .plan_sha256 = transaction_executor.planDigest(plan.*),
-            .exact_lock = if (legacy_lock) |value| .{
+            .exact_lock = if (lock != null and lock.?.baselineEvidence() != null) .{
+                .schema = exact_lock_v4.schema_id,
+                .version = exact_lock_v4.schema_version,
+                .digest_sha256 = try lock.?.documentDigest(allocator),
+            } else if (legacy_lock) |value| .{
                 .schema = exact_lock.schema_id,
                 .version = exact_lock.schema_version,
                 .digest_sha256 = value.digest_sha256,
@@ -1468,6 +1480,13 @@ pub const Backend = struct {
             } else null,
         })) |failure| return failure;
 
+        const baseline_preparation: ?@import("native_baseline_contract.zig").Contract = if (lock != null and lock.?.baselineEvidence() != null and self.transaction_backend == .native)
+            (native_runtime.captureBaselinePreparation(allocator, guard.active().?, &lock.?.installed_baseline, installed.source) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "InstalledBaselineExecutionUnsupported: native baseline preparation refused: {s}", .{@errorName(err)}));
+            }).contract
+        else
+            null;
         var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
             .maximum_object_bytes = 1024 * 1024 * 1024,
         });
@@ -1591,22 +1610,29 @@ pub const Backend = struct {
         const executor_policy = try executionPolicy(allocator, effective_request);
         if (self.transaction_backend == .native) {
             const install_evidence: ?api.NativeInstallEvidence = if (request.operation == .install) .{
-                .lock_sha256 = (native_lock orelse return error.NativeExactLockRequired).digest_sha256,
+                .lock_sha256 = if (lock != null and lock.?.baselineEvidence() != null) try lock.?.documentDigest(allocator) else (native_lock orelse return error.NativeExactLockRequired).digest_sha256,
                 .caller_request_sha256 = guard.active().?.record().request_sha256,
                 .caller_policy_sha256 = guard.active().?.record().policy_sha256,
-                .package_count = native_lock.?.packages.len,
+                .package_count = native_lock.?.packages.len + if (lock) |value| if (value.baselineEvidence()) |baseline| baseline.packages.len else @as(usize, 0) else @as(usize, 0),
             } else null;
             const archives = try allocator.alloc([]const u8, verified.items.len);
             defer allocator.free(archives);
             for (verified.items, archives) |package, *bytes| bytes.* = package.bytes;
-            var preparation = try native_runtime.prepare(self.nativeRuntimeAllocator(allocator), .{
+            var preparation = native_runtime.prepare(self.nativeRuntimeAllocator(allocator), .{
                 .attempt = guard.active().?,
                 .plan = plan,
                 .exact_lock = native_lock orelse return error.NativeExactLockRequired,
+                .baseline_lock = if (lock) |*value| if (value.* == .installed_baseline) &value.installed_baseline else null else null,
+                .baseline_preparation = if (baseline_preparation) |*value| value else null,
                 .archives = archives,
                 .policy = executor_policy,
                 .archive_digest_policy = self.native_archive_digest_policy,
-            });
+            }) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                if (lock != null and lock.?.baselineEvidence() != null)
+                    return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "InstalledBaselineExecutionUnsupported: native baseline preparation refused: {s}", .{@errorName(err)}));
+                return err;
+            };
             defer preparation.deinit();
             const prepared = switch (preparation) {
                 .unchanged => {
@@ -1630,11 +1656,13 @@ pub const Backend = struct {
                 .prepared = prepared,
                 .archives = archives,
                 .operation = if (plan.actions.len == 0) .process_triggers else nativeOperation(request.operation),
+                .external_mechanics = if (@import("builtin").is_test) self.native_test_mechanics else .{},
             });
             defer report.deinit();
             var result = try self.finishNative(allocator, request, guard, report, install_evidence);
             if (result.exit_status == .success) {
                 result.items = planned.items;
+                if (baseline_preparation != null and plan.actions.len == 0) result.changed = false;
             }
             return result;
         }
@@ -5370,6 +5398,15 @@ const ProductLock = union(enum) {
         };
     }
 
+    fn documentDigest(self: *const ProductLock, allocator: std.mem.Allocator) ![32]u8 {
+        if (self.* != .installed_baseline) return error.InvalidInstalledBaseline;
+        const bytes = try self.installed_baseline.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return digest;
+    }
+
     fn requestDigest(self: ProductLock) [32]u8 {
         return switch (self) {
             .installed_baseline => |owned| owned.archive_lock.lock.request_sha256,
@@ -6149,6 +6186,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         projected: bool = false,
         withhold_projection: bool = false,
         completion_crash: ?CompletionPoint = null,
+        root_mutation_crash: ?@import("root_mutation.zig").Boundary = null,
         owner_evidence: ?[]const u8 = null,
         review_evidence: ?[]const u8 = null,
         prepare_acknowledged_review: ?struct {
@@ -6360,6 +6398,7 @@ fn runExternalNativeWorkflow(request_path: []const u8, projection: ?*const live_
         .now_unix = 1_788_796_860,
         .completion_crash = .{ .context = &crash, .hitFn = Crash.hit },
         .process_runner = .{ .context = &crash, .runFn = Crash.rejectLegacy },
+        .native_test_mechanics = .{ .mutation_crash = external.root_mutation_crash },
     };
     if (external.archive_digest_policy) |policy| backend.native_archive_digest_policy = policy;
     var requested = external.workflow;
@@ -8223,13 +8262,276 @@ test "production native-only rehearsal refuses new legacy locks and results befo
 const installed_only_status =
     "Package: private-baseline\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
 
+fn nativeBaselineFixture(allocator: std.mem.Allocator, directory: *std.testing.TmpDir) !ProductionWorkflowFixture {
+    var fixture = try ProductionWorkflowFixture.initWithRepository(
+        allocator,
+        directory,
+        installed_only_status,
+        @embedFile("fixtures/native_baseline/InRelease"),
+        @embedFile("fixtures/native_baseline/Packages"),
+        @embedFile("fixtures/native_baseline/keyring.gpg"),
+    );
+    errdefer fixture.deinit();
+    try prepareBaselinePublicationLocks(directory);
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/triggers");
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/updates");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/" ++ @import("package_database.zig").info_format_name, .data = @import("package_database.zig").supported_info_format ++ "\n" });
+    try directory.dir.createDirPath(std.testing.io, "root/usr/share");
+    try directory.dir.createDirPath(std.testing.io, "root/usr/bin");
+    const trigger_target = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "/usr/bin/dpkg-trigger", allocator, .limited(4 * 1024 * 1024));
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/usr/bin/dpkg-trigger", .data = trigger_target });
+    try directory.dir.createDirPath(std.testing.io, "repo/pool");
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share\n/usr/share/private-baseline\n" });
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/usr/share/private-baseline", .data = "retained private payload\n" });
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/pool/alpha_1.0_amd64.deb", .data = @embedFile("fixtures/native_baseline/alpha.deb") });
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/pool/beta_1.0_amd64.deb", .data = @embedFile("fixtures/native_baseline/beta.deb") });
+    return fixture;
+}
+
+fn expectBaselineWorkflowSuccess(result: api.Result) !void {
+    if (result.exit_status != .success) for (result.diagnostics) |diagnostic|
+        std.debug.print("native baseline workflow refused: {s}: {s}\n", .{ @tagName(diagnostic.id), diagnostic.message });
+    try std.testing.expectEqual(api.ExitStatus.success, result.exit_status);
+}
+
+test "production native baseline signed batch receipt zero-op replay and owned process crash" {
+    if (std.c.getenv("DEBZ_NATIVE_WORKFLOW_REQUEST") != null) return error.SkipZigTest;
+    if (@import("builtin").os.tag != .linux or std.os.linux.getuid() != 0) return error.SkipZigTest;
+    for ([_]enum { batch, mutation_crash, mutation_crash_drift, crash, crash_drift, crash_trigger, empty }{ .batch, .mutation_crash, .mutation_crash_drift, .crash, .crash_drift, .crash_trigger, .empty }) |scenario| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+        const selectors: []const solver.PackageSelector = if (scenario == .empty)
+            &.{}
+        else
+            &.{ .{ .name = "alpha" }, .{ .name = "beta" } };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const operation: WorkflowSemanticOperation = if (scenario == .empty) .upgrade_all else .install;
+        try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{ .operation = operation, .mode = .plan_only, .selectors = selectors, .options = options }));
+        var lock = try readProductLock(allocator, std.testing.io, fixture.lock_path, .native);
+        defer lock.deinit();
+        try std.testing.expect(lock == .installed_baseline);
+        try std.testing.expect(lock.planningLockV3().?.findIdentity("private-baseline", "amd64") == null);
+        try std.testing.expectEqual(@as(usize, if (scenario == .empty) 0 else 2), lock.planningLockV3().?.packages.len);
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.conffile = .keep_existing;
+        var workflow: WorkflowRequest = .{ .operation = operation, .mode = .execute, .selectors = selectors, .options = options };
+        const mutation_crashed = scenario == .mutation_crash or scenario == .mutation_crash_drift;
+        const crashed = mutation_crashed or scenario == .crash or scenario == .crash_drift or scenario == .crash_trigger;
+        if (crashed) {
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/.debz-native-disposable", .data = "debz native materialization fixture v1\n" });
+            const request_path = try std.fmt.allocPrint(allocator, "{s}/crash-request.json", .{std.fs.path.dirname(fixture.install_root).?});
+            const report_path = try std.fmt.allocPrint(allocator, "{s}/crash-report.json", .{std.fs.path.dirname(fixture.install_root).?});
+            const request_bytes = try std.json.Stringify.valueAlloc(allocator, .{
+                .workflow = workflow,
+                .report = report_path,
+                .completion_crash = if (mutation_crashed) @as(?CompletionPoint, null) else CompletionPoint.after_native_receipt,
+                .root_mutation_crash = if (mutation_crashed) @import("root_mutation.zig").Boundary.parent_sync else @as(?@import("root_mutation.zig").Boundary, null),
+            }, .{});
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "crash-request.json", .data = request_bytes });
+            var environment = std.process.Environ.Map.init(allocator);
+            defer environment.deinit();
+            try environment.put("DEBZ_NATIVE_WORKFLOW_REQUEST", request_path);
+            const child = try std.process.run(allocator, std.testing.io, .{
+                .argv = &.{"/proc/self/exe"},
+                .environ_map = &environment,
+                .stdout_limit = .limited(64 * 1024),
+                .stderr_limit = .limited(64 * 1024),
+                .timeout = .{ .duration = .{ .raw = .fromSeconds(120), .clock = .awake } },
+            });
+            if (child.term != .exited or child.term.exited != native_recovery.crash_exit_code)
+                std.debug.print("baseline crash child: {any}\n{s}\n{s}\n", .{ child.term, child.stdout, child.stderr });
+            try std.testing.expect(child.term == .exited);
+            try std.testing.expectEqual(native_recovery.crash_exit_code, child.term.exited);
+            try std.testing.expect((try backendRootRecord(allocator, &directory)) != null);
+            try directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{});
+            if (mutation_crashed) {
+                try directory.dir.access(std.testing.io, "root/usr/share/alpha", .{});
+                try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/usr/share/beta", .{}));
+            }
+            try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/InRelease");
+            try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/main/binary-amd64/Packages");
+            try directory.dir.deleteFile(std.testing.io, "repo/pool/alpha_1.0_amd64.deb");
+            try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+            workflow.mode = .recover;
+            workflow.options = .{
+                .install_root = fixture.install_root,
+                .cache_path = fixture.cache_path,
+                .state_path = fixture.state_path,
+                .architecture = "amd64",
+                .assume_yes = true,
+                .conffile = .keep_existing,
+            };
+            if (scenario == .crash_drift or scenario == .mutation_crash_drift)
+                try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/usr/share/private-baseline", .data = "changed after the owned checkpoint\n" })
+            else if (scenario == .crash_trigger)
+                try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/triggers/Unincorp", .data = "foreign-trigger private-baseline\n" });
+        }
+        if (scenario == .crash_drift or scenario == .mutation_crash_drift or scenario == .crash_trigger) {
+            var before = (try backendRootRecord(allocator, &directory)) orelse return error.RootOperationMissing;
+            defer before.deinit();
+            const refused = try backend.executeWorkflow(allocator, workflow);
+            try std.testing.expect(refused.exit_status != .success);
+            var retained = (try backendRootRecord(allocator, &directory)) orelse return error.RootOperationMissing;
+            defer retained.deinit();
+            try std.testing.expectEqualSlices(u8, &before.record.attempt_id, &retained.record.attempt_id);
+            try directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{});
+            try directory.dir.access(std.testing.io, "root/usr/share/alpha", .{});
+            if (mutation_crashed)
+                try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/usr/share/beta", .{}))
+            else
+                try directory.dir.access(std.testing.io, "root/usr/share/beta", .{});
+            continue;
+        }
+        const executed = try backend.executeWorkflow(allocator, workflow);
+        try expectBaselineWorkflowSuccess(executed);
+        if (crashed) {
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/dists/stable/InRelease", .data = @embedFile("fixtures/native_baseline/InRelease") });
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/dists/stable/main/binary-amd64/Packages", .data = @embedFile("fixtures/native_baseline/Packages") });
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/pool/alpha_1.0_amd64.deb", .data = @embedFile("fixtures/native_baseline/alpha.deb") });
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/pool/beta_1.0_amd64.deb", .data = @embedFile("fixtures/native_baseline/beta.deb") });
+        }
+        try std.testing.expectEqual(scenario != .empty, executed.changed);
+        var root_directory = try directory.dir.openDir(std.testing.io, "root", .{});
+        defer root_directory.close(std.testing.io);
+        const root = root_fs.Root.init(std.testing.io, root_directory);
+        var receipt = (try native_provenance.read(allocator, root)) orelse return error.NativeReceiptRequired;
+        defer receipt.deinit();
+        try std.testing.expectEqual(native_provenance.FinalStateKind.package_database_closure_with_baseline_noop_v1, receipt.document.final_state_kind);
+        try std.testing.expectEqual(@as(u32, 3), receipt.document.authority.?.program_version);
+        try native_provenance.verifyEvidence(allocator, root, receipt.document);
+        var program_found = false;
+        for (receipt.document.evidence_files) |file| {
+            if (file.kind != .program) continue;
+            const bytes = try root.readFileAlloc(allocator, try root_fs.Path.init(file.path), @import("native_program.zig").maximum_document_bytes);
+            var program = try @import("native_program.zig").decode(allocator, bytes, @import("native_program.zig").maximum_document_bytes);
+            defer program.deinit();
+            try std.testing.expectEqual(@as(u32, 3), program.program.version);
+            try std.testing.expectEqual(@as(usize, 1), program.program.baseline.?.component.components.len);
+            try std.testing.expectEqualStrings("private-baseline", program.program.baseline.?.component.components[0].package.name);
+            try program.program.baseline.?.verify(allocator, root);
+            program_found = true;
+        }
+        try std.testing.expect(program_found);
+        if (scenario != .empty) {
+            try directory.dir.access(std.testing.io, "root/usr/share/alpha", .{});
+            try directory.dir.access(std.testing.io, "root/usr/share/beta", .{});
+        }
+        workflow.mode = .execute;
+        workflow.options = options;
+        const replay = try backend.executeWorkflow(allocator, workflow);
+        try expectBaselineWorkflowSuccess(replay);
+        try std.testing.expect(!replay.changed);
+        var replay_receipt = (try native_provenance.read(allocator, root)) orelse return error.NativeReceiptRequired;
+        defer replay_receipt.deinit();
+        try std.testing.expectEqualSlices(u8, &receipt.document.digest_sha256, &replay_receipt.document.digest_sha256);
+        const payload = try directory.dir.readFileAlloc(std.testing.io, "root/usr/share/private-baseline", allocator, .limited(1024));
+        try std.testing.expectEqualStrings("retained private payload\n", payload);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{}));
+    }
+}
+
+test "production native baseline refuses settled same-version metadata ownership payload and root drift" {
+    if (std.c.getenv("DEBZ_NATIVE_WORKFLOW_REQUEST") != null or
+        @import("builtin").os.tag != .linux or std.os.linux.getuid() != 0) return error.SkipZigTest;
+    for ([_]enum { metadata, list, payload, foreign_root }{ .metadata, .list, .payload, .foreign_root }) |mutation| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+        const selectors = [_]solver.PackageSelector{ .{ .name = "alpha" }, .{ .name = "beta" } };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options }));
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.conffile = .keep_existing;
+        try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .execute, .selectors = &selectors, .options = options }));
+        switch (mutation) {
+            .metadata => {
+                const status = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024));
+                const changed = try std.mem.replaceOwned(u8, allocator, status, "Package: private-baseline\n", "Package: private-baseline\nDescription: changed same-version metadata\n");
+                try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = changed });
+            },
+            .list => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" }),
+            .payload => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/usr/share/private-baseline", .data = "changed same-version payload\n" }),
+            .foreign_root => {
+                try directory.dir.createDirPath(std.testing.io, "foreign/var/lib/dpkg");
+                try directory.dir.writeFile(std.testing.io, .{ .sub_path = "foreign/var/lib/dpkg/status", .data = installed_only_status });
+                options.install_root = try std.fmt.allocPrint(allocator, "{s}/foreign", .{std.fs.path.dirname(fixture.install_root).?});
+            },
+        }
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .execute, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expect(!refused.changed);
+        try directory.dir.access(std.testing.io, "root/usr/share/alpha", .{});
+        try directory.dir.access(std.testing.io, "root/usr/share/beta", .{});
+    }
+}
+
+test "production native baseline cannot grant archive bytes private callbacks or trigger activation" {
+    if (std.c.getenv("DEBZ_NATIVE_WORKFLOW_REQUEST") != null or
+        @import("builtin").os.tag != .linux or std.os.linux.getuid() != 0) return error.SkipZigTest;
+    for ([_]enum { archive, callback, config_callback, trigger }{ .archive, .callback, .config_callback, .trigger }) |mutation| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        if (mutation == .callback) {
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.postinst", .data = "#!/bin/sh\nprintf forbidden > /callback-executed\n" });
+            var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+            defer root.close();
+            try root.root.applyMetadata(try root_fs.Path.init("var/lib/dpkg/info/private-baseline.postinst"), .{ .mode = 0o755 });
+        } else if (mutation == .config_callback) {
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.config", .data = "#!/bin/sh\nprintf forbidden > /callback-executed\n" });
+            var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+            defer root.close();
+            try root.root.applyMetadata(try root_fs.Path.init("var/lib/dpkg/info/private-baseline.config"), .{ .mode = 0o755 });
+        } else if (mutation == .trigger)
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.triggers", .data = "interest-noawait private-trigger\n" });
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+        const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        try expectBaselineWorkflowSuccess(try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options }));
+        if (mutation == .archive)
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "repo/pool/alpha_1.0_amd64.deb", .data = "not the signed archive\n" });
+        options.lock_output_path = null;
+        options.lock_input_path = fixture.lock_path;
+        options.assume_yes = true;
+        options.conffile = .keep_existing;
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .execute, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(if (mutation == .archive) api.ErrorId.download_failed else api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expect(!refused.changed);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/usr/share/alpha", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/callback-executed", .{}));
+    }
+}
+
 fn prepareBaselinePublicationLocks(directory: *std.testing.TmpDir) !void {
     try directory.dir.createDirPath(std.testing.io, "root/" ++ root_operation.namespace_path);
     for ([_][]const u8{ "root/" ++ root_operation.lock_path, "root/var/lib/dpkg/lock-frontend", "root/var/lib/dpkg/lock" }) |path|
         try directory.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
 }
 
-test "production installed-only baseline joins a complete signed archive lock and remains non-executable" {
+test "production installed-only baseline joins a signed archive lock but refuses incomplete native preparation and legacy execution" {
     for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |kind| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();

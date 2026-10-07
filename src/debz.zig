@@ -625,6 +625,8 @@ test "native_unpack.test.public runtime keeps fixture adapters private" {
 }
 
 test {
+    _ = @import("installed_baseline_component.zig");
+    _ = @import("native_baseline_contract.zig");
     _ = deb_payload;
     _ = archive_application;
     _ = deb822;

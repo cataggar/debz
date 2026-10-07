@@ -55,12 +55,12 @@ identity. Local origins bind a typed artifact ID plus the complete archive and
 pinned content identities; v2/v3 plan serialization remains byte-for-byte
 unchanged.
 
-## Installed-only baseline: planning-only v4
+## Installed-only baseline: v4 planning and native no-op execution
 
 Product planning can retain a healthy installed package whose exact version
 and architecture are absent from authenticated repositories. Instead of
 inventing an archive origin or dropping the retained fact, it emits
-`exact-closure-lock-v4`. This is an explicitly **planning-only** envelope:
+`exact-closure-lock-v4`. The planning envelope separates two authorities:
 
 - `archive_lock_json` contains the exact canonical v3 JSON string. Its signed
   repository/index identities, freshness admission, archive digests, backend
@@ -97,7 +97,7 @@ inventing an archive origin or dropping the retained fact, it emits
   files or directories in the bound database as setup. OFD exclusion conflicts
   with ordinary dpkg POSIX locks. These cooperative locks do not freeze writes
   by an administrator bypassing the supported locking protocol, and the
-  resulting lock is still observation evidence, never execution authority.
+  resulting baseline is still observation evidence, never archive or action authority.
 
 The envelope checksum detects document substitution; it is **not** a
 repository signature, an archive digest, or proof of installed payload bytes.
@@ -105,12 +105,59 @@ Baseline tuples cannot authorize fetching/installing an archive, reinstall,
 remove, reconfigure, or a new package. Archive/baseline identities cannot
 overlap. V1/v2/v3 decoding and canonical bytes are unchanged.
 
-Execution, download execution, recovery, and package-cache fingerprint/prepare currently reject v4 with
-`lock_verification_failed` / `InstalledBaselineExecutionUnsupported`. They do
-not flatten it to an archive-only lock or replan around it. Versioned native
-preparation, final-state, receipt, and recovery contracts must represent this
-authority before execution can safely accept it. This bounded planning
-slice does not complete the simple SymCrypt install/auto-lock workflow.
+### Native execution boundary
+
+Explicit native execution can compose that envelope with
+[`native-installed-baseline-noop-v1`](../schema/native-installed-baseline-noop-v1.json)
+and [`installed-baseline-component-v1`](../schema/installed-baseline-component-v1.json).
+Under the actual held root, before archive acquisition, preparation verifies
+the original whole-database prestate and captures each baseline's exact status
+fields, control/ownership files and owned payload. Regular files and symlinks
+bind physical identity, uid/gid/mode, size, mtime/ctime and SHA512 bytes/target;
+hard links and unsafe or unmodeled observations refuse. Shared directories bind
+identity and uid/gid/mode but not membership or timestamp: authenticated new
+packages may add children without changing the directory itself. Observation
+is bounded to 100,000 files, 256 MiB and 16 million comparison work units.
+
+**Payload observation starts at native preparation, not v4 planning.** The
+original v4 database evidence does not freeze all payload bytes during the
+planning-to-preparation interval. Once prepared, the same component is checked
+again after acquisition, before each native action, at managed checkpoints,
+before final verification/receipt acknowledgment, and on resumed execution.
+Changed/missing control, status, ownership, payload or root facts refuse;
+the executor cannot recapture around interrupted or completed owned work.
+
+Authorization v3 and program v3 explicitly bind this component contract and
+the complete original v4 envelope. Archive authority remains the unchanged
+signed v3 closure with algorithm-tagged identities. The local component grants
+only retention: it cannot fetch, unpack, reinstall, upgrade, remove, configure,
+change version, or activate a handler. This bounded generation permits only
+authenticated **new installs**, with no baseline ownership conflicts or
+directory-metadata changes, no callbacks (including debconf `config`), and no
+pending/declared/unincorporated trigger work. Other cases refuse rather than
+fall back to another backend or broaden authorization.
+
+Request v4, intent v2, non-bootstrap progress v3 and provenance v2 carry the exact
+authorization-v3/program-v3/lock-v4 tuple. The final-state kind is
+`package_database_closure_with_baseline_noop_v1`. A zero-archive, zero-action
+operation still compiles this explicit proof and publishes a genuine receipt;
+unchanged replay retains that receipt. The initial whole-database digest is
+not reused after legitimate owned writes: the original immutable components,
+complete final database, managed payload and terminal owned checkpoint are
+verified separately. Only an exact matching successful retained receipt
+authorizes replay against that owned completed database generation.
+Bootstrap progress v4 is not admitted by this bounded baseline contract.
+
+Recovery consumes the persisted exact inputs, program and component under
+the original attempt. It neither requires replacement repository/archive
+locations nor replans around missing ones. Baseline or unknown trigger drift
+after a crash refuses acknowledgment and retains the active intent/ownership.
+
+Legacy execution, download execution and package-cache fingerprint/prepare
+still reject v4 with `InstalledBaselineExecutionUnsupported`; their contracts
+have not been implemented. Legacy remains the default. This native slice does
+not complete backend-neutral execution, SymCrypt short commands, durable
+auto-lock orchestration, or supported Noble amd64/arm64 live acceptance.
 
 **Signed SHA256 with a derived SHA512.** Some signed archives, including
 Debian stable, publish only SHA256 in both
@@ -435,8 +482,10 @@ Schemas:
 - [`schema/transaction-result-summary-v1.json`](../schema/transaction-result-summary-v1.json)
 - [`schema/native-transaction-authorization-v1.json`](../schema/native-transaction-authorization-v1.json)
 - [`schema/native-transaction-authorization-v2.json`](../schema/native-transaction-authorization-v2.json)
+- [`schema/native-transaction-authorization-v3.json`](../schema/native-transaction-authorization-v3.json)
 - [`schema/native-transaction-program-v1.json`](../schema/native-transaction-program-v1.json)
 - [`schema/native-transaction-program-v2.json`](../schema/native-transaction-program-v2.json)
+- [`schema/native-transaction-program-v3.json`](../schema/native-transaction-program-v3.json)
 - [`schema/native-transaction-provenance-v2.json`](../schema/native-transaction-provenance-v2.json)
 
 `debz transaction-result verify` is the no-follow read boundary used after an

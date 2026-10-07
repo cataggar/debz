@@ -2,12 +2,7 @@ const std = @import("std");
 const status = @import("dpkg_status.zig");
 const root_fs = @import("root_fs.zig");
 
-pub const Package = struct {
-    name: []const u8,
-    version: []const u8,
-    architecture: []const u8,
-    selection: status.Want,
-};
+pub const Package = @import("installed_baseline_component.zig").Package;
 
 pub const Identity = struct {
     algorithm: enum { sha512 } = .sha512,

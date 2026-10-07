@@ -61,6 +61,7 @@ GUARD_PATHS = {
     "src/native_authorization.zig",
     "src/exact_lock_v2.zig", "src/exact_lock_v3.zig",
     "src/exact_lock_v4.zig", "src/installed_baseline.zig",
+    "src/installed_baseline_component.zig", "src/native_baseline_contract.zig",
     "src/native_transaction_result.zig", "src/native_execution_request.zig",
     "src/native_program.zig", "src/maintainer_script.zig",
     "src/native_unpack.zig", "src/root_operation.zig",

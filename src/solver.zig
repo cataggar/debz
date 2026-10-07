@@ -2083,6 +2083,15 @@ fn preflightRequest(
 ) PlanningError!?PlanFailure {
     switch (input.request) {
         .install => |selectors| for (selectors) |selector| {
+            if (input.installed_baseline != null) if (input.exact_lock_v3) |lock| {
+                if (findInstalledSelector(context, selector)) |index| {
+                    const state = internal(context);
+                    const record = state.source_records[state.mappings[index].record_index];
+                    if (record.status.isFullyInstalled()) if (lock.findPackage(record.name.value, record.version.spelling.value, record.architecture.value)) |locked| {
+                        if (locked.origin == .authenticated_repository) continue;
+                    };
+                }
+            };
             if (selector.version != null or selector.architecture != null) {
                 const candidate = findAvailableCandidate(context, selector) orelse {
                     return (try selectorFailure(backing, arena, context, selector)).failure;
