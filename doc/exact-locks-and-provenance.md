@@ -180,10 +180,34 @@ with zero archive counts, never synthetic digests or repository authority.
 
 Native baseline download publishes command.v2 with typed
 [`native-baseline-download-v1`](../schema/native-baseline-download-v1.json)
-evidence and does not execute packages. It requires an existing exact v4 input
-lock. Fresh download-time v4 generation remains refused before archive binding
-and lock publication: it needs a separate pre-refresh root exclusion contract
-and belongs to the later durable auto-lock stage. Other commands retain command.v1.
+evidence and does not execute packages. An existing exact v4 input remains
+supported. Without an input lock, explicit native download can use the existing
+non-mutating planning policy to observe healthy installed/held packages, hold
+the existing root-operation/dpkg exclusions before repository refresh, and
+freeze their database and eligible component observations. It resolves the
+signed closure separately and binds only the retained installed-only subset
+into the generated v4 envelope. A requested lock output is durably published;
+without one, the complete canonical lock remains in the typed download evidence.
+This is not implicit execution adoption or durable auto-lock orchestration.
+
+Fresh refresh uses a non-publishing metadata view, revalidating existing cached
+objects or authenticating newly fetched metadata with the unchanged signature,
+freshness and index policies. Pending bytes/keys/records are conservatively
+bounded by the existing metadata object byte cap, applied to the whole pending
+refresh. Complete command.v2 admission and actual-root/component revalidation
+precede persistent cache creation/publication, lock output and package archive
+acquisition. Potential-component observation remains conservative: an ineligible
+potential component cannot become v4 authority; a signed-only solve still uses
+v3 without claiming component authority. Owned work, orphan evidence and changed
+captured facts refuse, rather than being recaptured as a new baseline.
+
+Fresh v4 download with `signed_sha256_derived_sha512` currently refuses with
+`InstalledBaselineImplicitBindingUnsupported` before persistent cache, lock
+output or archive acquisition. The existing derivation helper acquires archives
+before it constructs the final lock; this path needs a separately bounded
+pre-acquisition admission contract. Supply an already bound exact v4 lock for
+that repository policy. No fake derived digest or weaker native digest policy
+is used. Other commands and signed-only results retain command.v1.
 Legacy v4 execution/download/cache still refuse; legacy remains the default.
 This native slice does
 not complete backend-neutral execution, SymCrypt short commands, durable

@@ -1153,6 +1153,16 @@ pub const Backend = struct {
                         return api.failure(request.operation, .planning, .planning_failed, native_download_budget_message);
                     };
                 }
+            } else if (request.options.status_path == null) {
+                download_baseline.captureFresh(allocator, self.io, request.options.install_root, request.options.architecture, request.options.lock_wait_ms) catch |err|
+                    return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                if (download_baseline.proof != null) {
+                    download_baseline.requireDestination(request.options.cache_path) catch |err|
+                        return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                    if (request.options.lock_output_path) |path|
+                        download_baseline.requireDestination(std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath) catch |err|
+                            return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                }
             }
         }
         if (request.options.source_paths.len == 0 and request.options.config_paths.len == 0)
@@ -1252,12 +1262,22 @@ pub const Backend = struct {
                 return api.failure(request.operation, .usage, .configuration_required, "Signed-By path was not declared with --keyring");
         }
 
-        var cache_root = try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
-        defer cache_root.close(self.io);
-        if (download_baseline.proof) |proof| proof.requireOutputOutsideDatabase(root_fs.Root.init(self.io, cache_root)) catch |err|
+        const fresh_download = download_baseline.fresh;
+        var cache_root: ?std.Io.Dir = if (fresh_download)
+            openAbsoluteDirectory(self.io, request.options.cache_path) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            }
+        else
+            try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
+        defer if (cache_root) |directory| directory.close(self.io);
+        if (download_baseline.proof) |proof| if (cache_root) |directory| proof.requireOutputOutsideDatabase(root_fs.Root.init(self.io, directory)) catch |err|
             return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
         if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
-        var metadata = try metadata_cache.Cache.initFromDir(self.io, cache_root, .{});
+        var metadata = if (fresh_download)
+            try metadata_cache.Cache.initDeferred(allocator, self.io, cache_root, .{})
+        else
+            try metadata_cache.Cache.initFromDir(self.io, cache_root.?, .{});
         defer metadata.deinit();
         var acquisition = repository_acquisition.Production{ .io = self.io };
         const credential_bytes: ?[]u8 = if (request.options.credential_reference) |path|
@@ -1465,8 +1485,9 @@ pub const Backend = struct {
         if (self.planning_sync) |sync| try sync.hit();
         var generated_lock: ?ProductLock = null;
         defer if (generated_lock) |*value| value.deinit();
-        if (request.options.lock_output_path) |path| {
+        if (request.options.lock_output_path != null or fresh_download) {
             if (lock == null) {
+                if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
                 generated_lock = resolveProductLock(
                     self.transaction_backend,
                     allocator,
@@ -1488,8 +1509,46 @@ pub const Backend = struct {
                             try std.fmt.allocPrint(allocator, "authenticated plan could not produce a complete exact lock: {s}", .{@errorName(err)}),
                         ),
                     };
-                if (self.transaction_backend == .native and mode == .download_only and generated_lock.?.baselineEvidence() != null) {
-                    return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: native baseline download requires an existing exact v4 lock; implicit baseline generation requires a separate pre-refresh root exclusion contract");
+                if (self.transaction_backend == .native and mode == .download_only and
+                    generated_lock.?.baselineEvidence() != null and !fresh_download)
+                    return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: fresh baseline download requires the actual-root exclusion and component capture from before repository refresh");
+                if (fresh_download) {
+                    if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
+                    if (generated_lock.?.baselineEvidence() != null) {
+                        download_baseline.bindFresh(&generated_lock.?.installed_baseline) catch |err|
+                            return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                        requireNativeDownloadAdmission(
+                            allocator,
+                            request.operation,
+                            generated_lock.?.nativeLock().?,
+                            download_baseline.contract.?,
+                            planning_records,
+                        ) catch |err| {
+                            if (err == error.OutOfMemory) return err;
+                            if (err != error.DocumentTooLarge) return err;
+                            return api.failure(request.operation, .planning, .planning_failed, native_download_budget_message);
+                        };
+                        // Derivation acquires archives before producing the final
+                        // lock. It needs its own pre-acquisition encoded admission.
+                        for (generated_lock.?.nativeLock().?.repositories) |repository| {
+                            const configured = findNormalized(configuration.repositories, .{ .bytes = repository.id }) orelse return error.MissingRepository;
+                            if (configured.archive_binding == .signed_sha256_derived_sha512)
+                                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineImplicitBindingUnsupported: fresh native baseline download cannot derive archive identities before complete command admission; supply an exact v4 lock");
+                        }
+                        admitNativeLock(
+                            generated_lock.?.nativeLock().?,
+                            configuration.repositories,
+                            self.native_archive_digest_policy,
+                        ) catch |err|
+                            return api.failure(request.operation, .planning, .lock_verification_failed, nativeLockAdmissionMessage(err));
+                    }
+                    if (cache_root == null) cache_root = try openOrCreateAbsoluteDirectory(self.io, request.options.cache_path);
+                    if (download_baseline.proof) |proof| proof.requireOutputOutsideDatabase(root_fs.Root.init(self.io, cache_root.?)) catch |err|
+                        return NativeBaselineCacheGuard.failure(allocator, request.operation, err);
+                    if (try download_baseline.verifyProduct(allocator, request.operation)) |failure| return failure;
+                    var destination = try metadata_cache.Cache.initFromDir(self.io, cache_root.?, .{});
+                    defer destination.deinit();
+                    try metadata.commitDeferred(&destination);
                 }
                 if (generated_lock.?.nativeLock() != null) {
                     self.bindConfiguredArchiveIdentities(
@@ -1498,7 +1557,7 @@ pub const Backend = struct {
                         request,
                         configuration.repositories,
                         refreshed.universe.repositories,
-                        cache_root,
+                        cache_root.?,
                         acquisition.dependencies(),
                         credentials,
                     ) catch |err| switch (err) {
@@ -1525,7 +1584,7 @@ pub const Backend = struct {
             const output = if (lock) |*value| value else &generated_lock.?;
             if (output.baselineEvidence() != null and mode != .plan_only and !(self.transaction_backend == .native and (mode == .execute or mode == .download_only)))
                 return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: this entrypoint cannot resolve executable v4 baseline authority");
-            output.writeScoped(allocator, self.io, path, .{
+            if (request.options.lock_output_path) |path| output.writeScoped(allocator, self.io, path, .{
                 .root_path = request.options.install_root,
                 .architecture = request.options.architecture,
                 .status_bytes = installed.source,
@@ -1543,7 +1602,12 @@ pub const Backend = struct {
         if (mode == .plan_only) return planResult(allocator, request.operation, plan.*);
 
         if (self.transaction_backend == .native and mode == .download_only) {
-            const baseline_lock: ?*ProductLock = if (lock != null and lock.?.baselineEvidence() != null) &lock.? else null;
+            const baseline_lock: ?*ProductLock = if (lock != null and lock.?.baselineEvidence() != null)
+                &lock.?
+            else if (generated_lock != null and generated_lock.?.baselineEvidence() != null)
+                &generated_lock.?
+            else
+                null;
             if (baseline_lock) |value| {
                 if (download_baseline.contract) |contract| {
                     const bytes = try value.installed_baseline.canonicalJson(allocator);
@@ -1551,7 +1615,7 @@ pub const Backend = struct {
                     if (!std.mem.eql(u8, bytes, contract.planning_lock_json))
                         return api.failure(request.operation, .planning, .lock_verification_failed, "native baseline download lock changed during preparation");
                 } else return api.failure(request.operation, .planning, .lock_verification_failed, "native baseline download lock changed during preparation");
-                var download_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{ .maximum_object_bytes = 1024 * 1024 * 1024 });
+                var download_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root.?, .{ .maximum_object_bytes = 1024 * 1024 * 1024 });
                 defer download_cache.deinit();
                 const views = try cacheRepositoryViews(allocator, configuration.repositories, refreshed);
                 defer allocator.free(views);
@@ -1624,7 +1688,7 @@ pub const Backend = struct {
             }).contract
         else
             null;
-        var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root, .{
+        var package_cache = try package_acquisition.Cache.initFromDir(self.io, cache_root.?, .{
             .maximum_object_bytes = 1024 * 1024 * 1024,
         });
         defer package_cache.deinit();
@@ -5503,6 +5567,110 @@ const NativeBaselineCacheGuard = struct {
     lock: ?*const exact_lock_v4.OwnedLock = null,
     proof: ?*installed_baseline.Verified = null,
     contract: ?@import("native_baseline_contract.zig").Contract = null,
+    component: ?@import("installed_baseline_component.zig").Manifest = null,
+    capture_error: ?anyerror = null,
+    fresh: bool = false,
+
+    fn captureFresh(self: *NativeBaselineCacheGuard, allocator: std.mem.Allocator, io: std.Io, root_path: []const u8, architecture: []const u8, wait_ms: u64) !void {
+        var root = try root_fs.openAbsoluteRoot(io, root_path);
+        defer root.close();
+        self.arena = .init(allocator);
+        const owned = self.arena.?.allocator();
+        try requireInactiveRoot(owned, root.root);
+        for ([_][]const u8{ native_provenance.document_path, native_provenance.legacy_document_path }) |path|
+            if (try root.root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return error.RecoveryRequired;
+        const status = root.root.readFileAlloc(owned, try root_fs.Path.init("var/lib/dpkg/status"), 64 * 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        var parsed = switch (try dpkg_status.parseOwned(owned, status, .{})) {
+            .diagnostic => return error.InvalidInstalledBaseline,
+            .database => |value| value,
+        };
+        defer parsed.deinit();
+        var packages: std.ArrayList(installed_baseline.Package) = .empty;
+        for (parsed.database.packages) |package| {
+            if (!package.status.isFullyInstalled()) continue;
+            try packages.append(owned, .{
+                .name = package.name.value,
+                .version = package.version.spelling.value,
+                .architecture = package.architecture.value,
+                .selection = if (package.status.want == .hold) .hold else .install,
+            });
+        }
+        if (packages.items.len == 0) return;
+        self.proof = try installed_baseline.capture(owned, io, root_path, architecture, status, packages.items);
+        self.fresh = true;
+        self.locks = .{ .allocator = allocator, .io = io };
+        try self.locks.?.acquire(.{
+            .root_path = root_path,
+            .architecture = architecture,
+            .status_bytes = status,
+            .wait_ms = wait_ms,
+        }, self.proof.?.evidence());
+        try self.verify();
+        self.component = @import("installed_baseline_component.zig").capture(
+            owned,
+            self.locks.?.root.?.root,
+            architecture,
+            self.proof.?.evidence().packages,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // An authenticated solve may need no baseline at all. Retain the
+            // refusal, never turn an ineligible observation into v4 authority.
+            self.capture_error = err;
+            return;
+        };
+        try self.requireNoQueuedTriggers(owned);
+        try self.verify();
+    }
+
+    fn bindFresh(self: *NativeBaselineCacheGuard, lock: *const exact_lock_v4.OwnedLock) !void {
+        if (self.capture_error) |err| return err;
+        try self.verify();
+        const owned = self.arena.?.allocator();
+        const observed = self.component orelse return error.InvalidInstalledBaselineComponent;
+        const evidence = lock.evidence();
+        const initial = self.proof.?.evidence();
+        if (lock.backend() != .native or !std.mem.eql(u8, initial.database_identity.value, evidence.database_identity.value) or
+            !std.mem.eql(u8, initial.root_path, evidence.root_path))
+            return error.InstalledBaselineChanged;
+        var subset = observed;
+        const components = try owned.alloc(@import("installed_baseline_component.zig").Component, evidence.packages.len);
+        // Both the captured proof and the v4 envelope use canonical package
+        // order. A merge walk binds the subset without a package cross-product.
+        var index: usize = 0;
+        for (evidence.packages, components) |package, *component| {
+            while (index < observed.components.len) : (index += 1) {
+                const candidate = observed.components[index].package;
+                const name_order = std.mem.order(u8, candidate.name, package.name);
+                const order = if (name_order == .eq) std.mem.order(u8, candidate.architecture, package.architecture) else name_order;
+                if (order != .lt) break;
+            }
+            if (index == observed.components.len) return error.InstalledBaselineChanged;
+            const candidate = observed.components[index];
+            if (!std.mem.eql(u8, candidate.package.name, package.name) or
+                !std.mem.eql(u8, candidate.package.architecture, package.architecture) or
+                !std.mem.eql(u8, candidate.package.version, package.version) or
+                candidate.package.selection != package.selection)
+                return error.InstalledBaselineChanged;
+            component.* = candidate;
+        }
+        subset.components = components;
+        const bytes = try lock.canonicalJson(owned);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const contract: @import("native_baseline_contract.zig").Contract = .{
+            .planning_lock_json = bytes,
+            .planning_lock_sha256 = digest,
+            .archive_lock_sha256 = lock.archive_lock.lock.digest_sha256,
+            .component = subset,
+        };
+        try contract.validate(owned, &lock.archive_lock.lock);
+        self.lock = lock;
+        self.contract = contract;
+    }
 
     fn acquire(self: *NativeBaselineCacheGuard, allocator: std.mem.Allocator, io: std.Io, lock: *const exact_lock_v4.OwnedLock, architecture: []const u8, wait_ms: u64) !void {
         if (lock.backend() != .native) return error.InstalledBaselineExecutionUnsupported;
@@ -5522,6 +5690,11 @@ const NativeBaselineCacheGuard = struct {
         const status = try root.readFileAlloc(owned, try root_fs.Path.init("var/lib/dpkg/status"), 64 * 1024 * 1024);
         self.proof = try installed_baseline.verify(owned, io, evidence.root_path, architecture, status, evidence);
         self.contract = try @import("native_baseline_contract.zig").capture(owned, io, root, lock, status);
+        try self.requireNoQueuedTriggers(owned);
+    }
+
+    fn requireNoQueuedTriggers(self: *NativeBaselineCacheGuard, owned: std.mem.Allocator) !void {
+        const root = self.locks.?.root.?.root;
         const queue_path = try root_fs.Path.init("var/lib/dpkg/triggers/Unincorp");
         if (try root.entryIfExists(queue_path) != null) {
             const bytes = try root.readFileAlloc(owned, queue_path, @import("native_trigger.zig").maximum_queue_bytes);
@@ -5533,6 +5706,12 @@ const NativeBaselineCacheGuard = struct {
 
     fn requireInactive(self: *NativeBaselineCacheGuard, allocator: std.mem.Allocator) !void {
         const root = self.locks.?.root.?.root;
+        try requireInactiveRoot(allocator, root);
+    }
+
+    fn requireInactiveRoot(allocator: std.mem.Allocator, root: root_fs.Root) !void {
+        if (try root.entryIfExists(try root_fs.Path.init(root_operation.deferred_ack_path)) != null)
+            return error.RecoveryRequired;
         if (try root_operation.Store.init(root).read(allocator)) |value| {
             var record = value;
             defer record.deinit();
@@ -5543,17 +5722,25 @@ const NativeBaselineCacheGuard = struct {
     }
 
     fn verify(self: *NativeBaselineCacheGuard) !void {
-        const contract = self.contract orelse return;
+        if (self.proof == null) return;
         var temporary: std.heap.ArenaAllocator = .init(self.locks.?.allocator);
         defer temporary.deinit();
         const owned = temporary.allocator();
         const root = self.locks.?.root.?.root;
         try self.requireInactive(owned);
-        const evidence = self.lock.?.evidence();
+        if (self.fresh) for ([_][]const u8{ native_provenance.document_path, native_provenance.legacy_document_path }) |path| {
+            if (try root.entryIfExists(try root_fs.Path.init(path)) != null)
+                return error.RecoveryRequired;
+        };
+        const evidence = self.proof.?.evidence();
         const status = try root.readFileAlloc(owned, try root_fs.Path.init("var/lib/dpkg/status"), 64 * 1024 * 1024);
         const actual = try installed_baseline.verify(owned, root.io, evidence.root_path, evidence.native_architecture, status, evidence);
         defer actual.deinit();
-        try contract.verify(owned, root);
+        if (self.component) |component| {
+            try @import("installed_baseline_component.zig").verify(owned, root, component);
+            try self.requireNoQueuedTriggers(owned);
+            if (self.contract) |contract| try contract.validate(owned, &self.lock.?.archive_lock.lock);
+        } else if (self.contract) |contract| try contract.verify(owned, root);
     }
 
     fn verifyProduct(self: *NativeBaselineCacheGuard, allocator: std.mem.Allocator, operation: api.Operation) !?api.Result {
@@ -8746,22 +8933,24 @@ test "production native baseline command 12000 genuine payload facts refuse befo
     try directory.dir.deleteTree(std.testing.io, "cache");
     try directory.dir.deleteFile(std.testing.io, "repo/pool/alpha_1.0_amd64.deb");
     try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
-    var options = fixture.options();
-    options.lock_input_path = fixture.lock_path;
-    options.lock_output_path = fixture.second_lock_path;
-    const refused = try backend.executeWorkflow(allocator, .{
-        .operation = .install,
-        .mode = .download_only,
-        .selectors = &.{ .{ .name = "alpha" }, .{ .name = "beta" } },
-        .options = options,
-    });
-    try std.testing.expectEqual(api.ExitStatus.planning, refused.exit_status);
-    try std.testing.expectEqual(api.ErrorId.planning_failed, refused.diagnostics[0].id);
-    try std.testing.expectEqualStrings(native_download_budget_message, refused.diagnostics[0].message);
-    try std.testing.expect(!refused.changed and refused.native_download == null);
-    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
-    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.second_lock_path), .{}));
-    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{}));
+    for ([_]bool{ false, true }) |fresh| {
+        var options = fixture.options();
+        options.lock_input_path = if (fresh) null else fixture.lock_path;
+        options.lock_output_path = fixture.second_lock_path;
+        const refused = try backend.executeWorkflow(allocator, .{
+            .operation = .install,
+            .mode = .download_only,
+            .selectors = &.{ .{ .name = "alpha" }, .{ .name = "beta" } },
+            .options = options,
+        });
+        try std.testing.expectEqual(api.ExitStatus.planning, refused.exit_status);
+        try std.testing.expectEqual(api.ErrorId.planning_failed, refused.diagnostics[0].id);
+        try std.testing.expectEqualStrings(native_download_budget_message, refused.diagnostics[0].message);
+        try std.testing.expect(!refused.changed and refused.native_download == null);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.second_lock_path), .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{}));
+    }
 }
 
 test "production native baseline cache signed miss hit export restore download and empty archive provenance" {
@@ -9086,9 +9275,217 @@ test "production native baseline cold exact download acquires only signed archiv
         .selectors = &.{ .{ .name = "alpha" }, .{ .name = "beta" } },
         .options = options,
     });
-    try std.testing.expectEqual(api.ErrorId.lock_verification_failed, implicit.diagnostics[0].id);
-    try std.testing.expect(std.mem.indexOf(u8, implicit.diagnostics[0].message, "pre-refresh root exclusion") != null);
-    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.second_lock_path), .{}));
+    try expectBaselineWorkflowSuccess(implicit);
+    try std.testing.expectEqual(@as(usize, 2), implicit.native_download.?.reused_count);
+    const implicit_bytes = try readFile(allocator, std.testing.io, fixture.second_lock_path, exact_lock_v4.maximum_document_bytes);
+    try std.testing.expectEqualStrings(implicit_bytes, implicit.native_download.?.baseline_noop.planning_lock_json);
+}
+
+test "production native baseline fresh download captures v4 signed closure and reuses cache without a supplied lock" {
+    for ([_]bool{ false, true }) |empty| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        var request: WorkflowRequest = .{
+            .operation = if (empty) .upgrade_all else .install,
+            .mode = .download_only,
+            .selectors = if (empty) &.{} else &.{ .{ .name = "alpha" }, .{ .name = "beta" } },
+            .options = options,
+        };
+        const cold = try backend.executeWorkflow(allocator, request);
+        try expectBaselineWorkflowSuccess(cold);
+        const count: usize = if (empty) 0 else 2;
+        try std.testing.expectEqual(count, cold.native_download.?.downloaded_count);
+        try std.testing.expectEqual(@as(usize, 0), cold.native_download.?.reused_count);
+        try std.testing.expectEqual(@as(u32, 2), cold.api_version);
+        var decoded = try api.decodeResult(allocator, try cold.canonicalJson(allocator));
+        defer decoded.deinit();
+        var lock = try readProductLock(allocator, std.testing.io, fixture.lock_path, .native);
+        defer lock.deinit();
+        try std.testing.expectEqual(count, lock.nativeLock().?.packages.len);
+        try std.testing.expect(lock.nativeLock().?.findPackage("private-baseline", "1.0", "amd64") == null);
+        try std.testing.expectEqualStrings("private-baseline", lock.baselineEvidence().?.packages[0].name);
+        try std.testing.expectEqualStrings(try lock.installed_baseline.canonicalJson(allocator), cold.native_download.?.baseline_noop.planning_lock_json);
+        var prepared = try backend.packageCachePrepare(allocator, baselineCacheRequest(&fixture), "1.2.3");
+        defer prepared.deinit();
+        try std.testing.expectEqual(count, prepared.reused_count);
+        try std.testing.expectEqualStrings(cold.native_download.?.baseline_noop.planning_lock_json, prepared.baseline.?.value.planning_lock_json);
+        try std.testing.expectEqualSlices(u8, &cold.native_download.?.baseline_noop.digest(), &prepared.baseline.?.value.digest());
+        try directory.dir.deleteFile(std.testing.io, "repo/pool/alpha_1.0_amd64.deb");
+        try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+        try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/InRelease");
+        try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/main/binary-amd64/Packages");
+        request.options.lock_output_path = null;
+        request.options.offline = true;
+        const hit = try backend.executeWorkflow(allocator, request);
+        try expectBaselineWorkflowSuccess(hit);
+        try std.testing.expectEqual(count, hit.native_download.?.reused_count);
+        try std.testing.expectEqual(@as(usize, 0), hit.native_download.?.downloaded_count);
+        try std.testing.expectEqualStrings(cold.native_download.?.baseline_noop.planning_lock_json, hit.native_download.?.baseline_noop.planning_lock_json);
+        const status = try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024));
+        try std.testing.expectEqualStrings(installed_only_status, status);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/usr/share/alpha", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{}));
+    }
+}
+
+test "production native baseline fresh download refuses captured drift before cache output or archive publication" {
+    const Drift = struct {
+        directory: std.Io.Dir,
+        mutation: enum { status, payload, list, root, intent, generation },
+        calls: usize = 0,
+        fn hit(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            switch (self.mutation) {
+                .status => try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = installed_only_status ++ "\n" }),
+                .payload => try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/usr/share/private-baseline", .data = "foreign component cannot replace the captured payload\n" }),
+                .list => try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" }),
+                .root => {
+                    try self.directory.rename("root", self.directory, "old-root", std.testing.io);
+                    try self.directory.createDirPath(std.testing.io, "root/var/lib/dpkg");
+                    try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = installed_only_status });
+                },
+                .intent => {
+                    try self.directory.createDirPath(std.testing.io, "root/" ++ comptime std.fs.path.dirname(native_recovery.intent_path).?);
+                    try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/" ++ native_recovery.intent_path, .data = "{}\n" });
+                },
+                .generation => try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/" ++ native_provenance.document_path, .data = "{}\n" }),
+            }
+        }
+    };
+    for ([_]@FieldType(Drift, "mutation"){ .status, .payload, .list, .root, .intent, .generation }) |mutation| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        var injected: Drift = .{ .directory = directory.dir, .mutation = mutation };
+        var backend: Backend = .{
+            .io = std.testing.io,
+            .transaction_backend = .native,
+            .now_unix = 1_788_796_860,
+            .planning_sync = .{ .context = &injected, .hitFn = Drift.hit },
+        };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        // Successful archive acquisition would fail: these are deliberately absent.
+        try directory.dir.deleteFile(std.testing.io, "repo/pool/alpha_1.0_amd64.deb");
+        try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{ .{ .name = "alpha" }, .{ .name = "beta" } }, .options = options });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expectEqual(@as(usize, 1), injected.calls);
+        try std.testing.expect(!refused.changed and refused.native_download == null);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
+    }
+}
+
+test "production native baseline fresh download refuses stale ownership callbacks and database destinations before refresh" {
+    for ([_]enum { intent, orphan, root_record, deferred_owner, completed_generation, callback, queue, cache_destination, lock_destination }{ .intent, .orphan, .root_record, .deferred_owner, .completed_generation, .callback, .queue, .cache_destination, .lock_destination }) |scenario| {
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        var fixture = try nativeBaselineFixture(allocator, &directory);
+        defer fixture.deinit();
+        switch (scenario) {
+            .intent => {
+                try directory.dir.createDirPath(std.testing.io, "root/" ++ comptime std.fs.path.dirname(native_recovery.intent_path).?);
+                try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/" ++ native_recovery.intent_path, .data = "{}\n" });
+            },
+            .orphan => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/" ++ root_operation.namespace_path ++ "/" ++ native_recovery.authorization_v3_name, .data = "{}\n" }),
+            .root_record => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/" ++ root_operation.record_path, .data = "{}\n" }),
+            .deferred_owner => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/" ++ root_operation.deferred_ack_path, .data = "{}\n" }),
+            .completed_generation => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/" ++ native_provenance.document_path, .data = "{}\n" }),
+            .callback => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.postinst", .data = "#!/bin/sh\nexit 0\n" }),
+            .queue => try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/triggers/Unincorp", .data = "foreign-trigger private-baseline\n" }),
+            .cache_destination, .lock_destination => {},
+        }
+
+        var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+        var options = fixture.options();
+        options.lock_output_path = if (scenario == .lock_destination)
+            try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/refused.json", .{fixture.install_root})
+        else
+            fixture.lock_path;
+        if (scenario == .cache_destination)
+            options.cache_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg/info/refused-cache", .{fixture.install_root});
+        if (scenario != .callback) try directory.dir.deleteFile(std.testing.io, "repo/dists/stable/InRelease");
+        const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "alpha" }}, .options = options });
+        try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+        try std.testing.expect(!refused.changed and refused.native_download == null);
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/dpkg/info/refused-cache", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "root/var/lib/dpkg/info/refused.json", .{}));
+        try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
+        if (scenario == .intent) try directory.dir.access(std.testing.io, "root/" ++ native_recovery.intent_path, .{});
+    }
+}
+
+test "production native baseline fresh download retains signed-only native v3 behavior without component authority" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try nativeBaselineFixture(allocator, &directory);
+    defer fixture.deinit();
+    const status = "Package: alpha\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = status });
+    // Alpha has no local .list: it cannot acquire component no-op authority.
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const planned = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &.{.{ .name = "beta" }}, .options = options });
+    try expectBaselineWorkflowSuccess(planned);
+    const original = try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock_v3.maximum_document_bytes);
+    options.lock_output_path = fixture.second_lock_path;
+    const downloaded = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{.{ .name = "beta" }}, .options = options });
+    try expectBaselineWorkflowSuccess(downloaded);
+    try std.testing.expectEqual(@as(u32, 1), downloaded.api_version);
+    try std.testing.expect(downloaded.native_download == null);
+    const generated = try readFile(allocator, std.testing.io, fixture.second_lock_path, exact_lock_v3.maximum_document_bytes);
+    try std.testing.expectEqualStrings(original, generated);
+    var lock = try readProductLock(allocator, std.testing.io, fixture.second_lock_path, .native);
+    defer lock.deinit();
+    try std.testing.expect(lock == .native);
+    try std.testing.expectEqualStrings(status, try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(64 * 1024)));
+}
+
+test "production native baseline fresh derived identity refuses before persistent cache lock output or archive acquisition" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try nativeBaselineFixture(allocator, &directory);
+    defer fixture.deinit();
+    const original = try directory.dir.readFileAlloc(std.testing.io, "sources.list", allocator, .limited(64 * 1024));
+    try directory.dir.writeFile(std.testing.io, .{
+        .sub_path = "sources.list",
+        .data = try std.mem.replaceOwned(u8, allocator, original, "arch=amd64", "arch=amd64 debz-archive-binding=signed_sha256_derived_sha512"),
+    });
+    try directory.dir.deleteFile(std.testing.io, "repo/pool/alpha_1.0_amd64.deb");
+    try directory.dir.deleteFile(std.testing.io, "repo/pool/beta_1.0_amd64.deb");
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860 };
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .download_only, .selectors = &.{ .{ .name = "alpha" }, .{ .name = "beta" } }, .options = options });
+    try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+    try std.testing.expect(std.mem.startsWith(u8, refused.diagnostics[0].message, "InstalledBaselineImplicitBindingUnsupported:"));
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, "cache", .{}));
+    try std.testing.expectError(error.FileNotFound, directory.dir.access(std.testing.io, std.fs.path.basename(fixture.lock_path), .{}));
 }
 
 test "production native baseline signed batch receipt zero-op replay and owned process crash" {

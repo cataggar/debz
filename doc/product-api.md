@@ -378,17 +378,35 @@ results/fingerprints use API v6 and root/component-specific cache keys; export
 uses archive format v4. Active owned work and drift refuse before cache
 preparation/publication. Completed execution generations are not implicitly
 adopted by these read-only entrypoints. Legacy/default behavior is unchanged.
+Native download without `lock_input_path` can generate the v4 envelope under
+the existing non-mutating installed-baseline planning policy, with exclusions
+and frozen actual-root observations taken before repository refresh. An optional
+`lock_output_path` publishes it; the complete canonical envelope is always
+present in successful typed v4 download evidence. Existing signed-only v3
+results remain command.v1. This does not select a default backend, authorize
+execution, or provide durable auto-lock/retry orchestration.
+
+Fresh v4 generation currently supports already published native archive
+identities. The opted-in `signed_sha256_derived_sha512` path refuses with
+`lock_verification_failed` / `InstalledBaselineImplicitBindingUnsupported`
+before persistent cache, lock output or package acquisition; an already bound
+exact v4 input remains supported. Derivation needs a separate pre-acquisition
+complete-envelope resource admission contract, not a fabricated digest.
 
 Command.v2 shares the existing **4 MiB (4,194,304 encoded bytes)** and
 **4,096 result items** limits with the command decoder and subprocess transport.
-Before any repository-cache creation/refresh, lock-output publication, or
-archive acquisition, download counts a complete canonical admission envelope:
+Before persistent repository-cache creation/publication, lock-output publication,
+or package archive acquisition, download counts a complete canonical admission envelope:
 all original baseline facts, headers, escaped strings, newline, the entire
 locked archive closure and captured installed-database item candidates, the
 longest solver action label, and a legal download/reuse partition with maximum
 decimal width. This deliberately reserves both candidate sets rather than
 predicting a solver result or future CAS hits; it can refuse a near-limit request
-whose eventual result would be smaller. The count uses the same writer as actual
+whose eventual result would be smaller. Existing exact-v4 requests admit before
+repository refresh. Fresh requests first authenticate metadata in a bounded
+non-publishing view (including revalidation of existing cache objects); its
+pending bytes, keys and records together may not exceed the existing metadata
+object byte cap. The count uses the same writer as actual
 serialization, without allocating another serialized baseline document. An
 over-budget request returns the ordinary `planning_failed` / `DocumentTooLarge`
 diagnostic before that work; it never truncates facts or changes result items.
