@@ -61,12 +61,24 @@ pub const Verified = opaque {
         value.arena.deinit();
         allocator.destroy(value);
     }
+
+    pub fn requireOutputOutsideDatabase(self: *const Verified, directory: root_fs.Root) !void {
+        const actual = try directory.rootEntry();
+        if (!actual.modeled or !actual.isDirectory()) return error.UnsafeInstalledBaseline;
+        for (self.data().directories) |bound| {
+            if (bound.device == actual.device and bound.inode == actual.inode)
+                return error.InstalledBaselineOutputOverlapsDatabase;
+        }
+    }
 };
+
+const DirectoryIdentity = struct { device: u64, inode: u64 };
 
 const Data = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     value: Evidence,
+    directories: []const DirectoryIdentity,
 };
 
 const Tree = struct {
@@ -77,6 +89,7 @@ const Tree = struct {
     bytes: usize = 0,
     metadata_bytes: usize = 0,
     status_bytes: ?[]const u8 = null,
+    directories: std.ArrayList(DirectoryIdentity) = .empty,
 
     fn charge(self: *Tree, bytes: usize) !void {
         self.metadata_bytes = std.math.add(usize, self.metadata_bytes, bytes) catch
@@ -132,6 +145,8 @@ fn captureTree(tree: *Tree, root: root_fs.Root, path: []const u8, depth: usize) 
     try tree.charge(observed.members.len * @sizeOf(root_fs.DirectoryMember));
     for (observed.members) |member| try tree.charge(member.name.len);
     try requireOwned(root, observed.entry);
+    try tree.charge(@sizeOf(DirectoryIdentity));
+    try tree.directories.append(tree.allocator, .{ .device = observed.entry.device, .inode = observed.entry.inode });
     try hashEntry(tree, path, observed.entry, observed.change_nanoseconds, null);
     if (std.mem.eql(u8, path, "var/lib/dpkg/updates") and observed.members.len != 0)
         return error.InstalledBaselineRecoveryRequired;
@@ -149,12 +164,12 @@ fn captureTree(tree: *Tree, root: root_fs.Root, path: []const u8, depth: usize) 
     _ = try pin.metadata();
 }
 
-fn captureIdentity(allocator: std.mem.Allocator, root: root_fs.Root) !struct { bytes: []const u8, digest: [64]u8 } {
+fn captureIdentity(allocator: std.mem.Allocator, root: root_fs.Root) !struct { bytes: []const u8, digest: [64]u8, directories: []const DirectoryIdentity } {
     var tree: Tree = .{ .allocator = allocator };
     tree.hash.update("debz installed database no-op prestate v1\x00");
     try captureTree(&tree, root, "var/lib/dpkg", 0);
     const bytes = tree.status_bytes orelse return error.InstalledBaselineStatusMissing;
-    return .{ .bytes = bytes, .digest = tree.hash.finalResult() };
+    return .{ .bytes = bytes, .digest = tree.hash.finalResult(), .directories = try tree.directories.toOwnedSlice(allocator) };
 }
 
 fn make(
@@ -228,7 +243,7 @@ fn make(
         .packages = saved,
     };
     const data = try allocator.create(Data);
-    data.* = .{ .allocator = allocator, .arena = arena, .value = value };
+    data.* = .{ .allocator = allocator, .arena = arena, .value = value, .directories = first.directories };
     return @ptrCast(data);
 }
 

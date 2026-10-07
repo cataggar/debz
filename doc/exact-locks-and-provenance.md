@@ -81,7 +81,23 @@ inventing an archive origin or dropping the retained fact, it emits
   fails closed. A new explicit plan can capture a new healthy baseline;
   replay cannot refresh or replace the old evidence.
   Lock output must be outside the bound database tree so publication cannot
-  invalidate its own retained prestate.
+  invalidate its own retained prestate. This check compares the pinned output
+  directory's device/inode against every directory in the verified database
+  tree, including database-subdirectory bind-mount aliases; path prefixes or
+  realpath spelling are not authority. It happens before creating a staging
+  entry, and the same opened output directory anchors publication.
+- Fresh and replayed v4 output share the same final verification/publication
+  path. The actual database is verified before staging and again immediately
+  before atomic rename. Existing root-operation, dpkg frontend and dpkg database
+  OFD locks are held in that order throughout these checks and publication,
+  without adopting, clearing or publishing a root-operation record.
+  The lock files must already exist, be regular owner-safe single-link files,
+  and be writable by the caller. Missing infrastructure refuses with
+  `InstalledBaselinePublicationLockUnavailable`; planning never creates lock
+  files or directories in the bound database as setup. OFD exclusion conflicts
+  with ordinary dpkg POSIX locks. These cooperative locks do not freeze writes
+  by an administrator bypassing the supported locking protocol, and the
+  resulting lock is still observation evidence, never execution authority.
 
 The envelope checksum detects document substitution; it is **not** a
 repository signature, an archive digest, or proof of installed payload bytes.

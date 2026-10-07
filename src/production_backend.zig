@@ -237,6 +237,8 @@ pub const Backend = struct {
     completion_crash: ?CompletionCrash = null,
     /// Test-only synchronization around the root lock and initial binding.
     root_binding_sync: ?RootBindingSync = null,
+    /// Test-only synchronization inside a planning call, after its solve.
+    planning_sync: ?PlanningSync = null,
     /// Archive identity policy for native engine and exact-lock v3 consumers
     /// (#261). There is deliberately no CLI override; repositories that publish
     /// only signed SHA256 opt into a derived SHA-512 binding per repository.
@@ -1373,15 +1375,11 @@ pub const Backend = struct {
             },
             .plan => |*value| value,
         };
+        if (self.planning_sync) |sync| try sync.hit();
         var generated_lock: ?ProductLock = null;
         defer if (generated_lock) |*value| value.deinit();
         if (request.options.lock_output_path) |path| {
-            if (lock) |*value| {
-                value.write(allocator, self.io, path) catch |err| switch (err) {
-                    error.InstalledBaselineOutputOverlapsDatabase => return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline lock output must remain outside its bound package database"),
-                    else => return err,
-                };
-            } else {
+            if (lock == null) {
                 generated_lock = resolveProductLock(
                     self.transaction_backend,
                     allocator,
@@ -1433,20 +1431,24 @@ pub const Backend = struct {
                         nativeLockAdmissionMessage(err),
                     );
                 }
-                if (generated_lock.?.baselineEvidence()) |evidence| {
-                    if (mode != .plan_only)
-                        return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: v4 baseline lock resolution is planning-only");
-                    const proof = installed_baseline.verify(allocator, self.io, request.options.install_root, request.options.architecture, installed.source, evidence) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => return api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "installed baseline prestate refused before publication: {s}", .{@errorName(err)})),
-                    };
-                    proof.deinit();
-                }
-                generated_lock.?.write(allocator, self.io, path) catch |err| switch (err) {
-                    error.InstalledBaselineOutputOverlapsDatabase => return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline lock output must remain outside its bound package database"),
-                    else => return err,
-                };
             }
+            const output = if (lock) |*value| value else &generated_lock.?;
+            if (output.baselineEvidence() != null and mode != .plan_only)
+                return api.failure(request.operation, .planning, .lock_verification_failed, "InstalledBaselineExecutionUnsupported: v4 baseline lock resolution is planning-only");
+            output.write(allocator, self.io, path, .{
+                .root_path = request.options.install_root,
+                .architecture = request.options.architecture,
+                .status_bytes = installed.source,
+                .wait_ms = request.options.lock_wait_ms,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.LockTimeout, error.LockUnavailable, error.LockCanceled, error.LockLost, error.LockFailed, error.LockOrderViolation => return mapRootOperationError(request.operation, err),
+                error.InstalledBaselineOutputOverlapsDatabase => return api.failure(request.operation, .planning, .lock_verification_failed, "installed baseline lock output must remain outside its bound package database"),
+                else => return if (output.baselineEvidence() != null)
+                    api.failure(request.operation, .planning, .lock_verification_failed, try std.fmt.allocPrint(allocator, "installed baseline prestate refused before publication: {s}", .{@errorName(err)}))
+                else
+                    err,
+            };
         }
         if (mode == .plan_only) return planResult(allocator, request.operation, plan.*);
 
@@ -5244,6 +5246,89 @@ fn openRegularFileAbsoluteNoFollow(io: std.Io, path: []const u8) !std.Io.File {
     return file;
 }
 
+const PlanningSync = struct {
+    context: *anyopaque,
+    hitFn: *const fn (*anyopaque) anyerror!void,
+
+    fn hit(self: PlanningSync) !void {
+        try self.hitFn(self.context);
+    }
+};
+
+const BaselinePublication = struct {
+    root_path: []const u8,
+    architecture: []const u8,
+    status_bytes: []const u8,
+    wait_ms: u64,
+};
+
+const BaselinePublicationLocks = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: ?root_fs.OwnedRoot = null,
+    backend: root_operation.SystemLockBackend = undefined,
+    held: [3]?root_operation.LockToken = @splat(null),
+
+    fn acquire(self: *BaselinePublicationLocks, publication: BaselinePublication, evidence: installed_baseline.Evidence) !void {
+        if (!std.mem.eql(u8, publication.root_path, evidence.root_path) or
+            !std.mem.eql(u8, publication.architecture, evidence.native_architecture))
+            return error.InstalledBaselineRootMismatch;
+        self.root = try root_fs.openAbsoluteRoot(self.io, publication.root_path);
+        const root = self.root.?.root;
+        const entry = try root.rootEntry();
+        if (!entry.modeled or entry.device != evidence.root_device or entry.inode != evidence.root_inode or
+            entry.uid != evidence.root_uid or entry.gid != evidence.root_gid or entry.mode != evidence.root_mode)
+            return error.InstalledBaselineChanged;
+        self.backend = .{ .allocator = self.allocator, .io = self.io };
+        var namespace: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(publication.root_path, &namespace, .{});
+        const paths = [_][]const u8{ root_operation.lock_path, "var/lib/dpkg/lock-frontend", "var/lib/dpkg/lock" };
+        for (paths, 0..) |path, index| {
+            const lock_entry = root.entry(try root_fs.Path.init(path)) catch |err| switch (err) {
+                error.FileNotFound => return error.InstalledBaselinePublicationLockUnavailable,
+                else => return err,
+            };
+            if (!lock_entry.modeled or !lock_entry.isRegularFile() or lock_entry.uid != entry.uid or
+                lock_entry.mode & 0o022 != 0 or lock_entry.link_count != 1)
+                return error.UnsafeInstalledBaseline;
+            self.held[index] = try self.backend.interface().acquire(.{
+                .rank = if (index == 0) .root_operation else .target_database,
+                .root = root,
+                .identity = .{ .install_root_sha256 = namespace, .inode = entry.inode },
+                .path = path,
+                .wait_ms = publication.wait_ms,
+                .cancellation = transaction_executor.Cancellation.never(),
+                .create_if_missing = false,
+            });
+        }
+    }
+
+    fn deinit(self: *BaselinePublicationLocks) void {
+        var index = self.held.len;
+        while (index != 0) {
+            index -= 1;
+            if (self.held[index]) |token| self.backend.interface().release(token);
+        }
+        if (self.root) |*root| root.close();
+    }
+};
+
+const BaselinePublicationCheck = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    publication: BaselinePublication,
+    evidence: installed_baseline.Evidence,
+    destination: root_fs.Root,
+
+    fn hit(context: *anyopaque, point: root_fs.PublishPoint) !void {
+        if (point != .before_rename) return;
+        const self: *BaselinePublicationCheck = @ptrCast(@alignCast(context));
+        const proof = try installed_baseline.verify(self.allocator, self.io, self.publication.root_path, self.publication.architecture, self.publication.status_bytes, self.evidence);
+        defer proof.deinit();
+        try proof.requireOutputOutsideDatabase(self.destination);
+    }
+};
+
 const ProductLock = union(enum) {
     legacy_dpkg: exact_lock.OwnedLock,
     native: exact_lock_v3.OwnedLock,
@@ -5299,7 +5384,7 @@ const ProductLock = union(enum) {
         };
     }
 
-    fn write(self: ProductLock, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    fn write(self: ProductLock, allocator: std.mem.Allocator, io: std.Io, path: []const u8, publication: BaselinePublication) !void {
         switch (self) {
             .legacy_dpkg => |owned| {
                 try writeLock(allocator, io, path, owned.lock);
@@ -5317,17 +5402,29 @@ const ProductLock = union(enum) {
             },
             .native => |owned| try writeLockVersion(exact_lock_v3, allocator, io, path, owned.lock),
             .installed_baseline => |*owned| {
-                const database_path = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg", .{std.mem.trimEnd(u8, owned.evidence().root_path, "/")});
-                defer allocator.free(database_path);
-                if (std.mem.eql(u8, path, database_path) or
-                    (std.mem.startsWith(u8, path, database_path) and path.len > database_path.len and path[database_path.len] == '/'))
-                    return error.InstalledBaselineOutputOverlapsDatabase;
                 const bytes = try owned.canonicalJson(allocator);
                 defer allocator.free(bytes);
                 const parent = std.fs.path.dirname(path) orelse return error.InvalidAbsolutePath;
                 var directory = try root_fs.openAbsoluteRoot(io, parent);
                 defer directory.close();
-                try directory.root.publishFile(try root_fs.Path.init(std.fs.path.basename(path)), bytes, .{ .permissions = .fromMode(0o600), .durable = true });
+                var locks: BaselinePublicationLocks = .{ .allocator = allocator, .io = io };
+                defer locks.deinit();
+                try locks.acquire(publication, owned.evidence());
+                const proof = try installed_baseline.verify(allocator, io, publication.root_path, publication.architecture, publication.status_bytes, owned.evidence());
+                defer proof.deinit();
+                try proof.requireOutputOutsideDatabase(directory.root);
+                var check: BaselinePublicationCheck = .{
+                    .allocator = allocator,
+                    .io = io,
+                    .publication = publication,
+                    .evidence = owned.evidence(),
+                    .destination = directory.root,
+                };
+                try directory.root.publishFile(try root_fs.Path.init(std.fs.path.basename(path)), bytes, .{
+                    .permissions = .fromMode(0o600),
+                    .durable = true,
+                    .observer = .{ .context = &check, .hitFn = BaselinePublicationCheck.hit },
+                });
             },
         }
     }
@@ -8126,6 +8223,12 @@ test "production native-only rehearsal refuses new legacy locks and results befo
 const installed_only_status =
     "Package: private-baseline\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n\n";
 
+fn prepareBaselinePublicationLocks(directory: *std.testing.TmpDir) !void {
+    try directory.dir.createDirPath(std.testing.io, "root/" ++ root_operation.namespace_path);
+    for ([_][]const u8{ "root/" ++ root_operation.lock_path, "root/var/lib/dpkg/lock-frontend", "root/var/lib/dpkg/lock" }) |path|
+        try directory.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "" });
+}
+
 test "production installed-only baseline joins a complete signed archive lock and remains non-executable" {
     for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |kind| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -8135,6 +8238,7 @@ test "production installed-only baseline joins a complete signed archive lock an
         defer directory.cleanup();
         var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
         defer fixture.deinit();
+        try prepareBaselinePublicationLocks(&directory);
         try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
         try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
         var process: TestProcess = .{ .io = std.testing.io, .dir = directory.dir };
@@ -8206,6 +8310,7 @@ test "production installed baseline refuses changed status metadata info metadat
         defer directory.cleanup();
         var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
         defer fixture.deinit();
+        try prepareBaselinePublicationLocks(&directory);
         try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
         try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
         var process: TestProcess = .{ .io = std.testing.io, .dir = directory.dir };
@@ -8238,6 +8343,188 @@ test "production installed baseline refuses changed status metadata info metadat
         try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, "installed baseline prestate refused") != null);
         try std.testing.expectEqual(@as(usize, 0), process.calls);
         try std.testing.expectError(error.FileNotFound, directory.dir.statFile(std.testing.io, "single-lock.json", .{}));
+    }
+}
+
+test "production installed baseline containment compares pinned database and subdirectory identities" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.init(allocator, &directory, installed_only_status);
+    defer fixture.deinit();
+    try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info/nested");
+    const proof = try installed_baseline.capture(allocator, std.testing.io, fixture.install_root, "amd64", installed_only_status, &.{.{
+        .name = "private-baseline",
+        .version = "1.0",
+        .architecture = "amd64",
+        .selection = .install,
+    }});
+    defer proof.deinit();
+    for ([_][]const u8{ "var/lib/dpkg", "var/lib/dpkg/info", "var/lib/dpkg/info/nested" }) |relative| {
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ fixture.install_root, relative });
+        var alias_descriptor = try root_fs.openAbsoluteRoot(std.testing.io, path);
+        defer alias_descriptor.close();
+        try std.testing.expectError(error.InstalledBaselineOutputOverlapsDatabase, proof.requireOutputOutsideDatabase(alias_descriptor.root));
+    }
+    var outside = try root_fs.openAbsoluteRoot(std.testing.io, fixture.state_path);
+    defer outside.close();
+    try proof.requireOutputOutsideDatabase(outside.root);
+}
+
+test "production installed baseline replay refuses database mutation inside the planning call" {
+    const Mutation = enum { status_metadata, selection, info };
+    const DuringReplay = struct {
+        directory: std.Io.Dir,
+        mutation: Mutation,
+        called: bool = false,
+
+        fn hit(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.called = true;
+            switch (self.mutation) {
+                .status_metadata => try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = installed_only_status ++ "Description: changed during replay\n\n" }),
+                .selection => try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/status", .data = "Package: private-baseline\nStatus: hold ok installed\nVersion: 1.0\nArchitecture: amd64\n\n" }),
+                .info => try self.directory.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/changed-during-replay\n" }),
+            }
+        }
+    };
+    for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |kind| {
+        for ([_]Mutation{ .status_metadata, .selection, .info }) |mutation| {
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            var directory = std.testing.tmpDir(.{});
+            defer directory.cleanup();
+            var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
+            defer fixture.deinit();
+            try prepareBaselinePublicationLocks(&directory);
+            try directory.dir.createDirPath(std.testing.io, "root/var/lib/dpkg/info");
+            try directory.dir.writeFile(std.testing.io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
+            var process: TestProcess = .{ .io = std.testing.io, .dir = directory.dir };
+            var backend: Backend = .{ .io = std.testing.io, .transaction_backend = kind, .now_unix = 1_788_796_860, .process_runner = process.interface(), .native_archive_digest_policy = .published_digests };
+            var options = fixture.options();
+            options.lock_output_path = fixture.lock_path;
+            const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
+            const planned = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+            try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+            const before = try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock.maximum_document_bytes);
+            var injected: DuringReplay = .{ .directory = directory.dir, .mutation = mutation };
+            backend.planning_sync = .{ .context = &injected, .hitFn = DuringReplay.hit };
+            options.lock_input_path = fixture.lock_path;
+            options.lock_output_path = fixture.second_lock_path;
+            const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+            try std.testing.expect(injected.called);
+            try std.testing.expectEqual(api.ErrorId.lock_verification_failed, refused.diagnostics[0].id);
+            try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, "before publication") != null);
+            try std.testing.expectEqual(@as(usize, 0), process.calls);
+            try std.testing.expectError(error.FileNotFound, directory.dir.statFile(std.testing.io, "single-lock.json", .{}));
+            try std.testing.expectEqualStrings(before, try readFile(allocator, std.testing.io, fixture.lock_path, exact_lock.maximum_document_bytes));
+        }
+    }
+}
+
+test "production installed baseline publication never creates missing exclusion files" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
+    defer fixture.deinit();
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860, .native_archive_digest_policy = .published_digests };
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    const result = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &.{.{ .name = "alpha" }}, .options = options });
+    try std.testing.expectEqual(api.ErrorId.lock_verification_failed, result.diagnostics[0].id);
+    try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "InstalledBaselinePublicationLockUnavailable") != null);
+    for ([_][]const u8{ "root/" ++ root_operation.lock_path, "root/var/lib/dpkg/lock-frontend", "root/var/lib/dpkg/lock", "batch-lock.json" }) |path|
+        try std.testing.expectError(error.FileNotFound, directory.dir.statFile(std.testing.io, path, .{}));
+    try std.testing.expectEqualStrings(installed_only_status, try directory.dir.readFileAlloc(std.testing.io, "root/var/lib/dpkg/status", allocator, .limited(4096)));
+}
+
+test "production installed baseline publication preserves an existing root operation owner" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
+    defer fixture.deinit();
+    try prepareBaselinePublicationLocks(&directory);
+    var root = try root_fs.openAbsoluteRoot(std.testing.io, fixture.install_root);
+    defer root.close();
+    var locks: root_operation.SystemLockBackend = .{ .allocator = allocator, .io = std.testing.io };
+    var coordinator = try root_operation.Coordinator.open(std.testing.io, root.root, fixture.install_root, locks.interface());
+    var owner = try coordinator.acquire(allocator, .{
+        .intent = .mutation,
+        .backend = .native,
+        .operation = .{ .package_transaction = .install },
+        .request_sha256 = @splat(1),
+        .policy_sha256 = @splat(2),
+        .target_architecture = "amd64",
+        .wait_ms = 0,
+    });
+    defer owner.release();
+    const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ fixture.install_root, root_operation.record_path });
+    const before = try readFile(allocator, std.testing.io, record_path, root_operation.maximum_document_bytes);
+    var backend: Backend = .{ .io = std.testing.io, .transaction_backend = .native, .now_unix = 1_788_796_860, .native_archive_digest_policy = .published_digests };
+    var options = fixture.options();
+    options.lock_output_path = fixture.lock_path;
+    options.lock_wait_ms = 0;
+    const refused = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &.{.{ .name = "alpha" }}, .options = options });
+    try std.testing.expectEqual(api.ErrorId.root_operation_conflict, refused.diagnostics[0].id);
+    try std.testing.expect(std.mem.indexOf(u8, refused.diagnostics[0].message, "root mutation lock") != null);
+    try std.testing.expectEqualStrings(before, try readFile(allocator, std.testing.io, record_path, root_operation.maximum_document_bytes));
+    try std.testing.expectError(error.FileNotFound, directory.dir.statFile(std.testing.io, "batch-lock.json", .{}));
+}
+
+test "production installed baseline refuses genuine private namespace database bind mounts" {
+    const raw = std.c.getenv("DEBZ_BASELINE_BINDMOUNT_ROOT") orelse return error.SkipZigTest;
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var own: [128]u8 = undefined;
+    var host: [128]u8 = undefined;
+    const own_len = try std.Io.Dir.cwd().readLink(io, "/proc/self/ns/mnt", &own);
+    const host_len = try std.Io.Dir.cwd().readLink(io, "/proc/1/ns/mnt", &host);
+    if (std.mem.eql(u8, own[0..own_len], host[0..host_len])) return error.NotPrivateTestNamespace;
+    var cwd: [std.fs.max_path_bytes]u8 = undefined;
+    var cwd_dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true, .follow_symlinks = false });
+    defer cwd_dir.close(io);
+    const cwd_len = try cwd_dir.realPath(io, &cwd);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const expected = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/baseline-publication-proof/mount-fixture", .{cwd[0..cwd_len]});
+    try std.testing.expectEqualStrings(expected, std.mem.span(raw));
+    var owned = try root_fs.openAbsoluteRoot(io, expected);
+    defer owned.close();
+    var directory: std.testing.TmpDir = .{ .dir = owned.root.dir, .parent_dir = undefined, .sub_path = undefined };
+    var fixture = try ProductionWorkflowFixture.initWithRepository(allocator, &directory, installed_only_status, @embedFile("fixtures/batch_workflow/InRelease"), @embedFile("fixtures/batch_workflow/Packages"), @embedFile("fixtures/batch_workflow/keyring.gpg"));
+    defer fixture.deinit();
+    try prepareBaselinePublicationLocks(&directory);
+    try directory.dir.writeFile(io, .{ .sub_path = "root/var/lib/dpkg/info/private-baseline.list", .data = "/usr/share/private-baseline\n" });
+    for ([_]transaction_engine.Kind{ .legacy_dpkg, .native }) |kind| {
+        var backend: Backend = .{ .io = io, .transaction_backend = kind, .now_unix = 1_788_796_860, .native_archive_digest_policy = .published_digests };
+        var options = fixture.options();
+        options.lock_output_path = fixture.lock_path;
+        const selectors = [_]solver.PackageSelector{.{ .name = "alpha" }};
+        const planned = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+        try std.testing.expectEqual(api.ExitStatus.success, planned.exit_status);
+        var lock = try readProductLock(allocator, io, fixture.lock_path, kind);
+        defer lock.deinit();
+        for ([_][]const u8{ "alias-dpkg/status", "alias-info/private-baseline.list" }) |alias| {
+            options.lock_output_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ expected, alias });
+            for ([_]bool{ false, true }) |replay| {
+                options.lock_input_path = if (replay) fixture.lock_path else null;
+                const result = try backend.executeWorkflow(allocator, .{ .operation = .install, .mode = .plan_only, .selectors = &selectors, .options = options });
+                try std.testing.expectEqual(api.ErrorId.lock_verification_failed, result.diagnostics[0].id);
+                try std.testing.expect(std.mem.indexOf(u8, result.diagnostics[0].message, "outside its bound package database") != null);
+                const after = try installed_baseline.verify(allocator, io, fixture.install_root, "amd64", installed_only_status, lock.baselineEvidence().?);
+                after.deinit();
+            }
+        }
     }
 }
 
@@ -11344,6 +11631,7 @@ test "production exact lock retains and validates the installed baseline without
     try std.testing.expectEqualStrings("1.0-1", lock.lock.packages[0].version);
     try std.testing.expectEqualStrings("amd64", lock.lock.packages[0].architecture);
 
+    try prepareBaselinePublicationLocks(&directory);
     try directory.dir.writeFile(std.testing.io, .{
         .sub_path = "root/var/lib/dpkg/status",
         .data =
