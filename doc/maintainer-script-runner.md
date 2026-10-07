@@ -668,6 +668,17 @@ execution**. General CI and an unactivated optional test are not proof.
 `tools/real-snapshot-less-reference.sh` accepts seven explicit arguments:
 the verified pinned arm64 dpkg, protected prestate root, signed lock,
 signed less archive, two new disposable root paths, and protected Zig.
+Before copying roots or constructing any negative fixtures, it activates a
+separate source-only Zig check with
+`DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT`. This calls the production
+input verifier, including regular alternatives-tool and absent cache
+requirements. All fixture writes then use descriptor-rooted no-follow
+parent traversal. Existing files are opened without truncation and their
+regular/single-link metadata is checked before `ftruncate` or `fchmod`;
+the cache and staged dpkg/archive files use exclusive no-follow creation.
+Source aliases therefore cannot redirect a privileged mutation to a host
+file, even if a malformed clone is presented. Unprivileged safety tests
+do not substitute for protected positive replay.
 It supplies all eight protected test coordinates and actually invokes the
 activated ReleaseSafe Zig test, before execution and again after unmodified
 script/pinned-dpkg replay and strict negative fixtures. It must be invoked

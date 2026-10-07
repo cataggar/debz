@@ -2,6 +2,7 @@
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PYTHONDONTWRITEBYTECODE=1
 
 [[ $# == 7 && $(id -u) == 0 ]] || {
   echo "usage (as root): $0 PINNED_DPKG PROTECTED_SOURCE_ROOT SIGNED_LOCK LESS_ARCHIVE NEW_SCRIPT_ROOT NEW_DPKG_ROOT ZIG" >&2
@@ -40,6 +41,7 @@ require_protected_file() {
 checkout=$(pwd -P)
 [[ $(realpath -- "${BASH_SOURCE[0]}") == "$checkout/tools/real-snapshot-less-reference.sh" ]]
 for file in tools/real-snapshot-less-reference.sh tools/prepare-native-dpkg.py \
+  tools/real_snapshot_less_fixtures.py tools/real_snapshot_reference_paths.py \
   src/fixtures/ubuntu-resolute-less.preinst; do require_protected_file "$checkout/$file"; done
 require_protected_path "$checkout/.real-snapshot"
 [[ $(stat -c '%u:%g:%a' "$checkout/.real-snapshot") == 0:0:700 ]]
@@ -89,19 +91,30 @@ require_lock_artifact libc6 2.43-2ubuntu2.4 1642036 865127bc2d7d9218e2a3482b7e0b
 require_protected_file "$source_root/var/lib/dpkg/info/less.preinst"
 cmp "$source_root/var/lib/dpkg/info/less.preinst" \
   "$checkout/src/fixtures/ubuntu-resolute-less.preinst"
+require_protected_path "$checkout/.zig-cache"
+mkdir -m0700 "$checkout/.zig-cache/arm64-less-probe-data"
+
+check_source_inputs() {
+  env -u DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT \
+    DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT="$source_root" \
+    TMPDIR="$checkout/.zig-cache/arm64-less-probe-data" \
+    ZIG_GLOBAL_CACHE_DIR="$checkout/.zig-cache/arm64-less-global" \
+    "$zig" build test-native-unpack -Doptimize=ReleaseSafe -j2 --summary all
+}
+
+check_source_inputs
 for path in "$script_root" "$dpkg_root" "$bad_script" "$bad_mode" \
   "$bad_tool" "$bad_alias" "$bad_prestate"; do
   cp -a --reflink=auto -- "$source_root" "$path"
   require_protected_path "$path"
 done
-sed -i 's/exit 0/exit 1/' "$bad_script/var/lib/dpkg/info/less.preinst"
-chmod 0644 "$bad_mode/var/lib/dpkg/info/less.preinst"
-printf 'foreign alternatives tool\n' > "$bad_tool/usr/bin/update-alternatives"
-rm "$bad_alias/usr/bin/sh"
-ln -s foreign-sh "$bad_alias/usr/bin/sh"
-printf 'unbound loader cache\n' > "$bad_prestate/etc/ld.so.cache"
-require_protected_path "$checkout/.zig-cache"
-mkdir -m0700 "$checkout/.zig-cache/arm64-less-probe-data"
+python3 - "$bad_script" "$bad_mode" "$bad_tool" "$bad_alias" "$bad_prestate" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, "tools")
+from real_snapshot_less_fixtures import mutate_negative_roots
+mutate_negative_roots([Path(root) for root in sys.argv[1:]])
+PY
 
 check_activated_roots() {
   env DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT="$source_root" \
@@ -139,19 +152,13 @@ timeout --signal=TERM --kill-after=5s 120s \
       DEBIAN_FRONTEND=noninteractive DPKG_COLORS=never \
       /bin/sh /var/lib/debz-lifecycle-scripts/less.preinst install
   '
-for path in "$dpkg_root/usr/local" "$dpkg_root/usr/local/sbin"; do
-  if [[ -e "$path" || -L "$path" ]]; then
-    require_protected_path "$path"
-  else
-    require_protected_path "$(dirname -- "$path")"
-    install -d -o root -g root -m0755 "$path"
-  fi
-done
-require_protected_path "$dpkg_root/var/lib/dpkg"
-[[ ! -e "$dpkg_root/var/lib/dpkg/less-probe.deb" &&
-   ! -L "$dpkg_root/var/lib/dpkg/less-probe.deb" ]]
-install -o root -g root -m0755 "$pinned" "$dpkg_root/usr/local/sbin/dpkg"
-install -o root -g root -m0644 "$archive" "$dpkg_root/var/lib/dpkg/less-probe.deb"
+python3 - "$dpkg_root" "$pinned" "$archive" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, "tools")
+from real_snapshot_less_fixtures import stage_dpkg_reference
+stage_dpkg_reference(*(Path(path) for path in sys.argv[1:]))
+PY
 timeout --signal=TERM --kill-after=5s 120s \
   unshare --mount --net --pid --fork --kill-child=SIGKILL --propagation private -- \
   chroot "$dpkg_root" /bin/sh -c '

@@ -24919,6 +24919,14 @@ test "native_unpack.test.arm64 less binds authenticated archives and exact runti
     }
 }
 
+test "native_unpack.test.protected signed arm64 less source is validated before fixture mutation" {
+    const path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT") orelse return;
+    const artifacts = try snapshotLessArm64TestArtifacts();
+    var root = try root_fs.openAbsoluteRoot(testing.io, std.mem.span(path));
+    defer root.close();
+    try verifySnapshotLessArm64Inputs(testing.allocator, root.root, &artifacts, "arm64");
+}
+
 test "native_unpack.test.protected signed arm64 less inert input and replay roots are exact" {
     const before_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT") orelse return;
     const script_after_path = std.c.getenv("DEBZ_REQUIRE_SIGNED_ARM64_LESS_SCRIPT_AFTER") orelse return error.TestUnexpectedResult;

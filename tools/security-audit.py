@@ -1681,6 +1681,7 @@ def audit_production_sources() -> None:
             fail(f"reviewed exact arm64 less inert boundary changed: {required}")
     less_reference = (ROOT / "tools/real-snapshot-less-reference.sh").read_text(errors="strict")
     for required in (
+        'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SOURCE_ROOT="$source_root"',
         'DEBZ_REQUIRE_SIGNED_ARM64_LESS_PREINST_ROOT="$source_root"',
         'DEBZ_REQUIRE_SIGNED_ARM64_LESS_SCRIPT_AFTER="$script_root"',
         'DEBZ_REQUIRE_SIGNED_ARM64_LESS_DPKG_AFTER="$dpkg_root"',
@@ -1695,6 +1696,23 @@ def audit_production_sources() -> None:
     ):
         if required not in less_reference:
             fail(f"protected arm64 less activated proof wiring changed: {required}")
+    if ("\ncheck_source_inputs\n" not in less_reference or
+            less_reference.index("\ncheck_source_inputs\n") > less_reference.index("cp -a --reflink=auto")):
+        fail("protected arm64 less source guard must run before fixture copies/mutations")
+    less_fixtures = (ROOT / "tools/real_snapshot_less_fixtures.py").read_text(errors="strict")
+    for required in (
+        "parent_fd = open_beneath(root_fd, parent, directory=True)",
+        "os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC",
+        "metadata = os.fstat(descriptor)",
+        "not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1",
+        "regular_metadata(descriptor)\n    os.ftruncate(descriptor, 0)",
+        "os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC",
+        "protected(root, directory=True)",
+    ):
+        if required not in less_fixtures:
+            fail(f"protected arm64 less no-follow fixture mutation boundary changed: {required}")
+    if "os.O_TRUNC" in less_fixtures:
+        fail("protected arm64 less fixture must check opened metadata before truncation")
     live_root = (ROOT / "src/live_root.zig").read_text(errors="strict")
     if "linux.syscall3(\n        .open_tree," not in live_root:
         fail("live-root detached open_tree boundary changed")
