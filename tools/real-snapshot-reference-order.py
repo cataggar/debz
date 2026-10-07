@@ -7,17 +7,22 @@ import argparse
 from dataclasses import dataclass
 import contextlib
 import hashlib
+import io
+import json
 from pathlib import Path
 import re
 import os
+import shutil
 import subprocess
 import tempfile
+import tarfile
 
 from real_snapshot_reference_paths import open_absolute, protected, read_root_file
 
 MAXIMUM_PACKAGES = 2000
 MAXIMUM_PROBES = 10000
 MAXIMUM_PROBE_OUTPUT = 65536
+MAXIMUM_CONTROL_BYTES = 1024 * 1024
 MAXIMUM_LOG_BYTES = 16 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 512 * 1024 * 1024
 NAME = re.compile(r"[a-z0-9][a-z0-9+.-]*\Z")
@@ -27,6 +32,25 @@ PROFILE_VERSIONS = {
     "udev": "259.5-0ubuntu3.4",
     "sudo": "1.9.17p2-1ubuntu3.1",
 }
+BASE_CYCLE = (
+    ("libc6", "2.43-2ubuntu2.4", 2104056,
+     "e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696",
+     "libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)"),
+    ("libgcc-s1", "16-20260322-1ubuntu1", 80312,
+     "a34e93f253ca90bd331c5eee563be6ebcc14dbf08147e82b9479f972fe566c83263b644e348757af1853f8663cb8ca2349e2c013e4a0ca0e3ea3d631297576b2",
+     "gcc-16-base (= 16-20260322-1ubuntu1), libc6 (>= 2.35)"),
+    ("gcc-16-base", "16-20260322-1ubuntu1", 38296,
+     "0767f731e71e709736596d52dbe181245a8ca181cdadbac6226aad5aa7151d8ce5149ad28625facc61d8882e76fc387af5336dc289126a0bf830b9e599b3922c", ""),
+    ("libc-gconv-modules-extra", "2.43-2ubuntu2.4", 1362202,
+     "c385f1ca4f8054e59f977a38819e31d6f2429909ce0a88c734c874ce163851dfa7e565dded6c65c3feb3bc8cf074498b45a4c2226bb8e17a2bc8b95027a29692", ""),
+)
+BASE_CYCLE_PROFILE = "libgcc_cycle"
+MAINTAINER_SCRIPTS = ("preinst", "postinst", "prerm", "postrm", "config")
+LIBGCC_TRIGGERS = b"# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"
+
+
+class CycleRefusal(RuntimeError):
+    """No authority to break a dependency cycle."""
 
 
 @dataclass(frozen=True)
@@ -105,8 +129,19 @@ def verify_archive(package: Package) -> None:
 
 def dpkg_command(
     launcher: Path, dpkg: Path, root: Path, architecture: str, profile: str,
-    verb: str, package: Package | None = None,
+    verb: str, package: Package | None = None, cycle: tuple[Package, ...] = (),
 ) -> list[str]:
+    if verb == "break_base_cycle":
+        if (architecture != "amd64" or profile != BASE_CYCLE_PROFILE
+            or len(cycle) != len(BASE_CYCLE) or package != cycle[1]
+            or any((p.name, p.version, p.architecture, p.size, p.digest) !=
+                   (name, version, "amd64", size, digest)
+                   for p, (name, version, size, digest, _) in zip(cycle, BASE_CYCLE))):
+            raise CycleRefusal("CycleIdentityChanged: unauthorized cycle operation")
+        return [str(launcher), str(root), str(dpkg), architecture, profile, verb,
+                package.selector, *(str(p.archive) for p in cycle)]
+    if cycle:
+        raise CycleRefusal("CycleIdentityChanged: archives on a normal operation")
     if verb not in ("probe_unpack", "unpack", "probe_configure", "configure"):
         raise ValueError(f"reference dpkg operation has no single-script binding: {verb}")
     if package is None:
@@ -191,9 +226,8 @@ def apply(
         raise ValueError("reference dpkg output exceeds limit")
 
 
-def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
-    records: dict[tuple[str, str], tuple[str, str]] = {}
-    data = read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024)
+def control_fields(data: bytes) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
     for stanza in data.decode("utf-8").strip().split("\n\n"):
         if not stanza:
             continue
@@ -203,6 +237,7 @@ def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
             if line.startswith((" ", "\t")):
                 if previous is None or previous in ("package", "architecture", "version", "status"):
                     raise ValueError("invalid continuation in reference database identity")
+                fields[previous] += "\n" + line
                 continue
             key, separator, value = line.partition(":")
             if not separator or not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*", key):
@@ -214,6 +249,14 @@ def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
             if previous in fields:
                 raise ValueError(f"duplicate reference database field: {key}")
             fields[previous] = value
+        records.append(fields)
+    return records
+
+
+def database_fields(root: Path) -> dict[tuple[str, str], dict[str, str]]:
+    records: dict[tuple[str, str], dict[str, str]] = {}
+    data = read_root_file(root, "var/lib/dpkg/status", 4 * 1024 * 1024)
+    for fields in control_fields(data):
         name = fields["package"]
         architecture = fields["architecture"]
         version = fields["version"]
@@ -223,8 +266,271 @@ def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
         key = name, architecture
         if key in records:
             raise ValueError(f"duplicate reference database package: {key}")
-        records[key] = (status, version)
+        records[key] = fields
     return records
+
+
+def database_packages(root: Path) -> dict[tuple[str, str], tuple[str, str]]:
+    return {key: (fields["status"], fields["version"])
+            for key, fields in database_fields(root).items()}
+
+
+def base_cycle_packages(packages: list[Package], architecture: str) -> tuple[Package, ...]:
+    if architecture != "amd64":
+        raise CycleRefusal("UnknownCycle: no reviewed base cycle for this architecture")
+    cycle: list[Package] = []
+    for name, version, size, digest, _ in BASE_CYCLE:
+        matches = [p for p in packages if p.name == name]
+        if (len(matches) != 1 or
+            (matches[0].version, matches[0].architecture, matches[0].size, matches[0].digest)
+                != (version, "amd64", size, digest)):
+            raise CycleRefusal(f"CycleIdentityChanged: {name}")
+        cycle.append(matches[0])
+    return tuple(cycle)
+
+
+def trigger_database(root: Path) -> dict[str, dict]:
+    updates = open_absolute(root / "var/lib/dpkg/updates", directory=True)
+    try:
+        if os.listdir(updates):
+            raise CycleRefusal("CycleStateChanged: pending database updates")
+    finally:
+        os.close(updates)
+    directory = open_absolute(root / "var/lib/dpkg/triggers", directory=True)
+    try:
+        names = os.listdir(directory)
+        if len(names) > MAXIMUM_PACKAGES:
+            raise CycleRefusal("CycleCallbackChanged: trigger database exceeds bound")
+        result = {}
+        for name in sorted(names):
+            data = read_root_file(root, f"var/lib/dpkg/triggers/{name}", MAXIMUM_CONTROL_BYTES)
+            if name == "Unincorp" and data:
+                raise CycleRefusal("CycleCallbackChanged: unincorporated trigger activations")
+            result[name] = {"size": len(data), "sha512": hashlib.sha512(data).hexdigest()}
+        return result
+    finally:
+        os.close(directory)
+
+
+def verify_base_cycle(root: Path, cycle: tuple[Package, ...]) -> dict:
+    records = database_fields(root)
+    triggers_before = trigger_database(root)
+    graph: dict[str, dict] = {}
+    for index, (package, binding) in enumerate(zip(cycle, BASE_CYCLE)):
+        try:
+            verify_archive(package)
+        except (ValueError, OSError) as error:
+            raise CycleRefusal(f"CycleIdentityChanged: {package.name}: {error}") from error
+        result = subprocess.run(
+            ["dpkg-deb", "--ctrl-tarfile", str(package.archive)],
+            env=oracle_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            check=True, timeout=30,
+        )
+        if len(result.stdout) > MAXIMUM_CONTROL_BYTES or result.stderr:
+            raise CycleRefusal("CycleControlChanged: oversized control archive")
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            members = archive.getmembers()
+            control = archive.extractfile("./control")
+            if control is None:
+                raise CycleRefusal("CycleControlChanged: missing control")
+            fields, = control_fields(control.read(MAXIMUM_PROBE_OUTPUT + 1))
+            if index == 1 and {m.name for m in members} != {
+                ".", "./control", "./md5sums", "./shlibs", "./symbols", "./triggers",
+            }:
+                raise CycleRefusal("CycleCallbackChanged: libgcc-s1 must have no scripts")
+            if index == 1:
+                triggers = archive.extractfile("./triggers")
+                if triggers is None or triggers.read() != LIBGCC_TRIGGERS:
+                    raise CycleRefusal("CycleCallbackChanged: signed trigger activation changed")
+        if (fields.get("package") != package.name or fields.get("version") != package.version
+            or fields.get("architecture") != "amd64" or fields.get("depends", "") != binding[4]
+            or fields.get("pre-depends", "")):
+            raise CycleRefusal(f"CycleControlChanged: signed dependency graph: {package.name}")
+        installed = records.get((package.name, "amd64"))
+        expected = "install ok unpacked" if index < 2 else "install ok installed"
+        if installed is None or installed.get("version") != package.version:
+            raise CycleRefusal(f"CycleStateChanged: {package.name}")
+        if installed.get("status") != expected:
+            reason = "CycleStateChanged" if index < 2 else "CycleOutsideDependency"
+            raise CycleRefusal(f"{reason}: {package.name}")
+        for field in ("depends", "pre-depends", "provides", "conflicts", "breaks", "replaces",
+                      "multi-arch", "protected", "essential"):
+            if installed.get(field, "") != fields.get(field, ""):
+                raise CycleRefusal(f"CycleControlChanged: installed {package.name} {field}")
+        if any(installed.get(field) for field in ("triggers-pending", "triggers-awaited", "config-version")):
+            raise CycleRefusal(f"CycleCallbackChanged: {package.name} trigger state")
+        graph[package.name] = {"version": package.version, "archive_sha512": package.digest,
+                               "depends": binding[4], "pre_depends": "", "status": expected}
+    info = root / "var/lib/dpkg/info"
+    try:
+        installed_triggers = read_root_file(root, "var/lib/dpkg/info/libgcc-s1:amd64.triggers", 1024)
+    except (ValueError, OSError) as error:
+        raise CycleRefusal("CycleCallbackChanged: installed trigger activation missing") from error
+    if installed_triggers != LIBGCC_TRIGGERS:
+        raise CycleRefusal("CycleCallbackChanged: installed trigger activation changed")
+    if (info / "libgcc-s1.triggers").exists() or (info / "libgcc-s1.triggers").is_symlink():
+        raise CycleRefusal("CycleCallbackChanged: ambiguous installed trigger activation")
+    for script in MAINTAINER_SCRIPTS:
+        for name in ("libgcc-s1", "libgcc-s1:amd64"):
+            path = info / f"{name}.{script}"
+            if path.exists() or path.is_symlink():
+                raise CycleRefusal(f"CycleCallbackChanged: unexpected {path.name}")
+    return {"graph": graph, "records": records, "callbacks": [],
+            "trigger_database": triggers_before,
+            "status_sha512": hashlib.sha512(read_root_file(
+                root, "var/lib/dpkg/status", 4 * 1024 * 1024,
+            )).hexdigest(),
+            "profile": BASE_CYCLE_PROFILE, "force": ["--force-depends"]}
+
+
+def break_base_cycle(
+    launcher: Path, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
+) -> Package:
+    cycle = base_cycle_packages(packages, architecture)
+    before = verify_base_cycle(root, cycle)
+    command = dpkg_command(launcher, dpkg, root, architecture, BASE_CYCLE_PROFILE,
+                           "break_base_cycle", cycle[1], cycle)
+    (evidence / "base-cycle-before.json").write_text(json.dumps(
+        {**before, "records": list(before["records"].values())}, sort_keys=True,
+    ) + "\n")
+    apply(command, environment, stdout, stderr)
+    after = database_fields(root)
+    triggers_after = trigger_database(root)
+    expected = {key: dict(value) for key, value in before["records"].items()}
+    expected[("libgcc-s1", "amd64")]["status"] = "install ok installed"
+    if after != expected or triggers_after != before["trigger_database"]:
+        raise CycleRefusal("CycleNoProgress: database changed beyond the one reviewed transition")
+    (evidence / "base-cycle-after.json").write_text(json.dumps({
+        "operation": command[3:], "callbacks": [], "status": "install ok installed",
+        "trigger_database": triggers_after,
+        "status_sha512": hashlib.sha512(read_root_file(
+            root, "var/lib/dpkg/status", 4 * 1024 * 1024,
+        )).hexdigest(),
+        "records": list(after.values()),
+    }, sort_keys=True) + "\n")
+    return cycle[1]
+
+
+def prove_base_cycle(
+    launcher: Path, dpkg: Path, root: Path, cache: Path, evidence: Path, setpriv: Path,
+) -> None:
+    """A four-package pending oracle, never a pending operation on the full closure."""
+    if os.uname().machine != "x86_64" or database_packages(root):
+        raise CycleRefusal("CycleProofPrestate: requires a fresh empty amd64 database")
+    protected(root, directory=True)
+    protected(setpriv)
+    if hashlib.sha256(setpriv.read_bytes()).hexdigest() != (
+        "86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993"
+    ):
+        raise CycleRefusal("CycleProofRuntimeChanged: signed setpriv")
+    cycle = base_cycle_packages(packages_from_manifest(evidence / "reference-archives.tsv", cache), "amd64")
+    proof = evidence / "base-cycle-proof"
+    proof.mkdir(mode=0o700)
+    environment = oracle_environment()
+    seed = proof / "seed"
+    subprocess.run(["cp", "-a", "--one-file-system", "--", str(root), str(seed)],
+                   check=True, timeout=60)
+    stdout, stderr = proof / "unpack.stdout", proof / "unpack.stderr"
+    for package in (cycle[2], cycle[3], cycle[0], cycle[1]):
+        verify_archive(package)
+        apply(dpkg_command(launcher, dpkg, seed, "amd64", "none", "unpack", package),
+              environment, stdout, stderr)
+    for package in cycle[2:]:
+        apply(dpkg_command(launcher, dpkg, seed, "amd64", "none", "configure", package),
+              environment, stdout, stderr)
+    verify_base_cycle(seed, cycle)
+    for package in cycle[:2]:
+        status, output = probe(dpkg_command(launcher, dpkg, seed, "amd64", "none",
+                                           "probe_configure", package), environment, proof)
+        if status == 0 or b"dependency problems" not in output:
+            raise CycleRefusal("CycleProofMissingStall: single configure did not refuse")
+    candidate, baseline = proof / "candidate", proof / "pending"
+    for destination in (candidate, baseline):
+        subprocess.run(["cp", "-a", "--one-file-system", "--", str(seed), str(destination)],
+                       check=True, timeout=60)
+    refused_command = dpkg_command(launcher, dpkg, candidate, "amd64", BASE_CYCLE_PROFILE,
+                                   "break_base_cycle", cycle[1], cycle)
+    before_refusal = database_fields(candidate)
+    before_triggers = trigger_database(candidate)
+    injected = candidate / "var/lib/dpkg/info/libgcc-s1:amd64.postinst"
+    injected.write_text("#!/bin/sh\necho unbound-cycle-callback-executed\nexit 0\n")
+    injected.chmod(0o755)
+    try:
+        status, output = probe(refused_command, environment, proof)
+        if (status == 0 or b"unbound-cycle-callback-executed" in output
+            or b"stage 11" not in output or database_fields(candidate) != before_refusal
+            or trigger_database(candidate) != before_triggers):
+            raise CycleRefusal("CycleProofCallbackChanged: launcher mutation did not refuse before exec")
+    finally:
+        injected.unlink()
+    (proof / "callback-refusal.log").write_bytes(output)
+    break_base_cycle(launcher, dpkg, candidate, proof, "amd64", list(cycle),
+                     environment, proof / "candidate.stdout", proof / "candidate.stderr")
+    if len(database_packages(baseline)) != 4:
+        raise CycleRefusal("CycleProofCallbackChanged: oracle pending set is not exactly four")
+    verify_base_cycle(baseline, cycle)
+    scripts = [baseline / f"var/lib/dpkg/info/{name}.postinst"
+               for name in ("libc6", "libc6:amd64")]
+    script, = [path for path in scripts if path.exists()]
+    signed_control = subprocess.check_output(["dpkg-deb", "--ctrl-tarfile", str(cycle[0].archive)],
+                                             env=environment, timeout=30)
+    with tarfile.open(fileobj=io.BytesIO(signed_control)) as archive:
+        signed_script = archive.extractfile("./postinst")
+        signed_bytes = signed_script.read() if signed_script else b""
+        if not signed_bytes or read_root_file(
+            baseline, str(script.relative_to(baseline)), MAXIMUM_PROBE_OUTPUT,
+        ) != signed_bytes:
+            raise CycleRefusal("CycleProofCallbackChanged: libc6 postinst")
+    # The only pending callback is denied before exec, not merely audited afterwards.
+    shutil.copyfile(dpkg, baseline / "usr/bin/dpkg")
+    shutil.copyfile(setpriv, baseline / "usr/bin/setpriv")
+    (baseline / "usr/bin/setpriv").chmod(0o755)
+    subprocess.run(["mount", "--bind", "--", str(script), str(script)], check=True, timeout=30)
+    try:
+        subprocess.run(["mount", "-o", "remount,bind,ro,noexec,nosuid,nodev", "--", str(script)],
+                       check=True, timeout=30)
+        command = [
+            "unshare", "--mount", "--pid", "--fork", "--kill-child=SIGKILL",
+            "--propagation", "private", "--", "chroot", str(baseline),
+            "/usr/bin/setpriv",
+            "--bounding-set=-all,+chown,+dac_override,+fowner,+fsetid,+setgid,+setuid,+setfcap",
+            "--inh-caps=-all", "--ambient-caps=-all", "--no-new-privs",
+            "/usr/bin/dpkg", "--root=/", "--force-not-root", "--force-bad-path",
+            "--force-confold", "--no-triggers", "--configure", "--pending",
+        ]
+        result = subprocess.run(command, env=environment, stdin=subprocess.DEVNULL,
+                                capture_output=True, check=False, timeout=120)
+    finally:
+        subprocess.run(["umount", "--", str(script)], check=True, timeout=30)
+    if (len(result.stdout) > MAXIMUM_PROBE_OUTPUT or len(result.stderr) > MAXIMUM_PROBE_OUTPUT
+        or result.returncode == 0 or b"Permission denied" not in result.stderr
+        or b"post-installation script" not in result.stderr):
+        raise CycleRefusal("CycleProofCallbackChanged: libc6 callback was not denied")
+    if read_root_file(baseline, str(script.relative_to(baseline)), MAXIMUM_PROBE_OUTPUT) != signed_bytes:
+        raise CycleRefusal("CycleProofCallbackChanged: denied libc6 postinst changed")
+    (proof / "pending.stdout").write_bytes(result.stdout)
+    (proof / "pending.stderr").write_bytes(result.stderr)
+    observed = database_packages(baseline)
+    wanted = database_packages(candidate)
+    expected = dict(wanted)
+    expected[("libc6", "amd64")] = ("install ok half-configured", cycle[0].version)
+    if observed != expected:
+        raise CycleRefusal(f"CycleProofScheduleChanged: {observed!r}")
+    (proof / "comparison.json").write_text(json.dumps({
+        "schema": "io.github.cataggar.debz.base-cycle-proof.v1",
+        "callbacks_executed": [], "callback_denied": "libc6 postinst configure",
+        "candidate": list(database_fields(candidate).values()),
+        "pending": list(database_fields(baseline).values()),
+        "candidate_trigger_database": trigger_database(candidate),
+        "pending_trigger_database": trigger_database(baseline),
+        "pending_argv": command,
+        "difference": "pending attempts libc6 configure; single breaker leaves libc6 unpacked",
+        "parity_claim": False,
+    }, sort_keys=True) + "\n")
+    for destination in (seed, candidate, baseline):
+        subprocess.run(["rm", "-rf", "--one-file-system", "--", str(destination)],
+                       check=True, timeout=60)
 
 
 @dataclass(frozen=True)
@@ -397,6 +703,7 @@ def install(
     stdout = evidence / "reference-install.stdout"
     stderr = evidence / "reference-install.stderr"
     probes = 0
+    cycle_broken = False
     while pending or unpacked:
         progressed = False
         deferred: list[str] = []
@@ -451,8 +758,19 @@ def install(
             configured.add((package.name, package.architecture))
             progressed = True
         if not progressed:
-            raise RuntimeError(
-                "reference dependency ordering stalled; ambiguous --configure --pending "
+            if not cycle_broken:
+                if base_cycle_packages(packages, architecture)[1] not in unpacked:
+                    raise CycleRefusal("CycleStateChanged: selected member is not unpacked")
+                selected = break_base_cycle(
+                    launcher, dpkg, root, evidence, architecture, packages,
+                    environment, stdout, stderr,
+                )
+                unpacked.remove(selected)
+                configured.add((selected.name, selected.architecture))
+                cycle_broken = True
+                continue
+            raise CycleRefusal(
+                "CycleNoProgress: reference dependency ordering stalled; ambiguous --configure --pending "
                 "is not authorized: " + ", ".join(deferred[:20])
             )
     if targets:
@@ -498,6 +816,7 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--prove-base-cycle", type=Path, metavar="SIGNED_SETPRIV")
     parser.add_argument("--launcher", type=Path)
     parser.add_argument("--architecture", choices=("amd64", "arm64"), required=True)
     parser.add_argument("--report-only", action="store_true")
@@ -518,6 +837,12 @@ def main() -> None:
     protected(args.dpkg)
     protected(args.cache, directory=True)
     protected(args.evidence, directory=True)
+    if args.prove_base_cycle is not None:
+        if args.architecture != "amd64" or args.prestate:
+            raise CycleRefusal("CycleProofPrestate: requires amd64 and no capture targets")
+        prove_base_cycle(args.launcher, args.dpkg, args.root, args.cache, args.evidence,
+                         args.prove_base_cycle)
+        return
     install(
         args.launcher, args.dpkg, args.root, args.cache, args.evidence,
         args.architecture, tuple(args.prestate),

@@ -226,6 +226,21 @@ launcher=$tools/reference-launcher
 chmod 0500 "$launcher"
 require_protected_file "$launcher"
 
+# This oracle has only the four reviewed packages registered. Its one possible
+# libc6 callback is denied before exec; --pending is never used on the closure.
+dpkg-deb --fsys-tarfile "$util_linux" | tar -xO ./usr/bin/setpriv >"$tools/setpriv"
+chmod 0755 "$tools/setpriv"
+[[ $(sha256sum "$tools/setpriv" | cut -d' ' -f1) == "$setpriv_sha256" ]]
+sha256sum "$tools/setpriv" >"$tools/setpriv.sha256"
+env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
+  unshare --mount --propagation private -- \
+  timeout --signal=TERM --kill-after=30s 5m \
+  python3 tools/real-snapshot-reference-order.py \
+    --launcher "$launcher" --architecture amd64 \
+    --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
+    --prove-base-cycle "$tools/setpriv"
+[[ -s "$evidence/base-cycle-proof/comparison.json" ]]
+
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
   timeout --signal=TERM --kill-after=30s 20m \
@@ -306,13 +321,6 @@ install -d -o root -g root -m 0755 "$prestates/udev/dev/snd"
 for node in dev/kvm dev/fuse dev/snd/seq; do
   install -o root -g root -m 0600 /dev/null "$prestates/udev/$node"
 done
-
-# Reference-only: the pinned-dpkg proof harnesses drop CAP_SYS_ADMIN with the
-# closure's setpriv, which util-linux has not unpacked yet in these states.
-dpkg-deb --fsys-tarfile "$util_linux" | tar -xO ./usr/bin/setpriv >"$tools/setpriv"
-chmod 0755 "$tools/setpriv"
-[[ $(sha256sum "$tools/setpriv" | cut -d' ' -f1) == "$setpriv_sha256" ]]
-sha256sum "$tools/setpriv" >"$tools/setpriv.sha256"
 
 printf 'SIGNED_SYSTEMD_PRESTATE=%s\nSIGNED_UDEV_PRESTATE=%s\nSIGNED_SUDO_PRESTATE=%s\nREFERENCE_SETPRIV=%s\n' \
   "$prestates/systemd" "$prestates/udev" "$prestates/sudo" "$tools/setpriv" \

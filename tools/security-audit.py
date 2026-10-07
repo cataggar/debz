@@ -2946,6 +2946,168 @@ def native_recovery_ci_failures(text: str) -> list[str]:
     return failures
 
 
+SIGNED_PROC_CI_JOB = (
+    "    name: Signed proc replay in protected amd64 roots (${{ matrix.optimize }})",
+    "    runs-on: ubuntu-24.04",
+    "    timeout-minutes: 35",
+    "      fail-fast: false",
+    "        optimize: [Debug, ReleaseSafe]",
+    "      OPTIMIZE: ${{ matrix.optimize }}",
+    "      PROTECTED: /srv/debz-protected/signed-proc",
+    "      UBUNTU_ARCHIVE_KEYRING_SHA256: 80a36b0a6de2f69f49d2df75ef473ccde121e9e190b9ea01d20a4f63778d5c31",
+)
+SIGNED_PROC_CI_STEPS = {
+    "Install Zig via ghr": (),
+    "Validate Zig version": ('        run: test "$(zig version)" = 0.16.0',),
+    "Bind the reviewed commit to a hosted amd64 runner": (
+        '          test "$RUNNER_ARCH" = X64',
+        '          test "$(uname -m)" = x86_64',
+        '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+        '          test ! -e "$PROTECTED" && test ! -L "$PROTECTED"',
+    ),
+    "Install metadata decompression dependency": (),
+    "Prepare pinned dpkg as the runner user": (
+        '          reference_dpkg="$(python3 tools/prepare-native-dpkg.py --architecture amd64)"',
+        '          test "$reference_dpkg" = "$PWD/.cache/native-dpkg-reference/1.22.22/amd64/usr/bin/dpkg"',
+    ),
+    "Refuse unprotected and incomplete signed replay inputs": (
+        "          set -euo pipefail",
+        "          grep -Fq 'prestate path is writable by an unprivileged user' .tmp/unprotected-prestates.log",
+        "          grep -Fq 'fixture path is writable by an unprivileged user' .tmp/unprotected-bindings.log",
+        "          grep -Fq 'signed proc replay requires -Dsigned-systemd-proc-root' .tmp/missing-roots.log",
+        "          grep -Fq 'three distinct absolute disposable root paths' .tmp/relative-roots.log",
+    ),
+    "Stage the reviewed commit, Zig and pinned dpkg under root-owned ancestry": (
+        "          set -euo pipefail",
+        "          git -c tar.umask=0022 archive --format=tar -o .tmp/protected-checkout.tar HEAD",
+        '          sudo -n tar -C "$PROTECTED/checkout" --no-same-owner -xf "$PROTECTED/checkout.tar"',
+        "          sudo -n install -o root -g root -m 0644 /usr/share/keyrings/ubuntu-archive-keyring.gpg \\",
+        '            <<<"$UBUNTU_ARCHIVE_KEYRING_SHA256  $PROTECTED/keyrings/ubuntu-archive-keyring.gpg"',
+        '          sudo -n chmod -R go-w "$PROTECTED"',
+        '          sudo -n find "$PROTECTED" -xdev \\( ! -uid 0 -o ! -gid 0 -o -perm /022 \\) ! -type l \\',
+        "          test ! -s .tmp/protected-writable.txt",
+        '          for path in / /srv /srv/debz-protected "$PROTECTED"; do',
+        "            test \"$(stat -c '%u:%g' \"$path\")\" = 0:0",
+        "            test $(( 8#$(stat -c '%a' \"$path\") & 022 )) -eq 0",
+        '          sudo -n cmp -- "$zig_binary" "$PROTECTED/zig/zig"',
+        '            --verify-only "$PROTECTED/checkout/.real-snapshot/pinned-dpkg/usr/bin/dpkg"',
+    ),
+    "Build the protected snapshot client": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "            zig build -Doptimize=Debug -j2 --summary all",
+    ),
+    "Authenticate the snapshot closure and generate fresh signed prestates": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        '            DEBZ_REAL_SNAPSHOT_KEYRING="$PROTECTED/keyrings/ubuntu-archive-keyring.gpg" \\',
+        '            tools/real-snapshot-signed-proc-bindings.sh "$PWD/zig-out/bin/debz" \\',
+        "            tools/real-snapshot-signed-proc-prestates.sh \\",
+        '            "$PWD/.real-snapshot/pinned-dpkg/usr/bin/dpkg" "$PWD/.real-snapshot/ws"',
+        '          sudo -n test -s "$PWD/.real-snapshot/ws/prestate-build/evidence/base-cycle-proof/comparison.json"',
+    ),
+    "Run pinned dpkg proofs on separate prestate copies": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        '                cp -a -- "$ws/prestates/$target" "$ws/native/$target"',
+        '                cp -a -- "$ws/prestates/$target" "$ws/proof-sources/$target"',
+        '              ln -sfn -- sudo.ws "$ws/native/sudo/usr/bin/sudoedit"',
+        '              ln -sfn -- sudo.ws.8.gz "$ws/native/sudo/usr/share/man/man8/sudoedit.8.gz"',
+        '              test "$(readlink -- "$ws/native/sudo/usr/bin/sudoedit")" = sudo.ws',
+        '              test "$(readlink -- "$ws/native/sudo/usr/share/man/man8/sudoedit.8.gz")" = sudo.ws.8.gz',
+        '              tools/real-snapshot-systemd-proc-reference.sh "$pinned" \\',
+        '                "$ws/proof-sources/systemd" "$ws/proofs/systemd"',
+        '              tools/real-snapshot-udev-reference.sh "$pinned" \\',
+        '                "$ws/proof-sources/udev" "$ws/proofs/udev"',
+        '              tools/real-snapshot-sudo-reference.sh "$pinned" \\',
+        '                "$ws/proof-sources/sudo" "$ws/proofs/sudo"',
+    ),
+    "Replay signed systemd, udev and sudo postinsts natively without skips": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "          set -euo pipefail",
+        '            zig build test-native-signed-proc -Doptimize="$OPTIMIZE" -j2 --summary all \\',
+        '              -Dsigned-systemd-proc-root="$ws/native/systemd" \\',
+        '              -Dsigned-udev-proc-root="$ws/native/udev" \\',
+        '              -Dsigned-sudo-proc-root="$ws/native/sudo" \\',
+        '          test "${status:-0}" -eq 0',
+        "          grep -Fxq 'All 4 tests passed.' \"$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log\"",
+        "          for name in 'systemd postinst uses scoped masked proc' \\",
+        "            'udev postinst uses only PID proc and applies static permissions' \\",
+        "            'sudo postinst repairs only pinned alternatives with PID-only proc'; do",
+        '            grep -Fq "maintainer_script.test.signed $name...OK" "$GITHUB_WORKSPACE/.tmp/signed-proc-replay.log"',
+    ),
+    "Compare native replays with pinned dpkg proofs": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "              python3 -m unittest tools/test_real_snapshot_signed_proc_compare.py",
+        "              for target in systemd udev sudo; do",
+        '                python3 tools/real-snapshot-signed-proc-compare.py "$target" \\',
+        '                  "$ws/native/$target" "$ws/proofs/$target" "$ws/compare/$target.json"',
+    ),
+    "Execute signed binding refusal fixtures": (
+        "        working-directory: ${{ env.PROTECTED }}/checkout",
+        "          set -euo pipefail",
+        "            DEBZ_REQUIRE_NATIVE_HELPER_NAMESPACE=1 \\",
+        '            sh "$PWD/.real-snapshot/ws/bindings.env" "$OPTIMIZE" \\',
+        '          test "${status:-0}" -eq 0',
+        "          grep -Eq 'run test [0-9]+ pass, 3 skip \\([0-9]+ total\\)' "
+        '"$GITHUB_WORKSPACE/.tmp/signed-bindings.log"',
+    ),
+    "Copy bounded evidence and remove named protected roots": (
+        "        if: ${{ always() }}",
+        "          set -euo pipefail",
+        '          if grep -F "$PROTECTED" .tmp/signed-proc-mounts.txt; then',
+        '          sudo -n rm -rf --one-file-system -- "$PROTECTED"',
+        '          test ! -e "$PROTECTED"',
+        "                prestate-build/evidence/base-cycle-before.json \\",
+        "                prestate-build/evidence/base-cycle-after.json \\",
+        "                prestate-build/evidence/base-cycle-proof/comparison.json \\",
+    ),
+    "Upload bounded signed replay evidence": (
+        "        if: ${{ always() }}",
+        "          if-no-files-found: error",
+    ),
+}
+
+
+def signed_proc_ci_failures(text: str) -> list[str]:
+    """Require the hosted amd64 non-skipped signed proc replay job as reviewed.
+
+    The job is deliberately outside the required aggregate: the pinned
+    snapshot's Valid-Until and the #262 repin change the signed identities.
+    """
+    jobs = dict(re.findall(
+        r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+        text,
+    ))
+    body = jobs.get("signed-proc-protected-replay", "")
+    lines = body.splitlines()
+    failures = []
+    if (
+        any(line not in lines for line in SIGNED_PROC_CI_JOB)
+        or re.search(r"(?m)^    (if|needs|continue-on-error):", body)
+        or re.search(r"(?m)^        (include|exclude):", body)
+        or "continue-on-error" in body
+    ):
+        failures.append("ci.yml: signed proc replay job must run both modes on hosted amd64 within 35 minutes")
+    steps = re.findall(r"(?ms)^      - name: ([^\n]+)\n(.*?)(?=^      - |\Z)", body)
+    if [name for name, _ in steps] != list(SIGNED_PROC_CI_STEPS):
+        failures.append("ci.yml: signed proc replay steps changed from the reviewed sequence")
+    for name, step_body in steps:
+        required = SIGNED_PROC_CI_STEPS.get(name, ())
+        step_lines = step_body.splitlines()
+        conditions = [line for line in step_lines if re.match(r"^        if:", line)]
+        if (
+            any(line not in step_lines for line in required)
+            or conditions not in ([], ["        if: ${{ always() }}"])
+            or (conditions and "        if: ${{ always() }}" not in required)
+            or any(
+                not 1 <= int(minutes) <= 25
+                for minutes in re.findall(r"(?m)^        timeout-minutes: ([0-9]+)$", step_body)
+            )
+        ):
+            failures.append(f"ci.yml: signed proc replay step changed: {name}")
+    if "--report-only" in body or "DEBZ_REQUIRE_SIGNED_PROC_ROOTS=0" in body:
+        failures.append("ci.yml: signed proc replay comparison and roots must fail closed")
+    return failures
+
+
 REPORT_PATH_ORACLE_FILES = (
     "test/native_recovery_oracle.zig",
     "test/native_recovery_unit.zig",
@@ -4109,7 +4271,9 @@ def audit_ci_pins() -> None:
                 for path in PROTECTED_REFERENCE_PATHS if (ROOT / path).is_file()
             }):
                 fail(failure)
-        expected_ghr_installs = {"ci.yml": 20, "release.yml": 1}.get(workflow.name)
+            for failure in signed_proc_ci_failures(text):
+                fail(failure)
+        expected_ghr_installs = {"ci.yml": 21, "release.yml": 1}.get(workflow.name)
         if expected_ghr_installs is not None:
             for failure in ghr_zig_workflow_failures(
                 text, str(relative), expected_ghr_installs
@@ -5066,7 +5230,7 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
             return 2
         failures = actions_native_only_candidate_failures(action, texts)
     elif kind == "ghr-ci":
-        failures = ghr_zig_workflow_failures(text, "ci.yml", 20)
+        failures = ghr_zig_workflow_failures(text, "ci.yml", 21)
     elif kind == "ghr-release":
         failures = ghr_zig_workflow_failures(text, "release.yml", 1)
     elif kind == "workflow-failure":
@@ -5077,6 +5241,8 @@ def check_policy_input(kind: str, input_path: pathlib.Path) -> int:
         failures = native_recovery_ci_failures(text)
     elif kind == "workload-build":
         failures = workload_partition_failures(text)
+    elif kind == "ci-signed-proc":
+        failures = signed_proc_ci_failures(text)
     elif kind in {
         "native-core", "native-final", "native-entry", "native-consumer",
         "native-repository", "native-workflow", "native-report",
