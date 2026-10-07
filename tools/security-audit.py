@@ -2548,6 +2548,11 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real-snapshot-reference.sh",
     "tools/real_snapshot_reference_paths.py",
     "tools/real_snapshot_outcome.py",
+    "tools/real-snapshot-python3-protected-stage.sh",
+    "tools/real-snapshot-python3-reference.sh",
+    "tools/real-snapshot-signed-proc-prestates.sh",
+    "src/native_unpack.zig",
+    "src/native_alternatives.zig",
 )
 PROTECTED_REFERENCE_INPUT = (
     '      run_protected_reference:\n'
@@ -2564,8 +2569,9 @@ PROTECTED_REFERENCE_HEADER = (
     '    runs-on: ${{ matrix.runner }}\n'
     '    # Root-run staging: Zig download and package fetch 5, debz build 15,\n'
     '    # snapshot staging 15, preflight refusals 5 and the proof 45 (its own\n'
-    '    # timeout), leaving 5 for evidence, upload and cleanup.\n'
-    '    timeout-minutes: 90\n'
+    '    # timeout), plus amd64 Python staging/replay 40 and Zig guards 10,\n'
+    '    # leaving 5 for evidence, upload and cleanup.\n'
+    '    timeout-minutes: 140\n'
     '    strategy:\n'
     '      fail-fast: false\n'
     '      matrix:\n'
@@ -2585,7 +2591,7 @@ PROTECTED_REFERENCE_HEADER = (
 
 PROTECTED_REFERENCE_BOOTSTRAP = (
     '      - name: Stage the reviewed commit in a root-owned tree and run the protected proof\n'
-    '        timeout-minutes: 80\n'
+    '        timeout-minutes: 130\n'
     '        run: |\n'
     '          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"\n'
     '          test -z "$(git status --porcelain)"\n'
@@ -2717,7 +2723,7 @@ PROTECTED_REFERENCE_SCRIPT_TOKENS = (
     'require_root_owned_file("staged-keyring", target, target_stat, 0o644)',
     "os.unlink(target)",
     'staged_archive_keyring=\nstage_verified_archive_keyring\nreadonly staged_archive_keyring',
-    '"DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
+    'step stage 0 "" "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
     'step tree-final 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"',
     "mutable=$negatives/mutable-ancestor\n[[ ! -e \"$mutable\" && ! -L \"$mutable\" ]]\ninstall -d -o root -g root -m 0777 \"$mutable\"",
     'negative mutable-ancestor "writable or non-root ancestor" \\',
@@ -2772,6 +2778,50 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'if command_status is None:',
         '"id": f"native_acceptance_evidence_{kind}"',
     ),
+    "tools/real-snapshot-python3-protected-stage.sh": (
+        '$(id -u) == 0 && $(id -g) == 0 && $(uname -m) == x86_64',
+        '"$workspace" == "$checkout/.real-snapshot/python3-amd64"',
+        'toolchain(Path(sys.argv[3]))',
+        '--check-keyring "$DEBZ_REAL_SNAPSHOT_KEYRING"',
+        'bash tools/real-snapshot-signed-proc-bindings.sh "$debz" "$workspace"',
+        'bash tools/real-snapshot-signed-proc-prestates.sh --python3 "$pinned" "$workspace"',
+        'protected(root / "dev", directory=True)',
+        'protected(root / "proc", directory=True)',
+        'not stat.S_ISCHR(meta.st_mode) or meta.st_rdev != os.makedev(1, 3)',
+        'os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW',
+        'for mode in 0600 0644; do',
+        'bash tools/real-snapshot-python3-reference.sh "$pinned" "$input" "$lock" "$archive"',
+        '"-Dpython3-reference-root-py3compile=$after-py3compile-before"',
+        '"-Dpython3-reference-after-py3compile=$after-py3compile-after"',
+        '"-Dpython3-reference-bad-minimal-compiler=$after-py3compile-bad-compiler"',
+        '"-Dpython3-reference-inputs-proof=$evidence/inputs-proof.txt"',
+        '"-Dpython3-reference-alternatives-proof=$evidence/alternatives-proof.txt"',
+        'bytes <= 16 * 1024 * 1024 * 1024',
+    ),
+    "tools/real-snapshot-python3-reference.sh": (
+        'require_protected_file "$source_root/dev/null"',
+        '0:0:600:0:1',
+        '0:0:644:0:1',
+        '0:0:644:20:1',
+        """[[ $(stat -c '%u:%g:%a:%s:%h' "$py3compile_after/dev/null") == 0:0:644:96:1 ]]""",
+        'e212fd644ebc9508a5494c1d69e26c62e23b5695d797588603dd870af154751e',
+        '[[ $(sha256sum "$py3compile_after/dev/null" | cut -d\' \' -f1) == \\\n'
+        '  3b74c3d36b39899791526ce6546cf74a38d042c28ebdd023828d17b100cdccbc ]]',
+    ),
+    "tools/real-snapshot-signed-proc-prestates.sh": (
+        'if [[ ${1:-} == --python3 ]]; then',
+        '--zig-lib-dir "$(dirname -- "$zig")/lib"',
+        '--prestate "python3:amd64=unpacked:$prestates/python3"',
+        'protected Python pre-configure source captured; no full reference completion claimed',
+    ),
+    "src/native_unpack.zig": (
+        'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_INPUTS_PROOF")',
+        'signed Python empty0600/0644 and amd64 20/96 input/output guards executed without skips',
+    ),
+    "src/native_alternatives.zig": (
+        'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_ALTERNATIVES_PROOF")',
+        'signed Python alternatives records and selectors executed without skips',
+    ),
     "tools/real-snapshot-reference.sh": (
         "unset ZIG_LIB_DIR",
         'zig=${DEBZ_ZIG:-$(command -v zig || true)}',
@@ -2789,6 +2839,18 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         "if not target.is_relative_to(library):",
     ),
     "build.zig": (
+        'b.step("test-real-snapshot-python3-protected",',
+        'run_python3_reference_tests.has_side_effects = true;',
+        'run_python3_alternatives_tests.has_side_effects = true;',
+        'python3_reference_step.dependOn(&run_python3_reference_tests.step);',
+        'python3_reference_step.dependOn(&run_python3_alternatives_tests.step);',
+        '"native_unpack.test.protected signed python3 inputs and redirected tool witness are exact"',
+        '"native_alternatives.test.protected signed python3 preinst preserves all records and selectors"',
+        'for (python3_coordinates, &python3_values)',
+        'for (python3_coordinates, python3_values)',
+        '"Required protected Python proof coordinate") orelse ""',
+        'b.fmt("DEBZ_REQUIRE_SIGNED_PYTHON3_{s}", .{coordinate.environment}),\n'
+        '            value.*,',
         '        "--profile-scripts",\n'
         '        b.option([]const u8, "reference-protected-profile-scripts", ',
         'b.step("test-real-snapshot-reference-protected", ',
@@ -2834,6 +2896,57 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
 def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     """The protected reference job stages only reviewed, root-owned inputs and cannot skip."""
     failures: list[str] = []
+    python_ci = texts.get("tools/real-snapshot-reference-protected-ci.sh", "")
+    python_start = 'if [[ $architecture == amd64 ]]; then\n  python3_workspace='
+    python_end = '\n# The protected proof on the staged new empty workspace'
+    python_body = python_ci.partition(python_start)[2].partition(python_end)[0]
+    for token in (
+        '$checkout/.real-snapshot/python3-amd64',
+        'step python3-stage 0 "all 18 root coordinates staged" timeout --signal=TERM --kill-after=60s 40m',
+        '"DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring"',
+        'bash tools/real-snapshot-python3-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz"',
+        '[[ ${#python3_arguments[@]} == 20 ]]',
+        'step python3-guards 0 "" timeout --signal=TERM --kill-after=60s 10m',
+        '"$zig" build test-real-snapshot-python3-protected "${python3_arguments[@]}"',
+        '-Doptimize=ReleaseSafe -j2 --summary all',
+        '"$python3_workspace/evidence/inputs-proof.txt"',
+        '"$python3_workspace/evidence/alternatives-proof.txt"',
+        'grep -F " $python3_workspace" /proc/self/mountinfo',
+        'rm -rf --one-file-system -- "$python3_workspace"',
+    ):
+        if token not in python_body:
+            failures.append(f"protected amd64 Python activation lost {token}")
+    if ("|| true" in python_body or "SkipZigTest" in python_body or
+            "test-integration-arm64" in python_body):
+        failures.append("protected Python activation must not skip, swallow errors or activate ARM397")
+    for path, name, tokens in (
+        ("src/native_unpack.zig",
+         "native_unpack.test.protected signed python3 inputs and redirected tool witness are exact", (
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, before.root, &program);",
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, before_0644.root, &program);",
+             "try verifySnapshotPython3PreinstInputs(testing.allocator, before_py3compile.root, &program);",
+             "try verifySnapshotPython3NullOutput(testing.allocator, after.root);",
+             "try verifySnapshotPython3NullOutput(testing.allocator, after_0644.root);",
+             "try verifySnapshotPython3NullOutput(testing.allocator, after_py3compile.root);",
+             "error.DirectoryTooLarge",
+             'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_INPUTS_PROOF")',
+             ".exclusive = true",
+             "try proof.writeStreamingAll(",
+         )),
+        ("src/native_alternatives.zig",
+         "native_alternatives.test.protected signed python3 preinst preserves all records and selectors", (
+             "try validateScriptInputs(",
+             "try validateScriptTransition(",
+             "try testing.expectEqualSlices(u8, old_record, new_record);",
+             'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_ALTERNATIVES_PROOF")',
+             ".exclusive = true",
+             "try proof.writeStreamingAll(",
+         )),
+    ):
+        body = texts.get(path, "").partition(f'test "{name}" {{')[2].partition('\ntest "')[0]
+        for token in tokens:
+            if token not in body:
+                failures.append(f"{path}: protected Python test body lost {token}")
     ci = texts.get(".github/workflows/ci.yml", "")
     jobs = dict(re.findall(
         r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)", ci,

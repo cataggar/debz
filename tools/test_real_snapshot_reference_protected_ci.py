@@ -247,6 +247,35 @@ class ProfileStagingTests(unittest.TestCase):
 
 
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_python_input_receipt_requires_actual_strict_root_assertions(self) -> None:
+        audit = load("debz_python_activation_policy", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        path = "src/native_unpack.zig"
+        # This source exceeds the generic mutation CLI's 1 MiB input cap.
+        # Exercise the same real policy directly; do not widen that cap.
+        for token in (
+            "    try verifySnapshotPython3PreinstInputs(testing.allocator, before_py3compile.root, &program);\n",
+            "    try verifySnapshotPython3NullOutput(testing.allocator, after_py3compile.root);\n",
+            '        try proof.writeStreamingAll(testing.io, "signed Python empty0600/0644 '
+            'and amd64 20/96 input/output guards executed without skips\\n");\n',
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, texts[path])
+                changed = dict(texts)
+                changed[path] = texts[path].replace(token, "", 1)
+                self.assertTrue(any("protected Python test body lost" in failure for failure in
+                                    audit.protected_reference_ci_failures(changed)))
+
+    def test_python_activation_refuses_unprivileged_or_incomplete_staging(self) -> None:
+        script = TOOLS / "real-snapshot-python3-protected-stage.sh"
+        for arguments in ((), ("/usr/bin/zig", "/usr/bin/debz", "/usr/bin/dpkg",
+                               str(TOOLS.parent / ".real-snapshot/python3-amd64"))):
+            result = subprocess.run(["bash", str(script), *arguments], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertNotIn("coordinates staged", result.stdout)
+
     def test_refuses_outside_its_root_owned_tree(self) -> None:
         script = TOOLS / "real-snapshot-reference-protected-ci.sh"
         for arguments in ((), ("/srv/debz-protected/ci-1-1-amd64", "arm64", "0" * 40),

@@ -2262,6 +2262,10 @@
         {
           "form": "hex",
           "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-python3-protected-stage.sh"
         }
       ],
       "derived_from": [
@@ -2296,6 +2300,10 @@
         {
           "form": "hex",
           "path": "src/native_unpack.zig"
+        },
+        {
+          "form": "hex",
+          "path": "tools/real-snapshot-python3-protected-stage.sh"
         },
         {
           "form": "hex",

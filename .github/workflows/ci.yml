@@ -2372,8 +2372,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Root-run staging: Zig download and package fetch 5, debz build 15,
     # snapshot staging 15, preflight refusals 5 and the proof 45 (its own
-    # timeout), leaving 5 for evidence, upload and cleanup.
-    timeout-minutes: 90
+    # timeout), plus amd64 Python staging/replay 40 and Zig guards 10,
+    # leaving 5 for evidence, upload and cleanup.
+    timeout-minutes: 140
     strategy:
       fail-fast: false
       matrix:
@@ -2390,7 +2391,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Stage the reviewed commit in a root-owned tree and run the protected proof
-        timeout-minutes: 80
+        timeout-minutes: 130
         run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"

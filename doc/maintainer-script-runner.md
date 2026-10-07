@@ -755,6 +755,30 @@ This extended positive replay remains a privileged/hosted acceptance gate;
 an unprivileged test pass does not prove it. Full #393/#262 closure and
 character-device `/dev/null` parity remain separate.
 
+The amd64 `protected-reference` lane now activates that gate. It stages an
+independent `.real-snapshot/python3-amd64` workspace using the same protected
+checkout, package-derived keyring, absolute compiler and pinned dpkg. The
+existing authenticated-closure/prestate producer captures the Python root
+before configure; it does not change reference configure semantics or claim
+full reference completion. New disposable copies supply the original empty
+0600/0644 sinks. The signed helper derives the separate 20-byte input by running
+the original minimal callback and proves the unchanged 96-byte output against
+both the script and pinned dpkg.
+
+All six positive before/after roots and twelve negative roots are mandatory
+coordinates for `zig build test-real-snapshot-python3-protected`. The target
+forces its environment even when options are missing, so the optional unit
+tests cannot return early and masquerade as activation. Both actual Zig test
+bodies must write new exclusive proof receipts after their assertions; the
+protected caller verifies those receipts, not test/skip counts. Staging/replay
+and Zig verification are separately bounded to 40 and 10 minutes. Missing
+source prerequisites, cycle/profile refusals or wrong root/control bytes fail
+the lane. The regular-file fixture conversion never resets a native root.
+
+This wiring is local implementation, not evidence of a passing hosted replay.
+The protected job remains skipped on ordinary PR runs and requires the parent's
+explicit dispatch after capacity release. ARM397 replay is not activated.
+
 ### Resolute arm64 Python input-binding prerequisite (#393)
 
 The inner Python preinst verifier selects an exact **target-architecture**

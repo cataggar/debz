@@ -169,7 +169,7 @@ proof. The bounded replacement refuses shared/unprotected checkouts,
 unknown or multi-package/pending script operations, and unsupported arm64
 script profiles. Hosted checkout staging, mode-0700 root-owned workspace
 and cleanup, small protected namespace tests, arm64 signed profiles and
-more than the current 90-minute job budget require separate review before
+the protected full-reference execution require separate review before
 re-enabling the full opt-in reference run. No retained failed root may be
 reused as a fresh proof.
 The opt-in `test-real-snapshot-reference-protected` Zig build target requires
@@ -185,7 +185,13 @@ runners only on the weekly schedule or a `workflow_dispatch` with
 from a root-owned bare repository into a new mode-0700 tree under
 `/srv/debz-protected`. It verifies the pinned Zig with minisign, tightens and
 records the `zig-pkg` modes, and runs seven fail-closed negatives before the
-proof. Bounded evidence is always uploaded, and the tree is always removed.
+proof. Its amd64 leg additionally stages a separate signed Python pre-configure
+source and runs the empty0600/0644 and strict20/96 replay, then requires exclusive
+receipts from both activated Zig root validators. The 140-minute job budget
+includes bounded Python staging/replay (40) and Zig verification (10), without
+activating ARM397 or changing reference configure semantics. These are dispatch
+gates, not proof inferred from skipped ordinary PR jobs.
+Bounded evidence is always uploaded, and the tree is always removed.
 `tools/security-audit.py` and `test/security-policy.zig` keep the job opt-in,
 `sudo -n`-only and unskippable; see "Hosted protected reference job" in
 [integration roots](integration-roots.md).

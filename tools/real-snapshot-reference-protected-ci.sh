@@ -105,7 +105,7 @@ collect() {
   local status=$?
   set +e
   local workspace=$checkout/.real-snapshot/$architecture
-  install -d -o root -g root -m 0755 "$upload/staging" "$upload/proof" "$upload/negatives"
+  install -d -o root -g root -m 0755 "$upload/staging" "$upload/proof" "$upload/negatives" "$upload/python3"
   find "$evidence" -maxdepth 1 -type f -size -16777217c -exec install -m 0644 -t "$upload" {} +
   if [[ -d $workspace/evidence ]]; then
     find "$workspace/evidence" -maxdepth 1 -type f -size -16777217c -exec install -m 0644 -t "$upload/staging" {} +
@@ -117,6 +117,17 @@ collect() {
     find "$workspace/proof" -maxdepth 1 -type f \( -name '*.json' -o -name '*.stdout' -o -name '*.stderr' \) \
       -size -16777217c -exec install -m 0644 -t "$upload/proof" {} +
   fi
+  if [[ -d $checkout/.real-snapshot/python3-amd64/evidence ]]; then
+    find "$checkout/.real-snapshot/python3-amd64/evidence" -maxdepth 1 -type f \
+      -size -16777217c -exec install -m 0644 -t "$upload/python3" {} +
+  fi
+  for source in snapshot/evidence prestate-build/evidence; do
+    local python3_evidence=$checkout/.real-snapshot/python3-amd64/$source
+    [[ -d $python3_evidence && ! -L $python3_evidence ]] || continue
+    install -d -o root -g root -m 0755 "$upload/python3/$source"
+    find "$python3_evidence" -maxdepth 1 -type f -size -16777217c \
+      -exec install -m 0644 -t "$upload/python3/$source" {} +
+  done
   for directory in "$workspace"/negative-*; do
     [[ -d $directory && ! -L $directory ]] || continue
     find "$directory" -maxdepth 1 -printf '%M %u:%g %s %P\n' >"$upload/negatives/${directory##*/}.listing"
@@ -526,7 +537,7 @@ find zig-pkg "$tree/zig-global" -xdev -perm /0022 ! -type l -printf '%M %u:%g %p
 chmod -R go-w zig-pkg "$tree/zig-global"
 step zig-pkg-verify 0 "" python3 -I tools/real-snapshot-reference-tree-check.py packages \
   "$checkout/zig-pkg" "$evidence/zig-pkg-manifest.txt"
-step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize=ReleaseSafe -j4
+step debz-build 0 "" "${zenv[@]}" "$zig" build -Doptimize=ReleaseSafe -j2
 chmod -R go-w "$tree/zig-global" "$checkout/.zig-cache" "$checkout/zig-out"
 step tree-built 0 "" python3 -I tools/real-snapshot-reference-tree-check.py tree "$tree"
 
@@ -584,7 +595,7 @@ negative() { # NAME PATTERN sed-expression...
   sed "${edits[@]}" "$arguments" >"$evidence/negative-$name.args"
   mapfile -t negative_arguments <"$evidence/negative-$name.args"
   step "negative-$name" refused "$pattern" "${zenv[@]}" "$zig" build test-real-snapshot-reference-protected \
-    "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j4
+    "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j2
   [[ -z $(find "$ws" -mindepth 1 -print -quit) ]] || {
     echo "negative-$name launched before refusing" >&2
     exit 1
@@ -617,7 +628,7 @@ sed "s|^-Dreference-protected-workspace=.*|-Dreference-protected-workspace=$work
   "$arguments" >"$evidence/negative-reused-workspace.args"
 mapfile -t negative_arguments <"$evidence/negative-reused-workspace.args"
 step negative-reused-workspace refused "must be new and empty" "${zenv[@]}" "$zig" build \
-  test-real-snapshot-reference-protected "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j4
+  test-real-snapshot-reference-protected "${negative_arguments[@]}" -Doptimize=ReleaseSafe -j2
 # A valid OpenPGP keyring for a different signer must fail the authenticated
 # refresh before staging locks or downloads anything.
 swapped_keyring_stage() {
@@ -636,11 +647,44 @@ step negative-swapped-keyring refused '"summary":"WrongSigningKey"' swapped_keyr
   exit 1
 }
 
+if [[ $architecture == amd64 ]]; then
+  python3_workspace=$checkout/.real-snapshot/python3-amd64
+  step python3-stage 0 "all 18 root coordinates staged" timeout --signal=TERM --kill-after=60s 40m \
+    "${zenv[@]}" "DEBZ_REAL_SNAPSHOT_KEYRING=$staged_archive_keyring" \
+    bash tools/real-snapshot-python3-protected-stage.sh "$zig" "$checkout/zig-out/bin/debz" \
+    "$workspace/dpkg/usr/bin/dpkg" "$python3_workspace"
+  python3 -B -I - "$checkout/tools" "$python3_workspace/evidence/python3-reference.args" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from real_snapshot_reference_paths import protected
+protected(Path(sys.argv[2]))
+PY
+  mapfile -t python3_arguments <"$python3_workspace/evidence/python3-reference.args"
+  [[ ${#python3_arguments[@]} == 20 ]]
+  step python3-guards 0 "" timeout --signal=TERM --kill-after=60s 10m \
+    "${zenv[@]}" "$zig" build test-real-snapshot-python3-protected "${python3_arguments[@]}" \
+    -Doptimize=ReleaseSafe -j2 --summary all
+  grep -Fx "signed Python empty0600/0644 and amd64 20/96 input/output guards executed without skips" \
+    "$python3_workspace/evidence/inputs-proof.txt"
+  grep -Fx "signed Python alternatives records and selectors executed without skips" \
+    "$python3_workspace/evidence/alternatives-proof.txt"
+  find "$python3_workspace/evidence" -maxdepth 1 -type f -size -16777217c \
+    -exec install -m 0644 -t "$evidence" {} +
+  # Remove only the fresh replay workspace, not package-owned bytes or bad
+  # inputs "repaired" to satisfy the final protected tool-tree check.
+  if grep -F " $python3_workspace" /proc/self/mountinfo; then
+    echo "mounts remain beneath the Python replay workspace" >&2
+    exit 1
+  fi
+  rm -rf --one-file-system -- "$python3_workspace"
+fi
+
 # The protected proof on the staged new empty workspace, bounded by a timeout
 # that kills the proof's process group.
 step proof 0 "executed without skips" timeout --signal=TERM --kill-after=60s 45m \
   "${zenv[@]}" "$zig" build test-real-snapshot-reference-protected "${proof_arguments[@]}" \
-  -Doptimize=ReleaseSafe -j4 --summary all
+  -Doptimize=ReleaseSafe -j2 --summary all
 grep -F "executed without skips" "$evidence/proof.log" >"$evidence/proof-summary.txt"
 if grep -F " $tree" /proc/self/mountinfo >"$evidence/mounts-after.txt"; then
   echo "mounts remain beneath the protected tree" >&2

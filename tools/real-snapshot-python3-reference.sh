@@ -95,6 +95,7 @@ require_protected_file "$source_root/var/lib/dpkg/info/python3-minimal.postinst"
 require_protected_file "$source_root/var/lib/dpkg/info/python3-minimal.list"
 require_protected_file "$source_root/usr/bin/py3compile"
 require_protected_file "$source_root/usr/bin/update-alternatives"
+require_protected_file "$source_root/dev/null"
 [[ $(sha256sum "$source_root/usr/bin/update-alternatives" | cut -d' ' -f1) == \
   023e1c2eef9f323f6f2c2f53aa22092cd118b1f087349ce133a677f94a03ed45 ]]
 [[ $(stat -c '%u:%g:%a:%s:%h' "$source_root/var/lib/dpkg/info/python3-minimal.list") == \

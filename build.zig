@@ -835,6 +835,46 @@ pub fn build(b: *std.Build) void {
     const run_native_unpack_tests = b.addRunArtifact(native_unpack_tests);
     b.step("test-native-unpack", "Run native unpack and file ownership tests")
         .dependOn(&run_native_unpack_tests.step);
+    const python3_reference_tests = b.addTest(.{
+        .root_module = debz,
+        .filters = &.{
+            "native_unpack.test.protected signed python3 inputs and redirected tool witness are exact",
+        },
+    });
+    const run_python3_reference_tests = b.addRunArtifact(python3_reference_tests);
+    run_python3_reference_tests.has_side_effects = true;
+    const python3_coordinates = [_]struct { option: []const u8, environment: []const u8 }{
+        .{ .option = "root", .environment = "PREINST_ROOT" },
+        .{ .option = "after", .environment = "PREINST_AFTER" },
+        .{ .option = "root-0644", .environment = "PREINST_ROOT_0644" },
+        .{ .option = "after-0644", .environment = "PREINST_AFTER_0644" },
+        .{ .option = "root-py3compile", .environment = "PREINST_ROOT_PY3COMPILE" },
+        .{ .option = "after-py3compile", .environment = "PREINST_AFTER_PY3COMPILE" },
+        .{ .option = "bad-html", .environment = "BAD_HTML" },
+        .{ .option = "bad-link", .environment = "BAD_LINK" },
+        .{ .option = "bad-shadow", .environment = "BAD_SHADOW" },
+        .{ .option = "bad-null", .environment = "BAD_NULL" },
+        .{ .option = "bad-null-0640", .environment = "BAD_NULL_0640" },
+        .{ .option = "bad-root", .environment = "BAD_ROOT" },
+        .{ .option = "bad-script", .environment = "BAD_SCRIPT" },
+        .{ .option = "bad-proc", .environment = "BAD_PROC" },
+        .{ .option = "bad-py3compile-hash", .environment = "BAD_NULL_PY3COMPILE_HASH" },
+        .{ .option = "bad-py3compile-mode", .environment = "BAD_NULL_PY3COMPILE_MODE" },
+        .{ .option = "bad-minimal-postinst", .environment = "BAD_MINIMAL_POSTINST" },
+        .{ .option = "bad-minimal-compiler", .environment = "BAD_MINIMAL_COMPILER" },
+        .{ .option = "inputs-proof", .environment = "INPUTS_PROOF" },
+        .{ .option = "alternatives-proof", .environment = "ALTERNATIVES_PROOF" },
+    };
+    var python3_values: [python3_coordinates.len][]const u8 = undefined;
+    for (python3_coordinates, &python3_values) |coordinate, *value| {
+        value.* = b.option([]const u8, b.fmt("python3-reference-{s}", .{coordinate.option}), "Required protected Python proof coordinate") orelse "";
+        run_python3_reference_tests.setEnvironmentVariable(
+            b.fmt("DEBZ_REQUIRE_SIGNED_PYTHON3_{s}", .{coordinate.environment}),
+            value.*,
+        );
+    }
+    const python3_reference_step = b.step("test-real-snapshot-python3-protected", "Require the protected signed Python root and alternatives proof without skips");
+    python3_reference_step.dependOn(&run_python3_reference_tests.step);
 
     const native_alternatives_test_module = b.createModule(.{
         .root_source_file = b.path("src/native_alternatives.zig"),
@@ -859,6 +899,19 @@ pub fn build(b: *std.Build) void {
     native_alternatives_test_module.linkLibrary(liblzma);
     native_alternatives_test_module.linkLibrary(zstd);
     native_alternatives_test_module.link_libc = true;
+    const python3_alternatives_tests = b.addTest(.{
+        .root_module = native_alternatives_test_module,
+        .filters = &.{"native_alternatives.test.protected signed python3 preinst preserves all records and selectors"},
+    });
+    const run_python3_alternatives_tests = b.addRunArtifact(python3_alternatives_tests);
+    run_python3_alternatives_tests.has_side_effects = true;
+    for (python3_coordinates, python3_values) |coordinate, value| {
+        run_python3_alternatives_tests.setEnvironmentVariable(
+            b.fmt("DEBZ_REQUIRE_SIGNED_PYTHON3_{s}", .{coordinate.environment}),
+            value,
+        );
+    }
+    python3_reference_step.dependOn(&run_python3_alternatives_tests.step);
     const native_alternatives_tests = b.addTest(.{
         .root_module = native_alternatives_test_module,
         .filters = &.{"native_alternatives.test."},

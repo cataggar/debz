@@ -3901,6 +3901,11 @@ test "native_alternatives.test.protected signed python3 preinst preserves all re
         error.AlternativesStateChanged,
         validateScriptTransition(testing.allocator, before, forged_after, script, authority),
     );
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_ALTERNATIVES_PROOF")) |path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed Python alternatives records and selectors executed without skips\n");
+    }
 }
 
 test "native_alternatives.test.snapshot less postinst pins one quiet install" {

@@ -23661,6 +23661,11 @@ test "native_unpack.test.protected signed python3 inputs and redirected tool wit
         error.DirectoryTooLarge,
         verifySnapshotPython3PreinstInputs(testing.allocator, proc_root.root, &program),
     );
+    if (std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_INPUTS_PROOF")) |path| {
+        var proof = try std.Io.Dir.createFileAbsolute(testing.io, std.mem.span(path), .{ .exclusive = true });
+        defer proof.close(testing.io);
+        try proof.writeStreamingAll(testing.io, "signed Python empty0600/0644 and amd64 20/96 input/output guards executed without skips\n");
+    }
 }
 
 test "native_unpack.test.snapshot sudo-rs requires signed fresh amd64 configure" {

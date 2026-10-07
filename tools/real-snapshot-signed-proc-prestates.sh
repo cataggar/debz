@@ -8,9 +8,16 @@
 # half-configured and was denied execution of the unchanged signed postinst;
 # sudo is copied while it is still unpacked. The copies are disposable
 # fixtures, not native installation results.
+# --python3 reuses this fixture producer to stop just before Python configure
+# on an independent workspace. It does not enable any additional proc profile.
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+purpose=proc
+if [[ ${1:-} == --python3 ]]; then
+  purpose=python3
+  shift
+fi
 
 # The lock document digest also covers the local keyring path, so bind the
 # authenticated snapshot Release, its signer and the exact archive closure.
@@ -29,7 +36,7 @@ readonly setpriv_sha256=86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c7
 readonly setpriv_runtime_sha256=60c767df6642a42ee28bf9a5b8975fe7ed59d4d87372b2737ccdf1a0ef1b268f
 
 [[ $# == 2 && $(id -u) == 0 ]] || {
-  echo "usage (as root): $0 PINNED_DPKG BINDING_WORKSPACE" >&2
+  echo "usage (as root): $0 [--python3] PINNED_DPKG BINDING_WORKSPACE" >&2
   exit 2
 }
 [[ $(uname -m) == x86_64 ]] || {
@@ -224,6 +231,7 @@ printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nrelease_sha256=%s\nc
   "$release_sha256" "$closure_sha256" "${#bootstrap[@]}" >"$evidence/reference-identity.txt"
 launcher=$tools/reference-launcher
 "$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+  --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$tools/zig-cache" \
   --global-cache-dir "$tools/zig-global-cache" \
   -femit-bin="$launcher"
@@ -251,6 +259,21 @@ env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
     --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
     --prove-base-cycle "$tools/setpriv"
 [[ -s "$evidence/base-cycle-proof/comparison.json" ]]
+
+if [[ $purpose == python3 ]]; then
+  env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
+    unshare --mount --propagation private -- \
+    timeout --signal=TERM --kill-after=30s 20m \
+    python3 -B tools/real-snapshot-reference-order.py \
+      --launcher "$launcher" --architecture amd64 \
+      --dpkg "$pinned" --root "$root" --cache "$cache" --evidence "$evidence" \
+      --prestate "python3:amd64=unpacked:$prestates/python3"
+  [[ $(cat "$prestates/prestates.tsv") == \
+    "$(printf 'python3:amd64\t3.14.3-0ubuntu2 install ok unpacked\t%s' "$prestates/python3")" ]]
+  printf 'PYTHON3_PRESTATE=%s\n' "$prestates/python3" >"$workspace/prestates.env"
+  echo "protected Python pre-configure source captured; no full reference completion claimed"
+  exit 0
+fi
 
 env -i PATH="$PATH" LC_ALL=C PYTHONDONTWRITEBYTECODE=1 TMPDIR="$build/tmp" \
   unshare --mount --propagation private -- \
