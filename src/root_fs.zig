@@ -21,6 +21,7 @@
 //! can never be written through.
 
 const std = @import("std");
+const phase_telemetry = @import("native_phase_telemetry.zig");
 const builtin = @import("builtin");
 const absolute_path = @import("absolute_path.zig");
 const package_acquisition = @import("package_acquisition.zig");
@@ -706,7 +707,7 @@ pub const StagedFile = struct {
         if (self.options.durable) {
             if (self.options.observer) |observer|
                 try observer.hit(.before_stage_sync);
-            try self.file.sync(self.io);
+            try syncFile(self.io, self.file);
             if (self.options.observer) |observer|
                 try observer.hit(.after_stage_sync);
         }
@@ -1133,7 +1134,7 @@ pub const Root = struct {
         var file = try self.createRegularFile(path, options);
         defer file.close(self.io);
         try file.writeStreamingAll(self.io, bytes);
-        if (durable) try file.sync(self.io);
+        if (durable) try syncFile(self.io, file);
     }
 
     /// Fsyncs an existing regular file so that content and metadata already
@@ -1141,7 +1142,7 @@ pub const Root = struct {
     pub fn syncRegularFile(self: Root, path: Path) !void {
         var file = try self.openRegularFile(path);
         defer file.close(self.io);
-        try file.sync(self.io);
+        try syncFile(self.io, file);
     }
 
     /// Byte length of an existing regular file plus a bounded window of its
@@ -1198,7 +1199,7 @@ pub const Root = struct {
         }) catch |err| return mapRegularFileError(err);
         defer file.close(self.io);
         try file.setLength(self.io, length);
-        if (durable) try file.sync(self.io);
+        if (durable) try syncFile(self.io, file);
     }
 
     /// True when the final component carries a `security.capability`
@@ -1248,7 +1249,7 @@ pub const Root = struct {
         }) catch |err| return mapRegularFileError(err);
         defer file.close(self.io);
         try file.writePositionalAll(self.io, bytes, offset);
-        if (durable) try file.sync(self.io);
+        if (durable) try syncFile(self.io, file);
     }
 
     /// Applies exact metadata to the final component without following it.
@@ -1584,7 +1585,15 @@ fn classifyComponentError(io: Io, base: Dir, component: []const u8, err: anyerro
 /// file is classified with the linux-specific decoder. Using the wrong one
 /// would silently report every failure as success, which for `fsync` would
 /// mean claiming durability that was never achieved.
+fn syncFile(io: Io, file: File) !void {
+    const span = phase_telemetry.start(.fsync);
+    defer span.end();
+    try file.sync(io);
+}
+
 fn syncDir(io: Io, dir: Dir) !void {
+    const span = phase_telemetry.start(.fsync);
+    defer span.end();
     _ = io;
     switch (builtin.os.tag) {
         .linux => switch (std.os.linux.errno(std.os.linux.fsync(dir.handle))) {

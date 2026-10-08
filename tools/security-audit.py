@@ -2024,7 +2024,7 @@ WORKLOAD_PARTITIONS = {
         "dpkg_oracle_evidence_tests", "signed_proc_compare_tests", "run_sha512_e2e_tests",
         "run_native_trigger_queue_tests", "run_lifecycle_zig_tests",
         "run_trigger_zig_tests", "run_settlement_tests", "run_recovery_unit_tests",
-        "run_native_recovery_tests", "run_repository_recovery_unit",
+        "run_native_recovery_tests", "phase_telemetry_step", "run_repository_recovery_unit",
         "run_package_cache_archive_tests",
     )),
     "workload_release": ("test-workload-release", (

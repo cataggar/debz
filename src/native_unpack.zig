@@ -44,6 +44,7 @@ const native_helper = @import("native_helper.zig");
 const native_operation = @import("native_operation.zig");
 const native_provenance = @import("native_provenance.zig");
 const native_recovery = @import("native_recovery.zig");
+const phase_telemetry = @import("native_phase_telemetry.zig");
 const native_statoverride = @import("native_statoverride.zig");
 const native_diversion = @import("native_diversion.zig");
 const native_diversion_cache = @import("native_diversion_cache.zig");
@@ -9476,6 +9477,8 @@ fn captureDatabaseSnapshotBounded(
     maximum_bytes: u64,
     allow_absent: bool,
 ) !CapturedDatabase {
+    const span = phase_telemetry.start(.capture);
+    defer span.end();
     const budget = try allocator.create(ModelAllocator);
     errdefer allocator.destroy(budget);
     budget.* = .init(allocator, maximum_bytes);
@@ -11907,7 +11910,7 @@ fn materializePlanned(
         const previous_steps = execution.phase_steps;
         execution.phase_steps = mutation_plan.steps;
         defer execution.phase_steps = previous_steps;
-        break :block root_mutation.apply(
+        break :block applyMaterializationMutation(
             &engine,
             .fromPlan(&mutation_plan),
         ) catch |err| switch (err) {
@@ -12134,6 +12137,12 @@ fn phasePreflight(
     return null;
 }
 
+fn applyMaterializationMutation(engine: *root_mutation.Engine, content: root_mutation.Content) root_mutation.Error!root_mutation.Report {
+    const span = phase_telemetry.start(.mutation);
+    defer span.end();
+    return root_mutation.apply(engine, content);
+}
+
 fn executePhaseMaterialization(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
@@ -12337,7 +12346,7 @@ fn executePhaseMaterialization(
         const previous_steps = execution.phase_steps;
         execution.phase_steps = mutation_plan.steps;
         defer execution.phase_steps = previous_steps;
-        break :block root_mutation.apply(
+        break :block applyMaterializationMutation(
             &engine,
             .fromPlan(&mutation_plan),
         ) catch |err| switch (err) {
@@ -14132,32 +14141,13 @@ fn configuredState(state: package_database.CurrentState) bool {
 fn materializeStateRecord(
     allocator: std.mem.Allocator,
     request: MaterializationRequest,
+    database: package_database.Database,
     state: native_program.StateRecord,
     want_override: ?package_database.Want,
     error_override: ?package_database.ErrorState,
 ) !MaterializationResult {
-    var captured = try captureDatabaseSnapshot(
-        allocator,
-        request.root,
-        request.planning.limits.database,
-    );
-    defer captured.deinit();
-    normalizeCapturedNativeArchitecture(
-        &captured.snapshot,
-        request.planning.program.target_architecture,
-    );
-    var database = switch (try package_database.importSnapshot(
-        allocator,
-        .{
-            .native_architecture = request.planning.program.target_architecture,
-            .snapshot = captured.snapshot,
-        },
-        request.planning.limits.database,
-    )) {
-        .database => |value| value,
-        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
-    };
-    defer database.deinit();
+    // Borrow the caller's same-phase import. Mutation preflight and the fresh
+    // post-apply capture remain the external-drift and publication fences.
     if (try phasePreflight(allocator, request, database)) |result| return result;
     const record = database.model.find(
         state.package.name,
@@ -14446,6 +14436,28 @@ fn materializeDetailedState(
         .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
     };
     defer database.deinit();
+    return materializeDetailedStateFromDatabase(
+        allocator,
+        request,
+        database,
+        package,
+        want,
+        error_state,
+        current,
+        config_version,
+    );
+}
+
+fn materializeDetailedStateFromDatabase(
+    allocator: std.mem.Allocator,
+    request: MaterializationRequest,
+    database: package_database.Database,
+    package: native_program.PackageIdentity,
+    want: package_database.Want,
+    error_state: package_database.ErrorState,
+    current: package_database.CurrentState,
+    config_version: ?[]const u8,
+) !MaterializationResult {
     const record = database.model.find(
         package.name,
         package.architecture,
@@ -17511,6 +17523,7 @@ fn lifecycleStateStep(
             policy,
             &.{},
         ),
+        current,
         state,
         want,
         error_state,
@@ -17579,7 +17592,16 @@ fn lifecycleDetailedState(
     var captured = try captureDatabaseSnapshot(allocator, root, .{});
     defer captured.deinit();
     normalizeCapturedNativeArchitecture(&captured.snapshot, program.target_architecture);
-    return materializeDetailedState(
+    var database = switch (try package_database.importSnapshot(
+        allocator,
+        .{ .native_architecture = program.target_architecture, .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return .{ .outcome = .refused, .detail = "database_rejected" },
+    };
+    defer database.deinit();
+    return materializeDetailedStateFromDatabase(
         allocator,
         lifecyclePhaseRequest(
             execution,
@@ -17595,6 +17617,7 @@ fn lifecycleDetailedState(
             policy,
             &.{},
         ),
+        database,
         package,
         want,
         error_state,
@@ -30019,6 +30042,9 @@ fn executePreparedNativeProgramWithHelper(
     bounds: ?*RuntimeBounds,
     external_mechanics: Runtime.ExternalMechanics,
 ) !LifecycleResult {
+    var telemetry = phase_telemetry.Context.initConfigured(root.io, attempt.attemptId());
+    telemetry.attach();
+    defer telemetry.detach();
     try checkRuntimeBounds(bounds);
     const program = compiled.program.program;
     if (!std.mem.eql(u8, &program.script_policy_sha256, &native_recovery.hexDigest(
@@ -30410,7 +30436,7 @@ fn initializeNativeDatabase(
     );
     defer engine.deinit();
     try validateDatabaseBootstrapJournal(root, program, action, engine.journal());
-    const applied = try root_mutation.apply(&engine, .fromPlan(&bootstrap_plan));
+    const applied = try applyMaterializationMutation(&engine, .fromPlan(&bootstrap_plan));
     if (bounds) |value| value.observeMutation(applied);
     if (applied.outcome == .recovery_required)
         return .{ .outcome = .recovery_required, .detail = "database_bootstrap_recovery_required" };
@@ -31153,6 +31179,9 @@ fn recoverPreparedNativeProgramWithHelper(
     bounds: ?*RuntimeBounds,
     external_mechanics: Runtime.ExternalMechanics,
 ) !LifecycleResult {
+    var telemetry = phase_telemetry.Context.initConfigured(root.io, attempt.attemptId());
+    telemetry.attach();
+    defer telemetry.detach();
     try checkRuntimeBounds(bounds);
     if (try readProductionCompletion(allocator, root, attempt)) |value| {
         var receipt = value;
@@ -31511,6 +31540,9 @@ fn executeLifecycleProgramWithRequest(
     }
     const attempt = borrowed_attempt orelse &owned_attempt;
     defer if (borrowed_attempt == null) attempt.release();
+    var telemetry = phase_telemetry.Context.initConfigured(root.io, attempt.attemptId());
+    telemetry.attach();
+    defer telemetry.detach();
     if (borrowed_attempt != null)
         try native_operation.bind(allocator, root, attempt, program.*);
     if (production_request) |request|
@@ -34840,7 +34872,7 @@ fn applyAbsentLifecycleNoOp(
         .{},
     );
     defer engine.deinit();
-    const report = try root_mutation.apply(&engine, .fromPlan(&mutation_plan));
+    const report = try applyMaterializationMutation(&engine, .fromPlan(&mutation_plan));
     if (report.outcome == .recovery_required)
         return .{ .outcome = .recovery_required, .detail = "no_op_recovery_required" };
     if (report.outcome != .applied)
@@ -39324,6 +39356,295 @@ test "native_unpack.test.materialization rollback and recovery retain truth" {
     try testing.expect(try crash_fixture.root().entryIfExists(
         try root_fs.Path.init(root_operation.record_path),
     ) != null);
+}
+
+const StatePhaseMeasurement = struct {
+    capture: phase_telemetry.Measurement,
+    imported: phase_telemetry.Measurement,
+    hash: phase_telemetry.Measurement,
+    mutation: phase_telemetry.Measurement,
+    fsync: phase_telemetry.Measurement,
+    elapsed_ns: i96,
+    generation: package_database.Generation,
+    status: [32]u8,
+    status_old: [32]u8,
+};
+
+// Reproduce only the removed same-phase capture/import, not a second mutation.
+fn measureStatePhase(fixture: *Fixture, recapture: bool, detailed: bool) !StatePhaseMeasurement {
+    const root = fixture.root();
+    var telemetry = phase_telemetry.Context.init(testing.io, @splat(0));
+    telemetry.attach();
+    defer telemetry.detach();
+    const started = std.Io.Clock.awake.now(testing.io);
+    var captured = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer captured.deinit();
+    var database = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = captured.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    var program = testProgram(database.generation.sha256, database.model.packages.len, &.{}, &.{});
+    var root_buffer: [4096]u8 = undefined;
+    const install_root = try fixtureInstallRoot(fixture, &root_buffer);
+    const root_identity = bindFixtureProgramRoot(&program, install_root);
+    var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+    defer locks.deinit();
+    const request: MaterializationRequest = .{
+        .io = testing.io,
+        .root = root,
+        .install_root = install_root,
+        .planning = .{
+            .program = &program,
+            .snapshot = captured.snapshot,
+            .archives = &.{},
+            .root = root,
+            .root_identity_sha256 = root_identity,
+            .interoperability = .isolated_root,
+        },
+        .locks = locks.interface(),
+        .operation = .install,
+    };
+    const state: native_program.StateRecord = .{
+        .package = .{ .name = "demo", .version = "1", .architecture = "amd64" },
+        .state = .installed,
+        .hold = false,
+        .remove_entry = false,
+    };
+    const result = if (recapture) block: {
+        var repeated = try captureDatabaseSnapshot(testing.allocator, root, .{});
+        defer repeated.deinit();
+        var imported = switch (try package_database.importSnapshot(
+            testing.allocator,
+            .{ .native_architecture = "amd64", .snapshot = repeated.snapshot },
+            .{},
+        )) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer imported.deinit();
+        break :block if (detailed)
+            try materializeDetailedStateFromDatabase(testing.allocator, request, imported, state.package, .install, .ok, .half_configured, "1")
+        else
+            try materializeStateRecord(testing.allocator, request, imported, state, null, null);
+    } else if (detailed)
+        try materializeDetailedStateFromDatabase(testing.allocator, request, database, state.package, .install, .ok, .half_configured, "1")
+    else
+        try materializeStateRecord(testing.allocator, request, database, state, null, null);
+    try testing.expectEqual(MaterializationOutcome.applied, result.outcome);
+    const elapsed_ns = started.durationTo(std.Io.Clock.awake.now(testing.io)).toNanoseconds();
+    const capture = telemetry.measurement(.capture);
+    const imported = telemetry.measurement(.import);
+    const hash = telemetry.measurement(.hash);
+    const mutation = telemetry.measurement(.mutation);
+    const fsync = telemetry.measurement(.fsync);
+    telemetry.detach();
+    var final = try captureDatabaseSnapshot(testing.allocator, root, .{});
+    defer final.deinit();
+    var final_database = switch (try package_database.importSnapshot(
+        testing.allocator,
+        .{ .native_architecture = "amd64", .snapshot = final.snapshot },
+        .{},
+    )) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer final_database.deinit();
+    const final_record = final_database.model.find("demo", "amd64").?;
+    try testing.expectEqual(if (detailed) package_database.CurrentState.half_configured else .installed, final_record.status.current);
+    if (detailed) try testing.expectEqualStrings("1", final_record.field("Config-Version").?.value_lines[0]);
+    try testing.expectEqualStrings(fixture.status, final.snapshot.status_old.?.bytes);
+    try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_mutation.journal_path)) == null);
+    var status_digest: [32]u8 = undefined;
+    Sha256.hash(final.snapshot.status.bytes, &status_digest, .{});
+    var old_digest: [32]u8 = undefined;
+    Sha256.hash(final.snapshot.status_old.?.bytes, &old_digest, .{});
+    return .{
+        .capture = capture,
+        .imported = imported,
+        .hash = hash,
+        .mutation = mutation,
+        .fsync = fsync,
+        .elapsed_ns = elapsed_ns,
+        .generation = final_database.generation,
+        .status = status_digest,
+        .status_old = old_digest,
+    };
+}
+
+const state_phase_status = "Package: demo\nStatus: install ok unpacked\nArchitecture: amd64\nVersion: 1\nDescription: demo\n\n";
+
+fn statePhaseFixture(fixture: *Fixture, owned: std.mem.Allocator, package_count: usize) !void {
+    const statuses = try owned.alloc([]const u8, package_count);
+    const info = try owned.alloc(package_database.InfoEntry, package_count);
+    statuses[0] = state_phase_status;
+    info[0] = .{ .name = "demo.list", .bytes = "/.\n" };
+    for (1..package_count) |index| {
+        statuses[index] = try std.fmt.allocPrint(
+            owned,
+            "Package: other-{d}\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1\nDescription: other\n\n",
+            .{index},
+        );
+        info[index] = .{ .name = try std.fmt.allocPrint(owned, "other-{d}.list", .{index}), .bytes = "/.\n" };
+    }
+    try fixture.init(try std.mem.join(owned, "", statuses), info);
+}
+
+test "native_unpack.test.materialization same-phase database reuse interleaves counters and exact state evidence" {
+    for ([_]usize{ 1, 175 }) |package_count| {
+        var expected: ?StatePhaseMeasurement = null;
+        var before: ?StatePhaseMeasurement = null;
+        for ([_]bool{ true, false, false, true, true, false }) |recapture| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            var fixture: Fixture = undefined;
+            try statePhaseFixture(&fixture, arena.allocator(), package_count);
+            defer fixture.deinit();
+            const measured = try measureStatePhase(&fixture, recapture, false);
+            if (!recapture) {
+                try testing.expectEqual(@as(u64, 2), measured.capture.count);
+                try testing.expectEqual(@as(u64, 2), measured.imported.count);
+                try testing.expectEqual(@as(u64, 1), measured.mutation.count);
+            }
+            if (expected) |value| {
+                try testing.expectEqualDeep(value.generation, measured.generation);
+                try testing.expectEqual(value.status, measured.status);
+                try testing.expectEqual(value.status_old, measured.status_old);
+            } else expected = measured;
+            if (recapture) before = measured else if (before) |value| {
+                try testing.expectEqual(value.capture.count, measured.capture.count + 1);
+                try testing.expectEqual(value.imported.count, measured.imported.count + 1);
+                try testing.expect(value.hash.count > measured.hash.count);
+                try testing.expectEqual(value.mutation.count, measured.mutation.count);
+                try testing.expectEqual(value.fsync.count, measured.fsync.count);
+            }
+            std.debug.print("database-phase packages={d} mode={s} elapsed_ns={d} capture={d} import={d} hash={d} mutation={d} fsync={d} generation={s} status={s} status_old={s}\n", .{
+                package_count,
+                if (recapture) "before-recapture" else "after-reuse",
+                measured.elapsed_ns,
+                measured.capture.count,
+                measured.imported.count,
+                measured.hash.count,
+                measured.mutation.count,
+                measured.fsync.count,
+                hex(32, measured.generation.sha256),
+                hex(32, measured.status),
+                hex(32, measured.status_old),
+            });
+        }
+    }
+}
+
+test "native_unpack.test.materialization same-phase detailed state preserves configuration and exact evidence" {
+    var before: ?StatePhaseMeasurement = null;
+    for ([_]bool{ true, false }) |recapture| {
+        var fixture: Fixture = undefined;
+        try fixture.init(state_phase_status, &.{.{ .name = "demo.list", .bytes = "/.\n" }});
+        defer fixture.deinit();
+        const measured = try measureStatePhase(&fixture, recapture, true);
+        if (before) |value| {
+            try testing.expectEqualDeep(value.generation, measured.generation);
+            try testing.expectEqual(value.status, measured.status);
+            try testing.expectEqual(value.status_old, measured.status_old);
+            try testing.expectEqual(@as(u64, 2), measured.capture.count);
+            try testing.expectEqual(@as(u64, 2), measured.imported.count);
+            try testing.expectEqual(value.capture.count, measured.capture.count + 1);
+            try testing.expectEqual(value.imported.count, measured.imported.count + 1);
+            try testing.expect(value.hash.count > measured.hash.count);
+            try testing.expectEqual(value.mutation.count, measured.mutation.count);
+            try testing.expectEqual(value.fsync.count, measured.fsync.count);
+        } else before = measured;
+    }
+}
+
+test "native_unpack.test.materialization same-phase database reuse refuses stale or missing status and retains crash ownership" {
+    const Scenario = enum { stale, missing, crash, missing_info_after_apply, status_old_after_apply };
+    const PostApplyTamper = struct {
+        root: root_fs.Root,
+        scenario: Scenario,
+        fired: bool = false,
+
+        fn before(context: ?*anyopaque, boundary: root_mutation.Boundary, _: u32) root_mutation.HookError!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            // All mutation steps have verified before staging is released.
+            if (self.fired or boundary != .release_staging) return;
+            self.fired = true;
+            if (self.scenario == .missing_info_after_apply)
+                self.root.removeFile(root_fs.Path.init("var/lib/dpkg/info/demo.list") catch unreachable) catch return error.UnlinkFailed
+            else
+                self.root.publishFile(root_fs.Path.init("var/lib/dpkg/status-old") catch unreachable, "tampered\n", .{}) catch return error.RenameFailed;
+        }
+    };
+    for ([_]Scenario{ .stale, .missing, .crash, .missing_info_after_apply, .status_old_after_apply }) |scenario| {
+        const crash = scenario == .crash;
+        const post_apply = scenario == .missing_info_after_apply or scenario == .status_old_after_apply;
+        var fixture: Fixture = undefined;
+        try fixture.init(state_phase_status, &.{.{ .name = "demo.list", .bytes = "/.\n" }});
+        defer fixture.deinit();
+        var captured = try captureDatabaseSnapshot(testing.allocator, fixture.root(), .{});
+        defer captured.deinit();
+        var database = switch (try package_database.importSnapshot(
+            testing.allocator,
+            .{ .native_architecture = "amd64", .snapshot = captured.snapshot },
+            .{},
+        )) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer database.deinit();
+        var program = testProgram(database.generation.sha256, database.model.packages.len, &.{}, &.{});
+        var root_buffer: [4096]u8 = undefined;
+        const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+        const root_identity = bindFixtureProgramRoot(&program, install_root);
+        var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var fault: MaterializationFault = .{ .boundary = .publish_rename, .crash = true };
+        var tamper: PostApplyTamper = .{ .root = fixture.root(), .scenario = scenario };
+        const request: MaterializationRequest = .{
+            .io = testing.io,
+            .root = fixture.root(),
+            .install_root = install_root,
+            .planning = .{
+                .program = &program,
+                .snapshot = captured.snapshot,
+                .archives = &.{},
+                .root = fixture.root(),
+                .root_identity_sha256 = root_identity,
+                .interoperability = .isolated_root,
+            },
+            .locks = locks.interface(),
+            .operation = .install,
+            .hooks = if (crash) fault.hooks() else if (post_apply) .{ .context = &tamper, .beforeFn = PostApplyTamper.before } else .{},
+        };
+        if (scenario == .missing)
+            try fixture.root().removeFile(try root_fs.Path.init("var/lib/dpkg/status"))
+        else if (scenario == .stale)
+            try fixture.root().publishFile(try root_fs.Path.init("var/lib/dpkg/status"), "tampered\n", .{});
+        const state: native_program.StateRecord = .{
+            .package = .{ .name = "demo", .version = "1", .architecture = "amd64" },
+            .state = .installed,
+            .hold = false,
+            .remove_entry = false,
+        };
+        const result = try materializeStateRecord(testing.allocator, request, database, state, null, null);
+        try testing.expectEqual(if (crash or post_apply) MaterializationOutcome.recovery_required else .refused, result.outcome);
+        if (post_apply) {
+            try testing.expect(tamper.fired);
+            try testing.expectEqualStrings("database_verification_failed", result.detail);
+        }
+        if (crash or post_apply) {
+            try testing.expect(try fixture.root().entryIfExists(try root_fs.Path.init(root_mutation.journal_path)) != null);
+            try testing.expectError(error.RecoveryRequired, materializeStateRecord(testing.allocator, request, database, state, null, null));
+        } else if (scenario == .stale) {
+            const status = try fixture.root().readFileAlloc(testing.allocator, try root_fs.Path.init("var/lib/dpkg/status"), 1024);
+            defer testing.allocator.free(status);
+            try testing.expectEqualStrings("tampered\n", status);
+        } else try testing.expect(try fixture.root().entryIfExists(try root_fs.Path.init("var/lib/dpkg/status")) == null);
+    }
 }
 
 test "native_unpack.test.materialization repeats without stale journal" {
