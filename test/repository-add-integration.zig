@@ -145,6 +145,20 @@ pub fn main(init: std.process.Init) !void {
     try expect(simulated_dpkg.descriptor_calls != 0);
     try expect(simulated_dpkg.dependency_calls != 0);
     try verifyEvidence(allocator, init.io, parsed.request.root, first);
+    const context = try debz.system_product_context.resolve(allocator, init.io, .{
+        .root = parsed.request.root,
+        .architecture = "amd64",
+    });
+    defer context.deinit();
+    try context.validate();
+    const active_manifest_bytes = try context.snapshot().manifest.canonicalJson(allocator);
+    defer allocator.free(active_manifest_bytes);
+    const generation = try debz.active_repository_config.generationPath(allocator, "/var/lib/debz", active_manifest_bytes);
+    defer allocator.free(generation);
+    try expect(std.mem.eql(u8, context.manifestPath(), generation));
+    try expect(!std.mem.eql(u8, context.manifestPath(), first.paths.target_manifest.?));
+    try expect(context.snapshot().configuration.repositories.len == 2);
+    try expect(context.options().source_paths.len == 0);
     const calls_after_first = simulated_dpkg.calls;
 
     const first_json = try first.canonicalJson(allocator);
@@ -159,6 +173,7 @@ pub fn main(init: std.process.Init) !void {
     try expect(second.installed);
     try expect(second.refreshed == !parsed.request.no_refresh);
     try expectEqual(calls_after_first, simulated_dpkg.calls);
+    try context.validate();
     const second_json = try second.canonicalJson(allocator);
     var decoded_second = try api.decode(allocator, second_json, api.maximum_document_bytes);
     defer decoded_second.deinit();

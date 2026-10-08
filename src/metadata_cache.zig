@@ -185,6 +185,78 @@ pub const Cache = struct {
     staging: Dir,
     locks: Dir,
     limits: Limits,
+    deferred: ?*Deferred = null,
+
+    const Publication = struct {
+        repository: RepositoryId,
+        snapshot: SnapshotId,
+        provenance: Provenance,
+        identity: ObjectIdentity,
+        bytes: []u8,
+    };
+
+    const Deferred = struct {
+        allocator: std.mem.Allocator,
+        previous: ?Cache,
+        publications: std.ArrayList(Publication) = .empty,
+        bytes: usize = 0,
+    };
+
+    /// A bounded, non-publishing refresh view. Existing objects are still
+    /// revalidated by lookup; admission must precede commitDeferred.
+    pub fn initDeferred(allocator: std.mem.Allocator, io: Io, root: ?Dir, limits: Limits) !Cache {
+        const state = try allocator.create(Deferred);
+        errdefer allocator.destroy(state);
+        state.* = .{ .allocator = allocator, .previous = null };
+        if (root) |directory| {
+            state.previous = try openExisting(io, directory, limits);
+        }
+        return .{
+            .io = io,
+            .root = undefined,
+            .owns_root = false,
+            .metadata = undefined,
+            .objects = undefined,
+            .manifests = undefined,
+            .staging = undefined,
+            .locks = undefined,
+            .limits = limits,
+            .deferred = state,
+        };
+    }
+
+    fn openExisting(io: Io, root: Dir, limits: Limits) !?Cache {
+        const metadata = root.openDir(io, namespace, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        errdefer metadata.close(io);
+        const objects = try metadata.openDir(io, "objects", .{ .iterate = true, .follow_symlinks = false });
+        errdefer objects.close(io);
+        const manifests = try metadata.openDir(io, "manifests", .{ .iterate = true, .follow_symlinks = false });
+        errdefer manifests.close(io);
+        const staging = try metadata.openDir(io, "staging", .{ .iterate = true, .follow_symlinks = false });
+        errdefer staging.close(io);
+        const locks = try metadata.openDir(io, "locks", .{ .follow_symlinks = false });
+        return Cache{
+            .io = io,
+            .root = root,
+            .owns_root = false,
+            .metadata = metadata,
+            .objects = objects,
+            .manifests = manifests,
+            .staging = staging,
+            .locks = locks,
+            .limits = limits,
+        };
+    }
+
+    pub fn commitDeferred(self: *Cache, destination: *Cache) !void {
+        const state = self.deferred orelse return error.InvalidCacheKey;
+        if (destination.deferred != null) return error.InvalidCacheKey;
+        for (state.publications.items) |publication|
+            try destination.publish(publication.repository, publication.snapshot, publication.provenance, publication.identity, publication.bytes, .{});
+    }
 
     /// Opens only the caller-selected path; no host cache location is consulted.
     pub fn init(io: Io, root_path: []const u8, limits: Limits) !Cache {
@@ -231,6 +303,18 @@ pub const Cache = struct {
     }
 
     pub fn deinit(self: *Cache) void {
+        if (self.deferred) |state| {
+            if (state.previous) |*previous| previous.deinit();
+            for (state.publications.items) |publication| {
+                state.allocator.free(publication.repository.value);
+                state.allocator.free(publication.snapshot.value);
+                state.allocator.free(publication.bytes);
+            }
+            state.publications.deinit(state.allocator);
+            state.allocator.destroy(state);
+            self.* = undefined;
+            return;
+        }
         self.locks.close(self.io);
         self.staging.close(self.io);
         self.manifests.close(self.io);
@@ -256,6 +340,27 @@ pub const Cache = struct {
         if (bytes.len > self.limits.max_object_bytes) return error.ObjectTooLarge;
         const actual = Digest.of(bytes);
         if (!actual.eql(expected.digest)) return error.DigestMismatch;
+        if (self.deferred) |state| {
+            // The existing object cap also bounds the entire pending refresh.
+            const charged = std.math.add(usize, bytes.len, repository.value.len + snapshot.value.len + @sizeOf(Publication)) catch return error.ObjectTooLarge;
+            if (charged > self.limits.max_object_bytes -| state.bytes) return error.ObjectTooLarge;
+            if (options.reservation != null or options.hooks.runFn != null or std.meta.activeTag(options.lock) != .fail_fast) return error.InvalidCacheKey;
+            const repository_copy = try state.allocator.dupe(u8, repository.value);
+            errdefer state.allocator.free(repository_copy);
+            const snapshot_copy = try state.allocator.dupe(u8, snapshot.value);
+            errdefer state.allocator.free(snapshot_copy);
+            const copy = try state.allocator.dupe(u8, bytes);
+            errdefer state.allocator.free(copy);
+            try state.publications.append(state.allocator, .{
+                .repository = .{ .value = repository_copy },
+                .snapshot = .{ .value = snapshot_copy },
+                .provenance = provenance,
+                .identity = expected,
+                .bytes = copy,
+            });
+            state.bytes += charged;
+            return;
+        }
 
         var held = try self.acquire(options.lock);
         defer held.release(self);
@@ -345,6 +450,23 @@ pub const Cache = struct {
     ) !Record {
         try validateKey(repository.value);
         try validateKey(snapshot.value);
+        if (self.deferred) |state| {
+            var index = state.publications.items.len;
+            while (index > 0) {
+                index -= 1;
+                const publication = state.publications.items[index];
+                if (!std.mem.eql(u8, publication.repository.value, repository.value) or
+                    !std.mem.eql(u8, publication.snapshot.value, snapshot.value)) continue;
+                return .{
+                    .bytes = try allocator.dupe(u8, publication.bytes),
+                    .identity = publication.identity,
+                    .provenance = publication.provenance,
+                    .allocator = allocator,
+                };
+            }
+            if (state.previous) |*previous| return previous.lookup(allocator, repository, snapshot);
+            return error.CacheMiss;
+        }
         const manifest_name = manifestName(repository, snapshot);
         const raw_manifest = secureReadAlloc(
             self.manifests,
@@ -395,6 +517,7 @@ pub const Cache = struct {
         allocator: std.mem.Allocator,
         options: GcOptions,
     ) !GcResult {
+        if (self.deferred != null) return error.InvalidCacheKey;
         var held = try self.acquire(options.lock);
         defer held.release(self);
 
@@ -669,6 +792,47 @@ const test_provenance = Provenance{
     .verification = .in_release,
     .verified_at_unix = 1_786_733_717,
 };
+
+test "deferred refresh verifies and bounds pending data before any persistent publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pending = try Cache.initDeferred(std.testing.allocator, std.testing.io, tmp.dir, .{ .max_object_bytes = 1024 });
+    defer pending.deinit();
+    const identity: ObjectIdentity = .{ .digest = Digest.of("data"), .size = 4 };
+    try std.testing.expectError(error.DigestMismatch, pending.publish(test_repository, test_snapshot, test_provenance, identity, "oops", .{}));
+    try pending.publish(test_repository, test_snapshot, test_provenance, identity, "data", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, namespace, .{}));
+    var observed = try pending.lookup(std.testing.allocator, test_repository, test_snapshot);
+    defer observed.deinit();
+    try std.testing.expectEqualStrings("data", observed.bytes);
+    const excess = "x" ** 900;
+    try std.testing.expectError(error.ObjectTooLarge, pending.publish(test_repository, test_snapshot, test_provenance, .{ .digest = Digest.of(excess), .size = excess.len }, excess, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, namespace, .{}));
+    var destination = try testCache(&tmp);
+    defer destination.deinit();
+    try pending.commitDeferred(&destination);
+    var committed = try destination.lookup(std.testing.allocator, test_repository, test_snapshot);
+    defer committed.deinit();
+    try std.testing.expectEqualStrings("data", committed.bytes);
+}
+
+test "deferred refresh revalidates existing objects and does not mask corrupt cache data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var previous = try testCache(&tmp);
+    defer previous.deinit();
+    const identity: ObjectIdentity = .{ .digest = Digest.of("data"), .size = 4 };
+    try previous.publish(test_repository, test_snapshot, test_provenance, identity, "data", .{});
+    var pending = try Cache.initDeferred(std.testing.allocator, std.testing.io, tmp.dir, .{ .max_object_bytes = 1024 });
+    defer pending.deinit();
+    var observed = try pending.lookup(std.testing.allocator, test_repository, test_snapshot);
+    defer observed.deinit();
+    try std.testing.expectEqualStrings("data", observed.bytes);
+    var digest_hex: [64]u8 = undefined;
+    identity.digest.formatHex(&digest_hex);
+    try previous.objects.writeFile(std.testing.io, .{ .sub_path = &digest_hex, .data = "oops" });
+    try std.testing.expectError(error.CorruptObject, pending.lookup(std.testing.allocator, test_repository, test_snapshot));
+}
 
 test "publish and cache-only lookup verify content identity" {
     var tmp = std.testing.tmpDir(.{});

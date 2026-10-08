@@ -819,14 +819,20 @@ fn tamperSettled(env: *Environment, settled: *const Settled) !void {
         document.operation = .{ .package_transaction = .remove };
         try matrix.receiptCase("receipt.operation", error.InvalidCompletion, document);
     }
-    inline for (.{ "exact_lock_version", "progress_version", "execution_intent_version", "program_version" }) |name| {
+    // Baseline-only versions are malformed on this non-baseline receipt.
+    inline for (.{
+        .{ "exact_lock_version", error.InvalidDocument },
+        .{ "progress_version", error.InvalidCompletion },
+        .{ "execution_intent_version", error.InvalidCompletion },
+        .{ "program_version", error.InvalidDocument },
+    }) |case| {
         var owned = try matrix.receipt();
         defer owned.deinit();
         var document = owned.document;
         var authority = document.authority.?;
-        @field(authority, name) += 1;
+        @field(authority, case[0]) += 1;
         document.authority = authority;
-        try matrix.receiptCase("receipt.authority." ++ name, error.InvalidCompletion, document);
+        try matrix.receiptCase("receipt.authority." ++ case[0], case[1], document);
     }
 
     // Retained evidence: every entry omitted, re-pointed at a different

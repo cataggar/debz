@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-baseline-download-v1",
+  "title": "debz exact signed archive download with a retained native baseline",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "outcome", "baseline_noop", "downloaded_count", "reused_count"],
+  "properties": {
+    "schema": {"const": "https://debz.dev/schema/native-baseline-download-v1"},
+    "version": {"const": 1},
+    "outcome": {"const": "archives_verified_without_execution"},
+    "baseline_noop": {"$ref": "https://debz.dev/schema/native-installed-baseline-noop-v1"},
+    "downloaded_count": {"type": "integer", "minimum": 0},
+    "reused_count": {"type": "integer", "minimum": 0}
+  }
+}

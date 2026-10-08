@@ -14,9 +14,11 @@ The tool never authenticates repository metadata itself:
   native --lock-output` and `download --lock-input`) in a fresh workspace with
   no host APT configuration.
 - The tool fetches each pocket's `InRelease` itself only to record its bytes.
-  It then binds those bytes to the cleartext `release_sha256` that `debz`
-  wrote into an exact lock after authenticating the Release. A pocket that
-  `debz` did not authenticate in some lock is refused.
+  It binds every pocket's cleartext Release digest to `debz refresh` public
+  repository evidence, including quiet pockets absent from any lock. Frozen
+  witness decisions must agree with their own refresh items, and contributing
+  exact locks must agree with refresh's Release/snapshot/signer identity.
+  Missing or mismatched public evidence is refused before planning/download.
 - Package members are read only from CAS objects that `debz download`
   verified. The tool hashes each object again against the lock's SHA-512
   archive identity and declared size before opening it.
@@ -72,17 +74,22 @@ The `version_bound` flag is reserved for reviewed cases where version-keyed
 logic is itself part of the admission; only then must a consumer name the
 provenance version.
 
-The committed manifest starts `pending` at the current pin, `20261001T000000Z`.
-It holds every reviewed identity, but no probe results yet. The tool refuses
-to probe a timestamp less than 24 hours old, so the first `record` runs in the
-first repin after that day has settled.
+The committed manifest is `probed` for `ubuntu-resolute` at
+`20261001T000000Z`: it records the frozen Release, both witnesses, and
+177-package closures on amd64 and arm64. Its admission deadline is
+2026-10-31 20:38:20 UTC; renewal requires a reviewed repin, not a clock
+override. Committed quiet-pocket `refresh_only` bindings remain
+[historical evidence](#historical-evidence-is-not-a-new-probe) until a real
+probe using the new public refresh output proves their identity.
+The tool refuses to probe a timestamp less than 24 hours old and compares
+two fetches of each InRelease before recording the result.
 
 ## Commands
 
 ### `probe`
 
 ```sh
-python3 tools/real-snapshot-repin.py probe --series ubuntu-stonking \
+python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute \
     [--timestamp 20261015T000000Z] --debz zig-out/bin/debz \
     [--manifest PATH] [--workspace DIR] [--accept-frozen-release]
 ```
@@ -113,10 +120,14 @@ The probe refuses, with exit status 2, when any of these checks fails:
    `allow_missing_valid_until_with_max_age_seconds` with the 31-day bound.
    The frozen pocket uses `frozen_release_with_witnesses`, pinned to the
    probed digest.
-5. A lock names a repository that refresh did not report, a signer other than
-   the reviewed signer, or a `release_sha256` other than the bytes the tool
-   fetched. Refresh must also report every pocket as freshly authenticated,
-   not from a stale cache.
+5. Refresh omits a pocket's typed repository evidence, reports a signer other
+   than the reviewed signer, or its tagged Release digest differs from the
+   fetched bytes. This is checked before any planning/download, including for
+   quiet pockets. Frozen decisions must name exactly the configured witnesses
+   in normalized policy order, with their own refresh snapshot digests, signed
+   Dates, calculated deadlines and reviewed primary signer. Each contributing
+   lock must agree with refresh's Release/snapshot/signer identity. Refresh must
+   report fresh authentication, not stale-cache admission.
 6. A closure package, or a package that a manifest identity needs, has no
    signed SHA-512 archive identity.
 7. A second fetch of any `InRelease`, made after all planning and
@@ -129,7 +140,8 @@ The probe refuses, with exit status 2, when any of these checks fails:
 Outputs, under `--workspace` (default `.tmp/real-snapshot-repin/<T>`):
 
 - `report.json` (`io.github.cataggar.debz.real-snapshot-repin-report.v1`):
-  the pockets with their per-architecture `binding`, `debz` repository ids,
+  the pockets with their per-architecture `binding`, `debz` repository ids and
+  full public `repository_evidence` (including frozen witness decisions),
   admission deadline, per-architecture closures (lock, lock digest, closure
   digest, package and pocket counts, packages), packages that could not be
   planned, and the observed value of every manifest identity.
@@ -142,13 +154,14 @@ Each pocket's `binding`, per architecture, is one of:
 - `exact_lock`: an exact lock from the closure plan or from an identity's
   plan names the repository, and its `release_sha256` equals the Release the
   tool fetched.
-- `refresh_only`: the pocket contributes no locked package, for example a
-  quiet `-security` pocket, or one whose fixes all reached `-updates`. `debz
-  refresh` authenticated it, and for a frozen series its witness admission
-  passed, but no `debz` output carries its Release digest (see
-  [Known gap](#known-gap-release-identity-of-a-pocket-outside-a-lock)). The
-  probe reports such a pocket and does not refuse it. `record` keeps the
-  binding in the manifest.
+- `refresh_identity`: the pocket contributes no locked package, for example a
+  quiet `-security` pocket, but its fetched Release is bound to public refresh
+  evidence. Frozen witnesses are bound regardless of lock contribution.
+- `refresh_only`: **historical evidence only**, produced before refresh exposed
+  repository identity. It is never emitted by a new probe. Existing reports and
+  manifests retain this honest limitation rather than being silently promoted.
+  `record` requires complete matching public repository evidence before it will
+  accept `refresh_identity`; a label edit alone is refused.
 
 ### `diff`
 
@@ -257,6 +270,15 @@ independent source bytes. Stored report observations are not used as derived
 byte verdicts. This is retained, reviewed authentication evidence, not
 offline re-verification of OpenPGP signatures or a new live probe.
 
+Adding an architecture requires its original archive bytes, not just an
+unchanged derived member. The retained v1 bundle authenticates the arm64
+Python package coordinates through its original lock and signed index but
+does not contain the arm64 `python3` or `python3-minimal` archives. Their
+expanded list-prestate coverage therefore fails closed until those exact
+original archives are retained in a separately generated, versioned bundle.
+The existing bundle and historical pocket labels must not be rewritten as
+a new successful probe to fill that gap.
+
 The ZIP is read without filesystem extraction. Limits are 64 MiB aggregate
 evidence, 256 ZIP entries, 128 MiB decompressed tar and 100,000 tar entries;
 duplicate/unsafe paths and unsupported ZIP entry types fail closed.
@@ -284,7 +306,7 @@ and also verifies that it refuses a manifest with a mutated identity.
 1. Build ReleaseSafe `debz` at the current `main`:
    `zig build -Doptimize=ReleaseSafe -j4`.
 2. Probe the newest settled day:
-   `python3 tools/real-snapshot-repin.py probe --series ubuntu-stonking --debz zig-out/bin/debz`.
+   `python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute --debz zig-out/bin/debz`.
    Read `summary.md` and note the new admission deadline.
 3. Run `diff --report .tmp/real-snapshot-repin/<T>/report.json --pr N` for
    every open real-snapshot pull request.
@@ -307,6 +329,84 @@ and also verifies that it refuses a manifest with a mutated identity.
 **Cadence:** monthly. Start when fewer than 10 days remain before the
 admission deadline (about day 21 of the 31-day bound).
 
+## Ubuntu archive trust-root renewal
+
+The protected reference proof uses a reviewed, package-derived trust root,
+not the hosted image's keyring (#355). The current source is the resolute
+`ubuntu-keyring_2023.11.28.1build1_all.deb`; its archive is 11,228 bytes and
+its `./usr/share/keyrings/ubuntu-archive-keyring.gpg` member is 3,607 bytes.
+The authoritative URL, archive SHA-512/size and member SHA-256/size constants
+live in `tools/real-snapshot-reference-protected-ci.sh`. Their anti-drift
+tokens are in `PROTECTED_REFERENCE_SCRIPT_TOKENS` in
+`tools/security-audit.py`. Read those current values when renewing; do not
+reuse the older stonking values from the original issue.
+
+Review renewal when Ubuntu announces an archive signing-key addition,
+replacement, revocation or expiry, when the authenticated package changes
+its key set, or when a required signature no longer validates under the
+reviewed root. Check these conditions during the monthly repin review. An
+older package version alone does not require rotation if its reviewed keys
+still satisfy the authentication policy. Conversely, a pending renewal does
+not permit accepting an unknown, expired or revoked signer.
+
+Renewal is a separate trust decision from a snapshot or freshness repin:
+
+1. Select a settled snapshot and record the candidate package's exact URL,
+   version, architecture, signed archive identity and size. Authenticate its
+   Release, index and package record using the still-accepted trust root,
+   then verify the downloaded bytes against that record before opening the
+   archive. A digest computed from an unauthenticated download is not a trust
+   source. If the existing root cannot authenticate the candidate, stop:
+   establish independently trusted Ubuntu key-transition evidence and obtain
+   explicit review of that bootstrap before proceeding.
+2. In a new private review directory, independently re-derive both identities
+   from the authenticated package, rather than copying the staging constants.
+   With `package` naming those verified bytes and `review` naming that new
+   directory:
+
+   ```sh
+   wc -c < "$package"
+   sha512sum "$package"
+   dpkg-deb --field "$package" Package Version Architecture
+   dpkg-deb --fsys-tarfile "$package" |
+     tar -xOf - ./usr/share/keyrings/ubuntu-archive-keyring.gpg \
+       > "$review/ubuntu-archive-keyring.gpg"
+   wc -c < "$review/ubuntu-archive-keyring.gpg"
+   sha256sum "$review/ubuntu-archive-keyring.gpg"
+   mkdir -m 0700 "$review/gnupg"
+   gpg --batch --homedir "$review/gnupg" --no-default-keyring \
+     --keyring "$review/ubuntu-archive-keyring.gpg" \
+     --with-colons --fingerprint --list-keys
+   ```
+
+   Retain the authenticated metadata/lock, archive identity, extraction
+   command, member bytes, complete fingerprints and expiry/revocation
+   information. Compare old and new key sets; document every addition,
+   removal and changed validity. Package authentication does not by itself
+   authorize accepting every key or replacing the configured signer.
+3. Obtain review of the source evidence, both independently derived
+   digest/size pairs, key-set delta and intended accepted signer set. Any
+   signer-policy change must be explicit in the same review; never silently
+   expand the allowlist to make a failed signature pass.
+4. Update the protected staging constants and anti-drift tokens together.
+   Use the probe/diff/record flow to update manifest identities
+   `archive:ubuntu-keyring` and
+   `file:ubuntu-keyring/usr/share/keyrings/ubuntu-archive-keyring.gpg`,
+   their provenance and every registered consumer, including
+   `doc/integration-roots.md`. Review related signer/profile changes
+   separately and run offline `check`, then the covering protected-CI
+   policy/mutation checks and security audit.
+5. Before accepting the renewal, execute the protected reference proof on
+   both amd64 and arm64 with the proposed staged root. Retain
+   `archive-keyring-path.tsv`, authenticated frozen/witness decisions,
+   commit identity and both job outcomes. A skipped job or a successful
+   proof under the previous root is not renewal evidence.
+
+A missing or mismatched archive/member, unaccepted signer, expired metadata,
+or an unreviewed key transition must fail the build or acceptance run. Never
+fall back to the image keyring, change the clock, relax signature checks,
+or extend the current witness deadline to conceal a renewal failure.
+
 ## Tests
 
 - `zig build test-real-snapshot-repin` (`test/real-snapshot-repin.zig`, in
@@ -322,37 +422,22 @@ admission deadline (about day 21 of the 31-day bound).
   - an unreviewed signer;
   - an unreviewed frozen Release, which is refused before `debz` runs;
   - a pocket whose packages are all shadowed by another pocket, and an empty
-    pocket. Each is reported as `refresh_only` on the architectures where it
+    pocket. Each is reported as `refresh_identity` on the architectures where it
     contributes nothing, without any extra `debz` plan, and `record` keeps
-    that binding.
+    that binding. Contributing Release/snapshot identities match exact locks;
+    frozen witnesses include an empty security pocket on both architectures.
 - `tools/test_real_snapshot_repin.py` unit-tests the tool's pure logic in
   `zig build security-audit`: timestamps, Release parsing, date and deadline
   rules, manifest and binding validation, statuses, `record` refusals and
   renames, pocket binding, and package member extraction.
 
-## Known gap: Release identity of a pocket outside a lock
+## Historical evidence is not a new probe
 
-`debz` already holds every configured pocket's authenticated Release digest
-after refresh: `PublishedRepositoryState.release_digest`, which is also the
-source of an exact lock's `release_sha256`. Two outputs reach the tool, and
-neither carries that digest for every pocket:
-
-- `debz refresh --json` emits, per repository, only the repository id
-  (`package`), the Release suite (`version`) and a detail string. It does not
-  emit the Release digest or the signer fingerprint.
-- An exact lock lists only the repositories that contribute a locked package.
-
-For a frozen series, `debz` also records each witness's repository id,
-snapshot digest, `Date`, deadline and primary fingerprint
-(`FrozenDecisions`/`WitnessDecision`). That record reaches snapshot digest v4
-and `debz`'s cache manifests only. The multi-repository cache manifest also
-lists every pocket's Release digest and signer, but it is a cache file, not
-command output.
-
-So for a `refresh_only` pocket, the tool records the Release bytes it fetched
-twice, but it cannot compare them with the digest `debz` authenticated. The
-tool does not work around this, for example by planning another closure or by
-reading `debz`'s cache files. Closing the gap needs `debz` to emit each
-pocket's tagged Release digest and signer in refresh output, and, for a
-frozen pocket, its witness decisions. The tool can then bind every pocket to
-that output and drop `refresh_only`. This is tracked in #344.
+Older committed evidence may still contain `refresh_only`, including the
+resolute arm64 security pocket. The implementation fixes future observations;
+it does not retroactively authenticate those fetched bytes. Replacing such a
+binding requires a reviewed report from the new binary's public refresh
+evidence, using the existing repin procedure. Do not fabricate a contributing
+package, inspect private metadata-cache manifests as a substitute, or describe
+an offline manifest `check` as a new live probe. Live native/protected acceptance
+gates remain separate from these synthetic, network-free tests.

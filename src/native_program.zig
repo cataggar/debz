@@ -41,6 +41,8 @@ const exact_lock_v2 = @import("exact_lock_v2.zig");
 const exact_lock_v3 = @import("exact_lock_v3.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_authorization = @import("native_authorization.zig");
+const native_baseline = @import("native_baseline_contract.zig");
+const exact_lock_v4 = @import("exact_lock_v4.zig");
 const package_origin = @import("package_origin.zig");
 const solver = @import("solver.zig");
 const transaction_executor = @import("transaction_executor.zig");
@@ -50,6 +52,12 @@ pub const schema_id = "https://debz.dev/schema/native-transaction-program-v1";
 pub const schema_version: u32 = 1;
 pub const schema_v2_id = "https://debz.dev/schema/native-transaction-program-v2";
 pub const schema_v2_version: u32 = 2;
+pub const schema_v3_id = "https://debz.dev/schema/native-transaction-program-v3";
+pub const schema_v3_version: u32 = 3;
+
+pub fn taggedAuthority(version: u32) bool {
+    return version == schema_v2_version or version == schema_v3_version;
+}
 
 /// Absolute resource ceilings. `Limits` may tighten them; nothing may raise
 /// them, so a hostile or defective caller cannot enlarge the compiler's
@@ -780,7 +788,19 @@ pub const Program = struct {
     artifacts_sha256: Digest,
     steps: []const Step,
     steps_sha256: Digest,
+    baseline: ?native_baseline.Contract = null,
     digest_sha256: Digest,
+
+    pub fn jsonStringify(self: Program, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (std.meta.fields(Program)) |field| {
+            if (!std.mem.eql(u8, field.name, "baseline") or self.version == schema_v3_version) {
+                try writer.objectField(field.name);
+                try writer.write(@field(self, field.name));
+            }
+        }
+        try writer.endObject();
+    }
 
     pub fn canonicalJson(self: Program, allocator: std.mem.Allocator) ![]u8 {
         var output: std.Io.Writer.Allocating = .init(allocator);
@@ -799,12 +819,33 @@ pub const Program = struct {
         self: Program,
         authorization: native_authorization.Authorization,
     ) bool {
-        const expected_schema = if (authorization.wire_version ==
+        const expected_schema = if (self.baseline != null) schema_v3_id else if (authorization.wire_version ==
             native_authorization.schema_v2_version)
             schema_v2_id
         else
             schema_id;
-        const expected_version = authorization.wire_version;
+        const expected_version = if (self.baseline != null) schema_v3_version else authorization.wire_version;
+        if (self.baseline) |baseline| {
+            if (authorization.wire_version != native_authorization.schema_v3_version or
+                authorization.baseline_noop_sha512 == null or
+                !std.mem.eql(u8, &authorization.baseline_noop_sha512.?, &baseline.digest()) or
+                !std.mem.eql(u8, &baseline.archive_lock_sha256, &authorization.exact_lock.digest_sha256) or
+                !std.mem.eql(u8, self.exact_lock.schema, exact_lock_v4.schema_id) or
+                self.exact_lock.version != exact_lock_v4.schema_version or
+                !std.mem.eql(u8, &self.exact_lock.digest_sha256, &hex(32, baseline.planning_lock_sha256)))
+                return false;
+            for (authorization.actions) |action| {
+                if (action.kind != .install or action.prior_version != null or
+                    baseline.component.containsName(action.package))
+                    return false;
+            }
+            for (baseline.component.components) |component| {
+                const final = authorization.findFinalPackage(component.package.name, component.package.architecture) orelse return false;
+                if (!std.mem.eql(u8, final.version, component.package.version) or final.state != .installed or
+                    final.dpkg_selection_hold != (component.package.selection == .hold))
+                    return false;
+            }
+        }
         return std.mem.eql(u8, self.schema, expected_schema) and
             self.version == expected_version and
             self.backend == authorization.backend and
@@ -814,11 +855,11 @@ pub const Program = struct {
             std.mem.eql(u8, &self.request_sha256, &hex(32, authorization.request_sha256)) and
             std.mem.eql(u8, &self.root_identity_sha256, &hex(32, authorization.root_identity_sha256)) and
             std.mem.eql(u8, self.install_root, authorization.install_root) and
-            std.mem.eql(
+            (self.baseline != null or std.mem.eql(
                 u8,
                 &self.exact_lock.digest_sha256,
                 &hex(32, authorization.exact_lock.digest_sha256),
-            );
+            ));
     }
 
     pub fn countSteps(self: Program, kind: StepKind) usize {
@@ -956,6 +997,7 @@ pub const OwnershipConflict = struct {
 
 pub const Input = struct {
     authorization: *const native_authorization.Authorization,
+    baseline: ?*const native_baseline.Contract = null,
     /// The reviewed plan's ordered lifecycle. It must cover every authorized
     /// action exactly once; nothing may be dropped or invented.
     ordered_actions: []const solver.OrderedAction,
@@ -1642,7 +1684,14 @@ fn validateBinding(self: *Compiler) CompileError!void {
         (std.mem.eql(u8, authorization.exact_lock.schema, exact_lock_v3.schema_id) and
             authorization.exact_lock.version == exact_lock_v3.schema_version)))
         return self.reject(.{ .code = .unsupported_lock_generation });
-    if (authorization.actions.len == 0 and
+    if ((self.input.baseline != null) != (authorization.wire_version == native_authorization.schema_v3_version))
+        return self.reject(.{ .code = .policy_mismatch, .detail = "baseline authority generation" });
+    if (self.input.baseline) |baseline| {
+        if (authorization.baseline_noop_sha512 == null or
+            !std.mem.eql(u8, &authorization.baseline_noop_sha512.?, &baseline.digest()))
+            return self.reject(.{ .code = .policy_mismatch, .detail = "baseline component contract" });
+    }
+    if (self.input.baseline == null and authorization.actions.len == 0 and
         (authorization.trigger_authority == null or
             authorization.trigger_authority.?.mode != .process_pending))
         return self.reject(.{ .code = .empty_program });
@@ -1687,7 +1736,7 @@ fn validateBinding(self: *Compiler) CompileError!void {
             (self.input.installed.packages.len != 0 or
                 authorization.foreign_architectures.len != 0 or
                 authorization.actions.len == 0 or
-                authorization.wire_version != native_authorization.schema_v2_version)))
+                !native_authorization.taggedAuthority(authorization.wire_version))))
         return self.reject(.{ .code = .database_not_quiescent });
     if (self.input.installed.packages.len > self.limits.installed_packages)
         return self.reject(.{ .code = .limit_exceeded, .detail = "installed packages" });
@@ -2411,6 +2460,13 @@ fn validateOrdering(self: *Compiler) CompileError!void {
         self.ordered_action_index = &.{};
         return;
     }
+    if (ordered.len == 0 and self.input.baseline != null and
+        authorization.wire_version == native_authorization.schema_v3_version and
+        authorization.actions.len == 0 and self.input.archives.len == 0)
+    {
+        self.ordered_action_index = &.{};
+        return;
+    }
     if (ordered.len == 0)
         return self.reject(.{ .code = .missing_ordered_action, .detail = "empty lifecycle" });
     self.ordered_action_index = try self.arena.alloc(usize, ordered.len);
@@ -2596,7 +2652,10 @@ fn emitPreflight(self: *Compiler) CompileError!void {
         .authorization_sha256 = hex(32, authorization.digest_sha256),
         .plan_sha256 = hex(32, authorization.plan_sha256),
         .request_sha256 = hex(32, authorization.request_sha256),
-        .exact_lock_sha256 = hex(32, authorization.exact_lock.digest_sha256),
+        .exact_lock_sha256 = hex(32, if (self.input.baseline) |baseline|
+            baseline.planning_lock_sha256
+        else
+            authorization.exact_lock.digest_sha256),
         .final_state_sha256 = hex(32, authorization.final_state_sha256),
     } });
     const foreign = try self.arena.alloc([]const u8, authorization.foreign_architectures.len);
@@ -4036,10 +4095,10 @@ fn assemble(self: *Compiler) CompileError!Program {
     const foreign = try self.arena.alloc([]const u8, authorization.foreign_architectures.len);
     for (authorization.foreign_architectures, 0..) |architecture, index|
         foreign[index] = try self.arena.dupe(u8, architecture);
-    const is_v2 = authorization.wire_version == native_authorization.schema_v2_version;
+    const is_v2 = native_authorization.taggedAuthority(authorization.wire_version);
     var program: Program = .{
-        .schema = if (is_v2) schema_v2_id else schema_id,
-        .version = if (is_v2) schema_v2_version else schema_version,
+        .schema = if (self.input.baseline != null) schema_v3_id else if (is_v2) schema_v2_id else schema_id,
+        .version = if (self.input.baseline != null) schema_v3_version else if (is_v2) schema_v2_version else schema_version,
         .backend = authorization.backend,
         .install_root = try self.arena.dupe(u8, authorization.install_root),
         .root_identity_sha256 = hex(32, authorization.root_identity_sha256),
@@ -4079,8 +4138,16 @@ fn assemble(self: *Compiler) CompileError!Program {
         .artifacts_sha256 = @splat('0'),
         .steps = try self.steps.toOwnedSlice(self.arena),
         .steps_sha256 = @splat('0'),
+        .baseline = if (self.input.baseline) |baseline| try baseline.clone(self.arena) else null,
         .digest_sha256 = @splat('0'),
     };
+    if (program.baseline) |baseline| {
+        program.exact_lock = .{
+            .schema = exact_lock_v4.schema_id,
+            .version = exact_lock_v4.schema_version,
+            .digest_sha256 = hex(32, baseline.planning_lock_sha256),
+        };
+    }
     program.artifacts_sha256 = hex(32, hashValue(if (is_v2)
         "debz-native-transaction-program-artifacts-v2\x00"
     else
@@ -4107,7 +4174,9 @@ fn hashValue(domain: []const u8, value: anytype) [32]u8 {
 fn documentDigest(program: Program) [32]u8 {
     var payload = program;
     payload.digest_sha256 = @splat('0');
-    return hashValue(if (program.version == schema_v2_version)
+    return hashValue(if (program.version == schema_v3_version)
+        "debz-native-transaction-program-v3\x00"
+    else if (program.version == schema_v2_version)
         "debz-native-transaction-program-v2\x00"
     else
         "debz-native-transaction-program-v1\x00", payload);
@@ -4322,6 +4391,81 @@ fn lessTriggerCallerBinding(
     return @intFromEnum(left.source) < @intFromEnum(right.source);
 }
 
+fn baselineOperation(
+    baseline: @import("installed_baseline_component.zig").Manifest,
+    artifacts: []const ProgramArtifact,
+    operation: Operation,
+) DecodeError!void {
+    switch (operation) {
+        .run_maintainer_script, .process_deferred_triggers, .remove_package_files, .purge_package_files, .record_trigger_interests, .activate_trigger, .materialize_bootstrap_payload => return error.InvalidProgram,
+        .unpack_package => |intent| {
+            if (intent.artifact >= artifacts.len or intent.prior_version != null or
+                intent.prior_owned_paths_sha256 != null or intent.bootstrapped)
+                return error.InvalidProgram;
+            const artifact = artifacts[intent.artifact];
+            if (!samePackageIdentity(intent.package, artifact.package)) return error.InvalidProgram;
+        },
+        .record_package_state => |record| {
+            if (record.remove_entry or record.state == .not_installed or record.state == .config_files or
+                !baselineNewPackage(artifacts, record.package))
+                return error.InvalidProgram;
+        },
+        .configure_barrier => |barrier| for (barrier.packages) |package| {
+            var found = false;
+            for (artifacts) |artifact| {
+                if (std.mem.eql(u8, package.name, artifact.package.name) and
+                    std.mem.eql(u8, package.architecture, artifact.package.architecture))
+                    found = true;
+            }
+            if (!found) return error.InvalidProgram;
+        },
+        .apply_conffile_decision => |decision| {
+            if (!baselineNewPackage(artifacts, decision.package)) return error.InvalidProgram;
+            for (baseline.components) |component| for (component.payload) |file| {
+                if (decision.path.len != 0 and std.mem.eql(u8, decision.path[1..], file.path))
+                    return error.InvalidProgram;
+            };
+        },
+        .assert_path_ownership => |assertion| {
+            if (baseline.find(assertion.holder.name, assertion.holder.architecture) != null)
+                return error.InvalidProgram;
+        },
+        else => {},
+    }
+}
+
+fn samePackageIdentity(left: PackageIdentity, right: PackageIdentity) bool {
+    return std.mem.eql(u8, left.name, right.name) and
+        std.mem.eql(u8, left.version, right.version) and
+        std.mem.eql(u8, left.architecture, right.architecture);
+}
+
+fn baselineNewPackage(artifacts: []const ProgramArtifact, package: PackageIdentity) bool {
+    for (artifacts) |artifact| if (samePackageIdentity(package, artifact.package)) return true;
+    return false;
+}
+
+test "native_program.test.baseline no-op cannot become a state transition or configure handler" {
+    const baseline: @import("installed_baseline_component.zig").Manifest = .{
+        .root = .{ .device = 0, .inode = 0, .uid = 0, .gid = 0, .mode = 0o755 },
+        .architecture = "amd64",
+        .components = &.{},
+    };
+    for ([_][]const u8{ "1.0", "2.0" }) |version| {
+        try std.testing.expectError(error.InvalidProgram, baselineOperation(baseline, &.{}, .{
+            .record_package_state = .{
+                .package = .{ .name = "private-baseline", .version = version, .architecture = "amd64" },
+                .state = .installed,
+                .hold = false,
+                .remove_entry = false,
+            },
+        }));
+    }
+    try std.testing.expectError(error.InvalidProgram, baselineOperation(baseline, &.{}, .{
+        .configure_barrier = .{ .reason = .final, .packages = &.{.{ .name = "private-baseline", .architecture = "amd64" }} },
+    }));
+}
+
 /// Revalidates a decoded document exactly as strictly as compilation validated
 /// the program it published.
 pub fn validateDocument(program: Program) DecodeError!void {
@@ -4329,8 +4473,40 @@ pub fn validateDocument(program: Program) DecodeError!void {
         program.version == schema_version;
     const is_v2 = std.mem.eql(u8, program.schema, schema_v2_id) and
         program.version == schema_v2_version;
-    if (!is_v1 and !is_v2)
+    const is_v3 = std.mem.eql(u8, program.schema, schema_v3_id) and program.version == schema_v3_version;
+    const tagged = is_v2 or is_v3;
+    if (!is_v1 and !tagged)
         return error.UnsupportedSchema;
+    if ((program.baseline != null) != is_v3) return error.InvalidProgram;
+    if (program.baseline) |baseline| {
+        if (!std.mem.eql(u8, baseline.schema, native_baseline.schema_id) or baseline.version != 1 or
+            !std.mem.eql(u8, program.exact_lock.schema, exact_lock_v4.schema_id) or
+            program.exact_lock.version != exact_lock_v4.schema_version or
+            !std.mem.eql(u8, &program.exact_lock.digest_sha256, &hex(32, baseline.planning_lock_sha256)) or
+            program.trigger_authority != null)
+            return error.InvalidProgram;
+        const per_step_work = std.math.add(usize, baseline.component.components.len, program.artifacts.len) catch return error.InvalidProgram;
+        var work = std.math.mul(usize, @max(per_step_work, 1), program.steps.len) catch return error.InvalidProgram;
+        work = std.math.add(usize, work, std.math.mul(usize, baseline.component.components.len, program.artifacts.len) catch return error.InvalidProgram) catch return error.InvalidProgram;
+        var payload_files: usize = 0;
+        for (baseline.component.components) |component|
+            payload_files = std.math.add(usize, payload_files, component.payload.len) catch return error.InvalidProgram;
+        for (program.steps) |step| {
+            const extra = switch (step.operation) {
+                .configure_barrier => |barrier| std.math.mul(usize, barrier.packages.len, program.artifacts.len) catch return error.InvalidProgram,
+                .apply_conffile_decision => payload_files,
+                else => 0,
+            };
+            work = std.math.add(usize, work, extra) catch return error.InvalidProgram;
+        }
+        if (work > maximum_compile_work) return error.InvalidProgram;
+        for (program.artifacts) |artifact| {
+            if (baseline.component.containsName(artifact.package.name) or
+                artifact.origin_v2 == null or artifact.origin_v2.? != .authenticated_repository)
+                return error.InvalidProgram;
+        }
+        for (program.steps) |step| try baselineOperation(baseline.component, program.artifacts, step.operation);
+    }
     switch (program.backend) {
         .native => {},
         .legacy_dpkg => return error.UnsupportedBackend,
@@ -4380,10 +4556,10 @@ pub fn validateDocument(program: Program) DecodeError!void {
         if (!validateModel(ProgramArtifact, artifact)) return error.InvalidDigest;
         if ((is_v1 and (artifact.archive_identity != null or artifact.origin == null or
             artifact.origin_v2 != null)) or
-            (is_v2 and (artifact.archive_identity == null or artifact.origin != null or
+            (tagged and (artifact.archive_identity == null or artifact.origin != null or
                 artifact.origin_v2 == null)))
             return error.InvalidProgram;
-        if (is_v2) switch (artifact.origin_v2.?) {
+        if (tagged) switch (artifact.origin_v2.?) {
             .authenticated_repository => {},
             .local_artifact => |local| {
                 if (!local.archive_identity.value.eql(artifact.archive_identity.?.value) or
@@ -4422,7 +4598,7 @@ pub fn validateDocument(program: Program) DecodeError!void {
                     return error.InvalidProgram;
                 const artifact = program.artifacts[assertion.artifact];
                 if ((is_v1 and assertion.archive_identity != null) or
-                    (is_v2 and assertion.archive_identity == null))
+                    (tagged and assertion.archive_identity == null))
                     return error.InvalidProgram;
                 const assertion_identity = assertion.identity() orelse
                     return error.InvalidProgram;
@@ -4495,12 +4671,12 @@ pub fn validateDocument(program: Program) DecodeError!void {
     if (program.steps[0].operation != .assert_authorization) return error.InvalidStepGraph;
     if (program.steps[program.steps.len - 1].operation != .publish_provenance)
         return error.InvalidStepGraph;
-    if (!std.mem.eql(u8, &program.artifacts_sha256, &hex(32, hashValue(if (is_v2)
+    if (!std.mem.eql(u8, &program.artifacts_sha256, &hex(32, hashValue(if (tagged)
         "debz-native-transaction-program-artifacts-v2\x00"
     else
         "debz-native-transaction-program-artifacts-v1\x00", program.artifacts))))
         return error.ArtifactsDigestMismatch;
-    if (!std.mem.eql(u8, &program.steps_sha256, &hex(32, hashValue(if (is_v2)
+    if (!std.mem.eql(u8, &program.steps_sha256, &hex(32, hashValue(if (tagged)
         "debz-native-transaction-program-steps-v2\x00"
     else
         "debz-native-transaction-program-steps-v1\x00", program.steps))))
@@ -8205,11 +8381,32 @@ test "native_program.test.schema stays synchronized with the compiled contract" 
     const required = root.get("required").?.array.items;
     try testing.expectEqual(required.len, properties.count());
     try testing.expectEqual(required.len, serialized.value.object.count());
-    try testing.expectEqual(std.meta.fields(Program).len, required.len);
+    try testing.expectEqual(std.meta.fields(Program).len - 1, required.len);
     for (required) |name| {
         try testing.expect(properties.contains(name.string));
         try testing.expect(serialized.value.object.contains(name.string));
     }
+    const baseline_source = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "schema/native-transaction-program-v3.json",
+        testing.allocator,
+        .limited(maximum_document_bytes),
+    );
+    defer testing.allocator.free(baseline_source);
+    var baseline_schema = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        baseline_source,
+        .{},
+    );
+    defer baseline_schema.deinit();
+    const baseline_properties = baseline_schema.value.object.get("properties").?.object;
+    const baseline_required = baseline_schema.value.object.get("required").?.array.items;
+    try testing.expectEqual(std.meta.fields(Program).len, baseline_properties.count());
+    try testing.expectEqual(baseline_properties.count(), baseline_required.len);
+    inline for (std.meta.fields(Program)) |field|
+        try testing.expect(baseline_properties.contains(field.name));
+    for (baseline_required) |name| try testing.expect(baseline_properties.contains(name.string));
 
     const operations = definitions.get("operations").?.object;
     try testing.expectEqual(std.meta.fields(StepKind).len, operations.count());

@@ -229,7 +229,8 @@
     },
     {
       "architectures": [
-        "amd64"
+        "amd64",
+        "arm64"
       ],
       "consumers": [
         {
@@ -269,11 +270,12 @@
       "path": "preinst",
       "provenance": {
         "archives": {
-          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa"
+          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
+          "arm64": "sha512:bad3bb3efc461da27a358059071544b865f05a387c2f3ae88f181fbe25965541b3dead5704092ff22a1bde61f70a452462c8f3537b16358dede22ccbab165f2d"
         },
         "version": "3.14.3-0ubuntu2"
       },
-      "review": "#220",
+      "review": "#393",
       "size": 856,
       "version_bound": false
     },
@@ -2228,7 +2230,8 @@
     },
     {
       "architectures": [
-        "amd64"
+        "amd64",
+        "arm64"
       ],
       "consumers": [
         {
@@ -2250,17 +2253,19 @@
       "path": "var/lib/dpkg/info/python3.list",
       "provenance": {
         "archives": {
-          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa"
+          "amd64": "sha512:616bc16aa40a486075b987804a735a7c9e1873ad151564d057452761e31377b93451f00d2f82fcbccd6b2edd32dbaaeba14e6862a6a5192229a37e66fe61f6aa",
+          "arm64": "sha512:bad3bb3efc461da27a358059071544b865f05a387c2f3ae88f181fbe25965541b3dead5704092ff22a1bde61f70a452462c8f3537b16358dede22ccbab165f2d"
         },
         "version": "3.14.3-0ubuntu2"
       },
-      "review": "#392",
+      "review": "#393",
       "size": 918,
       "version_bound": false
     },
     {
       "architectures": [
-        "amd64"
+        "amd64",
+        "arm64"
       ],
       "consumers": [
         {
@@ -2286,11 +2291,12 @@
       "path": "var/lib/dpkg/info/python3-minimal.list",
       "provenance": {
         "archives": {
-          "amd64": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5"
+          "amd64": "sha512:e45a8b4d3ee89c9c30f3c2a31af1dfc5600dd4a541f4fcf42abb4946870076ad2dfa3a629699aa204d77db9d17ae58529eee5202cd6e89f8af14a5a9ec9b96a5",
+          "arm64": "sha512:a6cd021e0907b3f9c5eb1ca7777450bd1dc89d9cad2714c3239850a78d1e2d6953c28672cf0c76cbf40d5665881b91b5eafeec9e3f4f1fe348a24129a1c4ade2"
         },
         "version": "3.14.3-0ubuntu2"
       },
-      "review": "#392",
+      "review": "#393",
       "size": 781,
       "version_bound": false
     },
@@ -2508,6 +2514,110 @@
       },
       "review": "#330",
       "size": 96,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha256:87630eb41654f7888e28fa5ef3ed0a351682e939d382b9239a24a8aefe84aeb9",
+      "id": "file:dash/usr/bin/dash@arm64",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "dash",
+      "path": "usr/bin/dash",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e"
+        },
+        "version": "0.5.12-12ubuntu3"
+      },
+      "review": "#393",
+      "size": 133864,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha256:d4887172b8395e1eabcefa9320a861489b80496e23bb1f3e62ca8f1d250332d8",
+      "id": "file:gnu-coreutils/usr/bin/gnurm@arm64",
+      "kind": "tool_file",
+      "mode": "0755",
+      "package": "gnu-coreutils",
+      "path": "usr/bin/gnurm",
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:4764da9b544f7c2c0bf74d3e90dcfdc4202b191ecfcbd57362afc10c682822d167cbaecd1d935b2b3007f70c3182e7946eb087720cd1709c773d92d449e9e144"
+        },
+        "version": "9.7-3ubuntu2.1"
+      },
+      "review": "#393",
+      "size": 68224,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha512:bad3bb3efc461da27a358059071544b865f05a387c2f3ae88f181fbe25965541b3dead5704092ff22a1bde61f70a452462c8f3537b16358dede22ccbab165f2d",
+      "id": "archive:python3@arm64",
+      "kind": "archive",
+      "mode": null,
+      "package": "python3",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:bad3bb3efc461da27a358059071544b865f05a387c2f3ae88f181fbe25965541b3dead5704092ff22a1bde61f70a452462c8f3537b16358dede22ccbab165f2d"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#393",
+      "size": 22938,
+      "version_bound": false
+    },
+    {
+      "architectures": [
+        "arm64"
+      ],
+      "consumers": [
+        {
+          "form": "hex",
+          "path": "src/native_unpack.zig"
+        }
+      ],
+      "digest": "sha512:a6cd021e0907b3f9c5eb1ca7777450bd1dc89d9cad2714c3239850a78d1e2d6953c28672cf0c76cbf40d5665881b91b5eafeec9e3f4f1fe348a24129a1c4ade2",
+      "id": "archive:python3-minimal@arm64",
+      "kind": "archive",
+      "mode": null,
+      "package": "python3-minimal",
+      "path": null,
+      "provenance": {
+        "archives": {
+          "arm64": "sha512:a6cd021e0907b3f9c5eb1ca7777450bd1dc89d9cad2714c3239850a78d1e2d6953c28672cf0c76cbf40d5665881b91b5eafeec9e3f4f1fe348a24129a1c4ade2"
+        },
+        "version": "3.14.3-0ubuntu2"
+      },
+      "review": "#393",
+      "size": 25808,
       "version_bound": false
     }
   ],

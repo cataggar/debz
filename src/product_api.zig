@@ -1,4 +1,5 @@
 const std = @import("std");
+const content_digest = @import("content_digest.zig");
 
 pub const api_version: u32 = 1;
 pub const json_schema = "io.github.cataggar.debz.command.v1";
@@ -132,6 +133,28 @@ pub const Item = struct {
     version: ?[]const u8 = null,
     architecture: ?[]const u8 = null,
     detail: ?[]const u8 = null,
+    repository: ?RepositoryEvidence = null,
+};
+
+pub const RepositoryEvidence = struct {
+    release_digest: content_digest.Value,
+    signer_fingerprints: []const [20]u8,
+    snapshot_digest: content_digest.Value,
+    frozen: ?FrozenRepositoryEvidence = null,
+};
+
+pub const FrozenRepositoryEvidence = struct {
+    release_digest: content_digest.Value,
+    admission_deadline_unix: i64,
+    witnesses: []const WitnessEvidence,
+};
+
+pub const WitnessEvidence = struct {
+    repository_id: [64]u8,
+    snapshot_digest: content_digest.Value,
+    release_date_unix: i64,
+    deadline_unix: i64,
+    primary_fingerprint: [20]u8,
 };
 
 pub const NativeInstallEvidence = struct {
@@ -197,15 +220,41 @@ pub const Result = struct {
     native_completion: ?NativeCompletionEvidence = null,
     // Typed consumers read who owns a refused held attempt; command.v1 omits it.
     recovery_owner: ?RecoveryOwner = null,
+    native_download: ?NativeBaselineDownload = null,
 
     pub fn canonicalJson(self: Result, allocator: std.mem.Allocator) ![]u8 {
+        if (self.native_download != null) try self.requireDocumentBudget();
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        const writer = &output.writer;
+        try self.writeCanonical(&output.writer);
+        return output.toOwnedSlice();
+    }
+
+    pub fn encodedDocumentSize(self: Result) !usize {
+        var buffer: [4096]u8 = undefined;
+        var output: std.Io.Writer.Discarding = .init(&buffer);
+        try self.writeCanonical(&output.writer);
+        return std.math.cast(usize, output.fullCount()) orelse error.DocumentTooLarge;
+    }
+
+    pub fn requireDocumentBudget(self: Result) !void {
+        try self.requireReservedDocumentBudget(0);
+    }
+
+    /// Pure encoding headroom, never inserted into the serialized result.
+    pub fn requireReservedDocumentBudget(self: Result, additional_bytes: usize) !void {
+        if (self.items.len > maximum_result_items or
+            (std.math.add(usize, try self.encodedDocumentSize(), additional_bytes) catch return error.DocumentTooLarge) > maximum_result_document_bytes)
+            return error.DocumentTooLarge;
+    }
+
+    fn writeCanonical(self: Result, writer: *std.Io.Writer) !void {
+        if (self.operation == .refresh and (self.api_version != api_version or self.native_download != null))
+            return error.UnsupportedSchema;
         try writer.writeAll("{\"schema\":\"");
-        try writer.writeAll(json_schema);
+        try writer.writeAll(if (self.native_download != null) "io.github.cataggar.debz.command.v2" else json_schema);
         try writer.writeAll("\",\"api_version\":");
-        try writer.print("{d}", .{self.api_version});
+        try writer.print("{d}", .{if (self.native_download != null) @as(u32, 2) else self.api_version});
         try writer.writeAll(",\"operation\":");
         try writeJsonString(writer, self.operation.spelling());
         try writer.writeAll(",\"exit_status\":");
@@ -225,6 +274,12 @@ pub const Result = struct {
             if (item.architecture) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
             try writer.writeAll(",\"detail\":");
             if (item.detail) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+            if (item.repository) |repository| {
+                if (self.operation != .refresh) return error.InvalidDocument;
+                try validateRepositoryEvidence(repository);
+                try writer.writeAll(",\"repository\":");
+                try writeRepositoryEvidence(writer, repository);
+            }
             try writer.writeByte('}');
         }
         try writer.writeAll("],\"diagnostics\":[");
@@ -236,9 +291,22 @@ pub const Result = struct {
             try writeJsonString(writer, diagnostic.message);
             try writer.writeByte('}');
         }
-        try writer.writeAll("]}\n");
-        return output.toOwnedSlice();
+        try writer.writeByte(']');
+        if (self.native_download) |evidence| {
+            try writer.writeAll(",\"native_download\":");
+            try std.json.Stringify.value(evidence, .{}, writer);
+        }
+        try writer.writeAll("}\n");
     }
+};
+
+pub const NativeBaselineDownload = struct {
+    schema: []const u8 = "https://debz.dev/schema/native-baseline-download-v1",
+    version: u32 = 1,
+    outcome: enum { archives_verified_without_execution } = .archives_verified_without_execution,
+    baseline_noop: @import("native_baseline_contract.zig").Contract,
+    downloaded_count: usize,
+    reused_count: usize,
 };
 
 pub const OwnedResult = struct {
@@ -258,6 +326,24 @@ const WireItem = struct {
     version: ?[]const u8,
     architecture: ?[]const u8,
     detail: ?[]const u8,
+    repository: ?WireRepositoryEvidence = null,
+};
+
+const WireRepositoryEvidence = struct {
+    release_digest: []const u8,
+    signer_fingerprints: []const []const u8,
+    snapshot_digest: []const u8,
+    frozen: ?struct {
+        release_digest: []const u8,
+        admission_deadline_unix: i64,
+        witnesses: []const struct {
+            repository_id: []const u8,
+            snapshot_digest: []const u8,
+            release_date_unix: i64,
+            deadline_unix: i64,
+            primary_fingerprint: []const u8,
+        },
+    },
 };
 
 const WireDiagnostic = struct {
@@ -274,6 +360,7 @@ const WireResult = struct {
     summary: []const u8,
     items: []const WireItem,
     diagnostics: []const WireDiagnostic,
+    native_download: ?NativeBaselineDownload = null,
 };
 
 /// Decodes the canonical bounded result transported out of the private
@@ -289,8 +376,9 @@ pub fn decodeResult(
         .ignore_unknown_fields = false,
     }) catch return error.InvalidDocument;
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.schema, json_schema) or
-        parsed.value.api_version != api_version)
+    const baseline_download = std.mem.eql(u8, parsed.value.schema, "io.github.cataggar.debz.command.v2") and parsed.value.api_version == 2;
+    if (!((std.mem.eql(u8, parsed.value.schema, json_schema) and parsed.value.api_version == api_version and parsed.value.native_download == null) or
+        (baseline_download and parsed.value.native_download != null)))
         return error.UnsupportedSchema;
     if (parsed.value.items.len > maximum_result_items or
         parsed.value.diagnostics.len > 1)
@@ -305,6 +393,16 @@ pub fn decodeResult(
     arena.* = .init(allocator);
     errdefer arena.deinit();
     const owned = arena.allocator();
+    if (parsed.value.native_download) |evidence| {
+        if (!std.mem.eql(u8, evidence.schema, "https://debz.dev/schema/native-baseline-download-v1") or evidence.version != 1 or
+            operation != .download or exit_status != .success or parsed.value.changed or parsed.value.diagnostics.len != 0)
+            return error.InvalidDocument;
+        try evidence.baseline_noop.validate(owned, null);
+        var baseline_lock = try @import("exact_lock_v4.zig").decode(owned, evidence.baseline_noop.planning_lock_json);
+        defer baseline_lock.deinit();
+        const count = std.math.add(usize, evidence.downloaded_count, evidence.reused_count) catch return error.InvalidDocument;
+        if (count != baseline_lock.archive_lock.lock.packages.len) return error.InvalidDocument;
+    }
     const items = try owned.alloc(Item, parsed.value.items.len);
     for (parsed.value.items, 0..) |item, index| {
         items[index] = .{
@@ -312,6 +410,10 @@ pub fn decodeResult(
             .version = try dupeOptional(owned, item.version),
             .architecture = try dupeOptional(owned, item.architecture),
             .detail = try dupeOptional(owned, item.detail),
+            .repository = if (item.repository) |repository| blk: {
+                if (operation != .refresh) return error.InvalidDocument;
+                break :blk try decodeRepositoryEvidence(owned, repository);
+            } else null,
         };
     }
     var diagnostics: [1]Diagnostic = undefined;
@@ -329,6 +431,7 @@ pub fn decodeResult(
     }
     var result: OwnedResult = .{
         .result = .{
+            .api_version = parsed.value.api_version,
             .operation = operation,
             .exit_status = exit_status,
             .changed = parsed.value.changed,
@@ -340,6 +443,11 @@ pub fn decodeResult(
         .arena = arena,
         .backing_allocator = allocator,
     };
+    if (parsed.value.native_download) |evidence| {
+        var value = evidence;
+        value.baseline_noop = try evidence.baseline_noop.clone(owned);
+        result.result.native_download = value;
+    }
     const canonical = try result.result.canonicalJson(allocator);
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, source))
@@ -453,6 +561,116 @@ fn dupeOptional(
     return if (value) |bytes| try allocator.dupe(u8, bytes) else null;
 }
 
+fn parseRepositoryDigest(text: []const u8) !content_digest.Value {
+    if (!std.mem.startsWith(u8, text, "sha256:")) return error.InvalidDocument;
+    return content_digest.Value.parse(.sha256, text[7..]) catch error.InvalidDocument;
+}
+
+fn parseFingerprint(text: []const u8) ![20]u8 {
+    if (!validHex(text, 40)) return error.InvalidDocument;
+    var bytes: [20]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text) catch return error.InvalidDocument;
+    return bytes;
+}
+
+fn validHex(text: []const u8, length: usize) bool {
+    if (text.len != length) return false;
+    for (text) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    return true;
+}
+
+fn decodeRepositoryEvidence(allocator: std.mem.Allocator, wire: WireRepositoryEvidence) !RepositoryEvidence {
+    const signers = try allocator.alloc([20]u8, wire.signer_fingerprints.len);
+    for (wire.signer_fingerprints, signers) |text, *signer| signer.* = try parseFingerprint(text);
+    const repository: RepositoryEvidence = .{
+        .release_digest = try parseRepositoryDigest(wire.release_digest),
+        .snapshot_digest = try parseRepositoryDigest(wire.snapshot_digest),
+        .signer_fingerprints = signers,
+        .frozen = if (wire.frozen) |frozen| blk: {
+            const witnesses = try allocator.alloc(WitnessEvidence, frozen.witnesses.len);
+            for (frozen.witnesses, witnesses) |witness, *value| {
+                if (!validHex(witness.repository_id, 64)) return error.InvalidDocument;
+                value.* = .{
+                    .repository_id = witness.repository_id[0..64].*,
+                    .snapshot_digest = try parseRepositoryDigest(witness.snapshot_digest),
+                    .release_date_unix = witness.release_date_unix,
+                    .deadline_unix = witness.deadline_unix,
+                    .primary_fingerprint = try parseFingerprint(witness.primary_fingerprint),
+                };
+            }
+            break :blk .{
+                .release_digest = try parseRepositoryDigest(frozen.release_digest),
+                .admission_deadline_unix = frozen.admission_deadline_unix,
+                .witnesses = witnesses,
+            };
+        } else null,
+    };
+    try validateRepositoryEvidence(repository);
+    return repository;
+}
+
+fn validateRepositoryEvidence(repository: RepositoryEvidence) !void {
+    if (repository.release_digest != .sha256 or repository.snapshot_digest != .sha256)
+        return error.InvalidDocument;
+    for (repository.signer_fingerprints, 0..) |fingerprint, index|
+        if (index != 0 and std.mem.order(u8, &repository.signer_fingerprints[index - 1], &fingerprint) != .lt)
+            return error.InvalidDocument;
+    if (repository.frozen) |frozen| {
+        if (!frozen.release_digest.eql(repository.release_digest) or
+            frozen.witnesses.len == 0 or frozen.witnesses.len > 4)
+            return error.InvalidDocument;
+        var earliest: i64 = std.math.maxInt(i64);
+        for (frozen.witnesses, 0..) |witness, index| {
+            if (!validHex(&witness.repository_id, 64) or witness.snapshot_digest != .sha256 or
+                witness.deadline_unix < witness.release_date_unix)
+                return error.InvalidDocument;
+            earliest = @min(earliest, witness.deadline_unix);
+            for (frozen.witnesses[0..index]) |prior|
+                if (std.mem.eql(u8, &prior.repository_id, &witness.repository_id)) return error.InvalidDocument;
+        }
+        if (earliest != frozen.admission_deadline_unix) return error.InvalidDocument;
+    }
+}
+
+fn writeRepositoryDigest(writer: *std.Io.Writer, digest: content_digest.Value) !void {
+    var encoded: [128]u8 = undefined;
+    try writer.writeAll("\"sha256:");
+    try writer.writeAll(digest.hex(&encoded));
+    try writer.writeByte('"');
+}
+
+fn writeRepositoryEvidence(writer: *std.Io.Writer, repository: RepositoryEvidence) !void {
+    try writer.writeAll("{\"release_digest\":");
+    try writeRepositoryDigest(writer, repository.release_digest);
+    try writer.writeAll(",\"signer_fingerprints\":[");
+    for (repository.signer_fingerprints, 0..) |fingerprint, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writeJsonString(writer, &std.fmt.bytesToHex(fingerprint, .lower));
+    }
+    try writer.writeAll("],\"snapshot_digest\":");
+    try writeRepositoryDigest(writer, repository.snapshot_digest);
+    try writer.writeAll(",\"frozen\":");
+    if (repository.frozen) |frozen| {
+        try writer.writeAll("{\"release_digest\":");
+        try writeRepositoryDigest(writer, frozen.release_digest);
+        try writer.print(",\"admission_deadline_unix\":{d},\"witnesses\":[", .{frozen.admission_deadline_unix});
+        for (frozen.witnesses, 0..) |witness, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"repository_id\":");
+            try writeJsonString(writer, &witness.repository_id);
+            try writer.writeAll(",\"snapshot_digest\":");
+            try writeRepositoryDigest(writer, witness.snapshot_digest);
+            try writer.print(",\"release_date_unix\":{d},\"deadline_unix\":{d},\"primary_fingerprint\":", .{
+                witness.release_date_unix, witness.deadline_unix,
+            });
+            try writeJsonString(writer, &std.fmt.bytesToHex(witness.primary_fingerprint, .lower));
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]}");
+    } else try writer.writeAll("null");
+    try writer.writeByte('}');
+}
+
 test "product_api.test.canonical transported result preserves installed items" {
     const items = [_]Item{
         .{
@@ -485,6 +703,83 @@ test "product_api.test.canonical transported result preserves installed items" {
         "all",
         decoded.result.items[1].architecture.?,
     );
+}
+
+test "product_api.test.refresh repository and frozen decisions survive owned transport" {
+    const allocator = std.testing.allocator;
+    var signers = [_][20]u8{@splat(0x33)};
+    var witnesses = [_]WitnessEvidence{.{
+        .repository_id = @splat('a'),
+        .snapshot_digest = .{ .sha256 = @splat(0x22) },
+        .release_date_unix = 100,
+        .deadline_unix = 200,
+        .primary_fingerprint = signers[0],
+    }};
+    const repository: RepositoryEvidence = .{
+        .release_digest = .{ .sha256 = @splat(0x11) },
+        .snapshot_digest = .{ .sha256 = @splat(0x44) },
+        .signer_fingerprints = &signers,
+        .frozen = .{
+            .release_digest = .{ .sha256 = @splat(0x11) },
+            .admission_deadline_unix = 200,
+            .witnesses = &witnesses,
+        },
+    };
+    const result: Result = .{
+        .operation = .refresh,
+        .exit_status = .success,
+        .summary = "authenticated",
+        .items = &.{.{ .package = "repo", .repository = repository }},
+    };
+    const source = try result.canonicalJson(allocator);
+    defer allocator.free(source);
+    var decoded = try decodeResult(allocator, source);
+    defer decoded.deinit();
+    signers[0] = @splat(0);
+    witnesses[0].repository_id = @splat('b');
+    const after = try decoded.result.canonicalJson(allocator);
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings(source, after);
+    try std.testing.expect(decoded.result.items[0].repository.?.frozen.?.witnesses.ptr != witnesses[0..].ptr);
+    const mutations = [_]struct { before: []const u8, after: []const u8, expected: anyerror }{
+        .{ .before = "\"operation\":\"refresh\"", .after = "\"operation\":\"info\"", .expected = error.InvalidDocument },
+        .{ .before = "\"api_version\":1", .after = "\"api_version\":2", .expected = error.UnsupportedSchema },
+        .{ .before = "sha256:", .after = "sha512:", .expected = error.InvalidDocument },
+        .{ .before = "\"admission_deadline_unix\":200", .after = "\"admission_deadline_unix\":201", .expected = error.InvalidDocument },
+        .{ .before = "\"deadline_unix\":200", .after = "\"deadline_unix\":true", .expected = error.InvalidDocument },
+        .{ .before = "\"repository\":{", .after = "\"repository\":{\"unknown\":1,", .expected = error.InvalidDocument },
+    };
+    for (mutations) |mutation| {
+        const changed = try std.mem.replaceOwned(u8, allocator, source, mutation.before, mutation.after);
+        defer allocator.free(changed);
+        try std.testing.expectError(mutation.expected, decodeResult(allocator, changed));
+    }
+    var wrong_operation = result;
+    wrong_operation.operation = .plan;
+    try std.testing.expectError(error.InvalidDocument, wrong_operation.canonicalJson(allocator));
+    var wrong_version = result;
+    wrong_version.api_version = 2;
+    try std.testing.expectError(error.UnsupportedSchema, wrong_version.canonicalJson(allocator));
+    try std.testing.expectError(error.UnsupportedSchema, wrong_version.encodedDocumentSize());
+}
+
+test "product_api.test.every non-refresh operation retains its original item JSON" {
+    inline for (std.meta.fields(Operation)) |field| {
+        const operation: Operation = @enumFromInt(field.value);
+        if (operation != .refresh) {
+            const result: Result = .{
+                .operation = operation,
+                .exit_status = .success,
+                .summary = "ok",
+                .items = &.{.{ .package = "demo", .version = "1", .architecture = "amd64" }},
+            };
+            const json = try result.canonicalJson(std.testing.allocator);
+            defer std.testing.allocator.free(json);
+            const expected = try std.fmt.allocPrint(std.testing.allocator, "{{\"schema\":\"io.github.cataggar.debz.command.v1\",\"api_version\":1,\"operation\":\"{s}\",\"exit_status\":0,\"changed\":false,\"summary\":\"ok\",\"items\":[{{\"package\":\"demo\",\"version\":\"1\",\"architecture\":\"amd64\",\"detail\":null}}],\"diagnostics\":[]}}\n", .{operation.spelling()});
+            defer std.testing.allocator.free(expected);
+            try std.testing.expectEqualStrings(expected, json);
+        }
+    }
 }
 
 fn validAbsolutePath(path: []const u8) bool {
