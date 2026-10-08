@@ -1130,8 +1130,12 @@ fn deferredSelectionChange(fixture: *foundation.Fixture, driver: []const u8, hel
         .defer_triggers = true,
     }, "deferred-unrelated-selection-change/install");
     defer result.deinit();
-    if (!std.mem.eql(u8, result.value.outcome, "recovery_required"))
+    if (!std.mem.eql(u8, result.value.outcome, "recovery_required")) {
+        std.debug.print("deferred selection drift: {s}/{s}\n", .{ result.value.outcome, result.value.detail });
         return error.DeferredSelectionMutationWasNotBlocked;
+    }
+    if (!std.mem.eql(u8, result.value.detail, "final_closure_mismatch"))
+        return error.DeferredSelectionWrongRefusal;
     const operation_bytes = try support.read(
         fixture,
         "deferred-unrelated-selection-change/native/var/lib/debz/root-operation-v1.json",
@@ -1428,6 +1432,8 @@ pub fn main(init: std.process.Init) !void {
     const native_driver = driver orelse "";
     if (multi_handler_only) {
         try runDeferredMultiHandler(&fixture, native_driver, selected, reference.executable, reference.architecture);
+        if (!oracle_only)
+            try deferredSelectionChange(&fixture, native_driver, selected, reference.executable, reference.architecture);
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return;
     }

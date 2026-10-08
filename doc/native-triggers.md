@@ -178,6 +178,11 @@ expectation, including exact pending names and awaiting edges. Missing,
 extra, or reordered edges and unrelated package identity/version/selection
 changes remain mismatches; derived mode is not permission to accept any
 pending state.
+Before publishing derived status, native execution checks each selection it
+would publish against that bound closure. A maintainer-script selection change
+requires recovery without rewriting status or status-old; trigger publication
+does not silently restore the authorized selection and conceal the drift.
+An unchanged authorized hold is retained.
 
 The input base digest must match the caller's exact closure before
 authorization canonicalizes package order. The returned authority rebinds
@@ -198,6 +203,9 @@ callback argv, and an unchanged zero-action upgrade including database and
 provenance bytes/mtimes. It also interrupts after deferred status publication:
 clean recovery must not replay scripts or rewrite status, and pending-field
 drift must retain recovery evidence with `managed_state_changed`.
+The native selector also requires a scripted unrelated selection change to
+retain the changed status, report `recovery_required/final_closure_mismatch`
+with its exact program binding, and block subsequent mutation.
 Repeat with `-Doptimize=ReleaseSafe`.
 
 This fixture does **not** establish dpkg's cross-handler `--pending` scheduling
