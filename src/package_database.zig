@@ -24,6 +24,7 @@ const status_model = @import("dpkg_status.zig");
 const version_module = @import("debian_version.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const phase_telemetry = @import("native_phase_telemetry.zig");
 
 pub const Want = status_model.Want;
 pub const ErrorState = status_model.ErrorState;
@@ -876,6 +877,8 @@ fn writeHex(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void 
 }
 
 fn digestOf(bytes: []const u8) [32]u8 {
+    const span = phase_telemetry.start(.hash);
+    defer span.end();
     var digest: [32]u8 = undefined;
     Sha256.hash(bytes, &digest, .{});
     return digest;
@@ -2403,6 +2406,8 @@ pub fn importSnapshot(
     request: ImportRequest,
     options: Options,
 ) std.mem.Allocator.Error!Result {
+    const span = phase_telemetry.start(.import);
+    defer span.end();
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = .init(allocator);
     var importer: Importer = .{
@@ -2561,6 +2566,8 @@ pub fn generation(
     std.mem.sort(GenerationEntry, entries.items, {}, lessGenerationEntry);
 
     var buffer: [512]u8 = undefined;
+    const hash_span = phase_telemetry.start(.hash);
+    defer hash_span.end();
     var sink: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
     const writer = &sink.writer;
     writer.writeAll("debz.package-database.generation.v1\n") catch unreachable;

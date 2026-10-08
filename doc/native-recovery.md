@@ -56,6 +56,59 @@ The CLI supplies its deallocating process allocator to native preparation,
 execution and recovery while keeping API result ownership in its
 argument-parsing arena. The latter cannot reclaim phase-local allocations.
 
+With `DEBZ_NATIVE_PHASE_TELEMETRY=1`, native execution also emits diagnostic-only `native_phase` structured log
+lines after durable progress publication and on an ordinary execution/recovery
+return (including refusals and errors, not necessarily successful completion).
+Each line identifies the attempt, a random process epoch, an
+invocation ID, context-local sequence, program step/substep/ordinal/stage/result, monotonic elapsed
+nanoseconds and cumulative count/nanoseconds pairs for database capture,
+database import, database hashing, native materialization application, fsync and progress
+serialization (read/decode/seal/validate/encode, excluding publication).
+The opt-in logs use the existing info logger on stderr, never JSON stdout.
+Ordinary invocations remain quiet and do not attach a measurement context;
+small hashes and fsyncs then incur no profiling clock reads. The variable changes
+only observation, never authorization, evidence or maintainer-script environment.
+There are six fixed-size saturating counters and no retained sample list.
+Counts include failed operations. Import includes its hash time; mutation
+measures the materializers' `root_mutation.apply` calls (not preparation or
+recovery rollback) and includes nested fsync time, so these inclusive durations
+must not be summed.
+Fsync measures actual file/directory synchronization through the root filesystem
+helpers; hashing covers package-database content and generation hashes, not
+archive/helper hashing. Aborted processes may have no final log line.
+
+These logs are neither durable checkpoints nor authority. They add no fields
+to frozen progress, intent, provenance, database or completion documents and
+never affect a deadline or permission to mutate. Recovery starts fresh counters
+and a fresh monotonic interval/invocation ID; a process restart changes the epoch. Compare
+deltas only within one invocation, not elapsed values across restarts.
+The elapsed timestamps are direct monotonic measurements in the opt-in
+diagnostic stream, **not timestamps added to native progress records**.
+Frozen durable progress schemas and canonical bytes remain unchanged;
+the progress-record timestamp follow-up in issue #345 is not implemented.
+
+State recording borrows its immediately preceding imported database; detailed
+state materialization borrows the same-phase import of its outer capture.
+The owning capture and import outlive planning/materialization and are then
+released. There is no retained database cache and no reuse across scripts,
+filesystem publication or recovery. Mutation preflight, expected-before
+checks, fresh post-apply database import, `status-old` verification and
+independently durable phase completion remain unchanged. No DB-only actions
+are grouped.
+
+The synthetic 1/175-package state-transition checks compare identical inputs
+against a seam that restores the removed capture/import. They establish fewer
+captures/imports/hashes with equal final generation, status, exact `status-old`,
+mutation and fsync counts; they do not measure a full install before/after.
+Issue #345 still requires controlled matched full 177-package snapshot runs
+on amd64 and arm64, direct production phase deltas, telemetry-overhead
+calibration and complete final root/provenance comparison. Shared-host timings,
+historical mtime allocations and cancelled CI cohorts are not acceptance or
+controlled full-snapshot speedup evidence.
+`zig build test-native-phase-telemetry` checks configured logging in separate
+processes with the variable absent, disabled, a non-opt-in value and enabled;
+it also runs in the unprivileged native unit workload.
+
 Filesystem and database repair delegates to the existing
 [root mutation layer](root-mutation.md). Missing, corrupt, mismatched, or
 externally changed evidence cannot become an absent journal or an implicitly
