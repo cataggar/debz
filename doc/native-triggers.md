@@ -20,7 +20,13 @@ matter. Multiple activations coalesce without losing their ordering.
 `postinst triggered` receives exactly two arguments: `triggered` and a single
 space-separated trigger-name argument. The name order is observable and is not
 arbitrarily sorted. File-trigger matching follows component boundaries and
-the package paths affected by unpack/removal.
+the package paths affected by unpack/removal. Automatic activations follow
+archive-entry or removal-intent order, noting the affected physical path before
+its parents, as dpkg's `trig_path_activate` does; registry record order is not
+activation order. A diverted directory can therefore be noted before later
+archive children activate the original logical directory. The pending list's
+prepend order then gives the logical directory before the diverted directory
+in the immediate callback, without changing registry bytes.
 
 Removal and purge derive file events from the actual planned filesystem
 removals, not merely from ownership lists. Retained conffiles therefore do not
@@ -29,6 +35,9 @@ cleanup do. Events remain durably bound to their original package and program.
 Known lifecycle-script failure still processes or defers authorized pending
 work before publishing the failed outcome. It neither discards those events
 nor converts the original package failure into a successful receipt.
+Earlier filesystem activations are incorporated before the failing script's
+helper queue in both immediate and deferred modes. Replaying authenticated
+completed publications preserves that order and does not move duplicate names.
 Incorporation checks the listener's current database state: an interested
 package that is still unpacked or otherwise not configured does not become
 `triggers-pending` or cause its activating package to become
@@ -264,12 +273,57 @@ activation, pending Unincorp queues, known failures, dynamic chains and
 no-progress cycles. It also checks interrupted handler evidence and re-entry
 blocking, malformed queue refusal, unrelated deferred selection changes,
 unauthenticated helper refusal, and diverted/aliased file-trigger routes.
-It also runs two **reference-only** guarded, pinned-dpkg cases for a failed
-activating postinst with an unpacked (not configured) listener, once with
-`interest-await` and once with `interest-noawait`. Both assert that the listener
-stays unpacked with no pending work, the source stays half-configured without
-an awaited edge, and `Unincorp` stays empty after the helper returns. These
-cases do **not** compare native execution: the native program compiler currently
+The one-handler byte-order cases compare raw status and exact, length-framed
+`postinst triggered` argv against pinned dpkg, with multiple explicit and file
+interests. Immediately noted names use dpkg's prepend order; a subsequent
+command reads `Triggers-Pending` by prepending its serialized tokens, reversing
+that order once. Native internal status publications are not new command
+imports. The deferred reinstallation case also tests imported pending names
+coalescing with repeated activations, without moving duplicates. The focused
+`-Dnative-trigger-byte-order-only=true` selector runs these cases in the
+existing native and two-dpkg oracle targets.
+
+Unprivileged `test-native-unpack` regressions reproduce diverted directory and
+child-before-parent file-event ordering, plus immediate/deferred failure
+incorporation and authenticated replay with a reordered-journal refusal. The
+failure regression deliberately leaves dispatch unbound so it can inspect the
+real pending database without running a script. These checks are not a
+replacement for pinned-dpkg settlement and conffile crash execution in CI.
+
+Recovery restores the live/imported pending-name distinction only from an
+authenticated normalization publication, not a generic completed database
+phase or queue/log contents. Normalization binds an intent/action-specific
+purpose digest in the existing preparation record's `evidence_sha256`.
+Replay requires that preparation **and** successful completion bound to the
+retained managed checkpoint; a preparation alone cannot establish live order.
+The journal schemas, fields and stages are unchanged. Existing generic/null
+preparations remain readable and are not promoted to normalization evidence.
+An uninterested activation can leave the queue and activation log empty after
+normalization. Replaying that publication must keep the original triggered
+argv so the recorded ordinal and outcome are reused without rerunning the
+handler. Queue clearing without event application and scriptless-handler
+completion do not establish live pending order.
+`zig build test-native-recovery-helper-zig -j2
+-Dnative-trigger-recovery-order-only=true -Dnative-reference-dpkg=/absolute/path/to/dpkg`
+runs genuine `after_trigger_outcome` crash/recovery cases with one imported
+handler, with and without an uninterested queue entry, and a scripted handler
+after a scriptless handler's non-normalizing completion. They require exact
+pinned-dpkg argv and final status bytes, unchanged retained outcome bytes and
+action identity, and no duplicate callback on recovery or terminal replay.
+Unit cases reject an unfinished preparation, missing/mismatched checkpoint and
+purpose bound to another action, while retaining generic v1 record semantics.
+They also restore a later authenticated normalization after generic phase 0;
+restoration is not restricted to the first completed database phase.
+Source-only fixture compilation and unit results are not evidence that these
+genuine-tool cases ran; guarded execution and hosted coverage must be
+established separately.
+
+The full trigger suite also runs two **reference-only** guarded, pinned-dpkg
+cases for a failed activating postinst with an unpacked (not configured)
+listener, once with `interest-await` and once with `interest-noawait`. Both
+assert that the listener stays unpacked with no pending work, the source stays
+half-configured without an awaited edge, and `Unincorp` stays empty after the
+helper returns. These cases do **not** compare native execution: the native program compiler currently
 refuses this unconfigured-listener program. Separate Zig tests for both await
 variants assert `program_compile_rejected`, unchanged full private-root
 snapshots, and no active authority. That fail-closed behavior must not be
@@ -282,13 +336,15 @@ pending (no `triggers-pending`/`triggers-awaited` package, no pending or
 awaited names, empty `Unincorp`) are not work. That root is `unchanged` with
 `changed=false`, compiles no `process_triggers` program, and leaves status,
 `triggers/` and provenance byte-identical. `test-native-root-import`'s
-`zeroActionTriggers` installs explicit and file interest handlers plus an
+`zeroActionTriggers` installs one explicit/file interest handler plus an
 activating source through native trigger processing. Two zero-action updates
 then leave `var/lib/dpkg` and `var/lib/debz` byte- and mtime-identical. Pinned
 dpkg's `--configure --pending` and `--triggers-only -a` run no script and
-change no `status` or `triggers/` bytes on the reference root; only
-`status-old` is rewritten. It also covers activate-only roots with no
-interested package. An unincorporated activation or a deferred
+change no `status` or `triggers/` bytes on either reference or native clones;
+only `status-old` is rewritten, with persistent locks additionally allowed on
+native clones. Record or field normalization is not accepted as byte equality.
+It also covers activate-only roots with no interested package.
+An unincorporated activation or a deferred
 `Triggers-Pending` still classifies as `execution_required` `process_triggers`,
 and after processing the root is unchanged again.
 
