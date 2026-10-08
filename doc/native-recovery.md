@@ -2672,3 +2672,22 @@ that follow.
 **Gaps (follow-ups).** The hermetic HC/HR/HQ and FS fixtures run no
 maintainer scripts; FSS, HCC and HCR cover retained `script_outcome`
 documents for scripted succeeded and recovered attempts (#318).
+## Installed-baseline no-op recovery
+
+The explicit native baseline contract uses authorization/program v3, the full
+v4 planning envelope, request v4, intent v2, non-bootstrap progress v3 and
+provenance v2. See the [component and authority boundary](exact-locks-and-provenance.md#native-execution-boundary).
+The initial complete database checksum is not replayed blindly after owned
+new-package mutations. Managed checkpoints bind those exact mutations, while
+the unchanged baseline status/control/ownership/payload component is verified
+independently before further work, final-state verification and acknowledgment.
+
+Recovery consumes the original retained program, component and authenticated
+archives, including when the original repository or archive files disappear.
+Baseline drift during a partial unpack or after receipt publication refuses
+further work/acknowledgment and retains the same active attempt and intent.
+Unknown pending triggers and private callbacks likewise cannot become baseline
+authority. A successful zero-action replay retains the exact existing receipt;
+it does not recapture changed local facts. Legacy baseline recovery and
+bootstrap, removal, reinstall, upgrade, callback or trigger grants remain
+unsupported by this bounded contract.

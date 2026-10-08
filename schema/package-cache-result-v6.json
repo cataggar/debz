@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/package-cache-result-v6.json",
+  "title": "debz native installed-baseline package-cache preparation result v6",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "api_version", "capability", "lock_digest", "fingerprint", "baseline_noop", "target_architecture", "cas_layout", "cache_root", "cache_path", "downloaded_count", "reused_count", "verified_count", "staging", "gc"],
+  "properties": {
+    "schema": {"const": "io.github.cataggar.debz.package-cache-result.v6"},
+    "api_version": {"const": 6},
+    "capability": {"const": "package-cache-v6"},
+    "lock_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "baseline_noop": {"$ref": "https://debz.dev/schema/native-installed-baseline-noop-v1"},
+    "target_architecture": {"type": "string", "minLength": 1, "maxLength": 64},
+    "cas_layout": {"const": "packages-v2"},
+    "cache_root": {"type": "string", "pattern": "^/"},
+    "cache_path": {"type": "string", "pattern": "/packages-v2/objects$"},
+    "downloaded_count": {"type": "integer", "minimum": 0},
+    "reused_count": {"type": "integer", "minimum": 0},
+    "verified_count": {"type": "integer", "minimum": 0},
+    "staging": {"$ref": "https://github.com/cataggar/debz/schema/package-cache-result-v5.json#/$defs/cleanup"},
+    "gc": {"$ref": "https://github.com/cataggar/debz/schema/package-cache-result-v5.json#/$defs/gc"}
+  }
+}

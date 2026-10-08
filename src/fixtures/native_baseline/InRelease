@@ -1,0 +1,25 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Origin: debz deterministic native baseline fixture
+Suite: stable
+Codename: stable
+Date: Mon, 07 Sep 2026 00:00:00 +0000
+Valid-Until: Mon, 14 Sep 2026 00:00:00 +0000
+Architectures: amd64
+Components: main
+Acquire-By-Hash: no
+SHA256:
+ f7e53cb6be362744bf5fa6603275b2dfe6219a864131ba7775f6af2f85ce7577 726 main/binary-amd64/Packages
+SHA512:
+ 6d2145d290b27df248bdf625860e976a9c98dd748bd245af2a9bfd39a79be38f6d9745380c0db9088e9fd1928a031ac4be46826d133ca5d5aa6629f0721bebc1 726 main/binary-amd64/Packages
+-----BEGIN PGP SIGNATURE-----
+
+wsBzBAEBCAAdBQJqnf6AFiEE/NAbjvJs5BQRWxQz9TItrOIzvrgACgkQ9TItrOIz
+vrhoZQgAliQAQBYz/1X0WvZlVxMKyNFs/0zRREGhlnaWGGV/kB7wy+ZqlFh3loCo
+3mCoBdZJbvbxOu8KnTQcN7n/rJ0kvj6Lrpg/VgtPUN5BVgBIeX6P8vwsow7QIxK5
+AKoaJNUM5FESz8DjJuHTl2ZZ2/9xvAmAHhDxSoKWM1/i/kYfhUXeNUY8tC9PZfqR
+y+rHOpPlpMim75zCSW8lBjtnNrfdSy/QdklEASIYoMIb0lxM12jd4NfokwLXsUHv
+i+hjavLYzXcv4MmVT6Xfw74jrClyi5lkEwDtbpYRVYuAERwlfZSMhnvctOvRo2EG
+zCjvxbnYlswDugaBTcw365qE6lTN3Q==
+-----END PGP SIGNATURE-----

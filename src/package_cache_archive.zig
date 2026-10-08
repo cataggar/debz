@@ -4,6 +4,7 @@ const exact_lock_v2 = @import("exact_lock_v2.zig");
 const exact_lock_v3 = @import("exact_lock_v3.zig");
 const content_digest = @import("content_digest.zig");
 const package_acquisition = @import("package_acquisition.zig");
+const native_baseline = @import("native_baseline_contract.zig");
 
 const File = std.Io.File;
 
@@ -13,6 +14,9 @@ pub const native_format_id = "debz-package-cache-archive-v2";
 pub const native_magic = native_format_id ++ "\n";
 pub const tagged_format_id = "debz-package-cache-archive-v3";
 pub const tagged_magic = tagged_format_id ++ "\n";
+pub const baseline_format_id = "debz-package-cache-archive-v4";
+pub const baseline_magic = baseline_format_id ++ "\n";
+pub const maximum_baseline_bytes: u64 = 128 * 1024 * 1024;
 pub const entry_header_bytes: u64 = 32 + 8;
 pub const trailer_bytes: u64 = 32;
 pub const maximum_tagged_entry_header_bytes: u64 = 2 + 1 + 32 + 1 + 64 + 8;
@@ -89,6 +93,10 @@ pub fn maximumTaggedArchiveBytes(limits: Limits) Error!u64 {
     total = std.math.add(u64, total, limits.maximum_total_object_bytes) catch
         return error.ArchiveTooLarge;
     return std.math.add(u64, total, trailer_bytes) catch error.ArchiveTooLarge;
+}
+
+pub fn maximumBaselineArchiveBytes(limits: Limits) Error!u64 {
+    return std.math.add(u64, try maximumTaggedArchiveBytes(limits), 4 + maximum_baseline_bytes) catch error.ArchiveTooLarge;
 }
 
 fn maximumBytes(comptime version: Version, limits: Limits) Error!u64 {
@@ -410,12 +418,41 @@ pub fn importTaggedFile(
     policy: ImportPolicy,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !ImportResult {
+    return importTaggedBinding(allocator, io, archive, cache, lock, limits, policy, writer_lock, null);
+}
+
+pub fn importBaselineFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    archive: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v3.Lock,
+    limits: Limits,
+    policy: ImportPolicy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    baseline: native_baseline.Contract,
+) !ImportResult {
+    try baseline.validate(allocator, &lock);
+    return importTaggedBinding(allocator, io, archive, cache, lock, limits, policy, writer_lock, baseline);
+}
+
+fn importTaggedBinding(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    archive: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v3.Lock,
+    limits: Limits,
+    policy: ImportPolicy,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    baseline: ?native_baseline.Contract,
+) !ImportResult {
     if (writer_lock.cache != cache or writer_lock.file == null or
         cache.limits.maximum_object_bytes != limits.maximum_object_bytes)
         return error.InvalidConfiguration;
     const stat = archive.stat(io) catch return error.InvalidArchiveFile;
     if (stat.kind != .file) return error.InvalidArchiveFile;
-    const maximum = try maximumTaggedArchiveBytes(limits);
+    const maximum = if (baseline != null) try maximumBaselineArchiveBytes(limits) else try maximumTaggedArchiveBytes(limits);
     const minimum: u64 = tagged_magic.len + @sizeOf(u32) + trailer_bytes;
     if (stat.size < minimum) return error.TruncatedArchive;
     if (stat.size > maximum) return error.ArchiveTooLarge;
@@ -445,7 +482,19 @@ pub fn importTaggedFile(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var magic_buffer: [tagged_magic.len]u8 = undefined;
     try readHashed(archive, io, &magic_buffer, &offset, &hasher);
-    if (!std.mem.eql(u8, &magic_buffer, tagged_magic)) return error.InvalidArchive;
+    if (!std.mem.eql(u8, &magic_buffer, if (baseline != null) baseline_magic else tagged_magic)) return error.InvalidArchive;
+    if (baseline) |expected| {
+        var length: [4]u8 = undefined;
+        try readHashed(archive, io, &length, &offset, &hasher);
+        const size = std.mem.readInt(u32, &length, .big);
+        if (size == 0 or size > maximum_baseline_bytes) return error.ArchiveTooLarge;
+        const bytes = try allocator.alloc(u8, size);
+        defer allocator.free(bytes);
+        try readHashed(archive, io, bytes, &offset, &hasher);
+        const wanted = try std.json.Stringify.valueAlloc(allocator, expected, .{});
+        defer allocator.free(wanted);
+        if (!std.mem.eql(u8, bytes, wanted)) return error.BaselineCacheBindingMismatch;
+    }
     var count_buffer: [4]u8 = undefined;
     try readHashed(archive, io, &count_buffer, &offset, &hasher);
     const count = std.mem.readInt(u32, &count_buffer, .big);
@@ -590,6 +639,33 @@ pub fn exportTaggedFile(
     limits: Limits,
     writer_lock: *const package_acquisition.Cache.WriterLock,
 ) !ExportResult {
+    return exportTaggedBinding(allocator, io, output, cache, lock, limits, writer_lock, null);
+}
+
+pub fn exportBaselineFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v3.Lock,
+    limits: Limits,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    baseline: native_baseline.Contract,
+) !ExportResult {
+    try baseline.validate(allocator, &lock);
+    return exportTaggedBinding(allocator, io, output, cache, lock, limits, writer_lock, baseline);
+}
+
+fn exportTaggedBinding(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: File,
+    cache: *package_acquisition.Cache,
+    lock: exact_lock_v3.Lock,
+    limits: Limits,
+    writer_lock: *const package_acquisition.Cache.WriterLock,
+    baseline: ?native_baseline.Contract,
+) !ExportResult {
     if (writer_lock.cache != cache or writer_lock.file == null or
         cache.limits.maximum_object_bytes != limits.maximum_object_bytes or
         lock.packages.len > limits.maximum_objects)
@@ -629,6 +705,12 @@ pub fn exportTaggedFile(
     }.less);
 
     var expected_size: u64 = tagged_magic.len + @sizeOf(u32) + trailer_bytes;
+    const baseline_bytes = if (baseline) |value| try std.json.Stringify.valueAlloc(allocator, value, .{}) else null;
+    defer if (baseline_bytes) |bytes| allocator.free(bytes);
+    if (baseline_bytes) |bytes| {
+        if (bytes.len > maximum_baseline_bytes) return error.ArchiveTooLarge;
+        expected_size = std.math.add(u64, expected_size, 4 + bytes.len) catch return error.ArchiveTooLarge;
+    }
     var total_bytes: u64 = 0;
     for (lock.packages) |package| {
         if (package.declared_size == 0 or package.declared_size > limits.maximum_object_bytes)
@@ -643,12 +725,18 @@ pub fn exportTaggedFile(
             taggedIdentityBytes(package.archive_identity) + 8 + package.declared_size,
         ) catch return error.ArchiveTooLarge;
     }
-    if (expected_size > try maximumTaggedArchiveBytes(limits))
+    if (expected_size > (if (baseline != null) try maximumBaselineArchiveBytes(limits) else try maximumTaggedArchiveBytes(limits)))
         return error.ArchiveTooLarge;
 
     var offset: u64 = 0;
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    try writeHashed(output, io, tagged_magic, &offset, &hasher);
+    try writeHashed(output, io, if (baseline != null) baseline_magic else tagged_magic, &offset, &hasher);
+    if (baseline_bytes) |bytes| {
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, @intCast(bytes.len), .big);
+        try writeHashed(output, io, &length, &offset, &hasher);
+        try writeHashed(output, io, bytes, &offset, &hasher);
+    }
     var count_buffer: [4]u8 = undefined;
     std.mem.writeInt(u32, &count_buffer, @intCast(lock.packages.len), .big);
     try writeHashed(output, io, &count_buffer, &offset, &hasher);

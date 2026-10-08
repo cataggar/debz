@@ -55,6 +55,187 @@ identity. Local origins bind a typed artifact ID plus the complete archive and
 pinned content identities; v2/v3 plan serialization remains byte-for-byte
 unchanged.
 
+## Installed-only baseline: v4 planning and native no-op execution
+
+Product planning can retain a healthy installed package whose exact version
+and architecture are absent from authenticated repositories. Instead of
+inventing an archive origin or dropping the retained fact, it emits
+`exact-closure-lock-v4`. The planning envelope separates two authorities:
+
+- `archive_lock_json` contains the exact canonical v3 JSON string. Its signed
+  repository/index identities, freshness admission, archive digests, backend
+  request/policy bindings, and complete archive closure remain mandatory.
+- `installed_baseline` is separate `installed_database_noop_v1` authority.
+  It binds the exact selected root path, device/inode/ownership/mode, native architecture,
+  complete `var/lib/dpkg` prestate identity, and sorted retained package
+  name/version/architecture/selection tuples. Only healthy `install` or `hold`
+  records qualify. The actual root database is required; `--status` projections
+  cannot supply this authority.
+- Database observations use pinned no-follow descriptors and include file
+  bytes, inode/ownership/mode/time metadata, and directory membership.
+  Symlinks, hard-linked files, unsafe ownership/write permissions, unfinished
+  `updates`, unstable observations, and bounded-work excess refuse.
+- Replay verifies the actual root and database before solving. It locks these
+  packages to their installed identities and rejects any action touching
+  them. Changed/missing prestate, another root, or different architecture
+  fails closed. A new explicit plan can capture a new healthy baseline;
+  replay cannot refresh or replace the old evidence.
+  Lock output must be outside the bound database tree so publication cannot
+  invalidate its own retained prestate. This check compares the pinned output
+  directory's device/inode against every directory in the verified database
+  tree, including database-subdirectory bind-mount aliases; path prefixes or
+  realpath spelling are not authority. It happens before creating a staging
+  entry, and the same opened output directory anchors publication.
+- Fresh and replayed v4 output share the same final verification/publication
+  path. The actual database is verified before staging and again immediately
+  before atomic rename. Existing root-operation, dpkg frontend and dpkg database
+  OFD locks are held in that order throughout these checks and publication,
+  without adopting, clearing or publishing a root-operation record.
+  The lock files must already exist, be regular owner-safe single-link files,
+  and be writable by the caller. Missing infrastructure refuses with
+  `InstalledBaselinePublicationLockUnavailable`; planning never creates lock
+  files or directories in the bound database as setup. OFD exclusion conflicts
+  with ordinary dpkg POSIX locks. These cooperative locks do not freeze writes
+  by an administrator bypassing the supported locking protocol, and the
+  resulting baseline is still observation evidence, never archive or action authority.
+
+The envelope checksum detects document substitution; it is **not** a
+repository signature, an archive digest, or proof of installed payload bytes.
+Baseline tuples cannot authorize fetching/installing an archive, reinstall,
+remove, reconfigure, or a new package. Archive/baseline identities cannot
+overlap. V1/v2/v3 decoding and canonical bytes are unchanged.
+
+### Native execution boundary
+
+Explicit native execution can compose that envelope with
+[`native-installed-baseline-noop-v1`](../schema/native-installed-baseline-noop-v1.json)
+and [`installed-baseline-component-v1`](../schema/installed-baseline-component-v1.json).
+Under the actual held root, before archive acquisition, preparation verifies
+the original whole-database prestate and captures each baseline's exact status
+fields, control/ownership files and owned payload. Regular files and symlinks
+bind physical identity, uid/gid/mode, size, mtime/ctime and SHA512 bytes/target;
+hard links and unsafe or unmodeled observations refuse. Shared directories bind
+identity and uid/gid/mode but not membership or timestamp: authenticated new
+packages may add children without changing the directory itself. Observation
+is bounded to 100,000 files, 256 MiB and 16 million comparison work units.
+
+**Payload observation starts at native preparation, not v4 planning.** The
+original v4 database evidence does not freeze all payload bytes during the
+planning-to-preparation interval. Once prepared, the same component is checked
+again after acquisition, before each native action, at managed checkpoints,
+before final verification/receipt acknowledgment, and on resumed execution.
+Changed/missing control, status, ownership, payload or root facts refuse;
+the executor cannot recapture around interrupted or completed owned work.
+
+Authorization v3 and program v3 explicitly bind this component contract and
+the complete original v4 envelope. Archive authority remains the unchanged
+signed v3 closure with algorithm-tagged identities. The local component grants
+only retention: it cannot fetch, unpack, reinstall, upgrade, remove, configure,
+change version, or activate a handler. This bounded generation permits only
+authenticated **new installs**, with no baseline ownership conflicts or
+directory-metadata changes, no callbacks (including debconf `config`), and no
+pending/declared/unincorporated trigger work. Other cases refuse rather than
+fall back to another backend or broaden authorization.
+Preparation indexes retained payload paths once, with bounded sorted lookup
+and cumulative archive-comparison work capped by the existing native work
+limit. Shared-directory mode and uid/gid must match every retained owner;
+all other exact-path overlaps refuse.
+
+Request v4, intent v2, non-bootstrap progress v3 and provenance v2 carry the exact
+authorization-v3/program-v3/lock-v4 tuple. The final-state kind is
+`package_database_closure_with_baseline_noop_v1`. A zero-archive, zero-action
+operation still compiles this explicit proof and publishes a genuine receipt;
+unchanged replay retains that receipt. The initial whole-database digest is
+not reused after legitimate owned writes: the original immutable components,
+complete final database, managed payload and terminal owned checkpoint are
+verified separately. Only an exact matching successful retained receipt
+authorizes replay against that owned completed database generation.
+Bootstrap progress v4 is not admitted by this bounded baseline contract.
+
+Recovery consumes the persisted exact inputs, program and component under
+the original attempt. It neither requires replacement repository/archive
+locations nor replans around missing ones. Baseline or unknown trigger drift
+after a crash refuses acknowledgment and retains the active intent/ownership.
+
+Native v4 download and package-cache fingerprint/prepare retain the complete
+envelope and component contract, but acquire only the genuine nested signed
+v3 archive closure. Cache API v6 fingerprints/results include `baseline_noop`;
+the fingerprint and restore prefix bind its root, full prestate and immutable
+component facts. Opaque cache archive v4 carries the canonical complete contract
+before the ordinary algorithm-tagged archive records. A foreign or changed
+binding is rejected before CAS import; the baseline is never an archive record.
+Verified immutable signed CAS objects remain reusable independently.
+
+These read-only workflows hold existing root-operation and dpkg exclusion
+locks without creating/adopting an intent. Active work or orphan checkpoints,
+missing/changed baseline metadata, unsafe callbacks and unknown trigger work
+refuse. Actual prestate and component facts are checked before archive work and
+before prepared/download publication; archive export is staged, durably synced,
+and checked again immediately before atomic rename. The original whole-database
+prestate remains required: these workflows do **not** use completed-execution
+receipts to adopt a later database generation. A new explicit healthy plan is
+needed for that generation; interrupted owned execution must be recovered,
+not replanned. Empty signed closures publish an explicit baseline no-op proof
+with zero archive counts, never synthetic digests or repository authority.
+
+Native baseline download publishes command.v2 with typed
+[`native-baseline-download-v1`](../schema/native-baseline-download-v1.json)
+evidence and does not execute packages. An existing exact v4 input remains
+supported. Without an input lock, explicit native download can use the existing
+non-mutating planning policy to observe healthy installed/held packages, hold
+the existing root-operation/dpkg exclusions before repository refresh, and
+freeze their database and eligible component observations. It resolves the
+signed closure separately and binds only the retained installed-only subset
+into the generated v4 envelope. A requested lock output is durably published;
+without one, the complete canonical lock remains in the typed download evidence.
+This is not implicit execution adoption or durable auto-lock orchestration.
+
+Fresh refresh uses a non-publishing metadata view, revalidating existing cached
+objects or authenticating newly fetched metadata with the unchanged signature,
+freshness and index policies. Pending bytes/keys/records are conservatively
+bounded by the existing metadata object byte cap, applied to the whole pending
+refresh. Complete command.v2 admission and actual-root/component revalidation
+precede persistent cache creation/publication, lock output and package archive
+acquisition. Potential-component observation remains conservative: an ineligible
+potential component cannot become v4 authority; a signed-only solve still uses
+v3 without claiming component authority. Owned work, orphan evidence and changed
+captured facts refuse, rather than being recaptured as a new baseline.
+Missing or caller-nonwritable baseline exclusions are retained as an unavailable
+authority refusal while authenticated resolution remains non-publishing. A solve
+requiring v4 returns that refusal before any later baseline capture or persistent
+work; it never repairs/reacquires the exclusions or recaptures around them.
+If the signed resolution needs no installed-only baseline, historical archive-only
+v3 download proceeds without creating or requiring those locks. Partial baseline
+lock acquisitions are released before resolution. Other lock failures, unsafe
+metadata, Root drift and owned-work checks are not relaxed.
+An unreadable dpkg `lock` or `lock-frontend` is a separate opaque, read-only
+observation, not a baseline proof: its no-follow identity, mode, size and change
+time remain bound, while every other database file still requires a stable
+full read. The original permission refusal prevents v4 generation, even if the
+caller later restores access. Strict v4 capture/verification still reads and
+hashes both exclusion files in full; this observation cannot supply v4 or no-op
+authority. Signed-only resolution retains database, owned-state and output
+containment checks without opening the unreadable exclusion for its bytes.
+
+Fresh v4 download with explicit `signed_sha256_derived_sha512` opt-in reserves
+the complete command envelope before archive acquisition or persistent cache
+and lock publication. Accounting-only headroom counts the shared canonical
+writer's binding/provenance fragments with both nested JSON-string escapes,
+128 non-escaping hexadecimal positions per derived SHA512, and maximum decimal
+width for the two rebound digest arrays. It contains no dummy identity or lock.
+Only genuine archives matching the signed SHA256, declared size and original
+authenticated source coordinates produce the derived values. Original guarded
+Root facts are reverified at CAS staging, before actual lock rebind and before
+metadata/lock publication; no later baseline adoption occurs. Tagged preparation
+then consumes those verified CAS objects through the existing path, so its
+download/reuse counters describe that preparation phase. Explicit-v4 policy,
+schemas and budgets are unchanged. Other commands and signed-only results retain
+command.v1.
+Legacy v4 execution/download/cache still refuse; legacy remains the default.
+This native slice does
+not complete backend-neutral execution, SymCrypt short commands, durable
+auto-lock orchestration, or supported Noble amd64/arm64 live acceptance.
+
 **Signed SHA256 with a derived SHA512.** Some signed archives, including
 Debian stable, publish only SHA256 in both
 Release and Packages. For those repositories debz accepts the signed SHA256
@@ -378,8 +559,10 @@ Schemas:
 - [`schema/transaction-result-summary-v1.json`](../schema/transaction-result-summary-v1.json)
 - [`schema/native-transaction-authorization-v1.json`](../schema/native-transaction-authorization-v1.json)
 - [`schema/native-transaction-authorization-v2.json`](../schema/native-transaction-authorization-v2.json)
+- [`schema/native-transaction-authorization-v3.json`](../schema/native-transaction-authorization-v3.json)
 - [`schema/native-transaction-program-v1.json`](../schema/native-transaction-program-v1.json)
 - [`schema/native-transaction-program-v2.json`](../schema/native-transaction-program-v2.json)
+- [`schema/native-transaction-program-v3.json`](../schema/native-transaction-program-v3.json)
 - [`schema/native-transaction-provenance-v2.json`](../schema/native-transaction-provenance-v2.json)
 
 `debz transaction-result verify` is the no-follow read boundary used after an

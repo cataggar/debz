@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-installed-baseline-noop-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "planning_lock_json", "planning_lock_sha256", "archive_lock_sha256", "component"],
+  "properties": {
+    "schema": {"const": "https://debz.dev/schema/native-installed-baseline-noop-v1"},
+    "version": {"const": 1},
+    "planning_lock_json": {"type": "string", "minLength": 1, "maxLength": 16777216},
+    "planning_lock_sha256": {"$ref": "#/$defs/sha256Bytes"},
+    "archive_lock_sha256": {"$ref": "#/$defs/sha256Bytes"},
+    "component": {"$ref": "https://debz.dev/schema/installed-baseline-component-v1"}
+  },
+  "$defs": {
+    "sha256Bytes": {"type": "array", "minItems": 32, "maxItems": 32, "items": {"type": "integer", "minimum": 0, "maximum": 255}}
+  }
+}
