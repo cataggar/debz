@@ -16253,6 +16253,42 @@ fn appendAutomaticFileTriggerEvent(
         );
 }
 
+const FileTriggerPathEvents = struct {
+    allocator: std.mem.Allocator,
+    interests: []const package_database.TriggerInterest,
+    paths: std.StringHashMapUnmanaged([]const u8) = .empty,
+    noted: std.StringHashMapUnmanaged(void) = .empty,
+    work: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, interests: []const package_database.TriggerInterest) !FileTriggerPathEvents {
+        var result: FileTriggerPathEvents = .{ .allocator = allocator, .interests = interests };
+        errdefer result.deinit();
+        for (interests) |interest| {
+            if (interest.trigger.len < 2 or interest.trigger[0] != '/') continue;
+            try result.paths.put(allocator, interest.trigger[1..], interest.trigger);
+        }
+        return result;
+    }
+
+    fn deinit(self: *FileTriggerPathEvents) void {
+        self.paths.deinit(self.allocator);
+        self.noted.deinit(self.allocator);
+    }
+
+    fn activate(self: *FileTriggerPathEvents, sink: FileTriggerSink, architecture: []const u8, path: []const u8) !void {
+        if (self.paths.count() == 0) return;
+        // dpkg's trig_path_activate notes the affected path before its parents.
+        var cursor: ?[]const u8 = path;
+        while (cursor) |component| : (cursor = std.fs.path.dirname(component)) {
+            self.work = std.math.add(usize, self.work, 1) catch return error.TriggerWorkLimit;
+            if (self.work > (Limits{}).max_work) return error.TriggerWorkLimit;
+            const trigger = self.paths.get(component) orelse continue;
+            if ((try self.noted.getOrPut(self.allocator, trigger)).found_existing) continue;
+            try appendAutomaticFileTriggerEvent(sink.allocator, sink.events, sink.source, architecture, trigger, self.interests);
+        }
+    }
+};
+
 fn persistRuntimeTriggerEvents(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -16374,7 +16410,6 @@ fn collectArchiveTriggerEvents(
         .name = model.facts.package,
         .architecture = model.facts.architecture,
     };
-    var work: usize = 0;
     for (model.triggers) |declaration| {
         if (declaration.kind != .activate) continue;
         try appendRuntimeTriggerEvent(
@@ -16387,30 +16422,16 @@ fn collectArchiveTriggerEvents(
             .automatic,
         );
     }
-    var seen_file: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen_file.deinit(allocator);
+    var file_events = try FileTriggerPathEvents.init(allocator, database.model.triggers.interests);
+    defer file_events.deinit();
     var diversions = try native_diversion.Index.init(allocator, diversion_records orelse database.model.diversions);
     defer diversions.deinit(allocator);
-    for (database.model.triggers.interests) |interest| {
-        if (interest.trigger.len == 0 or interest.trigger[0] != '/' or
-            !(try archiveTouchesFileTrigger(
-                model,
-                diversions,
-                interest.trigger,
-                &work,
-                (Limits{}).max_work,
-            )))
-            continue;
-        if ((try seen_file.getOrPut(allocator, interest.trigger)).found_existing)
-            continue;
-        try appendAutomaticFileTriggerEvent(
-            event_allocator,
-            events,
-            source,
-            architecture,
-            interest.trigger,
-            database.model.triggers.interests,
-        );
+    for (model.files) |file| {
+        try file_events.activate(.{
+            .allocator = event_allocator,
+            .source = source,
+            .events = events,
+        }, architecture, diversions.physical(file.path, model.facts.package));
     }
 }
 
@@ -16470,8 +16491,8 @@ fn collectRemovalTriggerEvents(
     intents: []const root_mutation.Intent,
 ) !void {
     const allocator = sink.allocator;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(allocator);
+    var file_events = try FileTriggerPathEvents.init(allocator, model.triggers.interests);
+    defer file_events.deinit();
     var names: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer names.deinit(allocator);
     for (ownership.owners, 0..) |owner, index| {
@@ -16485,35 +16506,12 @@ fn collectRemovalTriggerEvents(
         }
         break;
     }
-    var work: usize = 0;
-    for (model.triggers.interests) |interest| {
-        if (interest.trigger.len == 0 or interest.trigger[0] != '/') continue;
-        const prefix = interest.trigger[1..];
-        var touched = false;
-        for (intents) |intent| {
-            work = std.math.add(usize, work, 1) catch
-                return error.TriggerWorkLimit;
-            if (work > (Limits{}).max_work) return error.TriggerWorkLimit;
-            const physical = switch (intent) {
-                .remove, .remove_directory => intent.path(),
-                else => continue,
-            };
-            const path = names.get(physical) orelse physical;
-            if (std.mem.eql(u8, path, prefix) or
-                (path.len > prefix.len and path[prefix.len] == '/' and
-                    std.mem.startsWith(u8, path, prefix)))
-                touched = true;
-        }
-        if (!touched or (try seen.getOrPut(allocator, interest.trigger)).found_existing)
-            continue;
-        try appendAutomaticFileTriggerEvent(
-            allocator,
-            sink.events,
-            sink.source,
-            model.native_architecture,
-            interest.trigger,
-            model.triggers.interests,
-        );
+    for (intents) |intent| {
+        const physical = switch (intent) {
+            .remove, .remove_directory => intent.path(),
+            else => continue,
+        };
+        try file_events.activate(sink, model.native_architecture, names.get(physical) orelse physical);
     }
 }
 
@@ -16588,29 +16586,6 @@ fn simulateTriggerActivation(
             try appendUniqueText(allocator, &source.values, listener.package.name);
         }
     }
-}
-
-fn archiveTouchesFileTrigger(
-    model: *const archive_application.Model,
-    diversions: native_diversion.Index,
-    trigger: []const u8,
-    work: *usize,
-    maximum_work: usize,
-) !bool {
-    if (trigger.len < 2 or trigger[0] != '/') return false;
-    const relative = trigger[1..];
-    for (model.files) |file| {
-        work.* = std.math.add(usize, work.*, 1) catch
-            return error.TriggerWorkLimit;
-        if (work.* > maximum_work) return error.TriggerWorkLimit;
-        const path = diversions.physical(file.path, model.facts.package);
-        if (std.mem.eql(u8, path, relative) or
-            (path.len > relative.len and
-                path[relative.len] == '/' and
-                std.mem.startsWith(u8, path, relative)))
-            return true;
-    }
-    return false;
 }
 
 fn derivedHandlerAuthorized(
@@ -18578,9 +18553,9 @@ fn lifecycleRunTriggerWork(
     inject_unknown: bool,
     known_failure: bool,
 ) !LifecycleResult {
-    if (known_failure and program.trigger_authority.?.defer_triggers) {
-        // Deferred failure records file events before incorporating the helper
-        // queue; immediate failure incorporates that queue before dispatch.
+    if (known_failure) {
+        // Filesystem events precede the failing script's helper activations,
+        // regardless of whether handlers will run now or in a later command.
         const applied = try lifecycleApplyTriggerEvents(
             execution,
             allocator,
@@ -42701,6 +42676,240 @@ test "native_unpack.test.removal triggers preserve every interested identity" {
         snapshot,
         .{ .max_deferred = 1 },
     ), .deferred_limit);
+}
+
+test "native_unpack.test.failed lifecycle file events precede helper queue incorporation" {
+    for ([_]bool{ false, true }) |deferred| {
+        const status =
+            \\Package: receiver
+            \\Status: install ok installed
+            \\Architecture: amd64
+            \\Version: 1
+            \\Description: receiver
+            \\
+            \\
+        ;
+        const info = [_]package_database.InfoEntry{
+            .{ .name = "receiver.list", .bytes = "/.\n" },
+            .{ .name = "receiver.triggers", .bytes = "interest-noawait /etc/debz-native.conf\ninterest-noawait conffile-purge\n" },
+        };
+        var fixture: Fixture = undefined;
+        try fixture.init(status, &info);
+        defer fixture.deinit();
+        const root = fixture.root();
+        try seedFile(root, "var/lib/dpkg/triggers/File", "/etc/debz-native.conf receiver/noawait\n");
+        try seedFile(root, "var/lib/dpkg/triggers/conffile-purge", "receiver/noawait\n");
+        try seedFile(root, "var/lib/dpkg/triggers/Unincorp", "conffile-purge -\n");
+        var captured = try captureDatabaseSnapshot(testing.allocator, root, .{});
+        defer captured.deinit();
+        var database = switch (try package_database.importSnapshot(testing.allocator, .{
+            .native_architecture = "amd64",
+            .snapshot = captured.snapshot,
+        }, .{})) {
+            .database => |value| value,
+            .diagnostic => return error.TestUnexpectedResult,
+        };
+        defer database.deinit();
+        var initial_model = database.model;
+        initial_model.triggers.pending = &.{};
+        var program = testProgram(database.generation.sha256, 1, &.{}, &.{});
+        program.trigger_authority = .{
+            .mode = .transaction,
+            .defer_triggers = deferred,
+            .initial_state_sha256 = hex(32, native_trigger.stateDigest(initial_model)),
+            // Refuse dispatch so pending order remains observable without a process.
+            .handlers = &.{},
+            .callers = &.{},
+            .allowed_triggers = &.{ "/etc/debz-native.conf", "conffile-purge" },
+            .maximum_invocations = 1,
+        };
+        var root_buffer: [4096]u8 = undefined;
+        const install_root = try fixtureInstallRoot(&fixture, &root_buffer);
+        _ = bindFixtureProgramRoot(&program, install_root);
+        const authorization: native_authorization.Authorization = .{
+            .backend = .native,
+            .target_architecture = "amd64",
+            .foreign_architectures = &.{},
+            .install_root = install_root,
+            .root_identity_sha256 = transaction_recovery.rootIdentity(install_root),
+            .request_sha256 = @splat(0),
+            .solver_policy_sha256 = @splat(0),
+            .executor_policy_sha256 = @splat(0),
+            .plan_sha256 = @splat(0),
+            .exact_lock = .{ .schema = exact_lock_v2.schema_id, .version = exact_lock_v2.schema_version, .digest_sha256 = @splat(0) },
+            .policy = .{ .conffile = .keep_existing, .force = &.{}, .allow_host_root = false },
+            .actions = &.{},
+            .final_state = &.{},
+            .trigger_authority = null,
+            .final_state_sha256 = @splat(0),
+            .digest_sha256 = @splat(0),
+        };
+        var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
+        defer locks.deinit();
+        var coordinator = try root_operation.Coordinator.open(testing.io, root, install_root, locks.interface());
+        var attempt = try coordinator.acquire(testing.allocator, .{
+            .backend = .native,
+            .operation = .{ .package_transaction = .remove },
+            .request_sha256 = @splat(0),
+            .policy_sha256 = @splat(0),
+            .target_architecture = "amd64",
+            .evidence = try native_operation.evidence(program),
+        });
+        defer attempt.release();
+        const intent: native_recovery.Digest = @splat('a');
+        try native_recovery.initializeProgress(testing.allocator, root, intent);
+        try native_recovery.initializeManagedState(testing.allocator, root, intent);
+        try native_recovery.initializeTriggerEvents(testing.allocator, root, intent);
+        var runtime: native_recovery.Runtime = .{
+            .allocator = testing.allocator,
+            .root = root,
+            .intent_sha256 = intent,
+        };
+        var execution: ExecutionState = .{ .recovery = &runtime };
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+        try appendAutomaticFileTriggerEvent(allocator, &events, .{ .name = "failed-source", .architecture = "amd64" }, "amd64", "/etc/debz-native.conf", database.model.triggers.interests);
+        try persistRuntimeTriggerEvents(&execution, testing.allocator, root, events.items);
+        const result = try lifecycleRunTriggerWork(&execution, testing.allocator, allocator, &events, root, install_root, &program, &authorization, initial_model, locks.interface(), &attempt, .remove, .keep_existing, 0, false, true);
+        try testing.expectEqual(if (deferred) LifecycleOutcome.applied else LifecycleOutcome.refused, result.outcome);
+        try testing.expectEqualStrings(if (deferred) "triggers_deferred" else "trigger_handler_unbound", result.detail);
+        const pending = (try nextPendingTriggerHandler(allocator, root, "amd64", execution.trigger_pending_is_live)).?;
+        try testing.expectEqual(@as(usize, 2), pending.triggers.len);
+        try testing.expectEqualStrings("conffile-purge", pending.triggers[0]);
+        try testing.expectEqualStrings("/etc/debz-native.conf", pending.triggers[1]);
+        var before = try native_recovery.readProgress(testing.allocator, root);
+        defer before.deinit();
+        runtime.recovering = true;
+        execution = .{ .recovery = &runtime };
+        var restored: std.ArrayList(RuntimeTriggerEvent) = .empty;
+        try restoreRuntimeTriggerEvents(&execution, allocator, root, &restored);
+        const resumed = try lifecycleRunTriggerWork(&execution, testing.allocator, allocator, &restored, root, install_root, &program, &authorization, initial_model, locks.interface(), &attempt, .remove, .keep_existing, 0, false, true);
+        try testing.expectEqual(result.outcome, resumed.outcome);
+        try testing.expectEqualStrings(result.detail, resumed.detail);
+        const recovered = (try nextPendingTriggerHandler(allocator, root, "amd64", execution.trigger_pending_is_live)).?;
+        try testing.expectEqual(@as(usize, 2), recovered.triggers.len);
+        try testing.expectEqualStrings("conffile-purge", recovered.triggers[0]);
+        try testing.expectEqualStrings("/etc/debz-native.conf", recovered.triggers[1]);
+        var after = try native_recovery.readProgress(testing.allocator, root);
+        defer after.deinit();
+        try testing.expectEqual(before.document.records.len, after.document.records.len);
+        try testing.expectEqual(@as(usize, 2), restored.items.len);
+        const reordered = [_]RuntimeTriggerEvent{ restored.items[1], restored.items[0] };
+        try testing.expectError(error.TriggerEventsChanged, persistRuntimeTriggerEvents(&execution, testing.allocator, root, &reordered));
+    }
+}
+
+test "native_unpack.test.file triggers follow diverted archive paths before their parents" {
+    const status =
+        \\Package: receiver
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: receiver
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "receiver.list", .bytes = "/.\n" },
+        .{ .name = "receiver.triggers", .bytes = "interest-noawait /usr/share/emitter\ninterest-noawait /usr/share/emitter.original\ninterest-noawait /usr/share\ninterest-noawait /usr/share/emitter/data\n" },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    try seedFile(fixture.root(), "var/lib/dpkg/triggers/File", "/usr/share/emitter receiver/noawait\n" ++
+        "/usr/share/emitter.original receiver/noawait\n" ++
+        "/usr/share receiver/noawait\n" ++
+        "/usr/share/emitter/data receiver/noawait\n");
+    var data = [_]Entry{
+        .{ .path = "usr/share/emitter", .kind = '5' },
+        .{ .path = "usr/share/emitter/data", .content = "payload\n" },
+        .{ .path = "usr/share/emitter/other", .content = "other\n" },
+    };
+    const bytes = try buildOwnedArchive(.{ .package = "emitter", .version = "1" }, &data);
+    defer testing.allocator.free(bytes);
+    var model = try modelOf(bytes);
+    defer model.deinit();
+    const records = [_]package_database.DiversionRecord{.{
+        .from = "/usr/share/emitter",
+        .to = "/usr/share/emitter.original",
+        .package = null,
+    }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    try collectArchiveTriggerEvents(testing.allocator, arena.allocator(), fixture.root(), "amd64", &model, &events, &records);
+    const expected = [_][]const u8{
+        "/usr/share/emitter.original",
+        "/usr/share",
+        "/usr/share/emitter/data",
+        "/usr/share/emitter",
+    };
+    try testing.expectEqual(expected.len, events.items.len);
+    for (events.items, expected) |event, trigger| {
+        try testing.expectEqualStrings(trigger, event.trigger);
+        try testing.expectEqualStrings("receiver", event.listeners[0].package.name);
+    }
+}
+
+test "native_unpack.test.removal file triggers follow mutation paths before their parents" {
+    const status =
+        \\Package: emitter
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: emitter
+        \\
+        \\Package: receiver
+        \\Status: install ok installed
+        \\Architecture: amd64
+        \\Version: 1
+        \\Description: receiver
+        \\
+        \\
+    ;
+    const info = [_]package_database.InfoEntry{
+        .{ .name = "emitter.list", .bytes = "/.\n/usr/share/emitter/data\n/usr/share/emitter\n" },
+        .{ .name = "receiver.list", .bytes = "/.\n" },
+        .{ .name = "receiver.triggers", .bytes = "interest-noawait /usr/share/emitter\ninterest-noawait /usr/share/emitter/data\ninterest-noawait /usr/share/emitter2\n" },
+    };
+    var fixture: Fixture = undefined;
+    try fixture.init(status, &info);
+    defer fixture.deinit();
+    var snapshot = fixture.snapshot();
+    snapshot.triggers_file = package_database.regularFile(
+        "/usr/share/emitter receiver/noawait\n" ++
+            "/usr/share/emitter/data receiver/noawait\n" ++
+            "/usr/share/emitter2 receiver/noawait\n",
+    );
+    var database = switch (try package_database.importSnapshot(testing.allocator, .{
+        .native_architecture = "amd64",
+        .snapshot = snapshot,
+    }, .{})) {
+        .database => |value| value,
+        .diagnostic => return error.TestUnexpectedResult,
+    };
+    defer database.deinit();
+    var ownership = try indexOwnership(testing.allocator, database.model, .{ .aliases = &.{}, .foreign = &.{} });
+    defer ownership.deinit();
+    var diversions = try native_diversion.Index.init(testing.allocator, &.{});
+    defer diversions.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var events: std.ArrayList(RuntimeTriggerEvent) = .empty;
+    const intents = [_]root_mutation.Intent{
+        .{ .remove = .{ .path = "usr/share/emitter/data", .removal = .require_present } },
+        .{ .remove_directory = .{ .path = "usr/share/emitter", .removal = .allow_absent } },
+    };
+    try collectRemovalTriggerEvents(.{
+        .allocator = arena.allocator(),
+        .source = .{ .name = "emitter", .architecture = "amd64" },
+        .events = &events,
+    }, database.model, ownership, diversions, &intents);
+    try testing.expectEqual(@as(usize, 2), events.items.len);
+    try testing.expectEqualStrings("/usr/share/emitter/data", events.items[0].trigger);
+    try testing.expectEqualStrings("/usr/share/emitter", events.items[1].trigger);
 }
 
 test "native_unpack.test.trigger discovery releases database snapshots between packages" {

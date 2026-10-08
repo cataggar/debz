@@ -20,7 +20,13 @@ matter. Multiple activations coalesce without losing their ordering.
 `postinst triggered` receives exactly two arguments: `triggered` and a single
 space-separated trigger-name argument. The name order is observable and is not
 arbitrarily sorted. File-trigger matching follows component boundaries and
-the package paths affected by unpack/removal.
+the package paths affected by unpack/removal. Automatic activations follow
+archive-entry or removal-intent order, noting the affected physical path before
+its parents, as dpkg's `trig_path_activate` does; registry record order is not
+activation order. A diverted directory can therefore be noted before later
+archive children activate the original logical directory. The pending list's
+prepend order then gives the logical directory before the diverted directory
+in the immediate callback, without changing registry bytes.
 
 Removal and purge derive file events from the actual planned filesystem
 removals, not merely from ownership lists. Retained conffiles therefore do not
@@ -29,6 +35,9 @@ cleanup do. Events remain durably bound to their original package and program.
 Known lifecycle-script failure still processes or defers authorized pending
 work before publishing the failed outcome. It neither discards those events
 nor converts the original package failure into a successful receipt.
+Earlier filesystem activations are incorporated before the failing script's
+helper queue in both immediate and deferred modes. Replaying authenticated
+completed publications preserves that order and does not move duplicate names.
 Incorporation checks the listener's current database state: an interested
 package that is still unpacked or otherwise not configured does not become
 `triggers-pending` or cause its activating package to become
@@ -273,6 +282,13 @@ imports. The deferred reinstallation case also tests imported pending names
 coalescing with repeated activations, without moving duplicates. The focused
 `-Dnative-trigger-byte-order-only=true` selector runs these cases in the
 existing native and two-dpkg oracle targets.
+
+Unprivileged `test-native-unpack` regressions reproduce diverted directory and
+child-before-parent file-event ordering, plus immediate/deferred failure
+incorporation and authenticated replay with a reordered-journal refusal. The
+failure regression deliberately leaves dispatch unbound so it can inspect the
+real pending database without running a script. These checks are not a
+replacement for pinned-dpkg settlement and conffile crash execution in CI.
 
 Recovery restores the live/imported pending-name distinction only from an
 authenticated normalization publication, not a generic completed database

@@ -1652,8 +1652,15 @@ def audit_production_sources() -> None:
         "interest.package.architecture.len == 0 and",
         "std.mem.eql(u8, source.architecture, native_architecture)",
         "try eligible.append(allocator, interest);",
-        "appendAutomaticFileTriggerEvent(\n            event_allocator,",
-        "appendAutomaticFileTriggerEvent(\n            allocator,\n            sink.events,",
+        "const FileTriggerPathEvents = struct",
+        "while (cursor) |component| : (cursor = std.fs.path.dirname(component)) {",
+        "if (self.work > (Limits{}).max_work) return error.TriggerWorkLimit;",
+        "const trigger = self.paths.get(component) orelse continue;",
+        "if ((try self.noted.getOrPut(self.allocator, trigger)).found_existing) continue;",
+        "try appendAutomaticFileTriggerEvent(sink.allocator, sink.events, sink.source, architecture, trigger, self.interests);",
+        "for (model.files) |file| {\n        try file_events.activate(.{",
+        "}, architecture, diversions.physical(file.path, model.facts.package));",
+        "try file_events.activate(sink, model.native_architecture, names.get(physical) orelse physical);",
         "persistRuntimeTriggerEvents(&resumed, testing.allocator, root, &.{forged})",
     ):
         if required not in unpack:
