@@ -8,7 +8,8 @@ commands, typed canonical records, and authenticated root topology described
 below; all state outside that boundary remains fail-closed.
 
 The same `tools/prepare-native-dpkg.py` receipt also binds the sibling
-`dpkg-query` 1.22.22 binary for test-only fresh-root query parity checks. That
+`dpkg-query` 1.22.22 binary for test-only fresh-root and
+[imported-then-mutated query parity checks](native-lifecycle.md#read-only-imported-root-query-oracle). That
 pin does not admit a production `dpkg-query` dependency or broaden the separate
 signed-maintainer-script exception.
 

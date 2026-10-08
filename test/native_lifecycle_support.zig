@@ -144,6 +144,7 @@ pub const ScriptOptions = struct {
     after_failure: []const u8 = "",
     omit_postrm: bool = false,
     omit_prerm: bool = false,
+    omit_preinst: bool = false,
     only_postinst: bool = false,
     only_postrm: bool = false,
 };
@@ -158,6 +159,7 @@ pub fn scriptsWith(fixture: *foundation.Fixture, source: []const u8, package: []
         if (options.only_postrm and !std.mem.eql(u8, kind, "postrm")) continue;
         if (options.omit_postrm and std.mem.eql(u8, kind, "postrm")) continue;
         if (options.omit_prerm and std.mem.eql(u8, kind, "prerm")) continue;
+        if (options.omit_preinst and std.mem.eql(u8, kind, "preinst")) continue;
         const body = try std.fmt.allocPrint(fixture.allocator,
             \\#!/bin/sh
             \\printf '%s\t%s\t%s\t%s\t%d' '{s}@{s}:{s}' "$DPKG_MAINTSCRIPT_PACKAGE" "$DPKG_MAINTSCRIPT_NAME" "$DPKG_MAINTSCRIPT_ARCH" "$#" >> /{s}
@@ -208,6 +210,7 @@ pub const PackageSpec = struct {
     full_payload: bool = false,
     bootstrap_shell: bool = false,
     no_scripts: bool = false,
+    script_label_version: ?[]const u8 = null,
     scripts: ScriptOptions = .{},
 };
 
@@ -275,7 +278,7 @@ pub fn makePackage(fixture: *foundation.Fixture, architecture: []const u8, versi
         try fixture.write(relative, extra.content, extra.mode);
     }
     if (spec.bootstrap_shell) try copyProgram(fixture, source, "/bin/sh", "/bin/sh");
-    if (!spec.no_scripts) try scriptsWith(fixture, source, name, version, spec.scripts);
+    if (!spec.no_scripts) try scriptsWith(fixture, source, name, spec.script_label_version orelse version, spec.scripts);
     if (spec.config_content) |configuration| {
         const config = try path(fixture.allocator, source, "DEBIAN/config");
         defer fixture.allocator.free(config);

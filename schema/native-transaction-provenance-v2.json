@@ -80,7 +80,7 @@
       "items": { "$ref": "#/$defs/evidenceFile" }
     },
     "evidence_files_sha256": { "$ref": "#/$defs/sha256" },
-    "final_state_kind": { "const": "package_database_closure_v1" },
+    "final_state_kind": { "enum": ["package_database_closure_v1", "package_database_closure_with_baseline_noop_v1"] },
     "outcome": {
       "enum": ["succeeded", "failed", "recovery_required"]
     },
@@ -91,6 +91,10 @@
     },
     "digest_sha256": { "$ref": "#/$defs/sha256" }
   },
+  "oneOf": [
+    {"properties": {"final_state_kind": {"const": "package_database_closure_v1"}, "authority": {"properties": {"authorization_schema": {"const": "https://debz.dev/schema/native-transaction-authorization-v2"}, "authorization_version": {"const": 2}, "program_schema": {"const": "https://debz.dev/schema/native-transaction-program-v2"}, "program_version": {"const": 2}, "exact_lock_schema": {"const": "https://debz.dev/schema/exact-closure-lock-v3"}, "exact_lock_version": {"const": 3}}}}},
+    {"properties": {"final_state_kind": {"const": "package_database_closure_with_baseline_noop_v1"}, "authority": {"properties": {"authorization_schema": {"const": "https://debz.dev/schema/native-transaction-authorization-v3"}, "authorization_version": {"const": 3}, "program_schema": {"const": "https://debz.dev/schema/native-transaction-program-v3"}, "program_version": {"const": 3}, "exact_lock_schema": {"const": "https://debz.dev/schema/exact-closure-lock-v4"}, "exact_lock_version": {"const": 4}, "progress_schema": {"const": "https://debz.dev/schema/native-execution-progress-v3"}, "progress_version": {"const": 3}}}}}
+  ],
   "$defs": {
     "sha256": {
       "type": "string",
@@ -124,17 +128,17 @@
         },
         "execution_request_version": { "const": 4 },
         "authorization_schema": {
-          "const": "https://debz.dev/schema/native-transaction-authorization-v2"
+          "enum": ["https://debz.dev/schema/native-transaction-authorization-v2", "https://debz.dev/schema/native-transaction-authorization-v3"]
         },
-        "authorization_version": { "const": 2 },
+        "authorization_version": { "enum": [2, 3] },
         "program_schema": {
-          "const": "https://debz.dev/schema/native-transaction-program-v2"
+          "enum": ["https://debz.dev/schema/native-transaction-program-v2", "https://debz.dev/schema/native-transaction-program-v3"]
         },
-        "program_version": { "const": 2 },
+        "program_version": { "enum": [2, 3] },
         "exact_lock_schema": {
-          "const": "https://debz.dev/schema/exact-closure-lock-v3"
+          "enum": ["https://debz.dev/schema/exact-closure-lock-v3", "https://debz.dev/schema/exact-closure-lock-v4"]
         },
-        "exact_lock_version": { "const": 3 },
+        "exact_lock_version": { "enum": [3, 4] },
         "execution_intent_schema": {
           "const": "https://debz.dev/schema/native-execution-intent-v2"
         },

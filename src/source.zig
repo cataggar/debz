@@ -231,6 +231,7 @@ pub fn parseDeb822(
                     freeRepository(allocator, repository);
                     return .{ .diagnostic = diagnostic };
                 }
+                errdefer freeRepository(allocator, repository);
                 try repositories.append(allocator, repository);
             },
             .diagnostic => |diagnostic| return .{ .diagnostic = diagnostic },
@@ -280,6 +281,7 @@ pub fn parseLegacy(
                     freeRepository(allocator, repository);
                     return .{ .diagnostic = diagnostic };
                 }
+                errdefer freeRepository(allocator, repository);
                 try repositories.append(allocator, repository);
             },
         }
@@ -1070,6 +1072,28 @@ test "parses canonical DEB822 sources with comments and multiple values" {
     try std.testing.expect(!repository.enabled);
     try std.testing.expectEqualStrings("amd64", repository.architectures[0].value);
     try std.testing.expectEqual(64, repository.id.slice().len);
+}
+
+test "source parsing releases repository ownership on allocation failure" {
+    const exercise = struct {
+        fn run(allocator: std.mem.Allocator, input: []const u8, format: Format) !void {
+            const result = try parse(allocator, input, format, .{});
+            var sources = switch (result) {
+                .sources => |value| value,
+                .diagnostic => return error.UnexpectedDiagnostic,
+            };
+            defer sources.deinit();
+            try std.testing.expectEqual(@as(usize, 1), sources.repositories.len);
+        }
+    }.run;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercise, .{
+        "deb [signed-by=/usr/share/keyrings/example.gpg] https://deb.example/debian stable main\n",
+        Format.legacy,
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercise, .{
+        "Types: deb\nURIs: https://deb.example/debian\nSuites: stable\nComponents: main\nSigned-By: /usr/share/keyrings/example.gpg\n",
+        Format.deb822,
+    });
 }
 
 test "DEB822 whitespace normalizes to deterministic IDs" {

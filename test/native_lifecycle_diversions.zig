@@ -376,7 +376,120 @@ fn dynamicRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const
     }
 }
 
+fn assertRenamedPayload(case: *support.Scenario, live: []const u8, absent: []const u8, expected: []const u8, mode: u32) !void {
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const bytes = (try support.readOptionalCaseFile(case, side, live)) orelse return error.MissingRenamedPayload;
+        defer case.fixture.allocator.free(bytes);
+        if (!std.mem.eql(u8, bytes, expected)) return error.WrongRenamedPayload;
+        const missing = try std.fmt.allocPrint(case.fixture.allocator, "{s}/{s}/{s}", .{ case.name, side, absent });
+        defer case.fixture.allocator.free(missing);
+        try support.absent(case.fixture, missing);
+        var dir = try foundation.guardedRoot(case.fixture.io, if (std.mem.eql(u8, side, "reference")) case.reference_root else case.native_root);
+        defer dir.close(case.fixture.io);
+        const entry = try (root_fs.Root.init(case.fixture.io, dir)).entry(try root_fs.Path.init(live));
+        if (entry.mode != mode or entry.uid != 0 or entry.gid != 0) return error.WrongRenamedPayloadMetadata;
+    }
+}
+
 fn genuineToolRoutes(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    {
+        const package = "genuine-divert-postinst-rename";
+        const source = "usr/share/genuine-divert-postinst-rename/payload";
+        const destination = source ++ ".remove-bak";
+        const postinst =
+            \\if [ "$1" = configure ]; then
+            \\    /bin/rm -f /usr/share/genuine-divert-postinst-rename/payload || exit 31
+            \\    /usr/bin/dpkg-divert --package coreutils-switch --divert /usr/share/genuine-divert-postinst-rename/payload.remove-bak --rename --remove /usr/share/genuine-divert-postinst-rename/payload || exit 32
+            \\fi
+            \\
+        ;
+        const archive_file = try support.makePackage(fixture, arch, "1", package, "packages/genuine-divert-postinst-rename", .{
+            .postinst_append = postinst,
+            .extra_files = &.{.{ .path = source, .content = "renamed packaged payload\n", .mode = 0o751 }},
+        });
+        defer fixture.allocator.free(archive_file);
+        var case = try support.Scenario.init(fixture, "diversion-genuine-postinst-rename", driver, dpkg, arch, false);
+        defer case.deinit();
+        const records = try record(fixture, source, destination, "coreutils-switch");
+        defer fixture.allocator.free(records);
+        try seed(&case, records);
+        try installDpkgDivert(&case, dpkg);
+        for ([_][]const u8{ "reference", "native" }) |side| {
+            const root = try support.path(fixture.allocator, case.name, side);
+            defer fixture.allocator.free(root);
+            try support.copyProgram(fixture, root, "/bin/rm", "/bin/rm");
+        }
+        const selected = [_]foundation.PackageIdentity{.{ .name = package, .architecture = arch }};
+        try case.phase(.{ .operation = "install", .archives = &.{archive_file}, .packages = &selected }, false);
+        try assertRenamedPayload(&case, source, destination, "renamed packaged payload\n", 0o751);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+        try case.phase(.{ .operation = "remove", .packages = &selected }, false);
+        try case.phase(.{ .operation = "purge", .packages = &selected }, false);
+    }
+    {
+        const package = "genuine-divert-prerm-rename";
+        const source = "opt/genuine-divert-prerm-rename";
+        const destination = source ++ ".distrib";
+        const rename_script =
+            \\if [ "$DPKG_MAINTSCRIPT_NAME" = preinst ]; then
+            \\    /usr/bin/dpkg-divert --package genuine-divert-prerm-rename --rename --add /opt/genuine-divert-prerm-rename || exit 31
+            \\fi
+            \\if [ "$DPKG_MAINTSCRIPT_NAME" = prerm ] && [ "$1" = remove ]; then
+            \\    /usr/bin/dpkg-divert --package genuine-divert-prerm-rename --rename --remove /opt/genuine-divert-prerm-rename || exit 32
+            \\fi
+            \\
+        ;
+        const archive_file = try support.makePackage(fixture, arch, "1", package, "packages/genuine-divert-prerm-rename", .{
+            .scripts = .{ .before_failure = rename_script },
+        });
+        defer fixture.allocator.free(archive_file);
+        var case = try support.Scenario.init(fixture, "diversion-genuine-prerm-rename", driver, dpkg, arch, false);
+        defer case.deinit();
+        try both(&case, source, "restored administrator payload\n");
+        try installDpkgDivert(&case, dpkg);
+        const selected = [_]foundation.PackageIdentity{.{ .name = package, .architecture = arch }};
+        try case.phase(.{ .operation = "install", .archives = &.{archive_file}, .packages = &selected }, false);
+        try assertRenamedPayload(&case, destination, source, "restored administrator payload\n", 0o644);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+        try case.phase(.{ .operation = "remove", .packages = &selected }, false);
+        try assertRenamedPayload(&case, source, destination, "restored administrator payload\n", 0o644);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+        try case.phase(.{ .operation = "purge", .packages = &selected }, false);
+    }
+    {
+        const package = "genuine-divert-large-add-set";
+        const add_set_script =
+            \\if [ "$DPKG_MAINTSCRIPT_NAME" = prerm ] && [ "$1" = remove ]; then
+            \\    i=0
+            \\    while [ "$i" -lt 210 ]; do
+            \\        /usr/bin/dpkg-divert --package coreutils-switch --divert "/opt/coreutils-switch-$i.remove-bak" --no-rename --add "/opt/coreutils-switch-$i" || exit 31
+            \\        i=$((i + 1))
+            \\    done
+            \\fi
+            \\
+        ;
+        const archive_file = try support.makePackage(fixture, arch, "1", package, "packages/genuine-divert-large-add-set", .{
+            .scripts = .{ .before_failure = add_set_script },
+        });
+        defer fixture.allocator.free(archive_file);
+        var case = try support.Scenario.init(fixture, "diversion-genuine-large-add-set", driver, dpkg, arch, false);
+        defer case.deinit();
+        try installDpkgDivert(&case, dpkg);
+        const selected = [_]foundation.PackageIdentity{.{ .name = package, .architecture = arch }};
+        try case.phase(.{ .operation = "install", .archives = &.{archive_file}, .packages = &selected }, false);
+        try case.phase(.{ .operation = "remove", .packages = &selected }, false);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+        const bytes = (try support.readOptionalCaseFile(&case, "native", "var/lib/dpkg/diversions")) orelse return error.MissingDiversionSet;
+        defer fixture.allocator.free(bytes);
+        if (std.mem.count(u8, bytes, "\ncoreutils-switch\n") != 210) return error.IncompleteDiversionSet;
+        try case.phase(.{ .operation = "purge", .packages = &selected }, false);
+        try support.assertDatabaseBytes(&case, "diversions");
+        try support.assertDatabaseBytes(&case, "diversions-old");
+    }
     for ([_]struct {
         label: []const u8,
         package: []const u8,

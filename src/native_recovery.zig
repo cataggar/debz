@@ -68,7 +68,9 @@ pub const authority_bootstrap_progress_schema_id = "https://debz.dev/schema/nati
 pub const authorization_name = "native-transaction-authorization-v1.json";
 pub const program_name = "native-transaction-program-v1.json";
 pub const authorization_v2_name = "native-transaction-authorization-v2.json";
+pub const authorization_v3_name = "native-transaction-authorization-v3.json";
 pub const program_v2_name = "native-transaction-program-v2.json";
+pub const program_v3_name = "native-transaction-program-v3.json";
 pub const blob_prefix = "native-recovery-v1-blob-";
 pub const workspace_directory = native_helper.bootstrap_directory;
 pub const artifact_directory = workspace_directory ++ "/artifacts";
@@ -489,12 +491,12 @@ pub fn validateIntent(intent: Intent) !void {
         !std.mem.eql(
             u8,
             intent.authorization_path,
-            if (is_v2) authorization_v2_name else authorization_name,
+            if (is_v2 and intent.program_version == 3) authorization_v3_name else if (is_v2) authorization_v2_name else authorization_name,
         ) or
         !std.mem.eql(
             u8,
             intent.program_path,
-            if (is_v2) program_v2_name else program_name,
+            if (is_v2 and intent.program_version == 3) program_v3_name else if (is_v2) program_v2_name else program_name,
         ) or
         intent.packages.len > maximum_records or
         intent.ordered_actions.len > maximum_records)
@@ -508,6 +510,19 @@ pub fn validateIntent(intent: Intent) !void {
             intent.program_version == null or intent.exact_lock_schema == null or
             intent.exact_lock_version == null)))
         return error.InvalidIntent;
+    if (is_v2 and (intent.program_version == 3 or intent.authorization_version == 3 or intent.exact_lock_version == 4 or
+        std.mem.eql(u8, intent.program_schema.?, "https://debz.dev/schema/native-transaction-program-v3") or
+        std.mem.eql(u8, intent.authorization_schema.?, "https://debz.dev/schema/native-transaction-authorization-v3") or
+        std.mem.eql(u8, intent.exact_lock_schema.?, "https://debz.dev/schema/exact-closure-lock-v4")))
+    {
+        if (intent.program_version.? != 3 or
+            !std.mem.eql(u8, intent.program_schema.?, "https://debz.dev/schema/native-transaction-program-v3") or
+            intent.authorization_version.? != 3 or
+            !std.mem.eql(u8, intent.authorization_schema.?, "https://debz.dev/schema/native-transaction-authorization-v3") or
+            intent.exact_lock_version.? != 4 or
+            !std.mem.eql(u8, intent.exact_lock_schema.?, "https://debz.dev/schema/exact-closure-lock-v4"))
+            return error.InvalidIntent;
+    }
     const root_identity = hexDigest(
         @import("transaction_recovery.zig").rootIdentity(intent.install_root),
     );
@@ -1138,6 +1153,7 @@ pub const Runtime = struct {
     helper_binding: ?native_helper.Binding = null,
     helper_bootstrap: ?native_helper.Bootstrap = null,
     helper_source: ?native_helper.Source = null,
+    baseline: ?*const @import("native_baseline_contract.zig").Contract = null,
 
     pub fn append(
         self: *Runtime,
@@ -3433,6 +3449,26 @@ fn checkIntentBinding() !void {
     };
     sealIntent(&intent);
     try validateIntent(intent);
+    const legacy = intent;
+    intent.schema = "https://debz.dev/schema/native-execution-intent-v2";
+    intent.version = 2;
+    intent.authorization_schema = "https://debz.dev/schema/native-transaction-authorization-v3";
+    intent.authorization_version = 3;
+    intent.program_schema = "https://debz.dev/schema/native-transaction-program-v3";
+    intent.program_version = 3;
+    intent.exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v4";
+    intent.exact_lock_version = 4;
+    intent.authorization_path = authorization_v3_name;
+    intent.program_path = program_v3_name;
+    sealIntent(&intent);
+    try validateIntent(intent);
+    intent.program_schema = "https://debz.dev/schema/native-transaction-program-v2";
+    intent.program_version = 2;
+    intent.authorization_path = authorization_v2_name;
+    intent.program_path = program_v2_name;
+    sealIntent(&intent);
+    try std.testing.expectError(error.InvalidIntent, validateIntent(intent));
+    intent = legacy;
     intent.blobs = &.{};
     sealIntent(&intent);
     try std.testing.expectError(error.InvalidBlob, validateIntent(intent));

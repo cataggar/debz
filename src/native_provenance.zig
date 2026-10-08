@@ -115,6 +115,7 @@ pub const RetainedEvidence = struct {
 
 pub const FinalStateKind = enum {
     package_database_closure_v1,
+    package_database_closure_with_baseline_noop_v1,
 };
 
 pub const Authority = struct {
@@ -425,6 +426,29 @@ pub fn validate(document: Document) !void {
             authority.execution_intent_version,
             authority.progress_version,
         }) |value| if (value == 0) return error.InvalidDocument;
+    }
+    const baseline_noop = document.final_state_kind == .package_database_closure_with_baseline_noop_v1;
+    if (baseline_noop) {
+        const authority = document.authority orelse return error.InvalidDocument;
+        if (!current or authority.program_version != 3 or
+            !std.mem.eql(u8, authority.program_schema, "https://debz.dev/schema/native-transaction-program-v3") or
+            authority.authorization_version != 3 or
+            !std.mem.eql(u8, authority.authorization_schema, "https://debz.dev/schema/native-transaction-authorization-v3") or
+            authority.exact_lock_version != 4 or
+            !std.mem.eql(u8, authority.exact_lock_schema, "https://debz.dev/schema/exact-closure-lock-v4") or
+            authority.execution_request_version != 4 or
+            !std.mem.eql(u8, authority.execution_request_schema, "https://debz.dev/schema/native-execution-request-v4") or
+            authority.execution_intent_version != 2 or
+            !std.mem.eql(u8, authority.execution_intent_schema, "https://debz.dev/schema/native-execution-intent-v2") or
+            authority.progress_version != 3 or
+            !std.mem.eql(u8, authority.progress_schema, "https://debz.dev/schema/native-execution-progress-v3"))
+            return error.InvalidDocument;
+    } else if (document.authority) |authority| {
+        if (authority.program_version == 3 or authority.authorization_version == 3 or authority.exact_lock_version == 4 or
+            std.mem.eql(u8, authority.program_schema, "https://debz.dev/schema/native-transaction-program-v3") or
+            std.mem.eql(u8, authority.authorization_schema, "https://debz.dev/schema/native-transaction-authorization-v3") or
+            std.mem.eql(u8, authority.exact_lock_schema, "https://debz.dev/schema/exact-closure-lock-v4"))
+            return error.InvalidDocument;
     }
     const root_identity = hexDigest(
         transaction_recovery.rootIdentity(document.install_root),
@@ -866,6 +890,31 @@ pub fn testContract() !void {
 
 test "native_provenance.test.digest binds terminal evidence" {
     try testContract();
+}
+
+test "native_provenance.test.baseline receipt requires the exact request intent and progress contracts" {
+    var document = testDocument();
+    document.final_state_kind = .package_database_closure_with_baseline_noop_v1;
+    document.authority.?.authorization_schema = "https://debz.dev/schema/native-transaction-authorization-v3";
+    document.authority.?.authorization_version = 3;
+    document.authority.?.program_schema = "https://debz.dev/schema/native-transaction-program-v3";
+    document.authority.?.program_version = 3;
+    document.authority.?.exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v4";
+    document.authority.?.exact_lock_version = 4;
+    document.authority.?.progress_schema = "https://debz.dev/schema/native-execution-progress-v3";
+    document.authority.?.progress_version = 3;
+    seal(&document);
+    try validate(document);
+    inline for (.{ "execution_request_schema", "execution_intent_schema", "progress_schema" }) |field| {
+        const original = @field(document.authority.?, field);
+        @field(document.authority.?, field) = "https://debz.dev/schema/foreign";
+        seal(&document);
+        try std.testing.expectError(error.InvalidDocument, validate(document));
+        @field(document.authority.?, field) = original;
+    }
+    document.final_state_kind = .package_database_closure_v1;
+    seal(&document);
+    try std.testing.expectError(error.InvalidDocument, validate(document));
 }
 
 test "native_provenance.test.legacy v1 canonical bytes remain frozen" {

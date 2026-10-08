@@ -761,6 +761,7 @@ pub fn build(b: *std.Build) void {
             "native_authorization.test.",
             "native_program.test.",
             "native_preparation.test.",
+            "installed_baseline_component.test.",
             "transaction_engine.test.",
         },
     });
@@ -781,6 +782,37 @@ pub fn build(b: *std.Build) void {
     );
     native_program_step.dependOn(&run_native_program_tests.step);
     native_program_step.dependOn(&run_native_program_corpus_tests.step);
+    const native_baseline_tests = b.addTest(.{
+        .root_module = production_backend_tests.root_module,
+        .filters = &.{
+            "production native baseline",
+            "production workflow external native fixture",
+            "production workflow signed SHA256 archive binding is a per-repository native opt-in",
+            "production package family native resolution binds an opted-in signed SHA256 repository",
+        },
+    });
+    b.step("test-native-baseline", "Run genuine signed native installed-baseline workflows in owned roots")
+        .dependOn(&b.addRunArtifact(native_baseline_tests).step);
+    const product_result_module = b.createModule(.{
+        .root_source_file = b.path("src/product_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    product_result_module.addOptions("debz_build_options", build_options);
+    product_result_module.addIncludePath(libsolv_dependency.path("src"));
+    product_result_module.addIncludePath(xz_dependency.path("src/liblzma/api"));
+    product_result_module.addIncludePath(zstd_dependency.path("lib"));
+    product_result_module.addCMacro("LZMA_API_STATIC", "1");
+    product_result_module.linkLibrary(libsolv);
+    product_result_module.linkLibrary(liblzma);
+    product_result_module.linkLibrary(zstd);
+    const product_result_tests = b.addTest(.{
+        .root_module = product_result_module,
+        .filters = &.{ "product_api.test.", "canonical result JSON", "command JSON", "facade" },
+    });
+    b.step("test-product-results", "Run product command result encoding, decoding, and historical byte contracts")
+        .dependOn(&b.addRunArtifact(product_result_tests).step);
     workload_native.dependOn(&run_native_program_corpus_tests.step);
 
     const root_operation_tests = b.addTest(.{
@@ -1585,7 +1617,7 @@ pub fn build(b: *std.Build) void {
     });
     statoverride_recovery.addArtifactArg(statoverride_recovery_executable);
     statoverride_recovery.addArtifactArg(native_lifecycle_tests);
-    b.step("test-native-recovery-zig-statoverride", "Run 19 real statoverride crash/recovery cases")
+    b.step("test-native-recovery-zig-statoverride", "Run 30 real statoverride crash/recovery cases")
         .dependOn(&statoverride_recovery.step);
 
     const literal_recovery_module = b.createModule(.{
@@ -1723,6 +1755,10 @@ pub fn build(b: *std.Build) void {
     if (native_diversions_only) {
         for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, lifecycle_oracle_zig, trigger_oracle_zig }) |runner|
             runner.addArg("--diversions-only");
+    }
+    if (b.option(bool, "native-statoverrides-only", "Select genuine-tool and metadata statoverride lifecycle oracles") orelse false) {
+        for ([_]*std.Build.Step.Run{ lifecycle_zig, lifecycle_oracle_zig }) |runner|
+            runner.addArg("--statoverrides-only");
     }
     const selectors = [_]bool{
         native_core_only,           native_deadline_only,      native_script_failure_only,
@@ -1903,7 +1939,7 @@ pub fn build(b: *std.Build) void {
 
     const target_apt_tests = b.addTest(.{
         .root_module = debz,
-        .filters = &.{"target_apt_config.test."},
+        .filters = &.{ "target_apt_config.test.", "system_product_context.test." },
     });
     const run_target_apt_tests = b.addRunArtifact(target_apt_tests);
     b.step("test-target-apt-config", "Run target-root APT configuration import tests")
@@ -2172,6 +2208,7 @@ fn installReleaseFiles(
         "zvmi-package-family.md",
     };
     const schemas = [_][]const u8{
+        "active-repository-config-v1.json",
         "apt-config-snapshot-v1.json",
         "apt-config-snapshot-v2.json",
         "apt-system-cli-diagnostic-v1.json",
@@ -2182,9 +2219,13 @@ fn installReleaseFiles(
         "apt-system-result-v2.json",
         "apt-system-result-v3.json",
         "command-result-v1.json",
+        "command-result-v2.json",
+        "native-baseline-download-v1.json",
         "exact-closure-lock-v1.json",
         "exact-closure-lock-v2.json",
         "exact-closure-lock-v3.json",
+        "exact-closure-lock-v4.json",
+        "installed-baseline-component-v1.json",
         "legacy-capability-evidence-v1.json",
         "legacy-compatibility-policy-v1.json",
         "native-execution-intent-v1.json",
@@ -2197,6 +2238,7 @@ fn installReleaseFiles(
         "native-execution-request-v2.json",
         "native-execution-request-v3.json",
         "native-execution-request-v4.json",
+        "native-installed-baseline-noop-v1.json",
         "native-managed-state-v1.json",
         "native-repository-unchanged-v1.json",
         "native-diversion-cache-v1.json",
@@ -2205,8 +2247,10 @@ fn installReleaseFiles(
         "native-script-outcome-v1.json",
         "native-transaction-authorization-v1.json",
         "native-transaction-authorization-v2.json",
+        "native-transaction-authorization-v3.json",
         "native-transaction-program-v1.json",
         "native-transaction-program-v2.json",
+        "native-transaction-program-v3.json",
         "native-transaction-provenance-v1.json",
         "native-transaction-provenance-v2.json",
         "native-trigger-events-v1.json",
@@ -2216,11 +2260,13 @@ fn installReleaseFiles(
         "package-cache-fingerprint-v3.json",
         "package-cache-fingerprint-v4.json",
         "package-cache-fingerprint-v5.json",
+        "package-cache-fingerprint-v6.json",
         "package-cache-result-v1.json",
         "package-cache-result-v2.json",
         "package-cache-result-v3.json",
         "package-cache-result-v4.json",
         "package-cache-result-v5.json",
+        "package-cache-result-v6.json",
         "repository-add-state-v1.json",
         "repository-operation-result-v1.json",
         "root-operation-completion-v1.json",
