@@ -828,8 +828,6 @@ class PackageTests(unittest.TestCase):
                 debz.refresh({"r"})
 
     def test_command_schema_enforces_refresh_only_typed_repository_evidence(self) -> None:
-        from referencing import Registry, Resource
-
         schema = json.loads((ROOT / "schema/command-result-v1.json").read_text())
         jsonschema.Draft202012Validator.check_schema(schema)
         validator = jsonschema.Draft202012Validator(schema)
@@ -843,8 +841,8 @@ class PackageTests(unittest.TestCase):
         validator.validate(document)
         download_schema = json.loads((ROOT / "schema/command-result-v2.json").read_text())
         jsonschema.Draft202012Validator.check_schema(download_schema)
-        registry = Registry().with_resource(schema["$id"], Resource.from_contents(schema))
-        download_items = jsonschema.Draft202012Validator(download_schema["properties"]["items"], registry=registry)
+        resolver = jsonschema.RefResolver.from_schema(schema)
+        download_items = jsonschema.Draft202012Validator(download_schema["properties"]["items"], resolver=resolver)
         download_items.validate([{k: v for k, v in document["items"][0].items() if k != "repository"}])
         with self.assertRaises(jsonschema.ValidationError):
             download_items.validate(document["items"])
