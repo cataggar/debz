@@ -2621,7 +2621,7 @@
       "version_bound": false
     }
   ],
-  "prestate_evidence": "tools/fixtures/real-snapshot/prestate-sources-v1.zip",
+  "prestate_evidence": "tools/fixtures/real-snapshot/prestate-sources-v2.zip",
   "schema": "io.github.cataggar.debz.real-snapshot-pin.v1",
   "series": {
     "architectures": [
@@ -3077,7 +3077,7 @@
       {
         "binding": {
           "amd64": "exact_lock",
-          "arm64": "refresh_only"
+          "arm64": "refresh_identity"
         },
         "date": "Wed, 30 Sep 2026 21:10:36 UTC",
         "deadline": 1793481036,

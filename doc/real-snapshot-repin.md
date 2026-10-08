@@ -273,11 +273,15 @@ offline re-verification of OpenPGP signatures or a new live probe.
 Adding an architecture requires its original archive bytes, not just an
 unchanged derived member. The retained v1 bundle authenticates the arm64
 Python package coordinates through its original lock and signed index but
-does not contain the arm64 `python3` or `python3-minimal` archives. Their
-expanded list-prestate coverage therefore fails closed until those exact
-original archives are retained in a separately generated, versioned bundle.
-The existing bundle and historical pocket labels must not be rewritten as
-a new successful probe to fill that gap.
+does not contain the arm64 `python3` or `python3-minimal` archives. It remains
+byte-identical historical evidence. The current v2 bundle retains those
+exact original archives alongside the six previously retained archives,
+required signed metadata, locks and a separate genuine source-retaining
+probe report.
+Its fresh quiet-pocket binding comes from public refresh evidence, not
+relabeling the v1 report. Both Python list prestates are rederived for arm64;
+this ordinary byte proof does not establish protected execution or behavioral
+prestates.
 
 The ZIP is read without filesystem extraction. Limits are 64 MiB aggregate
 evidence, 256 ZIP entries, 128 MiB decompressed tar and 100,000 tar entries;

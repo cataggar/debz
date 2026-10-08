@@ -475,7 +475,7 @@ def tar_member(deb: bytes, prefix: str, path: str) -> tuple[bytes, int]:
             data = stream.read(MAXIMUM_MEMBER_BYTES + 1)
             if len(data) > MAXIMUM_MEMBER_BYTES:
                 fail(f"{prefix} member {path} is too large")
-            if len(data) != member.size:
+            if member.isreg() and len(data) != member.size:
                 fail(f"{prefix} member {path} is truncated")
             result = data, member.mode & 0o7777
     if result is not None:

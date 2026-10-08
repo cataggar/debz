@@ -910,6 +910,40 @@ class PackageTests(unittest.TestCase):
             with self.assertRaisesRegex(repin.RepinError, "has no member"):
                 repin.tar_member(data, "data.tar", "usr/bin/gamma")
 
+    def test_hardlink_members_preserve_target_bytes_without_bypassing_archive_guards(self) -> None:
+        payload = b"Package: alpha\nVersion: 1.0\nArchitecture: all\n"
+
+        def package(linkname="control-real", target_type=tarfile.REGTYPE, truncated=False):
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+                target = tarfile.TarInfo("control-real")
+                target.mode = 0o644
+                target.type = target_type
+                target.size = len(payload) if target.isreg() else 0
+                archive.addfile(target, io.BytesIO(payload) if target.isreg() else None)
+                link = tarfile.TarInfo("control")
+                link.mode = 0o644
+                link.type = tarfile.LNKTYPE
+                link.linkname = linkname
+                archive.addfile(link)
+            data = buffer.getvalue()
+            if truncated:
+                data = data[:512 + len(payload) - 1]
+            header = f"{'control.tar/':<16}{0:<12}{0:<6}{0:<6}{'100644':<8}{len(data):<10}`\n".encode()
+            return b"!<arch>\n" + header + data + (b"\n" if len(data) % 2 else b"")
+
+        self.assertEqual(repin.tar_member(package(), "control.tar", "control"), (payload, 0o644))
+        for target in ("../control-real", "/control-real"):
+            with self.subTest(target=target), self.assertRaisesRegex(repin.RepinError, "unsafe hardlink"):
+                repin.tar_member(package(linkname=target), "control.tar", "control")
+        with self.assertRaisesRegex(repin.RepinError, "cannot read"):
+            repin.tar_member(package(target_type=tarfile.DIRTYPE), "control.tar", "control")
+        with patch.object(repin, "MAXIMUM_MEMBER_BYTES", len(payload) - 1):
+            with self.assertRaisesRegex(repin.RepinError, "too large"):
+                repin.tar_member(package(), "control.tar", "control")
+        with self.assertRaises((repin.RepinError, tarfile.ReadError)):
+            repin.tar_member(package(truncated=True), "control.tar", "control-real")
+
     def test_dpkg_ownership_list_uses_data_tar_order(self) -> None:
         data = deb(
             {},
@@ -1273,6 +1307,28 @@ class SourceEvidenceTests(unittest.TestCase):
             with self.subTest(identity=item["id"]):
                 failures = repin.prestate_evidence_failures(changed, ROOT)
                 self.assertTrue(any(item["id"] in f and "derived bytes disagree" in f for f in failures), failures)
+
+    def test_real_arm64_archive_bytes_are_verified_and_tampering_refuses(self) -> None:
+        committed = repin.load_json(ROOT / repin.DEFAULT_MANIFEST)
+        data = repin.read_source_file(ROOT / committed["prestate_evidence"], ROOT,
+                                      repin.MAXIMUM_EVIDENCE_BYTES, "committed source evidence")
+        with patch.object(repin, "fetch", side_effect=AssertionError("offline")):
+            self.assertEqual(repin.check_prestate_evidence(committed, data), [])
+        with zipfile.ZipFile(io.BytesIO(data)) as original:
+            sources = json.loads(original.read("evidence.json"))["sources"]
+            for package in ("python3", "python3-minimal"):
+                source = next(item for item in sources
+                              if item["architecture"] == "arm64" and item["package"] == package)
+                output = io.BytesIO()
+                with zipfile.ZipFile(output, "w") as changed:
+                    for member in original.infolist():
+                        content = original.read(member.filename)
+                        if member.filename == source["archive_file"]:
+                            content = content[:-1] + bytes([content[-1] ^ 1])
+                        changed.writestr(copy.copy(member), content)
+                with self.subTest(package=package), self.assertRaisesRegex(
+                        repin.RepinError, f"source archive for {package} disagrees"):
+                    repin.check_prestate_evidence(committed, output.getvalue())
 
 
 if __name__ == "__main__":
