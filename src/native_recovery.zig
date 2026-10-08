@@ -39,6 +39,53 @@ test "native_recovery.test.phase telemetry preserves canonical progress authorit
         }
     }
 }
+
+test "native_recovery.test.phase telemetry cannot announce a failed progress publication" {
+    if (@import("builtin").os.tag != .linux or std.os.linux.geteuid() == 0)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var fixture = std.testing.tmpDir(.{ .iterate = true });
+    defer fixture.cleanup();
+    const root = root_fs.Root.init(std.testing.io, fixture.dir);
+    for ([_][]const u8{ "var", "var/lib", root_operation.namespace_path }) |path|
+        try root.ensureDirectory(try root_fs.Path.init(path), root_fs.default_directory_permissions);
+    const intent: Digest = @splat('1');
+    try initializeProgress(allocator, root, intent);
+    const before = try root.readFileAlloc(allocator, try root_fs.Path.init(progress_path), maximum_progress_bytes);
+    defer allocator.free(before);
+    const namespace = try root_fs.Path.init(root_operation.namespace_path);
+    const original_mode = (try root.entry(namespace)).mode;
+    try root.applyMetadata(namespace, .{ .mode = 0o500 });
+    defer root.applyMetadata(namespace, .{ .mode = original_mode }) catch {};
+    var telemetry = phase_telemetry.Context.init(std.testing.io, @splat(2));
+    telemetry.attach();
+    defer telemetry.detach();
+    const action: Action = .{ .kind = .database, .program_step = 0, .substep = 0, .ordinal = 0 };
+    try std.testing.expectError(error.AccessDenied, appendProgress(
+        allocator,
+        root,
+        intent,
+        action,
+        .prepared,
+        .none,
+        null,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), telemetry.sequence);
+    try std.testing.expectEqual(@as(u64, 1), telemetry.measurement(.progress_serialization).count);
+    try std.testing.expectEqual(@as(u64, 0), telemetry.measurement(.fsync).count);
+    const unchanged = try root.readFileAlloc(allocator, try root_fs.Path.init(progress_path), maximum_progress_bytes);
+    defer allocator.free(unchanged);
+    try std.testing.expectEqualSlices(u8, before, unchanged);
+    try root.applyMetadata(namespace, .{ .mode = original_mode });
+    try appendProgress(allocator, root, intent, action, .prepared, .none, null);
+    try std.testing.expectEqual(@as(u64, 1), telemetry.sequence);
+    try std.testing.expectEqual(@as(u64, 2), telemetry.measurement(.progress_serialization).count);
+    try std.testing.expectEqual(@as(u64, 2), telemetry.measurement(.fsync).count);
+    var progress = try readProgress(allocator, root);
+    defer progress.deinit();
+    try std.testing.expectEqual(@as(usize, 1), progress.document.records.len);
+}
+
 const content_digest = @import("content_digest.zig");
 const maintainer_script = @import("maintainer_script.zig");
 const native_helper = @import("native_helper.zig");

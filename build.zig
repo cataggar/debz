@@ -1330,6 +1330,34 @@ pub fn build(b: *std.Build) void {
     b.step("test-native-diversion-settlement-zig", "Compare 24 Zig settlement upgrades and 16 follow-ups with pinned dpkg")
         .dependOn(&settlement.step);
 
+    const phase_telemetry_module = b.createModule(.{
+        .root_source_file = b.path("src/native_phase_telemetry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const phase_telemetry_test_module = b.createModule(.{
+        .root_source_file = b.path("test/native_phase_telemetry.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    phase_telemetry_test_module.addImport("native_phase_telemetry", phase_telemetry_module);
+    const phase_telemetry_tests = b.addExecutable(.{
+        .name = "native-phase-telemetry-check",
+        .root_module = phase_telemetry_test_module,
+    });
+    const phase_telemetry_step = b.step("test-native-phase-telemetry", "Check native diagnostic logging with isolated opt-in environments");
+    for ([_]?[]const u8{ null, "0", "true", "1" }) |configured| {
+        const run = b.addRunArtifact(phase_telemetry_tests);
+        if (configured) |value|
+            run.setEnvironmentVariable("DEBZ_NATIVE_PHASE_TELEMETRY", value)
+        else
+            run.removeEnvironmentVariable("DEBZ_NATIVE_PHASE_TELEMETRY");
+        run.setEnvironmentVariable("EXPECT_NATIVE_PHASE_TELEMETRY", if (configured != null and std.mem.eql(u8, configured.?, "1")) "1" else "0");
+        phase_telemetry_step.dependOn(&run.step);
+    }
+    workload_native.dependOn(phase_telemetry_step);
+
     const native_recovery_tests = b.addTest(.{
         .root_module = debz,
         .filters = &.{

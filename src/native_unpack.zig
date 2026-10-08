@@ -39244,7 +39244,7 @@ const StatePhaseMeasurement = struct {
 };
 
 // Reproduce only the removed same-phase capture/import, not a second mutation.
-fn measureStatePhase(fixture: *Fixture, recapture: bool) !StatePhaseMeasurement {
+fn measureStatePhase(fixture: *Fixture, recapture: bool, detailed: bool) !StatePhaseMeasurement {
     const root = fixture.root();
     var telemetry = phase_telemetry.Context.init(testing.io, @splat(0));
     telemetry.attach();
@@ -39300,8 +39300,14 @@ fn measureStatePhase(fixture: *Fixture, recapture: bool) !StatePhaseMeasurement 
             .diagnostic => return error.TestUnexpectedResult,
         };
         defer imported.deinit();
-        break :block try materializeStateRecord(testing.allocator, request, imported, state, null, null);
-    } else try materializeStateRecord(testing.allocator, request, database, state, null, null);
+        break :block if (detailed)
+            try materializeDetailedStateFromDatabase(testing.allocator, request, imported, state.package, .install, .ok, .half_configured, "1")
+        else
+            try materializeStateRecord(testing.allocator, request, imported, state, null, null);
+    } else if (detailed)
+        try materializeDetailedStateFromDatabase(testing.allocator, request, database, state.package, .install, .ok, .half_configured, "1")
+    else
+        try materializeStateRecord(testing.allocator, request, database, state, null, null);
     try testing.expectEqual(MaterializationOutcome.applied, result.outcome);
     const elapsed_ns = started.durationTo(std.Io.Clock.awake.now(testing.io)).toNanoseconds();
     const capture = telemetry.measurement(.capture);
@@ -39321,7 +39327,9 @@ fn measureStatePhase(fixture: *Fixture, recapture: bool) !StatePhaseMeasurement 
         .diagnostic => return error.TestUnexpectedResult,
     };
     defer final_database.deinit();
-    try testing.expectEqual(package_database.CurrentState.installed, final_database.model.find("demo", "amd64").?.status.current);
+    const final_record = final_database.model.find("demo", "amd64").?;
+    try testing.expectEqual(if (detailed) package_database.CurrentState.half_configured else .installed, final_record.status.current);
+    if (detailed) try testing.expectEqualStrings("1", final_record.field("Config-Version").?.value_lines[0]);
     try testing.expectEqualStrings(fixture.status, final.snapshot.status_old.?.bytes);
     try testing.expect(try root.entryIfExists(try root_fs.Path.init(root_mutation.journal_path)) == null);
     var status_digest: [32]u8 = undefined;
@@ -39369,7 +39377,7 @@ test "native_unpack.test.materialization same-phase database reuse interleaves c
             var fixture: Fixture = undefined;
             try statePhaseFixture(&fixture, arena.allocator(), package_count);
             defer fixture.deinit();
-            const measured = try measureStatePhase(&fixture, recapture);
+            const measured = try measureStatePhase(&fixture, recapture, false);
             if (!recapture) {
                 try testing.expectEqual(@as(u64, 2), measured.capture.count);
                 try testing.expectEqual(@as(u64, 2), measured.imported.count);
@@ -39404,10 +39412,49 @@ test "native_unpack.test.materialization same-phase database reuse interleaves c
     }
 }
 
+test "native_unpack.test.materialization same-phase detailed state preserves configuration and exact evidence" {
+    var before: ?StatePhaseMeasurement = null;
+    for ([_]bool{ true, false }) |recapture| {
+        var fixture: Fixture = undefined;
+        try fixture.init(state_phase_status, &.{.{ .name = "demo.list", .bytes = "/.\n" }});
+        defer fixture.deinit();
+        const measured = try measureStatePhase(&fixture, recapture, true);
+        if (before) |value| {
+            try testing.expectEqualDeep(value.generation, measured.generation);
+            try testing.expectEqual(value.status, measured.status);
+            try testing.expectEqual(value.status_old, measured.status_old);
+            try testing.expectEqual(@as(u64, 2), measured.capture.count);
+            try testing.expectEqual(@as(u64, 2), measured.imported.count);
+            try testing.expectEqual(value.capture.count, measured.capture.count + 1);
+            try testing.expectEqual(value.imported.count, measured.imported.count + 1);
+            try testing.expect(value.hash.count > measured.hash.count);
+            try testing.expectEqual(value.mutation.count, measured.mutation.count);
+            try testing.expectEqual(value.fsync.count, measured.fsync.count);
+        } else before = measured;
+    }
+}
+
 test "native_unpack.test.materialization same-phase database reuse refuses stale or missing status and retains crash ownership" {
-    const Scenario = enum { stale, missing, crash };
-    for ([_]Scenario{ .stale, .missing, .crash }) |scenario| {
+    const Scenario = enum { stale, missing, crash, missing_info_after_apply, status_old_after_apply };
+    const PostApplyTamper = struct {
+        root: root_fs.Root,
+        scenario: Scenario,
+        fired: bool = false,
+
+        fn before(context: ?*anyopaque, boundary: root_mutation.Boundary, _: u32) root_mutation.HookError!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            // All mutation steps have verified before staging is released.
+            if (self.fired or boundary != .release_staging) return;
+            self.fired = true;
+            if (self.scenario == .missing_info_after_apply)
+                self.root.removeFile(root_fs.Path.init("var/lib/dpkg/info/demo.list") catch unreachable) catch return error.UnlinkFailed
+            else
+                self.root.publishFile(root_fs.Path.init("var/lib/dpkg/status-old") catch unreachable, "tampered\n", .{}) catch return error.RenameFailed;
+        }
+    };
+    for ([_]Scenario{ .stale, .missing, .crash, .missing_info_after_apply, .status_old_after_apply }) |scenario| {
         const crash = scenario == .crash;
+        const post_apply = scenario == .missing_info_after_apply or scenario == .status_old_after_apply;
         var fixture: Fixture = undefined;
         try fixture.init(state_phase_status, &.{.{ .name = "demo.list", .bytes = "/.\n" }});
         defer fixture.deinit();
@@ -39429,6 +39476,7 @@ test "native_unpack.test.materialization same-phase database reuse refuses stale
         var locks: root_operation.TestLockBackend = .{ .allocator = testing.allocator };
         defer locks.deinit();
         var fault: MaterializationFault = .{ .boundary = .publish_rename, .crash = true };
+        var tamper: PostApplyTamper = .{ .root = fixture.root(), .scenario = scenario };
         const request: MaterializationRequest = .{
             .io = testing.io,
             .root = fixture.root(),
@@ -39443,7 +39491,7 @@ test "native_unpack.test.materialization same-phase database reuse refuses stale
             },
             .locks = locks.interface(),
             .operation = .install,
-            .hooks = if (crash) fault.hooks() else .{},
+            .hooks = if (crash) fault.hooks() else if (post_apply) .{ .context = &tamper, .beforeFn = PostApplyTamper.before } else .{},
         };
         if (scenario == .missing)
             try fixture.root().removeFile(try root_fs.Path.init("var/lib/dpkg/status"))
@@ -39456,8 +39504,12 @@ test "native_unpack.test.materialization same-phase database reuse refuses stale
             .remove_entry = false,
         };
         const result = try materializeStateRecord(testing.allocator, request, database, state, null, null);
-        try testing.expectEqual(if (crash) MaterializationOutcome.recovery_required else .refused, result.outcome);
-        if (crash) {
+        try testing.expectEqual(if (crash or post_apply) MaterializationOutcome.recovery_required else .refused, result.outcome);
+        if (post_apply) {
+            try testing.expect(tamper.fired);
+            try testing.expectEqualStrings("database_verification_failed", result.detail);
+        }
+        if (crash or post_apply) {
             try testing.expect(try fixture.root().entryIfExists(try root_fs.Path.init(root_mutation.journal_path)) != null);
             try testing.expectError(error.RecoveryRequired, materializeStateRecord(testing.allocator, request, database, state, null, null));
         } else if (scenario == .stale) {
