@@ -27,6 +27,19 @@ attempt, root, request, policy, exact lock, artifact and database generation
 digests, stored paths, and limits. Recovery consumes these persisted inputs
 without caller archives, repository access, re-solving, or recompilation.
 
+Installed and incoming lifecycle script copies are staged before ordinary or
+bootstrap payload publication, even without pre-unpack callbacks. This keeps
+the original recorded digest bound to original installed bytes when live
+`info/` members subsequently describe the new version. Existing exact staged
+digest, compiled caller/version and managed-checkpoint checks remain unchanged.
+The statoverride recovery suite includes differing-script upgrades interrupted
+at preparation and known-outcome boundaries of the old upgrade `postrm`;
+archive eviction still permits exact recovery. Swapping old/new staged
+postinst bytes or replacing either with unrelated script bytes requires
+`managed_state_changed` refusal, with an unchanged root and no new invocation;
+these byte-drift controls preserve mode, owner, mtime and file identity.
+This bounded tool/fixture evidence is not a signed vendor-root parity claim.
+
 The native progress document preserves a logical append-only sequence and
 hash chain, atomically replacing its canonical JSON file on each append.
 Records describe native phases and invocation outcomes,

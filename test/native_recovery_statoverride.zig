@@ -619,6 +619,128 @@ fn expectChronyCheckpoint(fixture: *foundation.Fixture, root_path: []const u8) !
     }
 }
 
+const UpgradeScriptDrift = enum { old_to_new, new_to_old, old_unrelated, new_unrelated };
+
+fn runChangedChronyUpgrade(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    crash: []const u8,
+    drift: ?UpgradeScriptDrift,
+) !void {
+    const name = try std.fmt.allocPrint(fixture.allocator, "statoverride-script-upgrade-{s}-{s}", .{
+        crash, if (drift) |value| @tagName(value) else "recover",
+    });
+    defer fixture.allocator.free(name);
+    var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer case.deinit();
+    try statoverride.seedChrony(&case, dpkg, false);
+    const workspace = try support.path(fixture.allocator, name, "packages");
+    defer fixture.allocator.free(workspace);
+    const first = try statoverride.chronyArchive(fixture, arch, "1", workspace);
+    defer fixture.allocator.free(first);
+    const second = try statoverride.changedChronyArchive(fixture, arch, "2", workspace);
+    defer fixture.allocator.free(second);
+    const selected = [_]foundation.PackageIdentity{.{ .name = statoverride.chrony_name, .architecture = arch }};
+    try case.phase(.{ .operation = "install", .archives = &.{first}, .packages = &selected, .recovery = true }, false);
+    const original = try process.rootBytes(fixture, case.native_root, "var/lib/dpkg/info/" ++ statoverride.chrony_name ++ ".postinst");
+    defer fixture.allocator.free(original);
+    const reference_log = try support.path(fixture.allocator, name, "reference-upgrade");
+    defer fixture.allocator.free(reference_log);
+    try fixture.directory(reference_log);
+    if (try support.reference(fixture, dpkg, case.reference_root, .{
+        .operation = "upgrade",
+        .archives = &.{second},
+        .packages = &selected,
+    }, reference_log) != 0) return error.UnexpectedReferenceOutcome;
+    const crash_log = try support.path(fixture.allocator, name, "crash");
+    defer fixture.allocator.free(crash_log);
+    if (try process.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+        .operation = "upgrade",
+        .archives = &.{second},
+        .packages = &selected,
+        .crash_at = crash,
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) |value| {
+        var invalid = value;
+        invalid.deinit();
+        return error.MissingCrash;
+    }
+    const old_path = try std.fmt.allocPrint(fixture.allocator, "var/lib/debz-lifecycle-scripts/{s}:{s}.postinst", .{ statoverride.chrony_name, arch });
+    defer fixture.allocator.free(old_path);
+    const new_path = "var/lib/debz-lifecycle-scripts/" ++ statoverride.chrony_name ++ ".postinst";
+    const old_script = try process.rootBytes(fixture, case.native_root, old_path);
+    defer fixture.allocator.free(old_script);
+    const new_script = try process.rootBytes(fixture, case.native_root, new_path);
+    defer fixture.allocator.free(new_script);
+    if (!std.mem.eql(u8, original, old_script)) return error.OriginalScriptAuthorityLost;
+    if (std.mem.eql(u8, old_script, new_script)) return error.ChangedScriptFixtureWasByteStable;
+    if (drift) |value| {
+        const target = switch (value) {
+            .old_to_new, .old_unrelated => old_path,
+            .new_to_old, .new_unrelated => new_path,
+        };
+        const bytes = switch (value) {
+            .old_to_new => new_script,
+            .new_to_old => old_script,
+            .old_unrelated, .new_unrelated => "#!/bin/sh\nprintf 'unauthorized\\n' > /unrelated-script-called\nexit 0\n",
+        };
+        const path = try process.rootPath(fixture, case.native_root, target);
+        defer fixture.allocator.free(path);
+        var dir = try foundation.guardedRoot(fixture.io, case.native_root);
+        defer dir.close(fixture.io);
+        const root: root_fs.Root = .init(fixture.io, dir);
+        const entry = try root.entry(try root_fs.Path.init(target));
+        try support.fixtureFile(fixture, path, bytes, entry.mode);
+        try root.applyMetadata(try root_fs.Path.init(target), .{
+            .uid = entry.uid,
+            .gid = entry.gid,
+            .modified_nanoseconds = entry.modified_nanoseconds,
+        });
+        const after = try root.entry(try root_fs.Path.init(target));
+        if (entry.device != after.device or entry.inode != after.inode)
+            return error.ScriptDriftChangedIdentity;
+    }
+    try fixture.dir.deleteFile(fixture.io, first[fixture.path.len + 1 ..]);
+    try fixture.dir.deleteFile(fixture.io, second[fixture.path.len + 1 ..]);
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    const recovery_log = try support.path(fixture.allocator, name, "recover");
+    defer fixture.allocator.free(recovery_log);
+    var report = (try process.invoke(fixture, driver, case.native_root, arch, recovery_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer report.deinit();
+    try process.rootAbsent(fixture, case.native_root, "unrelated-script-called");
+    if (drift != null) {
+        if (!std.mem.eql(u8, report.value.outcome, "recovery_required") or
+            std.mem.indexOf(u8, report.value.detail, "managed_state_changed") == null)
+            return error.ChangedScriptAuthorityDriftAccepted;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        if (!std.mem.eql(u8, before, after)) return error.BlockedRecoveryMutatedRoot;
+    } else {
+        try process.same(report.value.outcome, "applied");
+        const comparison = try support.path(fixture.allocator, name, "comparison");
+        defer fixture.allocator.free(comparison);
+        try fixture.directory(comparison);
+        try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+        try statoverride.expectChangedChronyMetadata(&case);
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+        try statoverride.verifyChangedChronyState(&case);
+    }
+    std.debug.print("{s}: old/new script authority passed\n", .{name});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var arguments = init.minimal.args.iterate();
@@ -637,6 +759,10 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after statoverride failure: {s}\n", .{@errorName(err)});
+    try runChangedChronyUpgrade(&fixture, driver, reference.executable, reference.architecture, "after_script_prepared", null);
+    try runChangedChronyUpgrade(&fixture, driver, reference.executable, reference.architecture, "after_script_outcome", null);
+    for (std.meta.tags(UpgradeScriptDrift)) |drift|
+        try runChangedChronyUpgrade(&fixture, driver, reference.executable, reference.architecture, "after_script_outcome", drift);
     try runChronyCase(&fixture, driver, reference.executable, reference.architecture, false, null);
     try runChronyCase(&fixture, driver, reference.executable, reference.architecture, true, null);
     try runChronyCase(&fixture, driver, reference.executable, reference.architecture, false, .mode);

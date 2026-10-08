@@ -20471,6 +20471,17 @@ fn removalRunsInstalledScript(
     return false;
 }
 
+fn lifecycleNeedsScriptStaging(
+    model: *const archive_application.Model,
+    initial_model: package_database.Model,
+    package: native_program.PackageIdentity,
+) bool {
+    if (model.script(.config) != null or hasLifecycleScripts(model)) return true;
+    const installed = initial_model.find(package.name, package.architecture) orelse
+        return false;
+    return installed.scripts.len != 0;
+}
+
 fn stageLifecycleScripts(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -31892,8 +31903,8 @@ fn executeLifecycleProgramWithRequest(
         .materialize_bootstrap_payload => |intent| {
             var has_config = false;
             if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
-                if (models[model_index].script(.config) != null) {
-                    has_config = true;
+                has_config = models[model_index].script(.config) != null;
+                if (lifecycleNeedsScriptStaging(&models[model_index], initial_model, intent.package)) {
                     const staged = try stageLifecycleScripts(
                         execution,
                         allocator,
@@ -31914,12 +31925,12 @@ fn executeLifecycleProgramWithRequest(
                     );
                     if (lifecycleMaterializationFailure(staged)) |failure|
                         return failure;
-                    if (execution.recovery) |runtime| {
+                    if (has_config) if (execution.recovery) |runtime| {
                         runtime.crash.hit(if (staging.packages.count() > 1)
                             .after_subsequent_bootstrap_config_stage
                         else
                             .after_bootstrap_config_stage);
-                    }
+                    };
                 }
             }
             const result = try lifecycleDataStep(
@@ -32001,7 +32012,9 @@ fn executeLifecycleProgramWithRequest(
         },
         .unpack_package => |intent| {
             if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
-                if (models[model_index].script(.config) != null) {
+                // Retain original installed scripts before new info publication,
+                // even when no preinst or prerm callback precedes this unpack.
+                if (lifecycleNeedsScriptStaging(&models[model_index], initial_model, intent.package)) {
                     const staged = try stageLifecycleScripts(
                         execution,
                         allocator,

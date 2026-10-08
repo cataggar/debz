@@ -49,6 +49,17 @@ is not a substitute for its last configured version. Upgrade preinst and the
 incoming failed-upgrade/abort-upgrade scripts include both old and new versions
 where dpkg does.
 
+Before ordinary or bootstrap payload publication replaces installed `info/`
+members, native stages the incoming lifecycle scripts and retains the original
+installed lifecycle scripts in the existing journaled private staging area.
+This also applies when no `preinst` or `prerm` runs before unpack. Original
+copies still require their recorded installed digest; incoming members still
+require their archive digest. Later calls use the compiled source, owning
+version and digest, not whichever bytes currently occupy the live info path.
+Recovery accepts an existing staged member only with its exact original
+binding. No old-or-new digest alternative or additional callback admission is
+introduced.
+
 Known inert control members (`config`, `templates`, `shlibs`, `symbols`) are installed
 with their exact bytes and safe modes, replaced or retired on upgrade,
 reinstall and downgrade, and removed on successful removal/purge. Old upgrade
@@ -362,7 +373,10 @@ that scenario; without a pinned reference, only that scenario is skipped.
 `-Dnative-statoverrides-only=true` selects the statoverride metadata and
 genuine-tool lifecycle scenarios, including named-account creation, chrony-like
 script-created files and a shipped directory, guarded reinstall, a payload
-upgrade with byte-stable maintainer scripts, and remove/purge. The genuine
+upgrade with byte-stable maintainer scripts, and remove/purge. Additional
+upgrades genuinely change `postinst`/`postrm` bytes with no preinst/prerm and
+use `dpkg-statoverride` to change the key mode from 0640 to 0600, with and
+without durable recovery, followed by reinstall/remove/purge. The genuine
 diversion cases also cover postinst and prerm `--rename` moves and 210
 `prerm remove` additions owned by `coreutils-switch`.
 Both suites assert exact database and `-old` bytes. Use
