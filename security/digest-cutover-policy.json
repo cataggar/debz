@@ -402,6 +402,16 @@
       ]
     },
     {
+      "id": "refresh-repository-id-controls",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_protocol",
+      "rationale": "These exact command schema and repin checks validate opaque 64-character source repository ids used to join every public refresh pocket and frozen witness. Release and snapshot content digests remain algorithm-tagged; this does not introduce raw-width package content authority.",
+      "paths": [
+        "schema/command-result-v1.json",
+        "tools/real-snapshot-repin.py"
+      ]
+    },
+    {
       "id": "fixed-lifecycle-control-assertions",
       "kind": "fixed_64_hex_assumption",
       "classification": "fixed_control_protocol",

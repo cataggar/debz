@@ -13,7 +13,10 @@
     "exit_status": {"const": 0},
     "changed": {"const": false},
     "summary": {"type": "string"},
-    "items": {"$ref": "https://github.com/cataggar/debz/schema/command-result-v1.json#/properties/items"},
+    "items": {
+      "$ref": "https://github.com/cataggar/debz/schema/command-result-v1.json#/properties/items",
+      "items": {"not": {"required": ["repository"]}}
+    },
     "diagnostics": {"type": "array", "maxItems": 0},
     "native_download": {"$ref": "https://debz.dev/schema/native-baseline-download-v1"}
   }

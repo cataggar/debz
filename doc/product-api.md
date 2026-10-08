@@ -15,6 +15,39 @@ API version 1 includes every operation in the CLI vocabulary. Backends return a
 nonzero result with a stable diagnostic and must never return a success-shaped
 placeholder. Tests can inject the same backend used by production callers.
 
+### Refresh repository evidence
+
+`product_api.Item.repository` is optional typed `RepositoryEvidence`, emitted
+only for `refresh` in `io.github.cataggar.debz.command.v1`. Production refresh
+includes it for **every** configured authenticated repository, including empty,
+shadowed and quiet pockets. The existing item fields retain their meanings:
+`package` is the repository id and `version` is the Release suite.
+
+The object contains `release_digest` and `snapshot_digest` as
+`sha256:<lowercase hex>`, `signer_fingerprints` as the sorted primary fingerprint
+array, and `frozen` as null or the full authenticated frozen decision. For a
+contributing repository these identities equal exact-lock `release_sha256`,
+`snapshot_sha256` and `signer_fingerprints`; refresh does not invent package
+contributions. Plain, unauthenticated repository policy may yield an empty
+signer array, which is not proof of authenticated admission.
+
+A frozen decision contains the reviewed tagged `release_digest`,
+`admission_deadline_unix`, and `witnesses` in normalized policy order (suite
+order). Each witness contains `repository_id`, tagged `snapshot_digest`,
+`release_date_unix`, `deadline_unix` and `primary_fingerprint`. Its snapshot
+identity matches the corresponding witness refresh item, including witnesses
+that contribute no package. These values come from the authenticated snapshot,
+not reconstructed cache strings.
+
+The canonical writer rejects repository evidence on other operations. The
+bounded strict parser preserves owned nested arrays, rejects unsupported
+versions, algorithms, malformed identities and unknown members, and checks
+frozen decision shape/deadlines. Existing results without the optional member
+remain valid; other operations' output bytes are unchanged. Consumers must
+check the full evidence rather than treating the human `detail` as a digest.
+Refresh evidence remains command.v1-only. Native baseline download command.v2
+retains its existing document budget and validation and cannot carry this member.
+
 ## CLI
 
 ```

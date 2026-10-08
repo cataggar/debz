@@ -1,5 +1,15 @@
 # Authenticated repository refresh
 
+The production `refresh --json` result exposes each configured pocket's public
+typed repository evidence, including empty and shadowed pockets. Release and
+snapshot digests are algorithm-tagged SHA-256 values; primary signer arrays
+match contributing exact locks. Frozen decisions are copied from the complete
+authenticated snapshot policy: the reviewed Release pin, admission deadline,
+and each witness's id, snapshot digest, signed Date, deadline and primary
+fingerprint in normalized policy order. A witness's digest equals its own
+refresh item's snapshot digest. No private-cache inspection or synthetic lock
+contribution is necessary. See [the product API](product-api.md#refresh-repository-evidence).
+
 `repository_refresh.refresh` preserves the plain `Release` path and returns an
 untrusted `Result`. It verifies every supported Release-to-index digest
 (SHA256 and SHA512) but cannot be

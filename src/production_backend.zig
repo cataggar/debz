@@ -1328,18 +1328,23 @@ pub const Backend = struct {
 
         if (request.operation == .refresh) {
             var items = try allocator.alloc(api.Item, refreshed.states.len);
-            for (refreshed.states, 0..) |state, index| items[index] = .{
-                .package = try allocator.dupe(u8, state.repository_id.slice()),
-                .version = try allocator.dupe(u8, state.release_suite),
-                .architecture = null,
-                .detail = if (state.frozen) |frozen|
-                    try std.fmt.allocPrint(
-                        allocator,
-                        "authenticated frozen release; admission deadline {d}",
-                        .{frozen.admission_deadline_unix},
-                    )
-                else if (state.stale) "authenticated stale cache" else "authenticated",
-            };
+            for (refreshed.states, 0..) |state, index| {
+                const snapshot = findSnapshot(refreshed.snapshots, state.repository_id.bytes) orelse
+                    return error.MissingRepository;
+                items[index] = .{
+                    .package = try allocator.dupe(u8, state.repository_id.slice()),
+                    .version = try allocator.dupe(u8, state.release_suite),
+                    .architecture = null,
+                    .detail = if (state.frozen) |frozen|
+                        try std.fmt.allocPrint(
+                            allocator,
+                            "authenticated frozen release; admission deadline {d}",
+                            .{frozen.admission_deadline_unix},
+                        )
+                    else if (state.stale) "authenticated stale cache" else "authenticated",
+                    .repository = try refreshRepositoryEvidence(allocator, state, snapshot),
+                };
+            }
             return success(.refresh, true, "authenticated repository metadata refreshed", items);
         }
         if (request.operation == .list_available or request.operation == .info or request.operation == .provides)
@@ -6414,6 +6419,56 @@ fn findSnapshot(
             return snapshot;
     }
     return null;
+}
+
+fn refreshRepositoryEvidence(
+    allocator: std.mem.Allocator,
+    state: repository_policy.PublishedRepositoryState,
+    snapshot: *const repository_refresh.AuthenticatedResult,
+) !api.RepositoryEvidence {
+    const provenance = &snapshot.snapshot.provenance;
+    if (!std.mem.eql(u8, state.repository_id.slice(), provenance.repository_id.slice()) or
+        !std.mem.eql(u8, &state.release_digest.bytes, &provenance.release_digest.bytes))
+        return error.MissingRepository;
+    const signatures = provenance.authentication_evidence.signatures;
+    const signers = try allocator.alloc([20]u8, signatures.len);
+    var signer_count: usize = 0;
+    for (signatures) |signature| if (signature.primary_fingerprint) |fingerprint| {
+        signers[signer_count] = fingerprint;
+        signer_count += 1;
+    };
+    std.mem.sort([20]u8, signers[0..signer_count], {}, struct {
+        fn lessThan(_: void, a: [20]u8, b: [20]u8) bool {
+            return std.mem.order(u8, &a, &b) == .lt;
+        }
+    }.lessThan);
+    var unique_count: usize = 0;
+    for (signers[0..signer_count]) |fingerprint| {
+        if (unique_count == 0 or !std.mem.eql(u8, &signers[unique_count - 1], &fingerprint)) {
+            signers[unique_count] = fingerprint;
+            unique_count += 1;
+        }
+    }
+    return .{
+        .release_digest = .{ .sha256 = state.release_digest.bytes },
+        .signer_fingerprints = signers[0..unique_count],
+        .snapshot_digest = .{ .sha256 = repository_refresh.snapshotDigest(snapshot) },
+        .frozen = if (provenance.policy.frozen) |frozen| blk: {
+            const witnesses = try allocator.alloc(api.WitnessEvidence, frozen.slice().len);
+            for (frozen.slice(), witnesses) |decision, *witness| witness.* = .{
+                .repository_id = decision.repository_id.bytes,
+                .snapshot_digest = .{ .sha256 = decision.snapshot_sha256 },
+                .release_date_unix = decision.release_date_unix,
+                .deadline_unix = decision.deadline_unix,
+                .primary_fingerprint = decision.primary_fingerprint,
+            };
+            break :blk .{
+                .release_digest = frozen.release_digest,
+                .admission_deadline_unix = frozen.admission_deadline_unix,
+                .witnesses = witnesses,
+            };
+        } else null,
+    };
 }
 
 fn writeExecutionProvenance(
