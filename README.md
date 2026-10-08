@@ -109,9 +109,16 @@ Refresh requires a signed `Valid-Until` by default. Microsoft's Ubuntu 24.04
 feed omits that field, so `repo add` for the descriptor above applies a
 reviewed 14-day maximum Release age instead. It does so only for its exact
 `microsoft-prod.list` source, `noble main` on `amd64` or `arm64`, and the
-pinned Microsoft signing key. Separate descriptor structure checks still
-refuse the current upstream package; see
+pinned Microsoft signing key. The reviewed upstream descriptor structure is
+also supported; see
 [reviewed freshness profiles](doc/repository-management.md#reviewed-freshness-profiles).
+
+Successful repository add retains a root-scoped active configuration and a
+[typed read-only system context](doc/target-apt-config.md#typed-system-product-context).
+The short `sudo debz install symcrypt[-openssl]` workflow is **not yet wired**;
+use the explicit authenticated plan/review/replay path above where its strict
+installed-baseline and backend requirements can be met. System SymCrypt
+packages do not replace zig-symcrypt's pinned/static build inputs.
 
 The installed CLI exposes the limited profile-bound system facade:
 

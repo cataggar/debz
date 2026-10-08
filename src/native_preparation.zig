@@ -14,10 +14,12 @@ const package_origin = @import("package_origin.zig");
 const solver = @import("solver.zig");
 const transaction_engine = @import("transaction_engine.zig");
 const transaction_executor = @import("transaction_executor.zig");
+const native_baseline = @import("native_baseline_contract.zig");
 
 pub const Request = struct {
     plan: *const solver.Plan,
     exact_lock: *const exact_lock_v3.Lock,
+    baseline: ?*const native_baseline.Contract = null,
     install_root: []const u8,
     policy: transaction_executor.Policy,
     script_policy: maintainer_script.Policy,
@@ -925,6 +927,28 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
     };
     defer verified_lock.deinit();
     const lock = verified_lock.lock;
+    if (request.baseline) |baseline| {
+        try baseline.validate(temporary, &lock);
+        if (request.trigger_authority != null or request.unincorporated_triggers)
+            return error.InstalledBaselineCallbacksUnsupported;
+        for (request.installed.packages) |package| {
+            if (package.triggers_pending.len != 0 or package.triggers_awaited.len != 0 or package.triggers.len != 0)
+                return error.InstalledBaselineCallbacksUnsupported;
+        }
+        for (request.archives) |archive| {
+            if (archive.scripts.len != 0 or archive.triggers.len != 0)
+                return error.InstalledBaselineCallbacksUnsupported;
+        }
+        for (request.plan.actions) |action| {
+            if (baseline.component.containsName(action.package))
+                return error.InstalledBaselineActionForbidden;
+            if (action.kind != .install or action.prior_installed != null)
+                return error.InstalledBaselineOwnedNewInstallRequired;
+            const selected = lock.findIdentity(action.package, action.architecture) orelse return error.LockClosureMismatch;
+            if (selected.origin != .authenticated_repository)
+                return error.InstalledBaselineAuthenticatedArchiveRequired;
+        }
+    }
     var installed_index: IdentityIndex = .empty;
     for (request.installed.packages, 0..) |package, index| {
         const key = try identity(temporary, package.name, package.architecture);
@@ -1008,8 +1032,12 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
                 (package.state != .config_files and !retainsConfiguration(package)))
                 continue;
         } else if (package.state != .config_files) {
-            if (request.policy.exact_lock_verification != .locked_packages)
-                return error.LockClosureMismatch;
+            if (request.baseline) |baseline| {
+                const component = baseline.component.find(package.name, package.architecture) orelse return error.LockClosureMismatch;
+                if (!sameText(component.package.version, package.version) or
+                    (component.package.selection == .hold) != package.hold or package.state != .installed)
+                    return error.LockClosureMismatch;
+            } else if (request.policy.exact_lock_verification != .locked_packages) return error.LockClosureMismatch;
             // Preserve the captured final database without inventing origins
             // for healthy packages outside an operation-scoped lock.
             final_package_state = switch (package.state) {
@@ -1026,6 +1054,13 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         });
     }
     const pending_triggers = pendingTriggerWork(request.installed.packages, request.unincorporated_triggers);
+    if (request.baseline) |baseline| {
+        for (baseline.component.components) |component| {
+            const key = try identity(temporary, component.package.name, component.package.architecture);
+            if (!installed_index.contains(key) or action_index.contains(key))
+                return error.LockClosureMismatch;
+        }
+    }
     if (request.trigger_authority == null) {
         if (pending_triggers) return error.TriggerAuthorityRequired;
         for (request.archives) |archive| {
@@ -1040,7 +1075,7 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         // provenance and report a change.
         return error.TriggerAuthorityWithoutPendingWork;
     }
-    if (allow_unchanged and actions.len == 0 and request.trigger_authority == null) {
+    if (allow_unchanged and actions.len == 0 and request.trigger_authority == null and request.baseline == null) {
         if (request.plan.ordered_actions.len != 0 or request.archives.len != 0 or
             request.installed.updates_pending or request.unsupported_features.len != 0 or
             request.ownership_conflicts.len != 0)
@@ -1048,6 +1083,7 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
         return .unchanged;
     }
     var authorization = try native_authorization.create(allocator, .{
+        .baseline_noop_sha512 = if (request.baseline) |baseline| baseline.digest() else null,
         .backend = .native,
         .target_architecture = lock.target_architecture,
         .foreign_architectures = request.foreign_architectures,
@@ -1082,6 +1118,7 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
     try transaction_engine.authorize(.native, execution_request, &authorization.authorization);
     switch (native_program.compile(allocator, .{
         .authorization = &authorization.authorization,
+        .baseline = request.baseline,
         .ordered_actions = request.plan.ordered_actions,
         .installed = request.installed,
         .removal_retry = request.removal_retry,
@@ -1115,7 +1152,11 @@ fn prepareImpl(allocator: std.mem.Allocator, request: Request, allow_unchanged: 
                 };
             }
             authorization_transferred = true;
-            return .{ .prepared = .{ .authorization = authorization, .program = program, .removal_retry = retry } };
+            return .{ .prepared = .{
+                .authorization = authorization,
+                .program = program,
+                .removal_retry = retry,
+            } };
         },
     }
 }

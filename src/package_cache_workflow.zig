@@ -4,6 +4,8 @@ const deb_payload = @import("deb_payload.zig");
 const exact_lock = @import("exact_lock.zig");
 const exact_lock_v2 = @import("exact_lock_v2.zig");
 const exact_lock_v3 = @import("exact_lock_v3.zig");
+const exact_lock_v4 = @import("exact_lock_v4.zig");
+const native_baseline = @import("native_baseline_contract.zig");
 const content_digest = @import("content_digest.zig");
 const package_acquisition = @import("package_acquisition.zig");
 const package_cache_archive = @import("package_cache_archive.zig");
@@ -11,6 +13,7 @@ const packages_index = @import("packages_index.zig");
 const repository_acquisition = @import("repository_acquisition.zig");
 const solver = @import("solver.zig");
 const source = @import("source.zig");
+const root_fs = @import("root_fs.zig");
 
 pub const capability = "package-cache-v3";
 pub const fingerprint_schema = "io.github.cataggar.debz.package-cache-fingerprint.v3";
@@ -35,13 +38,19 @@ pub const tagged_api_version: u32 = 5;
 pub const tagged_fingerprint_domain = "debz-package-cache-fingerprint-v5";
 pub const tagged_origin_mode = "exact-lock-v3-content-identities";
 
-const Version = enum { v1, v2, v3 };
+pub const baseline_capability = "package-cache-v6";
+pub const baseline_fingerprint_schema = "io.github.cataggar.debz.package-cache-fingerprint.v6";
+pub const baseline_result_schema = "io.github.cataggar.debz.package-cache-result.v6";
+pub const baseline_api_version: u32 = 6;
+
+const Version = enum { v1, v2, v3, baseline };
 
 fn cacheApiVersion(version: Version) u32 {
     return switch (version) {
         .v1 => api_version,
         .v2 => native_api_version,
         .v3 => tagged_api_version,
+        .baseline => baseline_api_version,
     };
 }
 
@@ -50,6 +59,7 @@ fn cacheCapability(version: Version) []const u8 {
         .v1 => capability,
         .v2 => native_capability,
         .v3 => tagged_capability,
+        .baseline => baseline_capability,
     };
 }
 
@@ -58,6 +68,7 @@ fn fingerprintSchema(version: Version) []const u8 {
         .v1 => fingerprint_schema,
         .v2 => native_fingerprint_schema,
         .v3 => tagged_fingerprint_schema,
+        .baseline => baseline_fingerprint_schema,
     };
 }
 
@@ -66,6 +77,7 @@ fn resultSchema(version: Version) []const u8 {
         .v1 => result_schema,
         .v2 => native_result_schema,
         .v3 => tagged_result_schema,
+        .baseline => baseline_result_schema,
     };
 }
 
@@ -74,6 +86,7 @@ fn fingerprintDomain(version: Version) []const u8 {
         .v1 => fingerprint_domain,
         .v2 => native_fingerprint_domain,
         .v3 => tagged_fingerprint_domain,
+        .baseline => "debz-package-cache-fingerprint-v6",
     };
 }
 
@@ -82,6 +95,7 @@ fn lockSchema(version: Version) []const u8 {
         .v1 => exact_lock.schema_id,
         .v2 => exact_lock_v2.schema_id,
         .v3 => exact_lock_v3.schema_id,
+        .baseline => exact_lock_v4.schema_id,
     };
 }
 
@@ -90,6 +104,7 @@ fn lockSchemaVersion(version: Version) u32 {
         .v1 => exact_lock.schema_version,
         .v2 => exact_lock_v2.schema_version,
         .v3 => exact_lock_v3.schema_version,
+        .baseline => exact_lock_v4.schema_version,
     };
 }
 
@@ -98,6 +113,7 @@ fn archiveFormat(version: Version) []const u8 {
         .v1 => package_cache_archive.format_id,
         .v2 => package_cache_archive.native_format_id,
         .v3 => package_cache_archive.tagged_format_id,
+        .baseline => package_cache_archive.baseline_format_id,
     };
 }
 
@@ -106,13 +122,14 @@ fn originMode(version: Version) []const u8 {
         .v1 => supported_origin_mode,
         .v2 => native_origin_mode,
         .v3 => tagged_origin_mode,
+        .baseline => "exact-lock-v4-native-installed-component-noop",
     };
 }
 
 fn objectIdentityMode(version: Version) []const u8 {
     return switch (version) {
         .v1, .v2 => "exact-lock-sha256-cache-key-v1",
-        .v3 => unreachable,
+        .v3, .baseline => unreachable,
     };
 }
 
@@ -219,8 +236,10 @@ pub const Fingerprint = struct {
     cache_path: []u8,
     maximum_archive_bytes: u64,
     allocator: std.mem.Allocator,
+    baseline: ?std.json.Parsed(native_baseline.Contract) = null,
 
     pub fn deinit(self: *Fingerprint) void {
+        if (self.baseline) |*value| value.deinit();
         self.allocator.free(self.target_architecture);
         self.allocator.free(self.debz_version);
         self.allocator.free(self.primary_key);
@@ -260,6 +279,10 @@ pub const Fingerprint = struct {
         try writeJsonString(writer, &self.acceptance_policy_digest);
         try writer.writeAll(",\"fingerprint\":");
         try writeJsonString(writer, &self.fingerprint);
+        if (self.baseline) |value| {
+            try writer.writeAll(",\"baseline_noop\":");
+            try std.json.Stringify.value(value.value, .{}, writer);
+        }
         try writer.writeAll(",\"primary_key\":");
         try writeJsonString(writer, self.primary_key);
         try writer.writeAll(",\"restore_prefix\":");
@@ -307,6 +330,7 @@ fn LockType(comptime version: Version) type {
         .v1 => exact_lock.Lock,
         .v2 => exact_lock_v2.Lock,
         .v3 => exact_lock_v3.Lock,
+        .baseline => exact_lock_v4.OwnedLock,
     };
 }
 
@@ -331,8 +355,10 @@ pub const PrepareResult = struct {
     gc_deleted: usize,
     gc_bytes_deleted: u64,
     allocator: std.mem.Allocator,
+    baseline: ?std.json.Parsed(native_baseline.Contract) = null,
 
     pub fn deinit(self: *PrepareResult) void {
+        if (self.baseline) |*value| value.deinit();
         self.allocator.free(self.target_architecture);
         self.allocator.free(self.cache_root);
         self.allocator.free(self.cache_path);
@@ -351,6 +377,10 @@ pub const PrepareResult = struct {
         try writeJsonString(writer, &self.lock_digest);
         try writer.writeAll(",\"fingerprint\":");
         try writeJsonString(writer, &self.fingerprint);
+        if (self.baseline) |value| {
+            try writer.writeAll(",\"baseline_noop\":");
+            try std.json.Stringify.value(value.value, .{}, writer);
+        }
         try writer.writeAll(",\"target_architecture\":");
         try writeJsonString(writer, self.target_architecture);
         try writer.writeAll(",\"cas_layout\":");
@@ -461,6 +491,68 @@ pub fn createTaggedFingerprint(
     return createFingerprintVersion(.v3, allocator, lock, architecture, debz_version, cache_root, policy);
 }
 
+pub fn createBaselineFingerprint(
+    allocator: std.mem.Allocator,
+    lock: exact_lock_v3.Lock,
+    baseline: native_baseline.Contract,
+    root: root_fs.Root,
+    architecture: []const u8,
+    debz_version: []const u8,
+    cache_root: []const u8,
+    policy: Policy,
+) !Fingerprint {
+    try baseline.validate(allocator, &lock);
+    try baseline.verify(allocator, root);
+    var result = try createTaggedFingerprint(allocator, lock, architecture, debz_version, cache_root, policy);
+    errdefer result.deinit();
+    result.version = .baseline;
+    const digest = try acceptancePolicyDigest(.baseline, allocator, architecture, debz_version, policy);
+    formatHex(baseline.planning_lock_sha256, &result.lock_digest);
+    formatHex(digest, &result.acceptance_policy_digest);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hashField(&hash, fingerprintDomain(.baseline));
+    hash.update(&baseline.planning_lock_sha256);
+    hash.update(&digest);
+    hash.update(&baseline.digest());
+    formatHex(hash.finalResult(), &result.fingerprint);
+    const primary = try std.fmt.allocPrint(allocator, "debz-package-cas-v6-{s}-{s}-exact", .{ architecture, &result.fingerprint });
+    errdefer allocator.free(primary);
+    const prefix = try std.fmt.allocPrint(allocator, "debz-package-cas-v6-{s}-{s}-", .{ architecture, &result.fingerprint });
+    errdefer allocator.free(prefix);
+    const maximum = try package_cache_archive.maximumBaselineArchiveBytes(.{
+        .maximum_objects = policy.limits.maximum_lock_packages,
+        .maximum_object_bytes = policy.limits.maximum_package_bytes,
+        .maximum_total_object_bytes = policy.limits.maximum_total_package_bytes,
+    });
+    const owned = try ownBaseline(allocator, baseline);
+    allocator.free(result.primary_key);
+    allocator.free(result.restore_prefix);
+    result.primary_key = primary;
+    result.restore_prefix = prefix;
+    result.maximum_archive_bytes = maximum;
+    result.baseline = owned;
+    return result;
+}
+
+fn ownBaseline(allocator: std.mem.Allocator, baseline: native_baseline.Contract) !std.json.Parsed(native_baseline.Contract) {
+    const bytes = try std.json.Stringify.valueAlloc(allocator, baseline, .{});
+    defer allocator.free(bytes);
+    return std.json.parseFromSlice(native_baseline.Contract, allocator, bytes, .{ .allocate = .alloc_always, .max_value_len = package_cache_archive.maximum_baseline_bytes });
+}
+
+pub fn bindBaselineResult(
+    allocator: std.mem.Allocator,
+    result: *PrepareResult,
+    fingerprint: Fingerprint,
+) !void {
+    if (result.version != .v3 or fingerprint.version != .baseline or fingerprint.baseline == null)
+        return error.InvalidRequest;
+    result.baseline = try ownBaseline(allocator, fingerprint.baseline.?.value);
+    result.version = .baseline;
+    result.lock_digest = fingerprint.lock_digest;
+    result.fingerprint = fingerprint.fingerprint;
+}
+
 fn createFingerprintVersion(
     comptime version: Version,
     allocator: std.mem.Allocator,
@@ -515,6 +607,7 @@ fn createFingerprintVersion(
         .v1 => try package_cache_archive.maximumArchiveBytes(archive_limits),
         .v2 => try package_cache_archive.maximumNativeArchiveBytes(archive_limits),
         .v3 => try package_cache_archive.maximumTaggedArchiveBytes(archive_limits),
+        .baseline => unreachable,
     };
     return .{
         .version = version,
@@ -1029,6 +1122,7 @@ fn packageIdentity(comptime version: Version, package: anytype) content_digest.I
             .sha256,
         ) catch unreachable,
         .v3 => package.archive_identity,
+        .baseline => @compileError("A retained baseline is not package archive authority"),
     };
 }
 
@@ -1174,6 +1268,7 @@ fn packageEvidenceMatches(
             record.transport.identity,
             locked.archive_identity,
         ),
+        .baseline => @compileError("A retained baseline is not package archive authority"),
     };
 }
 
@@ -1276,7 +1371,7 @@ fn acceptancePolicyDigest(
     for (foreign) |value| hashField(&hash, value);
     hashField(&hash, debz_version);
     hashField(&hash, package_acquisition.namespace);
-    if (version != .v3) hashField(&hash, objectIdentityMode(version));
+    if (version == .v1 or version == .v2) hashField(&hash, objectIdentityMode(version));
     hashField(&hash, archiveFormat(version));
     hashField(&hash, abi_identity);
     hashField(&hash, payload_policy);
@@ -2679,7 +2774,7 @@ fn expectSha512MismatchRejectedOnDownload(comptime version: Version) !void {
             }));
             try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(lock_identity));
         },
-        .v3 => unreachable,
+        .v3, .baseline => unreachable,
     }
     try std.testing.expectEqual(@as(usize, 1), transport.calls);
 }
@@ -2757,7 +2852,7 @@ fn expectSha512MismatchRejectedOnCacheHit(comptime version: Version) !void {
             }));
             try std.testing.expectEqual(@as(?u64, payload.len), try cache.objectSize(lock_identity));
         },
-        .v3 => unreachable,
+        .v3, .baseline => unreachable,
     }
     try std.testing.expectEqual(@as(usize, 0), transport.calls);
 }
@@ -2832,7 +2927,7 @@ fn expectSha512PrimaryCacheKeyMigratesToLockIdentity(comptime version: Version) 
             try std.testing.expectEqual(@as(usize, 0), result.reused_count);
             try std.testing.expectEqual(@as(?u64, payload.len), try cache.objectSize(lock_identity));
         },
-        .v3 => unreachable,
+        .v3, .baseline => unreachable,
     }
     try std.testing.expectEqual(@as(usize, 1), transport.calls);
     try std.testing.expectEqual(@as(?u64, null), try cache.objectSize(old_identity));
