@@ -2792,7 +2792,9 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         '824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5',
         '865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7',
         'regular_descriptor(root, "var/lib/dpkg/info/less.list")',
-        'overwrite_regular(root, "var/lib/dpkg/info/less.list", content)',
+        'content = os.read(descriptor, 2048)',
+        'if (len(content) != 583 or hashlib.sha256(content).hexdigest() !=',
+        'raise ValueError("signed less ownership path set changed")',
         'create_exclusive(root, "var/lib/debz-lifecycle-scripts/less.preinst", script, 0o755)',
         'resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))',
     ),
@@ -2889,6 +2891,9 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
     "tools/real_snapshot_python_fixtures.py": (
         'maximum = 16 * 1024 * 1024',
         'raise ValueError("Python reference capture exceeds its byte limit")',
+        'content = read_regular(root, relative, 2048)',
+        'if len(content) != size or hashlib.sha256(content).hexdigest() != digest:',
+        'raise ValueError(f"signed Python list path set changed: {name}")',
         'not stat.S_ISCHR(metadata.st_mode) or metadata.st_rdev != os.makedev(1, 3)',
         'create_exclusive(root, "dev/null", b"", 0o600)',
         'create_exclusive(shadow, "usr/sbin/update-alternatives", b"shadow\\n", 0o644)',
@@ -3100,6 +3105,16 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     fixtures = texts.get("tools/real_snapshot_less_fixtures.py", "")
     if "os.O_TRUNC" in fixtures:
         failures.append("shared reference mutations must inspect the descriptor before truncation")
+    for path, name in (
+        ("tools/real_snapshot_less_stage.py", "seal"),
+        ("tools/real_snapshot_python_fixtures.py", "prepare_empty"),
+    ):
+        body = texts.get(path, "").partition(f"def {name}(")[2].partition("\ndef ")[0]
+        if not body or re.search(
+            r"\b(?:sorted|overwrite_regular|replace_contents|ftruncate|write|write_bytes|write_text)\s*\(",
+            body,
+        ):
+            failures.append(f"{path}: fixture lists must retain authenticated original bytes without rewriting")
     producer = texts.get("tools/prepare-native-dpkg.py", "").partition(
         "def receipt_from_extracted_archive("
     )[2].partition("\ndef ")[0]

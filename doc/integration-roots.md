@@ -720,10 +720,24 @@ systemd/udev half-configured and sudo unpacked capture semantics. That authority
 is never reused; neither bootstrap status registration nor trigger clearing is
 performed.
 
+When several prestates are requested, the producer's intentional interrupted
+systemd/udev postinst leaves the working package half-configured after its
+independent copy is captured. Only the separate `continue_prestate` verb may
+resume that state, with the existing exact amd64 systemd/udev version,
+selector, postinst digest and proc/privilege profile. Ordinary `configure`
+still requires unpacked, and sudo/other packages cannot use the continuation.
+The last requested target returns without continuation, preserving its
+captured state.
+
 The next signed stall is `libssl3t64 3.5.5-1ubuntu3.6 ↔
 openssl-provider-legacy 3.5.5-1ubuntu3.6`, not a coreutils or Python callback
 failure. Its two single-package pinned-dpkg dry runs refuse their unconfigured
 peer. An exact two-package dry run succeeds without dependency force flags.
+The expected peer spelling follows pinned dpkg 1.22.22's `pnaw_nonambig`:
+the authenticated native-amd64 `Multi-Arch: foreign` provider is unqualified
+(`Package openssl-provider-legacy is not configured yet.`), while the
+`Multi-Arch: same` libssl peer is qualified. Wrong peers or wrong qualification
+refuse; running amd64 metadata on an arm64 dpkg is not a native-amd64 proof.
 Both signed control archives contain **no maintainer scripts**. This separate
 `configure_openssl_cycle` operation uses the `openssl_cycle` profile, only on
 amd64 after the base bridge at genuine no-progress. It rehashes the exact pair

@@ -15,7 +15,7 @@ import tarfile
 
 sys.path.insert(0, str(Path(__file__).parent))
 from real_snapshot_less_fixtures import (
-    create_exclusive, overwrite_regular, parent_descriptor, regular_descriptor,
+    create_exclusive, parent_descriptor, regular_descriptor,
 )
 from real_snapshot_reference_paths import open_absolute, protected
 
@@ -167,11 +167,9 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path) -> None:
 def seal(root: Path) -> None:
     with regular_descriptor(root, "var/lib/dpkg/info/less.list") as descriptor:
         content = os.read(descriptor, 2048)
-        content = b"".join(sorted(content.splitlines(keepends=True)))
     if (len(content) != 583 or hashlib.sha256(content).hexdigest() !=
             "0206e202ee08fa90d694df6ee0a0f438258ce7f442ff3bc8db4ead65514c62ae"):
         raise ValueError("signed less ownership path set changed")
-    overwrite_regular(root, "var/lib/dpkg/info/less.list", content)
     with regular_descriptor(root, "var/lib/dpkg/info/less.preinst") as descriptor:
         script = os.read(descriptor, 1024)
     if (len(script) != 292 or hashlib.sha256(script).hexdigest() !=

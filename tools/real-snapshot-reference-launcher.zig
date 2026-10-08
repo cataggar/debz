@@ -70,7 +70,7 @@ const environment: [*:null]const ?[*:0]const u8 = &.{
 };
 
 const Profile = enum { none, systemd, udev, sudo, libgcc_cycle, openssl_cycle };
-const Verb = enum { probe_unpack, unpack, probe_configure, configure, break_base_cycle, configure_openssl_cycle };
+const Verb = enum { probe_unpack, unpack, probe_configure, configure, continue_prestate, break_base_cycle, configure_openssl_cycle };
 const ScriptBinding = struct {
     name: []const u8,
     version: []const u8,
@@ -261,7 +261,7 @@ fn validateOptions(options: Options) !void {
     else
         return error.UnsupportedArchitecture;
     const unpacking = options.verb == .unpack or options.verb == .probe_unpack;
-    const configuring = options.verb == .configure or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle;
+    const configuring = options.verb == .configure or options.verb == .continue_prestate or options.verb == .probe_configure or options.verb == .break_base_cycle or options.verb == .configure_openssl_cycle;
     if (unpacking != (options.archive != null) or
         unpacking != (options.archive_sha512 != null) or
         unpacking != (options.archive_size != null) or
@@ -292,8 +292,10 @@ fn validateOptions(options: Options) !void {
             std.mem.indexOfAny(u8, selector, "/ \t\n\x00") != null or selector[0] == '-')
             return error.InvalidArguments;
     }
+    if (options.verb == .continue_prestate and options.profile != .systemd and options.profile != .udev)
+        return error.InvalidProfile;
     if (scriptBinding(options.profile)) |binding| {
-        if (options.verb != .configure or architecture_index != 0)
+        if ((options.verb != .configure and options.verb != .continue_prestate) or architecture_index != 0)
             return error.InvalidProfile;
         const selector_name = options.selector.?;
         if (selector_name.len != binding.name.len + ":amd64".len or
@@ -445,6 +447,18 @@ fn openVerified(
 }
 
 fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
+    return bindingStatusMatchesFor(status, binding, .configure);
+}
+
+fn bindingStatusMatchesFor(status: []const u8, binding: ScriptBinding, verb: Verb) bool {
+    const expected_state: []const u8 = switch (verb) {
+        .configure => "install ok unpacked",
+        .continue_prestate => if (std.mem.eql(u8, binding.name, "systemd") or std.mem.eql(u8, binding.name, "udev"))
+            "install ok half-configured"
+        else
+            return false,
+        else => return false,
+    };
     var matched = false;
     var paragraphs = std.mem.splitSequence(u8, status, "\n\n");
     while (paragraphs.next()) |paragraph| {
@@ -489,7 +503,7 @@ fn bindingStatusMatches(status: []const u8, binding: ScriptBinding) bool {
             if (matched or architecture == null or version == null or state == null or
                 !std.mem.eql(u8, architecture.?, "amd64") or
                 !std.mem.eql(u8, version.?, binding.version) or
-                !std.mem.eql(u8, state.?, "install ok unpacked")) return false;
+                !std.mem.eql(u8, state.?, expected_state)) return false;
             matched = true;
         }
     }
@@ -530,10 +544,10 @@ fn readInstalledStatus() ![]u8 {
     return readInstalledFile("/var/lib/dpkg/status", 4 * 1024 * 1024);
 }
 
-fn verifyInstalledBinding(binding: ScriptBinding) !void {
+fn verifyInstalledBinding(binding: ScriptBinding, verb: Verb) !void {
     const bytes = try readInstalledStatus();
     defer std.heap.page_allocator.free(bytes);
-    if (!bindingStatusMatches(bytes, binding)) return error.InvalidInstalledBinding;
+    if (!bindingStatusMatchesFor(bytes, binding, verb)) return error.InvalidInstalledBinding;
     const script_path = try std.fmt.allocPrintSentinel(
         std.heap.page_allocator,
         "/var/lib/dpkg/info/{s}.postinst",
@@ -1128,7 +1142,7 @@ fn childMain(input: Child) noreturn {
     must(linux.chdir("/"), status, 4);
     _ = linux.close(root.fd);
     if (scriptBinding(child.options.profile)) |binding| {
-        verifyInstalledBinding(binding) catch
+        verifyInstalledBinding(binding, child.options.verb) catch
             fail(status, 10, .STALE);
     }
     if (child.options.verb == .break_base_cycle)
@@ -1158,7 +1172,7 @@ fn childMain(input: Child) noreturn {
         .probe_unpack => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--no-act", "--unpack", archive_target, null },
         .unpack => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--unpack", archive_target, null },
         .probe_configure => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--no-act", "--configure", selector, null },
-        .configure => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", selector, null },
+        .configure, .continue_prestate => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", selector, null },
         .break_base_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--force-depends", "--configure", selector, null },
         .configure_openssl_cycle => &.{ common[0], common[1], common[2], common[3], common[4], "--no-triggers", "--configure", "libssl3t64:amd64", "openssl-provider-legacy:amd64", null },
     };
@@ -1501,6 +1515,61 @@ test "reference cycle operation is not generic configure or a proc profile" {
 
 test "reference capability transition fails closed without root authority" {
     try unprivilegedTransitionProbe();
+}
+
+test "prestate continuation accepts only exact systemd and udev half-configured bindings" {
+    for ([_]Profile{ .systemd, .udev }) |profile| {
+        const binding = scriptBinding(profile).?;
+        const selector = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}:amd64", .{binding.name}, 0);
+        defer std.testing.allocator.free(selector);
+        const options: Options = .{
+            .root = "/root/proof/root",
+            .dpkg = "/root/proof/dpkg",
+            .architecture = "amd64",
+            .profile = profile,
+            .verb = .continue_prestate,
+            .selector = selector,
+        };
+        try validateOptions(options);
+        for ([_][]const u8{ "half-configured", "unpacked", "installed", "triggers-pending" }) |state| {
+            const bytes = try std.fmt.allocPrint(std.testing.allocator, "Package: {s}\nVersion: {s}\nArchitecture: amd64\nStatus: install ok {s}\n\n", .{ binding.name, binding.version, state });
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqual(std.mem.eql(u8, state, "half-configured"), bindingStatusMatchesFor(bytes, binding, .continue_prestate));
+            try std.testing.expectEqual(std.mem.eql(u8, state, "unpacked"), bindingStatusMatchesFor(bytes, binding, .configure));
+        }
+        for ([_][3][]const u8{
+            .{ "wrong", binding.version, "amd64" },
+            .{ binding.name, "wrong", "amd64" },
+            .{ binding.name, binding.version, "arm64" },
+        }) |identity| {
+            const bytes = try std.fmt.allocPrint(std.testing.allocator, "Package: {s}\nVersion: {s}\nArchitecture: {s}\nStatus: install ok half-configured\n\n", .{ identity[0], identity[1], identity[2] });
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expect(!bindingStatusMatchesFor(bytes, binding, .continue_prestate));
+        }
+        var changed = options;
+        changed.architecture = "arm64";
+        try std.testing.expectError(error.InvalidProfile, validateOptions(changed));
+        changed = options;
+        changed.selector = "sudo:amd64";
+        try std.testing.expectError(error.InvalidProfile, validateOptions(changed));
+    }
+    const sudo: Options = .{
+        .root = "/root/proof/root",
+        .dpkg = "/root/proof/dpkg",
+        .architecture = "amd64",
+        .profile = .sudo,
+        .verb = .continue_prestate,
+        .selector = "sudo:amd64",
+    };
+    try std.testing.expectError(error.InvalidProfile, validateOptions(sudo));
+    try std.testing.expect(!bindingStatusMatchesFor(
+        "Package: sudo\nVersion: 1.9.17p2-1ubuntu3.1\nArchitecture: amd64\nStatus: install ok half-configured\n\n",
+        scriptBinding(.sudo).?,
+        .continue_prestate,
+    ));
+    var none = sudo;
+    none.profile = .none;
+    try std.testing.expectError(error.InvalidProfile, validateOptions(none));
 }
 
 test "reference launcher rejects wider profiles and unsafe operation shapes" {

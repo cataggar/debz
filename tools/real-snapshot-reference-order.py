@@ -167,12 +167,14 @@ def dpkg_command(
                 package.selector, *(str(p.archive) for p in cycle)]
     if cycle:
         raise CycleRefusal("CycleIdentityChanged: archives on a normal operation")
-    if verb not in ("probe_unpack", "unpack", "probe_configure", "configure"):
+    if verb not in ("probe_unpack", "unpack", "probe_configure", "configure", "continue_prestate"):
         raise ValueError(f"reference dpkg operation has no single-script binding: {verb}")
     if package is None:
         raise ValueError("reference dpkg operation requires one signed package")
+    if verb == "continue_prestate" and profile not in ("systemd", "udev"):
+        raise ValueError("unauthorized half-configured prestate continuation")
     if profile != "none":
-        if (verb != "configure" or architecture != "amd64"
+        if (verb not in ("configure", "continue_prestate") or architecture != "amd64"
             or profile not in PROFILE_VERSIONS
             or package.name != profile or package.architecture != architecture
             or package.version != PROFILE_VERSIONS[profile]):
@@ -498,7 +500,8 @@ def verify_openssl_cycle(root: Path, cycle: tuple[Package, ...]) -> dict:
         if any(installed.get(field) for field in ("triggers-pending", "triggers-awaited", "config-version")):
             raise CycleRefusal(f"CycleCallbackChanged: {package.name} trigger state")
         graph[package.name] = {"version": package.version, "archive_sha512": package.digest,
-                               "depends": binding[4], "pre_depends": "", "status": expected}
+                               "depends": binding[4], "pre_depends": "", "status": expected,
+                               "multi_arch": fields.get("multi-arch", "")}
     installed_triggers = read_root_file(root, "var/lib/dpkg/info/libssl3t64:amd64.triggers", 1024)
     if installed_triggers != LIBGCC_TRIGGERS:
         raise CycleRefusal("CycleCallbackChanged: installed OpenSSL trigger activation changed")
@@ -529,8 +532,12 @@ def configure_openssl_cycle(
         refusals.append({"argv": command[3:], "exit_status": status,
                          "output": output.decode("utf-8", errors="replace")})
         (evidence / "openssl-cycle-refusals.json").write_text(json.dumps(refusals, sort_keys=True) + "\n")
+        peer_name = (
+            peer.name if peer.architecture == architecture
+            and before["graph"][peer.name]["multi_arch"] != "same" else peer.selector
+        )
         if (not status or b"dependency problems" not in output
-            or f"Package {peer.selector} is not configured yet.".encode() not in output):
+            or f"Package {peer_name} is not configured yet.".encode() not in output):
             raise CycleRefusal(f"CycleProbeChanged: {package.selector} did not refuse its exact peer")
     (evidence / "openssl-cycle-before.json").write_text(json.dumps(
         {**before, "records": list(before["records"].values())}, sort_keys=True,
@@ -937,6 +944,7 @@ def install(
             if profile != "none" and package.version != PROFILE_VERSIONS[profile]:
                 raise ValueError(f"unauthorized reference script version: {package.selector}")
             prestate = targets.pop(package.selector, None)
+            operation = "configure"
             if prestate is not None:
                 capture_prestate(
                     launcher, dpkg, root, architecture, package, prestate,
@@ -944,8 +952,14 @@ def install(
                 )
                 if not targets:
                     return
+                if prestate.status == "half-configured":
+                    if database_packages(root).get((package.name, package.architecture)) != (
+                        "install ok half-configured", package.version,
+                    ):
+                        raise ValueError(f"captured prestate state/version changed: {package.selector}")
+                    operation = "continue_prestate"
             apply(dpkg_command(
-                launcher, dpkg, root, architecture, profile, "configure", package,
+                launcher, dpkg, root, architecture, profile, operation, package,
             ), environment, stdout, stderr)
             unpacked.remove(package)
             configured.add((package.name, package.architecture))

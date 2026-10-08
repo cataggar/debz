@@ -319,6 +319,27 @@ class ExtractedReferenceReceiptTests(unittest.TestCase):
 
 
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_list_preparation_cannot_normalize_or_rewrite_authenticated_original_bytes(self) -> None:
+        audit = load("debz_original_fixture_list_guards", "security-audit.py")
+        texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
+        self.assertEqual(audit.protected_reference_ci_failures(texts), [])
+        for path, read, listing in (
+            ("tools/real_snapshot_less_stage.py", "        content = os.read(descriptor, 2048)\n",
+             "var/lib/dpkg/info/less.list"),
+            ("tools/real_snapshot_python_fixtures.py", "        content = read_regular(root, relative, 2048)\n",
+             "var/lib/dpkg/info/python3.list"),
+        ):
+            for mutation in (
+                '        content = b"".join(sorted(content.splitlines(keepends=True)))\n',
+                f'        overwrite_regular(root, "{listing}", content)\n',
+            ):
+                with self.subTest(path=path, mutation=mutation):
+                    self.assertIn(read, texts[path])
+                    changed = dict(texts)
+                    changed[path] = changed[path].replace(read, read + mutation, 1)
+                    self.assertTrue(any("retain authenticated original bytes without rewriting" in failure
+                                        for failure in audit.protected_reference_ci_failures(changed)))
+
     def test_receipt_and_python_premutation_guards_cannot_be_removed(self) -> None:
         audit = load("debz_receipt_python_guards", "security-audit.py")
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}

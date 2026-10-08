@@ -289,6 +289,13 @@ the already-retained arm64 lock and original signed Packages index; the
 original report, locks, InRelease and indexes remain unchanged. This adds
 the missing source bytes, not a new probe or a protected less replay claim.
 
+Ownership-list pins bind the original data-tar member order, not a sorted
+path set. Less sealing and Python empty-fixture preparation validate those
+exact archive-derived bytes without rewriting the `.list` files. Reordering
+or unsafe path mutations still refuse even when the apparent path set is
+unchanged; Python validates both lists before replacing its captured null
+device. Descriptor-rooted no-follow and single-link ownership checks remain.
+
 The ZIP is read without filesystem extraction. Limits are 64 MiB aggregate
 evidence, 256 ZIP entries, 128 MiB decompressed tar and 100,000 tar entries;
 duplicate/unsafe paths and unsupported ZIP entry types fail closed.

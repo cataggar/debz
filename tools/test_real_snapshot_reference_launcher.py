@@ -10,11 +10,13 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import tarfile
 import unittest
+import zipfile
 from unittest import mock
 
 TOOLS = Path(__file__).resolve().parent
@@ -32,6 +34,13 @@ assert SPEC and SPEC.loader
 ORDER = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = ORDER
 SPEC.loader.exec_module(ORDER)
+REPIN_SPEC = importlib.util.spec_from_file_location(
+    "debz_reference_repin", TOOLS / "real-snapshot-repin.py"
+)
+assert REPIN_SPEC and REPIN_SPEC.loader
+REPIN = importlib.util.module_from_spec(REPIN_SPEC)
+sys.modules[REPIN_SPEC.name] = REPIN
+REPIN_SPEC.loader.exec_module(REPIN)
 
 
 class ReferenceLauncherTests(unittest.TestCase):
@@ -39,6 +48,97 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="debz-reference-negative-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    def retained_list(self, name: str, architecture: str) -> tuple[bytes, bytes]:
+        manifest = json.loads((TOOLS / "fixtures/real-snapshot/pin-v1.json").read_text())
+        identity = next(i for i in manifest["identities"] if i["kind"] == "prestate"
+                        and i["path"] == f"var/lib/dpkg/info/{name}.list")
+        with zipfile.ZipFile(TOOLS / "fixtures/real-snapshot/prestate-sources-v2.zip") as archive:
+            sources = json.loads(archive.read("evidence.json"))["sources"]
+            source = next(s for s in sources if (s["package"], s["architecture"]) ==
+                          (name, architecture))
+            deb = archive.read(source["archive_file"])
+        self.assertEqual("sha512:" + hashlib.sha512(deb).hexdigest(),
+                         identity["provenance"]["archives"][architecture])
+        content, mode = REPIN.derive_prestate(identity, architecture, deb)
+        self.assertEqual((len(content), "sha256:" + hashlib.sha256(content).hexdigest(), mode),
+                         (identity["size"], identity["digest"], int(identity["mode"], 8)))
+        return content, deb
+
+    def test_less_seal_preserves_retained_archive_list_order_and_identity(self) -> None:
+        content, deb = self.retained_list("less", "arm64")
+        info = self.root / "var/lib/dpkg/info"
+        info.mkdir(parents=True)
+        (self.root / "var/lib/debz-lifecycle-scripts").mkdir()
+        listing = info / "less.list"
+        listing.write_bytes(content)
+        preinst, _ = REPIN.tar_member(deb, "control.tar", "preinst")
+        (info / "less.preinst").write_bytes(preinst)
+        before = listing.stat()
+        LESS_STAGE.seal(self.root)
+        after = listing.stat()
+        self.assertEqual(listing.read_bytes(), content)
+        self.assertEqual((after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
+                         (before.st_ino, before.st_mtime_ns, before.st_ctime_ns))
+        staged = self.root / "var/lib/debz-lifecycle-scripts/less.preinst"
+        self.assertEqual(staged.read_bytes(), preinst)
+        for changed in (b"".join(sorted(content.splitlines(keepends=True))),
+                        content.replace(b"/usr/bin/less\n", b"/../bin/less\n")):
+            self.assertNotEqual(changed, content)
+            listing.write_bytes(changed)
+            with self.assertRaisesRegex(ValueError, "signed less ownership path set changed"):
+                LESS_STAGE.seal(self.root)
+            self.assertEqual(listing.read_bytes(), changed)
+            self.assertEqual(staged.read_bytes(), preinst)
+
+    def test_python_prepare_empty_preserves_both_retained_lists_on_both_architectures(self) -> None:
+        real_stat = os.stat
+        def captured_null_metadata(path, *args, **kwargs):
+            metadata = real_stat(path, *args, **kwargs)
+            if path == "null" and kwargs.get("dir_fd") is not None:
+                return mock.Mock(st_mode=stat.S_IFCHR | 0o666, st_rdev=os.makedev(1, 3),
+                                 st_uid=metadata.st_uid, st_gid=metadata.st_gid, st_nlink=1)
+            return metadata
+        for architecture in ("amd64", "arm64"):
+            with self.subTest(architecture=architecture):
+                root = self.root / architecture
+                (root / "proc").mkdir(parents=True)
+                (root / "dev").mkdir()
+                info = root / "var/lib/dpkg/info"
+                info.mkdir(parents=True)
+                original = {}
+                for name in ("python3", "python3-minimal"):
+                    content, _ = self.retained_list(name, architecture)
+                    listing = info / f"{name}.list"
+                    listing.write_bytes(content)
+                    original[name] = content, listing.stat()
+                null = root / "dev/null"
+                null.write_bytes(b"captured null boundary")
+                with (mock.patch.object(PYTHON_FIXTURES, "protected"),
+                      mock.patch.object(PYTHON_FIXTURES.os, "stat",
+                                        side_effect=captured_null_metadata)):
+                    PYTHON_FIXTURES.prepare_empty(root)
+                self.assertEqual(null.read_bytes(), b"")
+                self.assertEqual(stat.S_IMODE(null.stat().st_mode), 0o600)
+                for name, (content, before) in original.items():
+                    listing = info / f"{name}.list"
+                    after = listing.stat()
+                    self.assertEqual(listing.read_bytes(), content)
+                    self.assertEqual((after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
+                                     (before.st_ino, before.st_mtime_ns, before.st_ctime_ns))
+                    for changed in (b"".join(sorted(content.splitlines(keepends=True))),
+                                    content.replace(b"/usr/bin/", b"/../bin/")):
+                        self.assertNotEqual(changed, content)
+                        listing.write_bytes(changed)
+                        null.write_bytes(b"not removed on invalid list")
+                        with (mock.patch.object(PYTHON_FIXTURES, "protected"),
+                              mock.patch.object(PYTHON_FIXTURES.os, "unlink") as unlink,
+                              self.assertRaisesRegex(ValueError, f"signed Python list path set changed: {name}")):
+                            PYTHON_FIXTURES.prepare_empty(root)
+                        unlink.assert_not_called()
+                        self.assertEqual(listing.read_bytes(), changed)
+                        self.assertEqual(null.read_bytes(), b"not removed on invalid list")
+                        listing.write_bytes(content)
 
     def test_python_dpkg_staging_refuses_parent_and_leaf_aliases(self) -> None:
         pinned, archive = self.root / "pinned", self.root / "archive"
@@ -876,7 +976,10 @@ class ReferenceLauncherTests(unittest.TestCase):
               mock.patch.object(ORDER, "database_fields", return_value=records),
               mock.patch.object(ORDER.subprocess, "run", side_effect=run),
               mock.patch.object(ORDER, "apply") as applied):
-            self.assertEqual(ORDER.verify_openssl_cycle(self.root, cycle)["callbacks"], [])
+            verified = ORDER.verify_openssl_cycle(self.root, cycle)
+            self.assertEqual(verified["callbacks"], [])
+            self.assertEqual(verified["graph"]["libssl3t64"]["multi_arch"], "same")
+            self.assertEqual(verified["graph"]["openssl-provider-legacy"]["multi_arch"], "foreign")
             for name, field, changed, reason in (
                 ("libssl3t64", "depends", "unknown-package", "CycleControlChanged"),
                 ("openssl-provider-legacy", "pre-depends", "libssl3t64", "CycleControlChanged"),
@@ -926,14 +1029,17 @@ class ReferenceLauncherTests(unittest.TestCase):
 
     def test_openssl_transition_requires_both_refusals_and_exact_two_package_progress(self) -> None:
         cycle, records, _ = self.cycle_fixture(openssl=True)
-        before = {"records": records, "callbacks": [], "graph": {}, "trigger_database": {},
+        before = {"records": records, "callbacks": [],
+                  "graph": {p.name: {"multi_arch": records[(p.name, "amd64")].get("multi-arch", "")}
+                            for p in cycle}, "trigger_database": {},
                   "force": []}
         after = {key: dict(value) for key, value in records.items()}
         for package in cycle[:2]:
             after[(package.name, "amd64")]["status"] = "install ok installed"
         def probe(command, *_):
             peer = cycle[1] if command[6] == cycle[0].selector else cycle[0]
-            return 1, f"dependency problems: Package {peer.selector} is not configured yet.".encode()
+            peer_name = peer.name if peer == cycle[1] else peer.selector
+            return 1, f"dependency problems: Package {peer_name} is not configured yet.".encode()
         with (mock.patch.object(ORDER, "verify_openssl_cycle", return_value=before),
               mock.patch.object(ORDER, "probe", side_effect=probe),
               mock.patch.object(ORDER, "database_fields", return_value=after),
@@ -963,14 +1069,89 @@ class ReferenceLauncherTests(unittest.TestCase):
                         list(cycle), {}, self.root / "out", self.root / "err",
                     )
             applied.reset_mock()
-            for response in ((0, b""), (1, b"dependency problems: unknown-package")):
-                with mock.patch.object(ORDER, "probe", return_value=response):
+            for selected, response in (
+                (cycle[0], (0, b"")),
+                (cycle[0], (1, b"dependency problems: Package unknown-package is not configured yet.")),
+                (cycle[0], (1, b"dependency problems: Package openssl-provider-legacy:amd64 is not configured yet.")),
+                (cycle[1], (1, b"dependency problems: Package libssl3t64 is not configured yet.")),
+                (cycle[1], (1, b"dependency problems: Package unknown-package:amd64 is not configured yet.")),
+            ):
+                with mock.patch.object(ORDER, "probe", side_effect=lambda command, *_:
+                                       response if command[6] == selected.selector else probe(command)):
                     with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleProbeChanged"):
                         ORDER.configure_openssl_cycle(
                             self.root / "launcher", self.root / "dpkg", self.root, self.root,
                             "amd64", list(cycle), {}, self.root / "out", self.root / "err",
                         )
             applied.assert_not_called()
+
+    def test_three_target_capture_continues_only_exact_half_configured_systemd_and_udev(self) -> None:
+        packages = [ORDER.Package(n, ORDER.PROFILE_VERSIONS[n], "amd64", "a" * 128, 42,
+                                  self.root / f"{n}.deb") for n in ("systemd", "udev", "sudo")]
+        targets = tuple(ORDER.Prestate(p.selector, "unpacked" if p.name == "sudo" else
+                                      "half-configured", self.root / f"saved-{p.name}")
+                        for p in packages)
+        for captured_state in ("half-configured", "unpacked", "installed"):
+            with self.subTest(captured_state=captured_state):
+                states = {}
+                captures = {}
+                continuations = []
+                def apply(command, *_):
+                    verb, selector = command[5:7]
+                    package = next(p for p in packages if p.selector == selector)
+                    key = (package.name, "amd64")
+                    if verb == "unpack":
+                        states[key] = ("install ok unpacked", package.version)
+                    else:
+                        self.assertEqual(verb, "continue_prestate")
+                        self.assertIn(package.name, ("systemd", "udev"))
+                        self.assertEqual(command[4], package.name)
+                        self.assertEqual(states[key], ("install ok half-configured", package.version))
+                        continuations.append(selector)
+                        states[key] = ("install ok installed", package.version)
+                def capture(*args):
+                    package, target = args[4:6]
+                    key = (package.name, "amd64")
+                    self.assertEqual(states[key], ("install ok unpacked", package.version))
+                    states[key] = (f"install ok {captured_state}" if target.status ==
+                                   "half-configured" else "install ok unpacked", package.version)
+                    captures[package.name] = dict(states)
+                with (mock.patch.object(ORDER, "packages_from_manifest", return_value=packages),
+                      mock.patch.object(ORDER, "verify_archive"),
+                      mock.patch.object(ORDER, "probe", return_value=(0, b"")),
+                      mock.patch.object(ORDER, "database_packages", side_effect=lambda _: dict(states)),
+                      mock.patch.object(ORDER, "capture_prestate", side_effect=capture),
+                      mock.patch.object(ORDER, "apply", side_effect=apply)):
+                    if captured_state == "half-configured":
+                        ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                                      self.root, self.root, "amd64", targets)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "captured prestate state/version changed"):
+                            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                                          self.root, self.root, "amd64", targets)
+                if captured_state == "half-configured":
+                    self.assertEqual(continuations, ["systemd:amd64", "udev:amd64"])
+                    self.assertEqual([captures[p.name][(p.name, "amd64")][0] for p in packages],
+                                     ["install ok half-configured", "install ok half-configured",
+                                      "install ok unpacked"])
+                    self.assertEqual(states[("sudo", "amd64")][0], "install ok unpacked")
+                else:
+                    self.assertEqual(continuations, [])
+
+    def test_half_configured_continuation_rejects_unbound_package_operations(self) -> None:
+        for name, architecture, version, profile in (
+            ("systemd", "amd64", ORDER.PROFILE_VERSIONS["systemd"], "none"),
+            ("sudo", "amd64", ORDER.PROFILE_VERSIONS["sudo"], "sudo"),
+            ("udev", "amd64", ORDER.PROFILE_VERSIONS["udev"], "systemd"),
+            ("systemd", "arm64", ORDER.PROFILE_VERSIONS["systemd"], "systemd"),
+            ("systemd", "amd64", "wrong", "systemd"),
+        ):
+            with self.subTest(name=name, architecture=architecture, version=version, profile=profile):
+                package = ORDER.Package(name, version, architecture, "a" * 128, 42,
+                                        self.root / f"{name}.deb")
+                with self.assertRaisesRegex(ValueError, "unauthorized"):
+                    ORDER.dpkg_command(self.root / "launcher", self.root / "dpkg", self.root,
+                                       architecture, profile, "continue_prestate", package)
 
     def test_openssl_cycle_resumes_single_package_capture_and_never_repeats_authority(self) -> None:
         cycle, _, _ = self.cycle_fixture(openssl=True)

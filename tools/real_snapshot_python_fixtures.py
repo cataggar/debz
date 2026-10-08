@@ -27,6 +27,14 @@ def prepare_empty(root: Path) -> None:
             raise ValueError("captured source proc must be empty")
     finally:
         os.close(proc)
+    for name, size, digest in (
+        ("python3", 918, "383196acd094063e8e49dc4511deb7094e264a41d872bb889d21b197a550f628"),
+        ("python3-minimal", 781, "82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519"),
+    ):
+        relative = f"var/lib/dpkg/info/{name}.list"
+        content = read_regular(root, relative, 2048)
+        if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+            raise ValueError(f"signed Python list path set changed: {name}")
     with parent_descriptor(root, "dev/null") as (parent, name):
         metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
         if (not stat.S_ISCHR(metadata.st_mode) or metadata.st_rdev != os.makedev(1, 3) or
@@ -35,15 +43,6 @@ def prepare_empty(root: Path) -> None:
             raise ValueError("fresh captured source must have the reference null device")
         os.unlink(name, dir_fd=parent)
     create_exclusive(root, "dev/null", b"", 0o600)
-    for name, size, digest in (
-        ("python3", 918, "383196acd094063e8e49dc4511deb7094e264a41d872bb889d21b197a550f628"),
-        ("python3-minimal", 781, "82003099685ad735bdf486d434276cdb0b82b88f269330f87504a5739008f519"),
-    ):
-        relative = f"var/lib/dpkg/info/{name}.list"
-        content = b"".join(sorted(read_regular(root, relative, 2048).splitlines(keepends=True)))
-        if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
-            raise ValueError(f"signed Python list path set changed: {name}")
-        overwrite_regular(root, relative, content)
 
 
 def preflight(root: Path) -> None:
