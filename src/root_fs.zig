@@ -1041,6 +1041,12 @@ pub const Root = struct {
         return entryAt(self.io, parent.dir, parent.leaf) catch |err| return mapLeafError(err);
     }
 
+    /// No-follow metadata, including change time, without opening the leaf.
+    pub fn observeEntry(self: Root, path: Path) !struct { entry: Entry, change_nanoseconds: i128 } {
+        const identity = try rootedIdentity(self, path);
+        return .{ .entry = identity.entry, .change_nanoseconds = identity.change_nanoseconds };
+    }
+
     /// `null` when the path, or any parent component, does not exist.
     pub fn entryIfExists(self: Root, path: Path) !?Entry {
         return self.entry(path) catch |err| switch (err) {

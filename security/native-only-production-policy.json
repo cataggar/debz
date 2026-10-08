@@ -4,35 +4,53 @@
   "removed_production_paths": [],
   "cli_build_path": "build.zig",
   "launch_allowances": {
-    "src/transaction_executor.zig": {"std.process.run": 1},
-    "src/target_apt_config.zig": {"std.process.run": 1},
-    "src/maintainer_script.zig": {"linux.clone2": 1, "linux.fork": 1, "linux.execve": 1},
-    "src/live_root.zig": {"linux.fork": 3},
-    "actions/setup/src/runner.ts": {"execFileAsync": 1},
-    "actions/download/src/runner.ts": {"execFile": 1},
-    "actions/install/src/subprocess.ts": {"spawn": 2}
+    "src/transaction_executor.zig": {
+      "std.process.run": 1
+    },
+    "src/target_apt_config.zig": {
+      "std.process.run": 1
+    },
+    "src/maintainer_script.zig": {
+      "linux.clone2": 1,
+      "linux.fork": 1,
+      "linux.execve": 1
+    },
+    "src/live_root.zig": {
+      "linux.fork": 3
+    },
+    "actions/setup/src/runner.ts": {
+      "execFileAsync": 1
+    },
+    "actions/download/src/runner.ts": {
+      "execFile": 1
+    },
+    "actions/install/src/subprocess.ts": {
+      "spawn": 2
+    }
   },
   "reviewed_fingerprints": {
-    "src/transaction_executor.zig": "eb546e88d64091c900ba097f1066c5a809df4884bb12b8ba469f9b4d3c502b6663a2c5deae7e769bbff010174b927f3a688ae0327d13a3d128b621b3a1f30427",
+    "src/active_repository_config.zig": "38461cbad59acb6fba26a3ba2ff382803bd2a0b350d043e2435b8e0df95c7a246431dc4435eed3ca028a3eb05038995ff28fe866b638baa125a4374d4c155e61",
+    "src/system_product_context.zig": "9b9c521fd62f60d85c2619f5c3daeaf008cc75b13470f318c3a405d3d0a5555944c52875e27e7d27b7f0fcf2f38de62916ffbecdad3f981dff20cec778d4ab8b",
+    "src/transaction_executor.zig": "47510a818e5a3544b5bb899483489e30eeb9a6ec274da0da2bd5a0b8b283bfbe47e94e8ca04a8a8c327cb56b07557afe5f1e5633bd1ab870b7c9ce442147fc5c",
     "src/exact_lock.zig": "7e71d79d4d6e46daf452815a37445c913cf989e80adbf1c6b8aff0d5ed8b1e15dbcd06990032cbe295af374222bce47be968f37099a980c0222bf3768b57be36",
     "src/transaction_provenance.zig": "97681205e52180826f19f6afbb6058b2acddef25c0ae632424be3ec271090323854aa72859898a1e7f86684f7af8d60594544a36ef5dd06a5d4ff2fc9bcf82d9",
     "src/transaction_provenance_v2.zig": "77590023eb89adae8138268c1febd4bb14d7f07e5bc5601b8c413ca32856fa776775e2a35e4a380078f5fb59639b6fa929537d1e19cf384eead14e45c74e388b",
-    "src/target_apt_config.zig": "f53fda429830e5f52b1c984989d93717cce9568090ad63d7cd66d6cd7b0093e1ad2f2b6dc3432595e2ebeccbcaf1392a5477cf7094ed71f76bdff5034edd4dba",
-    "src/transaction_engine.zig": "c946ffa8a22569ea04ec1cfc1e42e90010101e0a0a41fbf89acbc684d925d9dd0528ae4db5de86bbe87c1d597f740dffad30d11fddfa34d999fa6a7b0729e5bf",
-    "src/production_backend.zig": "176c86abd14f3ff648f14306b4d2f92bf249a2fca3b7caa22c5c833df1d315e114a0bf52ac8fceda6447b733056fc314f446b583537421bcbdd1a721ccba7871",
-    "src/repository_backend.zig": "53cf1621cabd68b8c4bf2cbb629cb46be492469dcb4df54e519aaf94ad86d72f163fa4a4f2f4372faa9ac2238f1d919898b13ba28dd6535ec7dbff318926e63e",
-    "src/package_family_backend.zig": "fa52136c268f31875d85facc841271de841e2ac5285c99ea0d367d1e65249db6630019b2ddab431785caab40f77185a1626ce858cae2c11883f8301f469a708e",
-    "src/package_cache_workflow.zig": "6ea20d3e9b96806df0422c8d043584f6800517bfc2cfca3c73024b16beb0a8d7a42e6401bd152e6163373b82c441444a05f6d73551464cf92f1df8ac06213eff",
+    "src/target_apt_config.zig": "637d6e9ad2c96f12eecaca0e243e562234f3edf8fa9433f6b481b1bc9a8065c035165f00d65955af1a5cb52f2c76ee3444ee5b20415e9e897573d5f173ccb4ed",
+    "src/transaction_engine.zig": "e9de547db8ce0e7983e9094dfb42360e681058c958968a17ffeff0dde8138a0ea755da37954f330426dcc5b8ba030728a830b7600d1d8ba0546cb49183f0546c",
+    "src/production_backend.zig": "2bc55a9c1d97c208b47336c8c88d495ed097301fce4987f1654e9f2eb72a241444fc9e78f54c64b44f0cd2334bc8ec80b71bee0d08ccf9014fc9350ec37b1c0b",
+    "src/repository_backend.zig": "7ecbaa60b1ee20ba07fcdc6fd0f885c22ecdec6fade85aaccd50c60b8bf8c95877440eefcca45373bdc8b363073986d6a12363c580efb000b281dd56117c7ca4",
+    "src/package_family_backend.zig": "afe9567fb4e234247d48145a289f821d7e905f65610779708a62ee89d58c77c948c03c5330a467fe12307871104c7d1ea57d01be888a58acdfc0d2981f16f123",
+    "src/package_cache_workflow.zig": "85a112813dbaaedc62b76fabea3a624d8faed31f1dbbbdc7b3b503af45da03f8fd6dbb4b7aaaa6af37832a7e596f09c851093fb36ceeb25c0c4aaa5de7c0fbc7",
     "src/transaction_result_summary.zig": "75512b49dd61c2f70db8d2372623ac534950e65ac05e15ad525ba586d30a25aae8f00ab331af1e30f9c7e8e6a8eb1ab64f40b7ae094b41c4f50b93fddef7f271",
     "src/system_profile.zig": "dc3ee092aee5d0d6445efbeeb6519fc23bf04c8e81376e74cfb2ff1ba6bf2db9faf47a4eeb4dd299b6cb568a2913f72179f3fbd92604303c205762dff4bcdc36",
     "src/repository_cli.zig": "657be188fe82acabc2e26f2246a5b9d7f2c14f6f188bcd6713e6f165fcd5f2bd5e92ef59ff7b1b8dce6a0d539af889b0e6e657523afb285ba35685b6e90bac2d",
-    "src/apt_system_orchestrator.zig": "df48f759930acb1ace39380bdbd6944e6c2fa6cdf49dcaed7b990c69a011b207b0a4bb644f2572f9e9c2df127037d97de799262b069ac23058f0a82895c8ff10",
-    "src/maintainer_script.zig": "3701bb54e525f05a58c5b2bb100d613ae6e16e18c90e6add5423375846738ecd78fbfcb5676018e1d70f8d7058c33c1d4078b05cc19d6544cc243707b160d260",
+    "src/apt_system_orchestrator.zig": "6bac76f6dae707f2041ccb4d37ca162b54ca77b477329ec47782cd73892caf3700f58d3fa69650507037cb94be4d4abe6fe26bf2244434c9be42e1c92f9ff9c2",
+    "src/maintainer_script.zig": "cb10b9fb326b6a7dd1ee724c63209dc824f696731efd2b46962415ec6ce5df4544fcef12837c285dde22de6296055a4905822aa9346f6c242f1fdd5dafd717bb",
     "src/live_root.zig": "73c3b5707811b3d6d9835c7303c45bb90dd4e0d103521620e4ddfc12963a8ab97790702f886e5489d27c7cee698524d5f38fdc6ebff85b7393290a28cad10c61",
     "actions/setup/src/runner.ts": "430b5d8f5a743f55b8183ff530326c0a1839fd3ca3cfd51534d621a5b44a7ea94707ba00331897e95e8a165a7fd13e1b6f17feeddaafcfa31c1612077d7bbbb9",
     "actions/download/src/runner.ts": "ddd4f232e7fc041bc965211c7ab6cfd871bc708e9658d16384e025b4aa6aff1a43447bef0dcf33c8d2cf6a650f20478e6971c91e6f0da6679feac0a34875e372",
     "actions/install/src/subprocess.ts": "0503a09372e6b1af4debd1579f369103995d94d4f86f6155fe2bb6b765cfe3e4e9c213a5a110d1eda09d68c1d63348717f811e49b6e12841fa83fce8b9a17792",
-    "src/main.zig": "256f3041ad9e655a6766138005ee41f2b87fcc1383303267554fe43873a1078ad32ab6bf6b10ac52241544d0566ff642dd478a423e06a2a5dd31c3413c591445",
+    "src/main.zig": "78e533855f2e22059b9d3a6fafbbd4a95c05a233fc1c3a2a22efc59da41419c34ae690c590e152d35c5e8edfea7a80e597afaeb463136942b8b96febaf0f7f9b",
     "src/root_operation.zig": "f206e086d708a183803731660b172700b6c90629be62d1dceec3fa8af8082e57b49db3d4286702420b19d7705b4abc4a906ab3efe9b55cb089bf0433d31f0b6b",
     "src/transaction_recovery.zig": "ffa106804985ab2590833ca7bccf5714651966bd986f47ed35d50396f3b2f249ae2216532aa481a9ff400ecf16ebcf4f646199fe9246a78a7eec9efe1f849231",
     "actions/download/src/inputs.ts": "e68ca5f7c7abd730754a9549e1d293410e1c72acb42417475c683b7c8d8896b90a6d52e22064fb7e3ff873f133c52d63e988a3008b13e80039635441c8904091",
@@ -45,19 +63,23 @@
     "actions/install/action.yml": "38715d63eddb240465918185adbb7ff1cedbd66e8ae9400038647228d5170ef87747fd107a99a05b9882d157dd35039d93c141f0c382b11391ba67deb0c51f5f",
     "src/legacy_compat.zig": "e8057838720be0b158ee530e715303448c6a4798fcd38619addbfb7cce08e01c60f49e4d2f89ff1c47238eeceff4b12667276fc8d2361d3b0f9116471c76c08c",
     "src/cli_backend_policy.zig": "0b5bc6b904e8ce6b63a3c8a94eb5342fcde38ccc850b2fa9f8d8956589331f7949b77fe9c474e2fff2f53e23cc85e7645fcd4f7541147e8f935a14cbe65a674a",
-    "src/native_authorization.zig": "6992ce485c64f370fe98faea60bb81f1ecfd00b9dced3bb2757196a92eb2f629d86f5b5d1af38d7623f199ed48dc82e8e3d1591b99e15829557049db2c318cf8",
+    "src/native_authorization.zig": "f921b0bfee6782d044d9c3c8d3817134e76fbb7f60f35b026d2a68f93b0bbaa7af31daba670ec8b9fc7b397b982917f411273b2bfc417f2ca0bf7791a6cab56c",
     "src/exact_lock_v2.zig": "7ff424dea4495a9c580add3d49a45015719263eb62620a39367cc1fe1ba374e986a62687b3ef29c896771284a1b3a6fcd36e93bf91516bfe7945e02cf942e1c9",
-    "src/exact_lock_v3.zig": "6f24151d24f0c43f79f62b487d4e03123169d79fe996220213d9a57b0ada3306a83c75562b3e7b810bf39728f38a8766cc8b0fae840eadd93e259118dba4b7b8",
-    "src/native_transaction_result.zig": "69311542872a7f82cda86fa5ecf18b55b74ec58a5c1be13152472711a02fb42047c94762e72ce50edde60f8f3c91851369106b8ae82801198e21bc66d46c33b6",
-    "src/native_execution_request.zig": "690e33f2d000e18523ec4d006db0949b83b54aae401a57166a655b46dc9c459e550d0ebfc5f484c8312bcd78f7f0d486185863d5fae060d3b6cff3649ae5853a",
-    "src/native_program.zig": "a3ff7d236a73d995e08a70c5c1517b9c58b8ad42af1b7f58715c6f63ca1f8ffca0ec768353110a401d2059b2eb7a6ae360506a8e0d0124f6ad5f4d13d92ce60a",
-    "src/native_unpack.zig": "f3cfa14293312274cfd2258422bf8c2ad05640fc43d8c941c962f98e5317768df99ca691903ad85e1c5056e9359f854367161eb0f0057da842f39fdfcd69871b",
+    "src/exact_lock_v3.zig": "149ab0b67c357bc6105b1853047df41f2d05370ac23220c0f267169af5773b5e883193cd39ef23a87b3985ea6ea31f5726560e8b53fb5384c955b2386cee8bcc",
+    "src/exact_lock_v4.zig": "b0592a557a1014c1dab8713163d33f3557e43636aae453168301b74b4c934247666f2ace5a19b472e6cdbd0b29d2e6bb1ba0e18b41ba16cb7eb62a13b721bb38",
+    "src/installed_baseline.zig": "57ec2277de40ecc44ec871c6a7a2757695b33aef42c5c0e0e0cafa937855490f93a9c4d4a263817345c821f9d53daeac6993e28bbb9a19944ba5a5e5064ef97f",
+    "src/native_transaction_result.zig": "a38564486c28e1716595b5cdea5e1dd157826e7635dc87efebbf89615706602254eea24ea7089264c2ec30254aeed2127a2e5ed7c08056fe057b0d5623bc58a0",
+    "src/native_execution_request.zig": "8cdcfa282bdff34008b28852ea69c7093eb32a416faf573091098004d82ab54886fdee1f9c8afa05c751a1fa4c7a5204dbfa996d593caf154eab68320f379447",
+    "src/native_program.zig": "0298ba28f028262ea6a6221ae1290c6774073d9a39ac16a7c8ed52935bef443a01e2950e680778898aa5b0bc3717a448da7f39746d5c0163e4ae0770b5f96277",
+    "src/native_unpack.zig": "1bc44ed37ab22e683bfbd16ab6009d2b38e595d356d67ab7fe442a07b67b253ed8f7a978f96e913d1e4de60082aad9d61403c3ca78e7fe6df60dbbd0c2fd3d6f",
     "src/root_operation_completion.zig": "a3cfec539eeefd69f7adc15e8972972aab3f4ef991be1517a6018ae89fd307926f1096d1af735ce4e25dc30a06ebc31129fb901d5c2342429b04dee4a88a35b9",
     "actions/download/dist/index.js": "23229ca48d984f02d6555316df68c337ea9d587c38f1745e40eb56dc686e9a9ecb081e2e2fd75d87bc0a8c099cd09d84be97ad7602200996b8c67286ddde3ed0",
     "actions/install/dist/index.js": "dad4adb56fe188e157583ce95be562d1ea31fc9b61ba3b093920de84f266104c4962a00667bc6b887cfdbf6af408dcff755be66ed03f167a08bf5f42af05aafb",
     "tools/prepare-native-dpkg.py": "360217c53c2f16caab6073b5edeb6a09b351d20c8ebf6a3d853162fb080c4d53676b037cc9093387c7762009feb818fbac6f2a4bf11597e624c81fa9ae7d6c0b",
     "tools/native-differential.py": "46e715fc4c3210deba0fc4141f85de46adef7edfbcc3c3e25ef0c9d67f4d27e4f383ee504ab5abd07b2406815bfe0afec5a8d1396dda02924a458b19bd6ecccd",
-    "build.zig": "dc10b4263b8ebf5385b25578422cee800844b1ac3978dd6d158fcdec2a9229aa7749fe895bf782837cd4652bbd90ce97517399ea0448ca66cdb22622a6061443"
+    "build.zig": "e96ef9086c33117dacc654437834fab85fe1dbf77768ec1d416726d5c24d9303c76cc56eb1957db035a4591cef0ccbe28a487110094cfe50f3bb672fd8b14d07",
+    "src/installed_baseline_component.zig": "de91f5b2833ac088e822b52b40b3c0a6e3824705a124638ff837b8a4c38e4b1845727adf44b4c67d0cde5dc9fcdc4af500498f46bc0d62c60039ece0cf8b04b8",
+    "src/native_baseline_contract.zig": "e387f3797acc723544744b37046797b311c6b7c3d27e85b233fd1948a0e08002b66938623ef9ac5a1dd0237a379a7f7abe3b20982ceb49849ced9e4843a3ec96"
   },
   "signed_script_exception": {
     "path": "src/maintainer_script.zig",

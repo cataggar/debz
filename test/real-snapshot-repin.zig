@@ -739,7 +739,7 @@ test "repin: a Release authenticated by debz under an unreviewed signer is refus
     try h.writeDebz("synthetic-signer", "");
     const refused = try h.probe("synthetic-signer", t1, "ws/signer", 2);
     try contains(refused.stderr, try h.print("stable is signed by ['{s}'], not the reviewed signer", .{try h.fingerprint()}));
-    try contains(try h.calls("synthetic-signer"), "plan\n");
+    try std.testing.expectEqualStrings("refresh\n", try h.calls("synthetic-signer"));
 }
 
 test "repin: a frozen Release that differs from the reviewed pin is refused before debz runs" {
@@ -764,13 +764,73 @@ test "repin: a frozen Release that differs from the reviewed pin is refused befo
     try std.testing.expect(!h.exists("ws/frozen"));
 }
 
+test "repin: offline source evidence defeats matching stale prestate code and manifest" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const t1 = h.settledDay(2);
+    const ownership = "/usr/share/alpha/data\n";
+    const packages = [_]Package{.{
+        .name = "alpha",
+        .version = "1.0",
+        .files = &.{.{ .name = "./usr/share/alpha/data", .bytes = "alpha\n" }},
+    }};
+    try h.writeSnapshot("prestate", t1, &.{"stable"}, &packages);
+    const profile = try h.writeProfile("synthetic-prestate", "prestate", try h.fingerprint(), bounded);
+    const digest = try sha256Hex(h.arena(), ownership);
+    const identities = try h.print(
+        "[{{\"id\":\"prestate:alpha/var/lib/dpkg/info/alpha.list\",\"kind\":\"prestate\",\"package\":\"alpha\"," ++
+            "\"architectures\":[\"amd64\",\"arm64\"],\"path\":\"var/lib/dpkg/info/alpha.list\"," ++
+            "\"digest\":\"sha256:{s}\",\"size\":{d},\"mode\":\"0644\",\"version_bound\":false," ++
+            "\"derived_from\":[{{\"package\":\"alpha\",\"version\":\"1.0\"}}],\"provenance\":\"pending\"," ++
+            "\"consumers\":[{{\"path\":\"src/native_unpack.zig\",\"form\":\"hex\"}}],\"review\":\"#1\"}}]",
+        .{ digest, ownership.len },
+    );
+    try h.writeManifest("synthetic-prestate", profile, t1, "[]", identities);
+    try h.writeDebz("synthetic-prestate", "");
+    const source = try h.print(
+        "const inputs = .{{.{{ .path = \"var/lib/dpkg/info/alpha.list\", .size = {d}, .mode = 0o644, .sha256 = \"{s}\" }}}};\n",
+        .{ ownership.len, digest },
+    );
+    try h.work.write("tree/src/native_unpack.zig", source);
+    _ = try h.probe("synthetic-prestate", t1, "ws/prestate", 0);
+    const manifest = try h.path("synthetic-prestate.pin.json");
+    const tree = try h.path("tree");
+    _ = try h.repin(&.{
+        "record", "--manifest", manifest, "--report", try h.path("ws/prestate/report.json"), "--root", tree,
+    }, 0);
+    const calls = try h.calls("synthetic-prestate");
+    const check = [_][]const u8{
+        "check", "--manifest", manifest, "--root", tree, "--profile", try h.path("synthetic-prestate.profile.json"),
+    };
+    _ = try h.repin(&check, 0);
+    try std.testing.expect(h.exists("tree/tools/fixtures/real-snapshot/prestate-sources-v1.zip"));
+    const stale = try sha256Hex(h.arena(), "stale historical list\n");
+    _ = try h.run(&.{
+        "python3", "-c",
+        "import json,sys; p=sys.argv[1]; m=json.load(open(p)); m['identities'][0]['digest']='sha256:'+sys.argv[2]; " ++
+            "open(p,'w').write(json.dumps(m))",
+        manifest,  stale,
+    }, 0);
+    try h.work.write("tree/src/native_unpack.zig", try h.print(
+        "const inputs = .{{.{{ .path = \"var/lib/dpkg/info/alpha.list\", .size = {d}, .mode = 0o644, .sha256 = \"{s}\" }}}};\n",
+        .{ ownership.len, stale },
+    ));
+    const refused = try h.repin(&check, 1);
+    try contains(refused.stderr, "independent source evidence");
+    try contains(refused.stderr, "derived bytes disagree");
+    try expectAbsent(refused.stderr, "does not pin");
+    try expectAbsent(refused.stderr, "in-tree pin");
+    try std.testing.expectEqualStrings(calls, try h.calls("synthetic-prestate"));
+}
+
 const two_bounded = "[{\"suite\":\"stable\",\"role\":\"bounded\"},{\"suite\":\"stable-security\",\"role\":\"bounded\"}]";
 
 const architectures = [_][]const u8{ "amd64", "arm64" };
 
 /// Asserts that, on each architecture, only the pocket the closure lock names
-/// is `exact_lock` and the other is `refresh_only`; returns the summary lines.
-fn expectBindings(h: *Harness, report: std.json.Value, pockets: std.json.Value) ![]const u8 {
+/// is `exact_lock` and the other has a public refresh identity.
+fn expectBindings(h: *Harness, workspace: []const u8, report: std.json.Value, pockets: std.json.Value) ![]const u8 {
     var lines: std.ArrayList(u8) = .empty;
     for ([_][]const u8{ "stable", "stable-security" }) |suite| {
         var quiet: std.ArrayList([]const u8) = .empty;
@@ -783,11 +843,29 @@ fn expectBindings(h: *Harness, report: std.json.Value, pockets: std.json.Value) 
                 if (std.mem.eql(u8, candidate.object.get("suite").?.string, suite)) break candidate;
             } else return error.MissingPocket;
             try std.testing.expectEqualStrings(
-                if (locked) "exact_lock" else "refresh_only",
+                if (locked) "exact_lock" else "refresh_identity",
                 pocket.object.get("binding").?.object.get(arch).?.string,
             );
+            const evidence = report.object.get("repository_evidence").?.object.get(arch).?.object.get(suite).?;
+            try std.testing.expectEqualStrings(pocket.object.get("release_sha256").?.string, evidence.object.get("release_digest").?.string);
+            try std.testing.expectEqualStrings(try h.fingerprint(), evidence.object.get("signer_fingerprints").?.array.items[0].string);
+            try std.testing.expectEqualStrings(report.object.get("repository_ids").?.object.get(arch).?.object.get(suite).?.string, evidence.object.get("id").?.string);
+            const lock = try std.json.parseFromSliceLeaky(std.json.Value, h.arena(), try h.read(try h.print("{s}/locks/{s}.lock.json", .{ workspace, arch })), .{});
+            var has_lock_identity = false;
+            for (lock.object.get("repositories").?.array.items) |repository| {
+                if (!std.mem.eql(u8, repository.object.get("id").?.string, evidence.object.get("id").?.string)) continue;
+                has_lock_identity = true;
+                try std.testing.expectEqualStrings(try h.print("sha256:{s}", .{repository.object.get("release_sha256").?.string}), evidence.object.get("release_digest").?.string);
+                try std.testing.expectEqualStrings(try h.print("sha256:{s}", .{repository.object.get("snapshot_sha256").?.string}), evidence.object.get("snapshot_digest").?.string);
+                const locked_signers = repository.object.get("signer_fingerprints").?.array.items;
+                const refresh_signers = evidence.object.get("signer_fingerprints").?.array.items;
+                try std.testing.expectEqual(locked_signers.len, refresh_signers.len);
+                for (locked_signers, refresh_signers) |locked_signer, refresh_signer|
+                    try std.testing.expectEqualStrings(locked_signer.string, refresh_signer.string);
+            }
+            try std.testing.expectEqual(locked, has_lock_identity);
         }
-        if (quiet.items.len != 0) try lines.print(h.arena(), "- `{s}` (bounded pocket) on {s}\n", .{
+        if (quiet.items.len != 0) try lines.print(h.arena(), "- `{s}` on {s}\n", .{
             suite, try std.mem.join(h.arena(), ", ", quiet.items),
         });
     }
@@ -801,9 +879,9 @@ fn expectQuietPocket(h: *Harness, name: []const u8, workspace: []const u8, t1: i
     _ = try h.probe(name, t1, workspace, 0);
     const report_path = try h.print("{s}/report.json", .{workspace});
     const report = try std.json.parseFromSliceLeaky(std.json.Value, h.arena(), try h.read(report_path), .{});
-    const lines = try expectBindings(h, report, report.object.get("pockets").?);
+    const lines = try expectBindings(h, workspace, report, report.object.get("pockets").?);
     const summary = try h.read(try h.print("{s}/summary.md", .{workspace}));
-    try contains(summary, "Pockets that contribute no locked package. `debz refresh` authenticated them");
+    try contains(summary, "Pockets that contribute no locked package. Their fetched Release is bound");
     try contains(summary, lines);
     // Per architecture: one refresh, one closure plan and one download.
     try std.testing.expectEqualStrings("refresh\nplan\ndownload\nrefresh\nplan\ndownload\n", try h.calls(name));
@@ -814,7 +892,7 @@ fn expectQuietPocket(h: *Harness, name: []const u8, workspace: []const u8, t1: i
     const manifest = try h.print("{s}.pin.json", .{name});
     _ = try h.repin(&.{ "record", "--manifest", try h.path(manifest), "--report", try h.path(report_path) }, 0);
     const recorded = try std.json.parseFromSliceLeaky(std.json.Value, h.arena(), try h.read(manifest), .{});
-    try std.testing.expectEqualStrings(lines, try expectBindings(h, report, recorded.object.get("snapshot").?.object.get("pockets").?));
+    try std.testing.expectEqualStrings(lines, try expectBindings(h, workspace, report, recorded.object.get("snapshot").?.object.get("pockets").?));
     return lines;
 }
 
@@ -845,7 +923,47 @@ test "repin: an empty pocket is reported, not refused" {
     try h.writeManifest("synthetic-empty", profile, t1, "[]", "[]");
     try h.writeDebz("synthetic-empty", "");
     try std.testing.expectEqualStrings(
-        "- `stable-security` (bounded pocket) on amd64, arm64\n",
+        "- `stable-security` on amd64, arm64\n",
         try expectQuietPocket(&h, "synthetic-empty", "ws/empty", t1),
     );
+}
+
+test "repin: frozen decisions bind both witnesses including an empty arm64 security pocket" {
+    var h: Harness = undefined;
+    try h.init();
+    defer h.deinit();
+    const t1 = h.settledDay(2);
+    const packages = try snapshotPackages(h.arena(), "1.0", "1.0", "gamma\n", true);
+    try h.writeSnapshot("witnesses", t1, &.{ "stable", "stable-updates" }, &packages);
+    try h.writeSnapshot("witnesses", t1, &.{"stable-security"}, &.{});
+    const profile = try h.writeProfile("synthetic-witnesses", "witnesses", try h.fingerprint(), "[{\"suite\":\"stable\",\"role\":\"frozen\"},{\"suite\":\"stable-updates\",\"role\":\"witness\"},{\"suite\":\"stable-security\",\"role\":\"witness\"}]");
+    try h.writeManifest("synthetic-witnesses", profile, t1, "[]", "[]");
+    try h.writeDebz("synthetic-witnesses", "");
+    _ = try h.repin(&.{
+        "probe",                                        "--series",                             "synthetic-witnesses",      "--timestamp",                              try h.timestamp(t1),
+        "--debz",                                       try h.path("debz-synthetic-witnesses"), "--manifest",               try h.path("synthetic-witnesses.pin.json"), "--profile",
+        try h.path("synthetic-witnesses.profile.json"), "--workspace",                          try h.path("ws/witnesses"), "--accept-frozen-release",
+    }, 0);
+    const report = try std.json.parseFromSliceLeaky(std.json.Value, h.arena(), try h.read("ws/witnesses/report.json"), .{});
+    for (architectures) |arch| {
+        const repositories = report.object.get("repository_evidence").?.object.get(arch).?.object;
+        const frozen = repositories.get("stable").?.object.get("frozen").?;
+        const decisions = frozen.object.get("witnesses").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), decisions.len);
+        for ([_][]const u8{ "stable-security", "stable-updates" }, decisions) |suite, decision| {
+            const witness = repositories.get(suite).?;
+            try std.testing.expectEqualStrings(witness.object.get("id").?.string, decision.object.get("repository_id").?.string);
+            try std.testing.expectEqualStrings(witness.object.get("snapshot_digest").?.string, decision.object.get("snapshot_digest").?.string);
+            try std.testing.expectEqualStrings(try h.fingerprint(), decision.object.get("primary_fingerprint").?.string);
+            try std.testing.expectEqual(t1 - 3600, decision.object.get("release_date_unix").?.integer);
+            try std.testing.expectEqual(t1 - 3600 + 31 * day, decision.object.get("deadline_unix").?.integer);
+        }
+        try std.testing.expectEqual(t1 - 3600 + 31 * day, frozen.object.get("admission_deadline_unix").?.integer);
+        try std.testing.expectEqualStrings(repositories.get("stable").?.object.get("release_digest").?.string, frozen.object.get("release_digest").?.string);
+        for (report.object.get("pockets").?.array.items) |pocket_value| {
+            if (std.mem.eql(u8, pocket_value.object.get("suite").?.string, "stable-security"))
+                try std.testing.expectEqualStrings("refresh_identity", pocket_value.object.get("binding").?.object.get(arch).?.string);
+        }
+    }
+    try std.testing.expectEqualStrings("refresh\nplan\ndownload\nrefresh\nplan\ndownload\n", try h.calls("synthetic-witnesses"));
 }

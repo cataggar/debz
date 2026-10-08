@@ -24,7 +24,8 @@
           "package": { "type": "string" },
           "version": { "type": ["string", "null"] },
           "architecture": { "type": ["string", "null"] },
-          "detail": { "type": ["string", "null"] }
+          "detail": { "type": ["string", "null"] },
+          "repository": { "$ref": "#/$defs/repository" }
         }
       }
     },
@@ -37,6 +38,55 @@
         "properties": {
           "id": { "type": "string" },
           "message": { "type": "string" }
+        }
+      }
+    }
+  },
+  "allOf": [{
+    "if": { "properties": { "operation": { "const": "refresh" } } },
+    "else": {
+      "properties": { "items": { "items": { "not": { "required": ["repository"] } } } }
+    }
+  }],
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_digest", "signer_fingerprints", "snapshot_digest", "frozen"],
+      "properties": {
+        "release_digest": { "$ref": "#/$defs/digest" },
+        "snapshot_digest": { "$ref": "#/$defs/digest" },
+        "signer_fingerprints": {
+          "type": "array", "uniqueItems": true,
+          "items": { "$ref": "#/$defs/fingerprint" }
+        },
+        "frozen": {
+          "oneOf": [{ "type": "null" }, {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["release_digest", "admission_deadline_unix", "witnesses"],
+            "properties": {
+              "release_digest": { "$ref": "#/$defs/digest" },
+              "admission_deadline_unix": { "type": "integer" },
+              "witnesses": {
+                "type": "array", "minItems": 1, "maxItems": 4,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["repository_id", "snapshot_digest", "release_date_unix", "deadline_unix", "primary_fingerprint"],
+                  "properties": {
+                    "repository_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                    "snapshot_digest": { "$ref": "#/$defs/digest" },
+                    "release_date_unix": { "type": "integer" },
+                    "deadline_unix": { "type": "integer" },
+                    "primary_fingerprint": { "$ref": "#/$defs/fingerprint" }
+                  }
+                }
+              }
+            }
+          }]
         }
       }
     }

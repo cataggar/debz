@@ -117,11 +117,13 @@ const ExecutionState = struct {
     stat_overrides: ?native_statoverride.Resolved = null,
     stat_override_allocator: ?std.mem.Allocator = null,
     stat_override_database_bytes: ?[]const u8 = null,
+    stat_override_records: []const package_database.StatOverrideRecord = &.{},
     diversion_observation: ?native_diversion.Observation = null,
     diversion_cache: ?*native_diversion.Session = null,
     route_settlement: ?ActiveRouteSettlement = null,
     recovery_models: ?[]const archive_application.Model = null,
     recovery_initial_model: ?*const package_database.Model = null,
+    baseline: ?*const @import("native_baseline_contract.zig").Contract = null,
 
     fn checkDeadline(self: *ExecutionState) !void {
         try checkRuntimeBounds(self.bounds);
@@ -199,6 +201,10 @@ fn beginNativeProgramStep(
     execution: *ExecutionState,
     step: native_program.Step,
 ) !native_program.Operation {
+    if (execution.baseline) |baseline| {
+        const runtime = execution.recovery orelse return error.NativeRecoveryRequired;
+        try baseline.verify(runtime.allocator, runtime.root);
+    }
     try execution.checkDeadline();
     execution.program_step = step.sequence;
     execution.phase_ordinal = 0;
@@ -229,6 +235,7 @@ fn checkpointManagedPathsAfterCacheValidation(
     observed_paths: []const []const u8,
     transient: bool,
 ) !native_recovery.Digest {
+    if (runtime.baseline) |baseline| try baseline.verify(allocator, runtime.root);
     try validateManagedDiversionUpdate(allocator, runtime, transient);
     const paths = try allocator.alloc([]const u8, steps.len + observed_paths.len);
     defer allocator.free(paths);
@@ -1376,6 +1383,27 @@ fn statOverrideDatabaseMatches(
     return std.mem.eql(u8, bytes, file.bytes);
 }
 
+fn changedStatOverrideTargets(
+    allocator: std.mem.Allocator,
+    previous: []const package_database.StatOverrideRecord,
+    current: []const package_database.StatOverrideRecord,
+) ![]const []const u8 {
+    var prior: std.StringHashMapUnmanaged(package_database.StatOverrideRecord) = .empty;
+    defer prior.deinit(allocator);
+    for (previous) |record| try prior.put(allocator, record.path, record);
+    var changed: std.ArrayList([]const u8) = .empty;
+    errdefer changed.deinit(allocator);
+    for (current) |record| {
+        if (prior.get(record.path)) |old| {
+            if (old.mode == record.mode and
+                std.mem.eql(u8, old.user, record.user) and
+                std.mem.eql(u8, old.group, record.group)) continue;
+        }
+        try changed.append(allocator, record.path[1..]);
+    }
+    return changed.toOwnedSlice(allocator);
+}
+
 fn refreshExecutionStatOverrides(
     execution: *ExecutionState,
     temporary: std.mem.Allocator,
@@ -1405,7 +1433,7 @@ fn refreshExecutionStatOverrides(
         persistent,
         database.model.stat_overrides,
     );
-    const resolved = native_statoverride.read(
+    var resolved = native_statoverride.read(
         persistent,
         root,
         records,
@@ -1413,7 +1441,26 @@ fn refreshExecutionStatOverrides(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidStatOverrideUpdate,
     };
+    const changed = try changedStatOverrideTargets(temporary, execution.stat_override_records, records);
+    defer temporary.free(changed);
+    const aliases = try detectAliases(temporary, root);
+    defer deinitAliasEvidence(temporary, aliases);
+    var observed: std.ArrayList([]const u8) = .empty;
+    try observed.appendSlice(persistent, resolved.observed_paths);
+    for (changed) |path| {
+        if (execution.stat_overrides.?.get(path)) |previous| {
+            // Genuine dpkg rewrites numeric identities to known account names
+            // even when only another record was changed.
+            if (std.meta.eql(previous, resolved.get(path).?)) continue;
+        }
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const physical = canonicalAliasPath(aliases, path, &buffer) orelse
+            return error.InvalidStatOverrideUpdate;
+        try observed.append(persistent, try persistent.dupe(u8, physical));
+    }
+    resolved.observed_paths = try observed.toOwnedSlice(persistent);
     execution.stat_overrides = resolved;
+    execution.stat_override_records = records;
     execution.stat_override_database_bytes =
         try copyStatOverrideDatabaseBytes(persistent, captured.snapshot.statoverride);
     return true;
@@ -3404,7 +3451,9 @@ fn validateProgram(builder: *Builder) PlanError!void {
     if (!((std.mem.eql(u8, program.schema, native_program.schema_id) and
         program.version == native_program.schema_version) or
         (std.mem.eql(u8, program.schema, native_program.schema_v2_id) and
-            program.version == native_program.schema_v2_version)))
+            program.version == native_program.schema_v2_version) or
+        (std.mem.eql(u8, program.schema, native_program.schema_v3_id) and
+            program.version == native_program.schema_v3_version)))
         return builder.fail(.{ .surface = .program, .code = .schema_unsupported });
     if (program.backend != .native)
         return builder.fail(.{ .surface = .program, .code = .backend_unsupported });
@@ -11966,7 +12015,9 @@ fn materializationProgramDigest(program: native_program.Program) [32]u8 {
     var payload = program;
     payload.digest_sha256 = @splat('0');
     return materializationHashValue(
-        if (program.version == native_program.schema_v2_version)
+        if (program.version == native_program.schema_v3_version)
+            "debz-native-transaction-program-v3\x00"
+        else if (program.version == native_program.schema_v2_version)
             "debz-native-transaction-program-v2\x00"
         else
             "debz-native-transaction-program-v1\x00",
@@ -11985,7 +12036,9 @@ fn phasePreflight(
     if (!((std.mem.eql(u8, program.schema, native_program.schema_id) and
         program.version == native_program.schema_version) or
         (std.mem.eql(u8, program.schema, native_program.schema_v2_id) and
-            program.version == native_program.schema_v2_version)) or
+            program.version == native_program.schema_v2_version) or
+        (std.mem.eql(u8, program.schema, native_program.schema_v3_id) and
+            program.version == native_program.schema_v3_version)) or
         program.backend != .native or
         !std.mem.eql(u8, program.install_root, request.install_root))
         return .{ .outcome = .refused, .detail = "program_mismatch" };
@@ -20418,6 +20471,17 @@ fn removalRunsInstalledScript(
     return false;
 }
 
+fn lifecycleNeedsScriptStaging(
+    model: *const archive_application.Model,
+    initial_model: package_database.Model,
+    package: native_program.PackageIdentity,
+) bool {
+    if (model.script(.config) != null or hasLifecycleScripts(model)) return true;
+    const installed = initial_model.find(package.name, package.architecture) orelse
+        return false;
+    return installed.scripts.len != 0;
+}
+
 fn stageLifecycleScripts(
     execution: *ExecutionState,
     allocator: std.mem.Allocator,
@@ -21938,7 +22002,7 @@ fn publishNativeRecoveryRequiredProvenance(
         .evidence_root = retained.root_path,
         .evidence_files = retained.files,
         .evidence_files_sha256 = retained.digest_sha256,
-        .final_state_kind = .package_database_closure_v1,
+        .final_state_kind = if (execution.baseline != null) .package_database_closure_with_baseline_noop_v1 else .package_database_closure_v1,
         .outcome = .recovery_required,
         .detail = detail,
         .digest_sha256 = @splat('0'),
@@ -26743,7 +26807,7 @@ fn finishLifecycleAttempt(
         .evidence_root = retained.root_path,
         .evidence_files = retained.files,
         .evidence_files_sha256 = retained.digest_sha256,
-        .final_state_kind = .package_database_closure_v1,
+        .final_state_kind = if (execution.baseline != null) .package_database_closure_with_baseline_noop_v1 else .package_database_closure_v1,
         .outcome = switch (terminal_result) {
             .succeeded => .succeeded,
             .recovered => .succeeded,
@@ -27221,8 +27285,7 @@ fn prepareNativeRecovery(
     helper_bootstrap: ?native_helper.Bootstrap,
     helper_source: ?native_helper.Source,
 ) !native_recovery.Runtime {
-    const authority_v2 = compiled.program.program.version ==
-        native_program.schema_v2_version;
+    const authority_v2 = native_program.taggedAuthority(compiled.program.program.version);
     if (production_request) |request| {
         try native_execution_request.validateBinding(request, root, attempt, compiled.program.program);
         var decoded = try native_execution_request.decodePersisted(allocator, raw_request);
@@ -27264,7 +27327,9 @@ fn prepareNativeRecovery(
     var authorization_store = try native_authorization.Store.init(
         root.io,
         namespace,
-        if (authority_v2)
+        if (compiled.program.program.version == 3)
+            native_recovery.authorization_v3_name
+        else if (authority_v2)
             native_recovery.authorization_v2_name
         else
             native_recovery.authorization_name,
@@ -27276,7 +27341,9 @@ fn prepareNativeRecovery(
     var program_store = try native_program.Store.init(
         root.io,
         namespace,
-        if (authority_v2)
+        if (compiled.program.program.version == native_program.schema_v3_version)
+            native_recovery.program_v3_name
+        else if (authority_v2)
             native_recovery.program_v2_name
         else
             native_recovery.program_name,
@@ -27526,7 +27593,9 @@ fn prepareNativeRecovery(
         .artifact_evidence_sha256 = native_recovery.hexDigest(artifact_sha256),
         .database_generation_sha256 = native_recovery.hexDigest(database_sha256),
         .initial_trigger_state_sha256 = native_recovery.hexDigest(trigger_sha256),
-        .authorization_schema = if (authority_v2)
+        .authorization_schema = if (program.version == 3)
+            native_authorization.schema_v3_id
+        else if (authority_v2)
             native_authorization.schema_v2_id
         else
             null,
@@ -27537,11 +27606,15 @@ fn prepareNativeRecovery(
         .exact_lock_version = if (authority_v2) program.exact_lock.version else null,
         .packages = packages.items,
         .ordered_actions = ordered.items,
-        .authorization_path = if (authority_v2)
+        .authorization_path = if (program.version == 3)
+            native_recovery.authorization_v3_name
+        else if (authority_v2)
             native_recovery.authorization_v2_name
         else
             native_recovery.authorization_name,
-        .program_path = if (authority_v2)
+        .program_path = if (program.version == native_program.schema_v3_version)
+            native_recovery.program_v3_name
+        else if (authority_v2)
             native_recovery.program_v2_name
         else
             native_recovery.program_name,
@@ -29036,8 +29109,10 @@ fn orphanNativeEvidenceDetail(
         if (std.mem.eql(u8, name, "native-recovery-v1") or
             std.mem.eql(u8, name, native_recovery.authorization_name) or
             std.mem.eql(u8, name, native_recovery.authorization_v2_name) or
+            std.mem.eql(u8, name, native_recovery.authorization_v3_name) or
             std.mem.eql(u8, name, native_recovery.program_name) or
             std.mem.eql(u8, name, native_recovery.program_v2_name) or
+            std.mem.eql(u8, name, native_recovery.program_v3_name) or
             std.mem.eql(u8, name, "native-execution-progress-v1.log") or
             std.mem.eql(u8, name, "native-managed-state-v1.json") or
             std.mem.eql(u8, name, std.fs.path.basename(native_recovery.diversion_cache_path)) or
@@ -29548,6 +29623,201 @@ fn productionLifecycleRequest(
     };
 }
 
+const BaselineOwnershipIndex = struct {
+    const RetainedFile = @import("installed_baseline_component.zig").File;
+    const RetainedEntry = struct {
+        file: *const RetainedFile,
+        incompatible: bool = false,
+    };
+
+    entries: []RetainedEntry,
+    allocation: []RetainedEntry,
+    allocator: std.mem.Allocator,
+    work: usize,
+
+    fn init(allocator: std.mem.Allocator, components: []const @import("installed_baseline_component.zig").Component) !BaselineOwnershipIndex {
+        var count: usize = 0;
+        for (components) |component| {
+            count = std.math.add(usize, count, component.payload.len) catch return error.InstalledBaselineComponentLimit;
+            if (count > @import("installed_baseline_component.zig").maximum_files)
+                return error.InstalledBaselineComponentLimit;
+        }
+        const entries = try allocator.alloc(RetainedEntry, count);
+        errdefer allocator.free(entries);
+        var offset: usize = 0;
+        for (components) |component| for (component.payload) |*file| {
+            entries[offset] = .{ .file = file };
+            offset += 1;
+        };
+        std.mem.sort(RetainedEntry, entries, {}, struct {
+            fn less(_: void, left: RetainedEntry, right: RetainedEntry) bool {
+                return std.mem.lessThan(u8, left.file.path, right.file.path);
+            }
+        }.less);
+        var unique: usize = 0;
+        for (entries) |entry| {
+            if (unique != 0 and std.mem.eql(u8, entries[unique - 1].file.path, entry.file.path)) {
+                const previous = &entries[unique - 1];
+                const left = previous.file;
+                const right = entry.file;
+                previous.incompatible = previous.incompatible or
+                    left.kind != .directory or right.kind != .directory or
+                    (left.mode & 0o7777) != (right.mode & 0o7777) or left.uid != right.uid or left.gid != right.gid;
+            } else {
+                entries[unique] = entry;
+                unique += 1;
+            }
+        }
+        return .{ .entries = entries[0..unique], .allocation = entries, .allocator = allocator, .work = count };
+    }
+
+    fn deinit(self: *BaselineOwnershipIndex) void {
+        self.allocator.free(self.allocation);
+    }
+
+    fn charge(self: *BaselineOwnershipIndex) !void {
+        self.work = std.math.add(usize, self.work, 1) catch return error.LimitExceeded;
+        if (self.work > (Limits{}).max_work) return error.LimitExceeded;
+    }
+
+    fn requireCompatible(self: *BaselineOwnershipIndex, files: []const archive_application.File) !void {
+        for (files) |file| {
+            try self.charge();
+            var low: usize = 0;
+            var high = self.entries.len;
+            while (low < high) {
+                try self.charge();
+                const middle = low + (high - low) / 2;
+                const entry = self.entries[middle];
+                switch (std.mem.order(u8, entry.file.path, file.path)) {
+                    .lt => low = middle + 1,
+                    .gt => high = middle,
+                    .eq => {
+                        const retained = entry.file;
+                        if (entry.incompatible or retained.kind != .directory or file.kind != .directory or
+                            retained.mode & 0o7777 != file.mode or retained.uid != file.uid or retained.gid != file.gid)
+                            return error.InstalledBaselineOwnershipConflict;
+                        break;
+                    },
+                }
+            }
+        }
+    }
+};
+
+const BaselineOwnershipTest = struct {
+    fn retained(path: []const u8, kind: @FieldType(BaselineOwnershipIndex.RetainedFile, "kind")) BaselineOwnershipIndex.RetainedFile {
+        return .{ .path = path, .kind = kind, .device = 1, .inode = 1, .uid = 0, .gid = 0, .mode = 0o755 };
+    }
+
+    fn component(payload: []const BaselineOwnershipIndex.RetainedFile) @import("installed_baseline_component.zig").Component {
+        return .{
+            .package = .{ .name = "private-baseline", .version = "1.0", .architecture = "amd64", .selection = .install },
+            .status_fields_sha512 = @splat('0'),
+            .info_stem = "private-baseline",
+            .controls = &.{},
+            .payload = payload,
+        };
+    }
+
+    fn archive(path: []const u8, kind: archive_application.FileKind) archive_application.File {
+        return .{
+            .path = path,
+            .kind = kind,
+            .mode = 0o755,
+            .uid = 0,
+            .gid = 0,
+            .owner_name = null,
+            .group_name = null,
+            .mtime = 0,
+            .size = 0,
+            .content = null,
+            .sha256 = null,
+            .md5 = null,
+            .link_target = null,
+            .link_literal = null,
+            .conffile = false,
+            .entry_index = 0,
+        };
+    }
+};
+
+test "native_unpack.test.baseline indexed ownership rejects overlap and preserves shared directory metadata" {
+    const fixture = BaselineOwnershipTest;
+    const payload = [_]BaselineOwnershipIndex.RetainedFile{
+        fixture.retained("usr/share/shared", .directory),
+        fixture.retained("usr/share/private", .regular),
+        fixture.retained("usr/share/link", .symlink),
+    };
+    const components = [_]@import("installed_baseline_component.zig").Component{fixture.component(&payload)};
+    var index = try BaselineOwnershipIndex.init(testing.allocator, &components);
+    defer index.deinit();
+    try index.requireCompatible(&.{ fixture.archive("usr/share/new", .regular), fixture.archive("usr/share/shared", .directory) });
+    for ([_][]const u8{ "usr/share/private", "usr/share/link" }) |path|
+        try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{fixture.archive(path, .regular)}));
+    var shared = fixture.archive("usr/share/shared", .directory);
+    shared.kind = .regular;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+    shared.kind = .directory;
+    shared.mode = 0o700;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+    shared.mode = 0o755;
+    shared.uid = 1;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+    shared.uid = 0;
+    shared.gid = 1;
+    try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{shared}));
+}
+
+test "native_unpack.test.baseline indexed ownership retains every duplicate owner's restrictions" {
+    const fixture = BaselineOwnershipTest;
+    for ([_]enum { matching, mode, uid, gid, kind }{ .matching, .mode, .uid, .gid, .kind }) |scenario| {
+        const first = [_]BaselineOwnershipIndex.RetainedFile{fixture.retained("shared", .directory)};
+        var second = first;
+        switch (scenario) {
+            .matching => {},
+            .mode => second[0].mode = 0o700,
+            .uid => second[0].uid = 1,
+            .gid => second[0].gid = 1,
+            .kind => second[0].kind = .regular,
+        }
+        const components = [_]@import("installed_baseline_component.zig").Component{ fixture.component(&first), fixture.component(&second) };
+        var index = try BaselineOwnershipIndex.init(testing.allocator, &components);
+        defer index.deinit();
+        try index.requireCompatible(&.{fixture.archive("new", .regular)});
+        if (scenario == .matching)
+            try index.requireCompatible(&.{fixture.archive("shared", .directory)})
+        else
+            try testing.expectError(error.InstalledBaselineOwnershipConflict, index.requireCompatible(&.{fixture.archive("shared", .directory)}));
+    }
+}
+
+test "native_unpack.test.baseline ownership 100k by 250k scan is indexed and cumulatively work bounded" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const fixture = BaselineOwnershipTest;
+    const payload = try allocator.alloc(BaselineOwnershipIndex.RetainedFile, 100_000);
+    for (payload, 0..) |*file, number|
+        file.* = fixture.retained(try std.fmt.allocPrint(allocator, "retained/{d:0>6}", .{number}), .regular);
+    const components = [_]@import("installed_baseline_component.zig").Component{fixture.component(payload)};
+    var index = try BaselineOwnershipIndex.init(allocator, &components);
+    defer index.deinit();
+    for (0..250_000) |number| {
+        var buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, "incoming/{d:0>6}", .{number});
+        try index.requireCompatible(&.{fixture.archive(path, .regular)});
+    }
+    try testing.expect(index.work <= payload.len + 250_000 * 19);
+    const missing = fixture.archive("incoming/more", .regular);
+    while (index.work < (Limits{}).max_work - 19)
+        try index.requireCompatible(&.{missing});
+    const more = [_]archive_application.File{missing} ** 19;
+    try testing.expectError(error.LimitExceeded, index.requireCompatible(&more));
+    const too_many = [_]@import("installed_baseline_component.zig").Component{ fixture.component(payload), fixture.component(payload[0..1]) };
+    try testing.expectError(error.InstalledBaselineComponentLimit, BaselineOwnershipIndex.init(allocator, &too_many));
+}
+
 /// Experimental caller-owned runtime. Product/CLI backend selection remains
 /// separate; this interface never accepts fixture requests or alternate helpers.
 pub const Runtime = struct {
@@ -29571,6 +29841,8 @@ pub const Runtime = struct {
         attempt: *root_operation.Attempt,
         plan: *const solver.Plan,
         exact_lock: *const exact_lock_v3.Lock,
+        baseline_lock: ?*const @import("exact_lock_v4.zig").OwnedLock = null,
+        baseline_preparation: ?*const @import("native_baseline_contract.zig").Contract = null,
         archives: []const []const u8,
         policy: transaction_executor.Policy,
         /// Native engine default (#261): every archive needs a SHA-512
@@ -29721,6 +29993,22 @@ pub const Runtime = struct {
         _ = try native_diversion.Index.init(temporary, database.model.diversions);
         _ = try native_statoverride.read(temporary, root, database.model.stat_overrides);
         const installed = try lifecycleInstalledEvidence(temporary, root, database.model);
+        var baseline_completed = false;
+        const baseline: ?@import("native_baseline_contract.zig").Contract = if (request.baseline_lock) |lock| blk: {
+            const prepared_baseline = try captureBaselinePreparation(temporary, request.attempt, lock, captured.snapshot.status.bytes);
+            const contract = prepared_baseline.contract;
+            baseline_completed = prepared_baseline.completed;
+            if (baseline_completed and (request.plan.actions.len != 0 or request.archives.len != 0))
+                return error.InstalledBaselineActionForbidden;
+            if (request.baseline_preparation) |expected| {
+                if (!std.mem.eql(u8, &expected.digest(), &contract.digest()))
+                    return error.InstalledBaselineComponentChanged;
+            }
+            try contract.validate(temporary, request.exact_lock);
+            if (database.model.triggers.pending.len != 0 or database.model.triggers.interests.len != 0)
+                return error.InstalledBaselineCallbacksUnsupported;
+            break :blk contract;
+        } else null;
         const retry: ?native_program.RemovalRetry = if (request.plan.actions.len == 1 and
             request.plan.actions[0].kind == .remove and request.archives.len == 0)
         blk: {
@@ -29740,6 +30028,11 @@ pub const Runtime = struct {
             request.archives.len,
         );
         var total_bytes: u64 = 0;
+        var baseline_ownership: ?BaselineOwnershipIndex = if (baseline) |contract|
+            try BaselineOwnershipIndex.init(temporary, contract.component.components)
+        else
+            null;
+        defer if (baseline_ownership) |*index| index.deinit();
         for (request.archives, 0..) |bytes, index| {
             total_bytes = std.math.add(u64, total_bytes, bytes.len) catch
                 return error.LimitExceeded;
@@ -29759,6 +30052,11 @@ pub const Runtime = struct {
                 return error.ArchiveEvidenceMismatch;
             if (!supportedArchiveMetadata(model))
                 return error.UnsupportedNativeArchive;
+            if (baseline != null) {
+                if (model.scripts.len != 0 or model.triggers.len != 0)
+                    return error.InstalledBaselineCallbacksUnsupported;
+                try baseline_ownership.?.requireCompatible(model.files);
+            }
             origins[index] = locked.origin;
             identities[index] = locked.archive_identity;
         }
@@ -29787,9 +30085,10 @@ pub const Runtime = struct {
             archives,
             &.{},
         );
-        const result = try native_preparation.prepareOrUnchanged(allocator, .{
+        var result = try native_preparation.prepareOrUnchanged(allocator, .{
             .plan = request.plan,
             .exact_lock = request.exact_lock,
+            .baseline = if (baseline) |*contract| contract else null,
             .install_root = request.attempt.record().install_root,
             .policy = request.policy,
             .script_policy = scriptPolicy(),
@@ -29809,6 +30108,14 @@ pub const Runtime = struct {
             .trigger_authority = authority,
             .unincorporated_triggers = unincorporated,
         });
+        if (baseline_completed and result == .prepared) {
+            if (!lifecycleFinalClosureMatches(result.prepared.authorization.authorization.final_state, database)) {
+                result.deinit();
+                return error.FinalStateMismatch;
+            }
+            result.deinit();
+            return .unchanged;
+        }
         if (result == .unchanged) {
             if (unchanged) |state| state.* = .{
                 .database_generation_sha256 = database.generation.sha256,
@@ -29974,6 +30281,108 @@ pub const Runtime = struct {
         if (receipt.outcome != .succeeded)
             return error.TransactionNotSuccessful;
         try verifyTerminalDatabase(allocator, root, authorization, receipt);
+    }
+
+    /// A completed composite attempt, not an unchanged baseline tuple, is the
+    /// only authority to move from its original full database to its final one.
+    pub const BaselinePreparation = struct {
+        contract: @import("native_baseline_contract.zig").Contract,
+        completed: bool,
+    };
+
+    pub fn captureBaselinePreparation(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        lock: *const @import("exact_lock_v4.zig").OwnedLock,
+        current_status: []const u8,
+    ) !BaselinePreparation {
+        const root = try validateAttempt(attempt);
+        if (try hasActiveEvidence(allocator, root)) return error.RecoveryRequired;
+        if (try native_provenance.read(allocator, root)) |value| {
+            var receipt = value;
+            defer receipt.deinit();
+            if (receipt.document.final_state_kind == .package_database_closure_with_baseline_noop_v1) {
+                try native_provenance.verifyEvidence(allocator, root, receipt.document);
+                const bytes = try retainedNativeBytes(allocator, root, receipt.document, .program);
+                defer allocator.free(bytes);
+                var program = try native_program.decode(allocator, bytes, native_program.maximum_document_bytes);
+                defer program.deinit();
+                const retained = program.program.baseline orelse return error.InvalidRecoveryProvenance;
+                const requested = try lock.canonicalJson(allocator);
+                defer allocator.free(requested);
+                if (std.mem.eql(u8, requested, retained.planning_lock_json)) {
+                    var contract: @import("native_baseline_contract.zig").Contract = undefined;
+                    const verified = try verifyRetainedBaseline(allocator, attempt, lock, current_status, &contract);
+                    verified.deinit();
+                    return .{ .contract = contract, .completed = true };
+                }
+            }
+        }
+        return .{
+            .contract = try @import("native_baseline_contract.zig").capture(allocator, root.io, root, lock, current_status),
+            .completed = false,
+        };
+    }
+
+    pub fn verifyRetainedBaseline(
+        allocator: std.mem.Allocator,
+        attempt: *root_operation.Attempt,
+        lock: *const @import("exact_lock_v4.zig").OwnedLock,
+        current_status: []const u8,
+        retained_contract: ?*@import("native_baseline_contract.zig").Contract,
+    ) !*@import("installed_baseline.zig").Verified {
+        const root = try validateAttempt(attempt);
+        if (try hasActiveEvidence(allocator, root)) return error.RecoveryRequired;
+        var receipt = try native_provenance.read(allocator, root) orelse return error.InstalledBaselineCompletionRequired;
+        defer receipt.deinit();
+        if (receipt.document.outcome != .succeeded or receipt.document.final_state_kind != .package_database_closure_with_baseline_noop_v1)
+            return error.InstalledBaselineCompletionRequired;
+        try native_provenance.verifyEvidence(allocator, root, receipt.document);
+        const program_bytes = try retainedNativeBytes(allocator, root, receipt.document, .program);
+        defer allocator.free(program_bytes);
+        var program = try native_program.decode(allocator, program_bytes, native_program.maximum_document_bytes);
+        defer program.deinit();
+        const baseline = program.program.baseline orelse return error.InstalledBaselineCompletionRequired;
+        const bytes = try lock.canonicalJson(allocator);
+        defer allocator.free(bytes);
+        if (!std.mem.eql(u8, bytes, baseline.planning_lock_json))
+            return error.InstalledBaselineCompletionRequired;
+        if (!std.mem.eql(u8, program.program.install_root, lock.evidence().root_path) or
+            !std.mem.eql(u8, receipt.document.install_root, program.program.install_root))
+            return error.InvalidRecoveryProvenance;
+        try baseline.verify(allocator, root);
+        const authorization_bytes = try retainedNativeBytes(allocator, root, receipt.document, .authorization);
+        defer allocator.free(authorization_bytes);
+        var authorization = try native_authorization.decode(allocator, authorization_bytes, native_authorization.maximum_document_bytes);
+        defer authorization.deinit();
+        const request_bytes = try retainedNativeBytes(allocator, root, receipt.document, .execution_request);
+        defer allocator.free(request_bytes);
+        var request = try native_execution_request.decodePersisted(allocator, request_bytes);
+        defer request.deinit();
+        try request.validateAuthorityDocuments(authorization.authorization, program.program);
+        if (!program.program.matchesAuthorization(authorization.authorization) or
+            !std.mem.eql(u8, &program.program.digest_sha256, &receipt.document.program_sha256) or
+            !std.mem.eql(u8, &program.program.exact_lock.digest_sha256, &receipt.document.exact_lock_sha256))
+            return error.InvalidRecoveryProvenance;
+        const progress_bytes = try retainedNativeBytes(allocator, root, receipt.document, .progress);
+        defer allocator.free(progress_bytes);
+        var progress = try native_recovery.decodeProgress(allocator, progress_bytes);
+        defer progress.deinit();
+        const terminal = native_recovery.latest(progress.document, nativeAction(.provenance, std.math.maxInt(u32), 0, 0)) orelse return error.InvalidRecoveryProvenance;
+        if (terminal.stage != .terminal or (terminal.result != .succeeded and terminal.result != .recovered) or
+            !std.mem.eql(u8, &progress.document.head_sha256, &receipt.document.progress_head_sha256) or
+            !std.mem.eql(u8, &progress.document.intent_sha256, &receipt.document.execution_intent_sha256) or
+            progress.document.records.len != receipt.document.progress_record_count)
+            return error.InvalidRecoveryProvenance;
+        try verifyTerminalDatabase(allocator, root, authorization.authorization, receipt.document);
+        const managed_bytes = try retainedNativeBytes(allocator, root, receipt.document, .managed_state);
+        defer allocator.free(managed_bytes);
+        var managed = try native_recovery.decodeManagedState(allocator, managed_bytes);
+        defer managed.deinit();
+        _ = try verifySettledPayload(allocator, root, program.program, managed.document, &.{}, null);
+        if (retained_contract) |destination| destination.* = try baseline.clone(allocator);
+        const evidence = lock.evidence();
+        return @import("installed_baseline.zig").capture(allocator, root.io, evidence.root_path, evidence.native_architecture, current_status, evidence.packages);
     }
 
     /// Matches a known failure's recorded database without asserting that the
@@ -30315,7 +30724,7 @@ fn executePreparedNativeProgramWithHelper(
             );
         }
     }
-    const bytes = if (program.version == native_program.schema_v2_version)
+    const bytes = if (native_program.taggedAuthority(program.version))
         try native_execution_request.encodeWithAuthority(
             scratch,
             try native_execution_request.withAuthority(
@@ -31318,6 +31727,12 @@ fn readProductionCompletion(
         authorization.authorization,
         program.program,
     );
+    if (program.program.baseline) |baseline| {
+        if (receipt.document.final_state_kind != .package_database_closure_with_baseline_noop_v1)
+            return error.InvalidRecoveryProvenance;
+        try baseline.verify(allocator, root);
+        try Runtime.verifyTerminalDatabase(allocator, root, authorization.authorization, receipt.document);
+    } else if (receipt.document.final_state_kind != .package_database_closure_v1) return error.InvalidRecoveryProvenance;
     try native_execution_request.validateBinding(execution, root, attempt, program.program);
     const document = receipt.document;
     if (!std.mem.eql(u8, &document.program_sha256, &execution.program.program_sha256) or
@@ -31665,6 +32080,7 @@ fn executeLifecycleProgramWithRequest(
         !std.mem.eql(u8, external.root, program.install_root) or
         !std.mem.eql(u8, external.architecture, program.target_architecture))
         return error.InvalidLifecycleProgram;
+    if (program.baseline) |baseline| try baseline.verify(allocator, root);
     const scratch_arena = try allocator.create(std.heap.ArenaAllocator);
     defer allocator.destroy(scratch_arena);
     scratch_arena.* = .init(allocator);
@@ -31918,10 +32334,12 @@ fn executeLifecycleProgramWithRequest(
             scratch,
             initial_snapshot.statoverride,
         ),
+        .stat_override_records = initial_model.stat_overrides,
         .diversion_observation = try native_diversion.observe(allocator, root),
         .diversion_cache = if (diversion_session) |*session| session else null,
         .recovery_models = models,
         .recovery_initial_model = &initial_model,
+        .baseline = if (program.baseline) |*baseline| baseline else null,
     };
     const execution = &execution_state;
     if (recovery_intent) |intent| {
@@ -31937,8 +32355,10 @@ fn executeLifecycleProgramWithRequest(
             .helper_binding = helper_binding,
             .helper_bootstrap = helper_bootstrap,
             .helper_source = helper_source,
+            .baseline = execution.baseline,
         };
         execution.recovery = &recovery_runtime;
+        recovery_runtime.baseline = execution.baseline;
         verifyNativeHelperBootstrapBeforeRecovery(
             allocator,
             root,
@@ -32083,6 +32503,7 @@ fn executeLifecycleProgramWithRequest(
             helper_bootstrap,
             helper_source,
         );
+        recovery_runtime.baseline = execution.baseline;
         execution.recovery = &recovery_runtime;
         if (helper_bootstrap) |bootstrap|
             try native_helper.verifyBootstrapPrivateState(
@@ -32181,8 +32602,8 @@ fn executeLifecycleProgramWithRequest(
         .materialize_bootstrap_payload => |intent| {
             var has_config = false;
             if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
-                if (models[model_index].script(.config) != null) {
-                    has_config = true;
+                has_config = models[model_index].script(.config) != null;
+                if (lifecycleNeedsScriptStaging(&models[model_index], initial_model, intent.package)) {
                     const staged = try stageLifecycleScripts(
                         execution,
                         allocator,
@@ -32203,12 +32624,12 @@ fn executeLifecycleProgramWithRequest(
                     );
                     if (lifecycleMaterializationFailure(staged)) |failure|
                         return failure;
-                    if (execution.recovery) |runtime| {
+                    if (has_config) if (execution.recovery) |runtime| {
                         runtime.crash.hit(if (staging.packages.count() > 1)
                             .after_subsequent_bootstrap_config_stage
                         else
                             .after_bootstrap_config_stage);
-                    }
+                    };
                 }
             }
             const result = try lifecycleDataStep(
@@ -32290,7 +32711,9 @@ fn executeLifecycleProgramWithRequest(
         },
         .unpack_package => |intent| {
             if (lifecycleArchiveIndex(models, intent.package)) |model_index| {
-                if (models[model_index].script(.config) != null) {
+                // Retain original installed scripts before new info publication,
+                // even when no preinst or prerm callback precedes this unpack.
+                if (lifecycleNeedsScriptStaging(&models[model_index], initial_model, intent.package)) {
                     const staged = try stageLifecycleScripts(
                         execution,
                         allocator,
@@ -33693,6 +34116,28 @@ fn externalProductOperation(value: ExternalMaterializationOperation) product_api
 test "native_recovery.test.native_provenance.test.contract coverage" {
     try native_recovery.testContracts();
     try native_provenance.testContract();
+}
+
+test "native_unpack.test.statoverride tracking excludes unchanged administrator records" {
+    const old = [_]package_database.StatOverrideRecord{
+        .{ .user = "root", .group = "root", .mode = 0o640, .path = "/admin" },
+        .{ .user = "root", .group = "root", .mode = 0o640, .path = "/changed" },
+        .{ .user = "root", .group = "root", .mode = 0o640, .path = "/removed" },
+    };
+    var current = old;
+    current[1].mode = 0o600;
+    current[2].path = "/created";
+    const targets = try changedStatOverrideTargets(testing.allocator, &old, &current);
+    defer testing.allocator.free(targets);
+    try testing.expectEqual(@as(usize, 2), targets.len);
+    try testing.expectEqualStrings("changed", targets[0]);
+    try testing.expectEqualStrings("created", targets[1]);
+    current[1] = old[1];
+    current[1].user = "#0";
+    const renamed_identity = try changedStatOverrideTargets(testing.allocator, &old, current[0..2]);
+    defer testing.allocator.free(renamed_identity);
+    try testing.expectEqual(@as(usize, 1), renamed_identity.len);
+    try testing.expectEqualStrings("changed", renamed_identity[0]);
 }
 
 test "native_unpack.test.statoverride identities are root-local and bounded" {

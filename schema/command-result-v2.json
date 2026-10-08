@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/cataggar/debz/schema/command-result-v2.json",
+  "title": "debz native baseline download command result v2",
+  "description": "The complete canonical UTF-8 document, including escaped baseline evidence, is limited to 4194304 bytes by the command encoder, decoder and transport. Native download reserves the complete archive and installed item candidate sets before repository/cache work; component file-count limits do not override this byte budget.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "api_version", "operation", "exit_status", "changed", "summary", "items", "diagnostics", "native_download"],
+  "properties": {
+    "schema": {"const": "io.github.cataggar.debz.command.v2"},
+    "api_version": {"const": 2},
+    "operation": {"const": "download"},
+    "exit_status": {"const": 0},
+    "changed": {"const": false},
+    "summary": {"type": "string"},
+    "items": {
+      "$ref": "https://github.com/cataggar/debz/schema/command-result-v1.json#/properties/items",
+      "items": {"not": {"required": ["repository"]}}
+    },
+    "diagnostics": {"type": "array", "maxItems": 0},
+    "native_download": {"$ref": "https://debz.dev/schema/native-baseline-download-v1"}
+  }
+}

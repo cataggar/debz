@@ -497,9 +497,14 @@ pub fn authorizeProgram(
                 if (authorized.wire_version == native_authorization.schema_version)
                     std.mem.eql(u8, compiled.schema, native_program.schema_id) and
                         compiled.version == native_program.schema_version
-                else
+                else if (authorized.wire_version == native_authorization.schema_v2_version)
                     std.mem.eql(u8, compiled.schema, native_program.schema_v2_id) and
-                        compiled.version == native_program.schema_v2_version;
+                        compiled.version == native_program.schema_v2_version
+                else if (authorized.wire_version == native_authorization.schema_v3_version)
+                    std.mem.eql(u8, compiled.schema, native_program.schema_v3_id) and
+                        compiled.version == native_program.schema_v3_version and compiled.baseline != null
+                else
+                    false;
             if (!schema_matches or compiled.backend != .native)
                 return error.ProgramSchemaMismatch;
             if (compiled.steps.len == 0) return error.EmptyProgram;

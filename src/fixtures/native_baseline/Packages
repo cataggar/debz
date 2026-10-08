@@ -1,0 +1,19 @@
+Package: alpha
+Version: 1.0
+Architecture: amd64
+Maintainer: Test <test@example.invalid>
+Description: alpha
+Filename: pool/alpha_1.0_amd64.deb
+Size: 20672
+SHA256: 63452041080b42550e3067a7a06cb950565ab111d25fcb38d7e156b71bb555fc
+SHA512: c9ebc4005408340a787f470d9e73cbd00067092fefcf60a89bceb906c08e1451c4b77b604c7045965af8c7258e63c4b97066a24d6764ffd2b74543b1feb36dde
+
+Package: beta
+Version: 1.0
+Architecture: amd64
+Maintainer: Test <test@example.invalid>
+Description: beta
+Filename: pool/beta_1.0_amd64.deb
+Size: 20672
+SHA256: 1266a6147a674eeaa44683cbcc050d663f4ae354fb0db4c172f4f1421139bfaf
+SHA512: e659a1c4a03103f369cf4d4bc611f4653403f429184d1da1f13f68b19397b847b710fe1089da3fa7a2b7acefa01dcd1d5be93f95fa9427adcd2859bd8048a4df

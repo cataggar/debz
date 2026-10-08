@@ -363,6 +363,17 @@ verifies/imports/refreshes the resulting target configuration. The standalone
 default root and `--root` for isolated images. See
 [Repository management API](repository-management.md).
 
+Successful repository add also publishes a checksummed, root-scoped active
+configuration pointer to its retained historical manifest, using the shared
+root lock and durable no-follow publication. `debz.system_product_context`
+provides a typed read-only resolver with root-local cache/state/lock defaults,
+target-metadata architecture, source/key/manifest revalidation and active-work
+refusal. This is an independently useful #68 preparation slice, not the
+simple system installation feature: durable auto-lock/owned retry/product
+evidence and scoped standalone execution are still unwired, and existing
+exact locks require authenticated origins for every retained installed
+package. See [typed system product context](target-apt-config.md#typed-system-product-context).
+
 `debz.release_metadata` parses caller-supplied `Release` bytes into typed identity, timestamp, architecture, component, by-hash, and SHA-256 index data. It validates normalized relative index paths and bounded checksum rows. Timestamps retain their declared civil time and UTC offset; expiration and other clock policy remain caller decisions. MD5, SHA-1, and unknown fields are never promoted into trusted checksum records.
 
 ## Repository metadata

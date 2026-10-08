@@ -200,16 +200,16 @@ pub const OwnedRequest = union(enum) {
         program: native_program.Program,
     ) !void {
         try validateProgram(self.execution(), program);
-        if (program.version == native_program.schema_v2_version) {
+        if (native_program.taggedAuthority(program.version)) {
             const document = switch (self) {
                 .authority_v2 => |value| value.document,
                 else => return error.RecoveryRequestBindingMismatch,
             };
-            if (authorization.wire_version != native_authorization.schema_v2_version or
+            if (authorization.wire_version != (if (program.version == 3) native_authorization.schema_v3_version else native_authorization.schema_v2_version) or
                 !std.mem.eql(
                     u8,
                     document.authority.authorization_schema,
-                    native_authorization.schema_v2_id,
+                    if (program.version == 3) native_authorization.schema_v3_id else native_authorization.schema_v2_id,
                 ) or
                 document.authority.authorization_version != authorization.wire_version or
                 !std.mem.eql(u8, document.authority.program_schema, program.schema) or
@@ -256,6 +256,20 @@ fn validateAuthority(document: AuthorityDocument) !void {
         return error.InvalidExecutionRequest;
     try validate(document.execution);
     if (document.helper) |helper| try helper.validate();
+    if (document.authority.program_version == 3 or document.authority.authorization_version == 3 or
+        document.authority.exact_lock_version == 4 or
+        std.mem.eql(u8, document.authority.program_schema, native_program.schema_v3_id) or
+        std.mem.eql(u8, document.authority.authorization_schema, native_authorization.schema_v3_id) or
+        std.mem.eql(u8, document.authority.exact_lock_schema, @import("exact_lock_v4.zig").schema_id))
+    {
+        if (document.authority.program_version != 3 or document.authority.authorization_version != 3 or
+            document.authority.exact_lock_version != 4 or
+            !std.mem.eql(u8, document.authority.program_schema, native_program.schema_v3_id) or
+            !std.mem.eql(u8, document.authority.authorization_schema, native_authorization.schema_v3_id) or
+            !std.mem.eql(u8, document.authority.exact_lock_schema, @import("exact_lock_v4.zig").schema_id) or
+            document.bootstrap != null)
+            return error.InvalidExecutionRequest;
+    }
     if (document.bootstrap) |bootstrap|
         try validateBootstrapExecution(document.execution, bootstrap);
     if (!std.mem.eql(u8, &document.digest_sha256, &authorityDigest(document)))
@@ -272,11 +286,18 @@ pub fn withAuthority(
     var document: AuthorityDocument = .{
         .execution = execution,
         .authority = .{
-            .authorization_schema = if (program.version == native_program.schema_v2_version)
+            .authorization_schema = if (program.version == 3)
+                native_authorization.schema_v3_id
+            else if (native_program.taggedAuthority(program.version))
                 native_authorization.schema_v2_id
             else
                 native_authorization.schema_id,
-            .authorization_version = program.version,
+            .authorization_version = if (program.version == 3)
+                native_authorization.schema_v3_version
+            else if (native_program.taggedAuthority(program.version))
+                native_authorization.schema_v2_version
+            else
+                native_authorization.schema_version,
             .program_schema = program.schema,
             .program_version = program.version,
             .exact_lock_schema = program.exact_lock.schema,
@@ -676,6 +697,29 @@ test "native_execution_request.test.rejects rehashed invalid fields and changed 
     document.defer_triggers = true;
     seal(&document);
     try std.testing.expectError(error.InvalidExecutionRequest, validate(document));
+}
+
+test "native_execution_request.test.baseline descriptors refuse mixed schema and version authority" {
+    var document: AuthorityDocument = .{
+        .execution = fixtureDocument(),
+        .authority = .{
+            .authorization_schema = native_authorization.schema_v3_id,
+            .authorization_version = 3,
+            .program_schema = native_program.schema_v3_id,
+            .program_version = 3,
+            .exact_lock_schema = @import("exact_lock_v4.zig").schema_id,
+            .exact_lock_version = 4,
+        },
+    };
+    document.digest_sha256 = authorityDigest(document);
+    try validateAuthority(document);
+    document.authority.program_version = 2;
+    document.digest_sha256 = authorityDigest(document);
+    try std.testing.expectError(error.InvalidExecutionRequest, validateAuthority(document));
+    document.authority.authorization_version = 2;
+    document.authority.exact_lock_version = 3;
+    document.digest_sha256 = authorityDigest(document);
+    try std.testing.expectError(error.InvalidExecutionRequest, validateAuthority(document));
 }
 
 fn roundTripHelper(allocator: std.mem.Allocator) !void {

@@ -1,4 +1,4 @@
-# Native transaction programs v1 and v2
+# Native transaction programs v1, v2 and baseline no-op v3
 
 The native transaction program is the complete low-level transaction the native
 engine executes against one root. It is compiled once, before any mutation,
@@ -8,6 +8,16 @@ durable authority for both execution and recovery.
 `debz.native_program` owns the model, the compiler, the canonical document, and
 the strict decoder. Compilation is pure: it reads no filesystem, opens no
 package database, downloads nothing, and runs no maintainer script.
+
+Program v3 adds the explicit installed-component no-op contract described in
+[installed-only baseline execution](exact-locks-and-provenance.md#native-execution-boundary).
+It binds the full v4 planning envelope independently of the genuine signed v3
+archive closure; it never fabricates an archive identity for a retained package.
+Only authorization v3 may admit it. Decoded v3 step graphs refuse baseline
+state transitions, configure handlers, callbacks, trigger work, bootstrap,
+removal and replacement actions before execution. A zero-archive/zero-action
+program retains explicit preflight/final-state/provenance steps. V1/v2 canonical
+bytes, tagged archive identity domains and historical recovery remain unchanged.
 
 ## Inputs
 
@@ -332,9 +342,10 @@ will use to require the exact program that the interrupted attempt published.
 `executeAuthorizedProgram` performs all of that before backend selection can
 reach an executor.
 
-`legacy_dpkg` remains the default backend and no native executor is registered,
-so a correct program still cannot start a native transaction yet: selection
-returns the typed unavailable result and never falls back.
+`legacy_dpkg` remains the default backend. This low-level selection API has no
+native executor registered: selection returns typed unavailability and never
+falls back. Explicit product native execution instead uses the separate
+[caller-owned native runtime](native-recovery.md#experimental-typed-runtime-api).
 
 ## Not in v1
 

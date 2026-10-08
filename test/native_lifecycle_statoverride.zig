@@ -2,6 +2,8 @@ const std = @import("std");
 const root_fs = @import("debz").root_fs;
 const foundation = @import("native_test_foundation.zig");
 const support = @import("native_lifecycle_support.zig");
+const debz = @import("debz");
+const process = @import("native_recovery_scriptless.zig");
 
 pub const name = "statoverride-lifecycle";
 pub const base = "usr/share/" ++ name;
@@ -111,11 +113,215 @@ fn expectPathMetadata(case: *support.Scenario, target: []const u8, expected: Exp
     }
 }
 
-fn installDpkgStatoverride(case: *support.Scenario, dpkg: []const u8) !void {
+pub fn installDpkgStatoverride(case: *support.Scenario, dpkg: []const u8) !void {
     for ([_][]const u8{ "reference", "native" }) |side| {
         const root_path = try support.path(case.fixture.allocator, case.name, side);
         defer case.fixture.allocator.free(root_path);
         try support.copyReferenceTool(case.fixture, root_path, dpkg, "dpkg-statoverride", "/usr/bin/dpkg-statoverride");
+    }
+}
+
+pub const chrony_name = "statoverride-chrony";
+pub const chrony_targets = [_][]const u8{ "etc/chrony/chrony.keys", "var/lib/chrony", "var/log/chrony" };
+pub const admin_target = "opt/admin-statoverride";
+const chrony_hook =
+    \\if [ "$DPKG_MAINTSCRIPT_NAME" = postinst ] && [ "$1" = configure ]; then
+    \\    if [ ! -f /chrony-account-created ]; then
+    \\        printf '_chrony:x:42420:42421:fixture:/:/bin/sh\n' >> /etc/passwd
+    \\        printf '_chrony:x:42421:\n' >> /etc/group
+    \\        printf 'created\n' > /chrony-account-created
+    \\    fi
+    \\    /bin/mkdir -p /etc/chrony /var/log/chrony || exit 30
+    \\    if [ ! -f /etc/chrony/chrony.keys ]; then
+    \\        printf 'fixture key\n' > /etc/chrony/chrony.keys
+    \\    fi
+    \\    if [ -f /chrony-replace-override ]; then
+    \\        /usr/bin/dpkg-statoverride --remove /etc/chrony/chrony.keys || exit 31
+    \\        /bin/rm /chrony-replace-override || exit 32
+    \\    fi
+    \\    if ! /usr/bin/dpkg-statoverride --list /etc/chrony/chrony.keys; then
+    \\        /usr/bin/dpkg-statoverride --update --add root _chrony 0640 /etc/chrony/chrony.keys || exit 33
+    \\    fi
+    \\    for d in /var/lib/chrony /var/log/chrony; do
+    \\        if ! /usr/bin/dpkg-statoverride --list "$d"; then
+    \\            /usr/bin/dpkg-statoverride --update --add _chrony _chrony 0750 "$d" || exit 34
+    \\        fi
+    \\    done
+    \\    /bin/touch -d @1700000000 /etc/passwd /etc/group /chrony-account-created /etc/chrony/chrony.keys || exit 37
+    \\fi
+    \\if [ "$DPKG_MAINTSCRIPT_NAME" = postrm ] && [ "$1" = purge ]; then
+    \\    /bin/rm -rf /etc/chrony /var/lib/chrony /var/log/chrony || exit 35
+    \\    for d in /etc/chrony/chrony.keys /var/lib/chrony /var/log/chrony; do
+    \\        if /usr/bin/dpkg-statoverride --list "$d"; then
+    \\            /usr/bin/dpkg-statoverride --remove "$d" || exit 36
+    \\        fi
+    \\    done
+    \\fi
+    \\
+;
+
+pub fn chronyArchive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
+    return chronyArchiveWithPostinst(fixture, arch, version, workspace, null);
+}
+
+pub fn changedChronyArchive(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8) ![]u8 {
+    return chronyArchiveWithPostinst(fixture, arch, version, workspace,
+        \\if [ "$1" = configure ]; then
+        \\    /usr/bin/dpkg-statoverride --remove /etc/chrony/chrony.keys || exit 38
+        \\    /usr/bin/dpkg-statoverride --update --add root _chrony 0600 /etc/chrony/chrony.keys || exit 39
+        \\fi
+        \\
+    );
+}
+
+fn chronyArchiveWithPostinst(fixture: *foundation.Fixture, arch: []const u8, version: []const u8, workspace: []const u8, postinst: ?[]const u8) ![]u8 {
+    return support.makePackage(fixture, arch, version, chrony_name, workspace, .{
+        .extra_files = &.{.{ .path = "var/lib/chrony/state", .content = "packaged state\n" }},
+        .conffile_content = "chrony fixture configuration\n",
+        .script_label_version = if (postinst != null) null else "fixture",
+        .postinst_append = postinst,
+        .scripts = .{ .omit_preinst = true, .omit_prerm = true, .before_failure = chrony_hook },
+    });
+}
+
+pub fn seedChrony(case: *support.Scenario, dpkg: []const u8, changed: bool) !void {
+    try both(case, "etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
+    try both(case, "etc/group", "root:x:0:\n");
+    const admin_record = "#0 #0 0644 /" ++ admin_target ++ "\n";
+    try both(case, "var/lib/dpkg/statoverride", if (changed)
+        admin_record ++ "#0 #0 0600 /etc/chrony/chrony.keys\n"
+    else
+        admin_record);
+    try both(case, admin_target, "administrator-owned file\n");
+    if (changed) {
+        try both(case, chrony_targets[0], "fixture key\n");
+        try both(case, "chrony-replace-override", "replace\n");
+    }
+    try installDpkgStatoverride(case, dpkg);
+    for ([_][]const u8{ "reference", "native" }) |side| {
+        const root_path = try support.path(case.fixture.allocator, case.name, side);
+        defer case.fixture.allocator.free(root_path);
+        try support.copyProgram(case.fixture, root_path, "/bin/mkdir", "/bin/mkdir");
+        try support.copyProgram(case.fixture, root_path, "/bin/rm", "/bin/rm");
+        try support.copyProgram(case.fixture, root_path, "/bin/touch", "/bin/touch");
+    }
+}
+
+pub fn expectChronyMetadata(case: *support.Scenario) !void {
+    try expectPathMetadata(case, chrony_targets[0], .{ .mode = 0o640, .uid = 0, .gid = 42421 });
+    for (chrony_targets[1..]) |target|
+        try expectPathMetadata(case, target, .{ .mode = 0o750, .uid = 42420, .gid = 42421 });
+}
+
+pub fn expectChangedChronyMetadata(case: *support.Scenario) !void {
+    try expectPathMetadata(case, chrony_targets[0], .{ .mode = 0o600, .uid = 0, .gid = 42421 });
+    for (chrony_targets[1..]) |target|
+        try expectPathMetadata(case, target, .{ .mode = 0o750, .uid = 42420, .gid = 42421 });
+}
+
+pub fn settledChronyState(case: *support.Scenario) !debz.native_recovery.OwnedManagedState {
+    var proof = try process.rootDocument(case.fixture, case.native_root, debz.native_provenance.legacy_document_path);
+    defer proof.deinit();
+    const files = try process.field(proof.value, "evidence_files");
+    if (files != .array) return error.InvalidRecoveryEvidence;
+    for (files.array.items) |file| {
+        if (!std.mem.eql(u8, try process.text(file, "kind"), "managed_state")) continue;
+        const bytes = try process.rootBytes(case.fixture, case.native_root, try process.text(file, "path"));
+        defer case.fixture.allocator.free(bytes);
+        return debz.native_recovery.decodeManagedState(case.fixture.allocator, bytes);
+    }
+    return error.MissingManagedState;
+}
+
+pub fn verifyChronyState(case: *support.Scenario) !void {
+    return verifyChronyTargets(case, &chrony_targets);
+}
+
+pub fn verifyChangedChronyState(case: *support.Scenario) !void {
+    return verifyChronyTargets(case, chrony_targets[0..1]);
+}
+
+fn verifyChronyTargets(case: *support.Scenario, targets: []const []const u8) !void {
+    var managed = try settledChronyState(case);
+    defer managed.deinit();
+    const stable = managed.document.stable orelse return error.MissingManagedState;
+    for (targets) |target| {
+        var found = false;
+        for (stable.entries) |entry| {
+            if (std.mem.eql(u8, entry.path, admin_target)) return error.AdministratorOverrideWasManaged;
+            if (std.mem.eql(u8, entry.path, target)) found = true;
+        }
+        if (!found) return error.MissingChangedOverrideTarget;
+    }
+    var dir = try foundation.guardedRoot(case.fixture.io, case.native_root);
+    defer dir.close(case.fixture.io);
+    _ = try debz.native_recovery.verifySettledManagedState(case.fixture.allocator, .init(case.fixture.io, dir), managed.document, .{
+        .paths = &.{"etc/debz-native.conf"},
+        .prefixes = &.{"var/lib/debz/"},
+    });
+}
+
+fn genuineChronyLifecycle(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const first = try chronyArchive(fixture, arch, "1", "packages/statoverride-chrony");
+    defer fixture.allocator.free(first);
+    const second = try chronyArchive(fixture, arch, "2", "packages/statoverride-chrony");
+    defer fixture.allocator.free(second);
+    const selected = [_]foundation.PackageIdentity{.{ .name = chrony_name, .architecture = arch }};
+    var case = try support.Scenario.init(fixture, "statoverride-genuine-chrony", driver, dpkg, arch, false);
+    defer case.deinit();
+    try seedChrony(&case, dpkg, false);
+    for ([_][]const u8{ "install", "reinstall", "upgrade" }, [_][]const u8{ first, first, second }) |operation, archive_file| {
+        try case.phase(.{ .operation = operation, .archives = &.{archive_file}, .packages = &selected, .recovery = true }, false);
+        try expectChronyMetadata(&case);
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+        if (!fixture.oracle_only and std.mem.eql(u8, operation, "install")) {
+            try both(&case, "etc/debz-native.conf", "administrator conffile edit\n");
+            for ([_][]const u8{ case.reference_root, case.native_root }) |root_path| {
+                var dir = try foundation.guardedRoot(fixture.io, root_path);
+                defer dir.close(fixture.io);
+                try (root_fs.Root.init(fixture.io, dir)).applyMetadata(try root_fs.Path.init(admin_target), .{ .mode = 0o600 });
+            }
+            try verifyChronyState(&case);
+        }
+    }
+    for ([_][]const u8{ "remove", "purge" }) |operation| {
+        try case.phase(.{ .operation = operation, .packages = &selected, .recovery = true }, false);
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+    }
+}
+
+fn genuineChangedChronyLifecycle(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, arch: []const u8) !void {
+    const workspace = "packages/statoverride-changed-chrony";
+    const first = try chronyArchive(fixture, arch, "1", workspace);
+    defer fixture.allocator.free(first);
+    const second = try changedChronyArchive(fixture, arch, "2", workspace);
+    defer fixture.allocator.free(second);
+    const selected = [_]foundation.PackageIdentity{.{ .name = chrony_name, .architecture = arch }};
+    for ([_]bool{ false, true }) |recovery| {
+        var case = try support.Scenario.init(fixture, if (recovery) "statoverride-changed-chrony-recovery" else "statoverride-changed-chrony", driver, dpkg, arch, false);
+        defer case.deinit();
+        try seedChrony(&case, dpkg, false);
+        try case.phase(.{ .operation = "install", .archives = &.{first}, .packages = &selected, .recovery = recovery }, false);
+        const original = try process.rootBytes(fixture, case.reference_root, "var/lib/dpkg/info/" ++ chrony_name ++ ".postinst");
+        defer fixture.allocator.free(original);
+        for ([_][]const u8{ "upgrade", "reinstall" }) |operation| {
+            try case.phase(.{ .operation = operation, .archives = &.{second}, .packages = &selected, .recovery = recovery }, false);
+            try expectChangedChronyMetadata(&case);
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+            if (recovery and !fixture.oracle_only and std.mem.eql(u8, operation, "upgrade"))
+                try verifyChangedChronyState(&case);
+        }
+        const current = try process.rootBytes(fixture, case.reference_root, "var/lib/dpkg/info/" ++ chrony_name ++ ".postinst");
+        defer fixture.allocator.free(current);
+        if (std.mem.eql(u8, original, current)) return error.ChangedScriptFixtureWasByteStable;
+        for ([_][]const u8{ "remove", "purge" }) |operation| {
+            try case.phase(.{ .operation = operation, .packages = &selected, .recovery = recovery }, false);
+            try support.assertDatabaseBytes(&case, "statoverride");
+            try support.assertDatabaseBytes(&case, "statoverride-old");
+        }
     }
 }
 
@@ -175,6 +381,8 @@ pub fn run(fixture: *foundation.Fixture, driver: []const u8, dpkg: []const u8, a
     const chosen = [_]foundation.PackageIdentity{.{ .name = name, .architecture = arch }};
 
     try genuineToolRefresh(fixture, driver, dpkg, arch);
+    try genuineChronyLifecycle(fixture, driver, dpkg, arch);
+    try genuineChangedChronyLifecycle(fixture, driver, dpkg, arch);
 
     const table = [_]struct {
         label: []const u8,

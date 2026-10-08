@@ -218,7 +218,8 @@ pub const Manifest = struct {
         try validateSerializableManifest(self);
         var output: std.Io.Writer.Allocating = .init(allocator);
         errdefer output.deinit();
-        try writeDocument(self, &output.writer);
+        writeDocument(self, &output.writer) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else err;
         return output.toOwnedSlice();
     }
 };
@@ -1679,7 +1680,8 @@ pub const ProductionFileSystem = struct {
         while (try iterator.next(self.io)) |entry| {
             if (entries.items.len >= maximum_entries)
                 return error.DirectoryLimitExceeded;
-            try entries.append(allocator, .{
+            try entries.ensureUnusedCapacity(allocator, 1);
+            entries.appendAssumeCapacity(.{
                 .name = try allocator.dupe(u8, entry.name),
                 .kind = switch (entry.kind) {
                     .file => .regular,
