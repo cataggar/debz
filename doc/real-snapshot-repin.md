@@ -23,6 +23,9 @@ The tool never authenticates repository metadata itself:
   verified. The tool hashes each object again against the lock's SHA-512
   archive identity and declared size before opening it.
 - `check` reads only the checkout. It runs offline in normal CI.
+  It re-derives supported prestates from retained original archive bytes;
+  it does not authenticate new metadata, contact the snapshot service, renew
+  freshness, or treat a saved successful report as a fresh probe.
 
 ## Pin manifest
 
@@ -35,14 +38,35 @@ for the real-snapshot pins:
 | `series` | The reviewed series profile: URI root, component, architectures, keyring, signer fingerprint, request, and pockets with their roles (`bounded`, `frozen`, `witness`). It must equal the built-in profile. |
 | `snapshot` | `pending` (timestamp only) or `probed`: per pocket the `Date`, `Valid-Until`, hash fields, signers, InRelease SHA-256/SHA-512, cleartext `release_sha256`, deadline and per-architecture `binding`; the admission deadline; and the per-architecture closure digest, package counts and versions. A frozen pocket also carries the review reference that accepted its Release. |
 | `uri_consumers` | Files that must name exactly the pinned snapshot URI and no other snapshot timestamp. |
+| `coordinate_consumers` | Optional typed bindings from snapshot URI, frozen suite, witness suites and frozen Release digest to named shell `readonly` assignments. |
 | `identities` | One record per reviewed byte identity: `id`, `kind` (`script`, `tool_file`, `archive`, `prestate`), `package`, `architectures`, `path`, tagged `digest` (`sha512:` for archives, `sha256:` for members), `size`, `mode`, boolean `version_bound`, `provenance`, `consumers` and `review`. Prestate identities also list `derived_from`. |
+| `prestate_evidence` | Repository-relative source-evidence ZIP, required by `check` for archive-derivable prestates and URL-bound artifacts. Retains original verified `.deb`, InRelease and Packages bytes, original authenticated exact locks and the probe report, not a second list of expected derived digests. |
 | `excluded` | Digest literals in the scanned sources that are not snapshot pins, each with a reason. |
 
-A consumer is a file that pins the identity in one of three forms:
+A consumer is a file that pins the identity in one of four forms:
 
 - `hex`: the file contains the hexadecimal digest.
 - `zig_bytes`: the named Zig byte-array constant equals the digest.
 - `fixture`: the file's own bytes are the identity.
+- `shell`: `bindings` maps typed coordinates (`digest`, `digest_size`, `url`,
+  `version`, `size`, `member`) to named literal `readonly` assignments.
+  The digest (or combined digest/size tuple) is mandatory. Comments containing
+  correct values cannot rescue a wrong assignment. Duplicate or nonliteral
+  assignments fail closed. An optional identity `artifact` supplies the
+  repository-relative `.deb` filename and package architecture; its basename
+  must agree with the package and provenance version. The full URL is derived
+  from that filename and the pinned snapshot URI.
+  For retained URL-bound artifacts, the filename is independently checked
+  against the original signed Packages stanza, not merely against another
+  editable manifest literal.
+
+The protected keyring registers its actual download URL, deb size, member
+path, member size and digests. The URL also binds its package version and
+architecture, so the historical stonking URL/size regression cannot pass with
+the resolute digest. The native dpkg exec-audit consumers additionally bind
+their explicit version and digest/size tuples. Snapshot-coordinate consumers
+register the acceptance, protected-stage and signed-proc staging scripts.
+The specialized protected stage/launcher coupling checks remain in force.
 
 Admissions are exact-byte-bound by default: a package version change is
 `provenance-only` when the reviewed member bytes, size and mode are unchanged.
@@ -191,8 +215,14 @@ python3 tools/real-snapshot-repin.py record --report DIR/report.json \
   `fixture` consumer paths that embed the old version (without its epoch) are
   renamed in the manifest. Rename those files in the same commit.
 
-`record` changes only the manifest. The repin commit updates the fixtures,
-admissions, constants and URIs itself, then runs `check`.
+For supported prestates and URL-bound artifacts, `record` also exports
+`prestate_evidence` from the report workspace's verified CAS objects and
+original exact locks, InRelease and signed Packages index bytes. Artifact
+coordinates come from those indices, not guessed pool paths. Missing source
+bytes, altered locks or inconsistent archive controls refuse recording; a
+report alone is insufficient. The
+repin commit updates the fixtures, admissions, constants and URIs itself,
+then runs `check`.
 
 ### `check`
 
@@ -208,6 +238,12 @@ python3 tools/real-snapshot-repin.py check
 - an identity consumer does not pin the identity's digest, an explicitly
   version-bound consumer does not name the provenance version, or a fixture's
   bytes differ;
+- a typed shell consumer's named URL, version, size, member or digest/size
+  tuple differs, or a snapshot-coordinate consumer's suite/witness
+  coordinates differ;
+- retained source evidence is missing, stale, malformed or inconsistent
+  with its original authenticated lock and current snapshot, or re-derived
+  `.list`/`.triggers` digest, size or mode differs from the manifest;
 - a fixture under `src/fixtures/ubuntu-*` is not a manifest consumer;
 - a digest literal is not a manifest identity or an exclusion, or an
   admission disagrees with its identity on path, size or mode. The scan
@@ -219,6 +255,52 @@ python3 tools/real-snapshot-repin.py check
   Release digest drift from the manifest, or the protected launcher's
   proc-profile `script_bindings` drift from the manifest identities for the
   staged `systemd`, `udev` and `sudo` postinsts.
+
+### Offline source-evidence boundary
+
+The retained source bundle comes from `probe`'s authenticated download path.
+`check` verifies each original archive's SHA-512 and declared size against
+its retained lock, verifies package/version/architecture from its control
+tar, checks the lock's repository/signer/Release against the retained probe
+lineage and current snapshot, validates the original InRelease/Packages
+hash chain and signed package filename/size/SHA-512, and re-runs the same archive extraction and
+dpkg ownership-list derivation used by `probe`. Editing both the manifest and
+its code consumers to a stale derived digest still fails against those
+independent source bytes. Stored report observations are not used as derived
+byte verdicts. This is retained, reviewed authentication evidence, not
+offline re-verification of OpenPGP signatures or a new live probe.
+
+Adding an architecture requires its original archive bytes, not just an
+unchanged derived member. The retained v1 bundle authenticates the arm64
+Python package coordinates through its original lock and signed index but
+does not contain the arm64 `python3` or `python3-minimal` archives. It remains
+byte-identical historical evidence. The current v2 bundle retains those
+exact original archives alongside the six previously retained archives,
+required signed metadata, locks and a separate genuine source-retaining
+probe report.
+Its fresh quiet-pocket binding comes from public refresh evidence, not
+relabeling the v1 report. Both Python list prestates are rederived for arm64;
+this ordinary byte proof does not establish protected execution or behavioral
+prestates.
+
+The ZIP is read without filesystem extraction. Limits are 64 MiB aggregate
+evidence, 256 ZIP entries, 128 MiB decompressed tar and 100,000 tar entries;
+duplicate/unsafe paths and unsupported ZIP entry types fail closed.
+JSON, lock and source-metadata inputs are limited to 16 MiB before parsing.
+Every source-file/ZIP-member read is capped, export enforces the remaining
+aggregate budget before reading, and candidate lock enumeration is bounded.
+Package tar parsing uses the standard library. Zstd-compressed packages use
+Python 3.14's `compression.zstd`, or the existing bounded `zstd` fallback.
+
+This gate covers the archive-derived `python3.list`, `python3-minimal.list`,
+`sudo.list`, `console-setup-linux.list` and glib trigger declaration, plus
+the keyring deb/member. The two sudo alternatives databases and
+`preinst-dev-null` are behavioral outputs, not archive members or ownership
+lists. Their reality still requires separately retained protected-run byte
+evidence and a reviewed behavioral derivation; this change does not claim
+that proof or substitute duplicated manifest constants for it. The
+`(probed)` suffix reports the manifest's recorded status, not an action
+performed by `check`.
 
 `test/real-snapshot-policy.zig` runs `check` in `zig build security-audit`
 and also verifies that it refuses a manifest with a mutated identity.
