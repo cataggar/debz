@@ -3114,15 +3114,41 @@ pub fn writeStatusParagraph(writer: *std.Io.Writer, record: PackageRecord) std.I
     }
 }
 
+fn statusNameNeedsArchitecture(record: PackageRecord, native_architecture: []const u8) bool {
+    return record.multi_arch == .same or
+        (!std.mem.eql(u8, record.architecture, native_architecture) and
+            !std.mem.eql(u8, record.architecture, "all"));
+}
+
+// dpkg 1.22.22 pkg_sorter_by_nonambig_name_arch in lib/dpkg/pkg-show.c:
+// the unqualified native/all instance precedes a qualified foreign instance.
+fn statusRecordLessThan(native_architecture: []const u8, left: *const PackageRecord, right: *const PackageRecord) bool {
+    const names = std.mem.order(u8, left.name, right.name);
+    if (names != .eq) return names == .lt;
+    if (std.mem.eql(u8, left.architecture, right.architecture)) return false;
+    if (statusNameNeedsArchitecture(left.*, native_architecture)) {
+        if (statusNameNeedsArchitecture(right.*, native_architecture))
+            return std.mem.lessThan(u8, left.architecture, right.architecture);
+        return false;
+    }
+    return true;
+}
+
+/// Sort as dpkg does without changing the model or any paragraph's fields.
 /// dpkg terminates every record, including the last, with a blank line.
 pub fn writeStatusDocument(
     allocator: std.mem.Allocator,
     packages: []const PackageRecord,
+    native_architecture: []const u8,
 ) std.mem.Allocator.Error![]u8 {
+    const ordered = try allocator.alloc(*const PackageRecord, packages.len);
+    defer allocator.free(ordered);
+    for (packages, 0..) |*record, index| ordered[index] = record;
+    std.mem.sort(*const PackageRecord, ordered, native_architecture, statusRecordLessThan);
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    for (packages) |record| {
-        writeStatusParagraph(&output.writer, record) catch return error.OutOfMemory;
+    for (ordered) |record| {
+        writeStatusParagraph(&output.writer, record.*) catch return error.OutOfMemory;
         output.writer.writeByte('\n') catch return error.OutOfMemory;
     }
     return output.toOwnedSlice() catch error.OutOfMemory;
@@ -3510,7 +3536,7 @@ test "package_database.test.healthy root imports every selected surface" {
     try testing.expectEqualStrings("libfoo", owners[0].name);
 }
 
-test "package_database.test.canonical writers reproduce the imported generation" {
+test "package_database.test.canonical writers sort status and reproduce other surfaces" {
     const result = try importSnapshot(testing.allocator, test_fixtures.request(), .{});
     var database = switch (result) {
         .diagnostic => return error.TestUnexpectedResult,
@@ -3519,9 +3545,15 @@ test "package_database.test.canonical writers reproduce the imported generation"
     defer database.deinit();
     const model = database.model;
 
-    const status_bytes = try writeStatusDocument(testing.allocator, model.packages);
+    const status_bytes = try writeStatusDocument(testing.allocator, model.packages, model.native_architecture);
     defer testing.allocator.free(status_bytes);
-    try testing.expectEqualStrings(test_fixtures.status, status_bytes);
+    const toolz_at = std.mem.indexOf(u8, test_fixtures.status, "Package: toolz\n").?;
+    const oldpkg_at = std.mem.indexOf(u8, test_fixtures.status, "Package: oldpkg\n").?;
+    const expected_status = try std.mem.concat(testing.allocator, u8, &.{
+        test_fixtures.status[0..toolz_at], test_fixtures.status[oldpkg_at..], test_fixtures.status[toolz_at..oldpkg_at],
+    });
+    defer testing.allocator.free(expected_status);
+    try testing.expectEqualStrings(expected_status, status_bytes);
 
     const libfoo = model.find("libfoo", "amd64").?;
     const list_bytes = try writeFileList(testing.allocator, libfoo.paths.?);
@@ -3558,6 +3590,34 @@ test "package_database.test.canonical writers reproduce the imported generation"
     const arch_bytes = try writeArchitectures(testing.allocator, model.foreign_architectures);
     defer testing.allocator.free(arch_bytes);
     try testing.expectEqualStrings(test_fixtures.arch, arch_bytes);
+}
+
+test "package_database.test.status writer orders names and nonambiguous architectures without losing fields" {
+    const Record = struct {
+        fn stanza(comptime name: []const u8, comptime arch: []const u8, comptime multiarch: []const u8) []const u8 {
+            return "Package: " ++ name ++ "\nStatus: deinstall ok config-files\n" ++
+                "Architecture: " ++ arch ++ "\n" ++ multiarch ++ "Version: 1\n" ++
+                "X-Order-Note: " ++ name ++ ":" ++ arch ++ "\n continuation preserved\n\n";
+        }
+    };
+    const last = comptime Record.stanza("zz", "i386", "");
+    const first = comptime Record.stanza("aa", "all", "");
+    const same_amd64 = comptime Record.stanza("multi", "amd64", "Multi-Arch: same\n");
+    const same_i386 = comptime Record.stanza("multi", "i386", "Multi-Arch: same\n");
+    const foreign = comptime Record.stanza("oldf", "amd64", "");
+    const native = comptime Record.stanza("oldf", "i386", "");
+    const all = comptime Record.stanza("oldall", "all", "");
+    const foreign_all = comptime Record.stanza("oldall", "amd64", "");
+    const input = last ++ same_i386 ++ foreign ++ foreign_all ++ first ++ same_amd64 ++ native ++ all;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var importer: Importer = .{ .arena = arena.allocator(), .scratch = testing.allocator, .options = .{} };
+    const records = try importer.parseStatusDocument(.status, status_path, input);
+    const written = try writeStatusDocument(testing.allocator, records, "i386");
+    defer testing.allocator.free(written);
+    try testing.expectEqualStrings(first ++ same_amd64 ++ same_i386 ++ all ++ foreign_all ++ native ++ foreign ++ last, written);
+    try testing.expectEqualStrings("zz", records[0].name);
+    try testing.expectEqualStrings("i386", records[1].architecture);
 }
 
 test "package_database.test.newconffile disappearing conffiles round trip byte exactly" {
@@ -3598,7 +3658,7 @@ test "package_database.test.newconffile disappearing conffiles round trip byte e
     try testing.expect(record.conffiles[1].digest == .new_conffile);
     try testing.expect(record.conffiles[1].obsolete);
     try testing.expect(!record.conffiles[1].remove_on_upgrade);
-    const status_bytes = try writeStatusDocument(testing.allocator, database.model.packages);
+    const status_bytes = try writeStatusDocument(testing.allocator, database.model.packages, database.model.native_architecture);
     defer testing.allocator.free(status_bytes);
     try testing.expectEqualStrings(status, status_bytes);
 }
@@ -3645,7 +3705,7 @@ test "package_database.test.literal package paths round trip every database surf
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    try testing.expectEqualStrings(status, try writeStatusDocument(allocator, database.model.packages));
+    try testing.expectEqualStrings(status, try writeStatusDocument(allocator, database.model.packages, database.model.native_architecture));
     try testing.expectEqualStrings(list, try writeFileList(allocator, record.paths.?));
     try testing.expectEqualStrings(sums, try writeMd5sums(allocator, record.md5sums.?));
     try testing.expectEqualStrings(config ++ "\n", try writeDeclaredConffiles(allocator, record.declared_conffiles.?));
@@ -3819,7 +3879,7 @@ test "package_database.test.unknown status fields survive a semantic round trip"
     const note = libfoo.field("X-Vendor-Note").?;
     try testing.expectEqualStrings("retained unknown field", note.value_lines[0]);
 
-    const republished = try writeStatusDocument(testing.allocator, database.model.packages);
+    const republished = try writeStatusDocument(testing.allocator, database.model.packages, database.model.native_architecture);
     defer testing.allocator.free(republished);
 
     var snapshot = test_fixtures.snapshot();
@@ -3842,11 +3902,10 @@ test "package_database.test.unknown status fields survive a semantic round trip"
         "retained unknown field",
         reimported.model.find("libfoo", "amd64").?.field("X-Vendor-Note").?.value_lines[0],
     );
-    try testing.expectEqualSlices(
-        u8,
-        &database.model.status.sha256,
-        &reimported.model.status.sha256,
-    );
+    try testing.expect(!std.mem.eql(u8, &database.model.status.sha256, &reimported.model.status.sha256));
+    const stable = try writeStatusDocument(testing.allocator, reimported.model.packages, reimported.model.native_architecture);
+    defer testing.allocator.free(stable);
+    try testing.expectEqualStrings(republished, stable);
 }
 
 test "package_database.test.generation evidence detects external database change" {
@@ -4937,7 +4996,7 @@ test "package_database.test.status field values must survive serialization uncha
         .database => |value| value,
     };
     defer database.deinit();
-    const written = try writeStatusDocument(allocator, database.model.packages);
+    const written = try writeStatusDocument(allocator, database.model.packages, database.model.native_architecture);
     defer allocator.free(written);
     try testing.expectEqualStrings(tabbed, written);
 }
@@ -5025,7 +5084,7 @@ test "package_database.test.long status fields import and republish unchanged" {
         .database => |value| value,
     };
     defer database.deinit();
-    const republished = try writeStatusDocument(allocator, database.model.packages);
+    const republished = try writeStatusDocument(allocator, database.model.packages, database.model.native_architecture);
     defer allocator.free(republished);
     try testing.expectEqualStrings(document, republished);
     try testing.expect(try verifySerializedStatus(allocator, republished, 1, .{}, .status) == null);
