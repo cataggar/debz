@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -90,6 +91,36 @@ class ReferenceLauncherTests(unittest.TestCase):
                 LESS_STAGE.seal(self.root)
             self.assertEqual(listing.read_bytes(), changed)
             self.assertEqual(staged.read_bytes(), preinst)
+
+    def test_signed_sudo_guard_preserves_retained_archive_list_bytes_and_inode(self) -> None:
+        content, _ = self.retained_list("sudo", "amd64")
+        listing = self.root / "sudo/var/lib/dpkg/info/sudo.list"
+        listing.parent.mkdir(parents=True)
+        source = (TOOLS / "real-snapshot-signed-proc-prestates.sh").read_text()
+        helper = "require_control() {" + source.split("require_control() {", 1)[1].split(
+            "\nrequire_prestate()", 1)[0]
+        start = source.index("list=$prestates/sudo/var/lib/dpkg/info/sudo.list\n")
+        end = source.index("\n", source.index(
+            "'var/lib/dpkg/info/sudo.list:2376:644:", start))
+        guard = (helper + "\n" + source[start:end]).replace("0:0:", f"{os.getuid()}:{os.getgid()}:")
+        for changed in (content, b"".join(sorted(content.splitlines(keepends=True))),
+                        content.replace(b"/usr/bin/", b"/../bin/")):
+            with self.subTest(original=changed == content):
+                listing.write_bytes(changed)
+                listing.chmod(0o644)
+                before = listing.stat()
+                result = subprocess.run(
+                    ["bash", "-c",
+                     'set -euo pipefail\nprestates=$1\n'
+                     'require_protected_file() { [[ -f $1 && ! -L $1 ]]; }\n' + guard,
+                     "sudo-list-guard-test", str(self.root)],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode == 0, changed == content, result.stderr)
+                self.assertEqual(listing.read_bytes(), changed)
+                after = listing.stat()
+                self.assertEqual((after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
+                                 (before.st_ino, before.st_mtime_ns, before.st_ctime_ns))
 
     def test_python_prepare_empty_preserves_both_retained_lists_on_both_architectures(self) -> None:
         real_stat = os.stat
@@ -1091,6 +1122,8 @@ class ReferenceLauncherTests(unittest.TestCase):
         targets = tuple(ORDER.Prestate(p.selector, "unpacked" if p.name == "sudo" else
                                       "half-configured", self.root / f"saved-{p.name}")
                         for p in packages)
+        packages.insert(0, ORDER.Package("sudo-rs", "0.2.13-0ubuntu1.2", "amd64",
+                                        "a" * 128, 42, self.root / "sudo-rs.deb"))
         for captured_state in ("half-configured", "unpacked", "installed"):
             with self.subTest(captured_state=captured_state):
                 states = {}
@@ -1102,6 +1135,10 @@ class ReferenceLauncherTests(unittest.TestCase):
                     key = (package.name, "amd64")
                     if verb == "unpack":
                         states[key] = ("install ok unpacked", package.version)
+                    elif package.name == "sudo-rs":
+                        self.assertEqual(verb, "configure")
+                        self.assertEqual(command[4], "none")
+                        states[key] = ("install ok installed", package.version)
                     else:
                         self.assertEqual(verb, "continue_prestate")
                         self.assertIn(package.name, ("systemd", "udev"))
@@ -1131,12 +1168,137 @@ class ReferenceLauncherTests(unittest.TestCase):
                                           self.root, self.root, "amd64", targets)
                 if captured_state == "half-configured":
                     self.assertEqual(continuations, ["systemd:amd64", "udev:amd64"])
-                    self.assertEqual([captures[p.name][(p.name, "amd64")][0] for p in packages],
+                    self.assertEqual([captures[p.name][(p.name, "amd64")][0] for p in packages[1:]],
                                      ["install ok half-configured", "install ok half-configured",
                                       "install ok unpacked"])
                     self.assertEqual(states[("sudo", "amd64")][0], "install ok unpacked")
                 else:
                     self.assertEqual(continuations, [])
+
+    def prestate_record_guard(self, record: bytes) -> subprocess.CompletedProcess:
+        script = (TOOLS / "real-snapshot-signed-proc-prestates.sh").read_text()
+        block = "expected_record=$(printf" + script.partition("expected_record=$(printf")[2].partition(
+            "\nrequire_control()"
+        )[0]
+        fixture = (TOOLS / "fixtures/real-snapshot/signed-proc-capture-record-v1.tsv").read_bytes()
+        prefix = fixture.decode().splitlines()[0].split("\t")[2].rsplit("/", 1)[0]
+        receipt = self.root / "prestates.tsv"
+        receipt.write_bytes(record)
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", block.replace('"$prestates/prestates.tsv"', '"$receipt"')],
+            env={"PATH": "/usr/bin:/bin", "prestates": prefix, "receipt": str(receipt)},
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(receipt.read_bytes(), record)
+        return result
+
+    def test_actual_ci_receipt_accepts_all_capture_orders_without_rewriting(self) -> None:
+        fixture = (TOOLS / "fixtures/real-snapshot/signed-proc-capture-record-v1.tsv").read_bytes()
+        for order in itertools.permutations(fixture.splitlines(keepends=True)):
+            with self.subTest(order=[line.split(b"\t")[0] for line in order]):
+                result = self.prestate_record_guard(b"".join(order))
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_capture_receipt_rejects_missing_duplicate_and_mutated_exact_records(self) -> None:
+        fixture = (TOOLS / "fixtures/real-snapshot/signed-proc-capture-record-v1.tsv").read_bytes()
+        lines = fixture.splitlines(keepends=True)
+        for changed in (
+            b"".join(lines[1:]), fixture + lines[0], fixture.replace(lines[1], lines[0]),
+            fixture.replace(b"sudo:amd64\t", b"sudo:arm64\t"),
+            fixture.replace(b"1.9.17p2-1ubuntu3.1", b"1.9.17p2-1ubuntu3.2"),
+            fixture.replace(b"install ok unpacked", b"install ok installed"),
+            fixture.replace(b"prestates/sudo\n", b"prestates/other\n"),
+            fixture + b"\n", fixture + b"unknown:amd64\t1 install ok unpacked\t/outside\n",
+        ):
+            with self.subTest(record=changed):
+                result = self.prestate_record_guard(changed)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("signed prestate record differs", result.stderr)
+
+    def test_sudo_prestate_waits_for_companion_without_changing_normal_configure_order(self) -> None:
+        sudo = ORDER.Package("sudo", ORDER.PROFILE_VERSIONS["sudo"], "amd64",
+                             "a" * 128, 42, self.root / "sudo.deb")
+        companion = ORDER.Package("sudo-rs", "0.2.13-0ubuntu1.2", "amd64",
+                                  "b" * 128, 42, self.root / "sudo-rs.deb")
+        for capture_requested in (True, False):
+            with self.subTest(capture_requested=capture_requested):
+                states = {}
+                configured = []
+                def apply(command, *_):
+                    verb, selector = command[5:7]
+                    package = sudo if selector == sudo.selector else companion
+                    states[(package.name, "amd64")] = (
+                        "install ok unpacked" if verb == "unpack" else "install ok installed",
+                        package.version,
+                    )
+                    if verb == "configure":
+                        configured.append(package.name)
+                def capture(*_):
+                    self.assertEqual(states[("sudo-rs", "amd64")],
+                                     ("install ok installed", companion.version))
+                    self.assertEqual(states[("sudo", "amd64")],
+                                     ("install ok unpacked", sudo.version))
+                with (mock.patch.object(ORDER, "packages_from_manifest", return_value=[sudo, companion]),
+                      mock.patch.object(ORDER, "verify_archive"),
+                      mock.patch.object(ORDER, "probe", return_value=(0, b"")),
+                      mock.patch.object(ORDER, "database_packages", side_effect=lambda _: dict(states)),
+                      mock.patch.object(ORDER, "apply", side_effect=apply),
+                      mock.patch.object(ORDER, "capture_prestate", side_effect=capture) as captured):
+                    targets = (ORDER.Prestate(sudo.selector, "unpacked", self.root / "saved"),) \
+                        if capture_requested else ()
+                    if capture_requested:
+                        ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                                      self.root, self.root, "amd64", targets)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "reference trigger closure refused"):
+                            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                                          self.root, self.root, "amd64", targets)
+                self.assertEqual(configured, ["sudo-rs"] if capture_requested else ["sudo", "sudo-rs"])
+                self.assertEqual(captured.call_count, int(capture_requested))
+
+    def test_sudo_prestate_refuses_missing_or_changed_companion_before_mutation(self) -> None:
+        sudo = ORDER.Package("sudo", ORDER.PROFILE_VERSIONS["sudo"], "amd64",
+                             "a" * 128, 42, self.root / "sudo.deb")
+        for architecture, version in ((None, None), ("amd64", "wrong"), ("arm64", "0.2.13-0ubuntu1.2")):
+            packages = [sudo] if architecture is None else [
+                sudo, ORDER.Package("sudo-rs", version, architecture, "b" * 128, 42, self.root / "companion"),
+            ]
+            with (self.subTest(architecture=architecture, version=version),
+                  mock.patch.object(ORDER, "packages_from_manifest", return_value=packages),
+                  mock.patch.object(ORDER, "apply") as applied,
+                  self.assertRaisesRegex(ValueError, "exact reviewed sudo-rs companion")):
+                ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                              self.root, self.root, "amd64",
+                              (ORDER.Prestate(sudo.selector, "unpacked", self.root / "saved"),))
+            applied.assert_not_called()
+
+    def test_sudo_prestate_refuses_companion_state_drift_after_successful_configure(self) -> None:
+        sudo = ORDER.Package("sudo", ORDER.PROFILE_VERSIONS["sudo"], "amd64",
+                             "a" * 128, 42, self.root / "sudo.deb")
+        companion = ORDER.Package("sudo-rs", "0.2.13-0ubuntu1.2", "amd64",
+                                  "b" * 128, 42, self.root / "companion.deb")
+        for changed in (
+            ("install ok unpacked", companion.version),
+            ("install ok half-configured", companion.version),
+            ("install ok installed", "wrong"),
+        ):
+            states = {}
+            def apply(command, *_):
+                package = sudo if command[6] == sudo.selector else companion
+                states[(package.name, "amd64")] = ("install ok unpacked", package.version) \
+                    if command[5] == "unpack" else changed
+            with (self.subTest(changed=changed),
+                  mock.patch.object(ORDER, "packages_from_manifest", return_value=[sudo, companion]),
+                  mock.patch.object(ORDER, "verify_archive"),
+                  mock.patch.object(ORDER, "probe", return_value=(0, b"")),
+                  mock.patch.object(ORDER, "database_packages", side_effect=lambda _: dict(states)),
+                  mock.patch.object(ORDER, "apply", side_effect=apply),
+                  mock.patch.object(ORDER, "capture_prestate") as captured,
+                  self.assertRaisesRegex(ValueError, "companion state/version changed")):
+                ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                              self.root, self.root, "amd64",
+                              (ORDER.Prestate(sudo.selector, "unpacked", self.root / "saved"),))
+            captured.assert_not_called()
 
     def test_half_configured_continuation_rejects_unbound_package_operations(self) -> None:
         for name, architecture, version, profile in (

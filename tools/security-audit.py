@@ -2905,6 +2905,11 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         '--zig-lib-dir "$(dirname -- "$zig")/lib"',
         '--prestate "python3:amd64=unpacked:$prestates/python3"',
         'protected Python pre-configure source captured; no full reference completion claimed',
+        'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")',
+        '[[ $actual_record == "$expected_record" ]]',
+        'signed prestate record differs from exact requested selectors/statuses/destinations',
+        'list=$prestates/sudo/var/lib/dpkg/info/sudo.list',
+        'var/lib/dpkg/info/sudo.list:2376:644:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8',
     ),
     "src/native_unpack.zig": (
         'std.c.getenv("DEBZ_REQUIRE_SIGNED_PYTHON3_INPUTS_PROOF")',
@@ -3115,6 +3120,11 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
             body,
         ):
             failures.append(f"{path}: fixture lists must retain authenticated original bytes without rewriting")
+    sudo_list = texts.get("tools/real-snapshot-signed-proc-prestates.sh", "").partition(
+        "list=$prestates/sudo/var/lib/dpkg/info/sudo.list\n"
+    )[2].partition("# The pre-sudo record")[0]
+    if not sudo_list or re.search(r"\b(?:sort|chmod|mv|cp|install|tee|dd)\b|>", sudo_list):
+        failures.append("signed sudo fixture list must retain authenticated original bytes without rewriting")
     producer = texts.get("tools/prepare-native-dpkg.py", "").partition(
         "def receipt_from_extracted_archive("
     )[2].partition("\ndef ")[0]

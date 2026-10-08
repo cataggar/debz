@@ -729,6 +729,32 @@ still requires unpacked, and sudo/other packages cannot use the continuation.
 The last requested target returns without continuation, preserving its
 captured state.
 
+The capture ledger records dependency-ready capture order, not CLI request
+order. Run `37840440734` produced all three rows in `sudo, systemd, udev`
+order, then its shell's request-order comparison silently refused. The retained
+`signed-proc-capture-record-v1.tsv` is that observed receipt (both modes, artifact
+IDs `11578395734` and `11577184247`), not a protected replay acceptance claim.
+The consumer compares C-sorted exact rows without rewriting the ledger or
+deduplicating: missing, duplicate, changed selector/version/status/destination
+or extra rows still refuse. This receipt comparison does **not** normalize any
+authenticated ownership-list bytes.
+
+The same authenticated sudo archive derives its original 2376-byte list with
+the reviewed `39fe94bd…` digest; C-sorting changes it to `92f90d6a…`, contradicting
+that pin. The consumer now validates the original list without sorting,
+replacing or changing its inode, just like the retained less/Python lists.
+Canonicalizing ledger row order is not permission to rewrite package inputs.
+
+That run's stopped database also leaves `sudo-rs` unpacked. The reviewed sudo
+fixture requires its already-existing registration and installed
+`sudo-rs:amd64 0.2.13-0ubuntu1.2`, but sudo only Recommends sudo-rs: an ordinary
+dpkg configure probe cannot establish that prestate requirement. Only a
+requested sudo capture therefore waits for this exact signed-closure companion
+to become installed through the unchanged ordinary scheduler. Sudo itself
+remains unpacked until capture. Missing or changed companion identities refuse;
+no dependencies are forced, statuses synthesized or script/proc authority
+added. Normal installs without the capture request retain their old order.
+
 The next signed stall is `libssl3t64 3.5.5-1ubuntu3.6 ↔
 openssl-provider-legacy 3.5.5-1ubuntu3.6`, not a coreutils or Python callback
 failure. Its two single-package pinned-dpkg dry runs refuse their unconfigured

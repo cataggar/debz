@@ -339,12 +339,27 @@ class ProtectedCiScriptTests(unittest.TestCase):
                     changed[path] = changed[path].replace(read, read + mutation, 1)
                     self.assertTrue(any("retain authenticated original bytes without rewriting" in failure
                                         for failure in audit.protected_reference_ci_failures(changed)))
+        path = "tools/real-snapshot-signed-proc-prestates.sh"
+        read = 'require_protected_file "$list"\n'
+        for mutation in ('LC_ALL=C sort -- "$list" >"$list.sorted"\n',
+                         'mv -- "$list.sorted" "$list"\n',
+                         'printf changed >"$list"\n'):
+            with self.subTest(path=path, mutation=mutation):
+                changed = dict(texts)
+                self.assertIn(read, changed[path])
+                changed[path] = changed[path].replace(read, read + mutation, 1)
+                self.assertTrue(any("retain authenticated original bytes without rewriting" in failure
+                                    for failure in audit.protected_reference_ci_failures(changed)))
 
     def test_receipt_and_python_premutation_guards_cannot_be_removed(self) -> None:
         audit = load("debz_receipt_python_guards", "security-audit.py")
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
         self.assertEqual(audit.protected_reference_ci_failures(texts), [])
         for path, token in (
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")\n'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '[[ $actual_record == "$expected_record" ]] || {\n'),
             ("tools/prepare-native-dpkg.py", "    verify_extracted_bindings(prefix, architecture)\n"),
             ("tools/prepare-native-dpkg.py", "    verify_archive_metadata(archive, architecture)\n"),
             ("tools/real-snapshot-reference-protected-stage.sh", "module.receipt_from_extracted_archive(\n"),

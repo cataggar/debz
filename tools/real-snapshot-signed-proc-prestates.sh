@@ -292,8 +292,12 @@ rm -rf --one-file-system -- "$root" "$build/tmp"
 expected_record=$(printf '%s\t%s\t%s\n' \
   systemd:amd64 '259.5-0ubuntu3.4 install ok half-configured' "$prestates/systemd" \
   udev:amd64 '259.5-0ubuntu3.4 install ok half-configured' "$prestates/udev" \
-  sudo:amd64 '1.9.17p2-1ubuntu3.1 install ok unpacked' "$prestates/sudo")
-[[ $(cat "$prestates/prestates.tsv") == "$expected_record" ]]
+  sudo:amd64 '1.9.17p2-1ubuntu3.1 install ok unpacked' "$prestates/sudo" | LC_ALL=C sort)
+actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")
+[[ $actual_record == "$expected_record" ]] || {
+  echo "signed prestate record differs from exact requested selectors/statuses/destinations" >&2
+  exit 1
+}
 
 require_control() { # root name:size:mode:sha256
   local name size mode digest file
@@ -324,18 +328,13 @@ require_prestate udev '259.5-0ubuntu3.4 install ok half-configured' \
 require_prestate sudo '1.9.17p2-1ubuntu3.1 install ok unpacked' \
   'var/lib/dpkg/info/sudo.postinst:1747:755:fd4c65932ab3ab7ce90c3633c42b8ee7a36af2c8292142d6e0cd134dda4c6383'
 
-# Pinned dpkg writes sudo.list in extraction order, symbolic links last; the
-# signed sudo binding pins the native engine's C-sorted list. Only the order
-# changes: the pinned digest proves the sorted list is the exact path set.
+# The signed sudo binding pins the original archive-derived ownership bytes.
 list=$prestates/sudo/var/lib/dpkg/info/sudo.list
 require_protected_file "$list"
 [[ $(stat -c '%u:%g:%a:%h' "$list") == 0:0:644:1 ]]
-LC_ALL=C sort -- "$list" >"$list.sorted"
-chmod 0644 "$list.sorted"
-mv -- "$list.sorted" "$list"
-# The pre-sudo record is sudo-rs's registration before sudo's postinst.
 require_control "$prestates/sudo" \
   'var/lib/dpkg/info/sudo.list:2376:644:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8'
+# The pre-sudo record is sudo-rs's registration before sudo's postinst.
 require_control "$prestates/sudo" \
   'var/lib/dpkg/alternatives/sudo:464:644:4f50d77a8e6f76e51745762486caec36324433ea7b09aac48274624c70e46da6'
 [[ $(dpkg-query --admindir="$prestates/sudo/var/lib/dpkg" -W \

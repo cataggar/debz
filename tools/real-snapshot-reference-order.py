@@ -61,6 +61,7 @@ OPENSSL_CYCLE = (
      "libc6 (>= 2.14)"),
 )
 OPENSSL_CYCLE_PROFILE = "openssl_cycle"
+SUDO_PRESTATE_COMPANION = ("sudo-rs", "0.2.13-0ubuntu1.2", "amd64")
 MAINTAINER_SCRIPTS = ("preinst", "postinst", "prerm", "postrm", "config")
 LIBGCC_TRIGGERS = b"# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"
 
@@ -886,6 +887,13 @@ def install(
     selectors = {package.selector for package in packages}
     if any(selector not in selectors for selector in targets):
         raise ValueError("prestate package is not in the verified closure")
+    if "sudo:amd64" in targets:
+        name, version, companion_architecture = SUDO_PRESTATE_COMPANION
+        companions = [package for package in packages if package.name == name]
+        if len(companions) != 1 or (
+            companions[0].version, companions[0].architecture,
+        ) != (version, companion_architecture):
+            raise ValueError("signed sudo prestate requires its exact reviewed sudo-rs companion")
     pending = packages[:]
     unpacked: list[Package] = []
     configured: set[tuple[str, str]] = set()
@@ -943,7 +951,17 @@ def install(
             profile = package.name if package.name in PROFILE_VERSIONS else "none"
             if profile != "none" and package.version != PROFILE_VERSIONS[profile]:
                 raise ValueError(f"unauthorized reference script version: {package.selector}")
-            prestate = targets.pop(package.selector, None)
+            prestate = targets.get(package.selector)
+            if prestate is not None and package.selector == "sudo:amd64":
+                name, version, companion_architecture = SUDO_PRESTATE_COMPANION
+                key = name, companion_architecture
+                companion_state = database_packages(root).get(key)
+                if companion_state != ("install ok installed", version):
+                    if key in configured or (companion_state is not None and companion_state[1] != version):
+                        raise ValueError("signed sudo prestate companion state/version changed")
+                    deferred.append(package.selector)
+                    continue
+            targets.pop(package.selector, None)
             operation = "configure"
             if prestate is not None:
                 capture_prestate(
