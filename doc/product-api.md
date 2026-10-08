@@ -45,6 +45,8 @@ versions, algorithms, malformed identities and unknown members, and checks
 frozen decision shape/deadlines. Existing results without the optional member
 remain valid; other operations' output bytes are unchanged. Consumers must
 check the full evidence rather than treating the human `detail` as a digest.
+Refresh evidence remains command.v1-only. Native baseline download command.v2
+retains its existing document budget and validation and cannot carry this member.
 
 ## CLI
 
@@ -61,6 +63,24 @@ The nested `debz repo add` command is not a product API v1 operation. It uses
 the separate versioned `debz.repository_api` surface documented in
 [Repository management API](repository-management.md), preserving every
 product API v1 request, result, schema, exit meaning, and host-root denial.
+
+Repository add now also publishes a root-scoped active configuration. The
+separate read-only [`system_product_context`](target-apt-config.md#typed-system-product-context)
+resolver exposes its verified snapshot and core system path defaults. It
+does not reinterpret empty v1 options, authorize host mutation, or make
+`debz install symcrypt[-openssl]` a working short command. Exact locks,
+confirmation, backend/capability selection, and existing explicit
+plan/review/replay remain unchanged.
+
+Explicit product `plan --lock-output` can now preserve a healthy
+installed-only exact package absent from signed repository metadata. Such
+plans emit the root-bound **v4 baseline envelope** described in
+[Exact closure locks](exact-locks-and-provenance.md#installed-only-baseline-v4-planning-and-native-no-op-execution).
+Exact plan replay verifies the actual complete database prestate; changed or
+missing metadata refuses. Local facts never become archive authority. Explicit
+native selection supports bounded retained-baseline no-op execution/recovery
+and read-only download/cache preparation; legacy v4 execution/download/cache
+still refuse. Existing archive-only v1/v3 plans retain their formats.
 
 The proposed apt-shaped system facade likewise has a separate
 `debz.apt_system_api` contract and trusted profile. It does not add
@@ -376,11 +396,58 @@ Package-cache JSON schemas are:
 - [`package-cache-fingerprint-v3.json`](../schema/package-cache-fingerprint-v3.json)
 - [`package-cache-fingerprint-v4.json`](../schema/package-cache-fingerprint-v4.json)
 - [`package-cache-fingerprint-v5.json`](../schema/package-cache-fingerprint-v5.json)
+- [`package-cache-fingerprint-v6.json`](../schema/package-cache-fingerprint-v6.json)
 - [`package-cache-result-v1.json`](../schema/package-cache-result-v1.json)
 - [`package-cache-result-v2.json`](../schema/package-cache-result-v2.json)
 - [`package-cache-result-v3.json`](../schema/package-cache-result-v3.json)
 - [`package-cache-result-v4.json`](../schema/package-cache-result-v4.json)
 - [`package-cache-result-v5.json`](../schema/package-cache-result-v5.json)
+- [`package-cache-result-v6.json`](../schema/package-cache-result-v6.json)
+
+Native v4 download uses [`command-result-v2.json`](../schema/command-result-v2.json)
+with the complete baseline no-op contract and exact signed archive counts.
+It cannot run callbacks or fetch the private baseline. Native v4 package-cache
+results/fingerprints use API v6 and root/component-specific cache keys; export
+uses archive format v4. Active owned work and drift refuse before cache
+preparation/publication. Completed execution generations are not implicitly
+adopted by these read-only entrypoints. Legacy/default behavior is unchanged.
+Native download without `lock_input_path` can generate the v4 envelope under
+the existing non-mutating installed-baseline planning policy, with exclusions
+and frozen actual-root observations taken before repository refresh. An optional
+`lock_output_path` publishes it; the complete canonical envelope is always
+present in successful typed v4 download evidence. Existing signed-only v3
+results remain command.v1. This does not select a default backend, authorize
+execution, or provide durable auto-lock/retry orchestration.
+
+Fresh v4 generation currently supports already published native archive
+identities. The opted-in `signed_sha256_derived_sha512` path refuses with
+`lock_verification_failed` / `InstalledBaselineImplicitBindingUnsupported`
+before persistent cache, lock output or package acquisition; an already bound
+exact v4 input remains supported. Derivation needs a separate pre-acquisition
+complete-envelope resource admission contract, not a fabricated digest.
+
+Command.v2 shares the existing **4 MiB (4,194,304 encoded bytes)** and
+**4,096 result items** limits with the command decoder and subprocess transport.
+Before persistent repository-cache creation/publication, lock-output publication,
+or package archive acquisition, download counts a complete canonical admission envelope:
+all original baseline facts, headers, escaped strings, newline, the entire
+locked archive closure and captured installed-database item candidates, the
+longest solver action label, and a legal download/reuse partition with maximum
+decimal width. This deliberately reserves both candidate sets rather than
+predicting a solver result or future CAS hits; it can refuse a near-limit request
+whose eventual result would be smaller. Existing exact-v4 requests admit before
+repository refresh. Fresh requests first authenticate metadata in a bounded
+non-publishing view (including revalidation of existing cache objects); its
+pending bytes, keys and records together may not exceed the existing metadata
+object byte cap. The count uses the same writer as actual
+serialization, without allocating another serialized baseline document. An
+over-budget request returns the ordinary `planning_failed` / `DocumentTooLarge`
+diagnostic before that work; it never truncates facts or changes result items.
+Actual v2 encoding also enforces the same budget. The component observation
+limit of 100,000 files does **not** promise that every such component fits this
+command-result byte budget. Cache format v6 and archive format v4 retain their
+own existing bounds.
+
 - [`package-cache-error-v1.json`](../schema/package-cache-error-v1.json)
 
 Their successful outputs include the canonical lock digest, CLI-owned

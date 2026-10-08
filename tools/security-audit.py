@@ -1485,6 +1485,17 @@ def audit_production_sources() -> None:
                 line = text.count("\n", 0, match.start()) + 1
                 fail(f"{relative}:{line}: forbidden {reason}")
         for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
+            if relative == "src/production_backend.zig":
+                fixture_start = text.find('\ntest "production native baseline signed batch receipt zero-op replay and owned process crash"')
+                fixture_end = text.find('\ntest "', fixture_start + 1)
+                if (
+                    fixture_start >= 0
+                    and fixture_start < match.start() < fixture_end
+                    and text.count("std.process.run(") == 1
+                    and '.argv = &.{"/proc/self/exe"}' in text[fixture_start:fixture_end]
+                    and "CompletionPoint.after_native_receipt" in text[fixture_start:fixture_end]
+                ):
+                    continue
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(r"\blinux\.(?:fork|clone2|execve|chroot)\s*\(", text):
             if relative == "src/native_unpack.zig" and match.group() == "linux.fork(":

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/exact-closure-lock-v4",
+  "title": "Planning-only exact archive closure and installed database no-op baseline",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["payload", "digest_sha512"],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "version", "backend", "usage", "archive_lock_json", "installed_baseline"],
+      "properties": {
+        "schema": {"const": "https://debz.dev/schema/exact-closure-lock-v4"},
+        "version": {"const": 4},
+        "backend": {"enum": ["legacy_dpkg", "native"]},
+        "usage": {"const": "planning_only"},
+        "archive_lock_json": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact canonical v3 archive-lock JSON, decoded and validated separately; no baseline tuple is an archive."
+        },
+        "installed_baseline": {"$ref": "#/$defs/baseline"}
+      }
+    },
+    "digest_sha512": {"$ref": "#/$defs/sha512"}
+  },
+  "$defs": {
+    "sha512": {"type": "string", "pattern": "^[0-9a-f]{128}$"},
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "root_path", "root_device", "root_inode", "root_uid", "root_gid", "root_mode", "native_architecture", "database_identity", "packages"],
+      "properties": {
+        "authority": {"const": "installed_database_noop_v1"},
+        "root_path": {"type": "string", "pattern": "^/", "maxLength": 4096},
+        "root_device": {"type": "integer", "minimum": 0},
+        "root_inode": {"type": "integer", "minimum": 0},
+        "root_uid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "root_gid": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "root_mode": {"type": "integer", "minimum": 0, "maximum": 4095},
+        "native_architecture": {"type": "string", "minLength": 1, "maxLength": 64},
+        "database_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "value"],
+          "properties": {
+            "algorithm": {"const": "sha512"},
+            "value": {"$ref": "#/$defs/sha512"}
+          }
+        },
+        "packages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "version", "architecture", "selection"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1, "maxLength": 255},
+              "version": {"type": "string", "minLength": 1, "maxLength": 4096},
+              "architecture": {"type": "string", "minLength": 1, "maxLength": 64},
+              "selection": {"enum": ["install", "hold"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}

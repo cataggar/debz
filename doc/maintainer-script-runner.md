@@ -658,6 +658,35 @@ post-launch proof failure requires durable recovery. The managed checkpoint
 includes that one changed file. This does not admit `--auto` with an
 absolute name elsewhere or the signed script's upgrade branch.
 
+### Resolute arm64 Python input-binding prerequisite (#393)
+
+The inner Python preinst verifier selects an exact **target-architecture**
+binding for the current `20261001T000000Z` resolute snapshot. Both `python3`
+and `python3-minimal` are version `3.14.3-0ubuntu2`; their archive sizes are
+22,938 and 25,808 bytes on both architectures, but their SHA-512 identities
+are different. Relabeling an amd64 archive as arm64 does not authorize it.
+Missing or duplicate archives, another version or architecture, changed
+size/digest, and missing authenticated-repository origin refuse.
+
+The `arm64` tool inputs are the signed 133,864-byte `dash`
+(`0.5.12-12ubuntu3`) and 68,224-byte `usr/bin/gnurm`
+(`gnu-coreutils` `9.7-3ubuntu2.1`). `gnurm` is extracted from the signed
+archive, not locally compiled. Their separate file identities and archive
+provenance are recorded in `tools/fixtures/real-snapshot/pin-v1.json`.
+The authenticated arm64 Python preinst and both derived ownership lists
+match the existing amd64 bytes, sizes and modes exactly; those three
+identities explicitly record both archive provenances, not invented variants.
+The verifier retains the existing root, argv, script/path, alias, shadow,
+empty-proc, metadata and `/dev/null` prestate/witness requirements.
+
+**This is an input-binding prerequisite, not arm64 execution admission.**
+The outer Python/script guards remain fail-closed on arm64. The retained
+protected arm64 reference proof explicitly refuses the amd64-only signed
+proc profiles and does not prove these snapshot script callbacks. Protected
+arm64 script/tool behavior and any needed proc/debconf profiles must be
+proved before enabling them under #393. A fresh native arm64 closure and
+exact final verification remain separate #262 acceptance gates.
+
 ## Outcome taxonomy
 
 `MaintainerScriptOutcome` keeps every result exactly distinguishable:

@@ -129,6 +129,7 @@ pub const Policy = struct {
     retry: acquisition.RetryPolicy = .{},
     credentials: acquisition.CredentialsProvider = .none,
     cache_lock: LockPolicy = .fail_fast,
+    publish_hooks: PublishHooks = .{},
 };
 
 pub const Request = struct {
@@ -716,7 +717,7 @@ pub fn acquirePackage(
         declared_size,
         downloaded.bytes,
         request.policy.cache_lock,
-        .{},
+        request.policy.publish_hooks,
     );
     const owned = downloaded.bytes;
     downloaded.bytes = &.{};
@@ -1385,6 +1386,23 @@ test "package_acquisition.test.signed SHA256 binding checks the derived SHA512 o
     var genuine_for_wrong: TestTransport = .{ .responses = &.{.{ .body = payload }} };
     try std.testing.expectError(error.DerivedDigestMismatch, acquirePackage(allocator, &cache, request, genuine_for_wrong.dependencies()));
     request.exact_lock_v3_package = locked;
+    request.policy = testPolicy(.cache_only);
+    try std.testing.expectError(error.CacheMiss, acquirePackage(allocator, &cache, request, offline.dependencies()));
+
+    const Gate = struct {
+        calls: usize = 0,
+        fn staged(context: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            return error.InstalledBaselineChanged;
+        }
+    };
+    var gate: Gate = .{};
+    request.policy = testPolicy(.online);
+    request.policy.publish_hooks = .{ .context = &gate, .stagedFn = Gate.staged };
+    var gated_transport: TestTransport = .{ .responses = &.{.{ .body = payload }} };
+    try std.testing.expectError(error.InstalledBaselineChanged, acquirePackage(allocator, &cache, request, gated_transport.dependencies()));
+    try std.testing.expectEqual(@as(usize, 1), gate.calls);
     request.policy = testPolicy(.cache_only);
     try std.testing.expectError(error.CacheMiss, acquirePackage(allocator, &cache, request, offline.dependencies()));
 
