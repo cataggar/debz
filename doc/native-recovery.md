@@ -409,6 +409,12 @@ obsolete intermediate states; managed-state verification still runs first.
 Absent-postinst handlers journal only their database transition, never a
 fabricated script outcome. Restart continues the remaining handler database
 phases without reusing completed phase identities.
+Consuming a completed database phase does not establish live pending-name
+order: scriptless completion preserves other handlers' imported names.
+Live order requires a normalization-specific preparation and its successful,
+checkpoint-bound publication, as described in [native triggers](native-triggers.md).
+Existing generic preparations remain generic; journal schemas and stages are
+unchanged, and a preparation without completed publication is not proof.
 Deferred awaited removal follows the same rule: once the helper queue is
 incorporated, replay accounts for its completed database phase even though
 `Unincorp` is empty. The next phase publishes the independently derived

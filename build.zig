@@ -1204,6 +1204,8 @@ pub fn build(b: *std.Build) void {
     native_lifecycle_step.dependOn(&lifecycle_zig.step);
     b.step("test-native-lifecycle-zig", "Run Zig-owned lifecycle and diversion acceptance against dpkg")
         .dependOn(&lifecycle_zig.step);
+    if (b.option(bool, "native-dpkg-query-only", "Select pinned dpkg-query status compatibility cases") orelse false)
+        lifecycle_zig.addArg("--dpkg-query-only");
     const root_import_module = b.createModule(.{
         .root_source_file = b.path("test/native_root_import.zig"),
         .target = target,
@@ -1225,6 +1227,10 @@ pub fn build(b: *std.Build) void {
         .name = "native-root-import-acceptance",
         .root_module = root_import_module,
     });
+    const root_import_unit_step = b.step("test-native-root-import-unit", "Run unprivileged root-import model tests and compile its acceptance fixture");
+    root_import_unit_step.dependOn(&run_root_import_tests.step);
+    root_import_unit_step.dependOn(&run_root_import_capture_tests.step);
+    root_import_unit_step.dependOn(&root_import_executable.step);
     const root_import = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
@@ -1282,6 +1288,10 @@ pub fn build(b: *std.Build) void {
     trigger_oracle_zig.step.dependOn(&run_trigger_zig_tests.step);
     b.step("test-native-triggers-zig-oracle", "Run trigger and settlement reference scenarios in two guarded dpkg roots")
         .dependOn(&trigger_oracle_zig.step);
+    if (b.option(bool, "native-trigger-byte-order-only", "Select exact status and triggered argv byte-order cases") orelse false) {
+        trigger_zig.addArg("--byte-order-only");
+        trigger_oracle_zig.addArg("--byte-order-only");
+    }
     const settlement_oracle_zig = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
@@ -1498,6 +1508,11 @@ pub fn build(b: *std.Build) void {
         .name = "native-recovery-helper-zig-acceptance",
         .root_module = recovery_helper_module,
     });
+    const order_fixture_build = b.step("build-native-order-fixtures-zig", "Compile status-order and trigger-replay fixtures without running privileged acceptance");
+    order_fixture_build.dependOn(&root_import_executable.step);
+    order_fixture_build.dependOn(&lifecycle_zig_executable.step);
+    order_fixture_build.dependOn(&trigger_zig_executable.step);
+    order_fixture_build.dependOn(&recovery_helper_executable.step);
     const recovery_helper = b.addSystemCommand(&.{
         "sudo",                                         "-n",                                                     "env",
         b.fmt("TMPDIR={s}", .{b.pathFromRoot(".tmp")}), b.fmt("XDG_CACHE_HOME={s}", .{b.pathFromRoot(".cache")}),
@@ -1505,6 +1520,8 @@ pub fn build(b: *std.Build) void {
     recovery_helper.addArtifactArg(recovery_helper_executable);
     recovery_helper.addArtifactArg(native_lifecycle_tests);
     if (native_script_failure_only or native_core_only) recovery_helper.addArg("--script-failure-only");
+    if (b.option(bool, "native-trigger-recovery-order-only", "Select imported pending trigger order crash/replay cases") orelse false)
+        recovery_helper.addArg("--trigger-pending-order-only");
     b.step("test-native-recovery-helper-zig", "Run Zig-owned real-process crash and helper acceptance")
         .dependOn(&recovery_helper.step);
 
