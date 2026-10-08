@@ -545,8 +545,9 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.assertEqual(sorted(output.splitlines()), [b"stderr witness", b"stdout witness"])
         self.assertEqual(list(evidence.iterdir()), [])
 
-    def cycle_fixture(self) -> tuple[tuple, dict, dict]:
-        fixture = json.loads((TOOLS / "fixtures/real-snapshot/base-cycle-controls-v1.json").read_text())
+    def cycle_fixture(self, openssl: bool = False) -> tuple[tuple, dict, dict]:
+        filename = "openssl-cycle-controls-v1.json" if openssl else "base-cycle-controls-v1.json"
+        fixture = json.loads((TOOLS / "fixtures/real-snapshot" / filename).read_text())
         packages = []
         records, controls = {}, {}
         for index, entry in enumerate(fixture["packages"]):
@@ -563,9 +564,11 @@ class ReferenceLauncherTests(unittest.TestCase):
                 entries = {"./control": "".join(
                     f"{key}: {value}\n" for key, value in fields.items()
                 ).encode()}
-                if index == 1:
+                if (openssl and index == 0) or (not openssl and index == 1):
                     entries.update({".": b"", "./md5sums": b"", "./shlibs": b"",
                                     "./symbols": b"", "./triggers": ORDER.LIBGCC_TRIGGERS})
+                elif openssl and index == 1:
+                    entries.update({".": b"", "./md5sums": b""})
                 for name, content in entries.items():
                     member = tarfile.TarInfo(name)
                     member.size = len(content)
@@ -576,7 +579,8 @@ class ReferenceLauncherTests(unittest.TestCase):
         (self.root / "var/lib/dpkg/triggers").mkdir()
         (self.root / "var/lib/dpkg/updates").mkdir()
         (self.root / "var/lib/dpkg/status").write_bytes(b"synthetic unit fixture only\n")
-        (info / "libgcc-s1:amd64.triggers").write_bytes(ORDER.LIBGCC_TRIGGERS)
+        trigger = "libssl3t64" if openssl else "libgcc-s1"
+        (info / f"{trigger}:amd64.triggers").write_bytes(ORDER.LIBGCC_TRIGGERS)
         return tuple(packages), records, controls
 
     def pending_oracle_fixture(self, stderr: bytes, *, returncode: int = 1,
@@ -836,6 +840,196 @@ class ReferenceLauncherTests(unittest.TestCase):
                 ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
                               self.root / "cache", self.root, "amd64")
         breaker.assert_called_once()
+
+    def test_openssl_operation_refuses_different_selectors_archives_and_profiles(self) -> None:
+        cycle, _, _ = self.cycle_fixture(openssl=True)
+        command = ORDER.dpkg_command(
+            self.root / "launcher", self.root / "dpkg", self.root, "amd64",
+            "openssl_cycle", "configure_openssl_cycle", cycle[0], cycle,
+        )
+        self.assertEqual(command[3:7],
+                         ["amd64", "openssl_cycle", "configure_openssl_cycle", "libssl3t64:amd64"])
+        for architecture, profile, selected, archives in (
+            ("arm64", "openssl_cycle", cycle[0], cycle),
+            ("amd64", "none", cycle[0], cycle),
+            ("amd64", "sudo", cycle[0], cycle),
+            ("amd64", "openssl_cycle", cycle[1], cycle),
+            ("amd64", "openssl_cycle", cycle[0], cycle[:2]),
+            ("amd64", "openssl_cycle", cycle[0], (*cycle[1:], cycle[0])),
+        ):
+            with self.subTest(architecture=architecture, profile=profile, selected=selected.name):
+                with self.assertRaises(ORDER.CycleRefusal):
+                    ORDER.dpkg_command(
+                        self.root / "launcher", self.root / "dpkg", self.root, architecture,
+                        profile, "configure_openssl_cycle", selected, archives,
+                    )
+        changed = ORDER.Package(cycle[0].name, cycle[0].version, "amd64",
+                                "0" * 128, cycle[0].size, cycle[0].archive)
+        with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleIdentityChanged"):
+            ORDER.openssl_cycle_packages([changed, *cycle[1:]], "amd64")
+
+    def test_openssl_cycle_refuses_graph_callbacks_triggers_and_outside_state_before_apply(self) -> None:
+        cycle, records, controls = self.cycle_fixture(openssl=True)
+        def run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, controls[command[2]], b"")
+        with (mock.patch.object(ORDER, "verify_archive"),
+              mock.patch.object(ORDER, "database_fields", return_value=records),
+              mock.patch.object(ORDER.subprocess, "run", side_effect=run),
+              mock.patch.object(ORDER, "apply") as applied):
+            self.assertEqual(ORDER.verify_openssl_cycle(self.root, cycle)["callbacks"], [])
+            for name, field, changed, reason in (
+                ("libssl3t64", "depends", "unknown-package", "CycleControlChanged"),
+                ("openssl-provider-legacy", "pre-depends", "libssl3t64", "CycleControlChanged"),
+                ("libc6", "status", "install ok unpacked", "CycleOutsideDependency"),
+                ("libzstd1", "version", "other", "CycleStateChanged"),
+                ("zlib1g", "conflicts", "", "CycleControlChanged"),
+                ("openssl-provider-legacy", "multi-arch", "same", "CycleControlChanged"),
+                ("libssl3t64", "triggers-pending", "ldconfig", "CycleCallbackChanged"),
+                ("openssl-provider-legacy", "config-version", "other", "CycleCallbackChanged"),
+            ):
+                record = records[(name, "amd64")]
+                saved = dict(record)
+                record[field] = changed
+                with self.subTest(name=name, field=field):
+                    with self.assertRaisesRegex(ORDER.CycleRefusal, reason):
+                        ORDER.configure_openssl_cycle(
+                            self.root / "launcher", self.root / "dpkg", self.root, self.root,
+                            "amd64", list(cycle), {}, self.root / "out", self.root / "err",
+                        )
+                record.clear()
+                record.update(saved)
+            for name in ("libssl3t64.postinst", "libssl3t64:amd64.postinst",
+                         "openssl-provider-legacy.postinst", "openssl-provider-legacy:amd64.config",
+                         "openssl-provider-legacy:amd64.triggers"):
+                path = self.root / "var/lib/dpkg/info" / name
+                path.symlink_to("/does-not-exist")
+                with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                    ORDER.verify_openssl_cycle(self.root, cycle)
+                path.unlink()
+            activation = self.root / "var/lib/dpkg/info/libssl3t64:amd64.triggers"
+            activation.write_bytes(b"activate ldconfig\n")
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                ORDER.verify_openssl_cycle(self.root, cycle)
+            activation.write_bytes(ORDER.LIBGCC_TRIGGERS)
+            archive = io.BytesIO()
+            with tarfile.open(fileobj=archive, mode="w") as output:
+                script = tarfile.TarInfo("./postinst")
+                script.size = 7
+                output.addfile(script, io.BytesIO(b"callback"))
+                with tarfile.open(fileobj=io.BytesIO(controls[str(cycle[1].archive)])) as original:
+                    for member in original:
+                        output.addfile(member, original.extractfile(member))
+            controls[str(cycle[1].archive)] = archive.getvalue()
+            with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleCallbackChanged"):
+                ORDER.verify_openssl_cycle(self.root, cycle)
+            applied.assert_not_called()
+
+    def test_openssl_transition_requires_both_refusals_and_exact_two_package_progress(self) -> None:
+        cycle, records, _ = self.cycle_fixture(openssl=True)
+        before = {"records": records, "callbacks": [], "graph": {}, "trigger_database": {},
+                  "force": []}
+        after = {key: dict(value) for key, value in records.items()}
+        for package in cycle[:2]:
+            after[(package.name, "amd64")]["status"] = "install ok installed"
+        def probe(command, *_):
+            peer = cycle[1] if command[6] == cycle[0].selector else cycle[0]
+            return 1, f"dependency problems: Package {peer.selector} is not configured yet.".encode()
+        with (mock.patch.object(ORDER, "verify_openssl_cycle", return_value=before),
+              mock.patch.object(ORDER, "probe", side_effect=probe),
+              mock.patch.object(ORDER, "database_fields", return_value=after),
+              mock.patch.object(ORDER, "trigger_database", return_value={}),
+              mock.patch.object(ORDER, "apply") as applied):
+            self.assertEqual(ORDER.configure_openssl_cycle(
+                self.root / "launcher", self.root / "dpkg", self.root, self.root, "amd64",
+                list(cycle), {}, self.root / "out", self.root / "err",
+            ), cycle[:2])
+            evidence = json.loads((self.root / "openssl-cycle-after.json").read_text())
+            self.assertEqual(evidence["callbacks"], [])
+            self.assertEqual(evidence["force"], [])
+            for name in ("libssl3t64", "openssl-provider-legacy", "libc6"):
+                saved = dict(after[(name, "amd64")])
+                after[(name, "amd64")]["status"] = "install ok half-configured"
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
+                        ORDER.configure_openssl_cycle(
+                            self.root / "launcher", self.root / "dpkg", self.root, self.root,
+                            "amd64", list(cycle), {}, self.root / "out", self.root / "err",
+                        )
+                after[(name, "amd64")] = saved
+            with mock.patch.object(ORDER, "trigger_database", return_value={"ldconfig": {}}):
+                with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
+                    ORDER.configure_openssl_cycle(
+                        self.root / "launcher", self.root / "dpkg", self.root, self.root, "amd64",
+                        list(cycle), {}, self.root / "out", self.root / "err",
+                    )
+            applied.reset_mock()
+            for response in ((0, b""), (1, b"dependency problems: unknown-package")):
+                with mock.patch.object(ORDER, "probe", return_value=response):
+                    with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleProbeChanged"):
+                        ORDER.configure_openssl_cycle(
+                            self.root / "launcher", self.root / "dpkg", self.root, self.root,
+                            "amd64", list(cycle), {}, self.root / "out", self.root / "err",
+                        )
+            applied.assert_not_called()
+
+    def test_openssl_cycle_resumes_single_package_capture_and_never_repeats_authority(self) -> None:
+        cycle, _, _ = self.cycle_fixture(openssl=True)
+        extra = [ORDER.Package(n, v, "amd64", d, s, self.root / n)
+                 for n, v, s, d, _ in ORDER.BASE_CYCLE if n != "libc6"]
+        target = ORDER.Package("systemd", ORDER.PROFILE_VERSIONS["systemd"], "amd64",
+                               "a" * 128, 42, self.root / "systemd.deb")
+        packages = [*cycle, *extra, target]
+        phase = 0
+        def probe(command, *_):
+            if command[5] == "probe_unpack":
+                return 0, b""
+            if phase == 0 or command[6] in (cycle[0].selector, cycle[1].selector):
+                return 1, b"dependency problems"
+            if command[6] == target.selector and phase != 2:
+                return 1, b"dependency problems"
+            return 0, b""
+        def base_break(*_):
+            nonlocal phase
+            phase = 1
+            return extra[0]
+        def ssl_break(*_):
+            nonlocal phase
+            phase = 2
+            return cycle[:2]
+        with (mock.patch.object(ORDER, "packages_from_manifest", return_value=packages),
+              mock.patch.object(ORDER, "probe", side_effect=probe),
+              mock.patch.object(ORDER, "verify_archive"),
+              mock.patch.object(ORDER, "database_packages", return_value={
+                  (p.name, p.architecture): ("install ok unpacked", p.version) for p in packages}),
+              mock.patch.object(ORDER, "break_base_cycle", side_effect=base_break) as base,
+              mock.patch.object(ORDER, "configure_openssl_cycle", side_effect=ssl_break) as ssl,
+              mock.patch.object(ORDER, "apply") as applied,
+              mock.patch.object(ORDER, "capture_prestate") as capture):
+            ORDER.install(self.root / "launcher", self.root / "dpkg", self.root, self.root,
+                          self.root, "amd64", (ORDER.Prestate(
+                              target.selector, "half-configured", self.root / "saved"),))
+            base.assert_called_once()
+            ssl.assert_called_once()
+            capture.assert_called_once()
+            self.assertNotIn(target.selector, [c.args[0][6] for c in applied.call_args_list
+                                               if c.args[0][5] == "configure"])
+            phase = 0
+            base.reset_mock()
+            ssl.reset_mock()
+            with mock.patch.object(ORDER, "probe", side_effect=lambda command, *_:
+                                   (0, b"") if command[5] == "probe_unpack"
+                                   else (1, b"dependency problems")):
+                with self.assertRaisesRegex(ORDER.CycleRefusal, "CycleNoProgress"):
+                    ORDER.install(self.root / "launcher", self.root / "dpkg", self.root,
+                                  self.root, self.root, "amd64")
+            base.assert_called_once()
+            ssl.assert_called_once()
+            refusal = json.loads((self.root / "reference-no-progress.json").read_text())
+            self.assertTrue(refusal["base_cycle_applied"])
+            self.assertTrue(refusal["openssl_cycle_applied"])
+            self.assertIn(target.selector, refusal["deferred"])
+            self.assertEqual(bytes.fromhex(refusal["refusals"][0]["output_prefix_hex"]),
+                             b"dependency problems")
 
     def test_cycle_break_retries_normal_schedule_without_configuring_prestate_target(self) -> None:
         cycle, _, _ = self.cycle_fixture()

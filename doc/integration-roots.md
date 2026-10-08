@@ -716,9 +716,40 @@ It adds only `--force-depends` to the existing common dpkg flags and
 callback is authorized. The expected transition is only libgcc-s1
 unpacked → installed; all other status fields and trigger-database bytes must
 be unchanged. Normal unforced scheduling then resumes, preserving the signed
-systemd/udev half-configured and sudo unpacked capture semantics. A second
-stall refuses; neither bootstrap status registration nor trigger clearing is
+systemd/udev half-configured and sudo unpacked capture semantics. That authority
+is never reused; neither bootstrap status registration nor trigger clearing is
 performed.
+
+The next signed stall is `libssl3t64 3.5.5-1ubuntu3.6 ↔
+openssl-provider-legacy 3.5.5-1ubuntu3.6`, not a coreutils or Python callback
+failure. Its two single-package pinned-dpkg dry runs refuse their unconfigured
+peer. An exact two-package dry run succeeds without dependency force flags.
+Both signed control archives contain **no maintainer scripts**. This separate
+`configure_openssl_cycle` operation uses the `openssl_cycle` profile, only on
+amd64 after the base bridge at genuine no-progress. It rehashes the exact pair
+and the already-installed external dependencies (`libc6 2.43-2ubuntu2.4`,
+`libzstd1 1.5.7+dfsg-3`, `zlib1g
+1:1.3.dfsg+really1.3.1-1ubuntu3.1`), and checks their signed and installed hard
+graphs, states, absent callbacks and unchanged trigger database. The launcher
+independently checks the five archive identities and the installed graph
+inside the protected chroot. Its fixed argv is
+`--no-triggers --configure libssl3t64:amd64 openssl-provider-legacy:amd64`
+with the existing common flags only: **no new force flags, pending batch,
+arbitrary selectors, callback or proc authority**. Only the pair may transition
+unpacked → installed; the signed `activate-noawait ldconfig` registration is
+not executed or cleared. Normal single-package scheduling and prestate capture
+then resume. Any later stall refuses rather than reusing either authority.
+
+`openssl-cycle-refusals.json` retains both real dry-run refusals and
+`openssl-cycle-before.json` / `openssl-cycle-after.json` retain the bounded
+transition. `reference-no-progress.json` preserves the latest stalled selectors
+and bounded probe prefixes/digests, including on an unknown successor cycle.
+The checked-in graph fixture is projected from authenticated, rehashed archive
+controls; its statuses are unit-test input, not a bootstrap database.
+Nonprivileged exact-byte dry runs and unit tests do **not** prove protected
+script replay. Fresh hosted Debug/ReleaseSafe signed-proc runs and actual
+protected Python/ARM fixture dispatches remain required; optional PR-job skips
+do not satisfy those gates.
 
 The restored `signed-proc-protected-replay` job runs both Debug and ReleaseSafe,
 with the historical protected staging, non-skipped signed systemd/udev/sudo

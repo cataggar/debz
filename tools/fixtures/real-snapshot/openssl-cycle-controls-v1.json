@@ -1,0 +1,36 @@
+{
+  "schema": "io.github.cataggar.debz.openssl-cycle-controls.v1",
+  "source": "Hard-graph fields projected from the five rehashed signed archive ./control members in the authenticated 20261001T000000Z amd64 closure. Status values are test input, not root registration.",
+  "packages": [
+    {
+      "archive_sha512": "10df2f82619faff2ed4b890812313c35cd58abbfce858caf3403e1b654fac857bd7bc28e7a528a79a18ebfbfbdca5cffb3c2dd5b340c729fb7eb2470b76d528d",
+      "archive_size": 2364586,
+      "control": "Package: libssl3t64\nVersion: 3.5.5-1ubuntu3.6\nArchitecture: amd64\nDepends: libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy\nBreaks: libssl3 (<< 3.5.5-1ubuntu3.6), openssh-client (<< 1:9.4p1), openssh-server (<< 1:9.4p1), python3-m2crypto (<< 0.38.0-4)\nReplaces: libssl3\nProvides: libssl3 (= 3.5.5-1ubuntu3.6)\nMulti-Arch: same\n",
+      "status": "install ok unpacked"
+    },
+    {
+      "archive_sha512": "cbb4f55a609576d99a1b52952a674e78b2cbb7026e54c765cfd964812b65bdcdea4f5ea67961159b737fcba3093b3b15de8b7a6aff3bbf08a85805a09290c470",
+      "archive_size": 39690,
+      "control": "Package: openssl-provider-legacy\nVersion: 3.5.5-1ubuntu3.6\nArchitecture: amd64\nDepends: libc6 (>= 2.14), libssl3t64 (>= 3.0.3)\nBreaks: libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)\nReplaces: libssl3 (<< 3.3.1-5), libssl3t64 (<< 3.3.1-5)\nMulti-Arch: foreign\n",
+      "status": "install ok unpacked"
+    },
+    {
+      "archive_sha512": "e27873bec6e0a7914834eac85748c31a360b44b0f0e971a7cd70439c2f9804e737f8f6113f15bb7f523d7a5d4a336173b43a5e22d804c440c8a11a5530bc6696",
+      "archive_size": 2104056,
+      "control": "Package: libc6\nVersion: 2.43-2ubuntu2.4\nArchitecture: amd64\nDepends: libgcc-s1, libc-gconv-modules-extra (= 2.43-2ubuntu2.4)\nBreaks: base-files (<< 13.3~), dhcpcd (<< 1:10.1.0-7~), libamdhip64-5 (<< 5.7.1-5+b1), libhiprtc-builtins5 (<< 5.7.1-5+b1), librccl1 (<< 5.4.3-3build1), libswupdate0.1 (<< 2024.12.1+dfsg-1+b3), locales (<< 2.43), locales-all (<< 2.43), lua-swupdate (<< 2024.12.1+dfsg-1+b3), nscd (<< 2.43), pd-scaf (<< 1:0.14.1+darcs20180201-6build5), postgresql-15-pllua (<< 1:2.0.12-4), postgresql-17-pllua (<< 1:2.0.12-3+b2), python3-mrgingham (<< 1.25-1), python3-onnxruntime (<< 1.20.1+dfsg-2~), sysvinit (<< 3.09-2~), sysvinit-core (<< 3.09-2~), uwsgi-plugin-pypy3 (<< 0.0.2+b1)\nReplaces: libc6-amd64\nMulti-Arch: same\n",
+      "status": "install ok installed"
+    },
+    {
+      "archive_sha512": "284a44950a9caae10a6b7a06baead5db2d6dd2989fc01107c78c76ef5468cb489fc1a8e92d6cb84d44b5a371f8b1156bd2f5c232e79f1631dcf000a601e52183",
+      "archive_size": 308174,
+      "control": "Package: libzstd1\nVersion: 1.5.7+dfsg-3\nArchitecture: amd64\nDepends: libc6 (>= 2.34)\nMulti-Arch: same\n",
+      "status": "install ok installed"
+    },
+    {
+      "archive_sha512": "a0ad94daadd3099ee40766a62a42d3fa7f431c6d805e9108d1dde07d64bfe3e7da66a41a2294598917e5ef5435df7a239d011711dd6d18037bc9b61b530ed3d4",
+      "archive_size": 61612,
+      "control": "Package: zlib1g\nVersion: 1:1.3.dfsg+really1.3.1-1ubuntu3.1\nArchitecture: amd64\nDepends: libc6 (>= 2.14)\nConflicts: zlib1 (<= 1:1.0.4-7)\nBreaks: libxml2 (<< 2.7.6.dfsg-2), texlive-binaries (<< 2023.20230311.66589-8)\nProvides: libz1\nMulti-Arch: same\n",
+      "status": "install ok installed"
+    }
+  ]
+}

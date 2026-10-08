@@ -3436,6 +3436,7 @@ SIGNED_PROC_CI_STEPS = {
         "            tools/real-snapshot-signed-proc-prestates.sh \\",
         '            "$PWD/.real-snapshot/pinned-dpkg/usr/bin/dpkg" "$PWD/.real-snapshot/ws"',
         '          sudo -n test -s "$PWD/.real-snapshot/ws/prestate-build/evidence/base-cycle-proof/comparison.json"',
+        '          sudo -n test -s "$PWD/.real-snapshot/ws/prestate-build/evidence/openssl-cycle-after.json"',
     ),
     "Run pinned dpkg proofs on separate prestate copies": (
         "        working-directory: ${{ env.PROTECTED }}/checkout",
@@ -3490,6 +3491,10 @@ SIGNED_PROC_CI_STEPS = {
         '          test ! -e "$PROTECTED"',
         "                prestate-build/evidence/base-cycle-before.json \\",
         "                prestate-build/evidence/base-cycle-after.json \\",
+        "                prestate-build/evidence/openssl-cycle-before.json \\",
+        "                prestate-build/evidence/openssl-cycle-after.json \\",
+        "                prestate-build/evidence/openssl-cycle-refusals.json \\",
+        "                prestate-build/evidence/reference-no-progress.json \\",
         "                prestate-build/evidence/base-cycle-proof/comparison.json \\",
     ),
     "Upload bounded signed replay evidence": (

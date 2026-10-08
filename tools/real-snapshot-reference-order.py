@@ -45,6 +45,22 @@ BASE_CYCLE = (
      "c385f1ca4f8054e59f977a38819e31d6f2429909ce0a88c734c874ce163851dfa7e565dded6c65c3feb3bc8cf074498b45a4c2226bb8e17a2bc8b95027a29692", ""),
 )
 BASE_CYCLE_PROFILE = "libgcc_cycle"
+OPENSSL_CYCLE = (
+    ("libssl3t64", "3.5.5-1ubuntu3.6", 2364586,
+     "10df2f82619faff2ed4b890812313c35cd58abbfce858caf3403e1b654fac857bd7bc28e7a528a79a18ebfbfbdca5cffb3c2dd5b340c729fb7eb2470b76d528d",
+     "libc6 (>= 2.38), libzstd1 (>= 1.5.5), zlib1g (>= 1:1.1.4), openssl-provider-legacy"),
+    ("openssl-provider-legacy", "3.5.5-1ubuntu3.6", 39690,
+     "cbb4f55a609576d99a1b52952a674e78b2cbb7026e54c765cfd964812b65bdcdea4f5ea67961159b737fcba3093b3b15de8b7a6aff3bbf08a85805a09290c470",
+     "libc6 (>= 2.14), libssl3t64 (>= 3.0.3)"),
+    BASE_CYCLE[0],
+    ("libzstd1", "1.5.7+dfsg-3", 308174,
+     "284a44950a9caae10a6b7a06baead5db2d6dd2989fc01107c78c76ef5468cb489fc1a8e92d6cb84d44b5a371f8b1156bd2f5c232e79f1631dcf000a601e52183",
+     "libc6 (>= 2.34)"),
+    ("zlib1g", "1:1.3.dfsg+really1.3.1-1ubuntu3.1", 61612,
+     "a0ad94daadd3099ee40766a62a42d3fa7f431c6d805e9108d1dde07d64bfe3e7da66a41a2294598917e5ef5435df7a239d011711dd6d18037bc9b61b530ed3d4",
+     "libc6 (>= 2.14)"),
+)
+OPENSSL_CYCLE_PROFILE = "openssl_cycle"
 MAINTAINER_SCRIPTS = ("preinst", "postinst", "prerm", "postrm", "config")
 LIBGCC_TRIGGERS = b"# Triggers added by dh_makeshlibs/13.31ubuntu1\nactivate-noawait ldconfig\n"
 
@@ -131,6 +147,15 @@ def dpkg_command(
     launcher: Path, dpkg: Path, root: Path, architecture: str, profile: str,
     verb: str, package: Package | None = None, cycle: tuple[Package, ...] = (),
 ) -> list[str]:
+    if verb == "configure_openssl_cycle":
+        if (architecture != "amd64" or profile != OPENSSL_CYCLE_PROFILE
+            or len(cycle) != len(OPENSSL_CYCLE) or package != cycle[0]
+            or any((p.name, p.version, p.architecture, p.size, p.digest) !=
+                   (name, version, "amd64", size, digest)
+                   for p, (name, version, size, digest, _) in zip(cycle, OPENSSL_CYCLE))):
+            raise CycleRefusal("CycleIdentityChanged: unauthorized OpenSSL cycle operation")
+        return [str(launcher), str(root), str(dpkg), architecture, profile, verb,
+                package.selector, *(str(p.archive) for p in cycle)]
     if verb == "break_base_cycle":
         if (architecture != "amd64" or profile != BASE_CYCLE_PROFILE
             or len(cycle) != len(BASE_CYCLE) or package != cycle[1]
@@ -410,6 +435,121 @@ def break_base_cycle(
         "records": list(after.values()),
     }, sort_keys=True) + "\n")
     return cycle[1]
+
+
+def openssl_cycle_packages(packages: list[Package], architecture: str) -> tuple[Package, ...]:
+    if architecture != "amd64":
+        raise CycleRefusal("UnknownCycle: no reviewed OpenSSL cycle for this architecture")
+    cycle = []
+    for name, version, size, digest, _ in OPENSSL_CYCLE:
+        matches = [p for p in packages if p.name == name]
+        if (len(matches) != 1 or
+            (matches[0].version, matches[0].architecture, matches[0].size, matches[0].digest)
+                != (version, "amd64", size, digest)):
+            raise CycleRefusal(f"CycleIdentityChanged: {name}")
+        cycle.append(matches[0])
+    return tuple(cycle)
+
+
+def verify_openssl_cycle(root: Path, cycle: tuple[Package, ...]) -> dict:
+    records = database_fields(root)
+    triggers_before = trigger_database(root)
+    graph = {}
+    for index, (package, binding) in enumerate(zip(cycle, OPENSSL_CYCLE)):
+        try:
+            verify_archive(package)
+        except (ValueError, OSError) as error:
+            raise CycleRefusal(f"CycleIdentityChanged: {package.name}: {error}") from error
+        result = subprocess.run(
+            ["dpkg-deb", "--ctrl-tarfile", str(package.archive)],
+            env=oracle_environment(), stdin=subprocess.DEVNULL, capture_output=True,
+            check=True, timeout=30,
+        )
+        if len(result.stdout) > MAXIMUM_CONTROL_BYTES or result.stderr:
+            raise CycleRefusal("CycleControlChanged: oversized OpenSSL control archive")
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            control = archive.extractfile("./control")
+            if control is None:
+                raise CycleRefusal("CycleControlChanged: missing OpenSSL control")
+            fields, = control_fields(control.read(MAXIMUM_PROBE_OUTPUT + 1))
+            if index < 2:
+                expected_members = {".", "./control", "./md5sums"}
+                if index == 0:
+                    expected_members.update(("./shlibs", "./symbols", "./triggers"))
+                if {m.name for m in archive.getmembers()} != expected_members:
+                    raise CycleRefusal("CycleCallbackChanged: OpenSSL pair must have no scripts")
+                if index == 0 and archive.extractfile("./triggers").read() != LIBGCC_TRIGGERS:
+                    raise CycleRefusal("CycleCallbackChanged: OpenSSL trigger activation changed")
+        if (fields.get("package") != package.name or fields.get("version") != package.version
+            or fields.get("architecture") != "amd64" or fields.get("depends", "") != binding[4]
+            or fields.get("pre-depends", "")):
+            raise CycleRefusal(f"CycleControlChanged: signed OpenSSL graph: {package.name}")
+        installed = records.get((package.name, "amd64"))
+        expected = "install ok unpacked" if index < 2 else "install ok installed"
+        if installed is None or installed.get("version") != package.version:
+            raise CycleRefusal(f"CycleStateChanged: {package.name}")
+        if installed.get("status") != expected:
+            reason = "CycleStateChanged" if index < 2 else "CycleOutsideDependency"
+            raise CycleRefusal(f"{reason}: {package.name}")
+        for field in ("depends", "pre-depends", "provides", "conflicts", "breaks", "replaces",
+                      "multi-arch", "protected", "essential"):
+            if installed.get(field, "") != fields.get(field, ""):
+                raise CycleRefusal(f"CycleControlChanged: installed {package.name} {field}")
+        if any(installed.get(field) for field in ("triggers-pending", "triggers-awaited", "config-version")):
+            raise CycleRefusal(f"CycleCallbackChanged: {package.name} trigger state")
+        graph[package.name] = {"version": package.version, "archive_sha512": package.digest,
+                               "depends": binding[4], "pre_depends": "", "status": expected}
+    installed_triggers = read_root_file(root, "var/lib/dpkg/info/libssl3t64:amd64.triggers", 1024)
+    if installed_triggers != LIBGCC_TRIGGERS:
+        raise CycleRefusal("CycleCallbackChanged: installed OpenSSL trigger activation changed")
+    info = root / "var/lib/dpkg/info"
+    forbidden = ["libssl3t64.triggers", "openssl-provider-legacy.triggers",
+                 "openssl-provider-legacy:amd64.triggers"]
+    forbidden.extend(f"{name}.{script}" for name in (
+        "libssl3t64", "libssl3t64:amd64", "openssl-provider-legacy", "openssl-provider-legacy:amd64",
+    ) for script in MAINTAINER_SCRIPTS)
+    for name in forbidden:
+        path = info / name
+        if path.exists() or path.is_symlink():
+            raise CycleRefusal(f"CycleCallbackChanged: unexpected {name}")
+    return {"graph": graph, "records": records, "callbacks": [],
+            "trigger_database": triggers_before, "profile": OPENSSL_CYCLE_PROFILE, "force": []}
+
+
+def configure_openssl_cycle(
+    launcher: Path, dpkg: Path, root: Path, evidence: Path, architecture: str,
+    packages: list[Package], environment: dict[str, str], stdout: Path, stderr: Path,
+) -> tuple[Package, ...]:
+    cycle = openssl_cycle_packages(packages, architecture)
+    before = verify_openssl_cycle(root, cycle)
+    refusals = []
+    for package, peer in ((cycle[0], cycle[1]), (cycle[1], cycle[0])):
+        command = dpkg_command(launcher, dpkg, root, architecture, "none", "probe_configure", package)
+        status, output = probe(command, environment, evidence)
+        refusals.append({"argv": command[3:], "exit_status": status,
+                         "output": output.decode("utf-8", errors="replace")})
+        (evidence / "openssl-cycle-refusals.json").write_text(json.dumps(refusals, sort_keys=True) + "\n")
+        if (not status or b"dependency problems" not in output
+            or f"Package {peer.selector} is not configured yet.".encode() not in output):
+            raise CycleRefusal(f"CycleProbeChanged: {package.selector} did not refuse its exact peer")
+    (evidence / "openssl-cycle-before.json").write_text(json.dumps(
+        {**before, "records": list(before["records"].values())}, sort_keys=True,
+    ) + "\n")
+    command = dpkg_command(launcher, dpkg, root, architecture, OPENSSL_CYCLE_PROFILE,
+                           "configure_openssl_cycle", cycle[0], cycle)
+    apply(command, environment, stdout, stderr)
+    after = database_fields(root)
+    triggers_after = trigger_database(root)
+    expected = {key: dict(value) for key, value in before["records"].items()}
+    for package in cycle[:2]:
+        expected[(package.name, "amd64")]["status"] = "install ok installed"
+    if after != expected or triggers_after != before["trigger_database"]:
+        raise CycleRefusal("CycleNoProgress: database changed beyond the two reviewed OpenSSL transitions")
+    (evidence / "openssl-cycle-after.json").write_text(json.dumps({
+        "operation": command[3:], "callbacks": [], "force": [],
+        "trigger_database": triggers_after, "records": list(after.values()),
+    }, sort_keys=True) + "\n")
+    return cycle[:2]
 
 
 def stage_pending_runtime(baseline: Path, setpriv: Path) -> dict:
@@ -747,9 +887,11 @@ def install(
     stderr = evidence / "reference-install.stderr"
     probes = 0
     cycle_broken = False
+    openssl_configured = False
     while pending or unpacked:
         progressed = False
         deferred: list[str] = []
+        refusals = []
         for package in pending[:]:
             command = dpkg_command(launcher, dpkg, root, architecture, "none", "probe_unpack", package)
             probes += 1
@@ -760,6 +902,10 @@ def install(
                 if b"pre-dependency problem" not in output:
                     raise RuntimeError(f"reference dpkg unpack refused {package.selector}: {output[:4096]!r}")
                 deferred.append(package.selector)
+                refusals.append({"selector": package.selector, "operation": "probe_unpack",
+                                 "exit_status": status, "output_bytes": len(output),
+                                 "output_prefix_hex": output[:4096].hex(),
+                                 "output_sha512": hashlib.sha512(output).hexdigest()})
                 continue
             verify_archive(package)
             apply(
@@ -779,6 +925,10 @@ def install(
                 if b"dependency problems" not in output:
                     raise RuntimeError(f"reference dpkg configure refused {package.selector}: {output[:4096]!r}")
                 deferred.append(package.selector)
+                refusals.append({"selector": package.selector, "operation": "probe_configure",
+                                 "exit_status": status, "output_bytes": len(output),
+                                 "output_prefix_hex": output[:4096].hex(),
+                                 "output_sha512": hashlib.sha512(output).hexdigest()})
                 continue
             current = database_packages(root).get((package.name, package.architecture))
             if current != ("install ok unpacked", package.version):
@@ -801,6 +951,11 @@ def install(
             configured.add((package.name, package.architecture))
             progressed = True
         if not progressed:
+            (evidence / "reference-no-progress.json").write_text(json.dumps({
+                "base_cycle_applied": cycle_broken, "openssl_cycle_applied": openssl_configured,
+                "deferred": deferred, "refusals": refusals[:128],
+                "refusals_truncated": len(refusals) > 128,
+            }, sort_keys=True) + "\n")
             if not cycle_broken:
                 if base_cycle_packages(packages, architecture)[1] not in unpacked:
                     raise CycleRefusal("CycleStateChanged: selected member is not unpacked")
@@ -811,6 +966,20 @@ def install(
                 unpacked.remove(selected)
                 configured.add((selected.name, selected.architecture))
                 cycle_broken = True
+                continue
+            if (not openssl_configured and
+                {"libssl3t64", "openssl-provider-legacy"} <= {p.name for p in unpacked}):
+                probes += 2
+                if probes > MAXIMUM_PROBES:
+                    raise ValueError("reference dpkg dependency probe limit exceeded")
+                selected = configure_openssl_cycle(
+                    launcher, dpkg, root, evidence, architecture, packages,
+                    environment, stdout, stderr,
+                )
+                for package in selected:
+                    unpacked.remove(package)
+                    configured.add((package.name, package.architecture))
+                openssl_configured = True
                 continue
             raise CycleRefusal(
                 "CycleNoProgress: reference dependency ordering stalled; ambiguous --configure --pending "
