@@ -10,7 +10,10 @@ architecture,
 solver policy, package/count/byte limits, and the running CLI version before
 printing a versioned fingerprint, exact cache key, compatible restore prefix,
 and the sole externally cacheable path. Filesystem paths, URLs, keyring names,
-proxy settings, and credentials do not enter key material.
+proxy settings, and credentials do not enter archive-only key material.
+Native v4 baseline keys additionally bind the complete root-scoped planning
+envelope and component observations; they are intentionally not portable
+baseline authority.
 
 `debz package-cache prepare` authenticates current repository evidence, requires
 the repository ID/snapshot/Release/Packages/signer and every package
@@ -172,6 +175,17 @@ fingerprint/result schemas v3 for legacy, v4 for exact-lock v2, and v5 for
 exact-lock v3, with distinct
 fingerprint domains and restore-key prefixes. Empty closures need no repository
 inputs and produce zero verified objects.
+
+Native v4 installed-baseline cache publications use fingerprint/result API v6
+and `debz-package-cache-archive-v4\n`. The stream adds a bounded big-endian u32
+length and the complete canonical no-op contract before the v3 signed archive
+records/count and framing checksum. This generation intentionally includes
+root-scoped local observations, including the bound root path; it is not a
+portable path-free baseline grant. The reader requires the exact current
+contract before importing any objects. Counts contain only genuine signed
+archive targets, including the valid empty closure. Baselines are never fetched
+or inserted into the CAS. Immutable signed CAS reuse still receives ordinary
+digest, size, metadata and payload verification.
 
 Native preparation authenticates repository evidence and validates each
 repository payload normally. Local-artifact entries must already be in the

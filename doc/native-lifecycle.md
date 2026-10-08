@@ -289,6 +289,52 @@ fixture controls remain private.
 Core product/CLI execution/recovery binds native receipts to outer completion
 before acknowledgment and cleanup. Other consumers remain independently gated.
 
+## Read-only imported-root query oracle
+
+`test/native_dpkg_query.zig`, invoked by the existing root-import runner, adds
+five imported-then-mutated cases. `Scenario.seed` runs pinned dpkg 1.22.22
+independently on **both** disposable roots before any native transaction; the
+baseline must match and have no `var/lib/debz` evidence. Native mutations then
+use the same lifecycle/import boundary as the healthy-root import fixture,
+while the reference side continues using pinned dpkg.
+
+Each prestate and final query checkpoint copies `var/lib/dpkg` to separate
+admindirs and runs the receipt-bound, test-only `dpkg-query` with `-W` (all
+packages and selected package), `-s`, `-L`, and `-S`. Exit codes, stdout and
+stderr match **byte-for-byte, with no query normalization**. Independently
+specified expected output also prevents two equally empty, stale or incorrect
+results from passing. Status expectations include the exact conffile MD5,
+`Config-Version` and `Triggers-Pending` where applicable; ownership lists and
+the all-package output are exact, not just nonempty.
+
+| Imported mutation | Expected selected state and query result |
+| --- | --- |
+| Upgrade configured v1 to v2 | `install ok installed`, version 2; nonempty status, payload/conffile list and exact ownership, exit 0 |
+| Remove configured v1 | `deinstall ok config-files`, version / `Config-Version` 1; conffile-only list and ownership, exit 0; removed payload `-S` returns 1 with empty stdout and exact missing-path diagnostic |
+| Purge configured v1 | Package absent from all-package output (the untouched keeper remains); selected `-W/-s/-L/-S` each return 1, empty stdout and their distinct exact diagnostics |
+| Fail v2 upgrade postinst | `install ok half-configured`, version 2 with retained `Config-Version: 1`; nonempty status and ownership, query exit 0 despite the failed transaction |
+| Upgrade v1 source to activating v2 with deferred triggers | Imported handler v1 becomes `install ok triggers-pending` with the exact named `Triggers-Pending`; upgraded source is installed v2, both have nonempty status and payload ownership, exit 0 |
+
+Queries run only against the copies, never the source root. Before/after
+witnesses cover copied database bytes, kinds, modes, owners and mtimes, and the
+source filesystem, raw database and native evidence (including its absence).
+Existing malformed, duplicate-identity and unsupported-entry import fixtures
+also query copied inputs before their repeated native refusals. The first two
+require query exit 2, empty stdout and nonempty unnormalized parse diagnostics;
+the unsupported-entry copy requires exit 0 and the exact installed keeper
+output, yet native still refuses `UnsupportedDatabaseEntry`. Their saved query
+observations are **not** import admissibility assertions: even a successful
+query cannot authorize a transaction, repair the root or create active
+mutation evidence. No separate import engine or new normalization is introduced.
+
+The same `test-native-root-import` command above covers these cases in Debug
+and ReleaseSafe in the existing required amd64/arm64 CI shard, without a new
+job or increased budget. The seven-key reference receipt and architecture,
+digest and size binding remain unchanged. This oracle grants no production
+query dependency and does not alter the exact signed sudo maintainer-script
+tool exception. It completes the bounded imported query slice of #277, not
+the signed full-root import gates owned by #270–#273 or final cutover #274.
+
 ## Independent reference acceptance
 
 Run on native Linux amd64 or arm64 with `dpkg`, `dpkg-deb`, `ldd`, `/bin/sh`, and

@@ -495,6 +495,71 @@ pub const BindError = ValidationError || error{
     DigestMismatch,
 };
 
+/// Encoding headroom only. Contains no archive identity or serializable lock.
+pub const DerivedSha512Reservation = struct {
+    command_growth_bytes: usize = 0,
+};
+
+pub fn reserveDerivedSha512(
+    lock: Lock,
+    repository_ids: []const [64]u8,
+) !DerivedSha512Reservation {
+    var growth: usize = 0;
+    for (repository_ids, 0..) |id, index| {
+        if (index != 0 and std.mem.order(u8, &repository_ids[index - 1], &id) != .lt)
+            return error.DuplicateRepository;
+        const repository = lock.findRepository(id) orelse return error.MissingRepository;
+        if (repository.archive_binding != .published_digests) return error.ArchiveBindingMismatch;
+        growth = std.math.add(usize, growth, try twiceEscapedSize(derived_repository_binding_wire)) catch
+            return error.DocumentTooLarge;
+    }
+    var prefix_buffer: [256]u8 = undefined;
+    var prefix: std.Io.Writer = .fixed(&prefix_buffer);
+    try writeDerivedPrefix(&prefix);
+    const package_growth = try twiceEscapedSize(prefix.buffered()) + 128 + try twiceEscapedSize("\"}");
+    for (lock.packages) |package| {
+        const origin = switch (package.origin) {
+            .authenticated_repository => |value| value,
+            .local_artifact => continue,
+        };
+        if (!containsSortedRepositoryId(repository_ids, origin.repository_id)) continue;
+        try requireDerivablePackage(package);
+        growth = std.math.add(usize, growth, package_growth) catch return error.DocumentTooLarge;
+    }
+    return .{ .command_growth_bytes = growth };
+}
+
+pub fn containsSortedRepositoryId(ids: []const [64]u8, id: [64]u8) bool {
+    var lower: usize = 0;
+    var upper = ids.len;
+    while (lower < upper) {
+        const middle = lower + (upper - lower) / 2;
+        switch (std.mem.order(u8, &ids[middle], &id)) {
+            .lt => lower = middle + 1,
+            .gt => upper = middle,
+            .eq => return true,
+        }
+    }
+    return false;
+}
+
+fn requireDerivablePackage(package: Package) error{ArchiveBindingMismatch}!void {
+    if (package.derived_sha512 != null or package.archive_identity.primary != .sha256 or
+        package.archive_identity.digests.sha256 == null or package.archive_identity.digests.sha512 != null)
+        return error.ArchiveBindingMismatch;
+}
+
+fn twiceEscapedSize(fragment: []const u8) !usize {
+    // v3 is a JSON string inside v4, itself a JSON string in command.v2.
+    var buffer: [512]u8 = undefined;
+    var first: std.Io.Writer = .fixed(&buffer);
+    try writeJsonString(&first, fragment);
+    var counting_buffer: [512]u8 = undefined;
+    var second: std.Io.Writer.Discarding = .init(&counting_buffer);
+    try writeJsonString(&second.writer, first.buffered()[1 .. first.buffered().len - 1]);
+    return std.math.cast(usize, second.fullCount() - 2) orelse error.DocumentTooLarge;
+}
+
 /// Records the signed-SHA256 derived-SHA512 binding for `repository_ids`.
 /// `archives` is parallel to `lock.packages`; every package of a bound
 /// repository must supply its bytes. Each archive is checked against its
@@ -528,10 +593,7 @@ pub fn bindSignedSha256Repositories(
             return error.MissingRepository;
         if (repositories[repository_index].archive_binding != .signed_sha256_derived_sha512)
             continue;
-        if (package.derived_sha512 != null) return error.ArchiveBindingMismatch;
-        if (package.archive_identity.primary != .sha256 or
-            package.archive_identity.digests.sha512 != null)
-            return error.ArchiveBindingMismatch;
+        try requireDerivablePackage(package.*);
         const bytes = archive orelse return error.MissingArchive;
         if (bytes.len != package.declared_size) return error.SizeMismatch;
         package.archive_identity.verify(bytes) catch return error.DigestMismatch;
@@ -887,9 +949,7 @@ fn writePayload(lock: Lock, writer: *std.Io.Writer) !void {
         try writeDigestIdentity(writer, repository.index_identity);
         switch (repository.archive_binding) {
             .published_digests => {},
-            .signed_sha256_derived_sha512 => try writer.writeAll(
-                ",\"archive_binding\":\"signed_sha256_derived_sha512\"",
-            ),
+            .signed_sha256_derived_sha512 => try writer.writeAll(derived_repository_binding_wire),
         }
         try writer.writeAll(",\"signer_fingerprints\":[");
         for (repository.signer_fingerprints, 0..) |fingerprint, signer_index| {
@@ -917,11 +977,9 @@ fn writePayload(lock: Lock, writer: *std.Io.Writer) !void {
         try writer.writeAll(",\"archive_identity\":");
         try writeDigestIdentity(writer, package.archive_identity);
         if (package.derived_sha512) |derived| {
-            try writer.writeAll(",\"derived_archive_identity\":{\"provenance\":");
-            try writeJsonString(writer, derived_sha512_provenance);
-            try writer.writeAll(",\"algorithm\":\"sha512\",\"digest\":");
-            try writeHexString(writer, &derived);
-            try writer.writeByte('}');
+            try writeDerivedPrefix(writer);
+            try writeHexBytes(writer, &derived);
+            try writer.writeAll("\"}");
         }
         try writer.print(",\"declared_size\":{},\"retention\":", .{package.declared_size});
         try writeJsonString(writer, @tagName(package.retention));
@@ -1031,14 +1089,26 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) !void {
     try writer.writeByte('"');
 }
 
+const derived_repository_binding_wire = ",\"archive_binding\":\"signed_sha256_derived_sha512\"";
+
+fn writeDerivedPrefix(writer: *std.Io.Writer) !void {
+    try writer.writeAll(",\"derived_archive_identity\":{\"provenance\":");
+    try writeJsonString(writer, derived_sha512_provenance);
+    try writer.writeAll(",\"algorithm\":\"sha512\",\"digest\":\"");
+}
+
 fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    const alphabet = "0123456789abcdef";
     try writer.writeByte('"');
+    try writeHexBytes(writer, bytes);
+    try writer.writeByte('"');
+}
+
+fn writeHexBytes(writer: *std.Io.Writer, bytes: []const u8) !void {
+    const alphabet = "0123456789abcdef";
     for (bytes) |byte| {
         try writer.writeByte(alphabet[byte >> 4]);
         try writer.writeByte(alphabet[byte & 15]);
     }
-    try writer.writeByte('"');
 }
 
 fn parseHex(comptime size: usize, value: []const u8) ValidationError![size]u8 {

@@ -328,7 +328,14 @@ test "security: native-only production candidate refuses shipped routes and exac
     defer unreviewed.deinit();
     try unreviewed.failsWith("src/maintainer_script.zig: unreviewed child-process operator");
     try unreviewed.failsWith("src/maintainer_script.zig: unreviewed/stale child-process allowance");
-    const stale = try f.replace(inventory, "eb546e88d64091c9", "ab546e88d64091c9");
+    const parsed_inventory = try std.json.parseFromSlice(std.json.Value, f.arena.allocator(), inventory, .{});
+    defer parsed_inventory.deinit();
+    const fingerprint = parsed_inventory.value.object.get("reviewed_fingerprints").?.object.get("src/transaction_executor.zig").?.string;
+    try testing.expectEqual(@as(usize, 128), fingerprint.len);
+    var corrupted: [128]u8 = undefined;
+    @memcpy(&corrupted, fingerprint);
+    corrupted[0] = if (fingerprint[0] == '0') '1' else '0';
+    const stale = try f.replace(inventory, fingerprint, &corrupted);
     const wrong_fingerprint = try productionCandidate(&f, "security/native-only-production-policy.json", stale);
     defer wrong_fingerprint.deinit();
     try wrong_fingerprint.failsWith("src/transaction_executor.zig: stale reviewed inventory fingerprint");

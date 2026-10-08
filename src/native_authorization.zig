@@ -27,6 +27,41 @@ pub const schema_id = "https://debz.dev/schema/native-transaction-authorization-
 pub const schema_version: u32 = 1;
 pub const schema_v2_id = "https://debz.dev/schema/native-transaction-authorization-v2";
 pub const schema_v2_version: u32 = 2;
+pub const schema_v3_id = "https://debz.dev/schema/native-transaction-authorization-v3";
+pub const schema_v3_version: u32 = 3;
+
+pub fn taggedAuthority(version: u32) bool {
+    return version == schema_v2_version or version == schema_v3_version;
+}
+
+test "native_authorization.test.baseline-only no-op is explicitly v3 and leaves v2 empty authority refused" {
+    const allocator = std.testing.allocator;
+    var input: Input = .{
+        .backend = .native,
+        .target_architecture = "amd64",
+        .install_root = "/fixture",
+        .request_sha256 = @splat(1),
+        .solver_policy_sha256 = @splat(2),
+        .executor_policy_sha256 = @splat(3),
+        .plan_sha256 = @splat(4),
+        .exact_lock = .{ .schema = exact_lock_v3.schema_id, .version = 3, .digest_sha256 = @splat(5) },
+        .policy = .{ .conffile = .keep_existing, .force = &.{}, .allow_host_root = false },
+        .actions = &.{},
+        .final_state = &.{.{ .name = "private-baseline", .version = "1.0", .architecture = "amd64", .state = .installed, .dpkg_selection_hold = false }},
+    };
+    try std.testing.expectError(error.EmptyProgram, create(allocator, input));
+    input.baseline_noop_sha512 = @splat('a');
+    var owned = try create(allocator, input);
+    defer owned.deinit();
+    try std.testing.expectEqual(@as(u32, 3), owned.authorization.wire_version);
+    const bytes = try owned.authorization.canonicalJson(allocator);
+    defer allocator.free(bytes);
+    var decoded = try decode(allocator, bytes, maximum_document_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), decoded.authorization.actions.len);
+    input.baseline_noop_sha512 = @splat('z');
+    try std.testing.expectError(error.InvalidBaselineNoop, create(allocator, input));
+}
 pub const maximum_document_bytes: usize = 16 * 1024 * 1024;
 pub const maximum_actions: usize = 100_000;
 pub const maximum_final_packages: usize = 200_000;
@@ -141,6 +176,7 @@ pub const FinalPackage = struct {
 };
 
 pub const Input = struct {
+    baseline_noop_sha512: ?[128]u8 = null,
     backend: Backend,
     target_architecture: []const u8,
     foreign_architectures: []const []const u8 = &.{},
@@ -157,6 +193,7 @@ pub const Input = struct {
 };
 
 pub const Authorization = struct {
+    baseline_noop_sha512: ?[128]u8 = null,
     wire_version: u32 = schema_version,
     backend: Backend,
     target_architecture: []const u8,
@@ -263,6 +300,7 @@ pub const ValidationError = error{
     DocumentTooLarge,
     InvalidDigest,
     InvalidTriggerAuthority,
+    InvalidBaselineNoop,
     TooManyTriggerHandlers,
     TooManyTriggerCallers,
     TooManyAuthorizedTriggers,
@@ -277,18 +315,31 @@ pub fn create(
         .native => {},
         .legacy_dpkg => return error.UnsupportedBackend,
     }
-    const wire_version: u32 =
-        if (std.mem.eql(u8, input.exact_lock.schema, exact_lock_v2.schema_id) and
+    const wire_version: u32 = if (input.baseline_noop_sha512 != null and
+        std.mem.eql(u8, input.exact_lock.schema, exact_lock_v3.schema_id) and input.exact_lock.version == exact_lock_v3.schema_version)
+        schema_v3_version
+    else if (std.mem.eql(u8, input.exact_lock.schema, exact_lock_v2.schema_id) and
         input.exact_lock.version == exact_lock_v2.schema_version)
-            schema_version
-        else if (std.mem.eql(u8, input.exact_lock.schema, exact_lock_v3.schema_id) and
+        schema_version
+    else if (std.mem.eql(u8, input.exact_lock.schema, exact_lock_v3.schema_id) and
         input.exact_lock.version == exact_lock_v3.schema_version)
-            schema_v2_version
-        else
-            return error.UnsupportedLockVersion;
+        schema_v2_version
+    else
+        return error.UnsupportedLockVersion;
+    if (input.baseline_noop_sha512) |digest| {
+        if (wire_version != schema_v3_version or input.trigger_authority != null or input.final_state.len == 0)
+            return error.InvalidBaselineNoop;
+        for (digest) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f'))
+            return error.InvalidBaselineNoop;
+        for (input.actions) |action| {
+            if (action.kind != .install or action.prior_version != null or action.artifact == null or
+                action.artifact.?.origin_v2 == null or action.artifact.?.origin_v2.? != .authenticated_repository)
+                return error.InvalidBaselineNoop;
+        }
+    }
     if (input.target_architecture.len == 0) return error.EmptyArchitecture;
     if (!validIdentity(input.target_architecture)) return error.InvalidIdentity;
-    if (input.actions.len == 0 and
+    if (input.baseline_noop_sha512 == null and input.actions.len == 0 and
         (input.trigger_authority == null or
             input.trigger_authority.?.mode != .process_pending))
         return error.EmptyProgram;
@@ -621,6 +672,7 @@ pub fn create(
 
     var authorization: Authorization = .{
         .wire_version = wire_version,
+        .baseline_noop_sha512 = input.baseline_noop_sha512,
         .backend = input.backend,
         .target_architecture = target_architecture,
         .foreign_architectures = foreign_architectures,
@@ -863,6 +915,7 @@ const WireActionV2 = struct {
 };
 
 const WireAuthorizationV2 = struct {
+    baseline_noop_sha512: ?[128]u8 = null,
     schema: []const u8,
     version: u32,
     backend: Backend,
@@ -896,8 +949,9 @@ pub fn decode(
         .ignore_unknown_fields = true,
     });
     defer header.deinit();
-    if (std.mem.eql(u8, header.value.schema, schema_v2_id) and
-        header.value.version == schema_v2_version)
+    if ((std.mem.eql(u8, header.value.schema, schema_v2_id) and
+        header.value.version == schema_v2_version) or
+        (std.mem.eql(u8, header.value.schema, schema_v3_id) and header.value.version == schema_v3_version))
         return decodeV2(allocator, source);
     var parsed = try std.json.parseFromSlice(WireAuthorization, allocator, source, .{
         .allocate = .alloc_always,
@@ -1051,8 +1105,10 @@ fn decodeV2(
         .{ .allocate = .alloc_always, .ignore_unknown_fields = false },
     );
     defer parsed.deinit();
-    if (!std.mem.eql(u8, parsed.value.schema, schema_v2_id) or
-        parsed.value.version != schema_v2_version)
+    const is_v3 = std.mem.eql(u8, parsed.value.schema, schema_v3_id) and parsed.value.version == schema_v3_version;
+    if ((!is_v3 and (!std.mem.eql(u8, parsed.value.schema, schema_v2_id) or
+        parsed.value.version != schema_v2_version)) or
+        (parsed.value.baseline_noop_sha512 != null) != is_v3)
         return error.UnsupportedSchema;
     if (parsed.value.actions.len > maximum_actions) return error.TooManyActions;
     if (parsed.value.final_state.len > maximum_final_packages)
@@ -1149,6 +1205,7 @@ fn decodeV2(
     }
 
     var result = try create(allocator, .{
+        .baseline_noop_sha512 = parsed.value.baseline_noop_sha512,
         .backend = parsed.value.backend,
         .target_architecture = parsed.value.target_architecture,
         .foreign_architectures = parsed.value.foreign_architectures,
@@ -1172,7 +1229,7 @@ fn decodeV2(
         .trigger_authority = trigger_authority,
     });
     errdefer result.deinit();
-    if (result.authorization.wire_version != schema_v2_version)
+    if (result.authorization.wire_version != parsed.value.version)
         return error.UnsupportedSchema;
     const root_identity = try parseHex(32, parsed.value.root_identity_sha256);
     if (!std.mem.eql(u8, &root_identity, &result.authorization.root_identity_sha256))
@@ -1399,7 +1456,9 @@ fn writeDocument(authorization: Authorization, writer: *std.Io.Writer) !void {
 
 fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
     try writer.writeAll("{\"schema\":");
-    const versioned_schema = if (authorization.wire_version == schema_v2_version)
+    const versioned_schema = if (authorization.wire_version == schema_v3_version)
+        schema_v3_id
+    else if (authorization.wire_version == schema_v2_version)
         schema_v2_id
     else
         schema_id;
@@ -1437,6 +1496,10 @@ fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
         try writeJsonString(writer, @tagName(risk));
     }
     try writer.print("],\"allow_host_root\":{}}}", .{authorization.policy.allow_host_root});
+    if (authorization.wire_version == schema_v3_version) {
+        try writer.writeAll(",\"baseline_noop_sha512\":");
+        try std.json.Stringify.value(authorization.baseline_noop_sha512.?, .{}, writer);
+    }
     try writer.writeAll(",\"actions\":[");
     for (authorization.actions, 0..) |action, index| {
         if (index != 0) try writer.writeByte(',');
@@ -1456,7 +1519,7 @@ fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
             try writer.writeAll("null");
         try writer.writeAll(",\"artifact\":");
         if (action.artifact) |artifact| {
-            if (authorization.wire_version == schema_v2_version) {
+            if (taggedAuthority(authorization.wire_version)) {
                 try writer.writeAll("{\"archive_identity\":");
                 try writeDigestIdentity(
                     writer,
@@ -1468,7 +1531,7 @@ fn writePayload(authorization: Authorization, writer: *std.Io.Writer) !void {
                 try writeHexString(writer, &artifact.sha256);
             }
             try writer.print(",\"size\":{},\"origin\":", .{artifact.size});
-            if (authorization.wire_version == schema_v2_version)
+            if (taggedAuthority(authorization.wire_version))
                 try writeOriginV2(
                     writer,
                     artifact.origin_v2 orelse return error.InvalidArtifactIdentity,

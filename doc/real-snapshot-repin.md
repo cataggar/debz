@@ -48,17 +48,22 @@ The `version_bound` flag is reserved for reviewed cases where version-keyed
 logic is itself part of the admission; only then must a consumer name the
 provenance version.
 
-The committed manifest starts `pending` at the current pin, `20261001T000000Z`.
-It holds every reviewed identity, but no probe results yet. The tool refuses
-to probe a timestamp less than 24 hours old, so the first `record` runs in the
-first repin after that day has settled.
+The committed manifest is `probed` for `ubuntu-resolute` at
+`20261001T000000Z`: it records the frozen Release, both witnesses, and
+177-package closures on amd64 and arm64. Its admission deadline is
+2026-10-31 20:38:20 UTC; renewal requires a reviewed repin, not a clock
+override. A quiet pocket's `refresh_only` binding remains subject to the
+[known gap](#known-gap-release-identity-of-a-pocket-outside-a-lock) below.
+The tool refuses to probe a timestamp less
+than 24 hours old and compares two fetches of each InRelease before recording
+the result.
 
 ## Commands
 
 ### `probe`
 
 ```sh
-python3 tools/real-snapshot-repin.py probe --series ubuntu-stonking \
+python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute \
     [--timestamp 20261015T000000Z] --debz zig-out/bin/debz \
     [--manifest PATH] [--workspace DIR] [--accept-frozen-release]
 ```
@@ -215,7 +220,7 @@ and also verifies that it refuses a manifest with a mutated identity.
 1. Build ReleaseSafe `debz` at the current `main`:
    `zig build -Doptimize=ReleaseSafe -j4`.
 2. Probe the newest settled day:
-   `python3 tools/real-snapshot-repin.py probe --series ubuntu-stonking --debz zig-out/bin/debz`.
+   `python3 tools/real-snapshot-repin.py probe --series ubuntu-resolute --debz zig-out/bin/debz`.
    Read `summary.md` and note the new admission deadline.
 3. Run `diff --report .tmp/real-snapshot-repin/<T>/report.json --pr N` for
    every open real-snapshot pull request.
@@ -237,6 +242,84 @@ and also verifies that it refuses a manifest with a mutated identity.
 
 **Cadence:** monthly. Start when fewer than 10 days remain before the
 admission deadline (about day 21 of the 31-day bound).
+
+## Ubuntu archive trust-root renewal
+
+The protected reference proof uses a reviewed, package-derived trust root,
+not the hosted image's keyring (#355). The current source is the resolute
+`ubuntu-keyring_2023.11.28.1build1_all.deb`; its archive is 11,228 bytes and
+its `./usr/share/keyrings/ubuntu-archive-keyring.gpg` member is 3,607 bytes.
+The authoritative URL, archive SHA-512/size and member SHA-256/size constants
+live in `tools/real-snapshot-reference-protected-ci.sh`. Their anti-drift
+tokens are in `PROTECTED_REFERENCE_SCRIPT_TOKENS` in
+`tools/security-audit.py`. Read those current values when renewing; do not
+reuse the older stonking values from the original issue.
+
+Review renewal when Ubuntu announces an archive signing-key addition,
+replacement, revocation or expiry, when the authenticated package changes
+its key set, or when a required signature no longer validates under the
+reviewed root. Check these conditions during the monthly repin review. An
+older package version alone does not require rotation if its reviewed keys
+still satisfy the authentication policy. Conversely, a pending renewal does
+not permit accepting an unknown, expired or revoked signer.
+
+Renewal is a separate trust decision from a snapshot or freshness repin:
+
+1. Select a settled snapshot and record the candidate package's exact URL,
+   version, architecture, signed archive identity and size. Authenticate its
+   Release, index and package record using the still-accepted trust root,
+   then verify the downloaded bytes against that record before opening the
+   archive. A digest computed from an unauthenticated download is not a trust
+   source. If the existing root cannot authenticate the candidate, stop:
+   establish independently trusted Ubuntu key-transition evidence and obtain
+   explicit review of that bootstrap before proceeding.
+2. In a new private review directory, independently re-derive both identities
+   from the authenticated package, rather than copying the staging constants.
+   With `package` naming those verified bytes and `review` naming that new
+   directory:
+
+   ```sh
+   wc -c < "$package"
+   sha512sum "$package"
+   dpkg-deb --field "$package" Package Version Architecture
+   dpkg-deb --fsys-tarfile "$package" |
+     tar -xOf - ./usr/share/keyrings/ubuntu-archive-keyring.gpg \
+       > "$review/ubuntu-archive-keyring.gpg"
+   wc -c < "$review/ubuntu-archive-keyring.gpg"
+   sha256sum "$review/ubuntu-archive-keyring.gpg"
+   mkdir -m 0700 "$review/gnupg"
+   gpg --batch --homedir "$review/gnupg" --no-default-keyring \
+     --keyring "$review/ubuntu-archive-keyring.gpg" \
+     --with-colons --fingerprint --list-keys
+   ```
+
+   Retain the authenticated metadata/lock, archive identity, extraction
+   command, member bytes, complete fingerprints and expiry/revocation
+   information. Compare old and new key sets; document every addition,
+   removal and changed validity. Package authentication does not by itself
+   authorize accepting every key or replacing the configured signer.
+3. Obtain review of the source evidence, both independently derived
+   digest/size pairs, key-set delta and intended accepted signer set. Any
+   signer-policy change must be explicit in the same review; never silently
+   expand the allowlist to make a failed signature pass.
+4. Update the protected staging constants and anti-drift tokens together.
+   Use the probe/diff/record flow to update manifest identities
+   `archive:ubuntu-keyring` and
+   `file:ubuntu-keyring/usr/share/keyrings/ubuntu-archive-keyring.gpg`,
+   their provenance and every registered consumer, including
+   `doc/integration-roots.md`. Review related signer/profile changes
+   separately and run offline `check`, then the covering protected-CI
+   policy/mutation checks and security audit.
+5. Before accepting the renewal, execute the protected reference proof on
+   both amd64 and arm64 with the proposed staged root. Retain
+   `archive-keyring-path.tsv`, authenticated frozen/witness decisions,
+   commit identity and both job outcomes. A skipped job or a successful
+   proof under the previous root is not renewal evidence.
+
+A missing or mismatched archive/member, unaccepted signer, expired metadata,
+or an unreviewed key transition must fail the build or acceptance run. Never
+fall back to the image keyring, change the clock, relax signature checks,
+or extend the current witness deadline to conceal a renewal failure.
 
 ## Tests
 
