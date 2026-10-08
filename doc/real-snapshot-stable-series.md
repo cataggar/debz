@@ -1,11 +1,28 @@
 # Real-snapshot reference on a stable series (design for #330)
 
-Status: **reviewed on #330** (see [review decisions](#review-decisions)).
-PR A implements the `frozen_release_with_witnesses` freshness policy; the repin
-tool (PR B) and the migration (PR C) are not implemented yet. The
-current pin stays the Ubuntu development series `stonking` at
-`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z` until the migration
-described in [question 5](#5-migration-order) lands.
+Status (2026-10-06): **reviewed on #330 and implemented** (see
+[review decisions](#review-decisions)). The freshness policy (#362), repin
+tool and runbook (#373), exact-byte admissions (#378), and resolute migration
+(#381, with follow-ups #387, #394, #395 and #398) have landed.
+The operational pin is Ubuntu 26.04 `resolute`, `resolute-updates` and
+`resolute-security` at `https://snapshot.ubuntu.com/ubuntu/20261001T000000Z`.
+The [repin runbook](real-snapshot-repin.md#runbook) describes the current flow.
+
+Both architectures authenticated the migrated snapshot in
+[run 37317412790](https://github.com/cataggar/debz/actions/runs/37317412790)
+at `7657602`, and both protected-reference jobs passed there. Those greens
+predate #398's changed signed-proc fixtures. The post-#398 protected-reference
+jobs also executed and passed for
+[amd64](https://github.com/cataggar/debz/actions/runs/37537004982/job/112520469522)
+and [arm64](https://github.com/cataggar/debz/actions/runs/37537004982/job/112520469651)
+in run `37537004982` at `98ec3b3b40b4760e441ea02411ebc145baa89bcf`.
+These are protected-lane proofs at that exact source SHA; completed native
+installation, signed-proc replay and full native/dpkg parity remain separate
+acceptance gates.
+
+The measurements and migration sequence below retain the original design
+baseline; references to stonking describe historical evidence, not today's
+operational pin.
 
 This document answers the five design questions on #330 with measured data:
 
@@ -31,7 +48,7 @@ This document answers the five design questions on #330 with measured data:
 
   The pocket's own age is never compared with the clock, and nothing is
   evaluated at a historical time. A resolute pin then stays admissible for
-  about 31 days after the snapshot timestamp. The current stonking pin lasts
+  about 31 days after the snapshot timestamp. The historical stonking pin lasts
   14 days, and a trixie pin that includes its 7-day `-updates`/`-security`
   pockets lasts at most 7 days.
 - **Churn:** over three consecutive two-week windows, the resolute
@@ -676,7 +693,10 @@ manifest cross-check in normal CI. It fails in these cases:
 - a provenance-only update is accepted;
 - the PR scan output.
 
-### Runbook (to be expanded in this document when the tool lands)
+### Runbook summary
+
+The implemented commands and current manifest are documented in the
+[repin runbook](real-snapshot-repin.md#runbook).
 
 1. Build ReleaseSafe `debz` at the current `main`.
 2. Run `tools/real-snapshot-repin.py probe` and read the report. Note the new
@@ -697,6 +717,9 @@ manifest cross-check in normal CI. It fails in these cases:
    admission deadline. For resolute that is about day 21 of 31.
 
 ## 5. Migration order
+
+This is the reviewed ordering at design time. PRs A, B and C have now landed;
+the current operational status and evidence boundary are recorded above.
 
 The goal is to review each piece of real-snapshot evidence once, on resolute,
 and never regenerate it on stonking first. The pinned stonking snapshot

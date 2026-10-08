@@ -3,8 +3,8 @@
 
 The tool never authenticates repository metadata itself. ``probe`` drives a
 ``debz`` binary (``refresh``, ``plan --lock-output`` and ``download
---lock-input``) and binds every Release it fetches to the cleartext digest
-that ``debz`` recorded in an exact lock. Package members are read only from
+--lock-input``) and binds every Release it fetches to public refresh evidence,
+requiring contributing exact locks to agree. Package members are read only from
 CAS objects that ``debz download`` verified, after re-hashing them against the
 lock. ``check`` is offline and is run in CI.
 """
@@ -16,6 +16,8 @@ import calendar
 import copy
 import difflib
 import email.utils
+import email.parser
+import email.policy
 import gzip
 import hashlib
 import io
@@ -29,15 +31,19 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = Path("tools/fixtures/real-snapshot/pin-v1.json")
 MANIFEST_SCHEMA = "io.github.cataggar.debz.real-snapshot-pin.v1"
 REPORT_SCHEMA = "io.github.cataggar.debz.real-snapshot-repin-report.v1"
+EVIDENCE_SCHEMA = "io.github.cataggar.debz.real-snapshot-source-evidence.v1"
+DEFAULT_EVIDENCE = "tools/fixtures/real-snapshot/prestate-sources-v1.zip"
 SETTLE_SECONDS = 24 * 60 * 60
 WITNESS_WINDOW_SECONDS = 48 * 60 * 60
 MAXIMUM_RELEASE_AGE_SECONDS = 31 * 24 * 60 * 60
@@ -46,6 +52,10 @@ DEBZ_LOCK_WAIT_MS = "30000"
 MAXIMUM_RELEASE_BYTES = 16 * 1024 * 1024
 MAXIMUM_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAXIMUM_MEMBER_BYTES = 64 * 1024 * 1024
+MAXIMUM_TAR_BYTES = 128 * 1024 * 1024
+MAXIMUM_TAR_MEMBERS = 100000
+MAXIMUM_EVIDENCE_BYTES = 64 * 1024 * 1024
+MAXIMUM_EVIDENCE_FILES = 256
 FETCH_TIMEOUT_SECONDS = 120
 SHA256_HEX = hashlib.sha256().digest_size * 2
 SHA512_HEX = hashlib.sha512().digest_size * 2
@@ -61,11 +71,13 @@ KINDS = ("script", "tool_file", "archive", "prestate")
 ROLES = ("bounded", "frozen", "witness")
 # How each pocket's fetched Release is tied to what debz authenticated, per
 # architecture. `exact_lock`: an exact lock names the repository with the same
-# cleartext release_sha256. `refresh_only`: debz refresh authenticated the
-# pocket, but it contributes no locked package and debz emits no Release digest
-# for it, so the fetched bytes are recorded without that cross-check (#344).
-BINDINGS = ("exact_lock", "refresh_only")
-CONSUMER_FORMS = ("hex", "zig_bytes", "fixture")
+# cleartext release_sha256. `refresh_identity`: public refresh evidence binds
+# even a quiet pocket. `refresh_only` is retained ONLY for historical reports
+# made by debz versions that did not expose that evidence.
+BINDINGS = ("exact_lock", "refresh_identity", "refresh_only")
+CONSUMER_FORMS = ("hex", "zig_bytes", "fixture", "shell")
+IDENTITY_COORDINATES = ("digest", "digest_size", "url", "version", "size", "member")
+SNAPSHOT_COORDINATES = ("uri", "suite", "witness_suites", "release_sha256")
 STATUSES = ("unchanged", "provenance-only", "changed", "missing")
 SNAPSHOT_URI = re.compile(r"snapshot\.ubuntu\.com/ubuntu/([0-9]{8}T[0-9]{6}Z)")
 SNAPSHOT_CONSTANT = re.compile(
@@ -81,6 +93,11 @@ SNAPSHOT_INPUT_ENTRY = re.compile(
     r'\.path = "(?P<path>[^"]+)",\s*(?:\.mode = 0o(?P<leading_mode>[0-7]+),\s*)?'
     r'\.size = (?P<size>[0-9]+),\s*(?:\.mode = 0o(?P<mode>[0-7]+),\s*)?'
     r'\.sha256 = "(?P<hex>[0-9a-f]+)"'
+)
+SNAPSHOT_ARCHIVE_ENTRY = re.compile(
+    r'\.package\s*=\s*\.\{\s*\.name\s*=\s*"(?P<package>[^"]+)",\s*'
+    r'\.version\s*=\s*"(?P<version>[^"]+)",\s*\.architecture\s*=\s*"(?P<arch>[^"]+)"\s*\},\s*'
+    r'\.size\s*=\s*(?P<size>[0-9]+),\s*\.sha512\s*=\s*"(?P<hex>[0-9a-f]{128})"'
 )
 FIXTURE_GLOB = "src/fixtures/ubuntu-*"
 PIN_SCRIPT_GLOB = "tools/real-snapshot-*.sh"
@@ -309,6 +326,8 @@ def check_pocket_dates(pockets: list[dict], snapshot: int) -> int:
 
 
 def ar_members(data: bytes) -> dict[str, bytes]:
+    if len(data) > MAXIMUM_ARCHIVE_BYTES:
+        fail("package is too large")
     if not data.startswith(b"!<arch>\n"):
         fail("package is not an ar archive")
     offset = 8
@@ -317,11 +336,20 @@ def ar_members(data: bytes) -> dict[str, bytes]:
         header = data[offset:offset + 60]
         if len(header) != 60 or header[58:60] != b"`\n":
             fail("package has a malformed ar header")
-        name = header[:16].decode("ascii").strip().rstrip("/")
-        size = int(header[48:58].decode("ascii").strip() or "x")
+        try:
+            name = header[:16].decode("ascii").strip().rstrip("/")
+            size_text = header[48:58].decode("ascii").strip()
+        except UnicodeError:
+            fail("package has a non-ASCII ar header")
+        if not re.fullmatch(r"[0-9]+", size_text):
+            fail("package has an invalid ar member size")
+        size = int(size_text)
         start = offset + 60
-        if start + size > len(data) or name in members:
+        end = start + size
+        if end + (size & 1) > len(data) or name in members:
             fail("package has a truncated or duplicate ar member")
+        if size & 1 and data[end:end + 1] != b"\n":
+            fail("package has invalid ar padding")
         members[name] = data[start:start + size]
         offset = start + size + (size & 1)
     return members
@@ -329,26 +357,73 @@ def ar_members(data: bytes) -> dict[str, bytes]:
 
 def decompress(name: str, data: bytes) -> bytes:
     if name.endswith(".tar"):
+        if len(data) > MAXIMUM_TAR_BYTES:
+            fail(f"{name} is too large")
         return data
     if name.endswith(".tar.gz"):
-        return gzip.decompress(data)
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as stream:
+                payload = stream.read(MAXIMUM_TAR_BYTES + 1)
+        except (OSError, EOFError) as error:
+            fail(f"cannot decompress {name}: {error}")
+        if len(payload) > MAXIMUM_TAR_BYTES:
+            fail(f"{name} is too large")
+        return payload
     if name.endswith(".tar.xz"):
-        return lzma.decompress(data)
+        payload = bytearray()
+        remaining = data
+        try:
+            while remaining:
+                decoder = lzma.LZMADecompressor(memlimit=MAXIMUM_TAR_BYTES)
+                payload.extend(decoder.decompress(remaining, max_length=MAXIMUM_TAR_BYTES + 1 - len(payload)))
+                if len(payload) > MAXIMUM_TAR_BYTES:
+                    fail(f"{name} is too large")
+                if not decoder.eof:
+                    fail(f"cannot decompress truncated {name}")
+                remaining = decoder.unused_data
+                if remaining and len(remaining) % 4 == 0 and not any(remaining):
+                    break
+        except lzma.LZMAError as error:
+            fail(f"cannot decompress {name}: {error}")
+        return bytes(payload)
     if name.endswith(".tar.zst"):
         try:
             from compression import zstd  # type: ignore[import-not-found]
 
-            return zstd.decompress(data)
+            with zstd.ZstdFile(io.BytesIO(data)) as stream:
+                payload = stream.read(MAXIMUM_TAR_BYTES + 1)
         except ImportError:
-            pass
-        if shutil.which("zstd") is None:
-            fail(f"{name} needs Python 3.14 compression.zstd or the zstd program")
-        result = subprocess.run(
-            ["zstd", "-q", "-d", "-c"], input=data, capture_output=True, check=False
-        )
-        if result.returncode != 0:
-            fail(f"cannot decompress {name}")
-        return result.stdout
+            if shutil.which("zstd") is None:
+                fail(f"{name} needs Python 3.14 compression.zstd or the zstd program")
+            with subprocess.Popen(["zstd", "-q", "-d", "-c"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+                def feed() -> None:
+                    assert process.stdin is not None
+                    try:
+                        process.stdin.write(data)
+                        process.stdin.close()
+                    except BrokenPipeError:
+                        pass
+
+                writer = threading.Thread(target=feed)
+                writer.start()
+                try:
+                    assert process.stdout is not None
+                    payload = process.stdout.read(MAXIMUM_TAR_BYTES + 1)
+                    if len(payload) > MAXIMUM_TAR_BYTES:
+                        fail(f"{name} is too large")
+                    if process.wait(timeout=FETCH_TIMEOUT_SECONDS) != 0:
+                        fail(f"cannot decompress {name}")
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                    writer.join()
+                    if process.stdout is not None:
+                        process.stdout.close()
+        if len(payload) > MAXIMUM_TAR_BYTES:
+            fail(f"{name} is too large")
+        return payload
     fail(f"unsupported package member {name}")
     raise AssertionError
 
@@ -359,24 +434,52 @@ def package_tar(deb: bytes, prefix: str) -> tarfile.TarFile:
     if len(names) != 1:
         fail(f"package must contain exactly one {prefix} member")
     payload = decompress(names[0], members[names[0]])
-    return tarfile.open(fileobj=io.BytesIO(payload), mode="r:")
+    try:
+        return tarfile.open(fileobj=io.BytesIO(payload), mode="r:")
+    except tarfile.TarError as error:
+        fail(f"cannot open {prefix}: {error}")
+    raise AssertionError
+
+
+def validated_tar_members(archive: tarfile.TarFile):
+    seen = set()
+    try:
+        for member in archive:
+            name = member.name.removeprefix("./").rstrip("/")
+            canonical = str(Path(name))
+            if (name.startswith("/") or ".." in name.split("/") or "\n" in name or "\r" in name
+                    or canonical in seen or len(seen) >= MAXIMUM_TAR_MEMBERS):
+                fail(f"unsafe, duplicate or excessive tar member {member.name!r}")
+            seen.add(canonical)
+            if member.size < 0 or member.size > MAXIMUM_MEMBER_BYTES:
+                fail(f"tar member {member.name!r} is too large")
+            yield member
+    except tarfile.TarError as error:
+        fail(f"malformed tar archive: {error}")
 
 
 def tar_member(deb: bytes, prefix: str, path: str) -> tuple[bytes, int]:
     wanted = {path, "./" + path}
+    result = None
     with package_tar(deb, prefix) as archive:
-        for member in archive.getmembers():
+        for member in validated_tar_members(archive):
             if member.name not in wanted:
                 continue
             if not (member.isreg() or member.islnk()):
                 fail(f"{prefix} member {path} is not a regular file")
+            if member.islnk() and (member.linkname.startswith("/") or ".." in member.linkname.split("/")):
+                fail(f"{prefix} member {path} has an unsafe hardlink")
             stream = archive.extractfile(member)
             if stream is None:
                 fail(f"cannot read {prefix} member {path}")
             data = stream.read(MAXIMUM_MEMBER_BYTES + 1)
             if len(data) > MAXIMUM_MEMBER_BYTES:
                 fail(f"{prefix} member {path} is too large")
-            return data, member.mode & 0o7777
+            if member.isreg() and len(data) != member.size:
+                fail(f"{prefix} member {path} is truncated")
+            result = data, member.mode & 0o7777
+    if result is not None:
+        return result
     fail(f"{prefix} has no member {path}")
     raise AssertionError
 
@@ -394,9 +497,31 @@ def tar_member_dpkg_list_path(name: str) -> str:
 def dpkg_ownership_list(deb: bytes) -> bytes:
     lines = []
     with package_tar(deb, "data.tar") as archive:
-        for member in archive:
+        for member in validated_tar_members(archive):
             lines.append(tar_member_dpkg_list_path(member.name))
     return ("\n".join(lines) + "\n").encode()
+
+
+def prestate_derivation(identity: dict, arch: str) -> str | None:
+    if identity["kind"] != "prestate":
+        return None
+    if identity["path"] == f"var/lib/dpkg/info/{identity['package']}.list":
+        return "dpkg-list"
+    if identity["path"] in (
+        f"var/lib/dpkg/info/{identity['package']}.triggers",
+        f"var/lib/dpkg/info/{identity['package']}:{arch}.triggers",
+    ):
+        return "control-triggers"
+    return None
+
+
+def derive_prestate(identity: dict, arch: str, deb: bytes) -> tuple[bytes, int] | None:
+    derivation = prestate_derivation(identity, arch)
+    if derivation == "dpkg-list":
+        return dpkg_ownership_list(deb), 0o644
+    if derivation == "control-triggers":
+        return tar_member(deb, "control.tar", "triggers")
+    return None
 
 
 # Manifest.
@@ -405,7 +530,10 @@ def dpkg_ownership_list(deb: bytes) -> bytes:
 def load_json(path: Path) -> dict:
     try:
         with path.open("rb") as stream:
-            document = json.load(stream)
+            data = stream.read(MAXIMUM_RELEASE_BYTES + 1)
+        if len(data) > MAXIMUM_RELEASE_BYTES:
+            fail(f"{path} JSON document is too large")
+        document = json.loads(data)
     except (OSError, ValueError) as error:
         fail(f"cannot read {path}: {error}")
     if not isinstance(document, dict):
@@ -494,7 +622,7 @@ def resolve_profile(name: str, profile_path: Path | None) -> dict:
 
 
 def validate_consumer(consumer: object, where: str) -> dict:
-    exact_keys(consumer, {"path", "form"}, {"name"}, where)
+    exact_keys(consumer, {"path", "form"}, {"name", "bindings"}, where)
     assert isinstance(consumer, dict)
     path = consumer["path"]
     if not isinstance(path, str) or path.startswith("/") or ".." in Path(path).parts or not path:
@@ -503,7 +631,26 @@ def validate_consumer(consumer: object, where: str) -> dict:
         fail(f"{where}.form is invalid")
     if (consumer["form"] == "zig_bytes") != ("name" in consumer):
         fail(f"{where}: only zig_bytes consumers name a constant")
+    if (consumer["form"] == "shell") != ("bindings" in consumer):
+        fail(f"{where}: exactly shell consumers list coordinate bindings")
+    if consumer["form"] == "shell":
+        validate_coordinate_bindings(consumer["bindings"], IDENTITY_COORDINATES, where)
+        if not {"digest", "digest_size"} & set(consumer["bindings"]):
+            fail(f"{where}: shell consumers must bind their digest")
     return consumer
+
+
+def validate_coordinate_bindings(bindings: object, coordinates: tuple[str, ...], where: str) -> None:
+    if (not isinstance(bindings, dict) or not bindings or set(bindings) - set(coordinates)
+            or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                   for name in bindings.values()) or len(set(bindings.values())) != len(bindings)):
+        fail(f"{where}: invalid typed coordinate bindings")
+
+
+def validate_relative_path(path: object, where: str) -> str:
+    if not isinstance(path, str) or not path or path.startswith("/") or ".." in Path(path).parts:
+        fail(f"{where} must be repository-relative")
+    return path
 
 
 def validate_identity(identity: object, index: int) -> dict:
@@ -512,7 +659,7 @@ def validate_identity(identity: object, index: int) -> dict:
         identity,
         {"id", "kind", "package", "architectures", "path", "digest", "size", "mode",
          "version_bound", "provenance", "consumers", "review"},
-        {"derived_from"},
+        {"derived_from", "artifact"},
         where,
     )
     assert isinstance(identity, dict)
@@ -560,6 +707,18 @@ def validate_identity(identity: object, index: int) -> dict:
             if not PACKAGE_NAME.fullmatch(str(item["package"])) or not isinstance(item["version"], str):
                 fail(f"{where}.derived_from[{item_index}] is invalid")
     validate_provenance(identity["provenance"], architectures, where)
+    artifact = identity.get("artifact")
+    if artifact is not None:
+        exact_keys(artifact, {"filename", "architecture"}, set(), f"{where}.artifact")
+        filename = validate_relative_path(artifact["filename"], f"{where}.artifact.filename")
+        if identity["provenance"] == "pending":
+            fail(f"{where}.artifact requires recorded provenance")
+        artifact_arch = artifact["architecture"]
+        if artifact_arch not in ("all", *architectures):
+            fail(f"{where}.artifact.architecture is invalid")
+        version = identity["provenance"]["version"].split(":", 1)[-1]
+        if Path(filename).name != f"{identity['package']}_{version}_{artifact_arch}.deb":
+            fail(f"{where}.artifact.filename disagrees with the package, version or architecture")
     if identity["version_bound"] and identity["provenance"] == "pending":
         fail(f"{where}.version_bound requires recorded provenance")
     consumers = identity["consumers"]
@@ -567,6 +726,17 @@ def validate_identity(identity: object, index: int) -> dict:
         fail(f"{where} has no consumer")
     for consumer_index, consumer in enumerate(consumers):
         validate_consumer(consumer, f"{where}.consumers[{consumer_index}]")
+        if consumer["form"] == "shell":
+            if "url" in consumer["bindings"] and artifact is None:
+                fail(f"{where}: URL bindings require artifact coordinates")
+            if "version" in consumer["bindings"] and identity["provenance"] == "pending":
+                fail(f"{where}: version bindings require recorded provenance")
+            if "member" in consumer["bindings"] and identity["path"] is None:
+                fail(f"{where}: member bindings require a member path")
+    if artifact is not None:
+        required = {"url", "size"} if identity["kind"] == "archive" else {"url", "size", "member"}
+        if not any(consumer["form"] == "shell" and required <= set(consumer["bindings"]) for consumer in consumers):
+            fail(f"{where}: artifact requires a complete typed URL/size/member consumer")
     if not isinstance(identity["review"], str) or not REVIEW_REFERENCE.fullmatch(identity["review"]):
         fail(f"{where}.review must be a PR or issue reference")
     return identity
@@ -641,7 +811,8 @@ def validate_snapshot(snapshot: object, profile: dict) -> dict:
 
 
 def validate_manifest(manifest: dict) -> dict:
-    exact_keys(manifest, {"schema", "series", "snapshot", "uri_consumers", "identities", "excluded"}, set(), "manifest")
+    exact_keys(manifest, {"schema", "series", "snapshot", "uri_consumers", "identities", "excluded"},
+               {"coordinate_consumers", "prestate_evidence"}, "manifest")
     if manifest["schema"] != MANIFEST_SCHEMA:
         fail("unsupported manifest schema")
     profile = validate_profile(manifest["series"])
@@ -658,6 +829,16 @@ def validate_manifest(manifest: dict) -> dict:
         if identity["id"] in seen:
             fail(f"duplicate identity {identity['id']}")
         seen.add(identity["id"])
+    coordinates = manifest.get("coordinate_consumers", [])
+    if not isinstance(coordinates, list):
+        fail("coordinate_consumers must be a list")
+    for index, consumer in enumerate(coordinates):
+        where = f"coordinate_consumers[{index}]"
+        exact_keys(consumer, {"path", "bindings"}, set(), where)
+        validate_relative_path(consumer["path"], f"{where}.path")
+        validate_coordinate_bindings(consumer["bindings"], SNAPSHOT_COORDINATES, where)
+    if "prestate_evidence" in manifest:
+        validate_relative_path(manifest["prestate_evidence"], "prestate_evidence")
     excluded = manifest["excluded"]
     if not isinstance(excluded, list):
         fail("excluded must be a list")
@@ -723,19 +904,36 @@ class Debz:
             fail(f"debz {operation} failed for {self.arch} (exit {result.returncode}): {detail[:2000]}")
         return document
 
-    def refresh(self, suites: set[str]) -> dict[str, str]:
-        """Refreshes every pocket and returns suite -> repository id."""
+    def refresh(self, suites: set[str]) -> dict[str, dict]:
+        """Returns every pocket's public authenticated repository evidence."""
         document = self.run("refresh", ["--assume-yes"])
-        repository_ids: dict[str, str] = {}
+        if (document.get("schema") != "io.github.cataggar.debz.command.v1"
+                or type(document.get("api_version")) is not int or document["api_version"] != 1
+                or document.get("operation") != "refresh"
+                or type(document.get("exit_status")) is not int or document["exit_status"] != 0
+                or not isinstance(document.get("items"), list)):
+            fail(f"{self.arch} refresh returned an unsupported command result")
+        repositories: dict[str, dict] = {}
         for item in document["items"]:
-            if item["version"] in suites:
-                detail = item.get("detail") or ""
-                if not detail.startswith("authenticated") or "stale" in detail:
-                    fail(f"{self.arch} refresh did not freshly authenticate {item['version']}: {detail}")
-                repository_ids[item["version"]] = item["package"]
-        if sorted(repository_ids) != sorted(suites):
+            if (not isinstance(item, dict) or not isinstance(item.get("version"), str)
+                    or item["version"] not in suites or item.get("architecture") is not None):
+                fail(f"{self.arch} refresh reported an unexpected pocket")
+            suite = item["version"]
+            if suite in repositories:
+                fail(f"{self.arch} refresh reported {suite} twice")
+            detail = item.get("detail") or ""
+            if not isinstance(detail, str) or not detail.startswith("authenticated") or "stale" in detail:
+                fail(f"{self.arch} refresh did not freshly authenticate {suite}: {detail}")
+            repository_id = item.get("package")
+            if not isinstance(repository_id, str) or not re.fullmatch(r"[0-9a-f]{64}", repository_id):
+                fail(f"{suite} refresh has an invalid repository id")
+            evidence = validate_refresh_repository(item.get("repository"), suite)
+            repositories[suite] = {"id": repository_id, **evidence}
+        if sorted(repositories) != sorted(suites):
             fail(f"{self.arch} refresh did not authenticate every pocket")
-        return repository_ids
+        if len({value["id"] for value in repositories.values()}) != len(repositories):
+            fail(f"{self.arch} refresh reported duplicate repository ids")
+        return repositories
 
     def plan(self, package: str, lock: Path) -> dict:
         self.run("plan", ["--transaction-backend", "native", "--lock-output", str(lock), package])
@@ -848,21 +1046,200 @@ def require_sha512(packages: dict[str, dict], arch: str) -> None:
         fail(f"{arch} closure packages without a signed SHA-512 archive identity: {', '.join(missing)}")
 
 
+def deb822_fields(data: bytes) -> dict[str, str]:
+    message = email.parser.BytesHeaderParser(policy=email.policy.default).parsebytes(data)
+    fields = {}
+    if message.defects:
+        fail("malformed source control/metadata fields")
+    for name, value in message.raw_items():
+        key = name.lower()
+        if key in fields:
+            fail(f"duplicate source control/metadata field {name}")
+        fields[key] = value.strip()
+    return fields
+
+
+def release_index_entries(data: bytes, algorithm: str) -> dict[str, tuple[str, int]]:
+    fields = deb822_fields(in_release_cleartext(data))
+    entries = {}
+    for line in fields.get(algorithm, "").splitlines():
+        words = line.split()
+        if not words:
+            continue
+        if len(words) != 3 or not words[1].isdigit():
+            fail("malformed source Release index checksum")
+        digest, size, name = words
+        parse_tagged(f"{algorithm}:{digest}", (algorithm,))
+        validate_relative_path(name, "source Release index path")
+        if name in entries:
+            fail("duplicate source Release index checksum")
+        entries[name] = digest, int(size)
+    return entries
+
+
+def source_index_package(index: bytes, index_path: str, entry: dict) -> dict[str, str]:
+    if index_path.endswith((".xz", ".gz", ".zst")):
+        data = decompress("source.tar" + Path(index_path).suffix, index)
+    else:
+        if len(index) > MAXIMUM_TAR_BYTES:
+            fail("source Packages index is too large")
+        data = index
+    matches = []
+    for paragraph in data.replace(b"\r\n", b"\n").split(b"\n\n"):
+        if not paragraph.strip():
+            continue
+        fields = deb822_fields(paragraph)
+        if (fields.get("package"), fields.get("version"), fields.get("architecture")) == (
+                entry["name"], entry["version"], entry["architecture"]):
+            matches.append(fields)
+    if len(matches) != 1:
+        fail(f"source Packages index must name {entry['name']} exactly once")
+    fields = matches[0]
+    if fields.get("sha512") != source_archive_digest(entry).split(":", 1)[1] or fields.get("size") != str(entry["declared_size"]):
+        fail(f"source Packages index for {entry['name']} differs from its authenticated archive lock")
+    validate_relative_path(fields.get("filename"), "source package Filename")
+    return fields
+
+
+def retain_source_metadata(
+    profile: dict, timestamp: str, first: dict[str, bytes], packages: dict[str, dict],
+    locks: list[dict], arch: str, workspace: Path, identities: list[dict],
+) -> dict[str, dict]:
+    wanted = {identity["package"] for identity in identities if arch in identity["architectures"]}
+    sources = {}
+    indexes = {}
+    for name in sorted(wanted):
+        package = packages.get(name)
+        if package is None:
+            continue
+        entry = package["lock_package"]
+        repository_id = entry["origin"]["repository_id"]
+        repositories = [r for lock in locks for r in lock["repositories"] if r["id"] == repository_id]
+        repository = repositories[0]
+        identity = repository["index_identity"]
+        algorithm = identity["primary"]
+        if algorithm not in ("sha256", "sha512"):
+            fail("source index needs a signed SHA-256 or SHA-512 identity")
+        digests = [d["digest"] for d in identity["digests"] if d["algorithm"] == algorithm]
+        if len(digests) != 1:
+            fail("source index has an ambiguous signed identity")
+        suite = package["pocket"]
+        release = first[suite]
+        checksums = release_index_entries(release, algorithm)
+        stem = f"{profile['component']}/binary-{arch}/Packages"
+        choices = [path for path, (digest, _) in checksums.items()
+                   if path in (stem, stem + ".xz", stem + ".gz", stem + ".zst") and digest == digests[0]]
+        if len(choices) != 1:
+            fail(f"source Release has no unique authenticated Packages index for {name}")
+        index_path = choices[0]
+        if suite not in indexes:
+            index = fetch(f"{snapshot_uri(profile, timestamp)}/dists/{suite}/{index_path}")
+            digest, size = checksums[index_path]
+            if len(index) != size or hashlib.new(algorithm, index).hexdigest() != digest:
+                fail(f"source Packages index for {suite} differs from its authenticated Release")
+            indexes[suite] = index
+            relative = f"indexes/{arch}-{suite}-{Path(index_path).name}"
+            target = workspace / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(index)
+            target = workspace / f"releases/{suite}.InRelease"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(release)
+        fields = source_index_package(indexes[suite], index_path, entry)
+        artifact = {"filename": fields["filename"], "architecture": fields["architecture"]}
+        package["artifact"] = artifact
+        sources[name] = {
+            "index_file": f"indexes/{arch}-{suite}-{Path(index_path).name}",
+            "index_path": index_path, "release_file": f"releases/{suite}.InRelease",
+        }
+    return sources
+
+
+def validate_refresh_repository(value: object, suite: str) -> dict:
+    exact_keys(value, {"release_digest", "snapshot_digest", "signer_fingerprints", "frozen"}, set(),
+               f"{suite} refresh repository")
+    assert isinstance(value, dict)
+    parse_tagged(value["release_digest"], ("sha256",))
+    parse_tagged(value["snapshot_digest"], ("sha256",))
+    signers = value["signer_fingerprints"]
+    if (not isinstance(signers, list) or not signers
+            or any(not isinstance(s, str) or not re.fullmatch(r"[0-9a-f]{40}", s) for s in signers)
+            or signers != sorted(set(signers))):
+        fail(f"{suite} refresh has invalid signer fingerprints")
+    frozen = value["frozen"]
+    if frozen is not None:
+        exact_keys(frozen, {"release_digest", "admission_deadline_unix", "witnesses"}, set(),
+                   f"{suite} frozen decisions")
+        parse_tagged(frozen["release_digest"], ("sha256",))
+        if type(frozen["admission_deadline_unix"]) is not int:
+            fail(f"{suite} frozen admission deadline must be an integer")
+        if not isinstance(frozen["witnesses"], list) or not 1 <= len(frozen["witnesses"]) <= 4:
+            fail(f"{suite} frozen decisions need one to four witnesses")
+        for witness in frozen["witnesses"]:
+            exact_keys(witness, {"repository_id", "snapshot_digest", "release_date_unix",
+                                "deadline_unix", "primary_fingerprint"}, set(), f"{suite} frozen witness")
+            if (not isinstance(witness["repository_id"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", witness["repository_id"])
+                    or not isinstance(witness["primary_fingerprint"], str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", witness["primary_fingerprint"])
+                    or type(witness["release_date_unix"]) is not int or type(witness["deadline_unix"]) is not int):
+                fail(f"{suite} frozen witness has invalid identity or decisions")
+            parse_tagged(witness["snapshot_digest"], ("sha256",))
+    return value
+
+
 def bind_pockets(
-    pockets: dict[str, dict], locks: list[dict], refresh_ids: dict[str, str], signer: str, arch: str
+    pockets: dict[str, dict], locks: list[dict], repositories: dict[str, dict], signer: str, arch: str
 ) -> set[str]:
-    """Binds fetched Release bytes to the cleartext digests debz locked; returns the bound suites."""
-    by_id = {repository_id: suite for suite, repository_id in refresh_ids.items()}
+    """Binds EVERY fetched pocket to refresh; locks must agree where they contribute."""
+    if set(repositories) != set(pockets):
+        fail(f"{arch} refresh did not authenticate every pocket")
+    for suite, repository in repositories.items():
+        exact_keys(repository, {"id", "release_digest", "snapshot_digest", "signer_fingerprints", "frozen"},
+                   set(), f"{suite} refresh evidence")
+        if not isinstance(repository["id"], str) or not re.fullmatch(r"[0-9a-f]{64}", repository["id"]):
+            fail(f"{suite} refresh has an invalid repository id")
+    by_id = {value["id"]: suite for suite, value in repositories.items()}
+    if len(by_id) != len(repositories):
+        fail(f"{arch} refresh reported duplicate repository ids")
+    for suite, repository in repositories.items():
+        validate_refresh_repository({key: value for key, value in repository.items() if key != "id"}, suite)
+        if repository["signer_fingerprints"] != [signer]:
+            fail(f"{suite} is signed by {repository['signer_fingerprints']}, not the reviewed signer")
+        if repository["release_digest"] != pockets[suite]["release_sha256"]:
+            fail(f"{suite} Release fetched by the probe differs from the Release debz authenticated")
+        frozen = repository["frozen"]
+        if pockets[suite]["role"] != "frozen":
+            if frozen is not None:
+                fail(f"{suite} unexpectedly reports frozen decisions")
+            continue
+        witnesses = sorted((p for p in pockets.values() if p["role"] == "witness"), key=lambda p: p["suite"])
+        if frozen is None or frozen["release_digest"] != pockets[suite]["release_sha256"]:
+            fail(f"{suite} frozen Release differs from the reviewed pin")
+        if [w["repository_id"] for w in frozen["witnesses"]] != [repositories[p["suite"]]["id"] for p in witnesses]:
+            fail(f"{suite} frozen witnesses differ from configured policy order")
+        for decision, pocket in zip(frozen["witnesses"], witnesses):
+            witness = repositories[pocket["suite"]]
+            date = release_time(pocket["date"], "Date")
+            deadline = (release_time(pocket["valid_until"], "Valid-Until") if pocket["valid_until"]
+                        else date + MAXIMUM_RELEASE_AGE_SECONDS)
+            if (decision["snapshot_digest"] != witness["snapshot_digest"]
+                    or decision["primary_fingerprint"] != signer
+                    or decision["release_date_unix"] != date or decision["deadline_unix"] != deadline):
+                fail(f"{suite} frozen witness {pocket['suite']} differs from its authenticated pocket")
+        if frozen["admission_deadline_unix"] != min(w["deadline_unix"] for w in frozen["witnesses"]):
+            fail(f"{suite} frozen admission deadline differs from its witnesses")
     bound: set[str] = set()
     for lock in locks:
         for repository in lock["repositories"]:
             suite = by_id.get(repository["id"])
             if suite is None:
                 fail(f"{arch} lock names a repository that refresh did not report")
-            if repository["signer_fingerprints"] != [signer]:
-                fail(f"{suite} is signed by {repository['signer_fingerprints']}, not the reviewed signer")
-            if lock_digest(repository["release_sha256"]) != pockets[suite]["release_sha256"]:
-                fail(f"{suite} Release fetched by the probe differs from the Release debz authenticated")
+            evidence = repositories[suite]
+            if (repository["signer_fingerprints"] != evidence["signer_fingerprints"]
+                    or lock_digest(repository["release_sha256"]) != evidence["release_digest"]
+                    or lock_digest(repository["snapshot_sha256"]) != evidence["snapshot_digest"]):
+                fail(f"{suite} exact lock differs from its authenticated refresh identity")
             bound.add(suite)
     return bound
 
@@ -876,6 +1253,8 @@ def observe_identity(identity: dict, arch: str, packages: dict[str, dict], debz:
         "archive": entry["archive"],
         "derived_versions": {},
     }
+    if "artifact" in entry:
+        observed["artifact"] = entry["artifact"]
     if identity["kind"] == "archive":
         observed.update(digest=entry["archive"], size=entry["size"], mode=None)
         return observed
@@ -883,20 +1262,10 @@ def observe_identity(identity: dict, arch: str, packages: dict[str, dict], debz:
         for item in identity["derived_from"]:
             derived = packages.get(item["package"])
             observed["derived_versions"][item["package"]] = None if derived is None else derived["version"]
-        if identity["path"] == f"var/lib/dpkg/info/{identity['package']}.list":
-            data = dpkg_ownership_list(debz.archive(entry["lock_package"]))
-            observed.update(
-                digest=tagged("sha256", data),
-                size=len(data),
-                mode="0644",
-            )
-            return observed
-        trigger_paths = {
-            f"var/lib/dpkg/info/{identity['package']}.triggers",
-            f"var/lib/dpkg/info/{identity['package']}:{entry['architecture']}.triggers",
-        }
-        if identity["path"] in trigger_paths:
-            data, mode = tar_member(debz.archive(entry["lock_package"]), "control.tar", "triggers")
+        if prestate_derivation(identity, arch) is not None:
+            derived = derive_prestate(identity, arch, debz.archive(entry["lock_package"]))
+            assert derived is not None
+            data, mode = derived
             observed.update(
                 digest=tagged("sha256", data),
                 size=len(data),
@@ -976,14 +1345,19 @@ def probe(args: argparse.Namespace, now: int | None = None) -> int:
     closures: dict[str, dict] = {}
     identities: dict[str, dict] = {}
     repository_ids: dict[str, dict[str, str]] = {}
+    repository_evidence: dict[str, dict[str, dict]] = {}
     unavailable: dict[str, dict[str, str]] = {}
+    artifact_sources = {}
     manifest_identities = manifest["identities"] if manifest else []
     for arch in profile["architectures"]:
         configs = write_configs(workspace / "config" / arch, profile, timestamp, arch,
                                 frozen["release_sha256"] if frozen else None)
         debz = Debz(debz_path, workspace, arch, configs, profile["keyring"])
-        refresh_ids = debz.refresh(set(pockets))
+        refreshed = debz.refresh(set(pockets))
+        bind_pockets(pockets, [], refreshed, profile["signer"], arch)
+        refresh_ids = {suite: value["id"] for suite, value in refreshed.items()}
         repository_ids[arch] = refresh_ids
+        repository_evidence[arch] = refreshed
         closure_lock_path = locks_directory / f"{arch}.lock.json"
         closure_lock = debz.plan(profile["request"], closure_lock_path)
         debz.download(profile["request"], closure_lock_path)
@@ -1014,11 +1388,15 @@ def probe(args: argparse.Namespace, now: int | None = None) -> int:
                     lock_entries.setdefault(package["name"], package)
                 for package_name, entry in extra_packages.items():
                     packages.setdefault(package_name, entry)
-        bound = bind_pockets(pockets, locks, refresh_ids, profile["signer"], arch)
+        bound = bind_pockets(pockets, locks, refreshed, profile["signer"], arch)
         for suite, pocket in pockets.items():
-            pocket["binding"][arch] = "exact_lock" if suite in bound else "refresh_only"
+            pocket["binding"][arch] = "exact_lock" if suite in bound else "refresh_identity"
         for name, entry in packages.items():
             entry["lock_package"] = lock_entries[name]
+        artifact_sources[arch] = retain_source_metadata(
+            profile, timestamp, first, packages, locks, arch, workspace,
+            source_evidence_identities(manifest) if manifest else [],
+        )
         for identity in manifest_identities:
             if arch in identity["architectures"]:
                 identities.setdefault(identity["id"], {})[arch] = observe_identity(
@@ -1054,10 +1432,12 @@ def probe(args: argparse.Namespace, now: int | None = None) -> int:
         "frozen_release_change": frozen_change,
         "pockets": ordered,
         "repository_ids": repository_ids,
+        "repository_evidence": repository_evidence,
         "admission_deadline": deadline,
         "closures": closures,
         "unavailable": unavailable,
         "identities": identities,
+        "artifact_sources": artifact_sources,
     }
     write_json(workspace / "report.json", report)
     (workspace / "summary.md").write_text(report_summary(report), encoding="utf-8")
@@ -1108,6 +1488,11 @@ def report_summary(report: dict) -> str:
             "",
             *unbound,
         ]
+    quiet = [f"- `{p['suite']}` on {', '.join(a for a, b in p['binding'].items() if b == 'refresh_identity')}"
+             for p in report["pockets"] if "refresh_identity" in p["binding"].values()]
+    if quiet:
+        lines += ["", "Pockets that contribute no locked package. Their fetched Release is bound to "
+                  "`debz refresh` repository evidence (no fabricated lock contribution):", "", *quiet]
     return "\n".join(lines) + "\n"
 
 
@@ -1119,7 +1504,25 @@ def load_report(path: Path) -> dict:
     if report.get("schema") != REPORT_SCHEMA:
         fail(f"{path} is not a repin probe report")
     validate_profile(report["series"], "report.series")
+    validate_report_pocket_evidence(report)
     return report
+
+
+def validate_report_pocket_evidence(report: dict) -> None:
+    """Never promote historical refresh-only reports without public identity evidence."""
+    if ("repository_evidence" not in report
+            and not any("refresh_identity" in p["binding"].values() for p in report["pockets"])):
+        return
+    evidence = report.get("repository_evidence")
+    if not isinstance(evidence, dict) or set(evidence) != set(report["series"]["architectures"]):
+        fail("report repository evidence must cover every architecture")
+    pockets = {p["suite"]: p for p in report["pockets"]}
+    for arch, repositories in evidence.items():
+        if not isinstance(repositories, dict):
+            fail(f"{arch} report repository evidence must be an object")
+        bind_pockets(pockets, [], repositories, report["series"]["signer"], arch)
+        if report.get("repository_ids", {}).get(arch) != {s: r["id"] for s, r in repositories.items()}:
+            fail(f"{arch} report repository ids differ from authenticated evidence")
 
 
 def identity_status(identity: dict, observed: dict[str, dict | None]) -> tuple[str, list[str]]:
@@ -1399,6 +1802,7 @@ def record_manifest(
     accept_frozen: str | None,
     allow_series_migration: bool = False,
 ) -> dict:
+    validate_report_pocket_evidence(report)
     series_migration = report["series"]["name"] != manifest["series"]["name"]
     if series_migration and not allow_series_migration:
         fail("the report is for a different series")
@@ -1471,6 +1875,10 @@ def record_manifest(
             "version": first["version"],
             "archives": {arch: observed[arch]["archive"] for arch in identity["architectures"]},
         }
+        if "artifact" in new:
+            if "artifact" not in first:
+                fail(f"{identity['id']} report has no independently observed artifact coordinates")
+            new["artifact"] = copy.deepcopy(first["artifact"])
         if identity["kind"] == "prestate":
             new["derived_from"] = [
                 {"package": item["package"], "version": first["derived_versions"][item["package"]]}
@@ -1496,6 +1904,9 @@ def record_command(args: argparse.Namespace) -> int:
         args.accept_frozen_release,
         args.allow_series_migration,
     )
+    if source_evidence_identities(updated):
+        updated["prestate_evidence"] = updated.get("prestate_evidence", DEFAULT_EVIDENCE)
+        export_prestate_evidence(updated, report, args.report.parent, args.root.resolve())
     write_json(args.manifest, updated)
     counts = {status: sum(1 for entry in diff["identities"] if entry["status"] == status) for status in STATUSES}
     print(f"recorded {report['timestamp']}: " + ", ".join(f"{count} {status}" for status, count in counts.items()))
@@ -1503,6 +1914,349 @@ def record_command(args: argparse.Namespace) -> int:
 
 
 # Check.
+
+def source_evidence_identities(manifest: dict) -> list[dict]:
+    return [
+        identity for identity in manifest["identities"]
+        if any(prestate_derivation(identity, arch) is not None for arch in identity["architectures"])
+        or any(consumer["form"] == "shell" and "url" in consumer["bindings"] for consumer in identity["consumers"])
+    ]
+
+
+def archive_package_fields(data: bytes) -> dict[str, str]:
+    control, _ = tar_member(data, "control.tar", "control")
+    fields = deb822_fields(control)
+    values = {}
+    for field in ("Package", "Version", "Architecture"):
+        value = fields.get(field.lower())
+        if not value:
+            fail(f"source archive has an invalid {field} control field")
+        values[field.lower()] = value
+    return values
+
+
+def authenticated_source_package(report: dict, lock: dict, package: str, arch: str) -> dict:
+    entries = [entry for entry in lock["packages"] if entry["name"] == package]
+    if len(entries) != 1:
+        fail(f"source lock must name {package} exactly once for {arch}")
+    entry = entries[0]
+    if entry["architecture"] not in (arch, "all") or entry["origin"]["type"] != "authenticated_repository":
+        fail(f"source lock has an unauthenticated or wrong-architecture {package}")
+    origin_id = entry["origin"]["repository_id"]
+    repositories = [repository for repository in lock["repositories"] if repository["id"] == origin_id]
+    if len(repositories) != 1:
+        fail(f"source lock has no unique authenticated repository for {package}")
+    by_id = {repository_id: suite for suite, repository_id in report["repository_ids"][arch].items()}
+    suite = by_id.get(origin_id)
+    pockets = [pocket for pocket in report["pockets"] if pocket["suite"] == suite]
+    if len(pockets) != 1:
+        fail(f"source lock repository for {package} was not refreshed")
+    repository = repositories[0]
+    if (repository["signer_fingerprints"] != [report["series"]["signer"]]
+            or lock_digest(repository["release_sha256"]) != pockets[0]["release_sha256"]):
+        fail(f"source lock repository for {package} differs from the authenticated probe Release")
+    origin_snapshot = entry["origin"]["repository_snapshot_sha256"]
+    lock_digest(origin_snapshot)
+    lock_digest(repository["snapshot_sha256"])
+    if origin_snapshot != repository["snapshot_sha256"]:
+        fail(f"source lock snapshot for {package} differs from its repository")
+    return entry
+
+
+def source_archive_digest(entry: dict) -> str:
+    identity = entry["archive_identity"]
+    digests = [value["digest"] for value in identity["digests"] if value["algorithm"] == "sha512"]
+    if identity["primary"] != "sha512" or len(digests) != 1:
+        fail("source lock has no unique SHA-512 archive identity")
+    value = "sha512:" + digests[0]
+    parse_tagged(value, ("sha512",))
+    return value
+
+
+def verify_source_archive(data: bytes, entry: dict) -> None:
+    if len(data) != entry["declared_size"] or tagged("sha512", data) != source_archive_digest(entry):
+        fail(f"source archive for {entry['name']} disagrees with its authenticated lock digest or size")
+    control = archive_package_fields(data)
+    if control != {"package": entry["name"], "version": entry["version"], "architecture": entry["architecture"]}:
+        fail(f"source archive control coordinates for {entry['name']} disagree with its authenticated lock")
+
+
+def verify_source_metadata(report: dict, lock: dict, source: dict, entry: dict, release: bytes, index: bytes) -> dict:
+    stem = f"{report['series']['component']}/binary-{source['architecture']}/Packages"
+    if source["index_path"] not in (stem, stem + ".xz", stem + ".gz", stem + ".zst"):
+        fail("retained source Packages path has the wrong component or architecture")
+    repository_id = entry["origin"]["repository_id"]
+    repository = next(r for r in lock["repositories"] if r["id"] == repository_id)
+    suite = next(suite for suite, value in report["repository_ids"][source["architecture"]].items()
+                 if value == repository_id)
+    pocket = next(p for p in report["pockets"] if p["suite"] == suite)
+    if (tagged("sha256", release) != pocket["in_release_sha256"]
+            or tagged("sha512", release) != pocket["in_release_sha512"]
+            or tagged("sha256", in_release_cleartext(release)) != pocket["release_sha256"]):
+        fail(f"retained source InRelease for {entry['name']} differs from the authenticated probe")
+    identity = repository["index_identity"]
+    algorithm = identity["primary"]
+    if algorithm not in ("sha256", "sha512"):
+        fail("retained source index needs a signed SHA-256 or SHA-512 identity")
+    digests = [d["digest"] for d in identity["digests"] if d["algorithm"] == algorithm]
+    checksums = release_index_entries(release, algorithm)
+    checksum = checksums.get(source["index_path"])
+    if (len(digests) != 1 or checksum != (digests[0], len(index))
+            or hashlib.new(algorithm, index).hexdigest() != digests[0]):
+        fail(f"retained source Packages index for {entry['name']} differs from its signed Release/lock")
+    return source_index_package(index, source["index_path"], entry)
+
+
+def read_source_file(path: Path, root: Path, limit: int, where: str) -> bytes:
+    if (not path.resolve().is_relative_to(root.resolve()) or not path.is_file() or path.is_symlink()):
+        fail(f"{where} is missing or unsafe")
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(limit + 1)
+    except OSError as error:
+        fail(f"cannot read {where}: {error}")
+    if len(data) > limit:
+        fail(f"{where} is too large")
+    return data
+
+
+def source_lock_paths(directory: Path) -> list[Path]:
+    path = directory / "locks"
+    if not path.resolve().is_relative_to(directory.resolve()) or not path.is_dir() or path.is_symlink():
+        fail("probe source lock directory is unsafe")
+    paths = []
+    try:
+        with os.scandir(path) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAXIMUM_EVIDENCE_FILES:
+                    fail("probe source lock directory exceeds its entry bound")
+                if entry.name.endswith(".lock.json"):
+                    paths.append(Path(entry.path))
+    except OSError as error:
+        fail(f"cannot read probe source lock directory: {error}")
+    return sorted(paths)
+
+
+def export_prestate_evidence(manifest: dict, report: dict, directory: Path, root: Path) -> None:
+    """Retain actual verified CAS objects and original probe locks, not derived hashes."""
+    files = {}
+
+    def remaining_bytes() -> int:
+        return MAXIMUM_EVIDENCE_BYTES - sum(map(len, files.values()))
+
+    def remember(name: str, data: bytes) -> None:
+        if name not in files:
+            if len(files) >= MAXIMUM_EVIDENCE_FILES or len(data) > remaining_bytes():
+                fail("source evidence exceeds its file or byte bound")
+            files[name] = data
+
+    def retain(relative: str, limit: int) -> bytes:
+        validate_relative_path(relative, "probe source metadata path")
+        if relative not in files:
+            data = read_source_file(directory / relative, directory, min(limit, remaining_bytes()),
+                                    f"probe source {relative}")
+            remember(relative, data)
+        return files[relative]
+
+    retain("report.json", MAXIMUM_RELEASE_BYTES)
+    lock_paths = source_lock_paths(directory)
+    sources = []
+    wanted = sorted({(arch, identity["package"]) for identity in source_evidence_identities(manifest)
+                     for arch in identity["architectures"]})
+    for arch, name in wanted:
+        selected = None
+        for path in lock_paths:
+            if not path.name.startswith(arch):
+                continue
+            lock_name = "locks/" + path.name
+            lock_bytes = files.get(lock_name)
+            if lock_bytes is None:
+                lock_bytes = read_source_file(path, directory, min(MAXIMUM_RELEASE_BYTES, remaining_bytes()),
+                                              f"probe source lock {path.name}")
+            try:
+                lock = json.loads(lock_bytes)
+            except ValueError as error:
+                fail(f"probe source lock {path.name} is invalid JSON: {error}")
+            if not isinstance(lock, dict):
+                fail(f"probe source lock {path.name} must be an object")
+            if any(entry["name"] == name for entry in lock["packages"]):
+                selected = path, lock_bytes, lock, authenticated_source_package(report, lock, name, arch)
+                break
+        if selected is None:
+            fail(f"probe has no authenticated source lock for {name} on {arch}")
+        path, lock_bytes, lock, entry = selected
+        digest = source_archive_digest(entry)
+        archive_name = "archives/" + digest.replace(":", "-") + ".deb"
+        source = directory / arch / "cache/packages-v2/objects" / digest.replace(":", "-")
+        lock_name = "locks/" + path.name
+        remember(lock_name, lock_bytes)
+        data = files.get(archive_name)
+        if data is None:
+            data = read_source_file(source, directory, remaining_bytes(), f"probe source archive for {name} on {arch}")
+        verify_source_archive(data, entry)
+        remember(archive_name, data)
+        metadata = report.get("artifact_sources", {}).get(arch, {}).get(name)
+        if not isinstance(metadata, dict):
+            fail(f"probe has no independently retained signed source metadata for {name} on {arch}; run a new probe")
+        exact_keys(metadata, {"index_file", "index_path", "release_file"}, set(), "probe source metadata")
+        sources.append({
+            "package": name, "architecture": arch, "archive_file": archive_name,
+            "lock_file": lock_name, "lock_sha256": tagged("sha256", files[lock_name]),
+            **metadata,
+        })
+        for relative in (sources[-1]["index_file"], sources[-1]["release_file"]):
+            retain(relative, MAXIMUM_RELEASE_BYTES)
+    remember("evidence.json", canonical_json({
+        "schema": EVIDENCE_SCHEMA, "report_sha256": tagged("sha256", files["report.json"]), "sources": sources,
+    }).encode())
+    if len(files) > MAXIMUM_EVIDENCE_FILES or sum(map(len, files.values())) > MAXIMUM_EVIDENCE_BYTES:
+        fail("source evidence exceeds its file or byte bound")
+    path = root / manifest["prestate_evidence"]
+    if path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+        fail("source evidence output must stay inside the checkout without a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in sorted(files.items()):
+            member = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            member.external_attr = 0o100644 << 16
+            archive.writestr(member, data)
+    # Validate the new retained bytes before replacing a previously reviewed bundle.
+    failures = check_prestate_evidence(manifest, stream.getvalue())
+    if failures:
+        fail("cannot record source evidence: " + "; ".join(failures))
+    path.write_bytes(stream.getvalue())
+
+
+def check_prestate_evidence(manifest: dict, data: bytes) -> list[str]:
+    failures = []
+    if len(data) > MAXIMUM_EVIDENCE_BYTES:
+        fail("source evidence ZIP is too large")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        entries = archive.infolist()
+        if (len(entries) > MAXIMUM_EVIDENCE_FILES or len({entry.filename for entry in entries}) != len(entries)
+                or sum(entry.file_size for entry in entries) > MAXIMUM_EVIDENCE_BYTES):
+            fail("source evidence ZIP has duplicate entries or exceeds its file or byte bound")
+        for entry in entries:
+            validate_relative_path(entry.filename, "source evidence ZIP member")
+            mode = entry.external_attr >> 16
+            if (entry.is_dir() or entry.flag_bits & 1 or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                    or mode & 0o170000 not in (0, 0o100000)):
+                fail(f"source evidence ZIP has an unsafe member {entry.filename}")
+
+        def read_member(name: str, limit: int | None = None) -> bytes:
+            if limit is None:
+                limit = MAXIMUM_RELEASE_BYTES
+            entry = archive.getinfo(name)
+            if entry.file_size > limit:
+                fail(f"source evidence member {name} is too large")
+            with archive.open(entry) as stream:
+                value = stream.read(limit + 1)
+            if len(value) > limit or len(value) != entry.file_size:
+                fail(f"source evidence member {name} is too large or truncated")
+            return value
+
+        def read_json(name: str) -> dict:
+            value = json.loads(read_member(name))
+            if not isinstance(value, dict):
+                fail(f"source evidence {name} must be an object")
+            return value
+
+        index = read_json("evidence.json")
+        exact_keys(index, {"schema", "report_sha256", "sources"}, set(), "source evidence")
+        if index["schema"] != EVIDENCE_SCHEMA or tagged("sha256", read_member("report.json")) != index["report_sha256"]:
+            fail("source evidence has an unsupported schema or changed probe report")
+        report = read_json("report.json")
+        if (report["schema"] != REPORT_SCHEMA or report["series"] != manifest["series"]
+                or report["timestamp"] != manifest["snapshot"]["timestamp"]):
+            fail("source evidence probe coordinates differ from the current manifest")
+        current_pockets = {pocket["suite"]: pocket for pocket in manifest["snapshot"].get("pockets", [])}
+        for pocket in report["pockets"]:
+            current = current_pockets.get(pocket["suite"])
+            if current is None or any(current[key] != pocket[key] for key in (
+                    "role", "release_sha256", "in_release_sha256", "in_release_sha512", "signers")):
+                fail(f"source evidence Release for {pocket['suite']} differs from the current manifest")
+        if not isinstance(index["sources"], list):
+            fail("source evidence sources must be a list")
+        sources = {}
+        used = {"evidence.json", "report.json"}
+        for source in index["sources"]:
+            exact_keys(source, {"package", "architecture", "archive_file", "lock_file", "lock_sha256",
+                                "index_file", "index_path", "release_file"},
+                       set(), "source evidence source")
+            key = source["architecture"], source["package"]
+            if key in sources:
+                fail("source evidence has duplicate package/architecture coordinates")
+            parse_tagged(source["lock_sha256"], ("sha256",))
+            lock_bytes = read_member(source["lock_file"])
+            if tagged("sha256", lock_bytes) != source["lock_sha256"]:
+                fail("source evidence lock bytes changed")
+            lock = json.loads(lock_bytes)
+            entry = authenticated_source_package(report, lock, source["package"], source["architecture"])
+            archive_bytes = read_member(source["archive_file"], MAXIMUM_EVIDENCE_BYTES)
+            verify_source_archive(archive_bytes, entry)
+            fields = verify_source_metadata(report, lock, source, entry, read_member(source["release_file"]),
+                                            read_member(source["index_file"]))
+            sources[key] = entry, archive_bytes, fields
+            used.update((source["lock_file"], source["archive_file"], source["release_file"], source["index_file"]))
+        if used != {entry.filename for entry in entries}:
+            fail("source evidence ZIP has unreferenced members")
+        needed = set()
+        for identity in source_evidence_identities(manifest):
+            for arch in identity["architectures"]:
+                where = f"{identity['id']} independent source evidence ({arch})"
+                key = arch, identity["package"]
+                needed.add(key)
+                if key not in sources:
+                    failures.append(f"{where} is missing")
+                    continue
+                entry, archive_bytes, fields = sources[key]
+                provenance = identity["provenance"]
+                if (not isinstance(provenance, dict) or provenance["version"] != entry["version"]
+                        or provenance["archives"][arch] != source_archive_digest(entry)):
+                    failures.append(f"{where} disagrees on archive provenance")
+                for dependency in identity.get("derived_from", []):
+                    dependency_source = sources.get((arch, dependency["package"]))
+                    if dependency_source is None or dependency_source[0]["version"] != dependency["version"]:
+                        failures.append(f"{where} disagrees on derived source {dependency['package']}")
+                derived = derive_prestate(identity, arch, archive_bytes)
+                if derived is not None:
+                    member, mode = derived
+                    if (tagged("sha256", member) != identity["digest"] or len(member) != identity["size"]
+                            or f"0{mode:03o}" != identity["mode"]):
+                        failures.append(f"{where} derived bytes disagree on digest, size or mode")
+                elif identity["kind"] == "archive":
+                    if identity["digest"] != source_archive_digest(entry) or identity["size"] != len(archive_bytes):
+                        failures.append(f"{where} archive digest or size disagrees")
+                else:
+                    member, mode = tar_member(archive_bytes, "data.tar", identity["path"])
+                    if (tagged("sha256", member) != identity["digest"] or len(member) != identity["size"]
+                            or f"0{mode:03o}" != identity["mode"]):
+                        failures.append(f"{where} member bytes disagree on digest, size or mode")
+                if "artifact" in identity and identity["artifact"] != {
+                        "filename": fields["filename"], "architecture": fields["architecture"]}:
+                    failures.append(f"{where} artifact filename or architecture disagrees")
+        if set(sources) - needed:
+            fail("source evidence has unneeded package/architecture coordinates")
+    return failures
+
+
+def prestate_evidence_failures(manifest: dict, root: Path) -> list[str]:
+    if not source_evidence_identities(manifest):
+        return []
+    relative = manifest.get("prestate_evidence")
+    if relative is None:
+        return ["derivable prestates/artifact coordinates have no retained independent source evidence"]
+    path = root / relative
+    if (not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(root.resolve())
+            or path.stat().st_size > MAXIMUM_EVIDENCE_BYTES):
+        return [f"independent source evidence {relative} is missing, unsafe or too large"]
+    try:
+        data = read_source_file(path, root, MAXIMUM_EVIDENCE_BYTES, f"independent source evidence {relative}")
+        return check_prestate_evidence(manifest, data)
+    except (RepinError, zipfile.BadZipFile, KeyError, ValueError, TypeError, OSError, EOFError) as error:
+        return [f"independent source evidence {relative}: {error}"]
 
 
 def zig_bytes_constant(text: str, name: str) -> str | None:
@@ -1515,7 +2269,7 @@ def zig_bytes_constant(text: str, name: str) -> str | None:
     return "".join(value.lower() for value in values)
 
 
-def consumer_failures(identity: dict, root: Path) -> list[str]:
+def consumer_failures(identity: dict, root: Path, manifest: dict | None = None) -> list[str]:
     failures = []
     hexadecimal = identity["digest"].split(":", 1)[1]
     version = None
@@ -1537,6 +2291,20 @@ def consumer_failures(identity: dict, root: Path) -> list[str]:
             version_seen = True
             continue
         text = data.decode("utf-8", "replace")
+        if consumer["form"] == "shell":
+            expected = {
+                "digest": hexadecimal,
+                "digest_size": f"{hexadecimal} {identity['size']}",
+                "size": str(identity["size"]),
+                "version": identity["provenance"].get("version") if isinstance(identity["provenance"], dict) else None,
+                "member": "./" + identity["path"] if identity["path"] is not None else None,
+            }
+            if manifest is not None and "artifact" in identity:
+                expected["url"] = snapshot_uri(manifest["series"], manifest["snapshot"]["timestamp"]) + "/" + identity["artifact"]["filename"]
+            failures += shell_coordinate_failures(text, consumer["bindings"], expected, where)
+            if "version" in consumer["bindings"] or "url" in consumer["bindings"]:
+                version_seen = True
+            continue
         if version is not None and version in text:
             version_seen = True
         if consumer["form"] == "hex":
@@ -1579,6 +2347,10 @@ def in_tree_pins(root: Path) -> list[tuple[str, str, dict]]:
             if mode is not None:
                 detail["mode"] = "0" + mode
             pins.append((f"{relative}:{match.group('path')}", match.group("hex"), detail))
+        for match in SNAPSHOT_ARCHIVE_ENTRY.finditer(text):
+            detail = {"package": match.group("package"), "version": match.group("version"),
+                      "architecture": match.group("arch"), "archive_size": int(match.group("size"))}
+            pins.append((f"{relative}:archive:{match.group('package')}", match.group("hex"), detail))
         for match in QUOTED_HEX_LITERAL.finditer(text):
             line = text.count("\n", 0, match.start()) + 1
             pins.append((f"{relative}:{line}", match.group(1), {}))
@@ -1599,12 +2371,17 @@ def bound_paths(identity: dict) -> set[str]:
     return {identity["path"]}
 
 
-def shell_readonly_scalars(text: str) -> dict[str, str]:
+def shell_readonly_scalars(text: str) -> dict[str, str | None]:
     values = {}
     for line in text.splitlines():
         match = re.match(r"^\s*readonly\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
         if match is None:
             continue
+        name = match.group(1)
+        if name in values:
+            values[name] = None
+            continue
+        values[name] = None
         raw = match.group(2).strip()
         if raw.startswith("("):
             continue
@@ -1613,18 +2390,57 @@ def shell_readonly_scalars(text: str) -> dict[str, str]:
         except ValueError:
             continue
         if len(words) == 1:
-            values[match.group(1)] = words[0]
+            values[name] = words[0]
     return values
 
 
 def shell_readonly_array(text: str, pattern: re.Pattern[str]) -> list[str] | None:
-    match = pattern.search(text)
-    if match is None:
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
         return None
+    match = matches[0]
     try:
         return shlex.split(match.group("body"), comments=True, posix=True)
     except ValueError:
         return None
+
+
+def shell_coordinate_failures(text: str, bindings: dict, expected: dict, where: str) -> list[str]:
+    failures = []
+    scalars = shell_readonly_scalars(text)
+    for coordinate, name in bindings.items():
+        wanted = expected.get(coordinate)
+        declarations = re.findall(r"(?m)^\s*readonly\s+" + re.escape(name) + r"=", text)
+        if len(declarations) != 1:
+            actual = None
+        elif isinstance(wanted, list):
+            pattern = re.compile(r"(?ms)^\s*readonly\s+" + re.escape(name) + r"=\((?P<body>[^)]*)\)")
+            actual = shell_readonly_array(text, pattern)
+        else:
+            actual = scalars.get(name)
+        if wanted is None or actual != wanted:
+            failures.append(f"{where} {coordinate} ({name}) is {actual!r}, expected {wanted!r}")
+    return failures
+
+
+def snapshot_coordinate_failures(manifest: dict, root: Path) -> list[str]:
+    failures = []
+    frozen = frozen_pocket(manifest["snapshot"])
+    frozen_suites = [p["suite"] for p in manifest["series"]["pockets"] if p["role"] == "frozen"]
+    expected = {
+        "uri": snapshot_uri(manifest["series"], manifest["snapshot"]["timestamp"]),
+        "suite": frozen_suites[0] if len(frozen_suites) == 1 else None,
+        "witness_suites": [p["suite"] for p in manifest["series"]["pockets"] if p["role"] == "witness"],
+        "release_sha256": frozen["release_sha256"].split(":", 1)[1] if frozen is not None else None,
+    }
+    for consumer in manifest.get("coordinate_consumers", []):
+        path = root / consumer["path"]
+        where = f"snapshot coordinate consumer {consumer['path']}"
+        if not path.is_file() or path.is_symlink():
+            failures.append(f"{where} does not exist")
+        else:
+            failures += shell_coordinate_failures(path.read_text(encoding="utf-8"), consumer["bindings"], expected, where)
+    return failures
 
 
 def protected_stage_profile_coupling_failures(manifest: dict, root: Path) -> list[str]:
@@ -1772,9 +2588,11 @@ def check_manifest(manifest: dict, root: Path, profile: dict | None = None) -> l
     for arch, closure in manifest["snapshot"].get("closures", {}).items():
         digests[closure["digest"].split(":", 1)[1]] = {"id": f"closure:{arch}", "path": None, "size": None}
     for identity in manifest["identities"]:
-        failures += consumer_failures(identity, root)
+        failures += consumer_failures(identity, root, manifest)
         digests.setdefault(identity["digest"].split(":", 1)[1], identity)
     failures += protected_stage_profile_coupling_failures(manifest, root)
+    failures += snapshot_coordinate_failures(manifest, root)
+    failures += prestate_evidence_failures(manifest, root)
     excluded = {item["digest"].split(":", 1)[1] for item in manifest["excluded"]}
     fixture_consumers = {
         consumer["path"]
@@ -1795,6 +2613,12 @@ def check_manifest(manifest: dict, root: Path, profile: dict | None = None) -> l
         if identity is None:
             failures.append(f"in-tree pin {location} {value[:16]}... is absent from the manifest")
             continue
+        if "archive_size" in detail and (
+            identity.get("kind") != "archive" or identity["package"] != detail["package"]
+            or identity["size"] != detail["archive_size"] or detail["architecture"] not in identity["architectures"]
+            or not isinstance(identity["provenance"], dict) or identity["provenance"]["version"] != detail["version"]
+        ):
+            failures.append(f"in-tree pin {location} disagrees with {identity['id']} on archive version, size or architecture")
         if "path" in detail and (
             detail["path"] not in bound_paths(identity)
             or identity["size"] != detail["size"]
@@ -1819,6 +2643,8 @@ def check_command(args: argparse.Namespace) -> int:
         f"check passed: {len(manifest['identities'])} identities for {manifest['series']['name']} "
         f"{manifest['snapshot']['timestamp']} ({status})"
     )
+    if source_evidence_identities(manifest):
+        print(f"offline retained source evidence: {len(source_evidence_identities(manifest))} byte identities verified; no live probe")
     return 0
 
 

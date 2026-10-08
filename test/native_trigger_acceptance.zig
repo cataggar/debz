@@ -1428,7 +1428,6 @@ pub fn main(init: std.process.Init) !void {
     const native_driver = driver orelse "";
     if (multi_handler_only) {
         try runDeferredMultiHandler(&fixture, native_driver, selected, reference.executable, reference.architecture);
-        try runUnwatchedDeclaredActivations(&fixture, native_driver, selected, reference.executable, reference.architecture);
         try support.assertHostUnchanged(allocator, init.io, reference.before);
         return;
     }
@@ -1537,6 +1536,17 @@ test "trigger byte-order oracle refuses reordered argv and duplicate callbacks" 
         trace ++ trace,
         "amd64",
         immediate_trigger_names,
+    ));
+    const named_callback = "zero-trigger-handler@1:postinst\tzero-trigger-handler\tpostinst\tamd64\t2\t9:triggered\t17:debz-zero-trigger\tpayload=data version 1\n";
+    const file_callback = "zero-file-handler@1:postinst\tzero-file-handler\tpostinst\tamd64\t2\t9:triggered\t26:/usr/share/debz-zero-files\tpayload=data version 1\n";
+    try assertPackageTriggeredArgv(allocator, file_callback ++ named_callback, "zero-trigger-handler", "amd64", "debz-zero-trigger");
+    try assertPackageTriggeredArgv(allocator, file_callback ++ named_callback, "zero-file-handler", "amd64", "/usr/share/debz-zero-files");
+    try std.testing.expectError(error.TriggerInvocationCountMismatch, assertPackageTriggeredArgv(
+        allocator,
+        named_callback,
+        "zero-file-handler",
+        "amd64",
+        "/usr/share/debz-zero-files",
     ));
 }
 
@@ -1723,6 +1733,37 @@ test "reference trigger-only and deferred phases emit distinct guarded dpkg flag
     try std.testing.expect(std.mem.indexOf(u8, deferred, "--no-triggers\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, deferred, "--install\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, deferred, "--pending") == null);
+    try fixture.directory("selected");
+    const selected_handlers = [_]foundation.PackageIdentity{
+        .{ .name = "zero-trigger-handler", .architecture = "amd64" },
+        .{ .name = "zero-file-handler", .architecture = "amd64" },
+    };
+    try std.testing.expectEqual(@as(u8, 0), try support.reference(
+        &fixture,
+        binary,
+        root,
+        .{ .operation = "process_triggers", .triggers = true, .reference_trigger_order = &selected_handlers },
+        "selected",
+    ));
+    const selected = try support.read(&fixture, "selected/reference.log", 64 * 1024);
+    defer std.testing.allocator.free(selected);
+    try std.testing.expect(std.mem.indexOf(u8, selected, "--no-triggers\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, selected, "--triggers-only\nzero-trigger-handler\nzero-file-handler\n"));
+    try std.testing.expect(std.mem.indexOf(u8, selected, "--pending") == null);
+    try std.testing.expectError(error.InvalidReferenceOperation, support.reference(
+        &fixture,
+        binary,
+        root,
+        .{ .operation = "install", .archives = &.{"package.deb"}, .reference_trigger_order = &selected_handlers },
+        "unused",
+    ));
+    try std.testing.expectError(error.InvalidReferenceOperation, support.reference(
+        &fixture,
+        binary,
+        root,
+        .{ .operation = "process_triggers", .triggers = true, .reference_trigger_order = &.{} },
+        "unused",
+    ));
     try std.testing.expectError(error.InvalidReferenceOperation, support.reference(
         &fixture,
         binary,

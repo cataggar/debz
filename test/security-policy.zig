@@ -328,7 +328,14 @@ test "security: native-only production candidate refuses shipped routes and exac
     defer unreviewed.deinit();
     try unreviewed.failsWith("src/maintainer_script.zig: unreviewed child-process operator");
     try unreviewed.failsWith("src/maintainer_script.zig: unreviewed/stale child-process allowance");
-    const stale = try f.replace(inventory, "eb546e88d64091c9", "ab546e88d64091c9");
+    const parsed_inventory = try std.json.parseFromSlice(std.json.Value, f.arena.allocator(), inventory, .{});
+    defer parsed_inventory.deinit();
+    const fingerprint = parsed_inventory.value.object.get("reviewed_fingerprints").?.object.get("src/transaction_executor.zig").?.string;
+    try testing.expectEqual(@as(usize, 128), fingerprint.len);
+    var corrupted: [128]u8 = undefined;
+    @memcpy(&corrupted, fingerprint);
+    corrupted[0] = if (fingerprint[0] == '0') '1' else '0';
+    const stale = try f.replace(inventory, fingerprint, &corrupted);
     const wrong_fingerprint = try productionCandidate(&f, "security/native-only-production-policy.json", stale);
     defer wrong_fingerprint.deinit();
     try wrong_fingerprint.failsWith("src/transaction_executor.zig: stale reviewed inventory fingerprint");
@@ -718,6 +725,35 @@ test "security: every split build workload job, mode and step fails closed under
     try refused.failsWith("ci.yml: build-and-test-workload-apt-system must execute Normalize apt facade acceptance diagnostics exactly as reviewed");
 }
 
+test "security: only the fork-gated core workload may use self-hosted runners" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const workflow = try f.source(".github/workflows/ci.yml");
+    const core = workload_jobs[0];
+    const core_body = try job(workflow, core.name, core.next);
+    const core_runs_on = "    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\",\"ubuntu2604\"]', matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}";
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, core_body, core_runs_on));
+    const core_limit = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must require both architectures and optimization modes within 45 minutes", .{core.name});
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ", .after = "" },
+        .{ .before = core_runs_on, .after = core_runs_on ++ "\n" ++ core_runs_on },
+        .{ .before = core_runs_on, .after = "    runs-on: [self-hosted, Linux, X64, ubuntu2604]" },
+    }) |mutation| {
+        const changed = try f.replace(workflow, core_body, try f.replace(core_body, mutation.before, mutation.after));
+        const rejected = try f.check("ci-recovery", changed);
+        defer rejected.deinit();
+        try rejected.failsWith(core_limit);
+    }
+    for (workload_jobs[1..]) |root_job| {
+        const body = try job(workflow, root_job.name, root_job.next);
+        const changed = try f.replace(workflow, body, try f.replace(body, "    runs-on: ${{ matrix.os }}", core_runs_on));
+        const rejected = try f.check("ci-recovery", changed);
+        defer rejected.deinit();
+        const limit = try std.fmt.allocPrint(f.arena.allocator(), "ci.yml: {s} must require both architectures and optimization modes within 45 minutes", .{root_job.name});
+        try rejected.failsWith(limit);
+    }
+}
+
 test "security: every former workload target runs exactly once across the split jobs" {
     var f = try Fixture.init();
     defer f.deinit();
@@ -797,7 +833,7 @@ test "security: build.zig test is exactly the disjoint union of the CI workload 
             try rejected.failsWith("build.zig:");
         }
     }
-    try testing.expectEqual(@as(usize, 45), members);
+    try testing.expectEqual(@as(usize, 46), members);
     for (partitions) |partition| {
         const binding = try std.fmt.allocPrint(f.arena.allocator(), "    test_step.dependOn({s});\n", .{partition});
         const removed = try f.check("workload-build", try f.replace(build, binding, ""));

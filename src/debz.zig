@@ -4,6 +4,8 @@ const build_options = @import("debz_build_options");
 
 pub const version = build_options.version;
 pub const product_api = @import("product_api.zig");
+pub const active_repository_config = @import("active_repository_config.zig");
+pub const system_product_context = @import("system_product_context.zig");
 pub const system_profile = @import("system_profile.zig");
 pub const apt_system_api = @import("apt_system_api.zig");
 pub const apt_system_cli = @import("apt_system_cli.zig");
@@ -262,6 +264,8 @@ pub const transaction_recovery = @import("transaction_recovery.zig");
 pub const exact_lock = @import("exact_lock.zig");
 pub const exact_lock_v2 = @import("exact_lock_v2.zig");
 pub const exact_lock_v3 = @import("exact_lock_v3.zig");
+pub const exact_lock_v4 = @import("exact_lock_v4.zig");
+pub const installed_baseline = @import("installed_baseline.zig");
 pub const native_authorization = @import("native_authorization.zig");
 pub const native_program = @import("native_program.zig");
 pub const native_preparation = @import("native_preparation.zig");
@@ -621,6 +625,8 @@ test "native_unpack.test.public runtime keeps fixture adapters private" {
 }
 
 test {
+    _ = @import("installed_baseline_component.zig");
+    _ = @import("native_baseline_contract.zig");
     _ = deb_payload;
     _ = archive_application;
     _ = deb822;
@@ -640,6 +646,7 @@ test {
     _ = repository_refresh;
     _ = repository_policy;
     _ = target_apt_config;
+    _ = system_product_context;
     _ = reviewed_repository_profile;
     _ = signed_release_envelope;
     _ = openpgp_verifier;

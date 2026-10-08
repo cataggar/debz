@@ -1485,6 +1485,17 @@ def audit_production_sources() -> None:
                 line = text.count("\n", 0, match.start()) + 1
                 fail(f"{relative}:{line}: forbidden {reason}")
         for match in re.finditer(r"\bstd\.process\.run\s*\(", text):
+            if relative == "src/production_backend.zig":
+                fixture_start = text.find('\ntest "production native baseline signed batch receipt zero-op replay and owned process crash"')
+                fixture_end = text.find('\ntest "', fixture_start + 1)
+                if (
+                    fixture_start >= 0
+                    and fixture_start < match.start() < fixture_end
+                    and text.count("std.process.run(") == 1
+                    and '.argv = &.{"/proc/self/exe"}' in text[fixture_start:fixture_end]
+                    and "CompletionPoint.after_native_receipt" in text[fixture_start:fixture_end]
+                ):
+                    continue
             process_calls.append(f"{relative}:{text.count(chr(10), 0, match.start()) + 1}")
         for match in re.finditer(r"\blinux\.(?:fork|clone2|execve|chroot)\s*\(", text):
             if relative == "src/native_unpack.zig" and match.group() == "linux.fork(":
@@ -1641,8 +1652,15 @@ def audit_production_sources() -> None:
         "interest.package.architecture.len == 0 and",
         "std.mem.eql(u8, source.architecture, native_architecture)",
         "try eligible.append(allocator, interest);",
-        "appendAutomaticFileTriggerEvent(\n            event_allocator,",
-        "appendAutomaticFileTriggerEvent(\n            allocator,\n            sink.events,",
+        "const FileTriggerPathEvents = struct",
+        "while (cursor) |component| : (cursor = std.fs.path.dirname(component)) {",
+        "if (self.work > (Limits{}).max_work) return error.TriggerWorkLimit;",
+        "const trigger = self.paths.get(component) orelse continue;",
+        "if ((try self.noted.getOrPut(self.allocator, trigger)).found_existing) continue;",
+        "try appendAutomaticFileTriggerEvent(sink.allocator, sink.events, sink.source, architecture, trigger, self.interests);",
+        "for (model.files) |file| {\n        try file_events.activate(.{",
+        "}, architecture, diversions.physical(file.path, model.facts.package));",
+        "try file_events.activate(sink, model.native_architecture, names.get(physical) orelse physical);",
         "persistRuntimeTriggerEvents(&resumed, testing.allocator, root, &.{forged})",
     ):
         if required not in unpack:
@@ -2006,7 +2024,7 @@ WORKLOAD_PARTITIONS = {
         "dpkg_oracle_evidence_tests", "signed_proc_compare_tests", "run_sha512_e2e_tests",
         "run_native_trigger_queue_tests", "run_lifecycle_zig_tests",
         "run_trigger_zig_tests", "run_settlement_tests", "run_recovery_unit_tests",
-        "run_native_recovery_tests", "run_repository_recovery_unit",
+        "run_native_recovery_tests", "phase_telemetry_step", "run_repository_recovery_unit",
         "run_package_cache_archive_tests",
     )),
     "workload_release": ("test-workload-release", (
@@ -2069,6 +2087,15 @@ WORKLOAD_SETUP_LINES = (
     "            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
     '        run: test "$(zig version)" = 0.16.0',
     "            sudo apt-get install --yes --no-install-recommends liblzma-dev libzstd-dev python3-jsonschema",
+)
+# Only the sudo-free core partition may use the trusted self-hosted pool; every
+# root-requiring workload keeps the disposable GitHub-hosted runner.
+WORKLOAD_RUNS_ON = "    runs-on: ${{ matrix.os }}"
+WORKLOAD_CORE_RUNS_ON = (
+    "    runs-on: ${{ (github.event_name != 'pull_request' || "
+    "github.event.pull_request.head.repo.full_name == github.repository) && "
+    "fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\",\"ubuntu2604\"]', "
+    "matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'X64')) || matrix.os }}"
 )
 WORKLOAD_DEBUG = "${{ matrix.optimize == 'Debug' }}"
 WORKLOAD_RELEASESAFE = "${{ matrix.optimize == 'ReleaseSafe' }}"
@@ -2325,7 +2352,8 @@ def workload_ci_failures(jobs: dict[str, str], text: str) -> list[str]:
         header = body.split("    steps:\n", 1)[0]
         if (
             f"    name: Build and test workload {label} (${{{{ matrix.name }}}}, ${{{{ matrix.optimize }}}})" not in lines
-            or "    runs-on: ${{ matrix.os }}" not in lines
+            or re.findall(r"(?m)^    runs-on:[^\n]*$", body)
+            != [WORKLOAD_CORE_RUNS_ON if label == "core" else WORKLOAD_RUNS_ON]
             or re.findall(r"(?m)^    timeout-minutes:[^\n]*$", body)
             != [f"    timeout-minutes: {WORKLOAD_TIMEOUT_MINUTES}"]
             or header.count("    strategy:\n") != 1

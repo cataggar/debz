@@ -27,6 +27,19 @@ attempt, root, request, policy, exact lock, artifact and database generation
 digests, stored paths, and limits. Recovery consumes these persisted inputs
 without caller archives, repository access, re-solving, or recompilation.
 
+Installed and incoming lifecycle script copies are staged before ordinary or
+bootstrap payload publication, even without pre-unpack callbacks. This keeps
+the original recorded digest bound to original installed bytes when live
+`info/` members subsequently describe the new version. Existing exact staged
+digest, compiled caller/version and managed-checkpoint checks remain unchanged.
+The statoverride recovery suite includes differing-script upgrades interrupted
+at preparation and known-outcome boundaries of the old upgrade `postrm`;
+archive eviction still permits exact recovery. Swapping old/new staged
+postinst bytes or replacing either with unrelated script bytes requires
+`managed_state_changed` refusal, with an unchanged root and no new invocation;
+these byte-drift controls preserve mode, owner, mtime and file identity.
+This bounded tool/fixture evidence is not a signed vendor-root parity claim.
+
 The native progress document preserves a logical append-only sequence and
 hash chain, atomically replacing its canonical JSON file on each append.
 Records describe native phases and invocation outcomes,
@@ -42,6 +55,59 @@ and trigger-event publication use temporary allocation scopes.
 The CLI supplies its deallocating process allocator to native preparation,
 execution and recovery while keeping API result ownership in its
 argument-parsing arena. The latter cannot reclaim phase-local allocations.
+
+With `DEBZ_NATIVE_PHASE_TELEMETRY=1`, native execution also emits diagnostic-only `native_phase` structured log
+lines after durable progress publication and on an ordinary execution/recovery
+return (including refusals and errors, not necessarily successful completion).
+Each line identifies the attempt, a random process epoch, an
+invocation ID, context-local sequence, program step/substep/ordinal/stage/result, monotonic elapsed
+nanoseconds and cumulative count/nanoseconds pairs for database capture,
+database import, database hashing, native materialization application, fsync and progress
+serialization (read/decode/seal/validate/encode, excluding publication).
+The opt-in logs use the existing info logger on stderr, never JSON stdout.
+Ordinary invocations remain quiet and do not attach a measurement context;
+small hashes and fsyncs then incur no profiling clock reads. The variable changes
+only observation, never authorization, evidence or maintainer-script environment.
+There are six fixed-size saturating counters and no retained sample list.
+Counts include failed operations. Import includes its hash time; mutation
+measures the materializers' `root_mutation.apply` calls (not preparation or
+recovery rollback) and includes nested fsync time, so these inclusive durations
+must not be summed.
+Fsync measures actual file/directory synchronization through the root filesystem
+helpers; hashing covers package-database content and generation hashes, not
+archive/helper hashing. Aborted processes may have no final log line.
+
+These logs are neither durable checkpoints nor authority. They add no fields
+to frozen progress, intent, provenance, database or completion documents and
+never affect a deadline or permission to mutate. Recovery starts fresh counters
+and a fresh monotonic interval/invocation ID; a process restart changes the epoch. Compare
+deltas only within one invocation, not elapsed values across restarts.
+The elapsed timestamps are direct monotonic measurements in the opt-in
+diagnostic stream, **not timestamps added to native progress records**.
+Frozen durable progress schemas and canonical bytes remain unchanged;
+the progress-record timestamp follow-up in issue #345 is not implemented.
+
+State recording borrows its immediately preceding imported database; detailed
+state materialization borrows the same-phase import of its outer capture.
+The owning capture and import outlive planning/materialization and are then
+released. There is no retained database cache and no reuse across scripts,
+filesystem publication or recovery. Mutation preflight, expected-before
+checks, fresh post-apply database import, `status-old` verification and
+independently durable phase completion remain unchanged. No DB-only actions
+are grouped.
+
+The synthetic 1/175-package state-transition checks compare identical inputs
+against a seam that restores the removed capture/import. They establish fewer
+captures/imports/hashes with equal final generation, status, exact `status-old`,
+mutation and fsync counts; they do not measure a full install before/after.
+Issue #345 still requires controlled matched full 177-package snapshot runs
+on amd64 and arm64, direct production phase deltas, telemetry-overhead
+calibration and complete final root/provenance comparison. Shared-host timings,
+historical mtime allocations and cancelled CI cohorts are not acceptance or
+controlled full-snapshot speedup evidence.
+`zig build test-native-phase-telemetry` checks configured logging in separate
+processes with the variable absent, disabled, a non-opt-in value and enabled;
+it also runs in the unprivileged native unit workload.
 
 Filesystem and database repair delegates to the existing
 [root mutation layer](root-mutation.md). Missing, corrupt, mismatched, or
@@ -65,8 +131,8 @@ This uses the existing versioned execution-progress, script-outcome,
 managed-state, root-mutation, completion, and provenance documents; no wire
 schema is widened, and older evidence retains its original meaning.
 
-Statoverride resolution is frozen for the original invocation. Alongside the
-original override database, recovery stores the exact account-file bytes and
+Recovery freezes the original pre-script statoverride resolution. Alongside
+the original override database, it stores the exact account-file bytes and
 modes actually required for named identities. These use bounded database-kind
 blobs keyed `statoverride-passwd` and `statoverride-group`, with exact logical
 paths `etc/passwd` and `etc/group`; they are not dpkg database-generation
@@ -76,7 +142,20 @@ current account files. Numeric-only records require no identity blobs.
 Managed observations separately track current override/account state across
 known script outcomes, so legitimate script changes can resume using the
 original resolution while subsequent external drift still blocks mutation.
-An initially empty override set also stays empty throughout recovery.
+As in normal execution, successful non-preinst outcomes refresh the override
+database for later phases. Their checkpoints include the database and the
+root-local account inputs used by the refreshed records. Only override records
+created or changed at that boundary add their live targets to managed state;
+unchanged administrator overrides do not add targets. Dpkg's incidental rewrite
+of a numeric identity into an equivalent account name is not a target change.
+The observation binds the actual no-follow kind, bytes and mode/uid/gid after genuine
+`dpkg-statoverride --update`, not an assumed copy of the record's metadata.
+Merged-/usr spellings are observed at their physical alias destination.
+Recovery refuses later target drift before continuing. Settled verification
+reuses the managed-payload checks, retaining the existing administrator
+conffile exemptions. Dpkg's `statoverride-old` and `diversions-old` remain
+scratch backups, compared byte-for-byte in the genuine-tool oracles rather
+than added to the lock or closure formats.
 
 Diversion inputs remain genuine database-generation blobs. Managed checkpoints
 also observe the live diversion database, including initial absence, and the
@@ -928,7 +1007,7 @@ status before completion, drift refusal without package mutation, exact
 reference-root parity, retained scripted-trigger receipt count, and immutable
 recovery repeats. This target is included in the complete aggregate in both modes on both CI
 architectures.
-`zig build test-native-recovery-zig-statoverride` runs all 17 named
+`zig build test-native-recovery-zig-statoverride` runs 24
 statoverride crash/recovery variants in fresh guarded roots, including
 install, upgrade, remove and purge, failed postinst, script-replaced account
 and override files, a newly created override database, and six independent
@@ -936,6 +1015,14 @@ identity, stored-blob and owner drifts. The Zig runner checks exact persisted
 account/group bytes, archive-evicted core recovery, unchanged helper inode and
 bytes, pinned-dpkg filesystem/database/script parity or refusal without
 package mutation, terminal completion, and immutable repeated receipts.
+The five genuine chrony-shaped additions cover created and changed records at
+`after_script_outcome`, archive-evicted recovery, exact `statoverride` and
+`statoverride-old` bytes, untracked administrator override edits, and mode,
+owner and content drift refusals. Script-created targets are present in both
+the checkpoint and retained settled snapshot; the shared settled verifier
+accepts their captured state and refuses later metadata drift. Fixture scripts
+set deterministic regular-file timestamps before observation rather than
+normalizing differences in captured roots.
 Both optimization modes are required on both CI architectures; this target
 alone was never sufficient to retire either Python recovery gate.
 `zig build test-native-recovery-zig-literal` runs all five literal-backslash
@@ -2644,3 +2731,22 @@ that follow.
 **Gaps (follow-ups).** The hermetic HC/HR/HQ and FS fixtures run no
 maintainer scripts; FSS, HCC and HCR cover retained `script_outcome`
 documents for scripted succeeded and recovered attempts (#318).
+## Installed-baseline no-op recovery
+
+The explicit native baseline contract uses authorization/program v3, the full
+v4 planning envelope, request v4, intent v2, non-bootstrap progress v3 and
+provenance v2. See the [component and authority boundary](exact-locks-and-provenance.md#native-execution-boundary).
+The initial complete database checksum is not replayed blindly after owned
+new-package mutations. Managed checkpoints bind those exact mutations, while
+the unchanged baseline status/control/ownership/payload component is verified
+independently before further work, final-state verification and acknowledgment.
+
+Recovery consumes the original retained program, component and authenticated
+archives, including when the original repository or archive files disappear.
+Baseline drift during a partial unpack or after receipt publication refuses
+further work/acknowledgment and retains the same active attempt and intent.
+Unknown pending triggers and private callbacks likewise cannot become baseline
+authority. A successful zero-action replay retains the exact existing receipt;
+it does not recapture changed local facts. Legacy baseline recovery and
+bootstrap, removal, reinstall, upgrade, callback or trigger grants remain
+unsupported by this bounded contract.

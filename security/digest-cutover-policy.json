@@ -105,6 +105,54 @@
   },
   "semantic_allowlist": [
     {
+      "id": "native-baseline-cache-publication-hex-controls",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "These two exact v6 schemas encode the full v4 planning-document checksum, acceptance-policy checksum and root/component-specific cache publication fingerprint/key. They never encode package/archive/repository content identity or substitute for signed algorithm-tagged archive authority.",
+      "paths": [
+        "schema/package-cache-fingerprint-v6.json",
+        "schema/package-cache-result-v6.json"
+      ]
+    },
+    {
+      "id": "native-baseline-document-controls",
+      "kind": "raw_32_byte_field",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "The baseline no-op v1 composition retains the existing canonical v4 planning-envelope and canonical v3 archive-lock document checksums. These are document bindings, never baseline archive digests or package authority; actual new archives remain algorithm-tagged and signed.",
+      "paths": [
+        "src/native_baseline_contract.zig"
+      ]
+    },
+    {
+      "id": "native-baseline-versioned-schema-controls",
+      "kind": "schema_sha256_field",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "These exact successor schemas retain the existing root, request, policy, database, program and canonical lock-document SHA256 control protocols. Archive identities remain the typed v2/v3 references, while installed no-op observations and their contract reference use SHA512 and grant no archive authority.",
+      "paths": [
+        "schema/native-installed-baseline-noop-v1.json",
+        "schema/native-transaction-authorization-v3.json",
+        "schema/native-transaction-program-v3.json"
+      ]
+    },
+    {
+      "id": "active-root-configuration-schema-controls",
+      "kind": "schema_sha256_field",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "The active pointer binds the existing root identity, its canonical payload checksum, and retained configuration-manifest bytes. These are root-scoped document controls, never package, archive, or index content authority.",
+      "paths": [
+        "schema/active-repository-config-v1.json"
+      ]
+    },
+    {
+      "id": "active-root-configuration-hex-controls",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_and_versioned_compatibility",
+      "rationale": "This exact schema encodes SHA256 root/document controls and the existing repository operation-id spelling. Current package/archive/index authority remains algorithm-tagged and unchanged.",
+      "paths": [
+        "schema/active-repository-config-v1.json"
+      ]
+    },
+    {
       "id": "typed-identity-raw-widths",
       "kind": "raw_32_byte_field",
       "classification": "typed_identity_internal",
@@ -351,6 +399,16 @@
         "tools/derive-vendor-state-reference.py",
         "tools/native-lifecycle-fixtures.py",
         "tools/test_vendor_state_capture.py"
+      ]
+    },
+    {
+      "id": "refresh-repository-id-controls",
+      "kind": "fixed_64_hex_assumption",
+      "classification": "fixed_control_protocol",
+      "rationale": "These exact command schema and repin checks validate opaque 64-character source repository ids used to join every public refresh pocket and frozen witness. Release and snapshot content digests remain algorithm-tagged; this does not introduce raw-width package content authority.",
+      "paths": [
+        "schema/command-result-v1.json",
+        "tools/real-snapshot-repin.py"
       ]
     },
     {

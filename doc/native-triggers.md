@@ -20,7 +20,13 @@ matter. Multiple activations coalesce without losing their ordering.
 `postinst triggered` receives exactly two arguments: `triggered` and a single
 space-separated trigger-name argument. The name order is observable and is not
 arbitrarily sorted. File-trigger matching follows component boundaries and
-the package paths affected by unpack/removal.
+the package paths affected by unpack/removal. Automatic activations follow
+archive-entry or removal-intent order, noting the affected physical path before
+its parents, as dpkg's `trig_path_activate` does; registry record order is not
+activation order. A diverted directory can therefore be noted before later
+archive children activate the original logical directory. The pending list's
+prepend order then gives the logical directory before the diverted directory
+in the immediate callback, without changing registry bytes.
 
 Removal and purge derive file events from the actual planned filesystem
 removals, not merely from ownership lists. Retained conffiles therefore do not
@@ -29,6 +35,9 @@ cleanup do. Events remain durably bound to their original package and program.
 Known lifecycle-script failure still processes or defers authorized pending
 work before publishing the failed outcome. It neither discards those events
 nor converts the original package failure into a successful receipt.
+Earlier filesystem activations are incorporated before the failing script's
+helper queue in both immediate and deferred modes. Replaying authenticated
+completed publications preserves that order and does not move duplicate names.
 Incorporation checks the listener's current database state: an interested
 package that is still unpacked or otherwise not configured does not become
 `triggers-pending` or cause its activating package to become
@@ -181,8 +190,8 @@ refuses; no handler, activation, or package transition is newly authorized.
 -Dnative-trigger-multi-handler-only=true -Dnative-reference-dpkg=/absolute/pinned/dpkg
 -Doptimize=Debug -j2` selects two natively installed handlers: explicit
 no-await interest and awaited file interest. The original source name and a
-source that sorts before a handler run with recovery on/off; the existing
-unwatched-activation case-1 matrix runs alongside them. The fixture
+source that sorts before both handlers run with recovery on/off. Case 1
+remains in the existing full suite, outside this focused selector. The fixture
 requires exact pinned-dpkg `--no-triggers` status bytes and pending/awaited
 edges, eventual native `process_triggers` settlement, exact per-handler
 callback argv, and an unchanged zero-action upgrade including database and
@@ -198,6 +207,10 @@ dpkg processes that selected list in reverse, matching the native fixture's
 file-then-explicit callback order. Traces are compared without reordering or
 normalization. Generic pending-handler scheduling remains a separate
 compatibility question; hosted isolated-runtime acceptance remains required.
+Unprivileged authorization and unpack tests also require the same canonical
+base and exact derived edges before and after serialization, and reject a
+wrong input digest, changed closure, unknown activation or unbound handler.
+Those tests do not execute the genuine callbacks or replace protected CI.
 
 ## Private activation helper
 
@@ -303,6 +316,13 @@ coalescing with repeated activations, without moving duplicates. The focused
 `-Dnative-trigger-byte-order-only=true` selector runs these cases in the
 existing native and two-dpkg oracle targets.
 
+Unprivileged `test-native-unpack` regressions reproduce diverted directory and
+child-before-parent file-event ordering, plus immediate/deferred failure
+incorporation and authenticated replay with a reordered-journal refusal. The
+failure regression deliberately leaves dispatch unbound so it can inspect the
+real pending database without running a script. These checks are not a
+replacement for pinned-dpkg settlement and conffile crash execution in CI.
+
 Recovery restores the live/imported pending-name distinction only from an
 authenticated normalization publication, not a generic completed database
 phase or queue/log contents. Normalization binds an intent/action-specific
@@ -327,6 +347,9 @@ Unit cases reject an unfinished preparation, missing/mismatched checkpoint and
 purpose bound to another action, while retaining generic v1 record semantics.
 They also restore a later authenticated normalization after generic phase 0;
 restoration is not restricted to the first completed database phase.
+Source-only fixture compilation and unit results are not evidence that these
+genuine-tool cases ran; guarded execution and hosted coverage must be
+established separately.
 
 The full trigger suite also runs two **reference-only** guarded, pinned-dpkg
 cases for a failed activating postinst with an unpacked (not configured)

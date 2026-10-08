@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://debz.dev/schema/native-transaction-program-v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "backend", "install_root", "root_identity_sha256", "target_architecture", "foreign_architectures", "authorization_sha256", "solver_policy_sha256", "executor_policy_sha256", "script_policy_sha256", "policy", "plan_sha256", "request_sha256", "exact_lock", "final_state_sha256", "installed_database", "trigger_authority", "artifacts", "artifacts_sha256", "steps", "steps_sha256", "baseline", "digest_sha256"],
+  "properties": {
+    "schema": {"const": "https://debz.dev/schema/native-transaction-program-v3"},
+    "version": {"const": 3},
+    "backend": {"const": "native"},
+    "install_root": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/install_root"},
+    "root_identity_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/root_identity_sha256"},
+    "target_architecture": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/target_architecture"},
+    "foreign_architectures": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/foreign_architectures"},
+    "authorization_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/authorization_sha256"},
+    "solver_policy_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/solver_policy_sha256"},
+    "executor_policy_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/executor_policy_sha256"},
+    "script_policy_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/script_policy_sha256"},
+    "policy": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/policy"},
+    "plan_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/plan_sha256"},
+    "request_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/request_sha256"},
+    "exact_lock": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "version", "digest_sha256"],
+      "properties": {
+        "schema": {"const": "https://debz.dev/schema/exact-closure-lock-v4"},
+        "version": {"const": 4},
+        "digest_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/$defs/sha256"}
+      }
+    },
+    "final_state_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/final_state_sha256"},
+    "installed_database": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/installed_database"},
+    "trigger_authority": {"type": "null"},
+    "artifacts": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/artifacts"},
+    "artifacts_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/artifacts_sha256"},
+    "steps": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/steps"},
+    "steps_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/steps_sha256"},
+    "baseline": {"$ref": "https://debz.dev/schema/native-installed-baseline-noop-v1"},
+    "digest_sha256": {"$ref": "https://debz.dev/schema/native-transaction-program-v2#/properties/digest_sha256"}
+  }
+}

@@ -439,6 +439,16 @@
   ],
   "compatibility_guard_paths": [
     {
+      "path": "src/active_repository_config.zig",
+      "role": "backend_neutral_root_scoped_configuration_publication_and_exact_revalidation",
+      "cutover": "retain_metadata_boundary_without_package_execution"
+    },
+    {
+      "path": "src/system_product_context.zig",
+      "role": "typed_read_only_active_configuration_context_and_root_owner_refusal",
+      "cutover": "retain_metadata_boundary_without_host_mutation_authority"
+    },
+    {
       "path": "src/legacy_compat.zig",
       "role": "exact_legacy_identity_classifier_and_non_authoritative_evidence",
       "cutover": "retain_historical_classifier_delete_new_execution_disposition"
@@ -462,6 +472,26 @@
       "path": "src/exact_lock_v3.zig",
       "role": "tagged_digest_lock_decoder_rejects_legacy_schemas",
       "cutover": "retain_guard"
+    },
+    {
+      "path": "src/exact_lock_v4.zig",
+      "role": "baseline_envelope_separates_archive_authority_from_typed_native_noops",
+      "cutover": "retain_strict_backend_binding_and_unsupported_entrypoint_refusal"
+    },
+    {
+      "path": "src/installed_baseline.zig",
+      "role": "opaque_actual_root_database_noop_proof_never_archive_authority",
+      "cutover": "retain_exact_root_prestate_and_owned_no_follow_validation"
+    },
+    {
+      "path": "src/installed_baseline_component.zig",
+      "role": "immutable_installed_component_observation_never_archive_or_callback_authority",
+      "cutover": "retain_actual_root_control_status_ownership_and_payload_binding"
+    },
+    {
+      "path": "src/native_baseline_contract.zig",
+      "role": "versioned_native_noop_composition_preserves_complete_v4_and_genuine_archive_v3",
+      "cutover": "retain_exact_component_and_full_planning_envelope_through_recovery"
     },
     {
       "path": "src/native_transaction_result.zig",

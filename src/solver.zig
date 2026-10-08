@@ -1,4 +1,5 @@
 const std = @import("std");
+const installed_baseline = @import("installed_baseline.zig");
 const content_digest = @import("content_digest.zig");
 const dpkg_status = @import("dpkg_status.zig");
 const packages_index = @import("packages_index.zig");
@@ -822,6 +823,7 @@ pub const PlanInput = struct {
     exact_lock: ?*const exact_lock_module.Lock = null,
     exact_lock_v2: ?*const exact_lock_v2.Lock = null,
     exact_lock_v3: ?*const exact_lock_v3.Lock = null,
+    installed_baseline: ?*const installed_baseline.Verified = null,
     /// Selects the caller's wire authority for an unlocked plan.
     output_schema_version: ?PlanSchemaVersion = null,
 };
@@ -1292,6 +1294,21 @@ fn planTransactionInternal(
             return .{ .failure = failure };
     }
     addEssentialJobs(context, input, repository_lookup_order, &jobs);
+    if (input.installed_baseline) |proof| {
+        if (input.exact_lock == null and input.exact_lock_v3 == null)
+            return failureOne(allocator, arena_ptr, .lock_closure_drift, null, null, "installed baseline requires an exact archive closure");
+        if (!std.mem.eql(u8, proof.evidence().native_architecture, input.target_architecture))
+            return failureOne(allocator, arena_ptr, .lock_package_mismatch, null, null, "installed baseline architecture differs");
+        for (proof.evidence().packages) |package| {
+            const index = findInstalledSelector(context, .{ .name = package.name, .version = package.version, .architecture = package.architecture }) orelse
+                return failureOne(allocator, arena_ptr, .lock_package_missing, package.name, null, "installed baseline package is absent or changed");
+            const mapping = state.mappings[index];
+            const record = state.source_records[mapping.record_index];
+            if (!record.status.isFullyInstalled() or record.status.want != package.selection)
+                return failureOne(allocator, arena_ptr, .lock_package_mismatch, package.name, null, "installed baseline health or selection differs");
+            libsolv.queue_push2(&jobs, libsolv.SOLVER_LOCK | libsolv.SOLVER_SOLVABLE, mapping.solvable_id);
+        }
+    }
     addSafetyLocks(context, input, &jobs);
     addInstallOnlyJobs(context, input, &jobs);
     addPhasedLocks(context, input, &jobs);
@@ -1361,6 +1378,10 @@ fn planTransactionInternal(
     }
     if (try validateNamedInstallAction(allocator, arena_ptr, context, input, actions.items)) |failure|
         return .{ .failure = failure };
+    if (input.installed_baseline) |proof| for (actions.items) |action| {
+        if (proof.find(action.package, action.architecture) != null)
+            return failureOne(allocator, arena_ptr, .lock_closure_drift, action.package, null, "installed baseline authorizes retention only, never removal, reconfiguration, or archive execution");
+    };
     if (input.exact_lock) |lock| {
         for (actions.items) |action| {
             if (isRemoval(action.kind)) continue;
@@ -1825,6 +1846,7 @@ fn addExactLockJobs(
         const installed = state.source_records[mapping.record_index];
         if (!installed.status.isFullyInstalled()) continue;
         if (lock.findIdentity(installed.name.value, installed.architecture.value) != null) continue;
+        if (input.installed_baseline) |proof| if (proof.find(installed.name.value, installed.architecture.value) != null) continue;
         if (isHeld(context, installed_index) and !input.policy.allow_change_held)
             return (try failureOne(backing, arena, .held_violation, installed.name.value, null, "dpkg selection hold prevents exact lock closure reproduction")).failure;
         if (removalViolation(context, input, installed_index)) |kind|
@@ -2014,6 +2036,7 @@ fn addExactLockV3Jobs(
         const installed = state.source_records[mapping.record_index];
         if (!installed.status.isFullyInstalled()) continue;
         if (lock.findIdentity(installed.name.value, installed.architecture.value) != null) continue;
+        if (input.installed_baseline) |proof| if (proof.find(installed.name.value, installed.architecture.value) != null) continue;
         if (isHeld(context, installed_index) and !input.policy.allow_change_held)
             return (try failureOne(backing, arena, .held_violation, installed.name.value, null, "exact lock excludes a held installed package")).failure;
         if (removalViolation(context, input, installed_index)) |kind|
@@ -2060,6 +2083,15 @@ fn preflightRequest(
 ) PlanningError!?PlanFailure {
     switch (input.request) {
         .install => |selectors| for (selectors) |selector| {
+            if (input.installed_baseline != null) if (input.exact_lock_v3) |lock| {
+                if (findInstalledSelector(context, selector)) |index| {
+                    const state = internal(context);
+                    const record = state.source_records[state.mappings[index].record_index];
+                    if (record.status.isFullyInstalled()) if (lock.findPackage(record.name.value, record.version.spelling.value, record.architecture.value)) |locked| {
+                        if (locked.origin == .authenticated_repository) continue;
+                    };
+                }
+            };
             if (selector.version != null or selector.architecture != null) {
                 const candidate = findAvailableCandidate(context, selector) orelse {
                     return (try selectorFailure(backing, arena, context, selector)).failure;
