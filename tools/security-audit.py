@@ -2915,6 +2915,8 @@ PROTECTED_REFERENCE_SOURCE_TOKENS = {
         'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")',
         '[[ $actual_record == "$expected_record" ]]',
         'signed prestate record differs from exact requested selectors/statuses/destinations',
+        'readonly setpriv_sha256=86965a019d37dc11d176ce8cbe9f5f5f8f37027c95e03cb4a8cad4c73d940993',
+        '  require_control "$target" "usr/bin/setpriv:47576:755:$setpriv_sha256"',
         'list=$prestates/sudo/var/lib/dpkg/info/sudo.list',
         'var/lib/dpkg/info/sudo.list:2376:644:39fe94bdbeab0a80b3aaeae4cfa258be578949b791aeb06875ddf9d488387bc8',
     ),

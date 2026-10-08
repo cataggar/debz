@@ -755,6 +755,19 @@ remains unpacked until capture. Missing or changed companion identities refuse;
 no dependencies are forced, statuses synthesized or script/proc authority
 added. Normal installs without the capture request retain their old order.
 
+Run `37854267473` confirms those captures and sudo-rs readiness completed in
+both modes. Its next silent refusal was an absence guard for `usr/bin/setpriv`,
+although signed `util-linux:amd64 2.41.3-3ubuntu2.2` was unpacked before every
+capture. The full closure necessarily contains that already-reviewed 47576-byte,
+0755 regular binary (`86965a01…`); only the smaller unregistered bootstrap lacks
+it. Prestate validation now requires its exact existing digest, size, mode,
+root ownership and single hardlink instead of deleting it or accepting arbitrary
+helpers. Native script/tool/proc authority is unchanged: this is package data,
+not a new native executable admission. The reference-only capability drop and
+the narrow comparator's absent-native/present-reference allowance remain
+unchanged. Both fresh artifacts retain the earlier pre-OpenSSL stall report;
+that report is not their terminal failure.
+
 The next signed stall is `libssl3t64 3.5.5-1ubuntu3.6 ↔
 openssl-provider-legacy 3.5.5-1ubuntu3.6`, not a coreutils or Python callback
 failure. Its two single-package pinned-dpkg dry runs refuse their unconfigured

@@ -360,6 +360,8 @@ class ProtectedCiScriptTests(unittest.TestCase):
              'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")\n'),
             ("tools/real-snapshot-signed-proc-prestates.sh",
              '[[ $actual_record == "$expected_record" ]] || {\n'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '  require_control "$target" "usr/bin/setpriv:47576:755:$setpriv_sha256"\n'),
             ("tools/prepare-native-dpkg.py", "    verify_extracted_bindings(prefix, architecture)\n"),
             ("tools/prepare-native-dpkg.py", "    verify_archive_metadata(archive, architecture)\n"),
             ("tools/real-snapshot-reference-protected-stage.sh", "module.receipt_from_extracted_archive(\n"),

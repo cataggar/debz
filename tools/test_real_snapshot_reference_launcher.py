@@ -122,6 +122,48 @@ class ReferenceLauncherTests(unittest.TestCase):
                 self.assertEqual((after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
                                  (before.st_ino, before.st_mtime_ns, before.st_ctime_ns))
 
+    def test_prestate_setpriv_guard_requires_exact_unchanged_regular_package_data(self) -> None:
+        source = (TOOLS / "real-snapshot-signed-proc-prestates.sh").read_text()
+        helper = "require_control() {" + source.split("require_control() {", 1)[1].split(
+            "\nrequire_prestate()", 1)[0]
+        guard = source.split('  require_control "$target" "$signed_dpkg"\n', 1)[1].split(
+            "\n}", 1)[0]
+        # Unit metadata uses our uid/gid and a synthetic known digest, never an executable.
+        helper = helper.replace("0:0:", f"{os.getuid()}:{os.getgid()}:")
+        content = b"unit closure setpriv metadata only\n".ljust(47576, b"\0")
+        digest = hashlib.sha256(content).hexdigest()
+        for changed in ("unchanged", "missing", "bytes", "mode", "symlink", "hardlink"):
+            with self.subTest(changed=changed):
+                target = self.root / changed
+                binary = target / "usr/bin/setpriv"
+                binary.parent.mkdir(parents=True)
+                if changed != "missing":
+                    binary.write_bytes(content if changed != "bytes" else b"wrong" + content[5:])
+                    binary.chmod(0o644 if changed == "mode" else 0o755)
+                    if changed == "symlink":
+                        original = binary.with_name("original")
+                        binary.rename(original)
+                        binary.symlink_to(original)
+                    elif changed == "hardlink":
+                        os.link(binary, binary.with_name("alias"))
+                before = binary.lstat() if changed != "missing" else None
+                result = subprocess.run(
+                    ["bash", "-c",
+                     'set -euo pipefail\ntarget=$1\nsetpriv_sha256=$2\n'
+                     'require_protected_file() { [[ -f $1 && ! -L $1 ]]; }\n'
+                     + helper + "\n" + guard, "setpriv-data-guard-test", str(target), digest],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode == 0, changed == "unchanged", result.stderr)
+                if before is not None:
+                    after = binary.lstat()
+                    self.assertEqual((after.st_ino, after.st_mtime_ns, after.st_ctime_ns),
+                                     (before.st_ino, before.st_mtime_ns, before.st_ctime_ns))
+                    self.assertEqual(binary.read_bytes(),
+                                     content if changed != "bytes" else b"wrong" + content[5:])
+                else:
+                    self.assertFalse(binary.exists())
+
     def test_python_prepare_empty_preserves_both_retained_lists_on_both_architectures(self) -> None:
         real_stat = os.stat
         def captured_null_metadata(path, *args, **kwargs):

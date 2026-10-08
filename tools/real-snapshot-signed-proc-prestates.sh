@@ -319,7 +319,8 @@ require_prestate() { # package status control
   [[ $(dpkg-query --admindir="$target/var/lib/dpkg" -W -f='${Version} ${Status}' "$1") == "$2" ]]
   require_control "$target" "$3"
   require_control "$target" "$signed_dpkg"
-  [[ ! -e "$target/usr/bin/setpriv" && ! -L "$target/usr/bin/setpriv" ]]
+  # Util-linux is in this full signed closure, not the 30-archive bootstrap.
+  require_control "$target" "usr/bin/setpriv:47576:755:$setpriv_sha256"
 }
 require_prestate systemd '259.5-0ubuntu3.4 install ok half-configured' \
   'var/lib/dpkg/info/systemd.postinst:5037:755:d9df6a03ccb6b557c16ac1c674557a66c1db290f3c6d3cadbef335e0ce74e31d'
