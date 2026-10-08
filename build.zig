@@ -1611,7 +1611,7 @@ pub fn build(b: *std.Build) void {
     });
     statoverride_recovery.addArtifactArg(statoverride_recovery_executable);
     statoverride_recovery.addArtifactArg(native_lifecycle_tests);
-    b.step("test-native-recovery-zig-statoverride", "Run 19 real statoverride crash/recovery cases")
+    b.step("test-native-recovery-zig-statoverride", "Run 24 real statoverride crash/recovery cases")
         .dependOn(&statoverride_recovery.step);
 
     const literal_recovery_module = b.createModule(.{
@@ -1749,6 +1749,10 @@ pub fn build(b: *std.Build) void {
     if (native_diversions_only) {
         for ([_]*std.Build.Step.Run{ lifecycle_zig, trigger_zig, lifecycle_oracle_zig, trigger_oracle_zig }) |runner|
             runner.addArg("--diversions-only");
+    }
+    if (b.option(bool, "native-statoverrides-only", "Select genuine-tool and metadata statoverride lifecycle oracles") orelse false) {
+        for ([_]*std.Build.Step.Run{ lifecycle_zig, lifecycle_oracle_zig }) |runner|
+            runner.addArg("--statoverrides-only");
     }
     const selectors = [_]bool{
         native_core_only,           native_deadline_only,      native_script_failure_only,

@@ -117,6 +117,7 @@ const ExecutionState = struct {
     stat_overrides: ?native_statoverride.Resolved = null,
     stat_override_allocator: ?std.mem.Allocator = null,
     stat_override_database_bytes: ?[]const u8 = null,
+    stat_override_records: []const package_database.StatOverrideRecord = &.{},
     diversion_observation: ?native_diversion.Observation = null,
     diversion_cache: ?*native_diversion.Session = null,
     route_settlement: ?ActiveRouteSettlement = null,
@@ -1382,6 +1383,27 @@ fn statOverrideDatabaseMatches(
     return std.mem.eql(u8, bytes, file.bytes);
 }
 
+fn changedStatOverrideTargets(
+    allocator: std.mem.Allocator,
+    previous: []const package_database.StatOverrideRecord,
+    current: []const package_database.StatOverrideRecord,
+) ![]const []const u8 {
+    var prior: std.StringHashMapUnmanaged(package_database.StatOverrideRecord) = .empty;
+    defer prior.deinit(allocator);
+    for (previous) |record| try prior.put(allocator, record.path, record);
+    var changed: std.ArrayList([]const u8) = .empty;
+    errdefer changed.deinit(allocator);
+    for (current) |record| {
+        if (prior.get(record.path)) |old| {
+            if (old.mode == record.mode and
+                std.mem.eql(u8, old.user, record.user) and
+                std.mem.eql(u8, old.group, record.group)) continue;
+        }
+        try changed.append(allocator, record.path[1..]);
+    }
+    return changed.toOwnedSlice(allocator);
+}
+
 fn refreshExecutionStatOverrides(
     execution: *ExecutionState,
     temporary: std.mem.Allocator,
@@ -1411,7 +1433,7 @@ fn refreshExecutionStatOverrides(
         persistent,
         database.model.stat_overrides,
     );
-    const resolved = native_statoverride.read(
+    var resolved = native_statoverride.read(
         persistent,
         root,
         records,
@@ -1419,7 +1441,26 @@ fn refreshExecutionStatOverrides(
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidStatOverrideUpdate,
     };
+    const changed = try changedStatOverrideTargets(temporary, execution.stat_override_records, records);
+    defer temporary.free(changed);
+    const aliases = try detectAliases(temporary, root);
+    defer deinitAliasEvidence(temporary, aliases);
+    var observed: std.ArrayList([]const u8) = .empty;
+    try observed.appendSlice(persistent, resolved.observed_paths);
+    for (changed) |path| {
+        if (execution.stat_overrides.?.get(path)) |previous| {
+            // Genuine dpkg rewrites numeric identities to known account names
+            // even when only another record was changed.
+            if (std.meta.eql(previous, resolved.get(path).?)) continue;
+        }
+        var buffer: [root_fs.maximum_path_bytes]u8 = undefined;
+        const physical = canonicalAliasPath(aliases, path, &buffer) orelse
+            return error.InvalidStatOverrideUpdate;
+        try observed.append(persistent, try persistent.dupe(u8, physical));
+    }
+    resolved.observed_paths = try observed.toOwnedSlice(persistent);
     execution.stat_overrides = resolved;
+    execution.stat_override_records = records;
     execution.stat_override_database_bytes =
         try copyStatOverrideDatabaseBytes(persistent, captured.snapshot.statoverride);
     return true;
@@ -31583,6 +31624,7 @@ fn executeLifecycleProgramWithRequest(
             scratch,
             initial_snapshot.statoverride,
         ),
+        .stat_override_records = initial_model.stat_overrides,
         .diversion_observation = try native_diversion.observe(allocator, root),
         .diversion_cache = if (diversion_session) |*session| session else null,
         .recovery_models = models,
@@ -33362,6 +33404,28 @@ fn externalProductOperation(value: ExternalMaterializationOperation) product_api
 test "native_recovery.test.native_provenance.test.contract coverage" {
     try native_recovery.testContracts();
     try native_provenance.testContract();
+}
+
+test "native_unpack.test.statoverride tracking excludes unchanged administrator records" {
+    const old = [_]package_database.StatOverrideRecord{
+        .{ .user = "root", .group = "root", .mode = 0o640, .path = "/admin" },
+        .{ .user = "root", .group = "root", .mode = 0o640, .path = "/changed" },
+        .{ .user = "root", .group = "root", .mode = 0o640, .path = "/removed" },
+    };
+    var current = old;
+    current[1].mode = 0o600;
+    current[2].path = "/created";
+    const targets = try changedStatOverrideTargets(testing.allocator, &old, &current);
+    defer testing.allocator.free(targets);
+    try testing.expectEqual(@as(usize, 2), targets.len);
+    try testing.expectEqualStrings("changed", targets[0]);
+    try testing.expectEqualStrings("created", targets[1]);
+    current[1] = old[1];
+    current[1].user = "#0";
+    const renamed_identity = try changedStatOverrideTargets(testing.allocator, &old, current[0..2]);
+    defer testing.allocator.free(renamed_identity);
+    try testing.expectEqual(@as(usize, 1), renamed_identity.len);
+    try testing.expectEqualStrings("changed", renamed_identity[0]);
 }
 
 test "native_unpack.test.statoverride identities are root-local and bounded" {

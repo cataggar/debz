@@ -5,6 +5,7 @@ const support = @import("native_lifecycle_support.zig");
 const statoverride = @import("native_lifecycle_statoverride.zig");
 const process = @import("native_recovery_scriptless.zig");
 const options = @import("native_test_options");
+const debz = @import("debz");
 
 const namespace = "var/lib/debz/";
 const operation_path = namespace ++ "root-operation-v1.json";
@@ -92,7 +93,8 @@ fn checkIdentityBlobs(
             .{ "etc/passwd", statoverride.passwd }
         else if (std.mem.eql(u8, key, "statoverride-group"))
             .{ "etc/group", statoverride.group }
-        else return error.UnexpectedStatoverrideIdentityBlob;
+        else
+            return error.UnexpectedStatoverrideIdentityBlob;
         try process.same(try process.text(blob, "kind"), "database");
         try process.same(try process.text(blob, "entry_kind"), "regular");
         try process.same(try process.text(blob, "logical_path"), expected_path);
@@ -483,6 +485,140 @@ fn runRefreshCase(fixture: *foundation.Fixture, driver: []const u8, dpkg: []cons
     try support.assertDatabaseBytes(&case, "statoverride-old");
 }
 
+fn runChronyCase(
+    fixture: *foundation.Fixture,
+    driver: []const u8,
+    dpkg: []const u8,
+    arch: []const u8,
+    changed: bool,
+    drift: ?enum { mode, owner, bytes },
+) !void {
+    const name = try std.fmt.allocPrint(fixture.allocator, "statoverride-chrony-{s}-{s}", .{
+        if (changed) "changed" else "created",
+        if (drift) |value| @tagName(value) else "recover",
+    });
+    defer fixture.allocator.free(name);
+    var case = try support.Scenario.init(fixture, name, driver, dpkg, arch, true);
+    defer case.deinit();
+    try statoverride.seedChrony(&case, dpkg, changed);
+    const workspace = try support.path(fixture.allocator, name, "packages");
+    defer fixture.allocator.free(workspace);
+    const archive = try statoverride.chronyArchive(fixture, arch, "1", workspace);
+    defer fixture.allocator.free(archive);
+    const selected = [_]foundation.PackageIdentity{.{ .name = statoverride.chrony_name, .architecture = arch }};
+    const reference_log = try support.path(fixture.allocator, name, "reference-execution");
+    defer fixture.allocator.free(reference_log);
+    try fixture.directory(reference_log);
+    if (try support.reference(fixture, dpkg, case.reference_root, .{
+        .operation = "install",
+        .archives = &.{archive},
+        .packages = &selected,
+    }, reference_log) != 0) return error.UnexpectedReferenceOutcome;
+    const crash_log = try support.path(fixture.allocator, name, "crash");
+    defer fixture.allocator.free(crash_log);
+    if (try process.invoke(fixture, driver, case.native_root, arch, crash_log, .{
+        .operation = "install",
+        .archives = &.{archive},
+        .packages = &selected,
+        .crash_at = "after_script_outcome",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) |value| {
+        var invalid = value;
+        invalid.deinit();
+        return error.MissingCrash;
+    }
+    try expectChronyCheckpoint(fixture, case.native_root);
+    try fixture.dir.deleteFile(fixture.io, archive[fixture.path.len + 1 ..]);
+    for ([_][]const u8{ case.reference_root, case.native_root }) |root_path| {
+        var dir = try foundation.guardedRoot(fixture.io, root_path);
+        defer dir.close(fixture.io);
+        try (root_fs.Root.init(fixture.io, dir)).applyMetadata(
+            try root_fs.Path.init(statoverride.admin_target),
+            .{ .mode = 0o600 },
+        );
+    }
+    if (drift) |value| {
+        var dir = try foundation.guardedRoot(fixture.io, case.native_root);
+        defer dir.close(fixture.io);
+        const root: root_fs.Root = .init(fixture.io, dir);
+        switch (value) {
+            .mode => try root.applyMetadata(try root_fs.Path.init("var/log/chrony"), .{ .mode = 0o700 }),
+            .owner => try root.applyMetadata(try root_fs.Path.init("var/lib/chrony"), .{ .uid = 42422 }),
+            .bytes => {
+                const path = try process.rootPath(fixture, case.native_root, statoverride.chrony_targets[0]);
+                defer fixture.allocator.free(path);
+                try support.fixtureFile(fixture, path, "drifted key!\n", 0o640);
+                try root.applyMetadata(try root_fs.Path.init(statoverride.chrony_targets[0]), .{ .gid = 42421 });
+            },
+        }
+    }
+    const before = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+    defer fixture.allocator.free(before);
+    const recovery_log = try support.path(fixture.allocator, name, "recover");
+    defer fixture.allocator.free(recovery_log);
+    var report = (try process.invoke(fixture, driver, case.native_root, arch, recovery_log, .{
+        .operation = "recover",
+        .triggers = false,
+        .caller_owned = true,
+        .isolated_helper = true,
+        .core_product = true,
+    })) orelse return error.MissingRecoveryReport;
+    defer report.deinit();
+    if (drift != null) {
+        if (!std.mem.eql(u8, report.value.outcome, "recovery_required") or
+            std.mem.indexOf(u8, report.value.detail, "managed_state_changed") == null)
+            return error.ChangedOverrideTargetDriftAccepted;
+        const after = try foundation.capture(fixture.allocator, fixture.io, case.native_root);
+        defer fixture.allocator.free(after);
+        if (!std.mem.eql(u8, before, after)) return error.BlockedRecoveryMutatedRoot;
+    } else {
+        try process.same(report.value.outcome, "applied");
+        const comparison = try support.path(fixture.allocator, name, "comparison");
+        defer fixture.allocator.free(comparison);
+        try fixture.directory(comparison);
+        try support.compare(fixture, case.reference_root, case.native_root, comparison, true);
+        try statoverride.expectChronyMetadata(&case);
+        try support.assertDatabaseBytes(&case, "statoverride");
+        try support.assertDatabaseBytes(&case, "statoverride-old");
+        try statoverride.verifyChronyState(&case);
+        var managed = try statoverride.settledChronyState(&case);
+        defer managed.deinit();
+        var dir = try foundation.guardedRoot(fixture.io, case.native_root);
+        defer dir.close(fixture.io);
+        const root: root_fs.Root = .init(fixture.io, dir);
+        try root.applyMetadata(try root_fs.Path.init("var/log/chrony"), .{ .mode = 0o700 });
+        try std.testing.expectError(error.LivePayloadChanged, debz.native_recovery.verifySettledManagedState(
+            fixture.allocator,
+            root,
+            managed.document,
+            .{ .paths = &.{"etc/debz-native.conf"}, .prefixes = &.{"var/lib/debz/"} },
+        ));
+    }
+    std.debug.print("{s}: checkpoint/settled verification passed\n", .{name});
+}
+
+fn expectChronyCheckpoint(fixture: *foundation.Fixture, root_path: []const u8) !void {
+    var dir = try foundation.guardedRoot(fixture.io, root_path);
+    defer dir.close(fixture.io);
+    var managed = try debz.native_recovery.readManagedState(fixture.allocator, .init(fixture.io, dir));
+    defer managed.deinit();
+    const stable = managed.document.stable orelse return error.MissingManagedState;
+    for (statoverride.chrony_targets) |target| {
+        var found = false;
+        for (stable.entries) |entry| {
+            if (std.mem.eql(u8, entry.path, statoverride.admin_target)) return error.AdministratorOverrideWasManaged;
+            if (std.mem.eql(u8, entry.path, target)) {
+                found = true;
+                if (entry.kind == .absent) return error.AbsentChangedOverrideTarget;
+            }
+        }
+        if (!found) return error.MissingChangedOverrideTarget;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var arguments = init.minimal.args.iterate();
@@ -501,6 +637,11 @@ pub fn main(init: std.process.Init) !void {
     errdefer fixture.retain = true;
     errdefer support.assertHostUnchanged(allocator, init.io, reference.before) catch |err|
         std.debug.print("host dpkg status changed after statoverride failure: {s}\n", .{@errorName(err)});
+    try runChronyCase(&fixture, driver, reference.executable, reference.architecture, false, null);
+    try runChronyCase(&fixture, driver, reference.executable, reference.architecture, true, null);
+    try runChronyCase(&fixture, driver, reference.executable, reference.architecture, false, .mode);
+    try runChronyCase(&fixture, driver, reference.executable, reference.architecture, true, .owner);
+    try runChronyCase(&fixture, driver, reference.executable, reference.architecture, false, .bytes);
     try runRefreshCase(&fixture, driver, reference.executable, reference.architecture, false);
     std.debug.print("statoverride refresh after_script_outcome: recovered\n", .{});
     try runRefreshCase(&fixture, driver, reference.executable, reference.architecture, true);

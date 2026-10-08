@@ -159,11 +159,13 @@ state while the operation is still pre-mutation, so a malformed root cannot be
 partially unpacked before this refusal. See the
 [pinned alternatives contract](dpkg-alternatives-reference.md).
 
-Statoverrides use file-backed target-root identities and are resolved once
-before scripts, not separately at unpack and configure. A preinst or postinst
-may change the account or override files, but the same invocation keeps its
-original resolved metadata, matching dpkg. A later invocation uses the new
-state. Missing identities refuse before lifecycle mutation. See the
+Statoverrides use file-backed target-root identities and are resolved before
+scripts. Preinst retains that resolution for its unpack. A successful
+non-preinst script refreshes changed override database bytes for later phases,
+using the target root's account files; a later invocation resolves anew.
+Recovery checkpoints live targets only for records created or changed by those
+scripts, leaving unchanged administrator overrides outside this added scope.
+Missing identities refuse before lifecycle mutation. See the
 [metadata contract](native-unpack.md#statoverride-metadata) for directory,
 symlink, hard-link and exact-path behavior.
 
@@ -357,6 +359,15 @@ recovery evidence and unchanged re-entry snapshots. The pinned reference
 option also supplies and independently verifies `update-alternatives` for
 that scenario; without a pinned reference, only that scenario is skipped.
 `-Dnative-diversions-only=true` selects diversion scenarios.
+`-Dnative-statoverrides-only=true` selects the statoverride metadata and
+genuine-tool lifecycle scenarios, including named-account creation, chrony-like
+script-created files and a shipped directory, guarded reinstall, a payload
+upgrade with byte-stable maintainer scripts, and remove/purge. The genuine
+diversion cases also cover postinst and prerm `--rename` moves and 210
+`prerm remove` additions owned by `coreutils-switch`.
+Both suites assert exact database and `-old` bytes. Use
+`-Dnative-reference-dpkg=/absolute/path/to/pinned/dpkg` for artifact-bound
+reference evidence; an unpinned host run is separate compatibility evidence.
 
 `test-native-lifecycle-zig-oracle` executes the standalone `--oracle-only`
 selector against two guarded roots with the same selected dpkg, independently
