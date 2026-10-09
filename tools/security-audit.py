@@ -2578,6 +2578,7 @@ PROTECTED_REFERENCE_PATHS = (
     "tools/real_snapshot_outcome.py",
     "tools/real-snapshot-python3-protected-stage.sh",
     "tools/real-snapshot-python3-reference.sh",
+    "tools/real-snapshot-signed-proc-bindings.sh",
     "tools/real-snapshot-signed-proc-prestates.sh",
     "src/native_unpack.zig",
     "src/native_alternatives.zig",
@@ -3134,6 +3135,12 @@ def protected_reference_ci_failures(texts: dict[str, str]) -> list[str]:
     )[2].partition("# The pre-sudo record")[0]
     if not sudo_list or re.search(r"\b(?:sort|chmod|mv|cp|install|tee|dd)\b|>", sudo_list):
         failures.append("signed sudo fixture list must retain authenticated original bytes without rewriting")
+    binding_list = texts.get("tools/real-snapshot-signed-proc-bindings.sh", "").partition(
+        """awk -F'\\t' '$1 == "sudo" { print "/" $2 }' "$listing" | sed 's#^/$#/.#'"""
+    )[2].partition("\ncopy_input()")[0]
+    if (not binding_list or re.search(r"\bsort\b", binding_list) or
+            '>"$source_root/var/lib/dpkg/info/sudo.list"' not in binding_list):
+        failures.append("signed sudo binding list must retain authenticated archive member order")
     producer = texts.get("tools/prepare-native-dpkg.py", "").partition(
         "def receipt_from_extracted_archive("
     )[2].partition("\ndef ")[0]

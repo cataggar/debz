@@ -360,6 +360,25 @@ timeout() {
                 else:
                     self.assertEqual(result.stderr, "")
 
+    def test_signed_sudo_binding_list_preserves_original_archive_member_order(self) -> None:
+        source = (TOOLS / "real-snapshot-signed-proc-bindings.sh").read_text()
+        prefix = "awk -F'\\t' '$1 == \"sudo\""
+        command = prefix + source.split(prefix, 1)[1].split("\nchmod 0644", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "var/lib/dpkg/info").mkdir(parents=True)
+            (root / "members.tsv").write_text(
+                "sudo\t\nsudo\tusr\nother\tunrelated\nsudo\tusr/bin/z\nsudo\tusr/bin/a\n"
+            )
+            subprocess.run(
+                ["bash", "-euo", "pipefail", "-c",
+                 'source_root=$1\nlisting=$1/members.tsv\n' + command,
+                 "signed-sudo-binding-list-test", str(root)],
+                check=True, capture_output=True, text=True,
+            )
+            self.assertEqual((root / "var/lib/dpkg/info/sudo.list").read_bytes(),
+                             b"/.\n/usr\n/usr/bin/z\n/usr/bin/a\n")
+
     def test_list_preparation_cannot_normalize_or_rewrite_authenticated_original_bytes(self) -> None:
         audit = load("debz_original_fixture_list_guards", "security-audit.py")
         texts = {path: (TOOLS.parent / path).read_text() for path in audit.PROTECTED_REFERENCE_PATHS}
@@ -380,6 +399,18 @@ timeout() {
                     changed[path] = changed[path].replace(read, read + mutation, 1)
                     self.assertTrue(any("retain authenticated original bytes without rewriting" in failure
                                         for failure in audit.protected_reference_ci_failures(changed)))
+        path = "tools/real-snapshot-signed-proc-bindings.sh"
+        output = '  >"$source_root/var/lib/dpkg/info/sudo.list"\n'
+        for mutation in (
+            '  LC_ALL=C sort >"$source_root/var/lib/dpkg/info/sudo.list"\n',
+            '  >"$source_root/var/lib/dpkg/info/sudo.list.sorted"\n',
+        ):
+            with self.subTest(path=path, mutation=mutation):
+                    changed = dict(texts)
+                    self.assertIn(output, changed[path])
+                    changed[path] = changed[path].replace(output, mutation, 1)
+                    self.assertIn("signed sudo binding list must retain authenticated archive member order",
+                                  audit.protected_reference_ci_failures(changed))
         path = "tools/real-snapshot-signed-proc-prestates.sh"
         read = 'require_protected_file "$list"\n'
         for mutation in ('LC_ALL=C sort -- "$list" >"$list.sorted"\n',

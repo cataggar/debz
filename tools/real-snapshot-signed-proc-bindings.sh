@@ -212,8 +212,9 @@ for package in udev sudo; do
     >"$source_root/var/lib/dpkg/info/$package.postinst"
   chmod 0755 "$source_root/var/lib/dpkg/info/$package.postinst"
 done
-awk -F'\t' '$1 == "sudo" { print "/" $2 }' "$listing" | sed 's#^/$#/.#' |
-  LC_ALL=C sort >"$source_root/var/lib/dpkg/info/sudo.list"
+# Archive order is part of the signed sudo input binding.
+awk -F'\t' '$1 == "sudo" { print "/" $2 }' "$listing" | sed 's#^/$#/.#' \
+  >"$source_root/var/lib/dpkg/info/sudo.list"
 chmod 0644 "$source_root/var/lib/dpkg/info/sudo.list"
 
 copy_input() { # root path
