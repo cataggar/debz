@@ -15,6 +15,7 @@
 //! instead of `no-proc-view`, then runs the same escape checks.
 const std = @import("std");
 const linux = std.os.linux;
+const network_probe = @import("network_probe");
 
 const CapHeader = extern struct { version: u32 = 0x20080522, pid: i32 = 0 };
 const allowed_caps = [_]u32{
@@ -242,10 +243,18 @@ fn checkNamespaceChanges() void {
 }
 
 fn networkInformation() void {
-    // #278 owns the shared host network decision; record it without judging.
     const socket = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
-    info("shared-network-namespace", "inet_socket={s}", .{@tagName(errno(socket))});
+    info("network-socket", "inet_socket={s}", .{@tagName(errno(socket))});
     if (errno(socket) == .SUCCESS) _ = linux.close(@intCast(socket));
+    inline for (.{
+        "/proc/1/net/dev",
+        "/proc/self/net/route",
+        "/sys/class/net",
+    }) |path| {
+        const opened = linux.open(path, .{ .PATH = true, .CLOEXEC = true }, 0);
+        info("network-view", "path={s} open={s}", .{ path, @tagName(errno(opened)) });
+        if (errno(opened) == .SUCCESS) _ = linux.close(@intCast(opened));
+    }
 }
 
 fn checkArchiveMount() void {
@@ -500,9 +509,51 @@ fn startDescendant() void {
     report("descendant-started", errno(got) == .SUCCESS and got == 1, "detached_sleeper={}", .{got == 1});
 }
 
+fn networkControl(profile: ?Profile) !void {
+    const opened = linux.open("/.debz-network-control", .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.MissingReferenceNetworkControl;
+    const fd: i32 = @intCast(opened);
+    defer _ = linux.close(fd);
+    var bytes: [256]u8 = undefined;
+    const count = linux.read(fd, &bytes, bytes.len);
+    if (linux.errno(count) != .SUCCESS or count == 0 or count == bytes.len)
+        return error.InvalidReferenceNetworkControl;
+    var fields = std.mem.splitScalar(u8, bytes[0..count], '\n');
+    const port = try std.fmt.parseInt(u16, fields.next() orelse
+        return error.InvalidReferenceNetworkControl, 10);
+    const name = fields.next() orelse return error.InvalidReferenceNetworkControl;
+    const inherited = try std.fmt.parseInt(i32, fields.next() orelse
+        return error.InvalidReferenceNetworkControl, 10);
+    if (fields.next() != null) return error.InvalidReferenceNetworkControl;
+    try network_probe.observe(
+        if (profile) |value| switch (value) {
+            .systemd => .systemd,
+            .udev => .udev,
+            .sudo => .sudo,
+        } else .reference,
+        port,
+        name,
+        inherited,
+    );
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     const args = init.args.vector;
     if (args.len < 2) return 2;
+    if (std.mem.eql(u8, std.mem.span(args[1]), "network-host")) {
+        if (args.len != 5) return 2;
+        const port = std.fmt.parseInt(u16, std.mem.span(args[2]), 10) catch return 2;
+        const inherited = std.fmt.parseInt(i32, std.mem.span(args[4]), 10) catch return 2;
+        network_probe.observe(.host, port, std.mem.span(args[3]), inherited) catch |err| {
+            std.log.err("reference host network control failed: {s}", .{@errorName(err)});
+            return 1;
+        };
+        return 0;
+    }
     const profile = scriptProfile(args);
     const mode = if (profile) |value| @tagName(value) else std.mem.span(args[1]);
     const confined = profile != null or std.mem.eql(u8, mode, "install");
@@ -515,6 +566,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     checkKernelAuthority();
     checkNamespaceChanges();
     networkInformation();
+    if (confined) {
+        networkControl(profile) catch |err| {
+            report("private-network", false, "error={s}", .{@errorName(err)});
+        };
+        if (failures == 0) report("private-network", true, "host-network=denied loopback=usable", .{});
+    }
     if (profile != null) {
         checkArchiveUnbound();
         startDescendant();

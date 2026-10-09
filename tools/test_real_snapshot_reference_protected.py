@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -11,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -349,6 +353,50 @@ def prove_runtime(args: argparse.Namespace, identity: str) -> None:
     }, indent=2) + "\n")
 
 
+@contextmanager
+def network_control(workspace: Path, name: str, root: Path, probe: Path) -> Iterator[int]:
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp,
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as unix,
+    ):
+        tcp.bind(("127.0.0.1", 0))
+        tcp.listen(2)
+        port = tcp.getsockname()[1]
+        unix_name = "debz-reference-" + hashlib.sha256(
+            f"{workspace}/{name}".encode()
+        ).hexdigest()
+        unix.bind("\0" + unix_name)
+        unix.listen(2)
+        inherited = fcntl.fcntl(tcp.fileno(), fcntl.F_DUPFD, 200)
+        try:
+            command = [str(probe), "network-host", str(port), unix_name, str(inherited)]
+            control = subprocess.run(
+                command, stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+                pass_fds=(inherited,), env=ORDER.oracle_environment(), check=False,
+            )
+            anchor = workspace.parent
+            prefix = f"{workspace.name}/{name}.network-host"
+            write_beneath(anchor, f"{prefix}.stdout", control.stdout, 0o600)
+            write_beneath(anchor, f"{prefix}.stderr", control.stderr, 0o600)
+            write_beneath(anchor, f"{prefix}.json", (
+                json.dumps({"argv": command, "exit_status": control.returncode,
+                            "port": port, "abstract_unix": unix_name,
+                            "inherited_fd": inherited}, indent=2) + "\n"
+            ).encode(), 0o600)
+            expected = b"DEBZ_HOST_NETWORK_PROOF tcp=reachable abstract_unix=reachable inherited_fd=open\n"
+            if control.returncode != 0 or control.stdout != expected:
+                raise AssertionError(
+                    f"{name}: host network controls were not genuinely reachable: "
+                    f"exit={control.returncode}: {control.stderr[:4096]!r}"
+                )
+            relative = f"{root.relative_to(workspace).as_posix()}/.debz-network-control"
+            write_beneath(workspace, relative,
+                          f"{port}\n{unix_name}\n{inherited}".encode(), 0o600)
+            yield inherited
+        finally:
+            os.close(inherited)
+
+
 def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
     probe = args.escape_probe.read_bytes()
     if args.architecture != "amd64":
@@ -366,18 +414,16 @@ def prove_profiles(args: argparse.Namespace, scripts: dict[str, bytes]) -> str:
     for profile, view in PROFILE_VIEW_CHECKS.items():
         name = f"profile-{profile}"
         root = profile_root(args.root_template, args.workspace, name, profile, scripts[profile], probe)
-        parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
+        with network_control(args.workspace, name, root, args.escape_probe) as inherited:
             status, error = operation(
                 args.workspace, name, args.launcher, args.dpkg, args.runtime, root,
                 args.architecture, None, None, None, "configure",
-                inherited_fd=parent_fd, profile=profile, selector=f"{profile}:amd64",
+                inherited_fd=inherited, profile=profile, selector=f"{profile}:amd64",
             )
-        finally:
-            os.close(parent_fd)
         output = (args.workspace / f"{name}.stdout").read_text(errors="replace")
         results = probe_results(output)
-        failed = [check for check in (*PROFILE_ESCAPE_CHECKS, *PROFILE_COMMON_CHECKS, *view, "result")
+        failed = [check for check in (*PROFILE_ESCAPE_CHECKS, *PROFILE_COMMON_CHECKS, *view,
+                                     "private-network", "result")
                   if results.get(check) != "ok"]
         if status != 0 or failed or "no-proc-view" in results:
             raise AssertionError(f"{name}: proc view checks failed {failed}; exit={status}: {error}")
@@ -574,19 +620,16 @@ def main() -> None:
     # Pinned dpkg (namespace PID 1) runs the static probe as its preinst; the
     # probe attempts each escape and leaves a detached descendant behind.
     root = fresh_root(args.root_template, args.workspace, "escape")
-    parent_fd = os.open(args.workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
+    with network_control(args.workspace, "escape", root, args.escape_probe) as inherited:
         status, error = operation(
             args.workspace, "escape", args.launcher, args.dpkg, args.runtime, root,
             args.architecture, args.escape_archive, args.escape_archive_sha512,
-            args.escape_archive_size, "unpack", inherited_fd=parent_fd,
+            args.escape_archive_size, "unpack", inherited_fd=inherited,
             package="debz-reference-escape-probe",
         )
-    finally:
-        os.close(parent_fd)
     escape_output = (args.workspace / "escape.stdout").read_text(errors="replace")
     results = probe_results(escape_output)
-    failed = [check for check in (*ESCAPE_CHECKS, *CONFINED_CHECKS, "result")
+    failed = [check for check in (*ESCAPE_CHECKS, *CONFINED_CHECKS, "private-network", "result")
               if results.get(check) != "ok"]
     if status != 0 or failed:
         raise AssertionError(f"escape: confinement checks failed {failed}; exit={status}: {error}")
@@ -601,7 +644,8 @@ def main() -> None:
         "protected pinned-dpkg runtime: ten loader/recursive-library and one preload preflight refusals; "
         "probe/unpack, six refusals, unconfined escape control and "
         f"{len(ESCAPE_CHECKS)} confined escape checks, read-only archive mount and "
-        f"descendant teardown, {profiles}: executed without skips"
+        f"descendant teardown, denied reachable-host TCP/abstract-UNIX and inherited sockets, "
+        f"private interface/IPv4/IPv6 route observation and usable loopback, {profiles}: executed without skips"
     )
 
 

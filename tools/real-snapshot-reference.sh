@@ -62,6 +62,7 @@ for path in (repository, repository / ".real-snapshot", workspace, cache):
 for path in (repository / "tools/real-snapshot-reference.sh",
              repository / "tools/real-snapshot-reference-launcher.zig",
              repository / "tools/real-snapshot-reference-runtime.zig",
+             repository / "src/private_network.zig",
              repository / "tools/real-snapshot-reference-order.py",
              repository / "tools/real_snapshot_reference_paths.py",
              repository / "tools/prepare-native-dpkg.py",
@@ -184,7 +185,8 @@ printf 'reference_dpkg_sha256=%s\nreference_lock_sha256=%s\nbootstrap_archives=%
   "$(sha256sum "$lock" | cut -d' ' -f1)" "${#bootstrap[@]}" \
   >"$evidence/reference-identity.txt"
 launcher="$workspace/reference-launcher"
-"$zig" build-exe tools/real-snapshot-reference-launcher.zig -O ReleaseSafe -lc \
+"$zig" build-exe -O ReleaseSafe -lc --dep private_network \
+  -Mroot=tools/real-snapshot-reference-launcher.zig -Mprivate_network=src/private_network.zig \
   --zig-lib-dir "$(dirname -- "$zig")/lib" \
   --cache-dir "$workspace/reference-zig-cache" \
   --global-cache-dir "$workspace/reference-zig-global-cache" \

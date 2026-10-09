@@ -536,7 +536,10 @@ class ReferenceLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         arguments = json.loads(log.read_text())
         self.assertEqual(arguments[0], str(compiler))
-        self.assertEqual(arguments[1:3], ["build-exe", "tools/real-snapshot-reference-launcher.zig"])
+        self.assertEqual(arguments[1], "build-exe")
+        self.assertEqual(arguments[arguments.index("--dep") + 1], "private_network")
+        self.assertIn("-Mroot=tools/real-snapshot-reference-launcher.zig", arguments)
+        self.assertIn("-Mprivate_network=src/private_network.zig", arguments)
         self.assertEqual(arguments[arguments.index("--zig-lib-dir") + 1], str(compiler_directory / "lib"))
         self.assertIn(f"-femit-bin={self.root}/launcher", arguments)
 
