@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -319,6 +320,190 @@ class ExtractedReferenceReceiptTests(unittest.TestCase):
 
 
 class ProtectedCiScriptTests(unittest.TestCase):
+    def test_selected_prestate_origins_require_all_fresh_authenticated_witnesses(self) -> None:
+        source = (TOOLS / "real-snapshot-signed-proc-prestates.sh").read_text()
+        predicate = re.search(r"jq -e --arg release .*? '\n(.*?)\n' \"\$lock\"",
+                              source, re.DOTALL).group(1)
+        pins = {name: re.search(rf"^readonly {name}=([a-f0-9]+)$", source, re.MULTILINE).group(1)
+                for name in ("release_sha256", "updates_release_sha256",
+                             "security_release_sha256", "release_signer")}
+        repositories = [
+            {"id": character * 64, "snapshot_sha256": str(index) * 64,
+             "release_sha256": pins[name], "index_identity": {"primary": "sha256"},
+             "signer_fingerprints": [pins["release_signer"]]}
+            for index, (character, name) in enumerate((
+                ("a", "release_sha256"), ("b", "updates_release_sha256"),
+                ("c", "security_release_sha256")), 1)
+        ]
+        sources = [
+            {"package": entry["id"], "repository": {
+                "release_digest": "sha256:" + entry["release_sha256"],
+                "snapshot_digest": "sha256:" + entry["snapshot_sha256"],
+                "signer_fingerprints": entry["signer_fingerprints"], "frozen": None}}
+            for entry in repositories
+        ]
+        sources[0]["repository"]["frozen"] = {
+            "release_digest": "sha256:" + pins["release_sha256"],
+            "witnesses": [
+                {"repository_id": item["package"],
+                 "snapshot_digest": item["repository"]["snapshot_digest"],
+                 "primary_fingerprint": pins["release_signer"]}
+                for item in sources[1:]
+            ],
+        }
+        versions = json.loads((TOOLS / "fixtures/real-snapshot/pin-v1.json").read_text())[
+            "snapshot"]["closures"]["amd64"]["packages"]
+        lock = {
+            "schema": "https://debz.dev/schema/exact-closure-lock-v3", "version": 3,
+            "target_architecture": "amd64", "repositories": repositories,
+            "packages": [
+                {"name": name, "version": versions[name], "architecture": "amd64",
+                 "archive_identity": {"primary": "sha512", "digests": [
+                     {"algorithm": "sha512", "digest": hashlib.sha512(name.encode()).hexdigest()}]}}
+                for name in ("systemd", "udev", "sudo", "sudo-rs", "util-linux", "libcap-ng0")
+            ],
+        }
+        report = {"schema": "io.github.cataggar.debz.command.v1", "api_version": 1,
+                  "operation": "refresh", "exit_status": 0, "items": sources}
+        arguments = []
+        for flag, name in (("release", "release_sha256"), ("updates", "updates_release_sha256"),
+                           ("security", "security_release_sha256"), ("signer", "release_signer")):
+            arguments.extend(("--arg", flag, pins[name]))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            def check(candidate: dict, admission: dict) -> subprocess.CompletedProcess:
+                (root / "lock.json").write_text(json.dumps(candidate))
+                (root / "refresh.json").write_text(json.dumps(admission))
+                return subprocess.run(
+                    ["jq", "-e", *arguments, "--slurpfile", "refreshed",
+                     str(root / "refresh.json"), predicate, str(root / "lock.json")],
+                    capture_output=True, text=True,
+                )
+            for count in (2, 3):
+                with self.subTest(selected=count):
+                    candidate = dict(lock, repositories=repositories[:count])
+                    result = check(candidate, report)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            for mutation in ("missing-witness", "unknown-signer", "changed-witness",
+                             "changed-id", "changed-snapshot", "unknown-release",
+                             "duplicate-origin", "missing-base", "extra-source", "failed-refresh"):
+                with self.subTest(mutation=mutation):
+                    candidate = json.loads(json.dumps(dict(lock, repositories=repositories[:2])))
+                    admission = json.loads(json.dumps(report))
+                    if mutation == "missing-witness":
+                        admission["items"].pop()
+                    elif mutation == "unknown-signer":
+                        admission["items"][2]["repository"]["signer_fingerprints"] = ["0" * 40]
+                    elif mutation == "changed-witness":
+                        admission["items"][0]["repository"]["frozen"]["witnesses"][0][
+                            "snapshot_digest"] = "sha256:" + "0" * 64
+                    elif mutation == "changed-id":
+                        candidate["repositories"][0]["id"] = "0" * 64
+                    elif mutation == "changed-snapshot":
+                        candidate["repositories"][0]["snapshot_sha256"] = "0" * 64
+                    elif mutation == "unknown-release":
+                        candidate["repositories"][0]["release_sha256"] = "0" * 64
+                    elif mutation == "duplicate-origin":
+                        candidate["repositories"][1] = candidate["repositories"][0]
+                    elif mutation == "missing-base":
+                        candidate["repositories"] = repositories[1:]
+                    elif mutation == "extra-source":
+                        admission["items"].append(admission["items"][0])
+                    else:
+                        admission["exit_status"] = 4
+                    result = check(candidate, admission)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_protected_staging_plan_and_download_use_separate_single_root_locks(self) -> None:
+        source = (TOOLS / "real-snapshot-reference-protected-stage.sh").read_text()
+        selection = 'closure_args=("$closure_root")' + source.split(
+            'closure_args=("$closure_root")', 1
+        )[1].split("\nexport PATH=", 1)[0]
+        calls = "debz_step plan plan " + source.split(
+            "debz_step plan plan ", 1
+        )[1].split("\ntemplate=", 1)[0]
+        setup = """
+closure_root=dpkg
+purpose=$1
+architecture=$2
+snapshot=/protected-test/snapshot
+lock=/protected-test/runtime.lock.json
+evidence=/protected-test/evidence
+authenticated_lock() { :; }
+debz_step() { printf '%s\\t' "$@"; printf '\\n'; }
+"""
+        for purpose, architecture in (("proof", "amd64"), ("proof", "arm64"),
+                                       ("arm64-less", "arm64")):
+            with self.subTest(purpose=purpose, architecture=architecture):
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", setup + selection + "\n" + calls,
+                     "protected-staging-roots-test", purpose, architecture],
+                    check=True, capture_output=True, text=True,
+                )
+                rows = [line.rstrip("\t").split("\t") for line in result.stdout.splitlines()]
+                goals = ("dpkg", "less", "dash", "util-linux") if purpose == "arm64-less" else ("dpkg",)
+                self.assertEqual(len(rows), 2 * len(goals))
+                for index, package in enumerate(goals):
+                    for offset, command in enumerate(("plan", "download")):
+                        row = rows[2 * index + offset]
+                        name = command if package == "dpkg" else f"{package}-{command}"
+                        self.assertEqual(row[:2], [name, command])
+                        self.assertEqual(row[7:], [package])
+                        expected_lock = ("/protected-test/runtime.lock.json" if package == "dpkg"
+                                         else f"/protected-test/evidence/{package}.lock.json")
+                        self.assertEqual(row[6], expected_lock)
+
+    def test_less_reference_pins_use_separate_locks_and_retain_combined_lock_support(self) -> None:
+        stage = load("debz_less_source_lock_pins", "real_snapshot_less_stage.py")
+        source = (TOOLS / "real-snapshot-less-reference.sh").read_text()
+        checks = "require_lock_artifact() {" + source.split(
+            "require_lock_artifact() {", 1
+        )[1].split("\n[[ $(stat -c '%s'", 1)[0]
+        records = {
+            name: {"name": name, "version": version, "architecture": "arm64",
+                   "declared_size": size, "origin": {"type": "authenticated_repository"},
+                   "archive_identity": {"primary": "sha512", "digests": [
+                       {"algorithm": "sha512", "digest": digest}]}}
+            for name, (version, size, digest) in stage.SOURCE_ARTIFACTS.items()
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for separate in (False, True):
+                with self.subTest(separate=separate):
+                    runtime = [records[name] for name in ("dpkg", "libc6")] if separate else list(records.values())
+                    (root / "runtime.json").write_text(json.dumps({"packages": runtime}))
+                    (root / "less.json").write_text(json.dumps({"packages": [records["less"]]}))
+                    (root / "dash.json").write_text(json.dumps({"packages": [records["dash"]]}))
+                    setup = """
+lock=$1/runtime.json
+less_lock=$lock
+dash_lock=$lock
+if [[ $2 == separate ]]; then
+  less_lock=$1/less.json
+  dash_lock=$1/dash.json
+fi
+"""
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", setup + checks,
+                         "less-reference-source-locks-test", str(root),
+                         "separate" if separate else "combined"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    wrong = dict(records["dash"], declared_size=records["dash"]["declared_size"] + 1)
+                    if separate:
+                        (root / "dash.json").write_text(json.dumps({"packages": [wrong]}))
+                    else:
+                        (root / "runtime.json").write_text(json.dumps({
+                            "packages": [wrong if entry["name"] == "dash" else entry for entry in runtime]}))
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", setup + checks,
+                         "less-reference-source-locks-test", str(root),
+                         "separate" if separate else "combined"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+
     def test_binding_step_failure_reports_stage_preserves_exit_and_raw_evidence(self) -> None:
         source = (TOOLS / "real-snapshot-signed-proc-bindings.sh").read_text()
         loop = "for step in refresh plan download; do" + source.split(
@@ -431,6 +616,18 @@ timeout() {
         self.assertEqual(audit.protected_reference_ci_failures(texts), [])
         for path, token in (
             ("tools/real-snapshot-signed-proc-prestates.sh",
+             'require_protected_file "$snapshot/evidence/refresh.json"\n'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '  --slurpfile refreshed "$snapshot/evidence/refresh.json"'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '  ([$frozen.witnesses[].repository_id] | sort) =='),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '      .repository.snapshot_digest == ("sha256:" + $repository.snapshot_sha256)'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
+             '      .repository.release_digest == ("sha256:" + $repository.release_sha256)'),
+            ("tools/real-snapshot-reference-protected-stage.sh",
+             '  for package in less dash util-linux; do'),
+            ("tools/real-snapshot-signed-proc-prestates.sh",
              'actual_record=$(LC_ALL=C sort -- "$prestates/prestates.tsv")\n'),
             ("tools/real-snapshot-signed-proc-prestates.sh",
              '[[ $actual_record == "$expected_record" ]] || {\n'),
@@ -466,7 +663,7 @@ timeout() {
             ("src/native_unpack.zig", '        try testing.expectEqualDeep(before.record, after.record);\n'),
             ("src/native_unpack.zig", '        try proof.writeStreamingAll(testing.io, "signed arm64 less eight replay roots executed without skips\\n");\n'),
             ("tools/real-snapshot-reference-protected-ci.sh", '"$zig" build test-real-snapshot-arm64-less-protected'),
-            ("tools/real_snapshot_less_stage.py", '    for package in SOURCE_ARTIFACTS:\n        archive(lock, cache, package)\n'),
+            ("tools/real_snapshot_less_stage.py", '    for package in SOURCE_ARTIFACTS:\n        archive(locks["dpkg" if package == "libc6" else package], cache, package)\n'),
         ):
             with self.subTest(token=token):
                 self.assertIn(token, texts[path])

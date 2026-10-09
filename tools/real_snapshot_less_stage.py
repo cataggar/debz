@@ -137,15 +137,23 @@ def limit_capture() -> None:
     resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
 
 
-def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path) -> None:
-    for path in (lock_path, pinned, Path("/usr/bin/dpkg-deb")):
+def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path,
+            *additional_locks: Path) -> None:
+    if len(additional_locks) not in (0, 3):
+        raise ValueError("separate less, dash and util-linux locks must be provided together")
+    for path in (lock_path, *additional_locks, pinned, Path("/usr/bin/dpkg-deb")):
         protected(path)
     protected(root, directory=True)
-    lock = json.loads(lock_path.read_bytes())
-    if lock["target_architecture"] != "arm64":
-        raise ValueError("source target must be arm64")
+    goals = ("dpkg", "less", "dash", "util-linux")
+    paths = (lock_path, *additional_locks) if additional_locks else (lock_path,) * len(goals)
+    locks = {}
+    for goal, path in zip(goals, paths):
+        lock = json.loads(path.read_bytes())
+        if lock["target_architecture"] != "arm64":
+            raise ValueError(f"source target must be arm64: {path}")
+        locks[goal] = lock
     for package in SOURCE_ARTIFACTS:
-        archive(lock, cache, package)
+        archive(locks["dpkg" if package == "libc6" else package], cache, package)
     remove_lib64(root)
     for path in ("etc", "etc/alternatives", "var/lib/dpkg/alternatives",
                  "var/lib/debz-lifecycle-scripts"):
@@ -156,11 +164,12 @@ def prepare(root: Path, lock_path: Path, cache: Path, pinned: Path) -> None:
         ("util-linux", "usr/bin/setpriv", 0o755),
         ("libcap-ng0", "usr/lib/aarch64-linux-gnu/libcap-ng.so.0.0.0", 0o644),
     ):
+        lock = locks["util-linux" if package == "libcap-ng0" else package]
         create_exclusive(root, path, member(archive(lock, cache, package), path), mode)
     alias(root, "usr/bin/sh", "dash")
     alias(root, "usr/lib/aarch64-linux-gnu/libcap-ng.so.0", "libcap-ng.so.0.0.0")
     create_exclusive(root, "var/lib/dpkg/producer-dpkg", pinned.read_bytes(), 0o755)
-    less = archive(lock, cache, "less")
+    less = archive(locks["less"], cache, "less")
     create_exclusive(root, "var/lib/dpkg/producer-less.deb", less.read_bytes(), 0o644)
 
 

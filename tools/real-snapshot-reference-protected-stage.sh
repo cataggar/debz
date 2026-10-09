@@ -121,7 +121,6 @@ esac
 closure_args=("$closure_root")
 if [[ $purpose == arm64-less ]]; then
   [[ $architecture == arm64 ]]
-  closure_args+=(less dash util-linux)
 fi
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PYTHONPATH PYTHONHOME LD_PRELOAD LD_LIBRARY_PATH
@@ -193,6 +192,15 @@ debz_step refresh refresh "$snapshot/root" --assume-yes
 debz_step plan plan "$snapshot/root" --transaction-backend native --lock-output "$lock" "${closure_args[@]}"
 debz_step download download "$snapshot/root" --transaction-backend native --lock-input "$lock" "${closure_args[@]}"
 authenticated_lock "$lock"
+if [[ $purpose == arm64-less ]]; then
+  # Each CLI request accepts one root. Keep its authenticated lock intact.
+  for package in less dash util-linux; do
+    package_lock=$evidence/$package.lock.json
+    debz_step "$package-plan" plan "$snapshot/root" --transaction-backend native --lock-output "$package_lock" "$package"
+    debz_step "$package-download" download "$snapshot/root" --transaction-backend native --lock-input "$package_lock" "$package"
+    authenticated_lock "$package_lock"
+  done
+fi
 
 template=$workspace/template
 install -d -o root -g root -m 0700 "$template"

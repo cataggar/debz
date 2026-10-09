@@ -127,6 +127,7 @@ snapshot=$workspace/snapshot
 lock=$snapshot/evidence/ubuntu-minimal.lock.json
 cache=$snapshot/cache
 require_protected_file "$lock"
+require_protected_file "$snapshot/evidence/refresh.json"
 require_protected_path "$cache/packages-v2/objects"
 prestates=$workspace/prestates
 build=$workspace/prestate-build
@@ -139,17 +140,41 @@ for path in "$prestates" "$build" "$tools" "$workspace/prestates.env"; do
 done
 python3 tools/prepare-native-dpkg.py --architecture amd64 --verify-only "$pinned"
 
-# The signed proc profiles bind these exact package identities.
+# Locks contain selected origins, not unused freshness witnesses. Bind both
+# witnesses through the fresh authentication report, and every selected origin
+# to that same admission without changing the exact package closure.
 jq -e --arg release "$release_sha256" --arg updates "$updates_release_sha256" \
-  --arg security "$security_release_sha256" --arg signer "$release_signer" '
+  --arg security "$security_release_sha256" --arg signer "$release_signer" \
+  --slurpfile refreshed "$snapshot/evidence/refresh.json" '
+  $refreshed[0] as $report |
+  $report.items as $sources |
+  ([$sources[] | select(.repository.release_digest == ("sha256:" + $release))][0]
+    .repository.frozen) as $frozen |
+  ($refreshed | length) == 1 and
+  $report.schema == "io.github.cataggar.debz.command.v1" and
+  $report.api_version == 1 and $report.operation == "refresh" and $report.exit_status == 0 and
+  ($sources | length) == 3 and ([$sources[].package] | unique | length) == 3 and
+  ([$sources[].repository.release_digest] | sort) ==
+    (["sha256:" + $release, "sha256:" + $updates, "sha256:" + $security] | sort) and
+  all($sources[]; .repository.signer_fingerprints == [$signer]) and
+  $frozen.release_digest == ("sha256:" + $release) and
+  ([$frozen.witnesses[].repository_id] | sort) ==
+    ([$sources[] | select(.repository.release_digest != ("sha256:" + $release)) | .package] | sort) and
+  all($frozen.witnesses[]; . as $witness |
+    any($sources[]; .package == $witness.repository_id and
+      .repository.snapshot_digest == $witness.snapshot_digest and
+      .repository.signer_fingerprints == [$witness.primary_fingerprint])) and
   .schema == "https://debz.dev/schema/exact-closure-lock-v3" and
   .version == 3 and .target_architecture == "amd64" and
-  (.repositories | length) == 3 and
+  (.repositories | length) >= 2 and (.repositories | length) <= 3 and
+  ([.repositories[].id] | unique | length) == (.repositories | length) and
   all(.repositories[]; .index_identity.primary == "sha256") and
-  ([.repositories[].release_sha256] |
-    index($release) != null and index($updates) != null and index($security) != null) and
-  all(.repositories[].release_sha256; . == $release or . == $updates or . == $security) and
-  ([.repositories[].signer_fingerprints[]] | unique) == [$signer] and
+  ([.repositories[].release_sha256] | index($release) != null) and
+  all(.repositories[]; . as $repository |
+    any($sources[]; .package == $repository.id and
+      .repository.snapshot_digest == ("sha256:" + $repository.snapshot_sha256) and
+      .repository.release_digest == ("sha256:" + $repository.release_sha256) and
+      .repository.signer_fingerprints == $repository.signer_fingerprints)) and
   all(.packages[]; .archive_identity.primary == "sha512" and
     ([.archive_identity.digests[] | select(.algorithm == "sha512")] | length) == 1) and
   ([.packages[] | select(.architecture == "amd64" and (
@@ -159,7 +184,10 @@ jq -e --arg release "$release_sha256" --arg updates "$updates_release_sha256" \
     (.name == "sudo-rs" and .version == "0.2.13-0ubuntu1.2") or
     (.name == "util-linux" and .version == "2.41.3-3ubuntu2.2") or
     (.name == "libcap-ng0" and .version == "0.8.5-4build5")))] | length) == 6
-' "$lock" >/dev/null
+' "$lock" >/dev/null || {
+  echo "prestate lock or fresh authenticated repository admission differs from reviewed authority" >&2
+  exit 1
+}
 
 install -d -o root -g root -m 0700 "$build" "$build/evidence" "$build/tmp" "$prestates" "$tools"
 evidence=$build/evidence

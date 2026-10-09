@@ -4,8 +4,8 @@ umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PYTHONDONTWRITEBYTECODE=1
 
-[[ $# == 7 && $(id -u) == 0 ]] || {
-  echo "usage (as root): $0 PINNED_DPKG PROTECTED_SOURCE_ROOT SIGNED_LOCK LESS_ARCHIVE NEW_SCRIPT_ROOT NEW_DPKG_ROOT ZIG" >&2
+[[ ( $# == 7 || $# == 9 ) && $(id -u) == 0 ]] || {
+  echo "usage (as root): $0 PINNED_DPKG PROTECTED_SOURCE_ROOT SIGNED_LOCK LESS_ARCHIVE NEW_SCRIPT_ROOT NEW_DPKG_ROOT ZIG [LESS_LOCK DASH_LOCK]" >&2
   exit 2
 }
 
@@ -52,10 +52,15 @@ archive=$(realpath -- "$4")
 script_root=$(realpath -m -- "$5")
 dpkg_root=$(realpath -m -- "$6")
 zig=$(realpath -- "$7")
-for file in "$pinned" "$lock" "$archive" "$zig"; do require_protected_file "$file"; done
+less_lock=$lock dash_lock=$lock
+if [[ $# == 9 ]]; then
+  less_lock=$(realpath -- "$8")
+  dash_lock=$(realpath -- "$9")
+fi
+for file in "$pinned" "$lock" "$less_lock" "$dash_lock" "$archive" "$zig"; do require_protected_file "$file"; done
 require_protected_path "$source_root"
 [[ $(stat -c '%u:%g:%a' "$source_root") == 0:0:700 ]]
-for path in "$pinned" "$source_root" "$lock" "$archive" "$script_root" "$dpkg_root"; do
+for path in "$pinned" "$source_root" "$lock" "$less_lock" "$dash_lock" "$archive" "$script_root" "$dpkg_root"; do
   case "$path" in "$checkout"/.real-snapshot/*) ;; *) exit 2 ;; esac
 done
 [[ "$source_root" != "$script_root" && "$source_root" != "$dpkg_root" &&
@@ -72,16 +77,18 @@ for path in "$script_root" "$dpkg_root" "$bad_script" "$bad_mode" \
   case "$path" in "$source_root"/*) exit 2 ;; esac
 done
 python3 tools/prepare-native-dpkg.py --architecture arm64 --verify-only "$pinned"
-[[ $(jq -r '.target_architecture' "$lock") == arm64 ]]
+for source in "$lock" "$less_lock" "$dash_lock"; do
+  [[ $(jq -r '.target_architecture' "$source") == arm64 ]]
+done
 require_lock_artifact() {
-  local name=$1 version=$2 size=$3 sha512=$4 observed
+  local name=$1 version=$2 size=$3 sha512=$4 observed source=${5:-$lock}
   observed=$(jq -r --arg name "$name" --arg version "$version" \
-    '.packages[] | select(.name == $name and .version == $version and .architecture == "arm64" and .origin.type == "authenticated_repository" and .archive_identity.primary == "sha512") | [.declared_size, (.archive_identity.digests[] | select(.algorithm == "sha512") | .digest)] | @tsv' "$lock")
+    '.packages[] | select(.name == $name and .version == $version and .architecture == "arm64" and .origin.type == "authenticated_repository" and .archive_identity.primary == "sha512") | [.declared_size, (.archive_identity.digests[] | select(.algorithm == "sha512") | .digest)] | @tsv' "$source")
   [[ "$observed" == "$size"$'\t'"$sha512" ]]
 }
 digest=f3d538070be0217eec1c5e747f0b6ed05b08b22a006001dafac6c87747ab46e9055fb8bf1985aed2d4010f57d597108dbff22ed73f92959703fffa57ec84e0e8
-require_lock_artifact less 668-1build1 171138 "$digest"
-require_lock_artifact dash 0.5.12-12ubuntu3 95716 c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e
+require_lock_artifact less 668-1build1 171138 "$digest" "$less_lock"
+require_lock_artifact dash 0.5.12-12ubuntu3 95716 c4a44690b1541936c4c85956f8e5bef0c915ce05afe6618230b70f4906803f8710b314b9093b451787b995bcd7b25a3947f51c8efa03dbda16c7eac720f93c6e "$dash_lock"
 require_lock_artifact dpkg 1.23.7ubuntu1 1260980 824a6a3f33837c16dedb4faff92bd15b0dbe82d27dd9b25403f87ec4572acc6332159a6374558185ca503e18de6f637d2a79e7db9fafaab3ccae4ac77427eee5
 require_lock_artifact libc6 2.43-2ubuntu2.4 1642036 865127bc2d7d9218e2a3482b7e0b5ae3649c31bcac82d0437a7231c798f56a1939f0f18fc664111a7c446eef6f9864176c040ad78b7aac1a6a3afe4d4b9cbeb7
 [[ $(stat -c '%s' "$archive") == 171138 &&

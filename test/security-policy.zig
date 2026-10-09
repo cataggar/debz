@@ -2382,11 +2382,11 @@ test "security: protected reference CI stays opt-in, root-staged, bounded and un
     });
     try nativeMutations(&f, "protected-reference", "tools/real-snapshot-less-protected-stage.sh", &.{
         "  --check-keyring \"$DEBZ_REAL_SNAPSHOT_KEYRING\" >/dev/null\n",
-        "python3 -B -I tools/real_snapshot_less_stage.py prepare \"$source\" \"$lock\" \"$cache\" \"$pinned\"\n",
+        "python3 -B -I tools/real_snapshot_less_stage.py prepare \"$source\" \"$lock\" \"$cache\" \"$pinned\" \\\n",
         "  bash tools/real-snapshot-less-reference.sh \"$pinned\" \"$source\" \"$lock\" \"$cache/sha512-$digest\" \\\n",
     });
     try nativeMutations(&f, "protected-reference", "tools/real_snapshot_less_stage.py", &.{
-        "    for package in SOURCE_ARTIFACTS:\n        archive(lock, cache, package)\n",
+        "    for package in SOURCE_ARTIFACTS:\n        archive(locks[\"dpkg\" if package == \"libc6\" else package], cache, package)\n",
         "        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,\n",
     });
     try nativeMutations(&f, "protected-reference", ".github/workflows/ci.yml", &.{

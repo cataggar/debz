@@ -342,6 +342,56 @@ class ReferenceLauncherTests(unittest.TestCase):
                         LESS_STAGE.archive({"packages": [wrong]}, self.root, "less")
                     opened.assert_not_called()
 
+    def test_less_source_setup_checks_all_goal_locks_before_mutation(self) -> None:
+        goals = {"dpkg": ("dpkg", "libc6"), "less": ("less",),
+                 "dash": ("dash",), "util-linux": ("util-linux", "libcap-ng0")}
+        locks = {goal: self.root / f"{goal}.json" for goal in goals}
+        archive_path = self.root / "cached-archive"
+        archive_path.write_bytes(b"unit fixture archive bytes")
+        verified = []
+        def check_archive(document, cache, package):
+            self.assertIn(package, [entry["name"] for entry in document["packages"]])
+            verified.append(package)
+            return archive_path
+        def before_mutation(root):
+            self.assertEqual(set(verified), set(LESS_STAGE.SOURCE_ARTIFACTS))
+        for separate in (False, True):
+            with self.subTest(separate=separate):
+                for goal, names in goals.items():
+                    packages = names if separate else tuple(name for members in goals.values() for name in members)
+                    locks[goal].write_text(json.dumps({
+                        "target_architecture": "arm64", "packages": [{"name": name} for name in packages]}))
+                verified.clear()
+                additional = tuple(locks[goal] for goal in ("less", "dash", "util-linux")) if separate else ()
+                with mock.patch.object(LESS_STAGE, "protected"), \
+                     mock.patch.object(LESS_STAGE, "archive", side_effect=check_archive), \
+                     mock.patch.object(LESS_STAGE, "remove_lib64", side_effect=before_mutation), \
+                     mock.patch.object(LESS_STAGE, "directory"), \
+                     mock.patch.object(LESS_STAGE, "member", return_value=b"unit runtime bytes"), \
+                     mock.patch.object(LESS_STAGE, "create_exclusive"), \
+                     mock.patch.object(LESS_STAGE, "alias"):
+                    LESS_STAGE.prepare(self.root, locks["dpkg"], self.root, archive_path, *additional)
+
+    def test_less_source_setup_refuses_missing_or_wrong_arch_goal_lock_before_mutation(self) -> None:
+        paths = [self.root / f"{name}.json" for name in ("dpkg", "less", "dash", "util-linux")]
+        for mutation in ("missing", "wrong-architecture"):
+            with self.subTest(mutation=mutation):
+                for path in paths:
+                    path.write_text(json.dumps({"target_architecture": "arm64", "packages": []}))
+                if mutation == "missing":
+                    paths[2].unlink()
+                    expected = FileNotFoundError
+                else:
+                    paths[2].write_text(json.dumps({"target_architecture": "amd64", "packages": []}))
+                    expected = ValueError
+                with mock.patch.object(LESS_STAGE, "protected"), \
+                     mock.patch.object(LESS_STAGE, "archive") as archive, \
+                     mock.patch.object(LESS_STAGE, "remove_lib64") as mutate:
+                    with self.assertRaises(expected):
+                        LESS_STAGE.prepare(self.root, paths[0], self.root, self.root / "pinned", *paths[1:])
+                    archive.assert_not_called()
+                    mutate.assert_not_called()
+
     def test_less_source_capture_is_exclusive_without_following_an_existing_alias(self) -> None:
         outside = self.root / "outside"
         outside.write_bytes(b"must stay intact")

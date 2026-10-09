@@ -33,7 +33,8 @@ cp -a --reflink=auto --one-file-system -- "$workspace/template" "$source"
 lock=$workspace/evidence/runtime.lock.json
 cache=$workspace/snapshot/cache/packages-v2/objects
 pinned=$workspace/dpkg/usr/bin/dpkg
-python3 -B -I tools/real_snapshot_less_stage.py prepare "$source" "$lock" "$cache" "$pinned"
+python3 -B -I tools/real_snapshot_less_stage.py prepare "$source" "$lock" "$cache" "$pinned" \
+  "$workspace/evidence/less.lock.json" "$workspace/evidence/dash.lock.json" "$workspace/evidence/util-linux.lock.json"
 # Obtain a genuine unpacked database/control state from pinned dpkg. Only the
 # unchanged signed inert less preinst runs; no configure/trigger authority.
 timeout --signal=TERM --kill-after=5s 120s \
@@ -50,11 +51,13 @@ timeout --signal=TERM --kill-after=5s 120s \
 python3 -B -I tools/real_snapshot_less_stage.py seal "$source"
 read -r bytes _ < <(du -sb "$source")
 (( bytes <= 512 * 1024 * 1024 ))
+less_lock=$workspace/evidence/less.lock.json
+dash_lock=$workspace/evidence/dash.lock.json
 digest=$(jq -er '.packages[] | select(.name == "less" and .architecture == "arm64") |
-  .archive_identity.digests[] | select(.algorithm == "sha512") | .digest' "$lock")
+  .archive_identity.digests[] | select(.algorithm == "sha512") | .digest' "$less_lock")
 timeout --signal=TERM --kill-after=30s 15m \
   bash tools/real-snapshot-less-reference.sh "$pinned" "$source" "$lock" "$cache/sha512-$digest" \
-  "$workspace/script-after" "$workspace/dpkg-after" "$zig" \
+  "$workspace/script-after" "$workspace/dpkg-after" "$zig" "$less_lock" "$dash_lock" \
   >"$workspace/evidence/less-replay.txt" 2>"$workspace/evidence/less-replay.stderr"
 read -r bytes _ < <(du -sb "$workspace")
 (( bytes <= 8 * 1024 * 1024 * 1024 ))
